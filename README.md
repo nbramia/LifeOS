@@ -69,7 +69,7 @@ Turn years of interaction history across thousands of contacts into insight — 
 
 - A ranked, searchable directory; per-person pages with contacts, sources, stats, and extracted facts; a [chronological timeline](docs/specs/product/crm-interactions.md) across all sources; and a force-directed [relationship graph](docs/specs/product/crm-graph.md).
 - [Analytics dashboards](docs/specs/product/crm-analytics.md) — **Family**, **Me** (network health), **Birthdays**, and a **Relationship** dashboard for a designated partner.
-- *"Who am I engaging with less than I used to? Who should I reconnect with?"* → interaction history, communication patterns, and relationship strength over time.
+- *"Who am I engaging with less these days? Who should I reconnect with?"* → interaction history, communication patterns, and relationship strength over time.
 
 ### Health & fitness
 

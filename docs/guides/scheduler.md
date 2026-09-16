@@ -93,7 +93,7 @@ with a 422 that lists the accepted ones. Leaving the field unset means the
 primary bot, which is what an installation with no specialized bots configured
 gets.
 
-If a stored schedule names a bot the registry no longer has — usually because
+If a stored schedule names a bot missing from the registry — usually because
 the bot was renamed after the schedule was written — the notification is still
 delivered from the primary bot rather than dropped, but the message carries a
 routing warning naming the unresolvable bot so the misroute is visible in the

@@ -139,7 +139,7 @@ Hardening upgrade (deferred to a later issue): swap the bearer-token check for a
 Tasks tagged `#cloud-haiku` / `#cloud-sonnet` route to Claude on Anthropic's [Managed Agents](https://platform.claude.com/docs/en/managed-agents/overview) platform. Bare `#cloud` routes to your configured remote OpenAI-compatible provider instead (see [configuration.md](configuration.md#openai-compatible-remote-provider)). Per [ADR-018](../adr/018-api-spend-requires-consent.md) an explicit tag is required: an untagged task whose title merely *implies* cloud connectors asks you which engine to use rather than dispatching to the API. Set this section up if you want the Managed Agents path available at all — it is the API-billed route, and the only one that reaches Vault-authenticated connectors. The architecture has three reusable resources you set up once in the [Anthropic console](https://platform.claude.com):
 
 - **Agent preset** (`agent_…`) — model, system prompt, MCP servers, tools, skills. Sessions reference it by ID.
-- **Environment** (`env_…`) — where tool calls execute. Cloud container by default; self-hosted sandbox tracked in [#111](https://github.com/nbramia/LifeOS/issues/111).
+- **Environment** (`env_…`) — where tool calls execute. Cloud container by default; self-hosted sandbox tracked as [a future enhancement](https://github.com/nbramia/LifeOS/issues/111).
 - **Vault** (`vlt_…`) — OAuth credentials for MCP servers, matched to the MCP URLs declared in the agent preset.
 
 > **Beta caveat:** Managed Agents launched April 2026 and the request/response schemas are still evolving. If a request fails with a 4xx, check the [Anthropic docs](https://platform.claude.com/docs/en/managed-agents) and update `api/services/agent_worker/managed_driver.py` accordingly.
@@ -480,7 +480,7 @@ Claude Code CLI (which *does* work headless on Linux), then monitor it with
 `lifeos_agent_check`. This delegation is the supported path for any task that
 needs a real browser.
 
-## Card assignment: running a card on another machine (#851)
+## Card assignment: running a card on another machine
 
 A board card (or a `#claude`/`#codex` task carrying `host` / `model` /
 `effort` fields) can name a machine other than this API host to run on.
@@ -557,7 +557,7 @@ fails with its own distinct reason (`host <name> did not answer within
 **What doesn't work remotely:** Apple-data tasks (iMessage, Photos,
 Contacts) need Full Disk Access, which is granted per-launching-process
 and can't be inherited over ssh — see
-[agent-worker.md](../specs/technical/agent-worker.md#card-assignment-851).
+[agent-worker.md](../specs/technical/agent-worker.md#card-assignment).
 The Apple Data Agent's own export/import pipeline
 ([operations.md](operations.md)) is the supported path for cross-machine
 Apple data, not this mechanism.
@@ -690,7 +690,7 @@ suggestions to keep iteration cheap:
 - [Configuration](configuration.md) — environment variable reference
 - [Scripts](scripts.md) — `setup-systemd.sh` and other operational scripts
 - [Human Queue](human-queue.md) — `done_when` auto-resolve checks require this worker to be running
-- [Agent Worker — Technical](../specs/technical/agent-worker.md#card-assignment-851) — Host registry and ssh spawn mechanism this guide's setup section covers operationally
+- [Agent Worker — Technical](../specs/technical/agent-worker.md#card-assignment) — Host registry and ssh spawn mechanism this guide's setup section covers operationally
 - [Agent Worker — Technical § Working directory](../specs/technical/agent-worker.md#working-directory-925) — Guard implementation this guide's working-directory section covers operationally
 - [Agent Viz — Technical](../specs/technical/agent-viz.md#remote-transcript-mirror) — The transcript mirror mechanism this guide's setup section covers operationally
 - [Operations](operations.md) — Apple Data Agent export/import, the supported path for cross-machine Apple data this guide's remote-host section can't reach

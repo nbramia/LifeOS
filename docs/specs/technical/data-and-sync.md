@@ -373,7 +373,7 @@ the script's own docstring for the exact exclusion list and reasoning.
 Safe to re-run: it reuses the same per-source scripts as the nightly job
 unmodified, and those are already idempotent (upsert by source ID, not
 append-only). An unconfigured source is reported as a clean skip, not a
-failure (#687's pattern), and one source failing doesn't stop the rest of
+failure, and one source failing doesn't stop the rest of
 the backfill from running. When it finishes, it prints a coverage report
 (record count and earliest/latest date per source) read from
 `data/interactions.db` — a quick way to confirm history actually arrived.
@@ -469,12 +469,7 @@ Two Phase 2 sources touch iMessage data, and their order matters:
 
 `link_imessage` runs after `imessage` (`depends_on: ["imessage"]` in
 `SYNC_SOURCES`) so its backfill operates on the night's freshly-created
-interactions rather than lagging a day behind. An earlier ordering (`link_imessage`
-before `imessage`) was intentional at the time it was introduced — `imessage`
-did not yet link unconditionally — but that root cause was fixed directly
-inside `sync_imessage_interactions.py` afterward, making the pre-linking step
-unnecessary and leaving the retroactive backfill running on stale CRM data
-each night.
+interactions rather than lagging a day behind.
 
 ### Slack Sync
 

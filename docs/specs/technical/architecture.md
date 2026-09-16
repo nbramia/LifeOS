@@ -397,8 +397,7 @@ def my_function():
 **Guarantee:** a curated write endpoint must never report a failure inside an
 HTTP 2xx without a top-level `error` key — a caller (human, MCP client, or
 the agent worker) must be able to tell success from failure from the status
-code or that key alone, without parsing prose. This was violated once (#603,
-`fitness.py`) and the class of defect was audited end to end for #609.
+code or that key alone, without parsing prose.
 
 **How it's enforced, mechanically:**
 
@@ -431,7 +430,7 @@ a *route* returns 2xx with a failure embedded in the body without a
 top-level `error` key. The table below is the audit of every curated write
 endpoint against that condition, plus which of the three mechanisms above
 actually consumes it — an endpoint can be honest while every consumer of it
-is blind, which is how the incident that prompted #609 happened. This is
+is blind. This is
 what makes the guarantee above true rather than aspirational (docs/AGENTS.md:
 no document may claim an unenforced guarantee).
 
@@ -447,11 +446,11 @@ no document may claim an unenforced guarantee).
 | `lifeos_telegram_send` | `POST /api/reminders/send` | Safe — 400 not configured / 500 send failure | MCP, worker (no native-loop equivalent) | `tests/test_reminders_api.py` |
 | `lifeos_schedule_create/update/delete` | `{POST,PUT,DELETE} /api/scheduler[/{id}]` | Safe — 400/404 | MCP, worker, native (`_schedule_create/_update/_delete`) | `tests/test_scheduler_api.py` |
 | `lifeos_sync_trigger` (`source=vault`) | `POST /api/admin/reindex` | Safe — reports enqueue state honestly, never claims completion | MCP, worker (no native-loop equivalent — see note below) | `tests/test_admin.py` |
-| `lifeos_sync_trigger` (`source=calendar`) | `POST /api/admin/calendar/sync` | **Fixed for #609/#614.** `except Exception` returns a `JSONResponse` with a top-level `"error"` key alongside the existing fields *and* an explicit 500 status (#614: a total failure means the requested sync did not happen, and a consumer that only checks HTTP status should get correct behavior without knowing the body convention). A `partial` outcome (some calendar accounts synced, one failed) is a real, non-error result and stays 200 — it's returned via the normal `CalendarSyncResponse` path above the `except`, never through this branch. | MCP, worker (no native-loop equivalent) | `tests/test_calendar_indexer.py::test_trigger_calendar_sync_failure_carries_top_level_error` (500 + error key), `tests/test_calendar_indexer.py::test_trigger_calendar_sync_partial_status_stays_200` (partial stays 200), `tests/test_mcp_server.py::test_sync_trigger_2xx_with_embedded_error_sets_is_error` |
+| `lifeos_sync_trigger` (`source=calendar`) | `POST /api/admin/calendar/sync` | **Safe — explicit error contract.** `except Exception` returns a `JSONResponse` with a top-level `"error"` key alongside the existing fields *and* an explicit 500 status (a total failure means the requested sync did not happen, and a consumer that only checks HTTP status should get correct behavior without knowing the body convention). A `partial` outcome (some calendar accounts synced, one failed) is a real, non-error result and stays 200 — it's returned via the normal `CalendarSyncResponse` path above the `except`, never through this branch. | MCP, worker (no native-loop equivalent) | `tests/test_calendar_indexer.py::test_trigger_calendar_sync_failure_carries_top_level_error` (500 + error key), `tests/test_calendar_indexer.py::test_trigger_calendar_sync_partial_status_stays_200` (partial stays 200), `tests/test_mcp_server.py::test_sync_trigger_2xx_with_embedded_error_sets_is_error` |
 | `lifeos_sync_trigger` (`source=contacts`, `slack`) | `POST /api/crm/{contacts,slack}/sync` | Safe — raise `HTTPException` on failure | MCP, worker (no native-loop equivalent) | `tests/test_crm_api.py` |
-| `lifeos_sync_trigger` (`source=photos`) | `POST /api/photos/sync` | **Fixed for #609/#614.** Same mechanism as the calendar case — the error previously lived only nested inside `stats["error"]`, invisible to the generic top-level check; now also present at the top level, with an explicit 500 status (same #614 reasoning as above; this endpoint has no `partial` outcome to preserve). | MCP, worker (no native-loop equivalent) | `tests/test_photos_sync_api.py::test_sync_failure_carries_top_level_error` |
-| `lifeos_sync_trigger` (`source=gmail`, `imessage`, `phone`, `facetime`, `linkedin`) | `POST /api/crm/sources/{type}/sync` | Stub — always returns `{"status": "queued"}`; no sync is actually implemented yet, so there is no failure path to mis-report. Not a #609 defect. | MCP, worker (no native-loop equivalent) | — |
-| `lifeos_workout_manage` | `POST /api/fitness/workouts` | Safe — fixed in #603 | MCP, worker, native (`_tool_manage_workouts`) | `tests/test_workout_mcp_route.py` |
+| `lifeos_sync_trigger` (`source=photos`) | `POST /api/photos/sync` | **Safe — explicit error contract.** Same mechanism as the calendar case — the error is surfaced at the top level (not just nested inside `stats["error"]`, which the generic top-level check can't see), with an explicit 500 status (same reasoning as above; this endpoint has no `partial` outcome to preserve). | MCP, worker (no native-loop equivalent) | `tests/test_photos_sync_api.py::test_sync_failure_carries_top_level_error` |
+| `lifeos_sync_trigger` (`source=gmail`, `imessage`, `phone`, `facetime`, `linkedin`) | `POST /api/crm/sources/{type}/sync` | Stub — always returns `{"status": "queued"}`; no sync is actually implemented yet, so there is no failure path to mis-report. | MCP, worker (no native-loop equivalent) | — |
+| `lifeos_workout_manage` | `POST /api/fitness/workouts` | Safe | MCP, worker, native (`_tool_manage_workouts`) | `tests/test_workout_mcp_route.py` |
 | `lifeos_task_create/update/complete/delete` | `{POST,PUT,DELETE} /api/tasks[/{id}[/complete]]` | Safe — unhandled exception → 500; not-found → 404 | MCP, worker, native covers create/update/complete (`_task_create/_update/_complete`) — no native delete | `tests/test_tasks_api.py::test_create_task_failure_is_never_success_shaped` (create); 404 cases elsewhere in the same file |
 | `lifeos_calendar_create/update/delete` | `{POST,PUT,DELETE} /api/calendar/events[/{id}]` | Safe — 401/500 | MCP, worker, native (`_tool_create/update/delete_calendar_event`) | `tests/test_calendar_api.py::TestCalendarWriteFailures` |
 
@@ -479,7 +478,7 @@ a static approximation, not a substitute for the failure-injection tests
 cited in the table above.
 `tests/test_mcp_server.py::TestMCPServerToolDiscovery::test_task_create_tags_advertised_as_array`
 separately pins the specific schema mistyping (`tags` as `string` instead of
-`array`) that #603 fixed and #609 traced the original incident to.
+`array`) against regression.
 
 ---
 

@@ -208,7 +208,7 @@ CLI handoffs run as async worker sessions and report results via Telegram and `/
 
 **Status:** Complete
 
-Web `/chat` speaks to the same agent-thread model as Telegram (#236, Phase 3 of #233):
+Web `/chat` speaks to the same agent-thread model as Telegram:
 
 - **Threads panel** (sidebar) — lists recent/resumable agent sessions (root sessions only) with a status badge (running / completed / failed / budget / blocked) and a route badge showing where the agent runs: **🖥 local** (Gemma) or **☁ cloud** (Claude / Managed Agents), with the model name on hover. Backed by `GET /api/agents/threads`; polled for live-ish updates (the `/agents` page uses the `/api/agents/stream` SSE for the full graph).
 - **Open a thread** — clicking a thread loads its full conversation into the main chat body: user prompts and the agent's replies render as chat bubbles, with the agent's tool calls shown as collapsible detail under each reply. Backed by `GET /api/agents/threads/{id}`, which returns a reconstructed `conversation` (from the session's message history, or the managed transcript for cloud sessions). A banner — carrying the same local/cloud route badge — marks the thread; **Exit to chat** (or **+**) returns to normal chat.

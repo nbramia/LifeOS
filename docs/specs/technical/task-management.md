@@ -92,8 +92,8 @@ A checkbox line with no `<!-- id:xxxx -->` comment gets one minted
 next reindex, `_reparse_lines` (`:713`) appends that id comment to the raw
 line — and changes nothing else about it: no reformatting, no inserted
 `TODO`, no field reordering. Every other line in the file, task or not, is
-copied through byte-for-byte. This matters because the parser no longer
-requires `TODO`: on the first reindex after this feature ships, every
+copied through byte-for-byte. This matters because the parser does not
+require `TODO`: the first time a vault reindexes under this parser, every
 existing hand-written `- [ ]` checklist item in `LifeOS/Tasks/*.md` gets an
 id comment appended, once, and is indexed as a task from then on. That is
 the intended migration, not a bug.
@@ -130,9 +130,9 @@ what the caller sent:
   fields and, after the next reindex re-parses the line, `updated_at` would
   read back as `"SPOOFED"`.
 
-`status` is validated the same way, against `VALID_STATUSES` — an
-unrecognized status previously wrote a blank checkbox (the symbol lookup
-falls back to `todo`'s `" "`) and round-tripped as the invalid string until
+`status` is validated the same way, against `VALID_STATUSES` — without this,
+an unrecognized status would write a blank checkbox (the symbol lookup
+falls back to `todo`'s `" "`) and round-trip as the invalid string until
 the next reindex silently flipped it back to `todo`.
 
 ## Id-addressed, compare-and-swap writes
@@ -164,8 +164,8 @@ in place, so a losing attempt's edits are never visible through `get()` —
 
 `_cas_rewrite` also checks, before calling `compute()`, whether the on-disk
 block already reflects an edit `reindex_file` hasn't absorbed yet — the raw
-line text no longer matches the last line the API wrote or saw for this id,
-or the on-disk notes body no longer matches the in-memory task's. This is
+line text differs from the last line the API wrote or saw for this id,
+or the on-disk notes body differs from the in-memory task's. This is
 the *normal* case for an edit that just landed, not a rare race: the
 watcher's 2s debounce means a `PUT` can easily arrive after an external
 edit has hit disk but before `reindex_file` has run. Without this check,
@@ -187,7 +187,7 @@ raises, the source is untouched — the task never disappears. If the source
 removal then fails (a conflict there, after the destination insert already
 succeeded), the manager best-effort removes the just-inserted destination
 block before re-raising, rather than leaving the task duplicated in both
-files. If the task's block is no longer present in the source at all (an
+files. If the task's block is absent from the source entirely (an
 external delete raced the move), the move is treated like any other
 externally-deleted task — reconciled out of the index — rather than raising
 a conflict.

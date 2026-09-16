@@ -412,7 +412,7 @@ class LifeOSMCPServer:
             trusted_session_id or os.environ.get("LIFEOS_AGENT_SESSION_ID") or ""
         ).strip()
         self._mcp_transport_secret = ""
-        # Per-session tool-result cache (#139 §4). Bypassed when the caller
+        # Per-session tool-result cache. Bypassed when the caller
         # doesn't supply a session id (which is the common case for local-CLI
         # tool calls; cache hits matter most on managed-agent HTTP calls).
         try:
@@ -566,7 +566,7 @@ class LifeOSMCPServer:
         Pydantic v2 renders `Optional[X]` as `anyOf: [<X's schema>, {"type":
         "null"}]` with no top-level `type` — every optional field in this
         codebase's request models takes this shape. Reading only the
-        top-level `type` (the old behavior) silently falls back to a default,
+        top-level `type` without unwrapping silently falls back to a default,
         so `sets: Optional[list[...]]` was advertised as `"type": "string"`
         and a schema-following MCP client couldn't build the array a workout
         log needs. A schema that already has a top-level `type` (a required
@@ -1290,7 +1290,7 @@ class LifeOSMCPServer:
     def _call_api(self, tool_name: str, arguments: dict, session_id: str | None = None) -> dict:
         """Call the LifeOS API based on tool name and arguments.
 
-        `session_id` (optional) enables the per-session result cache (#139 §4):
+        `session_id` (optional) enables the per-session result cache:
         when supplied, identical GET-style tool calls within the same session
         are served from a 60s LRU instead of round-tripping to the API. Writes
         (POST/PUT/DELETE) are never cached. The cache also skips inter-agent
@@ -1377,7 +1377,7 @@ class LifeOSMCPServer:
                         if body:
                             msg["body"] = body
 
-            # Store in the per-session cache for read-only tools (#139 §4).
+            # Store in the per-session cache for read-only tools.
             if self._cache_eligible(tool_name) and session_id and self._result_cache is not None:
                 self._result_cache.put(session_id, tool_name, cache_key_args, result)
 
@@ -1747,13 +1747,9 @@ class LifeOSMCPServer:
             text = "## Communication Gap Analysis\n\n"
             # Show person summaries first
             text += "### Overview\n"
-            # Report the fields the endpoint actually returns. All three names
-            # read here before were absent from the response, so every .get()
-            # fell through to its default: each person was rendered as "999 days
-            # since contact" — a fabricated interval, not a real one — the real
-            # average gap was dropped because it read as 0, and the alert could
-            # never fire. There is no days-since-contact in this response, so
-            # none is invented.
+            # Report the fields the endpoint actually returns. There is no
+            # days-since-contact in this response, so none is invented here —
+            # a fabricated interval would misrepresent contact recency.
             for s in summaries:
                 name = s.get("person_name", "Unknown")
                 avg = s.get("avg_gap_days")

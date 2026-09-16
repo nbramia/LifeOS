@@ -152,7 +152,7 @@ For ADRs, `Status` reflects document completeness; `Decision` reflects whether t
 
 ## ADR Template
 
-ADRs use the following structure. The retrofit issue (#182) brought existing ADRs into this shape; all new ADRs must follow it.
+ADRs use the following structure; all new ADRs must follow it.
 
 ```markdown
 # ADR-NNN: Short Title
@@ -268,7 +268,7 @@ Use only the buckets that apply — omit empty buckets rather than including the
 **Specs are living:**
 - Update when the design changes, not when tasks complete.
 - If a spec describes a target that's not yet built, the `Status: Partial` value is appropriate.
-- Specs are not changelogs, and neither are comments, docstrings, or tests. Don't add "Added X in PR #N" notes, "this used to do X" narration, or review-round/finding citations anywhere in the repo; that's what `git log` and `git blame` are for.
+- Specs are not changelogs, and neither are comments, docstrings, or tests. Don't cite an issue or PR number as a record of what happened, describe current behavior by contrasting it with an earlier state, or reference review-round or reviewer-finding numbers anywhere in the repo; that's what `git log` and `git blame` are for.
 
 **Plans are ephemeral:**
 - A plan ends as either "completed" (move to `archive/` with `Completed: YYYY-MM-DD`) or "superseded" (note the successor and move to `archive/`).

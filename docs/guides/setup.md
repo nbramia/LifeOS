@@ -191,7 +191,7 @@ cp config/family_members.example.json config/family_members.json
 
 Then personalize the two people-related files:
 
-**[ASK USER]** What is your first name? (Used to exclude self from entity extraction.)
+**[ASK USER]** What is your first name? (Excludes you from entity extraction.)
 
 Edit `config/people_dictionary.json` — replace the placeholder self entry with the
 user's first name (as `canonical`) and lowercase aliases, keeping `"category": "self"`

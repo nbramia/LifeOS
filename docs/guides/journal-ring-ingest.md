@@ -6,8 +6,8 @@
 
 Lets a capture device — the motivating case is the [Pebble Index](https://repebble.com/index)
 ring, which transcribes speech on-phone and can "route… transcribed text
-directly to your own app via webhook" — feed fragments into the `journal`
-persona ([#659](../../config/personas/journal.md)) from outside the tailnet.
+directly to your own app via webhook" — feed fragments into the
+[`journal` persona](../../config/personas/journal.md) from outside the tailnet.
 
 **This is our own contract, not the ring's.** The Pebble Index ships March
 2026; its real webhook payload shape is unknown until then. This endpoint
@@ -25,7 +25,7 @@ deliberately **not** used here: it would hand interpretation of a spoken
 fragment to the ring's own small on-device model choosing among 60+ tools,
 so a spoken thought and a typed one could end up governed by two different
 judgments about what deserves a task. This endpoint keeps the ring as
-transport and the `journal` persona as the sole interpreter — see #660.
+transport and the `journal` persona as the sole interpreter.
 
 ## Behavior
 
@@ -69,8 +69,8 @@ LIFEOS_JOURNAL_INGEST_TOKEN=$(openssl rand -hex 32)
 ```
 
 Empty (the default) disables the endpoint — it returns `503`. The `journal`
-persona itself must also be configured (`TELEGRAM_JOURNAL_BOT_TOKEN` set,
-per [#659](../../config/personas/journal.md)); if it isn't, the endpoint
+persona itself must also be configured (`TELEGRAM_JOURNAL_BOT_TOKEN` set —
+see [`config/personas/journal.md`](../../config/personas/journal.md)); if it isn't, the endpoint
 returns `503` rather than routing to an unprimed chat turn.
 
 Point the device (or its phone-side app) at:
@@ -144,7 +144,7 @@ Check `LifeOS/Log/Journal/<today>.md` in the vault for the new bullet.
 
 ## Related Documents
 
-- [`config/personas/journal.md`](../../config/personas/journal.md) — The persona this endpoint routes into (#659); authoritative on task/schedule extraction. Log shape is owned by `api/services/journal_capture.py`, below.
+- [`config/personas/journal.md`](../../config/personas/journal.md) — The persona this endpoint routes into; authoritative on task/schedule extraction. Log shape is owned by `api/services/journal_capture.py`, below.
 - [Configuration](configuration.md#journal-ring-ingest) — `LIFEOS_JOURNAL_INGEST_TOKEN` reference.
 - [`api/routes/journal_ingest.py`](../../api/routes/journal_ingest.py) — Implementation; `_adapt_payload()` is the one function to change once a real device's webhook is observed.
 - [`api/services/journal_capture.py`](../../api/services/journal_capture.py) — The deterministic write this endpoint's capture confirmation comes from.

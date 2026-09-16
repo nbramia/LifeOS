@@ -178,7 +178,7 @@ found unless a change already touches that file.
 - Route parameters and Pydantic models are fully typed.
 - Service methods use basic type hints (`Optional[str]`, `list[Task]`, `-> bool`).
 - Dataclasses have explicit type annotations on all fields.
-- `TYPE_CHECKING` guard is used to avoid circular imports.
+- `TYPE_CHECKING` guard avoids circular imports.
 
 ## Logging
 
@@ -212,17 +212,18 @@ logger.info(f"Indexed {person.display_name}: {person.email}, {person.phone}")
 ## Comments and Docstrings
 
 Comments and docstrings describe current behavior only: what the code does and, where
-it's non-obvious, why — never how it got there. No "used to"/"previously"/"now"/"no
-longer", no "this change"/"this fix", no review rounds, findings, reviewers, or
-issue/PR numbers cited as history. Git history is where that narrative belongs. A
-comment earns its place only by stating an invariant or a non-obvious present-tense
-reason.
+it's non-obvious, why — never how it got there. Avoid comparative wording that measures
+today's behavior against an earlier one, avoid framing a comment around a specific edit
+rather than the resulting behavior, avoid review-round or reviewer-finding narration,
+and never cite an issue/PR number as history. Git history is where that narrative
+belongs. A comment earns its place only by stating an invariant or a non-obvious
+present-tense reason.
 
 ```python
 # BAD — narrates history instead of describing current behavior
-# This used to fetch every relationship row per call; now caches results
-# per person (review finding 6) because that was measured at ~40ms per row
-# on the full table.
+# Fetching every relationship row per call was the original approach; a
+# per-person cache exists on top of that because of a slow full-table
+# measurement (~40ms per row) raised during code review.
 def get_all_for_person(self, person_id: str) -> list[Relationship]:
     ...
 

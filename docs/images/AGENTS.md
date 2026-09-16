@@ -121,7 +121,7 @@ cycle's angle = time/order). Otherwise use bands/columns.
 - Serve over `http://localhost` and screenshot with Playwright. `file://` is blocked; **direct
   navigation to a `.svg` can hang** — embed the SVG in a tiny HTML wrapper (`<img src=...>`)
   and screenshot that instead. A wrapper with a hard-cropped, scaled `<img>` is a cheap way to
-  zoom into one region (used to confirm the bidirectional arrowheads).
+  zoom into one region (useful for confirming the bidirectional arrowheads).
 - Check on a **white** and a **dark** background; the panel should look intentional on both.
 - Clean up scratch `_preview.html` / screenshots before finishing — don't commit them.
 

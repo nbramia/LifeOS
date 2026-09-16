@@ -243,7 +243,7 @@ The CRM uses a two-tier model for managing people:
 │  Raw observations from data sources. Each message/event creates one.     │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                          │
-│  Gmail Message #123     Calendar Event #456     iMessage +15550123      │
+│  Gmail Message M123     Calendar Event E456     iMessage +15550123      │
 │  ├─ observed_email      ├─ observed_email       ├─ observed_phone       │
 │  └─ observed_name       └─ observed_name        └─ observed_name        │
 │                                                                          │

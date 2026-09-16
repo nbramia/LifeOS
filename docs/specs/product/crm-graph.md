@@ -132,7 +132,7 @@ first-degree node with no edge back to the center.
 Edge selection: every edge connecting the center to a first-degree node is
 always included, regardless of `max_edges` — this is what guarantees every
 first-degree node has an edge to the center — except when the center itself
-was dropped by the `category`/`min_strength` filters below, in which case no
+is excluded by the `category`/`min_strength` filters below, in which case no
 center edges are emitted (there is no center node left for them to connect
 to). The remaining edge budget (`max_edges` minus those center edges) is
 filled with the strongest remaining edges among the selected nodes, by the

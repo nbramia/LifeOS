@@ -75,7 +75,7 @@ class TelegramBotConfig:
     capitalized ``name``. ``orchestrates`` marks a bot that drives Claude Code
     sessions (e.g. the doctor self-repair bot) instead of being pure chat — such
     a bot owns its own agent-session reply threads rather than redirecting coding
-    tasks to the primary bot. ``backend`` (#684) selects which pipeline answers
+    tasks to the primary bot. ``backend`` selects which pipeline answers
     this bot's turns: ``"hermes"`` (the default for every registry entry, i.e.
     every specialized bot) targets the Hermes proxy (``/api/hermes/ask/stream``),
     the same backend ``/chat`` prefers when it's available; ``"lifeos"``
@@ -153,10 +153,9 @@ def _surface_variant_body(persona_file: str, default_body: str, surface: "str | 
     General mechanism for a persona whose execution model genuinely differs
     by surface (e.g. `doctor` on Telegram/web, which drives a headless Claude
     Code session with a shell, vs. on Hermes, which has MCP tools and no
-    shell — see #641). ``surface=None`` — every call site before this existed,
-    and every call site that hasn't opted in — always returns ``default_body``
-    untouched, with no extra filesystem access: byte-identical to before this
-    existed. A named surface checks for a sibling ``<stem>.<surface><suffix>``
+    shell). ``surface=None`` — the default for every call site that hasn't
+    opted in — always returns ``default_body`` untouched, with no extra
+    filesystem access. A named surface checks for a sibling ``<stem>.<surface><suffix>``
     file next to ``persona_file`` (e.g. ``config/personas/doctor.md`` ->
     ``config/personas/doctor.hermes.md``); if it exists, its body (parsed the
     same way, frontmatter stripped) replaces the default one. A persona with
@@ -231,16 +230,16 @@ class Settings(BaseSettings):
     )
 
     # Voice gateway (whisper-relay). LifeOS reverse-proxies /api/voice/* here so
-    # the browser stays same-origin for mic/HTTPS (#361). See ADR-016.
+    # the browser stays same-origin for mic/HTTPS. See ADR-016.
     voice_gateway_url: str = Field(
         default="http://127.0.0.1:9788",
         alias="LIFEOS_VOICE_GATEWAY_URL",
         description="whisper-relay voice gateway base URL"
     )
 
-    # Smart turn endpointing (#718): while auto-continue is on, the web client
-    # runs an energy VAD on the live recording stream and, after this much
-    # trailing silence following speech, POSTs the audio-so-far to the bare-STT
+    # Smart turn endpointing: while auto-continue is on, the web client
+    # runs an energy VAD on the live recording stream and, once this much
+    # trailing silence follows speech, POSTs the audio-so-far to the bare-STT
     # route (POST /api/voice/transcribe) to check whether the user sounds done.
     # Read by GET /api/chat/config -> web/chat/voice.js; both are pure client-
     # side timing knobs, not used anywhere server-side.
@@ -256,10 +255,10 @@ class Settings(BaseSettings):
         description="Continuous silence (ms) in auto-mode voice recording that finalizes "
                     "the turn regardless of the completeness check, so it can never hang"
     )
-    # Idle timeout (#723): a disjoint budget from the two above, for the
+    # Idle timeout: a disjoint budget from the two above, for the
     # opposite situation -- no speech at all yet this recording, so there is
     # no trailing silence for voice_endpoint_silence_ms/_hard_cap_ms to
-    # measure. After this much silence with nothing spoken, the client stops
+    # measure. Once this much silence passes with nothing spoken, the client stops
     # and discards the recording (no turn submitted) rather than leaving the
     # mic open indefinitely. Read by GET /api/chat/config -> web/chat/voice.js,
     # same pattern as the two settings above -- also a pure client-side
@@ -273,11 +272,10 @@ class Settings(BaseSettings):
     # Reserved for an optional LLM completeness classifier for ambiguous
     # candidate transcripts (no terminal punctuation, no trailing filler word
     # either) — see isTranscriptComplete()'s doc comment in web/chat/voice.js.
-    # Not implemented yet: it would need a new server endpoint (a classify
-    # call analogous to conversation_titler.py's generate_text() use), which
-    # is out of scope for this change. Left False and unwired on the client —
-    # flipping it currently has no effect; the heuristic alone governs every
-    # completeness decision.
+    # Not implemented: it would need a new server endpoint (a classify call
+    # analogous to conversation_titler.py's generate_text() use). Left False
+    # and unwired on the client — flipping it currently has no effect; the
+    # heuristic alone governs every completeness decision.
     voice_endpoint_semantic: bool = Field(
         default=False,
         alias="LIFEOS_VOICE_ENDPOINT_SEMANTIC",
@@ -288,7 +286,7 @@ class Settings(BaseSettings):
 
     # Agent text backend (OpenClaw voice-adapter). LifeOS proxies the "Agent"
     # text backend to /api/ask/stream here, adding the bearer token server-side
-    # so it's never exposed to the browser (#361). Empty url = Agent disabled.
+    # so it's never exposed to the browser. Empty url = Agent disabled.
     agent_backend_url: str = Field(
         default="",
         alias="LIFEOS_AGENT_BACKEND_URL",
@@ -300,7 +298,7 @@ class Settings(BaseSettings):
         description="Optional bearer token for the Agent text backend"
     )
 
-    # Hermes text backend (an agent harness reached as a gateway, #587). Proxied
+    # Hermes text backend (an agent harness reached as a gateway). Proxied
     # the same way as the Agent backend above — same shared factory, same
     # server-side bearer injection. Empty url = Hermes disabled, and /chat's
     # default backend resolution falls back to lifeos.
@@ -338,8 +336,8 @@ class Settings(BaseSettings):
                     "unauthenticated session writes over the tailnet until an operator sets one."
     )
 
-    # Bounded lifetime for a chat turn that has detached from its client (#611):
-    # a disconnect no longer stops generation, but an abandoned turn still needs
+    # Bounded lifetime for a chat turn that has detached from its client:
+    # a disconnect does not stop generation, but an abandoned turn still needs
     # a ceiling so it can't run forever with nobody watching. Matches the read
     # timeout the proxy already gives a voice/agent/hermes turn (api/routes/
     # _proxy.py's TIMEOUT), so a detached turn's own clock (which starts at
@@ -377,7 +375,7 @@ class Settings(BaseSettings):
                     "line and count toward slow_count in GET /api/perf/routes."
     )
 
-    # Host guard (#506): the ONE machine allowed to run this API server. A
+    # Host guard: the ONE machine allowed to run this API server. A
     # second live server elsewhere writes to its own SQLite/Chroma copy that
     # silently diverges from the real one, so clients pointed at the wrong
     # host get stale answers with no signal anything is wrong. Empty
@@ -462,10 +460,10 @@ class Settings(BaseSettings):
     # Search
     default_top_k: int = 20
 
-    # LLM Backend: "anthropic" (default), "local", or "remote" (#771 —
-    # makes the already-configured paid OpenAI-compatible provider below
-    # the standing default engine, not just a per-turn picker option; see
-    # ADR-024). See get_local_llm() in api/services/llm_client.py for the
+    # LLM Backend: "anthropic" (default), "local", or "remote" (makes the
+    # already-configured paid OpenAI-compatible provider below the standing
+    # default engine, not just a per-turn picker option; see ADR-024). See
+    # get_local_llm() in api/services/llm_client.py for the
     # resolution logic and its no-key/not-configured error paths.
     llm_backend: str = Field(default="anthropic", alias="LIFEOS_LLM_BACKEND")
 
@@ -476,7 +474,7 @@ class Settings(BaseSettings):
     # extraction, tone analysis) — Sonnet-tier for quality, independent of the
     # orchestrator model above. Pin ALIASES here (e.g. claude-sonnet-5),
     # never dated snapshots (claude-*-20YYMMDD): snapshots retire and start
-    # returning 404, silently breaking every specialist feature (#470).
+    # returning 404, silently breaking every specialist feature.
     anthropic_specialist_model: str = Field(
         default="claude-sonnet-5", alias="LIFEOS_ANTHROPIC_SPECIALIST_MODEL"
     )
@@ -495,7 +493,7 @@ class Settings(BaseSettings):
     # eventually point at a distinct llama-server instance without touching
     # local_llm_url, which chat synthesis uses. Empty (default) falls back to
     # that global value — see routing_llm_url — so a fresh clone behaves
-    # exactly as it does today (#566 PR 2). llama-server serves one model per
+    # exactly as it would with no routing override configured. llama-server serves one model per
     # process and ignores the request's "model" field, so on this
     # architecture "which model" *is* "which URL" — there is no separate
     # model-name setting to wire up.
@@ -583,7 +581,7 @@ class Settings(BaseSettings):
         """Resolved routing-target URL: the dedicated override if set, else local_llm_url."""
         return self.local_routing_llm_url or self.local_llm_url
 
-    # Paid OpenAI-compatible remote provider (#654) — e.g. Fireworks running
+    # Paid OpenAI-compatible remote provider — e.g. Fireworks running
     # DeepSeek/Qwen/etc. An explicit per-turn model pick (like "gemma"/local),
     # never something the escalation ladder can reach on its own (ADR-018):
     # NON_API_RUNGS in agent_loop.py already filters any non-local rung out
@@ -637,13 +635,13 @@ class Settings(BaseSettings):
         unpriced (see remote_llm_input_price_per_mtok)."""
         return bool(self.remote_llm_base_url and self.remote_llm_model and self.remote_llm_api_key)
 
-    # #699 — lets the agent worker's `local` route fall back to the remote
+    # Lets the agent worker's `local` route fall back to the remote
     # OpenAI-compatible provider above when the local llama-server isn't
     # reachable. Exists for a real deployment with NO other #agent executor
     # (no Claude Code, no Codex, no local llama-server, no Anthropic key) —
     # without this, #agent tasks there have nowhere to run. Default False +
-    # empty remote config (default) is byte-identical to pre-#699 behavior
-    # everywhere, including the maintainer's own install, which has every
+    # empty remote config (default) is byte-identical everywhere, including
+    # the maintainer's own install, which has every
     # other executor and no remote config. This is a fallback, not a new
     # route: an explicit `#agent local` on a host with a live llama-server
     # is unaffected — see agent_worker/local_executor.py's selection logic.
@@ -931,13 +929,13 @@ class Settings(BaseSettings):
                     "`codex resume` invocation. Substitutions: `{session_id}`, "
                     "`{cwd}`. Set to empty to skip the inner command."
     )
-    # #851: card assignment to a host other than the API host, over ssh.
+    # Card assignment to a host other than the API host, over ssh.
     #
-    # `NoDecode` (round-1 review, finding #8): pydantic-settings' own
+    # `NoDecode`: pydantic-settings' own
     # complex-field JSON pre-decode runs BEFORE `mode="before"` validators —
     # for a plain `dict[str, str]` field that pre-decode raises straight out
     # of `Settings()` on an empty string or malformed JSON, so
-    # `_parse_agent_hosts` below never even ran for those cases despite the
+    # `_parse_agent_hosts` below never even runs for those cases despite the
     # docstring's promise. `NoDecode` opts this field out of that pre-decode
     # so the validator receives the raw env string and its empty/invalid
     # branches actually execute.
@@ -1139,9 +1137,8 @@ class Settings(BaseSettings):
                     "When false, llama-server must be started manually."
     )
 
-    # Local LLM Router — historically Ollama-named; now consumed by the
-    # llama-server-backed summarizer / fact-validation paths after the
-    # 2026-05 migration. The env var aliases (OLLAMA_HOST / OLLAMA_MODEL /
+    # Local LLM Router — Ollama-named for legacy compatibility; consumed by
+    # the llama-server-backed summarizer / fact-validation paths. The env var aliases (OLLAMA_HOST / OLLAMA_MODEL /
     # OLLAMA_TIMEOUT / OLLAMA_RETRY_TIMEOUT) are kept so existing operator
     # .env files don't need to change; only ``ollama_timeout`` /
     # ``ollama_retry_timeout`` are still read in code (as generic request
@@ -1391,10 +1388,10 @@ class Settings(BaseSettings):
         description="Name for the Apple Data Agent machine used in staleness/failure "
                     "alerts from scripts/apple_data_import.py (e.g. 'Mac Mini', "
                     "'my MacBook'). Generic default since the export agent's hardware "
-                    "is installer-specific (#770)."
+                    "is installer-specific."
     )
 
-    # Journal ring ingest (#660) — a wearable (e.g. the Pebble Index ring) posts
+    # Journal ring ingest — a wearable (e.g. the Pebble Index ring) posts
     # transcribed fragments here from outside the tailnet.
     journal_ingest_token: str = Field(
         default="",
@@ -1448,7 +1445,7 @@ class Settings(BaseSettings):
                     "LIFEOS_VAULT_PATH, same convention as LIFEOS_AGENT_OUTPUT_DIR."
     )
 
-    # Investments (Schwab pipeline snapshot, #767). A separate export pipeline
+    # Investments (Schwab pipeline snapshot). A separate export pipeline
     # (not part of this repo) writes summary.json/portfolio.json here; the API
     # route and the search_finances "investments" tool both read from it.
     # Defaults to the maintainer's existing Syncthing-synced folder so an
@@ -1541,7 +1538,7 @@ class Settings(BaseSettings):
             persona=persona,
             voice=voice,
             model=model,
-            # Always "lifeos" (#684) — the primary bot never targets Hermes,
+            # Always "lifeos" — the primary bot never targets Hermes,
             # regardless of the dataclass default meant for specialized bots.
             backend="lifeos",
         )
@@ -1707,7 +1704,7 @@ class Settings(BaseSettings):
         ``orchestrates`` is sourced from ``persona_orchestrates()`` — the same
         check real routing (chat.py, hermes_proxy.py) uses — rather than
         derived from ``capabilities``, which happen to be identical for
-        ``primary`` and an orchestrating bot like ``doctor`` (#643).
+        ``primary`` and an orchestrating bot like ``doctor``.
         """
         personas = []
         for definition in self.persona_definitions:

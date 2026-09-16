@@ -31,7 +31,7 @@ Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Fou
 14. [Job Queue Endpoints](#job-queue-endpoints)
 15. [Performance Trace Endpoints](#performance-trace-endpoints)
 16. [Admin Endpoints](#admin-endpoints)
-17. [Card Assignment Endpoints](#card-assignment-endpoints-851)
+17. [Card Assignment Endpoints](#card-assignment-endpoints)
 18. [Home Endpoints (Eero)](#home-endpoints-eero)
 19. [MCP Tools — see mcp-tools.md](mcp-tools.md)
 
@@ -148,7 +148,7 @@ List conversations for a persona (most recent first, up to 50).
 
 **Query params:**
 - `persona_id` (optional, default `"primary"`) — scope to a persona's threads (e.g. `?persona_id=fitness`). Omitting it returns the `primary` persona's threads, preserving web-chat behavior. Persona ids come from [`GET /api/personas`](api-communications.md#get-apipersonas).
-- `backend` (optional, default unset) — scope to threads tagged with that backend (e.g. `?backend=hermes`). Unset returns threads from every backend, preserving behavior for every caller that predates this filter (#596).
+- `backend` (optional, default unset) — scope to threads tagged with that backend (e.g. `?backend=hermes`). Unset returns threads from every backend, preserving behavior for every caller that predates this filter.
 
 **Response:**
 ```json
@@ -167,7 +167,7 @@ List conversations for a persona (most recent first, up to 50).
 }
 ```
 
-Conversations are tagged with `persona_id` when created via `POST /api/ask/stream` (default `primary`); rows created before this field existed backfill to `primary`. They're tagged with `backend` too (default `"lifeos"`; rows predating the column backfill to it) — see the `backend` field on [`POST /api/ask/stream`](api-communications.md#post-apiaskstream) for how a thread ends up tagged `"hermes"` instead.
+Conversations are tagged with `persona_id` when created via `POST /api/ask/stream` (default `primary`); rows that predate this field backfill to `primary`. They're tagged with `backend` too (default `"lifeos"`; rows predating the column backfill to it) — see the `backend` field on [`POST /api/ask/stream`](api-communications.md#post-apiaskstream) for how a thread ends up tagged `"hermes"` instead.
 
 ### POST /api/conversations
 
@@ -203,11 +203,11 @@ Get conversation with messages. Access by id is **not** persona-scoped — any v
 
 `pending_question` is present only while a spawned **orchestrating-persona** session (e.g. `doctor`) started from this conversation is awaiting an answer — `{ "session_id": "...", "question": "...", "kind": "..." }` — and is `null`/absent otherwise. `kind` is `goal_approval` (a `[GOAL]` awaiting approval) or `followup` (a `[CLARIFY]`). The client renders an answer affordance when it's present and posts to `/answer` below.
 
-`active_turn` (#611) is present only while a chat turn is running server-side for this conversation — native or Hermes-relayed alike — and `null` otherwise: `{ "turn_id": "...", "conversation_id": "...", "started_at": "2026-08-21T09:14:22" }`. Lets a client that reconnects mid-turn show "still working..." and reach the cancel affordance below. A completed turn's message carries no marker on it in the normal case; an *interrupted* one (cancelled, timed out, caught in a server shutdown, or a genuine stream error) has its content suffixed with a visible cut-off marker and `routing: {"truncated": true, "truncation_reason": "cancelled" | "deadline" | "shutdown" | "stream_error"}` — see [client-surfaces.md § Turn lifetime and cancellation](../technical/client-surfaces.md#turn-lifetime-and-cancellation-611).
+`active_turn` is present only while a chat turn is running server-side for this conversation — native or Hermes-relayed alike — and `null` otherwise: `{ "turn_id": "...", "conversation_id": "...", "started_at": "2026-08-21T09:14:22" }`. Lets a client that reconnects mid-turn show "still working..." and reach the cancel affordance below. A completed turn's message carries no marker on it in the normal case; an *interrupted* one (cancelled, timed out, caught in a server shutdown, or a genuine stream error) has its content suffixed with a visible cut-off marker and `routing: {"truncated": true, "truncation_reason": "cancelled" | "deadline" | "shutdown" | "stream_error"}` — see [client-surfaces.md § Turn lifetime and cancellation](../technical/client-surfaces.md#turn-lifetime-and-cancellation).
 
 ### POST /api/conversations/{id}/cancel
 
-Stop a chat turn in flight for this conversation (#611) — native or Hermes-relayed. Since a disconnect no longer stops a turn on its own, this is the explicit way to do it (also used internally when a new turn on the same conversation supersedes an old one still running).
+Stop a chat turn in flight for this conversation — native or Hermes-relayed. Since a disconnect does not stop a turn on its own, this is the explicit way to do it (also used internally when a new turn on the same conversation supersedes an old one still running).
 
 **Response:**
 ```json
@@ -369,7 +369,7 @@ List/filter tasks.
 - `status` (string): Filter by status (todo, done, in_progress, cancelled, deferred, blocked, urgent)
 - `context` (string): Filter by context (Work, Personal, Finance, etc.)
 - `tag` (string): Filter by tag
-- `due_before` (string): YYYY-MM-DD, tasks due before this date
+- `due_before` (string): YYYY-MM-DD, tasks due on or before the given date
 - `query` (string): Fuzzy text search across task descriptions
 
 ### GET /api/tasks/conflicts
@@ -756,11 +756,11 @@ Cancel a pending job. Only pending jobs can be cancelled.
 
 ### GET /health
 
-Basic health check. Verifies API key and scheduler status. `api_key_configured` reports whether `ANTHROPIC_API_KEY` is set — a supported `LIFEOS_LLM_BACKEND=local` or `=remote` install with no Anthropic key still reports this as unset/degraded here; that's expected, not a sign the install is broken (#797).
+Basic health check. Verifies API key and scheduler status. `api_key_configured` reports whether `ANTHROPIC_API_KEY` is set — a supported `LIFEOS_LLM_BACKEND=local` or `=remote` install with no Anthropic key still reports this as unset/degraded here; that's expected, not a sign the install is broken.
 
 ### GET /health/full
 
-Comprehensive health check. Tests all services (ChromaDB, vault search, calendar, Gmail, Drive, people, conversations, memories, iMessage) with per-service latency. The `local_llm` check reports `{"status": "not_in_use", "detail": "LIFEOS_LLM_BACKEND=... not in use"}` rather than probing reachability when `LIFEOS_LLM_BACKEND` isn't `local` — an honest "not applicable" instead of a stale "ok" (#797).
+Comprehensive health check. Tests all services (ChromaDB, vault search, calendar, Gmail, Drive, people, conversations, memories, iMessage) with per-service latency. The `local_llm` check reports `{"status": "not_in_use", "detail": "LIFEOS_LLM_BACKEND=... not in use"}` rather than probing reachability when `LIFEOS_LLM_BACKEND` isn't `local` — an honest "not applicable" instead of a stale "ok".
 
 ### GET /health/services
 
@@ -816,13 +816,13 @@ Exit maintenance mode early. Re-enables CRITICAL alerts.
 
 #### GET /api/admin/usage
 
-Get usage summary with stats for 24h, 7d, 30d, and all-time. Includes daily cost breakdown for charting. Totals include Hermes-proxied (external-backend) turns alongside native ones (#595) — the usage store has no per-model or per-backend filtering, so any row written to it (native or relayed) counts.
+Get usage summary with stats for 24h, 7d, 30d, and all-time. Includes daily cost breakdown for charting. Totals include Hermes-proxied (external-backend) turns alongside native ones — the usage store has no per-model or per-backend filtering, so any row written to it (native or relayed) counts.
 
 ---
 
-## Card Assignment Endpoints (#851)
+## Card Assignment Endpoints
 
-Card kill/resume/focus/registration endpoints are documented in [agent-viz.md § Endpoints](../technical/agent-viz.md#endpoints) alongside the rest of the `/agents` operator-control surface, per item 6 of this file's Table of Contents. These two are new to this issue and don't fit that page's visualization framing, so they're listed here instead — full mechanism in [agent-worker.md § Card assignment](../technical/agent-worker.md#card-assignment-851).
+Card kill/resume/focus/registration endpoints are documented in [agent-viz.md § Endpoints](../technical/agent-viz.md#endpoints) alongside the rest of the `/agents` operator-control surface, per item 6 of this file's Table of Contents. These two are new to this issue and don't fit that page's visualization framing, so they're listed here instead — full mechanism in [agent-worker.md § Card assignment](../technical/agent-worker.md#card-assignment).
 
 `POST /sessions/{id}/resume` and `/focus` also accept an optional `target_host` in the body — "resume here". Full contract in [agent-viz.md § Resume target host](../technical/agent-viz.md#resume-target-host).
 
@@ -891,7 +891,7 @@ Resume a profile or device's internet access. Same idempotent, state-reconciling
 
 - [api-communications.md](api-communications.md) — Chat/search, Google integration, and messaging HTTP endpoints (split out from this file)
 - [api-crm.md](api-crm.md) — `/api/crm/*` HTTP endpoints (split out from this file)
-- [mcp-tools.md](mcp-tools.md) — MCP tool catalog (the canonical home — was previously duplicated here)
+- [mcp-tools.md](mcp-tools.md) — MCP tool catalog (the canonical home for this content)
 - [Agent Viz — Technical](../technical/agent-viz.md) — `/api/agents/*` endpoints in detail, including cross-machine CLI session registration
 - [Agent Worker — Technical](../technical/agent-worker.md) — Card assignment mechanism behind the Card Assignment Endpoints above
 - [Data & Sync](../technical/data-and-sync.md) — Data sources and sync pipeline

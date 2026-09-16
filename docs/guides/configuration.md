@@ -21,7 +21,7 @@ Each section corresponds roughly to a section in [`config/settings.py`](../../co
 | `LIFEOS_HOST` | str | `0.0.0.0` | API server bind address. Keep `0.0.0.0` for Tailscale access; `127.0.0.1` to restrict to localhost only. |
 | `LIFEOS_PORT` | int | `8000` | API server port. |
 | `LIFEOS_SLOW_REQUEST_MS` | int | `500` | Threshold (ms) above which `RouteTimingMiddleware` logs one WARNING for a request and counts it toward `slow_count` in `GET /api/perf/routes`. See [Observability](../specs/technical/observability.md#route-timing). |
-| `LIFEOS_SERVER_HOSTNAME` | str | — | Hostname of the one machine designated to run the LifeOS API server (e.g. `<your-host>`, matching `hostname`/`socket.gethostname()` there). Empty (default) disables the guard so a fresh clone is never blocked. When set, `api/main.py` and `scripts/server.sh` refuse to start on any other machine — other machines should point at the designated host via `LIFEOS_API_URL` instead of running their own server (#506). |
+| `LIFEOS_SERVER_HOSTNAME` | str | — | Hostname of the one machine designated to run the LifeOS API server (e.g. `<your-host>`, matching `hostname`/`socket.gethostname()` there). Empty (default) disables the guard so a fresh clone is never blocked. When set, `api/main.py` and `scripts/server.sh` refuse to start on any other machine — other machines should point at the designated host via `LIFEOS_API_URL` instead of running their own server. |
 | `LIFEOS_CHROMA_URL` | str | `http://localhost:8001` | ChromaDB server endpoint the API connects to. |
 | `LIFEOS_CHROMA_PATH` | path | `./data/chromadb` | Where ChromaDB persists its data. |
 | `LIFEOS_CODE_DIR` | path | `~/Code` | Parent directory containing LifeOS and (optionally) other projects. Used by `/claude` orchestrator path resolution. |
@@ -36,10 +36,10 @@ Each section corresponds roughly to a section in [`config/settings.py`](../../co
 | `LIFEOS_CHAT_DEFAULT_VOICE` | bool | `false` | Make voice the default `/chat` input mode. A `?mode=` URL parameter or a stored preference takes precedence. |
 | `LIFEOS_AGENT_BACKEND_URL` | str | *(empty)* | Agent text backend base URL. LifeOS proxies it at `/api/agent/ask/stream`, adding a bearer server-side. Empty disables the `/chat` Agent option entirely. Deliberately absent from `.env.example` — see [voice-setup.md](voice-setup.md#optional-agent-and-hermes-text-backends). |
 | `LIFEOS_AGENT_BACKEND_TOKEN` | str | *(empty)* | Optional bearer token for the Agent text backend, added server-side (never exposed to the browser). |
-| `LIFEOS_HERMES_BACKEND_URL` | str | *(empty)* | Hermes text backend base URL, proxied the same way at `/api/hermes/ask/stream` (#587). Empty disables the `/chat` Hermes option; with no stored backend preference, `/chat` defaults to Hermes when it's configured and reachable, else LifeOS. Deliberately absent from `.env.example`. |
+| `LIFEOS_HERMES_BACKEND_URL` | str | *(empty)* | Hermes text backend base URL, proxied the same way at `/api/hermes/ask/stream`. Empty disables the `/chat` Hermes option; with no stored backend preference, `/chat` defaults to Hermes when it's configured and reachable, else LifeOS. Deliberately absent from `.env.example`. |
 | `LIFEOS_HERMES_BACKEND_TOKEN` | str | *(empty)* | Optional bearer token for the Hermes text backend, added server-side. |
 | `LIFEOS_HERMES_TASK_QUESTIONS` | bool | `false` | Delivers a Hermes-assigned task's clarification questions to the Hermes Telegram DM instead of the primary bot. Depends on Hermes's own Telegram plugin forwarding a threaded reply to `POST /api/hermes/deposit-answer`; without that return path a question sent there has no way back. Progress and terminal notices use the Hermes channel regardless of this flag. |
-| `LIFEOS_DETACHED_TURN_TIMEOUT_SECONDS` | float | `300.0` | How long a chat turn (native or Hermes-relayed) may keep running after its client disconnects before it's cancelled (#611). The clock starts at disconnect, not at turn start, so a turn that stays watched is never affected by it. Matches the proxy's own upstream read timeout (`api/routes/_proxy.py`'s `TIMEOUT`), so a detached turn isn't cut off any earlier than a connected one already tolerates. |
+| `LIFEOS_DETACHED_TURN_TIMEOUT_SECONDS` | float | `300.0` | How long a chat turn (native or Hermes-relayed) may keep running after its client disconnects before it's cancelled. The clock starts at disconnect, not at turn start, so a turn that stays watched is never affected by it. Matches the proxy's own upstream read timeout (`api/routes/_proxy.py`'s `TIMEOUT`), so a detached turn isn't cut off any earlier than a connected one already tolerates. |
 
 **Tailscale Serve (phone /chat + voice):** run once after install, then enable the user unit so it survives reboot:
 
@@ -67,12 +67,12 @@ Governs chat synthesis, intent classification, and agentic orchestration. The to
 
 | Variable | Type | Default | Sets |
 |---|---|---|---|
-| `LIFEOS_LLM_BACKEND` | str | `anthropic` | `anthropic` (Claude API), `local` (llama-server on `LIFEOS_LOCAL_LLM_URL`), or `remote` (the configured paid provider below, as the standing default rather than a per-turn pick — #771/ADR-024). `anthropic` with no `ANTHROPIC_API_KEY`, or `remote` without the provider fully configured, fails fast with a named error rather than silently falling back. |
+| `LIFEOS_LLM_BACKEND` | str | `anthropic` | `anthropic` (Claude API), `local` (llama-server on `LIFEOS_LOCAL_LLM_URL`), or `remote` (the configured paid provider below, as the standing default rather than a per-turn pick — see ADR-024). `anthropic` with no `ANTHROPIC_API_KEY`, or `remote` without the provider fully configured, fails fast with a named error rather than silently falling back. |
 | `LIFEOS_ANTHROPIC_MODEL` | str | `claude-haiku-4-5` | **Base** Claude model for chat orchestration when `LIFEOS_LLM_BACKEND=anthropic`. Per-query escalation can override it for a turn (see below). |
-| `LIFEOS_ANTHROPIC_SPECIALIST_MODEL` | str | `claude-sonnet-5` | Sonnet-tier model for specialist calls (relationship insights, fact extraction, tone analysis) — independent of the orchestrator model above. Pin aliases here, never dated snapshots (`claude-*-20YYMMDD`): snapshots retire and 404, silently breaking specialist features (#470). |
-| `LIFEOS_AGENT_ESCALATION_MODEL` | str | — (off) | Switches per-query escalation **on**; empty disables it. Anthropic backend only. Despite the name it no longer names the rung an automatic escalation climbs to — that is limited to non-API engines (see below). A model named here is still what "escalate to opus"-style *user-directed* escalation resolves against. |
+| `LIFEOS_ANTHROPIC_SPECIALIST_MODEL` | str | `claude-sonnet-5` | Sonnet-tier model for specialist calls (relationship insights, fact extraction, tone analysis) — independent of the orchestrator model above. Pin aliases here, never dated snapshots (`claude-*-20YYMMDD`): snapshots retire and 404, silently breaking specialist features. |
+| `LIFEOS_AGENT_ESCALATION_MODEL` | str | — (off) | Switches per-query escalation **on**; empty disables it. Anthropic backend only. Despite the name, it does not name the rung an automatic escalation climbs to — that is limited to non-API engines (see below). A model named here is still what "escalate to opus"-style *user-directed* escalation resolves against. |
 | `LIFEOS_AGENT_ESCALATION_LADDER` | str | `claude_code,codex` | Comma-separated rungs climbed on each successive refusal+pushback. Rungs must cost nothing per token: `claude_code`, `codex` (subscription CLIs) or `local` (on-box Gemma). Anthropic model ids are accepted but **dropped from the climb** with a log line — LifeOS never puts a turn on the API unless you ask. Override e.g. `local,claude_code,codex`. |
-| `ANTHROPIC_API_KEY` | str | — | Required when `LIFEOS_LLM_BACKEND=anthropic`. Also the preferred client for specialized calls (relationship insights, fact extraction, tone analysis — [ADR-025](../adr/025-specialist-call-fallback.md)) regardless of `LIFEOS_LLM_BACKEND`; when unset, those calls fall back to the local llama-server if reachable, else the remote provider below, instead of silently producing nothing (#772). Web search has no local equivalent and is unaffected — see below. |
+| `ANTHROPIC_API_KEY` | str | — | Required when `LIFEOS_LLM_BACKEND=anthropic`. Also the preferred client for specialized calls (relationship insights, fact extraction, tone analysis — [ADR-025](../adr/025-specialist-call-fallback.md)) regardless of `LIFEOS_LLM_BACKEND`; when unset, those calls fall back to the local llama-server if reachable, else the remote provider below, instead of silently producing nothing. Web search has no local equivalent and is unaffected — see below. |
 | `LIFEOS_LOCAL_LLM_URL` | str | `http://localhost:8080` | Local llama-server endpoint. |
 | `LIFEOS_LOCAL_LLM_TIMEOUT` | int | `90` | Local LLM HTTP request timeout, seconds. |
 | `LIFEOS_LLM_MODEL` | str | — | Optional override for the GGUF model the `lifeos-llm` systemd unit loads. When unset, the unit uses its bundled `-hf` default; when set, the setup script substitutes a `-m`/`--mmproj` form. |
@@ -82,7 +82,7 @@ Governs chat synthesis, intent classification, and agentic orchestration. The to
 
 ### OpenAI-compatible Remote Provider
 
-A paid OpenAI-compatible endpoint — e.g. Fireworks running DeepSeek or Qwen. Reachable two ways: an explicit per-turn model pick from the chat model picker (`model_override="remote"`), or as the process-wide default via `LIFEOS_LLM_BACKEND=remote` above (#771). Never a rung the escalation ladder can reach on its own (ADR-018), regardless of which of those two ways selects it — it only ever runs when named explicitly, by an operator or by a user's per-turn pick. Also what the agent worker's local route can fall back to when the local llama-server is unreachable — see [agent-worker.md § Local executor](../specs/technical/agent-worker.md#local-executor-gemma-path).
+A paid OpenAI-compatible endpoint — e.g. Fireworks running DeepSeek or Qwen. Reachable two ways: an explicit per-turn model pick from the chat model picker (`model_override="remote"`), or as the process-wide default via `LIFEOS_LLM_BACKEND=remote` above. Never a rung the escalation ladder can reach on its own (ADR-018), regardless of which of those two ways selects it — it only ever runs when named explicitly, by an operator or by a user's per-turn pick. Also what the agent worker's local route can fall back to when the local llama-server is unreachable — see [agent-worker.md § Local executor](../specs/technical/agent-worker.md#local-executor-gemma-path).
 
 | Variable | Type | Default | Sets |
 |---|---|---|---|
@@ -96,9 +96,9 @@ A paid OpenAI-compatible endpoint — e.g. Fireworks running DeepSeek or Qwen. R
 
 All three of URL, model, and API key must be set for the provider to be considered configured; pricing is independent and can be added later without affecting whether turns run.
 
-### Routing Target and Reasoning Control (#566/#773)
+### Routing Target and Reasoning Control
 
-Query routing, conversation titling, agent-activity summaries, and person-fact filtering never use the Claude API, regardless of `LIFEOS_LLM_BACKEND` — these are cheap, auxiliary, non-user-facing calls that shouldn't carry API cost. The local llama-server (`_get_local_routing_client`) is the preferred target; when it's unreachable, these calls fall back to the configured remote provider (below) instead of silently doing nothing, still never to Anthropic (#773). These settings let the local routing target — and whether it's asked to reason — be configured independently of the main local LLM used for chat synthesis.
+Query routing, conversation titling, agent-activity summaries, and person-fact filtering never use the Claude API, regardless of `LIFEOS_LLM_BACKEND` — these are cheap, auxiliary, non-user-facing calls that shouldn't carry API cost. The local llama-server (`_get_local_routing_client`) is the preferred target; when it's unreachable, these calls fall back to the configured remote provider (below) instead of silently doing nothing, still never to Anthropic. These settings let the local routing target — and whether it's asked to reason — be configured independently of the main local LLM used for chat synthesis.
 
 | Variable | Type | Default | Sets |
 |---|---|---|---|
@@ -107,7 +107,7 @@ Query routing, conversation titling, agent-activity summaries, and person-fact f
 
 `LocalLLMClient.create`/`acreate`/`astream` (and the `generate_text`/`generate_json` routing helpers) also accept per-request `enable_thinking` (bool) and `reasoning_effort` (str) keyword arguments, sent as `chat_template_kwargs: {"enable_thinking": ...}` and `reasoning_effort` on the request body. Leaving both unset adds no new keys to the request — existing callers are unaffected.
 
-### Document Summarization Target (#742/#775)
+### Document Summarization Target
 
 The indexer's document-summary generation (`api/services/summarizer.py`) talks to an OpenAI-compatible endpoint directly, independent of `LIFEOS_LLM_BACKEND` and the routing target above. `llama-server` ignores the request's `model` field (one model per process); Ollama does not and rejects a request naming a model it isn't serving — this pair exists so an Ollama-only host (no `llama-server`) can still get document summaries.
 
@@ -127,9 +127,9 @@ Encoder model selection and search-pipeline knobs. Decision recorded in [ADR-012
 | `LIFEOS_RERANKER_MODEL` | str | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Cross-encoder for the rerank stage. |
 | `LIFEOS_RERANKER_ENABLED` | bool | `true` | Disable to skip the rerank pass (faster, lower precision). |
 | `LIFEOS_EMBEDDING_MEMORY_THRESHOLD_MB` | int | `28000` | Pre-flight free-RAM gate before phase 4 (embedding). Below this threshold the phase is skipped to avoid kernel OOM. Read directly from the environment by `scripts/run_all_syncs.py` (not a Pydantic Setting). |
-| `LIFEOS_EMBEDDING_BATCH_SIZE` | int | `8` | Max texts per `model.encode()` batch. Bounds peak VRAM per embedding call so one large document's chunks can't spike GPU memory and exhaust a unified-memory iGPU's SDMA queues, freezing the host (#483). Semantically neutral — only affects peak memory. |
-| `LIFEOS_EMBEDDING_GPU_LOCK_ENABLED` | bool | `true` | Serializes GPU embedding across processes (API server, agent worker, nightly sync, ad-hoc scripts) via a cross-process file lock, so they can't all grab GPU compute queues at once (#521). |
-| `LIFEOS_EMBEDDING_GPU_LOCK_PATH` | str | `./data/gpu_embed.lock` | `flock()` path for the cross-process GPU embedding lock (#521). Relative paths resolve against the process cwd, which every LifeOS process shares. Set to empty to disable the lock. |
+| `LIFEOS_EMBEDDING_BATCH_SIZE` | int | `8` | Max texts per `model.encode()` batch. Bounds peak VRAM per embedding call so one large document's chunks can't spike GPU memory and exhaust a unified-memory iGPU's SDMA queues, freezing the host. Semantically neutral — only affects peak memory. |
+| `LIFEOS_EMBEDDING_GPU_LOCK_ENABLED` | bool | `true` | Serializes GPU embedding across processes (API server, agent worker, nightly sync, ad-hoc scripts) via a cross-process file lock, so they can't all grab GPU compute queues at once. |
+| `LIFEOS_EMBEDDING_GPU_LOCK_PATH` | str | `./data/gpu_embed.lock` | `flock()` path for the cross-process GPU embedding lock. Relative paths resolve against the process cwd, which every LifeOS process shares. Set to empty to disable the lock. |
 | `LIFEOS_EMBEDDING_GPU_LOCK_TIMEOUT` | float | `300.0` | Max seconds to wait for the cross-process GPU embedding lock before giving up. |
 | `HF_HUB_OFFLINE` | bool | `1` | Standard HuggingFace flag. `1` forces the embedding loader to use the local model cache only, skipping the huggingface.co etag round-trip on every model load. Set in `.env.example` to avoid DNS-failure retry storms during the nightly sync window (model files are pinned by `requirements.txt`). Honored directly by the HuggingFace libraries, not a Pydantic Setting. |
 | `TRANSFORMERS_OFFLINE` | bool | `1` | Companion to `HF_HUB_OFFLINE` for the `transformers` library. Same rationale. |
@@ -138,7 +138,7 @@ Encoder model selection and search-pipeline knobs. Decision recorded in [ADR-012
 
 ## Ollama — Legacy Timeout Aliases
 
-**These `OLLAMA_*` variables are legacy aliases.** LifeOS no longer runs Ollama — routing and summarization go through the unified LLM client (the Anthropic API or a local `llama-server`, per `LIFEOS_LLM_BACKEND`). The variable names are retained only so existing operator `.env` files don't break. Of the four, only the two timeout vars still have any effect (read as generic request timeouts); `OLLAMA_HOST` and `OLLAMA_MODEL` are vestigial and read by nothing. Historical decision: [ADR-006](../adr/006-ollama-query-routing.md).
+**These `OLLAMA_*` variables are legacy aliases.** LifeOS does not run Ollama — routing and summarization go through the unified LLM client (the Anthropic API or a local `llama-server`, per `LIFEOS_LLM_BACKEND`). The variable names are retained only so existing operator `.env` files don't break. Of the four, only the two timeout vars still have any effect (read as generic request timeouts); `OLLAMA_HOST` and `OLLAMA_MODEL` are vestigial and read by nothing. Historical decision: [ADR-006](../adr/006-ollama-query-routing.md).
 
 | Variable | Type | Default | Sets |
 |---|---|---|---|
@@ -184,7 +184,7 @@ Engine-assigned task worker. Product spec: [agent-worker.md](../specs/product/ag
 | `LIFEOS_AGENT_MAX_CONCURRENT_MANAGED` | int | varies | Concurrent Managed-Agents sessions. |
 | `LIFEOS_AGENT_REMOTE_EXECUTOR` | bool | `false` | Opt-in: when the [OpenAI-compatible remote provider](#openai-compatible-remote-provider) is fully configured and the local llama-server is unreachable at session start, the local route runs the session on the remote provider instead of failing. No-op unless the remote provider is fully configured. |
 | `LIFEOS_AGENT_DEFAULT_ROUTE` | str | *(empty)* | Route preflight dispatches to instead of `ask` when a task has no routing cues at all — for a single-executor install there's nothing useful to ask about. Applies only when lack of cues, not a sanity failure, is why preflight would otherwise ask. Tag overrides (`#local`, `#cloud`, etc.) always win. When set to a valid route, also demotes any preflight `ambiguity` to advisory (logged, not blocking) instead of parking the task on the question — see [agent-worker.md](../specs/technical/agent-worker.md#preflight) for the full precedence. |
-| `LIFEOS_LOCAL_AGENT_ENABLE_THINKING` | bool | `false` | Whether `run_agent_loop`'s tool-round and synthesis calls request reasoning/thinking from a **local** model (Anthropic backend ignores this). Default `false` (#567): measured on the real orchestrator with Gemma 4 26B-A4B across 6 multi-step questions — thinking on averaged 233.0s/1032 chars, off 72.6s, with no answer-quality regression. |
+| `LIFEOS_LOCAL_AGENT_ENABLE_THINKING` | bool | `false` | Whether `run_agent_loop`'s tool-round and synthesis calls request reasoning/thinking from a **local** model (Anthropic backend ignores this). Default `false`: measured on the real orchestrator with Gemma 4 26B-A4B across 6 multi-step questions — thinking on averaged 233.0s/1032 chars, off 72.6s, with no answer-quality regression. |
 
 ## Agent Worker — Managed Agents (Cloud)
 
@@ -254,9 +254,9 @@ The token above is set on the machine hosting the API. Each machine *posting* se
 |---|---|
 | `~/.config/lifeos/agent-hook.env` (override path via `$LIFEOS_AGENT_HOOK_ENV`) | Contains `LIFEOS_API_URL` and `LIFEOS_AGENT_HOOK_TOKEN` (the same token as above). Values already set in the environment take precedence over this file. Absent → the hook exits silently without posting. |
 
-## Card Assignment (`#851`, host / model / effort routing)
+## Card Assignment (host / model / effort routing)
 
-See [guides/agent-worker-setup.md § Card assignment](agent-worker-setup.md#card-assignment-running-a-card-on-another-machine-851) for the ssh-prerequisites walkthrough and [specs/technical/agent-worker.md § Card assignment](../specs/technical/agent-worker.md#card-assignment-851) for the mechanism.
+See [guides/agent-worker-setup.md § Card assignment](agent-worker-setup.md#card-assignment-running-a-card-on-another-machine) for the ssh-prerequisites walkthrough and [specs/technical/agent-worker.md § Card assignment](../specs/technical/agent-worker.md#card-assignment) for the mechanism.
 
 | Variable | Type | Default | Sets |
 |---|---|---|---|
@@ -264,7 +264,7 @@ See [guides/agent-worker-setup.md § Card assignment](agent-worker-setup.md#card
 | `LIFEOS_AGENT_SSH_CONNECT_TIMEOUT` | int (seconds) | `10` | How long ssh may spend establishing a connection to a remote host before giving up. Applies to remote spawn, remote kill, and remote resume/focus alike. |
 | `LIFEOS_AGENT_MODEL_CATALOG_TTL_SECONDS` | int (seconds) | `86400` | How long `GET /api/agents/models` caches each engine's model list before re-querying providers. |
 | `LIFEOS_CODEX_MODELS_CACHE_PATH` | str | `~/.codex/models_cache.json` | Path to the Codex CLI's own model-catalog cache, read by the model catalog endpoint for the codex engine's picker list. |
-| `LIFEOS_OPENAI_API_KEY` | str | *(empty)* | Optional OpenAI API key, used ONLY as the model-catalog fallback when `LIFEOS_CODEX_MODELS_CACHE_PATH` is missing/unreadable. Never used to run turns — Codex sessions are subscription-billed through the CLI itself, never the API. |
+| `LIFEOS_OPENAI_API_KEY` | str | *(empty)* | Optional OpenAI API key, used only as the model-catalog fallback when `LIFEOS_CODEX_MODELS_CACHE_PATH` is missing/unreadable. It never runs turns — Codex sessions are subscription-billed through the CLI itself, never the API. |
 
 ## Remote Session Parity (transcript mirror)
 
@@ -345,7 +345,7 @@ All work toggles default to `false` — work data is not indexed unless explicit
 | Variable | Type | Default | Sets |
 |---|---|---|---|
 | `LIFEOS_PHOTOS_PATH` | path | `~/Pictures/Photos Library.photoslibrary` | Apple Photos library path. Read by the Apple Data Agent on macOS (see [ADR-010](../adr/010-apple-data-agent.md)). |
-| `LIFEOS_APPLE_EXPORT_AGENT_LABEL` | str | `the export agent` | Name for the Apple Data Agent machine used in staleness/failure alerts from `scripts/apple_data_import.py` (e.g. `Mac Mini`, `my MacBook`). Generic default since the export agent's hardware is installer-specific (#770). |
+| `LIFEOS_APPLE_EXPORT_AGENT_LABEL` | str | `the export agent` | Name for the Apple Data Agent machine used in staleness/failure alerts from `scripts/apple_data_import.py` (e.g. `Mac Mini`, `my MacBook`). Generic default since the export agent's hardware is installer-specific. |
 
 ## Fitness & Health
 
