@@ -1,4 +1,4 @@
-"""Browser tests for spoken-turn backend/persona parity (#593).
+"""Browser tests for spoken-turn backend/persona parity.
 
 Drives `web/chat/voice.js`'s `submitTurn()` directly -- the seam it's exported
 for specifically so a headless harness can drive a turn without a real mic
@@ -180,7 +180,7 @@ def _polled_conversation(page: Page, conv_id):
 
 
 # An orchestrating persona (e.g. doctor), matching personaOrchestrates()'s own
-# gate: non-primary + a persona with `orchestrates: true` (#643 — the server's
+# gate: non-primary + a persona with `orchestrates: true` (the server's
 # own verdict, not inferred from `capabilities`).
 _ORCHESTRATING_PERSONA = {"id": "doctor", "label": "Doctor", "capabilities": ["handoff"], "orchestrates": True}
 
@@ -221,7 +221,7 @@ class TestSpokenTurnFieldsAcrossBackends:
         assert "model_override" not in form
 
     def test_agent_backend_keeps_dropping_persona_and_model(self, page: Page, chat_base_url):
-        """Out of scope (#593): the Agent backend keeps its current
+        """Out of scope: the Agent backend keeps its current
         field-dropping behavior -- it has no persona pass-through on either
         surface, mirroring askStream()'s `backend !== 'agent'` gate."""
         _open_voice_chat(page, chat_base_url)
@@ -260,14 +260,12 @@ class TestStatusTextPerBackend:
 
 class TestOrchestratingPersonaPollingGate:
     """AC: an orchestrating persona's spoken turn on the Hermes backend must
-    not start pending-question polling. Voice never had a client-side
-    diversion of a Hermes-selected orchestrating turn back to lifeos the way
-    the (now also removed, #642) text-path diversion did (#596) -- such a
-    persona_id reaching the Hermes proxy used to be rejected there with a 400
-    (hermes_proxy.py). Since #642 Hermes drives that persona itself instead
-    (lifeos_agent_spawn, #640) rather than rejecting it, but that's still not
-    a LifeOS-linked session -- there is still nothing here for this client to
-    poll for on that backend."""
+    not start pending-question polling. Voice has no client-side
+    diversion of a Hermes-selected orchestrating turn back to lifeos: such
+    a persona_id reaching the Hermes proxy (hermes_proxy.py) is driven by
+    Hermes itself (lifeos_agent_spawn) rather than by a LifeOS-linked
+    session -- there is nothing here for this client to poll for on that
+    backend."""
 
     def test_lifeos_backend_starts_polling(self, page: Page, chat_base_url):
         """Positive control: the gate isn't just always-false."""
@@ -288,8 +286,8 @@ class TestOrchestratingPersonaPollingGate:
 
     def test_agent_backend_does_not_start_polling(self, page: Page, chat_base_url):
         """Sanity check: personaOrchestrates() is already false for the agent
-        backend (no persona pass-through at all), so this was already true
-        before #593 -- pinned here alongside the hermes case for contrast."""
+        backend (no persona pass-through at all), so this holds
+        regardless -- pinned here alongside the hermes case for contrast."""
         _open_voice_chat(page, chat_base_url)
         _set_backend(page, "agent")
         _set_persona(page, "doctor", personas=[_ORCHESTRATING_PERSONA])
