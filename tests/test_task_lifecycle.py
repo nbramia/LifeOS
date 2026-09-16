@@ -293,13 +293,12 @@ def test_drift_sweep_does_not_double_project_a_live_kill_already_reconciled(tmp_
 def test_drift_sweep_leaves_a_live_session_alone_regardless_of_status(tmp_path, live_status):
     """A task carrying #agent-running whose session is still non-terminal —
     CLAIMED, RUNNING, or parked at BLOCKED — is legitimately in progress and
-    must never be touched. This includes a task legitimately reopened for a
-    resumed follow-up turn, which flips the tag back to #agent-running while
-    leaving its session row non-terminal — superficially similar to a
-    freshly-dispatched task, but excluded by session status alone. This is
-    the property that replaced the old attempt-scoping and reopen guards
-    entirely: under the inverted sweep there's no bookkeeping to scope,
-    because a live session is excluded on sight."""
+    must never be touched. This includes a task reopened for a resumed
+    follow-up turn, which flips the tag back to #agent-running while leaving
+    its session row non-terminal — superficially similar to a
+    freshly-dispatched task, but excluded by session status alone: the
+    sweep only ever heals a task whose session has reached a terminal
+    status."""
     manager = TaskManager(tmp_path / "vault", tmp_path / "task-index.json")
     task = manager.create(
         "Synthetic live task", status="in_progress", tags=["claude_code", RUNNING_TAG],
@@ -320,13 +319,10 @@ def test_drift_sweep_leaves_a_live_session_alone_regardless_of_status(tmp_path, 
 def test_drift_sweep_leaves_a_settled_task_alone(tmp_path):
     """A task the operator already accepted (`#accepted #agent-completed`,
     status done) must be left byte-identical, even though its session row
-    is terminal and was never explicitly reconciled by anything (mirrors a
-    historical session that predates this sweep entirely, or a task an
-    operator edited directly). Under the inverted sweep this is structurally
-    guaranteed rather than merely checked: the candidate set is every task
-    currently carrying `RUNNING_TAG`/`BLOCKED_TAG`, and a settled task
-    carries neither, so it's never even listed as a candidate in the first
-    place."""
+    is terminal and was never explicitly reconciled by anything (e.g. an
+    operator edited the tags directly). The sweep's candidate set is every
+    task currently carrying `RUNNING_TAG`/`BLOCKED_TAG`, and a settled task
+    carries neither, so it's never even listed as a candidate."""
     manager = TaskManager(tmp_path / "vault", tmp_path / "task-index.json")
     task = manager.create(
         "Synthetic already-settled task", status="done",
@@ -357,9 +353,7 @@ def test_drift_sweep_survives_a_transient_tag_listing_failure_and_heals_on_the_n
     """A failure listing tagged tasks — an API blip, a timeout, the API
     restarting mid-tick after a deploy — must corrupt nothing: the sweep
     heals nothing that tick, writes no durable state, and heals normally on
-    the next tick once the API recovers. This is the regression test for
-    the entire class of bug (unavailable-vs-absent conflation) that
-    dominated the mechanism this sweep replaced."""
+    the next tick once the API recovers."""
     manager = TaskManager(tmp_path / "vault", tmp_path / "task-index.json")
     task = manager.create(
         "Synthetic flaky-listing task", status="blocked", tags=["claude_code", RUNNING_TAG],
@@ -397,10 +391,9 @@ def test_drift_sweep_survives_a_transient_tag_listing_failure_and_heals_on_the_n
 
 def test_drift_sweep_heals_a_second_drift_after_reopen_with_new_attempt(tmp_path):
     """A task can legitimately be killed at the same terminal status twice
-    across separate reopened executions. The inverted sweep has no
-    bookkeeping that could mask this: each tick re-derives its candidate set
-    fresh from the current vault tags, so a second, later drift on the same
-    task heals exactly like the first."""
+    across separate reopened executions. Each tick derives its candidate
+    set fresh from the current vault tags, so a second, later drift on the
+    same task heals exactly like the first."""
     manager = TaskManager(tmp_path / "vault", tmp_path / "task-index.json")
     task = manager.create(
         "Synthetic twice-killed task", status="blocked", tags=["claude_code", RUNNING_TAG],
@@ -442,13 +435,11 @@ def test_drift_sweep_heals_a_reopen_on_the_same_attempt_then_re_kill(tmp_path):
     reopen-for-pending-messages path (`code_reopened_for_pending_messages`)
     does this: it swaps a terminal vault tag back to `#agent-running` and
     reclaims the row via `update_status(..., STATUS_CLAIMED,
-    attempt_id=<same attempt>)`. A projection-marker keyed on
-    `(task, attempt, status)` could not tell a second, genuine drift on that
-    same attempt apart from the first one it already marked settled, and
-    would mask it forever — the reproduction that forced this rework. The
-    inverted sweep has no per-attempt state to confuse: the reopen removes
-    the task from the RUNNING_TAG/BLOCKED_TAG candidate set as soon as the
-    session goes non-terminal, and the re-kill puts it right back."""
+    attempt_id=<same attempt>)`. The sweep tracks no per-attempt state: the
+    reopen removes the task from the RUNNING_TAG/BLOCKED_TAG candidate set
+    as soon as the session goes non-terminal, and the re-kill on that same
+    attempt puts it right back, so the second drift heals exactly like the
+    first."""
     manager = TaskManager(tmp_path / "vault", tmp_path / "task-index.json")
     task = manager.create(
         "Synthetic same-attempt reopen task", status="cancelled",
@@ -483,14 +474,6 @@ def test_drift_sweep_heals_a_reopen_on_the_same_attempt_then_re_kill(tmp_path):
     assert second_healed == 1
     assert FAILED_TAG in refreshed.tags
     assert RUNNING_TAG not in refreshed.tags
-
-
-# `test_drift_sweep_batch_self_advances_past_non_actionable_rows` (round 2)
-# is deleted outright rather than adapted: it pinned that a bounded per-tick
-# batch (`_LIFECYCLE_DRIFT_SWEEP_LIMIT`) doesn't let a backlog of settled
-# rows crowd out a genuine drift. That limit no longer exists — the tag
-# listing endpoint takes no limit/pagination param and returns every match,
-# so there is no batch to starve and nothing left to pin.
 
 
 def test_tick_wires_in_the_lifecycle_drift_sweep(tmp_path, monkeypatch):
@@ -582,12 +565,11 @@ class TestReconcileLifecycleDriftHasVaultTaskGate:
     """`has_vault_task` (`session.origin != 'operator'` and no
     `parent_session_id`) must exclude an operator root-spawn or a spawned
     child from being reconciled — they carry synthetic task ids with no
-    real vault row, so projecting through TaskManager would 404. Under the
-    inverted sweep the candidate set comes from real vault tasks (the tag
-    listing), so this is ordinarily unreachable: a synthetic task id was
-    never in the vault to carry a tag in the first place. It's still
-    checked directly against the session for defense in depth — pinned here
-    by constructing a real vault task whose session row happens to be
+    real vault row, so projecting through TaskManager would 404. The
+    sweep's candidate set comes from real vault tasks (the tag listing), so
+    a synthetic task id is never a candidate in the first place; the gate
+    still checks the session directly for defense in depth, pinned here by
+    constructing a real vault task whose session row happens to be
     operator-origin / child-parented, exercising the gate the same way
     `_reconcile_lifecycle_drift` does."""
 
@@ -653,16 +635,3 @@ class TestReconcileLifecycleDriftHasVaultTaskGate:
         refreshed = manager.get(task.id)
         assert healed == 1
         assert FAILED_TAG in refreshed.tags
-
-
-# `TestListTerminalUnsweptNullAttemptRows` (round 2) and
-# `TestDriftSweepWatermarkInvalidation` (round 3) are deleted outright
-# rather than adapted: both pinned NULL-safety and invalidation properties
-# of query predicates (`p.attempt_id IS s.attempt_id`, then
-# `drift_swept_at`/`last_activity_at`) that belonged entirely to the
-# candidate-filter mechanisms this rework removed. The inverted sweep has
-# no equivalent query to be NULL-unsafe in, and no stamp to invalidate —
-# `session.attempt_id` is only ever read to build the outgoing
-# `LifecycleEvent`, exactly as every other terminal-write call site in
-# `worker.py` already does, so there is nothing specific to this sweep left
-# to pin.
