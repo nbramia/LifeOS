@@ -241,7 +241,7 @@ One row per Claude Code / Codex CLI session registered from any host via `POST /
 ## Lifecycle of a task
 
 ```
-poll → resolve Human-queue cards whose done_when now passes (throttled by
+poll → resolve Human-queue cards whose done_when passes (throttled by
         LIFEOS_HUMAN_QUEUE_POLL_SECONDS; runs before the spend guard — it
         never spends)
      → heal stranded lifecycle tags (#agent-running / #agent-blocked) whose

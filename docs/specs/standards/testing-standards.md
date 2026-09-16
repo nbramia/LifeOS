@@ -350,10 +350,10 @@ contain. Two enforced reasons:
 its module docstring documents exactly which inputs are pinned, why each one
 matters, and the recapture recipe (pin env vars before importing anything
 from this repo, then capture against the pre-change code). Follow that
-pattern for any new golden/snapshot fixture. See #598 for the underlying
-defect this guards against -- `api/main.py`'s `load_dotenv()` now loads an
-explicit repo-root path rather than searching upward, which is the primary
-fix, but pinning at capture time remains the standard for any fixture that
+pattern for any new golden/snapshot fixture. The defect this guards against is
+environment bleed at capture time: `api/main.py`'s `load_dotenv()` loads an
+explicit repo-root path rather than searching upward, and pinning at capture
+time remains the standard for any fixture that
 touches config-derived output.
 
 ## Singleton Reset

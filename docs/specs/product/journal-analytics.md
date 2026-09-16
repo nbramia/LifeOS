@@ -37,7 +37,7 @@ This is unrelated to the CRM's two-tier `SourceEntity`/`PersonEntity` model (see
 
 ## Data Source
 
-Daily journal entries live at `<vault_path>/Personal/Journal/YYYY-MM-DD.md`, one file per day the entry was made (not every calendar day has one). Each entry has YAML frontmatter with a `date:` field and a `feeling:` field, plus other logged fields (`mood`, `stress`, `sleep`, `body`, `alcohol`, `eating`, `caffeine`, `exercise`, `one_word`) that this feature does not use — the issue asked for the emotion wheel, not a general journal dashboard.
+Daily journal entries live at `<vault_path>/Personal/Journal/YYYY-MM-DD.md`, one file per day the entry was made (not every calendar day has one). Each entry has YAML frontmatter with a `date:` field and a `feeling:` field, plus other logged fields (`mood`, `stress`, `sleep`, `body`, `alcohol`, `eating`, `caffeine`, `exercise`, `one_word`) that this feature does not use — its scope is the emotion wheel, not a general journal dashboard.
 
 ## The Emotion Chain
 
@@ -174,9 +174,9 @@ The view addresses this in four ways:
 
 ## Deviations From a Literal Plutchik Wheel
 
-The issue suggested "the emotion wheel (likely Plutchik or a derivative)." A literal Plutchik wheel has eight fixed primary emotions (joy, trust, fear, surprise, sadness, disgust, anger, anticipation) with fixed color relationships and intensity rings. The journal's actual vocabulary (`Happy`, `Bad`, `Not sure`, `Sad`, `Disgusted`, `Angry`, plus 17+ distinct level-2/3 words) doesn't map cleanly onto Plutchik's eight primaries — forcing a mapping would mean inventing a taxonomy the data doesn't actually express (e.g. deciding whether "Bad" means Plutchik's sadness, disgust, or something else).
+The emotion wheel is a Plutchik derivative rather than a literal Plutchik wheel. A literal Plutchik wheel has eight fixed primary emotions (joy, trust, fear, surprise, sadness, disgust, anger, anticipation) with fixed color relationships and intensity rings. The journal's actual vocabulary (`Happy`, `Bad`, `Not sure`, `Sad`, `Disgusted`, `Angry`, plus 17+ distinct level-2/3 words) doesn't map cleanly onto Plutchik's eight primaries — forcing a mapping would mean inventing a taxonomy the data doesn't actually express (e.g. deciding whether "Bad" means Plutchik's sadness, disgust, or something else).
 
-Instead, this view is the "derivative" the issue allowed for: a radial partition driven directly by whatever chain values actually appear in the data, with no assumed taxonomy. It reads visually like a Plutchik-style wheel (concentric rings, wedge-per-emotion) without requiring an invented mapping, and it automatically accommodates new level-1 values the journal template might introduce later.
+This view is that derivative: a radial partition driven directly by whatever chain values actually appear in the data, with no assumed taxonomy. It reads visually like a Plutchik-style wheel (concentric rings, wedge-per-emotion) without requiring an invented mapping, and it automatically accommodates new level-1 values the journal template might introduce later.
 
 The animated/temporal view the issue also proposed was scoped out: with entries spanning `~5` months non-contiguously (dozens, not hundreds, of entries as of this writing), a day-by-day animation would spend most of its runtime on days with no entry at all. The static, window-selectable wheel is a better fit for how sparse and irregular the data actually is; a temporal view is a candidate for a follow-up issue once entry volume grows.
 
