@@ -1,4 +1,4 @@
-"""Snapshot-union tests for cross-machine CLI sessions (issue #849).
+"""Snapshot-union tests for cross-machine CLI sessions.
 
 `GET /api/agents/snapshot` merges the `cli_sessions` table (posted by
 scripts/lifeos-agent-hook.sh, from any machine) with the local transcript
@@ -224,7 +224,7 @@ def test_worker_and_all_rows_carry_host(client, stores):
 
 @pytest.mark.unit
 def test_focus_409_for_session_on_different_host(client, stores):
-    """#849: focus isn't implemented for remote hosts yet — it should 409
+    """Focus isn't implemented for remote hosts yet — it should 409
     with the host name rather than trying (and failing) a local wezterm
     probe for a pane that was never on this machine."""
     session_store, _ = stores

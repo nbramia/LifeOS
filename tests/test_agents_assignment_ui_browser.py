@@ -1,7 +1,6 @@
-"""Browser test for web/agents/assignment.js (#851) — the isolated
-model/effort/host/engine assignment-picker module, built ahead of the
-Kanban board UI (#850) merging (see this PR's description for why it's
-standalone rather than wired into web/agents/board.js).
+"""Browser test for web/agents/assignment.js — the isolated
+model/effort/host/engine assignment-picker module, standalone rather than
+wired into web/agents/board.js.
 
 Serves `web/` itself from an ephemeral port (same pattern as
 tests/test_voice_mic_block_ui_browser.py) rather than pointing at a running
