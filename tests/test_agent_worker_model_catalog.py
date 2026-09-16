@@ -327,7 +327,7 @@ async def test_empty_valid_unconfigured_and_unknown_are_distinct(tmp_path, monke
         clock=_FrozenClock(1),
     ).get(ttl_seconds=100)
     assert result["engine_states"]["claude"]["state"] == "unconfigured"
-    monkeypatch.setattr("api.services.agent_worker.model_catalog.shutil.which", lambda _: "/usr/bin/codex")
+    monkeypatch.setattr("api.services.agent_worker.binary_resolver.shutil.which", lambda _: "/usr/bin/codex")
     result = await ModelCatalog(
         codex_cache_path=str(tmp_path / "missing.json"),
         local_probe=_noop_local_probe,
@@ -386,7 +386,7 @@ async def test_keyless_codex_cli_is_ready_without_discovery_or_quota(tmp_path, m
 
     monkeypatch.setattr(settings, "anthropic_api_key", "", raising=False)
     monkeypatch.setattr(settings, "openai_api_key", "", raising=False)
-    monkeypatch.setattr("api.services.agent_worker.model_catalog.shutil.which", lambda _: "/usr/bin/codex")
+    monkeypatch.setattr("api.services.agent_worker.binary_resolver.shutil.which", lambda _: "/usr/bin/codex")
     result = await ModelCatalog(
         codex_cache_path=str(tmp_path / "missing.json"),
         local_probe=_noop_local_probe,
@@ -406,7 +406,7 @@ async def test_facts_adapter_and_legacy_fields_are_stable(tmp_path, monkeypatch)
     monkeypatch.setattr(settings, "anthropic_api_key", "", raising=False)
     # Every CLI engine's catalog state is derived from whether its binary
     # resolves on PATH, so pin that rather than inheriting the host's.
-    monkeypatch.setattr("api.services.agent_worker.model_catalog.shutil.which", lambda _: "/usr/bin/codex")
+    monkeypatch.setattr("api.services.agent_worker.binary_resolver.shutil.which", lambda _: "/usr/bin/codex")
     result = await ModelCatalog(
         codex_cache_path=str(tmp_path / "missing.json"),
         local_probe=_noop_local_probe,

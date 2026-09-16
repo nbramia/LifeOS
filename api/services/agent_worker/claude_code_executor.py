@@ -13,7 +13,6 @@ import logging
 import os
 import platform
 import re
-import shutil
 import subprocess
 import threading
 import time
@@ -21,6 +20,7 @@ from dataclasses import dataclass, field
 from typing import Callable, NamedTuple, Optional
 
 from api.services.agent_worker.assignment import ENGINE_CLAUDE_CODE, map_effort_for_engine
+from api.services.agent_worker.binary_resolver import resolve_for_spawn
 from api.services.agent_worker.delegation import delegation_preamble
 from api.services.agent_worker.local_executor import ExecutorOutcome
 from api.services.agent_worker.remote_spawn import (
@@ -135,29 +135,11 @@ def _scan_protocol_tags(text: str) -> _TagScan:
     return _TagScan(clarify, notify, goal, "".join(parts))
 
 
-# Common install locations for the Claude CLI when launchd-style minimal PATHs
-# don't pick up the user-local install. Mirrors the orchestrator's resolver.
-_CLAUDE_SEARCH_PATHS = [
-    os.path.expanduser("~/.local/bin/claude"),
-    "/usr/local/bin/claude",
-    os.path.expanduser("~/.npm/bin/claude"),
-    "/opt/homebrew/bin/claude",
-]
-
-
 def _resolve_claude_binary() -> str:
-    """Resolve the Claude CLI binary path; identical contract to the legacy
-    orchestrator so swapping execution paths is a no-op for operators."""
-    configured = settings.claude_binary
-    if os.path.isabs(configured):
-        return configured
-    if shutil.which(configured):
-        return configured
-    for path in _CLAUDE_SEARCH_PATHS:
-        if os.path.isfile(path) and os.access(path, os.X_OK):
-            logger.info("Claude binary not on PATH, found at %s", path)
-            return path
-    return configured  # caller surfaces the FileNotFoundError on spawn
+    """Resolve the Claude CLI binary path via the shared binary resolver
+    (:mod:`api.services.agent_worker.binary_resolver`), so this spawn-time
+    resolution agrees with the worker's readiness check."""
+    return resolve_for_spawn(settings.claude_binary)
 
 
 # The system prompt is the operator-facing contract for /claude's behavior —

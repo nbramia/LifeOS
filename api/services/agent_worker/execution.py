@@ -264,6 +264,10 @@ class ExecutorFacts:
     catalog: CatalogFacts = field(default_factory=CatalogFacts)
     native_model_id: str | None = None
     billing: BillingClass = BillingClass.UNKNOWN
+    # Populated when readiness is UNAVAILABLE for a binary-resolved CLI
+    # executor: names the candidate locations the resolver searched, so the
+    # resolution diagnostic can surface them to the operator.
+    unavailable_detail: str | None = None
 
 
 @dataclass(frozen=True)
@@ -614,7 +618,10 @@ def resolve_execution(
     if target is None:
         return _failure(ResolutionStatus.UNKNOWN, diagnostics + [Diagnostic("missing_executor_facts", f"no facts for {executor}", "executor")])
     if target.readiness in {ReadinessState.UNAVAILABLE, ReadinessState.UNCONFIGURED}:
-        return _failure(ResolutionStatus.UNAVAILABLE, diagnostics + [Diagnostic("executor_unavailable", f"executor {executor} is {target.readiness.value}", "executor")])
+        message = f"executor {executor} is {target.readiness.value}"
+        if target.unavailable_detail:
+            message = f"{message} ({target.unavailable_detail})"
+        return _failure(ResolutionStatus.UNAVAILABLE, diagnostics + [Diagnostic("executor_unavailable", message, "executor")])
     if target.readiness == ReadinessState.UNKNOWN:
         return _failure(ResolutionStatus.UNKNOWN, diagnostics + [Diagnostic("executor_readiness_unknown", f"readiness for {executor} is unknown", "executor")])
     missing = tuple(item for item in constraints.required_capabilities if item not in target.capabilities)

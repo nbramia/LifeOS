@@ -36,7 +36,6 @@ import asyncio
 import json
 import logging
 import os
-import shutil
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -44,6 +43,7 @@ from typing import Any, Callable, Optional
 
 import httpx
 
+from api.services.agent_worker.binary_resolver import resolve_binary
 from api.services.agent_worker.pricing import PRICING, _DATED_SNAPSHOT_SUFFIX
 from config.settings import settings
 
@@ -265,8 +265,7 @@ class ModelCatalog:
 
     @staticmethod
     def _codex_readiness() -> str:
-        binary = getattr(settings, "codex_binary", "codex")
-        return "ready" if shutil.which(os.path.expanduser(binary)) else "unavailable"
+        return "ready" if resolve_binary(settings.codex_binary).ready else "unavailable"
 
     async def _fetch_codex_fallback(self, cache_reason: str) -> _EngineResult:
         readiness = self._codex_readiness()
@@ -382,9 +381,8 @@ def facts_from_catalog(response: dict) -> dict[str, dict]:
         readiness = state.get("readiness") or {}
         models = state.get("models") or (response.get("engines") or {}).get(engine) or []
         if engine == "claude_code":
-            binary = getattr(settings, "claude_binary", "claude")
             readiness = {
-                "state": "ready" if shutil.which(os.path.expanduser(binary)) else "unavailable",
+                "state": "ready" if resolve_binary(settings.claude_binary).ready else "unavailable",
                 "source": "claude_binary_presence",
                 "observed_at": refreshed_at,
             }

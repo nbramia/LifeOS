@@ -23,7 +23,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shutil
 import subprocess
 import tempfile
 import threading
@@ -32,6 +31,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from api.services.agent_worker.assignment import ENGINE_CODEX, map_effort_for_engine
+from api.services.agent_worker.binary_resolver import resolve_for_spawn
 from api.services.agent_worker.capabilities_preamble import CAPABILITIES_PREAMBLE
 from api.services.agent_worker.claude_code_executor import (
     _ALTERNATE_AUTH_ENV_PREFIXES,
@@ -66,41 +66,12 @@ logger = logging.getLogger(__name__)
 HEARTBEAT_INTERVAL = 300  # 5 minutes between progress pings
 
 
-# Common install locations for the codex CLI when systemd-style minimal
-# PATHs don't pick up the user-local install (npm-global / nvm).
-_CODEX_SEARCH_PATHS = [
-    os.path.expanduser("~/.local/bin/codex"),
-    "/usr/local/bin/codex",
-    os.path.expanduser("~/.npm/bin/codex"),
-    "/opt/homebrew/bin/codex",
-]
-
-
 def _resolve_codex_binary() -> str:
-    """Resolve the codex CLI binary path, with nvm-friendly fallbacks.
-
-    Mirrors :func:`claude_code_executor._resolve_claude_binary`. Also probes
-    the active nvm version dir since codex is usually `npm i -g`-installed
-    into the current node version's bin.
+    """Resolve the codex CLI binary path via the shared binary resolver
+    (:mod:`api.services.agent_worker.binary_resolver`), so this spawn-time
+    resolution agrees with the worker's readiness check.
     """
-    configured = getattr(settings, "codex_binary", "codex")
-    if os.path.isabs(configured):
-        return configured
-    if shutil.which(configured):
-        return shutil.which(configured)
-    for path in _CODEX_SEARCH_PATHS:
-        if os.path.isfile(path) and os.access(path, os.X_OK):
-            logger.info("codex binary not on PATH, found at %s", path)
-            return path
-    # nvm: ~/.nvm/versions/node/v*/bin/codex
-    nvm_root = os.path.expanduser("~/.nvm/versions/node")
-    if os.path.isdir(nvm_root):
-        for ver in sorted(os.listdir(nvm_root), reverse=True):
-            candidate = os.path.join(nvm_root, ver, "bin", "codex")
-            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-                logger.info("codex binary found under nvm at %s", candidate)
-                return candidate
-    return configured  # caller surfaces FileNotFoundError on spawn
+    return resolve_for_spawn(settings.codex_binary)
 
 
 def _delegation_header(session_id: str) -> str:
