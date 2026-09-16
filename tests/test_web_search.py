@@ -1,5 +1,5 @@
 """
-Tests for the web search service (real search on every backend — #467).
+Tests for the web search service (real search on every backend).
 """
 import pytest
 from unittest.mock import patch, MagicMock, AsyncMock
@@ -127,7 +127,7 @@ class TestNativeAnswerAccumulation:
     def test_parse_anthropic_response_accumulates_text_blocks(self):
         """A cited web-search answer spans multiple text blocks (split at citation
         boundaries) interleaved with server-tool blocks — all text must survive,
-        not just the last block (the #469 truncation bug)."""
+        not just the last block."""
         from api.services.llm_client import AnthropicLLMClient
         # Skip __init__ (needs an API key) — _parse_anthropic_response uses no self state.
         client = AnthropicLLMClient.__new__(AnthropicLLMClient)

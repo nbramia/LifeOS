@@ -1,4 +1,4 @@
-"""Regression test for scripts/create-worktree.sh (#812).
+"""Regression test for scripts/create-worktree.sh.
 
 On GNU/Linux, `stat -f %m "$lock_dir"` doesn't mean "read mtime" — `-f` means
 FILESYSTEM status, so GNU coreutils treats `%m` as a filename, fails to find

@@ -1,4 +1,4 @@
-"""Tests for the #828 one-off cleanup script
+"""Tests for the one-off cleanup script
 (`scripts/cleanup_vectorstore_tmp_rows.py`).
 
 The acceptance criterion this backs is that the selector "must not touch

@@ -51,7 +51,7 @@ class TestBM25Index:
             people=["Kevin", "Sarah"]
         )
 
-        # Verify it was added
+        # Verify it is retrievable
         results = index.search("budget")
         assert len(results) == 1
         assert results[0]["doc_id"] == "doc1"

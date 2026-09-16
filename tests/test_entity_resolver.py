@@ -195,7 +195,7 @@ class TestResolveByName:
     def test_create_with_context_inference(self, populated_resolver):
         """Test new entity gets context from path.
 
-        #682: _infer_vault_contexts checks settings.current_work_path first,
+        _infer_vault_contexts checks settings.current_work_path first,
         which is real per-operator config (e.g. "Work/ML/"). Unconfigured on
         a clean checkout, it falls through to the generic "Work/" branch —
         so this needs a real configured settings.current_work_path.
@@ -584,7 +584,7 @@ class TestSingleLetterFirstNameEntity:
 
     "A Reader" matched ADP, ACP, and ADS, Inc. — all promoted to
     first_name_context_clear and silently linked, because the entire match
-    rested on one shared letter (#551).
+    rested on one shared letter.
     """
 
     def test_first_name_only_query_does_not_match_on_initial_alone(self, temp_store):

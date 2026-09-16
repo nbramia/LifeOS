@@ -345,8 +345,8 @@ class TestHealthCheck:
         """Health should return degraded status if the Anthropic API key is missing.
 
         `api_key_configured` reflects whether ANTHROPIC_API_KEY is actually
-        set (#697) — it used to check `local_llm_url`, which has a
-        non-empty default and so could never report false.
+        set -- checking `local_llm_url` instead would be wrong, since that
+        has a non-empty default and so could never report false.
         """
         # This is a unit test of the health logic
         from fastapi.testclient import TestClient
@@ -366,7 +366,7 @@ class TestHealthCheck:
             assert not data['checks']['api_key_configured']
 
     def test_health_reports_scheduler_watcher_liveness_distinct_from_reminder_scheduler(self):
-        """#766: the scheduler file watcher's liveness is a separate field
+        """The scheduler file watcher's liveness is a separate field
         from reminder_scheduler (the delivery thread) — a watcher that's
         down must be visible even when delivery is fine, and vice versa."""
         from fastapi.testclient import TestClient

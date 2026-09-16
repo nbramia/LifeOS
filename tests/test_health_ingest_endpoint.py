@@ -1,5 +1,5 @@
 """
-Tests for the authenticated Apple Health ingest endpoint and service (#333).
+Tests for the authenticated Apple Health ingest endpoint and service.
 
 POST /api/fitness/health/ingest shares the ingest core with the file importer;
 this covers the bearer-auth gate and that a posted payload lands in fitness.db.

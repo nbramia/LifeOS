@@ -1,9 +1,9 @@
 """Exit-code hardening for credential-dependent sync scripts.
 
 A skipped or fatally-failed sync must exit nonzero so run_all_syncs records
-FAILED (and alerts) instead of silent success — see issue #438, where the
-nightly slack sync "succeeded" in 0.28s for 8 days because the not-enabled
-skip path exited 0.
+FAILED (and alerts) instead of silent success — a not-enabled skip path
+that exits 0 lets a sync "succeed" in a fraction of a second
+indefinitely without anyone noticing.
 """
 from pathlib import Path
 from unittest.mock import patch
@@ -84,7 +84,7 @@ class TestSlackSyncExitCodes:
 class TestGoogleDocsSyncExitCodes:
     """scripts/sync_google_docs.py must fail loudly when the sync dies outright.
 
-    google_docs is the third documented casualty of issue #438 — its typical
+    google_docs is one of several sources sharing this risk — its typical
     ~12s duration sits below the 60s duration-collapse gate, so the exit code
     is the only defense.
     """

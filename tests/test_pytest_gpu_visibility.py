@@ -1,5 +1,5 @@
 """
-Tests for the CPU-only-embeddings-under-pytest guard (#521).
+Tests for the CPU-only-embeddings-under-pytest guard.
 
 This host's iGPU has only 8 SDMA queues; `pytest -n auto` spawns one worker
 per core, and each worker independently loading a GPU embedding model would

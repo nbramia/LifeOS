@@ -1,6 +1,6 @@
 """Tests for api/services/whatsapp.py — pure helpers and JSON-based processing.
 
-Replaces tests/test_sync_whatsapp.py. The wacli-calling logic now lives in
+Replaces tests/test_sync_whatsapp.py. The wacli-calling logic lives in
 scripts/apple_data_export.py (Mac-only) and is exercised end-to-end on the
 Mac Mini, not in unit tests. The processing logic — entity resolution and
 interaction creation — operates on parsed dicts and is tested here.
@@ -605,7 +605,7 @@ def _mock_contact_stores(get_by_source_result=None, resolved_person: str = "pers
 
 
 class TestProcessWhatsAppContactsLid:
-    """LID contacts (#503) must produce source entities, deduped against classic ones."""
+    """LID contacts must produce source entities, deduped against classic ones."""
 
     def test_lid_with_name_and_resolvable_phone_creates_entity(self):
         source_store, person_store, resolver, person = _mock_contact_stores(

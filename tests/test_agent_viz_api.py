@@ -1,4 +1,4 @@
-"""API tests for the read-only agent activity visualization (issue #133).
+"""API tests for the read-only agent activity visualization.
 
 Covers /api/agents/snapshot, /api/agents/sessions/{sid}/events, and the
 per-session SSE transcript tail. Uses temp-dir-backed stores via monkeypatch

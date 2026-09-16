@@ -384,7 +384,7 @@ class TestNoImplicitThreadResume:
 
 
 # =============================================================================
-# Operator agent spawn command (Issue #235)
+# Operator agent spawn command
 # =============================================================================
 
 

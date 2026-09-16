@@ -215,8 +215,8 @@ class TestGetMessagesBatch:
     """
     Batched message fetching.
 
-    Fetching one at a time cost ~42 min per nightly run on a busy mailbox,
-    dominated by the per-call rate-limit sleep (#552).
+    Fetching one at a time can cost ~42 min per nightly run on a busy
+    mailbox, dominated by the per-call rate-limit sleep.
     """
 
     @pytest.fixture
@@ -632,7 +632,7 @@ class TestGmailDraftAPI:
             assert "drafts" in data["gmail_url"]
 
     def test_create_draft_failure_returns_500(self, mock_gmail_service):
-        """#609: a failed draft creation must be a non-2xx, not a 200 body
+        """A failed draft creation must be a non-2xx, not a 200 body
         that merely omits the fields a successful draft would have."""
         from fastapi.testclient import TestClient
         from api.main import app

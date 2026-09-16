@@ -1,4 +1,4 @@
-"""Unit tests for the cc_pane_locate probe (issue #251).
+"""Unit tests for the cc_pane_locate probe.
 
 The probe walks: transcript_path → lsof PIDs → /proc/<pid>/fd/0 (tty) →
 wezterm pane.tty_name. Each subprocess and filesystem touch is mocked so

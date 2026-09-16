@@ -1,4 +1,4 @@
-"""Regression tests for #645: seven data-store defaults resolved against the
+"""Regression tests: seven data-store defaults resolved against the
 *process's* working directory instead of the repo root — the same class of
 bug ``mcp_server.py`` already had to defend against for the agent-session
 stores (see ``test_inter_agent_stores_anchored_to_repo_not_cwd``).
@@ -177,7 +177,7 @@ def test_slack_token_store_explicit_relative_path_still_resolves_against_cwd(
 ):
     """Anchoring the *default* must not change resolution for a caller that
     deliberately passes a relative path — it should still resolve against
-    cwd exactly as before. Credentials path, so covered explicitly per #645."""
+    cwd unchanged. Credentials path, so covered explicitly."""
     from api.services.slack_integration import SlackTokenStore
 
     monkeypatch.chdir(tmp_path)

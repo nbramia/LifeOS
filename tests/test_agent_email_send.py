@@ -121,7 +121,7 @@ async def test_gate_holds_across_gather_child_tasks():
     mock = _mock_gmail(draft_id="d1")
 
     with patch("api.services.gmail.GmailService", return_value=mock):
-        # Round 1: create runs in a gather child task.
+        # First gather call: create runs in a gather child task.
         (create_result,) = await asyncio.gather(
             _tool_create_email_draft(
                 {"to": "recipient@example.com", "subject": "test", "body": "test body"}
@@ -129,7 +129,7 @@ async def test_gate_holds_across_gather_child_tasks():
         )
         assert "d1" in create_result
 
-        # Round 2: send runs in a separate gather child task and must still see
+        # Second gather call: send runs in a separate gather child task and must still see
         # that d1 was created this turn → blocked.
         (send_result,) = await asyncio.gather(_tool_send_email_draft({"draft_id": "d1"}))
 

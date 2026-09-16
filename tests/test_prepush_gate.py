@@ -331,10 +331,10 @@ _CASES = [
     # docs-only -> skip
     ("README.md", "skip-docs", "docs_readme"),
     ("docs/guides/scheduler.md\ndocs/AGENTS.md", "skip-docs", "docs_multiple"),
-    # Dependency manifests are code-affecting, NOT docs. The hook used to carry
-    # its own `\.(md|txt|rst)$` regex, which matched requirements.txt and
-    # skipped the entire suite on a dep bump — while test.sh's decide_plan
-    # deliberately excluded them. These pin the two back together.
+    # Dependency manifests are code-affecting, NOT docs. A hook using its
+    # own `\.(md|txt|rst)$` regex would match requirements.txt and skip
+    # the entire suite on a dep bump — while test.sh's decide_plan
+    # deliberately excludes them. These pin the two together.
     ("requirements.txt", "run-local", "requirements"),
     ("requirements-dev.txt", "run-local", "requirements_dev"),
     ("constraints.txt", "run-local", "constraints"),
@@ -360,7 +360,7 @@ def test_prepush_decision(tmp_path, changed, expected):
 def test_deletion_only_push_skips(tmp_path):
     """Deleting a branch sends no commits, so there is nothing to gate.
 
-    This previously ran the full suite: the zero-SHA ref was skipped, leaving
+    The zero-SHA ref is skipped, leaving
     an empty file list, which falls through to the safe "unknown -> run
     everything" default.
     """

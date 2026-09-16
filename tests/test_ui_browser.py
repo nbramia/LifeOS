@@ -308,7 +308,7 @@ class TestAttachmentUI:
         # Add drag-over class via JS to verify styles are properly defined
         page.evaluate("document.getElementById('inputArea').classList.add('drag-over')")
 
-        # Check the class was added and element has the expected border style
+        # Check the class is present and element has the expected border style
         expect(input_area).to_have_class("input-area drag-over")
 
         # Verify the border color changes (indicates CSS is working)

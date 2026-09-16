@@ -1,5 +1,4 @@
-"""Regression tests for SessionStore/TranscriptStore default path anchoring
-(#640 review).
+"""Regression tests for SessionStore/TranscriptStore default path anchoring.
 
 `mcp_server.py` is run as a stdio MCP child by CLI agents (codex/claude_code
 with a `-C` working dir) AND by Hermes (its own cwd, e.g. `~/.hermes`) —
@@ -42,7 +41,7 @@ def test_transcript_store_default_dir_is_repo_anchored():
 
 @pytest.mark.unit
 def test_session_store_default_resolves_same_file_regardless_of_cwd(tmp_path, monkeypatch):
-    """The exact bug shape reported against #640: a bare `SessionStore()`
+    """A bare `SessionStore()`
     instantiated from a directory other than the repo root must still land
     on the real repo db, not a phantom sibling under that other directory."""
     other_cwd = tmp_path / "not-the-repo"

@@ -1,5 +1,5 @@
 """
-Tests for the Apple Health import (issue #323).
+Tests for the Apple Health import.
 
 The iOS Shortcut writes health.json; import_health upserts workouts into
 workout_sessions(source=apple_health) and metrics into health_metrics, both

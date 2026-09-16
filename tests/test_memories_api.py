@@ -83,7 +83,7 @@ class TestMemoriesAPI:
         assert response.status_code == 400
 
     def test_create_memory_failure_is_never_success_shaped(self, mock_memory_store):
-        """#609: a store write failure must be a non-2xx, never a 200 with
+        """A store write failure must be a non-2xx, never a 200 with
         the created memory's own shape."""
         from fastapi.testclient import TestClient
         from api.main import app

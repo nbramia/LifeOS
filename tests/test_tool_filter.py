@@ -1,4 +1,4 @@
-"""Tests for the per-class tool filter helper (#139 §3, partial)."""
+"""Tests for the per-class tool filter helper."""
 from __future__ import annotations
 
 import pytest

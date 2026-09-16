@@ -100,7 +100,7 @@ class TestImperativeFollowupRegex:
 
 
 # =============================================================================
-# Operator agent spawn from chat (Issue #235, AC6)
+# Operator agent spawn from chat
 # =============================================================================
 
 

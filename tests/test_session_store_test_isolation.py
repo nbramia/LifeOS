@@ -1,9 +1,9 @@
-"""Regression coverage for the #652 autouse isolation fixtures in
+"""Regression coverage for the autouse isolation fixtures in
 ``conftest.py`` (``_isolate_session_store_db`` / `_isolate_transcript_store_dir`).
 
 Nothing here exercises the isolation fixtures explicitly — they're autouse,
 so they're already active for every test in the suite, including these.
-What's asserted is the thing #652 was actually about: a bare
+What's asserted: a bare
 ``SessionStore()``/``TranscriptStore()`` built under test must never resolve
 to the real repo-anchored default, because that's exactly what let the
 Hermes envelope path (`_build_envelope` -> `_resolve_caller_session_id`)

@@ -1,5 +1,5 @@
 """
-Tests for outbound Telegram bot routing (issue #318).
+Tests for outbound Telegram bot routing.
 
 Verifies that send functions, the adhoc endpoint, the MCP tool schema,
 and the scheduler all route proactive sends from the correct bot account
