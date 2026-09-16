@@ -83,10 +83,10 @@ _CASES = [
     ("api/services/llm_client.py", "unit", "service_plain"),
     ("config/settings.py", "unit", "config"),
     # frontend -> unit + critical browser test. These paths must be ones that
-    # really exist: the mapping previously matched on `static/` and
-    # `/templates/`, neither of which is in this repo, and these cases asserted
-    # the same fiction — so a web/-only JS change silently skipped the browser
-    # scope while the suite stayed green (#518).
+    # really exist: a mapping matching on `static/` or `/templates/` (neither
+    # of which is in this repo) would assert a fiction — a web/-only JS
+    # change would silently skip the browser scope while the suite stayed
+    # green.
     ("api/routes/chat.py", "unit browser", "front_routes"),
     ("web/chat/voice.js", "unit browser", "front_js"),
     ("web/index.html", "unit browser", "front_html"),

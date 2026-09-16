@@ -1,4 +1,4 @@
-"""Tests for operator root-spawn (#235, Phase 2 of #233).
+"""Tests for operator root-spawn.
 
 Covers `create_operator_session`: explicit-routing override, preflight
 auto-route, the ambiguous (ROUTE_ASK) clarification path, the operator origin
@@ -80,11 +80,10 @@ def test_no_keyword_routes_via_preflight(tmp_path: Path):
 @pytest.mark.unit
 def test_inferred_cloud_route_parks_for_confirmation(tmp_path: Path):
     """A spawn nobody routed by hand can't land on the API on preflight's
-    say-so (#584): it parks at `ask` and waits for the operator to choose.
+    say-so: it parks at `ask` and waits for the operator to choose.
 
-    The previous version of the test above used a `claude` preflight result to
-    prove pass-through; that exact case is now the one that must NOT pass
-    through, so it gets its own test rather than disappearing.
+    A `claude` preflight result must NOT pass through unrouted, so it gets
+    its own test rather than being folded into pass-through coverage.
     """
     store = SessionStore(db_path=tmp_path / "s.db")
     result = create_operator_session(

@@ -1,5 +1,5 @@
 """
-Tests that the three Human-queue MCP tools (#852) are registered and
+Tests that the three Human-queue MCP tools are registered and
 reachable over both the stdio and HTTP transports, and that the total tool
 count (71 = 62 CURATED_ENDPOINTS + 9 lifeos_agent_*) matches AGENTS.md.
 """
@@ -84,7 +84,7 @@ class TestCuratedEndpointsRegistration:
 
 
 class TestCallApiDispatch:
-    """Real `_call_api` dispatch coverage (#852 review): the tool-count and
+    """Real `_call_api` dispatch coverage: the tool-count and
     schema tests above never actually invoke the dispatcher against a
     mocked HTTP client."""
 

@@ -290,9 +290,7 @@ class TestGetMeetingPrep:
 
         Only exercises the PERSONAL account, which get_configured_accounts()
         always includes unconditionally (unlike WORK/WORK2, gated on a
-        credentials file) — so this passes on a clean checkout. Verified by
-        running: 17 passed / 3 failed on this file, and this test is in the
-        17 (#682).
+        credentials file) — so this passes on a clean checkout.
         """
         from api.services.google_auth import GoogleAccount
 
@@ -352,7 +350,7 @@ class TestGetMeetingPrep:
 # API endpoint tests (slow - requires app initialization). Each method below
 # carries its own @pytest.mark.slow — `pytestmark` (not `pytestmark_api`,
 # which pytest never recognizes) would apply it uniformly, but per-method is
-# already equivalent here since every method in the class has it (#682).
+# already equivalent here since every method in the class has it.
 
 
 class TestMeetingPrepEndpoint:
