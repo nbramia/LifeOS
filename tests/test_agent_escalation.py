@@ -1,4 +1,4 @@
-"""Orchestrator escalation (#303).
+"""Orchestrator escalation.
 
 When the prior assistant turn refused / claimed something impossible and the
 user's new message pushes back, the chat orchestrator retries on a stronger
@@ -125,9 +125,9 @@ def test_giveup_phrases_count_as_refusal(giveup):
 # ---------------------------------------------------------------------------
 
 def test_resolve_escalates_when_configured_and_triggered():
-    """Escalation still fires — it just no longer climbs onto the API (#584).
+    """Escalation fires but never climbs onto the API.
 
-    `escalation_model` now only says "escalation is configured"; the rung it
+    `escalation_model` only says "escalation is configured"; the rung it
     lands on is the first non-API engine, not the model named here.
     """
     history = [FakeMessage("assistant", _REFUSAL)]
@@ -162,7 +162,7 @@ def test_resolve_no_escalation_when_not_triggered():
 
 
 # ---------------------------------------------------------------------------
-# user-directed escalation (#305)
+# user-directed escalation
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("question, expected", [
@@ -268,7 +268,7 @@ def test_non_directive_mentions_do_not_escalate(question):
 
 
 # ---------------------------------------------------------------------------
-# multi-tier escalation ladder (#305 part c)
+# multi-tier escalation ladder
 # ---------------------------------------------------------------------------
 
 def _refusal_history(n):
@@ -331,11 +331,10 @@ def test_escalation_cycles_counts_pushback_chain():
 
 
 def test_stale_refusals_do_not_advance_the_rung():
-    """Regression (#309 review): refusals on an earlier topic the user never
+    """Refusals on an earlier topic the user never
     pushed back on must not catapult the first fresh pushback up the ladder.
-
-    (Formerly "...do_not_jump_to_engine_rung" — since #584 every rung is an
-    engine, so the invariant is about the rung *index*, not its kind.)"""
+    Every rung is an engine, so the invariant is about the rung *index*, not
+    its kind."""
     history = [
         FakeMessage("user", "question one"),
         FakeMessage("assistant", _REFUSAL),
@@ -391,7 +390,7 @@ def test_api_rungs_are_filtered_out_of_a_configured_ladder(monkeypatch):
     """An all-API ladder leaves nothing to climb, so the turn does not escalate.
 
     The operator can still reach these models by asking ("escalate to opus") —
-    what's gone is LifeOS deciding to spend API credits by itself (#584).
+    what's gone is LifeOS deciding to spend API credits by itself.
     """
     monkeypatch.setattr(
         "api.services.agent_loop.settings.agent_escalation_ladder",
@@ -431,7 +430,7 @@ def test_local_is_a_legal_rung(monkeypatch):
 
 
 def test_remote_is_never_a_legal_escalation_rung(monkeypatch):
-    """(#654) The remote provider is a paid engine, same category as an
+    """The remote provider is a paid engine, same category as an
     Anthropic model id — it must never be reachable from auto-escalation,
     even if an operator mistakenly names it in LIFEOS_AGENT_ESCALATION_LADDER.
     NON_API_RUNGS filters it out exactly like it would filter "claude-opus-4-8"
@@ -468,7 +467,7 @@ def test_remote_not_in_non_api_rungs():
 
 
 def test_local_escalation_rung_ignores_the_699_remote_executor_flag(monkeypatch):
-    """(#699) The agent worker's flag-gated remote fallback lives entirely
+    """The agent worker's flag-gated remote fallback lives entirely
     in agent_worker/local_executor.py — a different code path from the chat
     orchestrator's escalation ladder in this module. Proves it structurally:
     even with LIFEOS_AGENT_REMOTE_EXECUTOR on, the remote provider fully
@@ -498,7 +497,7 @@ def test_local_escalation_rung_ignores_the_699_remote_executor_flag(monkeypatch)
 
 
 # ---------------------------------------------------------------------------
-# engine handoff directives (#305 part b)
+# engine handoff directives
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("question, engine, task", [
@@ -622,7 +621,7 @@ def test_force_local_reuses_singleton_on_local_backend(monkeypatch):
 
 
 def test_force_local_builds_local_client_on_remote_backend(monkeypatch):
-    """(#771) The "Gemma" picker option always means the on-box llama-server,
+    """The "Gemma" picker option always means the on-box llama-server,
     never whatever LIFEOS_LLM_BACKEND=remote's singleton happens to point
     at -- reusing the singleton here (as a naive `!= "anthropic"` check
     would) would silently hand a "local" pick to the remote provider."""
@@ -639,7 +638,7 @@ def test_force_local_builds_local_client_on_remote_backend(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Model picker: per-turn remote provider ("Remote", #654)
+# Model picker: per-turn remote provider ("Remote")
 # ---------------------------------------------------------------------------
 
 def test_force_remote_builds_client_from_settings(monkeypatch):
@@ -661,7 +660,7 @@ def test_force_remote_builds_client_from_settings(monkeypatch):
 
     from api.services.llm_client import LocalLLMClient
     assert isinstance(client, LocalLLMClient)
-    # #706: LocalLLMClient strips one trailing /v1 segment so the wire
+    # LocalLLMClient strips one trailing /v1 segment so the wire
     # path is always {base}/v1/chat/completions, never .../v1/v1/....
     assert client.base_url == "https://api.fireworks.ai/inference"
     assert client.model == "accounts/fireworks/models/deepseek-v4-flash-0731"
