@@ -537,7 +537,15 @@ class CodexExecutor:
             })
             return ExecutorOutcome(status=STATUS_FAILED, reason=REASON_TIMEOUT)
 
-        if proc.returncode == 0 or state.terminal:
+        # A non-zero exit is authoritative even when `turn.completed` was
+        # parsed: the CLI process itself is reporting a bad end-of-run, and
+        # a turn that completed just before that is exactly the "stopped
+        # mid-thought but looks done" shape the terminal-evidence gate in
+        # normalize_outcome exists to catch, not a case for this executor to
+        # paper over. `state.terminal` still reaches `exit_meta` below either
+        # way, so a genuinely-clean run with no `turn.completed` (an
+        # interrupted stream that happens to exit 0) is still flagged there.
+        if proc.returncode == 0:
             exit_meta = self._exit_metadata(proc, timed_out, state)
             completed = self.session_store.update_status(
                 session.task_id, STATUS_COMPLETED,

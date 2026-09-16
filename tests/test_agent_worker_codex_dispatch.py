@@ -729,3 +729,62 @@ def test_codex_session_with_real_executor_reaches_completed_disposition(tmp_path
     assert "cli_session_interrupted" not in kinds
     assert "terminal_evidence_downgrade" not in kinds
 
+
+@dataclass
+class _CrashingCodexExecutor:
+    """Raises from execute()/resume() instead of returning an outcome — drives
+    the dispatch's own exception handling rather than an executor result."""
+    error: Exception
+
+    def execute(self, session, task):
+        raise self.error
+
+    def resume(self, session, message):
+        raise self.error
+
+
+def test_codex_execute_crash_records_dispatch_crashed_event(tmp_path: Path):
+    """An exception escaping the executor's execute() call (not a clean FAILED
+    outcome — e.g. a bug in the executor itself) must not leave the session
+    FAILED with no transcript record of why: `codex_dispatch_crashed` names
+    the phase and the error before the terminal status is written."""
+    plain_sends: list[str] = []
+    withid_sends: list[str] = []
+    stub = _CrashingCodexExecutor(error=RuntimeError("boom-execute"))
+    worker = _make_worker(tmp_path, codex_executor=stub, plain_sends=plain_sends, withid_sends=withid_sends)
+    session = worker.session_store.create(task_id="cx-crash-execute", routing="codex", origin="operator")
+
+    worker._dispatch_codex_session(session, [{"content": "do the thing"}])
+
+    assert worker.session_store.get("cx-crash-execute").status == STATUS_FAILED
+    crashed = [
+        e for e in worker.transcript_store.read(session.session_id)
+        if e["kind"] == "codex_dispatch_crashed"
+    ]
+    assert len(crashed) == 1
+    assert crashed[0]["payload"]["phase"] == "execute"
+    assert "boom-execute" in crashed[0]["payload"]["error"]
+
+
+def test_codex_resume_crash_records_dispatch_crashed_event(tmp_path: Path):
+    """Same as the execute-crash case, on the resume branch (a persisted CLI
+    session id routes dispatch there)."""
+    plain_sends: list[str] = []
+    withid_sends: list[str] = []
+    stub = _CrashingCodexExecutor(error=RuntimeError("boom-resume"))
+    worker = _make_worker(tmp_path, codex_executor=stub, plain_sends=plain_sends, withid_sends=withid_sends)
+    worker.session_store.create(task_id="cx-crash-resume", routing="codex", origin="operator")
+    worker.session_store.set_claude_code_session_id("cx-crash-resume", "codex-uuid-crash")
+    session = worker.session_store.get("cx-crash-resume")
+
+    worker._dispatch_codex_session(session, [{"content": "follow up"}])
+
+    assert worker.session_store.get("cx-crash-resume").status == STATUS_FAILED
+    crashed = [
+        e for e in worker.transcript_store.read(session.session_id)
+        if e["kind"] == "codex_dispatch_crashed"
+    ]
+    assert len(crashed) == 1
+    assert crashed[0]["payload"]["phase"] == "resume"
+    assert "boom-resume" in crashed[0]["payload"]["error"]
+

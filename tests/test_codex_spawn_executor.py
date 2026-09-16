@@ -846,3 +846,37 @@ def test_nonzero_returncode_stays_failed_through_the_adapter(stores, tmp_path):
     assert sess_store.get(session.task_id).status == STATUS_FAILED
     kinds = [e["kind"] for e in tr_store.read(session.session_id)]
     assert "codex_failed" in kinds
+
+
+@pytest.mark.unit
+def test_turn_completed_then_nonzero_exit_stays_failed(stores, tmp_path):
+    """`turn.completed` records that the CLI itself reported the turn done,
+    but the subprocess exiting non-zero afterward is a real failure signal
+    from the process, not something a parsed stream event should override —
+    a turn that completed just before a bad exit is exactly the "stopped
+    mid-thought but looks done" shape the terminal-evidence gate exists to
+    catch. The kill/cancel/timeout guards above this branch don't apply here
+    (no cancellation, no FAILED row, no timeout), so this exercises the
+    returncode check directly."""
+    sess_store, tr_store = stores
+    session = _seed_codex_session(sess_store, task_id="cx-term-then-bad-exit")
+    lines = [
+        {"type": "thread.started", "thread_id": "thread-badexit"},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "done, I think"}},
+        {"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}},
+    ]
+    executor = CodexExecutor(
+        session_store=sess_store,
+        transcript_store=tr_store,
+        spawn_fn=_spawn_capturing({}, _FakeProc(lines, returncode=1), final_text="done, I think"),
+        binary_resolver=lambda: "/usr/bin/true",
+        heartbeat_interval=9999,
+    )
+
+    outcome = executor.execute(session, {"description": "task", "working_dir": str(tmp_path)})
+
+    assert outcome.status == STATUS_FAILED
+    assert sess_store.get(session.task_id).status == STATUS_FAILED
+    kinds = [e["kind"] for e in tr_store.read(session.session_id)]
+    assert "codex_failed" in kinds
+    assert "codex_completed" not in kinds
