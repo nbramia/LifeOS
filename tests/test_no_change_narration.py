@@ -55,11 +55,13 @@ BASELINE_PATH = Path(__file__).resolve().parent / "narration_baseline.json"
 # character (not itself meaningful here, but excluded to avoid matching
 # inside identifiers or URLs).
 PATTERN = re.compile(
-    r'\b(previously|used to|no longer|now (that|runs|uses|does|returns|caches|computes|reads|serves|renders|records|handles|lives|sends|includes|applies|filters|accepts|performs|takes|opens|keeps|points|reports|writes|rejects|carries|resolves|means)|'
+    r'\b(previously|used to|no longer|(?<![-\w])now (that|\w+s\b)|'
     r'(was|were) (a |an |the |previously |once )?(added|removed|replaced|introduced|changed|reworked|rewritten|moved|dropped)|'
     r'before this|after this|improv(ed|ement|es)|faster than|instead of the (old|previous)|'
     r'the old (code|behaviou?r|implementation|version|path|endpoint|flow)|'
-    r'(this|the) (change|fix|milestone|PR)\b|as of 20|used to be|'
+    r"(this|the) (change|fix|milestone|PR)\b|(the|this) (issue|ticket)('s|s')|"
+    r"(the|this) (issue|ticket) (said|says|suggested|suggests|asked|asks|wanted|wants|"
+    r"set out|calls for|called for|specified|specifies)|as of 20|used to be|"
     r'has been (added|moved|changed|removed|replaced|rewritten)|historically|formerly|in the past|'
     r'earlier (version|implementation|code)|round [0-9]|finding [0-9]|review(er)? (round|finding))'
     r'|(?<![\w#])#\d{3,5}\b',
@@ -241,7 +243,7 @@ def _gather_targets() -> list[Path]:
         p = REPO / name
         if p.exists():
             targets.append(p)
-    for d in ("api", "scripts", "tests"):
+    for d in ("api", "config", "scripts", "tests"):
         targets.extend((REPO / d).rglob("*.py"))
     mcp = REPO / "mcp_server.py"
     if mcp.exists():

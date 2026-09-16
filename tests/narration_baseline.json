@@ -100,7 +100,8 @@
     "# (round 1, finding #6) Serializes the todo/running-session checks and the",
     "# (round 2, finding #1) That gap is only ever a few seconds wide \u2014 the CLI",
     "New card-assignment endpoints (#851): the model catalog and the",
-    "every lifecycle event it posts (#849), and `POST /cli-sessions/events`"
+    "every lifecycle event it posts (#849), and `POST /cli-sessions/events`",
+    "now moves the card to `in_progress` the moment that session registers"
   ],
   "api/routes/agent_proxy.py": [
     "Agent text-backend proxy (#361).",
@@ -343,6 +344,7 @@
     "# `POST /api/hermes/resolve-persona` (#644) \u2014 persona selection for Hermes's",
     "# `caller_session_id` (#640) is added here, on the envelope's copy of",
     "# a genuine truncation, distinct from #592's disconnect-truncation",
+    "# caller_session_id), so the persona now reaches Hermes like any other;",
     "# completion -- see the class docstring's #611 paragraph.",
     "# docstring's #611 paragraph. finalize() treats \"never saw done\" as",
     "# doctor). The #590 contract told Hermes to fail loudly if it ever",
@@ -468,8 +470,10 @@
   "api/routes/journal_trends.py": [
     "(issue follow-up to #212).",
     "An earlier version took `window` and used the wheel's day/week/month/",
+    "Deliberately reuses rather than reimplements, per the issue's explicit",
     "`api.services.entity_resolver` \u2014 was removed after operator feedback that",
     "before this file existed was already a full unit on its own. Splitting",
+    "reinvention the issue asked to avoid.",
     "the form used to have but later removed still shows up as \"available,"
   ],
   "api/routes/scheduler.py": [
@@ -510,12 +514,14 @@
     "# The accepted marker for Review -> Done (#850) \u2014 a tag, not a new status",
     "# actually dispatching to an engine from an assignee tag is issue #851",
     "# only Done (the accept path) may act on it directly (round-2 finding 2a).",
+    "# symbol, per the issue's constraints.",
     "# the worker's own claim state (round-2 finding 1: the round-1 strip of",
     "#850) \u2014 a tag, not a new status",
     "#851",
     "Kanban board view-model helpers for `/agents` (#850).",
     "See the lane table in issue #850. Never stored \u2014 recomputed on every",
-    "lane table in issue #850 without a TaskManager or SchedulerStore fixture."
+    "lane table in issue #850 without a TaskManager or SchedulerStore fixture.",
+    "way, matching the issue's rule that both show in Done."
   ],
   "api/services/agent_loop.py": [
     "# #615: hand the caller a live reference to `result` before the loop does",
@@ -847,6 +853,7 @@
     "# before any API dispatch happens without a confirmation (#584) \u2014 the tags",
     "# configured and valid (#803). Holds the original `sane_reason` so the",
     "# constraint (see `_DESTRUCTIVE_TITLE_RE` / #747), so the code cannot rely on",
+    "# default the issue calls for: inference still asks, never spends.",
     "# downgrade it to `ask` so the worker confirms first (#584). The classifier's",
     "# exactly the false-positive failure mode #747 exists to fix.",
     "# failure mode #757 exists to catch for `local` \u2014 and this gives that case",
@@ -917,6 +924,7 @@
     "Build the #654 remote-provider `LocalLLMClient`, unconditionally.",
     "Compute the cache-cold cost estimate and apply #139 \u00a76 + \u00a77 gates.",
     "Establish `sane_fatal` independent of the model's own claim (#747).",
+    "LLM route now needs `routing_explicit=True` *and* a matching",
     "One more `ask` source needs excluding: `_apply_tag_overrides`'s #584",
     "Same construction as the #704 fallback branch (order 3 below): base URL,",
     "This closes that gap the same way #584 already closes it for cloud: a",
@@ -1085,6 +1093,7 @@
     "# A reply that arrived MID-RUN (status-anchor route, #458) is",
     "# Affirmative replies that lock a proposed [GOAL] (#398). A goal-approval reply",
     "# CLI id there is nothing to resume \u2014 say so (#458).",
+    "# Every completed task now lands a durable note in the vault's",
     "# Human-queue done_when poll (#852) \u2014 throttled independently of the",
     "# Operator root-spawns (#235) are root sessions (no parent) so they DO",
     "# Operator root-spawns (#235) have no backing vault task, so skip the",
@@ -1094,6 +1103,7 @@
     "# Primary keeps the original callback (byte-identical to pre-#348). An",
     "# Re-execute guard (#411) \u2014 mirrors the claude_code dispatch (#400/#408).",
     "# Remote route (#809, `#cloud` tag): the configured remote",
+    "# Resolve Human-queue cards whose done_when condition now passes.",
     "# Sanity gate (#747). Only a *fatal* sane=False fails the task",
     "# The engine-choice confirmation (#584). Every route offered here except the",
     "# URL \u2014 which embeds the bot token) would leak the token every send (#519).",
@@ -1140,6 +1150,7 @@
     "# to a CLI engine (#753) go through this pool via _submit_cli_dispatch.",
     "# to retry. Spawned children keep the old behavior; their parent",
     "# turn boundary is here, mirroring reopen-on-send (#428): resume",
+    "# typed reply now requires 'anthropic', 'api', 'managed', or a model name",
     "# vault row, so both vault ops are skipped for them (#401 review).",
     "# worker is paused or near its daily cap (#852 R2).",
     "#100 acceptance: restart-resumable).",
@@ -1238,6 +1249,7 @@
     "Exception \u2014 deliberate self-restart (#401): a session named in the",
     "One-line flag naming the engine(s) a session delegated work to (#349).",
     "Operator replied to a proposed [GOAL] (#398). On approval, inject",
+    "Resolve open Human-queue cards whose `done_when` check now passes",
     "STATUS_COMPLETED without an earned completion signal (#760,",
     "That is the safe reading of an ambiguous word now that both exist: the",
     "True when a goal-approval reply means 'lock it and go' (#398).",
@@ -1285,6 +1297,7 @@
     "# #616 lifted the modality-keyed gate that used to live here:",
     "# Opaque, client-generated key (#611 review) \u2014 known to the client",
     "# `build_system_prompt()` call) and for observability. #616 lifted",
+    "# a voice turn's disconnect now detaches exactly like a text turn's,",
     "# finished one (the #611 problem statement: \"a partial answer... looks like",
     "# in the whisper-relay repo) used to only abandon this stream",
     "# so this field no longer changes cancellation behavior on its own.",
@@ -1310,9 +1323,13 @@
   ],
   "api/services/claude_code/session_ingest.py": [
     "# `_cost_from_usage` (#669). Sticky for the session: distinguishes a",
+    "# distinct objects from the ones the cache entry now owns, so a caller",
     "#669). Sticky for the session: distinguishes a",
     "record): it costs $0.00 and `unpriced=True` is returned instead (#669).",
     "the agent worker's cost accounting after #145 / #157 landed"
+  ],
+  "api/services/codex/session_ingest.py": [
+    "# distinct objects from the ones the cache entry now owns, so a caller"
   ],
   "api/services/conversation_store.py": [
     "# (#403). Existing rows backfill to NULL (no spawned session).",
@@ -1403,6 +1420,7 @@
     "two-sourced again, which the #644 AC forbids."
   ],
   "api/services/human_queue.py": [
+    "# execution surface reachable by any agent (see the issue's Out of Scope).",
     "Human queue: fire-and-forget cards any agent can file for the operator (#852)."
   ],
   "api/services/imessage.py": [
@@ -1427,6 +1445,7 @@
     "Useful for cleanup before re-indexing vault notes with improved"
   ],
   "api/services/job_queue.py": [
+    "# WhatsApp is intentionally absent \u2014 it now ships via the Mac Mini Apple",
     "# process's start time\" (#768): JobQueue is a per-process singleton",
     "# row still RUNNING with a started_at before this timestamp cannot",
     "#768): JobQueue is a per-process singleton",
@@ -1671,6 +1690,51 @@
   ],
   "api/utils/memory_monitor.py": [
     "consecutive_warnings_to_stop: Stop after this many consecutive warnings (default 3)"
+  ],
+  "config/settings.py": [
+    "# #699 \u2014 lets the agent worker's `local` route fall back to the remote",
+    "# #851: card assignment to a host other than the API host, over ssh.",
+    "# Always \"lifeos\" (#684) \u2014 the primary bot never targets Hermes,",
+    "# Bounded lifetime for a chat turn that has detached from its client (#611):",
+    "# Hermes text backend (an agent harness reached as a gateway, #587). Proxied",
+    "# Host guard (#506): the ONE machine allowed to run this API server. A",
+    "# Idle timeout (#723): a disjoint budget from the two above, for the",
+    "# Investments (Schwab pipeline snapshot, #767). A separate export pipeline",
+    "# Journal ring ingest (#660) \u2014 a wearable (e.g. the Pebble Index ring) posts",
+    "# LLM Backend: \"anthropic\" (default), \"local\", or \"remote\" (#771 \u2014",
+    "# Local LLM Router \u2014 historically Ollama-named; now consumed by the",
+    "# Paid OpenAI-compatible remote provider (#654) \u2014 e.g. Fireworks running",
+    "# Smart turn endpointing (#718): while auto-continue is on, the web client",
+    "# a disconnect no longer stops generation, but an abandoned turn still needs",
+    "# empty remote config (default) is byte-identical to pre-#699 behavior",
+    "# exactly as it does today (#566 PR 2). llama-server serves one model per",
+    "# is out of scope for this change. Left False and unwired on the client \u2014",
+    "# measure. After this much silence with nothing spoken, the client stops",
+    "# returning 404, silently breaking every specialist feature (#470).",
+    "# runs an energy VAD on the live recording stream and, after this much",
+    "# so it's never exposed to the browser (#361). Empty url = Agent disabled.",
+    "# the browser stays same-origin for mic/HTTPS (#361). See ADR-016.",
+    "#361). Empty url = Agent disabled.",
+    "#361). See ADR-016.",
+    "#470).",
+    "#506): the ONE machine allowed to run this API server. A",
+    "#566 PR 2). llama-server serves one model per",
+    "#587). Proxied",
+    "#611):",
+    "#654) \u2014 e.g. Fireworks running",
+    "#660) \u2014 a wearable (e.g. the Pebble Index ring) posts",
+    "#684) \u2014 the primary bot never targets Hermes,",
+    "#699 behavior",
+    "#699 \u2014 lets the agent worker's `local` route fall back to the remote",
+    "#718): while auto-continue is on, the web client",
+    "#723): a disjoint budget from the two above, for the",
+    "#767). A separate export pipeline",
+    "#771 \u2014",
+    "#851: card assignment to a host other than the API host, over ssh.",
+    "``primary`` and an orchestrating bot like ``doctor`` (#643).",
+    "shell \u2014 see #641). ``surface=None`` \u2014 every call site before this existed,",
+    "tasks to the primary bot. ``backend`` (#684) selects which pipeline answers",
+    "untouched, with no extra filesystem access: byte-identical to before this"
   ],
   "docs/AGENTS.md": [
     "- Specs are not changelogs, and neither are comments, docstrings, or tests. Don't add \"Added X in PR #N\" notes, \"this used to do X\" narration, or review-round/finding citations anywhere in the repo; that's what `git log` and `git blame` are for.",
@@ -2215,11 +2279,13 @@
     "#793).",
     "#852) \u2014 files/resolves operator-only-failure",
     "#852).",
+    "`failed_sources` is already exactly the classification this issue asks",
     "absence used to reach sync_gmail_calendar_interactions.py unguarded and",
     "card for a source that succeeded this run (#852).",
     "install that never set up personal Gmail/Calendar \u2014 issue #687.",
     "never enters that list), and resolve any previously-filed `sync:<source>`",
-    "resolves automatically once re-auth succeeds (#852). A no-op for any"
+    "resolves automatically once re-auth succeeds (#852). A no-op for any",
+    "snapshot taken now is only known to be a *usable* rollback point once the"
   ],
   "scripts/setup_identity.py": [
     "Guided first-run identity setup: owner, partner, family, work domains (#763).",
@@ -2340,6 +2406,7 @@
     "#682: the equivalent \"integration\" name-substring auto-mark used to",
     "#828 investigation) -- kept in the guard's blocklist anyway,",
     "(#652 follow-up).",
+    "(``api/services/agent_system_prompt.py``) now calls it on every call to",
     "Keep tests off the production Telegram offset file (#357).",
     "Reset the #611 chat-turn registry (`api/services/chat_turns.py`)",
     "Telegram reply-thread persona mapping (#644 follow-up).",
@@ -2377,6 +2444,7 @@
     "# Round-2 finding 1: agent-blocked means the worker owns this card",
     "# Round-2 finding 1: the worker owns a card carrying agent-running or",
     "# accept path (round-2 finding 2a)",
+    "# derive_lane \u2014 one test per row of the issue's lane table",
     "# plan_lane_move \u2014 landing lane invariant (#850 round-1 finding 1, sharpened",
     "# starting tags \u2014 never \"any 409 passes\" (round-2 finding 12/2c):",
     "# the target is In progress or Done (round-2 finding 1)",
@@ -2535,6 +2603,7 @@
     "API tests for the web /chat agent-threads endpoints (#236, Phase 3)."
   ],
   "tests/test_agent_threads_ui_browser.py": [
+    "# The main composer now continues the thread.",
     "# appears and both turns render \u2014 small threads stay unchanged (#270).",
     "#270 \u2014 a thread with a very large transcript must render bounded, not",
     "#270).",
@@ -2853,6 +2922,7 @@
     "case from PR #130.",
     "confirmation round-trip for a legitimate feature request \u2014 see #803.",
     "covers the second real title (#774, a macOS setup-script parity task)",
+    "failure. The empty-final-text guard now routes it through the failure",
     "model's prose) still fails closed \u2014 #747 must not weaken this guard.",
     "nothing useful, and idles without a final reply. Previously this got",
     "operator with the parent-internal child id. Per PR #132 invariant,",
@@ -2961,6 +3031,7 @@
     "cloud route must still go through #584's confirmation flow \u2014 `ask`, not",
     "configured) \u2014 the issue this fixes (#751) is specifically that a",
     "coverage deliberately, right next to the #757 tests, as the explicit",
+    "docs or web search. The prompt now tells the classifier that",
     "downgraded to `ask` (#584), so tests that want a real cloud dispatch either",
     "expectation (ambiguity used to hard-block even with a default route",
     "field-evidence payload's routing stands exactly as it did before this",
@@ -3013,6 +3084,7 @@
     "# (#850 round-3 finding 4). Cancel it first so aclose() sees a",
     "# Hermes label fix + Codex stream dispatch (#850)",
     "# Round-2 finding 10: without a mutation, ticks must not emit \u2014",
+    "# The row now looks exactly like it would after a Telegram reply via",
     "#850 round-3 finding 4). Cancel it first so aclose() sees a",
     "#850)",
     "API tests for the /agents Kanban board (#850).",
@@ -3036,6 +3108,7 @@
     "actually leave Human queue \u2014 the stale `human` tag used to keep it"
   ],
   "tests/test_agents_board_open.py": [
+    "# session state now looks fully reopenable.",
     "Round 1, finding #6: a genuine double-click \u2014 two OS threads racing",
     "Round 2, finding #1: `_opening_card_ids` used to be discarded ONLY on",
     "Tests for POST /api/agents/board/cards/{id}/open (#851, AC9) and the",
@@ -3044,6 +3117,7 @@
   "tests/test_agents_board_ui_browser.py": [
     "# #859: assignee claude/codex (unlike t2's \"me\") \u2014 used",
     "# Obviously synthetic \u2014 same shape GET /api/agents/models returns (#851).",
+    "# Second confirm click: the note now promises the kill, so it happens.",
     "# assign) \u2014 one popped entry per successful PUT (#850",
     "# assignee select PUTs `assignee` alongside `lane` (#859",
     "# deliberately skips re-rendering it (#850 round-2 finding 4), so a",
@@ -3077,6 +3151,7 @@
     "Round-1 finding 8: the Tags field must not let a vault-comment",
     "Round-1 finding 9: a rejected assignee change (the lane PUT 409s)",
     "Round-2 finding 5 (reworks round-1 finding 12(b)'s test, which was",
+    "The issue's own repro: hold an effort save, change the assignee,",
     "`{\"status\": <code>, \"detail\": <str>}` \u2014 the 409 failure path (#859);",
     "a fixed timer (#850 round-2 finding 5). `board_stream_frames` (and",
     "board write path. Round-2 finding 9: the docstring claimed all",
@@ -3133,6 +3208,7 @@
     "#820 follow-up): these",
     "#820) \u2014 a partial export run must not refresh",
     "#820: per-source exported_at/agent_sha)...",
+    "(zero .abcdp files found), the export-side fix now marks that as an",
     "A manifest written before #820 has no per-source exported_at at",
     "Historically (issue #505) export_contacts returned {\"status\": \"ok\",",
     "Issue #226 policy: an unresolved phone observation still produces",
@@ -3196,6 +3272,7 @@
     "actually happen (#777 acceptance criterion).",
     "review, #833/F6) \u2014 every caller already calls `holder.terminate()` in",
     "self-tracked restart marker means tests can no longer fake \"the service",
+    "the process-spawn contention this is trying to survive. It now calls",
     "the same technique used to isolate `service_active_since_epoch` from a real",
     "the whole vault via `find`) used to be computed unconditionally near",
     "time (well before this pull) proves it's still stale."
@@ -3206,6 +3283,7 @@
     "# #643 regression guard, weakened by #642: this used to guard against",
     "# (\"still runs on LifeOS, regardless of backend\") \u2014 no longer true,",
     "# Configured but unreachable (#688) \u2014 distinct from both",
+    "# Stand-in for the issue's two entry paths (opening /chat directly vs.",
     "# `handoff` (like primary/doctor) but `orchestrates: false`. #642",
     "# hermes (#642): Hermes drives it itself now, not LifeOS",
     "# hermes (#642): Hermes drives it itself now, not this client",
@@ -3230,11 +3308,13 @@
     "#688: a Hermes that's configured but down must default `/chat` to",
     "AC (#590): 'The persona picker's contents shall not change based on",
     "Browser tests for the three-way LifeOS|Agent|Hermes backend selector (#587).",
+    "Hermes now matches Agent here even though the persona itself still",
     "Through #641, an orchestrating persona (e.g. doctor) always ran on",
     "`conversation_list` (#607) stubs the body of the sidebar's `GET",
     "`conversations` (#592) maps a conversation id to the body `GET",
     "`persona.js` treats those two differently (#607) \u2014 only the latter is",
     "instead of the Hermes proxy. #642 gave Hermes its own way to drive that",
+    "orchestrating persona's Hermes turn now posts to the Hermes proxy like",
     "persona (lifeos_agent_spawn, #640) and removed the divert: an",
     "sent in the same order; only responses could arrive out of order. The fix",
     "session this client tracks. Through #641, orchestration (not",
@@ -3293,7 +3373,9 @@
     "The corrected acceptance criterion #616 adds: a barge-in landing",
     "`client_turn_id`'s reason for existing (#611 review), now proven for",
     "barge-in gap #611 review closed for text and #616 now extends to voice.",
-    "reader is still attached, with the disconnect following. #611"
+    "now goes through the exact same explicit-cancel machinery as a text",
+    "reader is still attached, with the disconnect following. #611",
+    "removed this exact sequence is what a real barge-in now produces on"
   ],
   "tests/test_chat_turn_cancel_usage.py": [
     "# The partial-text persistence #611 already guarantees is unaffected.",
@@ -3304,6 +3386,7 @@
     "#629: mimics an AnthropicLLMClient-backed turn cancelled mid-round.",
     "A consumer (or, as here, a test double) that predates #615 and",
     "Regression guard for #611's own acceptance criterion: a turn that",
+    "`run_agent_loop` now yields a `turn_state` event carrying a live, mutable",
     "did before #629 -- this backend gets no incremental-usage improvement,",
     "from #615's behavior, not a regression introduced by #629.",
     "persists the partial text exactly as #611 designed it."
@@ -3317,6 +3400,7 @@
     "no explicit cancel \u2014 no longer means \"stop\": a voice turn detaches and"
   ],
   "tests/test_chat_turns.py": [
+    "# now unblocks",
     "Unit tests for api/services/chat_turns.py (#611) \u2014 the turn registry"
   ],
   "tests/test_chunker.py": [
@@ -3335,6 +3419,7 @@
     "Tests for the #828 one-off cleanup script"
   ],
   "tests/test_cleanup_worktrees.py": [
+    "# The add the doctor would run next now succeeds.",
     "A leftover directory git no longer tracks (e.g. metadata pruned but the",
     "Idempotency / stale-collision tests for scripts/cleanup-worktrees.sh (#400)."
   ],
@@ -3342,6 +3427,7 @@
     "# Developer message was dropped."
   ],
   "tests/test_codex_skill_sync.py": [
+    "directories it copied from `.agents/skills/` \u2014 Codex now gets the",
     "lifecycle from the `benjamcalvin/bootstraps` marketplace instead (#491)."
   ],
   "tests/test_codex_spawn_executor.py": [
@@ -3387,6 +3473,7 @@
   "tests/test_create_contact_persons.py": [
     "# Person + link already exist before this script ever runs (e.g.",
     "# already linked, no longer \"unlinked\"",
+    "# created via WhatsApp import, as in the issue's control case).",
     "Motivating case: a phone-less, email-only contact (#700).",
     "Tests for scripts/create_contact_persons.py (#700)."
   ],
@@ -3427,6 +3514,7 @@
     "review, #833/F6, applied here too for the same reason) \u2014 every caller",
     "running row means busy (yielded does not \u2014 see #636).",
     "silently: 62 consecutive skips on the real host, during which #631's drift",
+    "the process-spawn contention this is trying to survive. It now calls",
     "the worker \u2014 mid-session \u2014 defers instead (#631 acceptance: never",
     "this is the exact scenario that silently restarted nothing (#631).",
     "to the one tracked api/ file, an hour in the past.",
@@ -3457,6 +3545,7 @@
     "The #398 acceptance criterion: the proposed condition is durable via",
     "bot='primary' must still match pre-#348 rows that have NULL bot.",
     "goal used to stream as its own message with a separate instruction",
+    "is retired \u2014 a fresh message now flows through the same chat pipeline",
     "pipeline is ever reached \u2014 unaffected by #684's retirement of the",
     "pipeline normally, exactly as before #684."
   ],
@@ -3686,6 +3775,7 @@
     "caller_session_id, used to `lifeos_agent_spawn` a worker, must produce a",
     "figure reflects only turns already completed before this one started.",
     "inversion is deliberate, not a weakening -- see #616.",
+    "longer stops the turn early at all. The invariant this test now pins is",
     "observed. Fixed for #592 by observing before yielding.",
     "prelude-delivery fix (#685 finding 2): a capture that succeeds while",
     "that happens, #674's bug a third time.",
@@ -3716,6 +3806,7 @@
     "Regression tests for the file-descriptor leak in the export path (#647).",
     "`contextlib.closing`, matching the export-path fix in #647.",
     "bounds as 'YYYY-MM-DD' strings (previously crashed on str.isoformat) and",
+    "entity_resolver-based behavior, and the confidence signal it now surfaces",
     "imessage.py used to define resolve_entity_id twice: a people_aggregator-",
     "issues single-day queries for 'yesterday'/'on <date>' (previously returned",
     "messages (#647).",
@@ -3753,10 +3844,12 @@
     "start_time comparison outright (#768 Codex review)."
   ],
   "tests/test_jobs_route.py": [
+    "# Simulate a process restart: process_start_time now postdates started_at.",
     "Tests for the /api/jobs/* endpoints' additive `stale` field (#768)."
   ],
   "tests/test_journal_capture.py": [
     "# Since #769 the reservation only applies with the journal persona",
+    "# The key was NOT burned: the genuine retry now lands.",
     "#660's mocked tests could not see through.",
     "#674: journal capture actually writes the fragment.",
     "#769 the reservation only applies with the journal persona",
@@ -3774,6 +3867,7 @@
     "#674).",
     "#674: the persona used to tell the model to append the bullet via",
     "#769 the guard only applies",
+    "- the persona file itself states the behavior the issue specifies (mirrors",
     "Tests for the `journal` persona (#659) \u2014 disjointed-fragment capture into",
     "`api/services/journal_capture.py`, because the tool it used to be told to",
     "capture path (#674 moved capture out of the persona's prompt and into"
@@ -3872,10 +3966,12 @@
     "and the request body is byte-identical to before this feature existed",
     "astream(..., timeout=180), which used to raise TypeError on the",
     "chain-of-thought and never reaches an answer used to fail silently",
+    "configured) now gets query routing, conversation titling,",
     "construction -- byte-for-byte the same request as before this",
     "generate_text retries against (#773).",
     "header at all \u2014 not an empty one \u2014 same as before this parameter",
     "independent of the orchestrator model (#470 \u2014 was a hardcoded dated",
+    "llama-server, it now falls back to that instead.",
     "llama-server-specific (#654): a configured `model`/`api_key` reach the",
     "logged naming the cause (thinking) and the fix (disable it / raise",
     "propagates exactly as it did before this fallback existed, so"
@@ -4022,6 +4118,7 @@
     "#744 revision)",
     "#746 deliberately defers extracting shared orchestration-invariant prose",
     "#746)",
+    "(an orchestrating persona's Hermes turn now reaches the Hermes proxy",
     "Drift guard for #643: list_http_personas()'s `orchestrates` must",
     "Endpoint-level drift guard for #643: `GET /api/personas`'s",
     "Tests for HTTP persona discovery and persona_id chat scoping (issue #351).",
@@ -4092,6 +4189,9 @@
     "than a fuzzy heuristic (see the third class -- #769's \"hardcoded value",
     "trivially bypassed by the other styling (Codex review finding)."
   ],
+  "tests/test_route_handlers_concurrency.py": [
+    "# The issue's own acceptance bound. Measured non-flaky even under deliberate"
+  ],
   "tests/test_run_all_syncs.py": [
     "(issue #687). Personal has no explicit on/off toggle like work/work2 --",
     "A source that historically takes minutes finishing in <2s is flagged.",
@@ -4117,12 +4217,14 @@
     "manage_schedules wrapper \u2014 the renamed surface from #246."
   ],
   "tests/test_scheduler_bot_validation.py": [
+    "- the fire path, which stays fail-open but now marks the misroute in the",
     "Before #575 nothing validated it, so a typo \u2014 or a name orphaned by a bot",
     "Tests for schedule notification-bot validation (issue #575)."
   ],
   "tests/test_scheduler_store.py": [
     "#245 \u2014 _fire_entry dispatches on action, records run history, hands off agents.",
-    "The index must never be observable half-rebuilt (issue #524)."
+    "The index must never be observable half-rebuilt (issue #524).",
+    "now shares \u2014 covered directly here for the multi-trigger case the"
   ],
   "tests/test_scheduler_watcher.py": [
     "Liveness reporting for /health (#766)."
@@ -4188,7 +4290,8 @@
   ],
   "tests/test_sync_google_sheets.py": [
     "Before this fix, a missing config/gsheet_sync.yaml (e.g. the gsheet-journal",
-    "Tests for scripts/sync_google_sheets.py's clean-skip path (issue #687)."
+    "Tests for scripts/sync_google_sheets.py's clean-skip path (issue #687).",
+    "from a real, quiet run. These tests pin that the script now surfaces the skip"
   ],
   "tests/test_sync_health.py": [
     "# (not gmail_personal) since #687: a dev checkout with no",
@@ -4424,6 +4527,7 @@
     "Browser tests for smart turn endpointing in auto-mode voice recording (#718)",
     "Idle timeout (#723): a recording that captures no speech at all is",
     "The endpointing ScriptProcessorNode (#734's tap #3 -- see the",
+    "While the **Auto** dock toggle is on, `web/chat/voice.js` now decides *when a",
     "`LIFEOS_VOICE_IDLE_TIMEOUT_MS` (#723, `TestIdleTimeout`/`TestIdleTimeoutThenWake`",
     "acquire its own mic. Listening (#710, on by default) holds its own",
     "and the idle timeout for a recording with no speech at all (#723).",
@@ -4467,7 +4571,8 @@
     "#801: \"one held blob, replaced by the next recording -- not an",
     "The five behaviors #801 calls out explicitly, each independent of the",
     "connections (#801).",
-    "never satisfy, and #801's retry/held-recording mechanics only have"
+    "never satisfy, and #801's retry/held-recording mechanics only have",
+    "policy `web/chat/voice.js` now implements:"
   ],
   "tests/test_voice_proxy.py": [
     "# Persistence tee (#711) \u2014 `_VoiceTurnPersister`",
@@ -4479,6 +4584,7 @@
     "transcribe/wake-check call (#710) that errors or is cancelled before a"
   ],
   "tests/test_voice_rate_toggle_playback_ui_browser.py": [
+    "\"say so\" requirement: a genuine (non-benign) playback failure now surfaces in",
     "Browser tests for the 2x-toggle spoken-playback regression (#608).",
     "Control: the AC requires the fix to hold on the shared-element",
     "Reproduction (see the PR description for the full trace): the actual defect",
@@ -4502,6 +4608,7 @@
     "Also checked directly via isEndpointTapActive() (#734's tap",
     "Browser tests for the spoken-cancel discard while recording (#722).",
     "Rides on #718's smart-turn endpointing candidate-pause transcript rather than",
+    "in `web/chat/voice.js` now checks the SAME transcript it already fetches from",
     "never re-arms auto-continue (#721): the only re-arm trigger is",
     "unreachable), or 'cancelled' (a spoken-cancel discard, #722)."
   ],
@@ -4541,6 +4648,7 @@
     "branch and #832 generalized to every exit path) is what prevents it.",
     "first -- a real trigger per #832's own issue (a slow server response, or a",
     "instead of a sleep-and-hope (#832/F4). Never passes a blob (headless --",
+    "newer turn now owns it. `isOwnTurn()` (an identity check against the settling",
     "proven, not just the function it calls (#832/F10).",
     "turn's own captured `AbortController`, the pattern #827 introduced for one"
   ],
@@ -4553,8 +4661,11 @@
     "#725: the chime used to always play via a fresh `new Audio()` -- an element",
     "- The #608 regression guard: a wake match while a real TTS clip is still",
     "When Listening (#710) recognizes the wake word \"Hermes\", `triggerWakeRecording()`",
+    "`manifest.json` -- it stubs the manifest response (the repo now ships real",
     "`useSharedTtsAudio()` takes the shared-element path (#725).",
-    "before #725."
+    "before #725.",
+    "in `web/chat/voice.js` now plays one randomly-chosen sound from the bundled",
+    "silently blocks. `playWakeChime()` now branches on `useSharedTtsAudio()`:"
   ],
   "tests/test_web_manifest_api.py": [
     "# cleanly (#731).",
@@ -4618,11 +4729,13 @@
     "// do here, just avoid an unhandled rejection now that it re-throws.",
     "// drawer (#850 round-3 finding 1).",
     "// last card the drawer actually shows (#850 round-2 finding 4).",
+    "// mid-navigation (an option or a chip's remove button now has",
     "// own (#850 round-2 finding 2b).",
     "// rejected choice (#850 finding 9).",
     "// that same card id (#850 verify-1 finding 3).",
     "// that was never actually persisted (#850 finding 9).",
     "// the drawer (#859 review round 1 finding 1).",
+    "// the issue's scope \u2014 no bulk untagging.",
     "// there \u2014 #850 finding 4) but never drag between lanes: their lane is",
     "// whether an SSE tick needs to rebuild the drawer at all (#850 finding 2)."
   ],
@@ -4645,6 +4758,7 @@
     "// (#359) \u2014 only personas with the `handoff` capability may trigger",
     "// (lifeos_agent_spawn, #640), carrying a Hermes-specific preamble the proxy",
     "// Chat SSE client (#358): streams an answer from /api/ask/stream and the",
+    "// Hermes now drives its own background worker for these personas",
     "// LifeOS-native with no Hermes equivalent (#596). #642 removed that divert:",
     "// Orchestrating personas (e.g. doctor) used to always run on LifeOS, even",
     "// Orchestrating-persona spawn (#403/#412): this turn started a",
@@ -4728,6 +4842,7 @@
     "// a non-primary persona was previously chosen), fall back to the first option",
     "// agent backend (no persona pass-through there) and, since #642, the hermes",
     "// and since #642 an orchestrating persona's Hermes turn is driven by Hermes",
+    "// backend too (Hermes now drives orchestrating personas itself rather than",
     "// function (before this function's first await) would still race the",
     "// hasn't been resolved yet at this point (initBackend() runs after this),",
     "// like `doctor`. Used to decide whether a turn should poll for a",
@@ -4839,6 +4954,7 @@
     "// already-granted origin does not re-prompt on its own. (#724's own",
     "// await below, so a concurrent second call -- #718's hard cap, a",
     "// before this ever settles -- it already reset thinking/cancel/status",
+    "// below that would otherwise touch module state a newer turn now owns",
     "// caller) and this offers the only two things #801 promises -- resubmit the",
     "// candidate's \"complete\" verdict, and #723's idle timeout can each reach",
     "// capture itself live regardless, which is exactly the mechanism #734",

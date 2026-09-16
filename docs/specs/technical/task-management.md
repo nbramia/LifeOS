@@ -314,9 +314,9 @@ freshly reindexed task, but it does not attempt a field-level three-way
 merge against a concurrent, unrelated edit to the *same* task (e.g. the
 operator renames a task in Obsidian in the same instant the API is changing
 its due date). The later writer's full requested change wins outright for
-that task — an accepted simplification for a single-user vault, and a
-narrower race window than the previous cached-line-number addressing had
-for the sibling-line case this issue set out to fix.
+that task — an accepted simplification for a single-user vault. Addressing a
+task by id keeps the race window narrow in the sibling-line case, because a
+write never depends on a cached line number staying valid.
 
 ## Conflict files
 

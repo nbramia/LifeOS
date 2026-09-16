@@ -1,7 +1,7 @@
 # Configuration Guide
 
 **Status:** Complete
-**Last Updated:** 2026-09-15
+**Last Updated:** 2026-09-16
 **Audience:** Operators
 
 **This is the single authoritative reference for every `LIFEOS_*` environment variable and the third-party service variables (`ANTHROPIC_API_KEY`, `OLLAMA_*`, `SLACK_*`, `TELEGRAM_*`, `MONARCH_*`) that LifeOS reads.** Other guides reference this file rather than restating defaults — when documentation conflicts, this file wins (and `config/settings.py` wins over both, since the code is the source of truth).
@@ -29,10 +29,16 @@ Each section corresponds roughly to a section in [`config/settings.py`](../../co
 | `LIFEOS_BACKUP_KEEP` | int | `2` | Nightly snapshots retained per database. Older ones are pruned only after a fully successful sync whose newest snapshot passes an integrity check, so repeated failures cannot rotate away the last good copy. |
 | `TAILNET_HTTPS_URL` | str | — | Your machine's Tailscale HTTPS URL (no port), e.g. `https://<your-machine>.<tailnet>.ts.net`. Used by `scripts/setup-tailscale.sh` status output, and returned as `secure_url` by `GET /api/chat/config` so `/chat` can offer a one-tap link here when the mic is blocked by an insecure context. **Open `/chat` on this URL for voice** — the mic requires HTTPS. |
 | `LIFEOS_VOICE_GATEWAY_URL` | str | `http://127.0.0.1:9788` | whisper-relay base URL; LifeOS reverse-proxies `/api/voice/*` here (ADR-016). |
+| `LIFEOS_VOICE_ENDPOINT_SILENCE_MS` | int | `1600` | Trailing silence (ms) after speech in auto-mode voice recording before a candidate turn-endpoint check runs. Client-side timing only, read via `GET /api/chat/config`. |
+| `LIFEOS_VOICE_ENDPOINT_HARD_CAP_MS` | int | `3000` | Continuous silence (ms) in auto-mode voice recording that finalizes the turn regardless of the completeness check. Client-side timing only. |
+| `LIFEOS_VOICE_IDLE_TIMEOUT_MS` | int | `10000` | Silence (ms) with no speech detected at all in auto-mode voice recording before the dock stops listening. Client-side timing only. |
+| `LIFEOS_VOICE_ENDPOINT_SEMANTIC` | bool | `false` | Reserved for an optional LLM completeness classifier for ambiguous turn endings. The heuristic governs every completeness decision, so this flag has no effect. |
+| `LIFEOS_CHAT_DEFAULT_VOICE` | bool | `false` | Make voice the default `/chat` input mode. A `?mode=` URL parameter or a stored preference takes precedence. |
 | `LIFEOS_AGENT_BACKEND_URL` | str | *(empty)* | Agent text backend base URL. LifeOS proxies it at `/api/agent/ask/stream`, adding a bearer server-side. Empty disables the `/chat` Agent option entirely. Deliberately absent from `.env.example` — see [voice-setup.md](voice-setup.md#optional-agent-and-hermes-text-backends). |
 | `LIFEOS_AGENT_BACKEND_TOKEN` | str | *(empty)* | Optional bearer token for the Agent text backend, added server-side (never exposed to the browser). |
 | `LIFEOS_HERMES_BACKEND_URL` | str | *(empty)* | Hermes text backend base URL, proxied the same way at `/api/hermes/ask/stream` (#587). Empty disables the `/chat` Hermes option; with no stored backend preference, `/chat` defaults to Hermes when it's configured and reachable, else LifeOS. Deliberately absent from `.env.example`. |
 | `LIFEOS_HERMES_BACKEND_TOKEN` | str | *(empty)* | Optional bearer token for the Hermes text backend, added server-side. |
+| `LIFEOS_HERMES_TASK_QUESTIONS` | bool | `false` | Delivers a Hermes-assigned task's clarification questions to the Hermes Telegram DM instead of the primary bot. Depends on Hermes's own Telegram plugin forwarding a threaded reply to `POST /api/hermes/deposit-answer`; without that return path a question sent there has no way back. Progress and terminal notices use the Hermes channel regardless of this flag. |
 | `LIFEOS_DETACHED_TURN_TIMEOUT_SECONDS` | float | `300.0` | How long a chat turn (native or Hermes-relayed) may keep running after its client disconnects before it's cancelled (#611). The clock starts at disconnect, not at turn start, so a turn that stays watched is never affected by it. Matches the proxy's own upstream read timeout (`api/routes/_proxy.py`'s `TIMEOUT`), so a detached turn isn't cut off any earlier than a connected one already tolerates. |
 
 **Tailscale Serve (phone /chat + voice):** run once after install, then enable the user unit so it survives reboot:
@@ -277,9 +283,12 @@ Subprocess orchestration triggered from Telegram. See [claude-code-orchestration
 | Variable | Type | Default | Sets |
 |---|---|---|---|
 | `LIFEOS_CLAUDE_BINARY` | str | `claude` | Path to the Claude CLI binary. |
+| `LIFEOS_CODEX_BINARY` | str | `codex` | Path to the Codex CLI binary. Read by `codex_executor.py` (spawn) and `model_catalog.py` (readiness probe). |
 | `LIFEOS_CLAUDE_TIMEOUT` | int | `3600` | Safety-net wall-time per session, seconds. Heartbeats keep you informed; this is a backstop. |
 | `LIFEOS_CLAUDE_MAX_TURNS` | int | `50` | Max turns per session. |
 | `LIFEOS_CLAUDE_MAX_COST` | float | `2.0` | Max cost per session, USD. |
+
+Both binary settings resolve the same way (`api/services/agent_worker/binary_resolver.py`): an absolute path is an explicit operator override, honoured exactly and never repaired by falling through to a search, so a wrong override is visible rather than silently worked around. A bare name resolves against `$PATH`, then `~/.local/bin`, `/usr/local/bin`, `~/.npm/bin`, `/opt/homebrew/bin`, then `~/.nvm/versions/node/v*/bin` newest-first.
 
 ## User Identity
 

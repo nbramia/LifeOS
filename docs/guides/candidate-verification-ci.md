@@ -1,7 +1,7 @@
 # Candidate Verification CI
 
 **Status:** Partial
-**Last Updated:** 2026-09-12
+**Last Updated:** 2026-09-16
 **Audience:** Operators
 
 Candidate verification runs on GitHub-hosted ephemeral runners. The publisher
@@ -71,16 +71,24 @@ of a partitioned run:
   --lane-log-dir /path/to/lane-logs
 ```
 
-### What running the gate in parts still waits on
+The hosted workflow uploads its `--lane-log-dir` as an artifact only on a
+failed execution job (`if: ${{ failure() }}`), so a passing hosted run leaves
+no lane logs to harvest. Refresh the record from a local run's
+`--lane-log-dir` instead.
 
-The hosted gate runs one execution job, not a matrix. Partitioning a lane is
-safe only where every module in it establishes its own prerequisites. A
-cross-module prerequisite — a module whose tests pass only because some other
-module created runtime state first — is one no partition of whole modules can
-satisfy, and it shows up as a conditional skip that a part takes and a whole
-lane does not. A module that reads the runtime `interactions` database creates
-that table through `require_db`, so it reports the same outcomes selected alone
-as it does beside the whole lane.
+### The partitioning safety invariant
+
+The hosted gate runs each retained lane across a 4-part matrix
+(`.github/workflows/candidate-verification.yml`'s `strategy.matrix.part: [0,
+1, 2, 3]`, `fail-fast: false`), each part invoking the verifier with its own
+`--part-index`/`--part-count`. Partitioning a lane is safe only where every
+module in it establishes its own prerequisites. A cross-module prerequisite —
+a module whose tests pass only because some other module created runtime
+state first — is one no partition of whole modules can satisfy, and it shows
+up as a conditional skip that a part takes and a whole lane does not. A
+module that reads the runtime `interactions` database establishes that table
+itself through `require_db`'s module-scoped `interaction_schema` fixture, so
+it reports the same outcomes selected alone as it does beside the whole lane.
 
 Confirm that property for a lane before changing its topology: run an
 unpartitioned verification of one candidate and a partitioned verification of
