@@ -1,5 +1,5 @@
 """Tests for the usage tracking store (api/services/usage_store.py) and the
-admin usage summary that reads it (#595).
+admin usage summary that reads it.
 
 The store itself is backend-agnostic: `record_usage()` takes whatever model
 name and cost it's given and never recomputes or filters by model. This is
@@ -9,7 +9,7 @@ route change -- these tests are the proof.
 
 The one exception is a negative `cost_usd`: money spent can't be less than
 zero, so `record_usage()` clamps a negative value to 0.0 rather than storing
-it verbatim (#657) -- see `test_record_usage_clamps_negative_cost_and_logs`.
+it verbatim -- see `test_record_usage_clamps_negative_cost_and_logs`.
 """
 import sqlite3
 
@@ -43,7 +43,7 @@ def test_record_usage_stores_cost_verbatim(store):
 
 
 def test_record_usage_clamps_negative_cost_and_logs(store, caplog):
-    """A negative `cost_usd` (#657 -- e.g. a cache-token accounting bug that
+    """A negative `cost_usd` (e.g. a cache-token accounting bug that
     subtracts more than it should) must never reach the table: a floor that
     can be dragged below zero silently shrinks every SUM(cost_usd) it feeds
     (GET /api/admin/usage, session-cost totals). The guard clamps to 0.0 but
@@ -66,7 +66,7 @@ def test_record_usage_clamps_negative_cost_and_logs(store, caplog):
 
 def test_summary_totals_include_a_non_anthropic_model(store):
     """A row recorded under a model name the cost calculator
-    (`agent_worker/pricing.py`'s `cost_for`, #656) doesn't recognize
+    (`agent_worker/pricing.py`'s `cost_for`) doesn't recognize
     contributes to `get_summary()`'s totals exactly like a native one -- the
     store has no per-model branching that could exclude it."""
     store.record_usage(model="claude-haiku-4-5", input_tokens=100, output_tokens=50, cost_usd=0.001)
@@ -114,10 +114,9 @@ async def test_admin_usage_endpoint_includes_external_backend_totals(monkeypatch
 # session-to-date cost, and a marker distinguishing a row whose upstream
 # sent no `cost_usd` (recorded as 0.0, never invented) from a row that
 # reported a real cost of zero. Both otherwise land in this table
-# indistinguishably, which is exactly the gap #613 closes: prior to it,
-# `get_conversation_usage()`'s sum was always documented as an unconditional
-# floor, since there was no way to tell "these turns were free" from "some
-# were unpriced." With the flag, a sum containing only rows written after
+# indistinguishably, so without this marker there is no way to tell
+# "these turns were free" from "some were unpriced." With the flag, a
+# sum containing only rows written after
 # this column existed can be exact; a sum spanning any earlier row remains
 # a floor regardless of what this flag reports (see the docstring).
 # ---------------------------------------------------------------------------
@@ -142,9 +141,9 @@ def test_record_usage_stores_unpriced_flag(store):
 
 
 def test_existing_db_without_the_unpriced_column_is_migrated(tmp_path):
-    """A `usage.db` written before #613 has no `unpriced` column at all.
+    """A legacy `usage.db` has no `unpriced` column at all.
     `UsageStore.__init__` must add it via ALTER TABLE without erroring, and
-    existing rows must default to 0 (priced) -- that history genuinely
+    existing rows must default to 0 (priced) -- their pricing status
     can't be recovered as unpriced, so it's treated as priced rather than
     guessed at."""
     db_path = tmp_path / "pre_613_usage.db"

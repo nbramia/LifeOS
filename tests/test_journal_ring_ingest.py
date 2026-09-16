@@ -1,21 +1,21 @@
 """
-Tests for the journal ring ingestion endpoint (#660).
+Tests for the journal ring ingestion endpoint.
 
 POST /api/journal/ingest lets a capture device (e.g. the Pebble Index ring)
-feed transcribed fragments into the `journal` persona built in #659. The
+feed transcribed fragments into the `journal` persona. The
 underlying chat pipeline (`api.services.telegram.chat_via_api`) is mocked
 throughout — these tests cover the endpoint's own contract (auth, payload
 adapter, idempotency, clean failure) and that it calls into the pipeline the
 same way the journal Telegram bot does, not the persona's LLM behavior
-itself (which #659's own tests already note isn't unit-testable without a
-model). Never touches the real vault or a real chat pipeline.
+itself (which isn't unit-testable without a model). Never touches the real
+vault or a real chat pipeline.
 
-The mock returns `journal_capture` because since #674 the pipeline reports
+The mock returns `journal_capture` because the pipeline reports
 back that the fragment reached disk, and this endpoint refuses to call a
 delivery `logged` (or burn its dedupe key) without that confirmation — a
-mocked pipeline asserting only that it was *called* is precisely what let
-#674 ship. The tests that exercise a real capture, file content and all, are
-in tests/test_journal_capture.py.
+mocked pipeline asserting only that it was *called* would silently miss a
+capture that never actually happened. The tests that exercise a real
+capture, file content and all, are in tests/test_journal_capture.py.
 """
 import pytest
 from fastapi import FastAPI
@@ -29,7 +29,7 @@ pytestmark = pytest.mark.unit
 
 
 def _captured_result(conversation_id="conv-1"):
-    """What the chat pipeline returns for a journal turn since #674: a reply
+    """What the chat pipeline returns for a journal turn: a reply
     AND proof the fragment is on disk."""
     return {
         "answer": "Logged.",
