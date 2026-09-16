@@ -68,7 +68,7 @@ def wait_for_condition(predicate, timeout: float, interval: float = 0.2):
     if the timeout was reached). Used by the file-watcher tests
     (test_indexer.py, test_integration.py) to wait on the watcher's actual
     observable output instead of a fixed ``time.sleep`` that can undershoot
-    ``VaultEventHandler``'s batch-processing delay (#839) — callers should
+    ``VaultEventHandler``'s batch-processing delay — callers should
     derive ``timeout`` from that delay rather than guessing a duration.
     """
     deadline = time.monotonic() + timeout
@@ -121,7 +121,7 @@ def candidate_base_url():
 
 
 # ---------------------------------------------------------------------------
-# Force CPU-only embeddings under pytest (#521).
+# Force CPU-only embeddings under pytest.
 #
 # This host's iGPU has only 8 SDMA queues. `pytest -n auto` (see
 # scripts/test.sh) spawns one worker process per core (16 here), and any
@@ -176,14 +176,14 @@ def pytest_configure(config):
 
 
 # ---------------------------------------------------------------------------
-# Unmarked-test guard (#682)
+# Unmarked-test guard
 #
 # The pre-push hook and scripts/test.sh both select tests by marker
 # expression (`-m "unit and not slow"` / the negative filter). A test file
 # that carries none of the recognized category markers is silently deselected
 # from BOTH — it still collects and "exists", so nothing in CI or on push
-# reports it as missing. That's exactly how #646 and #677's regression guards
-# in tests/test_apple_pipeline.py went unmarked and unrun on push for months.
+# reports it as missing, and a regression guard living in that file can go
+# unrun on push indefinitely without anyone noticing.
 #
 # tryfirst=True so this sees every collected item before pytest's own -m
 # deselection hook removes anything — a brand-new unmarked file must fail
@@ -199,7 +199,7 @@ _RECOGNIZED_TEST_MARKERS = ("unit", "browser", "integration", "slow", "requires_
 
 
 # ---------------------------------------------------------------------------
-# Anthropic API call guard (#138)
+# Anthropic API call guard
 #
 # Bleeds happen when a test forgets to mock the LLM client and silently makes
 # a real billed call. Guard installs a process-wide httpx transport hook that
@@ -735,7 +735,7 @@ def _isolate_default_person_entity_store_path(request, tmp_path, monkeypatch):
 #
 # `CALENDAR_COLLECTION` is dead in practice: `CalendarIndexer` writes through
 # the vault-default `get_vector_store()` singleton instead of a collection of
-# its own (see #828 investigation) -- kept in the guard's blocklist anyway,
+# its own -- kept in the guard's blocklist anyway,
 # in case that ever changes.
 _LIVE_VECTORSTORE_COLLECTIONS = frozenset(
     {
@@ -750,7 +750,7 @@ _LIVE_VECTORSTORE_COLLECTIONS = frozenset(
 @pytest.fixture(autouse=True)
 def _guard_live_vectorstore_collections(request, monkeypatch):
     """Fail loudly if a test constructs a ``VectorStore`` against a real
-    production collection on the live ChromaDB server (#828).
+    production collection on the live ChromaDB server.
 
     ``VectorStore`` always opens a real HTTP connection
     (``chromadb.HttpClient`` to ``settings.chroma_url``, which defaults to
@@ -760,7 +760,7 @@ def _guard_live_vectorstore_collections(request, monkeypatch):
     by renaming the collection before construction; this fixture is the
     backstop for every *other* call site. 45 rows with
     ``/tmp/tmpXXXXXXXX/vault/...`` file_paths and real vault ``note_type``
-    values turned up in the live ``lifeos_vault`` collection (#828) —
+    values turned up in the live ``lifeos_vault`` collection —
     debris from `test_indexer.py`/`test_integration.py`/`test_people.py`'s
     `tempfile.TemporaryDirectory()`-based vault fixtures, predating (or
     bypassing) that per-collection isolation.
@@ -773,9 +773,9 @@ def _guard_live_vectorstore_collections(request, monkeypatch):
     import VectorStore``, or via ``get_vector_store()`` which resolves the
     bare name in ``vectorstore.py``'s own globals either way), so mutating
     its ``__init__`` catches all of them regardless of which module's
-    namespace holds the reference — unlike #652's ``SessionStore`` fix,
-    which had to swap the *class name* because that bug was about a default
-    argument bound once at class-definition time; here we're validating an
+    namespace holds the reference — unlike the ``SessionStore`` isolation
+    below, which has to swap the *class name* because that default
+    argument is bound once at class-definition time; here we're validating an
     incoming argument, not changing a default, so patching the method
     in place is enough and doesn't disturb ``_isolate_vault_indexer_stores``'s
     own wrapper (it still resolves to the same, now-guarded, class).
@@ -824,8 +824,7 @@ def _guard_live_vectorstore_collections(request, monkeypatch):
 @pytest.fixture(autouse=True)
 def _reset_vectorstore_singletons(monkeypatch):
     """Clear every process-wide singleton that can hold a live
-    VectorStore/HybridSearch/*Indexer instance, around every test (#828
-    follow-up).
+    VectorStore/HybridSearch/*Indexer instance, around every test.
 
     A handful of modules memoize a real instance in a module-level global
     the first time their getter is called: ``api.services.vectorstore``'s
@@ -870,7 +869,7 @@ def _reset_vectorstore_singletons(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _isolate_telegram_state_file(tmp_path, monkeypatch):
-    """Keep tests off the production Telegram offset file (#357).
+    """Keep tests off the production Telegram offset file.
 
     ``TelegramBotListener._STATE_FILE`` defaults to the process-global relative
     path ``data/telegram_state.json``. Any listener built without patching it —
@@ -947,7 +946,7 @@ def _stub_conversation_titler(monkeypatch):
 @pytest.fixture(autouse=True)
 def _isolate_gmail_draft_ledger(tmp_path, monkeypatch):
     """Stop tests from opening (and writing to) the production Gmail draft
-    send-gate ledger (#588).
+    send-gate ledger.
 
     ``GmailDraftLedger`` is a process-wide singleton keyed off
     ``settings.chroma_path`` — the real ``data/gmail_draft_ledger.db`` on
@@ -974,12 +973,12 @@ def _isolate_gmail_draft_ledger(tmp_path, monkeypatch):
 @pytest.fixture(autouse=True)
 def _isolate_usage_store_db(tmp_path, monkeypatch):
     """Stop tests from opening (and writing to) the production usage-
-    tracking DB (#610).
+    tracking DB.
 
     ``UsageStore`` is a process-wide singleton (``get_usage_store()``) keyed
     off ``settings.chroma_path`` — the real ``data/usage.db`` on whatever
     machine runs the suite. ``build_turn_context()``
-    (``api/services/agent_system_prompt.py``) now calls it on every call to
+    (``api/services/agent_system_prompt.py``) calls it on every call to
     look up session-to-date cost, so any test exercising
     ``GET /api/chat/turn-context`` or the Hermes envelope without patching
     it would open (and, via ``record_usage()``, write to) production data.
@@ -1007,7 +1006,7 @@ def _isolate_usage_store_db(tmp_path, monkeypatch):
 @pytest.fixture(autouse=True)
 def _isolate_hermes_persona_thread_store_db(tmp_path, monkeypatch):
     """Stop tests from opening (and writing to) the production Hermes-
-    Telegram reply-thread persona mapping (#644 follow-up).
+    Telegram reply-thread persona mapping.
 
     ``HermesPersonaThreadStore`` is a process-wide singleton
     (``get_persona_thread_store()``) keyed off ``settings.chroma_path`` —
@@ -1049,7 +1048,7 @@ def _isolate_hermes_question_thread_store_db(tmp_path, monkeypatch):
 @pytest.fixture(autouse=True)
 def _isolate_session_store_db(tmp_path, monkeypatch):
     """Stop tests from opening (and writing to) the production agent-session
-    store (#652).
+    store.
 
     Unlike ``ConversationStore`` (which resolves its default path by calling
     ``get_conversation_db_path()`` fresh on every construction, so patching
@@ -1066,16 +1065,16 @@ def _isolate_session_store_db(tmp_path, monkeypatch):
     ``SessionStore`` LOCALLY, inside the function that uses it, specifically
     so tests can replace the class in place —
     ``api/routes/hermes_proxy.py::_resolve_caller_session_id`` documents this
-    explicitly. #640 added a caller-session lookup to that function's
-    caller, ``_build_envelope()``; ``tests/test_hermes_proxy.py`` sandboxes
-    its own tests with a per-test fixture doing exactly this, but every
-    *other* test that reaches the Hermes envelope path had no such
-    protection and wrote real rows into the operator's live
+    explicitly. Its caller, ``_build_envelope()``, does a caller-session
+    lookup; ``tests/test_hermes_proxy.py`` sandboxes its own tests with a
+    per-test fixture doing exactly this, but every *other* test that reaches
+    the Hermes envelope path relies on this autouse fixture instead, to
+    avoid writing real rows into the operator's live
     ``data/agent_sessions.db``.
 
     Tests that construct ``SessionStore(db_path=...)`` directly are
     unaffected two ways over: most import the real class at module
-    collection time, before this fixture ever runs, so patching the name
+    collection time, prior to this fixture running, so patching the name
     afterward doesn't touch their already-bound reference; and for the local-
     import call sites that DO pass an explicit path (e.g.
     ``tests/test_agent_worker_mcp_exposure.py``'s
@@ -1107,14 +1106,13 @@ def _isolate_session_store_db(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _isolate_transcript_store_dir(tmp_path, monkeypatch):
-    """Stop tests from touching the production agent-transcript directory
-    (#652 follow-up).
+    """Stop tests from touching the production agent-transcript directory.
 
     ``TranscriptStore`` has the identical bound-at-import-time default-
-    argument shape as ``SessionStore`` above (``#640`` anchored both the
-    same way), so it needs the same class-patching treatment rather than a
-    ``DEFAULT_TRANSCRIPTS_DIR`` reassignment. Nothing on the Hermes envelope
-    path that motivated #652 touches ``TranscriptStore`` — only
+    argument shape as ``SessionStore`` above, so it needs the same
+    class-patching treatment rather than a ``DEFAULT_TRANSCRIPTS_DIR``
+    reassignment. Nothing on the Hermes envelope path touches
+    ``TranscriptStore`` — only
     ``agent_viz_summary_prefetch.py``'s (disabled-by-default-in-tests) busy
     check and ``api/routes/agents.py``'s lazy singleton (already
     monkeypatched directly by the tests that use it) construct a bare one —
@@ -1137,7 +1135,7 @@ def _isolate_transcript_store_dir(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _reset_turn_registry():
-    """Reset the #611 chat-turn registry (`api/services/chat_turns.py`)
+    """Reset the chat-turn registry (`api/services/chat_turns.py`)
     before and after every test.
 
     It's a process-wide singleton holding live `asyncio.Task`s — a turn left
@@ -1204,13 +1202,13 @@ def embedding_service():
 
 # Parallel execution configuration
 #
-# Also the unmarked-test guard (#682): the pre-push hook and scripts/test.sh
+# Also the unmarked-test guard: the pre-push hook and scripts/test.sh
 # both select tests by marker expression (`-m "unit and not slow"` / the
 # negative filter). A test file that carries none of the recognized category
 # markers is silently deselected from BOTH — it still collects and "exists",
-# so nothing in CI or on push reports it as missing. That's exactly how #646
-# and #677's regression guards in tests/test_apple_pipeline.py went unmarked
-# and unrun on push for months.
+# so nothing in CI or on push reports it as missing, and a regression guard
+# living in that file can go unrun on push indefinitely without anyone
+# noticing.
 #
 # tryfirst=True so the guard below sees every collected item before pytest's
 # own -m deselection hook removes anything — a brand-new unmarked file must
@@ -1228,17 +1226,13 @@ def pytest_collection_modifyitems(config, items):
         if "browser" in item.name or "playwright" in str(item.fspath):
             item.add_marker(pytest.mark.browser)
 
-        # #682: the equivalent "integration" name-substring auto-mark used to
-        # live here too (`"integration" in item.name or "real_" in item.name`)
-        # and is why the pre-push (`-m "unit and not slow"`) and test.sh
-        # scopes disagreed by 29 tests — it silently added `integration` to
-        # any test merely *named* things like test_real_dns_failed_..., which
-        # then carried both `unit` (explicit, correct) and `integration`
-        # (false positive from the name match), landing it in the push gate
-        # but not test.sh's negative filter. Every test now carries an
-        # explicit, correct marker (enforced by the guard below), so this
-        # heuristic add is pure liability with no remaining upside. Removed
-        # rather than special-cased per file.
+        # A name-substring auto-mark (e.g. inferring `integration` from
+        # "integration" or "real_" appearing in a test's name) is deliberately
+        # not used here: it would silently add `integration` to any test
+        # merely *named* something like test_real_dns_failed_..., landing
+        # that test in the push gate's scope via a false positive rather than
+        # an explicit marker. Every test carries an explicit, correct marker
+        # instead (enforced by the guard below).
 
     unmarked = [
         item.nodeid
