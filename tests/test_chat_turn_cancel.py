@@ -1,4 +1,4 @@
-"""#611: the explicit cancellation path (`POST /api/conversations/{id}/cancel`),
+"""The explicit cancellation path (`POST /api/conversations/{id}/cancel`),
 `active_turn` surfacing on `GET /api/conversations/{id}`, and supersede (a new
 turn on a conversation that already has one in flight cancels the old one
 first).
@@ -226,7 +226,7 @@ class TestSupersede:
 
 
 class TestClientTurnIdCancel:
-    """#611 review (whisper-relay maintainer): `conversation_id` alone can't
+    """`conversation_id` alone can't
     cancel a turn before its first SSE frame ever arrives -- a brand-new
     conversation's id doesn't exist until the `conversation_id` event, and
     that's exactly the window a first-turn voice barge-in falls into. A
@@ -349,7 +349,7 @@ class TestClientTurnIdCancel:
         with pytest.raises(asyncio.CancelledError):
             await first_turn.task
 
-        # "dup-key" now resolves to the SECOND turn, not the first -- the
+        # "dup-key" resolves to the SECOND turn, not the first -- the
         # scoping guarantee: a reused key always reaches its current
         # claimant, never a stray earlier one.
         current = chat_turns.get_turn_registry().get_by_client_turn_id("dup-key")
@@ -415,7 +415,7 @@ class TestClientTurnIdCancel:
 
 
 class TestCancelOrderingsAroundAnAttachedReader:
-    """#611 review (whisper-relay maintainer): the gateway fires its cancel
+    """The gateway fires its cancel
     POST from its cancel-event handler, not from inside its SSE read loop
     (checking a flag between lines would add latency) -- so the POST can
     genuinely arrive slightly BEFORE the client stops reading. All three
@@ -550,15 +550,14 @@ class TestCancelOrderingsAroundAnAttachedReader:
 
 
 class TestVoiceModalityCancelAfterGateLift:
-    """#616: with the modality-keyed detachment gate lifted, a voice turn
-    now goes through the exact same explicit-cancel machinery as a text
-    turn -- these are the acceptance-criteria cases the issue calls out by
-    name: an explicit cancel stops a voice turn on the same bound as web
+    """With the modality-keyed detachment gate lifted, a voice turn
+    goes through the exact same explicit-cancel machinery as a text
+    turn: an explicit cancel stops a voice turn on the same bound as web
     chat's Stop button, the partial reply is marked truncated on the same
     terms as any other interrupted turn, and a barge-in that lands before
     the turn's first SSE frame (no conversation_id yet) still halts
-    generation via `client_turn_id` -- exactly the whisper-relay first-turn
-    barge-in gap #611 review closed for text and #616 now extends to voice."""
+    generation via `client_turn_id` -- the same whisper-relay first-turn
+    barge-in coverage that exists for text, extended to voice."""
 
     async def test_explicit_cancel_stops_a_voice_turn_same_as_web_chats_stop(
         self, api_client, store, monkeypatch,
@@ -581,7 +580,7 @@ class TestVoiceModalityCancelAfterGateLift:
         conversation_id = next(
             e["conversation_id"] for e in events if e.get("type") == "conversation_id"
         )
-        await gen.aclose()  # detach -- must NOT itself cancel (that's #616's point)
+        await gen.aclose()  # detach -- must NOT itself cancel
 
         turn = chat_turns.get_turn_registry().get_by_conversation(conversation_id)
         assert turn is not None and turn.modality == "voice"
@@ -606,10 +605,10 @@ class TestVoiceModalityCancelAfterGateLift:
     async def test_client_turn_id_cancel_halts_a_voice_barge_in_before_first_sse_frame(
         self, store, monkeypatch,
     ):
-        """The corrected acceptance criterion #616 adds: a barge-in landing
+        """A barge-in landing
         BEFORE the turn's first SSE frame -- so before any conversation_id
         exists to cancel by -- must still halt generation. This is exactly
-        `client_turn_id`'s reason for existing (#611 review), now proven for
+        `client_turn_id`'s reason for existing, proven here for
         a voice-modality turn specifically rather than just a text one."""
         import api.services.agent_loop as agent_loop_mod
 
@@ -650,11 +649,11 @@ class TestVoiceModalityCancelAfterGateLift:
         fires `POST /api/chat/cancel` with `client_turn_id` from its
         cancel-event handler (not its SSE read loop), and only afterward
         abandons the stream -- so the POST can genuinely land while our
-        reader is still attached, with the disconnect following. #611
-        review already proved this ordering safe for a text turn
+        reader is still attached, with the disconnect following. This
+        ordering is safe for a text turn
         (`TestCancelOrderingsAroundAnAttachedReader` above); this is the
         same proof for a voice turn specifically, since with the gate
-        removed this exact sequence is what a real barge-in now produces on
+        removed this exact sequence is what a real barge-in produces on
         a detachable voice turn -- the ordering must not depend on modality,
         and it doesn't: `reader()`'s `finally` no-ops once `finalized` is
         already True, regardless of which modality got it there."""

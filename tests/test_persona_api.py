@@ -1,5 +1,5 @@
 """
-Tests for HTTP persona discovery and persona_id chat scoping (issue #351).
+Tests for HTTP persona discovery and persona_id chat scoping.
 
 Covers the settings registry helpers (list_http_personas / resolve_persona),
 the GET /api/personas discovery endpoint, persona_id resolution + 400 handling
@@ -277,7 +277,7 @@ class TestListHttpPersonas:
         assert by_id["fitness"].orchestrates is False
 
     def test_orchestrates_matches_persona_orchestrates_for_every_persona(self, tmp_path, monkeypatch):
-        """Drift guard for #643: list_http_personas()'s `orchestrates` must
+        """Drift guard: list_http_personas()'s `orchestrates` must
         never diverge from `settings.persona_orchestrates()`, which is what
         real routing (api/routes/chat.py, api/routes/hermes_proxy.py) actually
         checks. This is the test that couldn't exist before the field did —
@@ -305,16 +305,16 @@ class TestListHttpPersonas:
 
 class TestResolvePersona:
     def test_primary_resolves_to_primary_md(self):
-        # #390 P2: primary's personality now lives in config/personas/primary.md.
+        # primary's personality lives in config/personas/primary.md.
         from config.settings import settings
         pre = settings.resolve_persona("primary")
-        assert pre and "general-purpose" in pre  # body loaded (no longer empty)
+        assert pre and "general-purpose" in pre  # body loaded (non-empty)
         assert not pre.lstrip().startswith("---")  # frontmatter stripped
         # The primary Telegram bot draws from the same file (single source).
         assert settings.telegram_primary_bot.persona == pre
 
     def test_primary_personality_moved_out_of_static_prompt(self):
-        # The proactivity/tone now lives in primary.md, not the shared static prompt.
+        # The proactivity/tone lives in primary.md, not the shared static prompt.
         import api.services.agent_system_prompt as asp
         from config.settings import _load_primary_persona
         body = _load_primary_persona()[0]
@@ -401,7 +401,7 @@ class TestSurfaceVariantPersona:
         for marker in ("[NOTIFY]", "[CLARIFY]", "[GOAL]"):
             assert marker not in hermes_pre, f"{marker} wrapper marker leaked into the Hermes preamble"
 
-        # No claim of shell/git/filesystem access (the false claim #641 fixes);
+        # No claim of shell/git/filesystem access (that would be a false claim);
         # it must instead plainly deny having it.
         assert "full shell, git, `gh`, and filesystem access" not in hermes_pre
         assert "no shell" in hermes_pre.lower()
@@ -767,14 +767,13 @@ class TestOrchestratingPersonaSpawn:
         """A doctor turn sent directly to this LifeOS endpoint with
         `backend: "hermes"` spawns exactly as it does natively, and the
         conversation it creates is tagged "hermes" rather than silently
-        reclassified as a lifeos thread. Through #641 this exact request
-        shape was what the client sent when diverting an orchestrating
-        persona's Hermes-selected turn here (#596); #642 removed that divert
-        (an orchestrating persona's Hermes turn now reaches the Hermes proxy
-        instead, see tests/test_hermes_proxy.py), so the first-party client
-        no longer constructs this request — but `backend` stays a generic,
-        supported field on this endpoint (client-surfaces.md), and this spawn
-        + tagging behavior is unchanged for any caller that still sends it."""
+        reclassified as a lifeos thread. The first-party client does not
+        construct this request shape itself (an orchestrating persona's
+        Hermes turn reaches the Hermes proxy instead, see
+        tests/test_hermes_proxy.py) — but `backend` stays a generic,
+        supported field on this endpoint (client-surfaces.md), and this
+        spawn + tagging behavior must hold for any caller that still sends
+        it."""
         import re
         import api.services.agent_worker.claude_code_spawn as ccs
         self._doctor_registry(tmp_path, monkeypatch)
@@ -838,7 +837,7 @@ class TestPersonasEndpoint:
         assert data["personas"][1]["orchestrates"] is False
 
     def test_orchestrates_field_matches_settings_for_every_persona(self, client, tmp_path, monkeypatch):
-        """Endpoint-level drift guard for #643: `GET /api/personas`'s
+        """Endpoint-level drift guard: `GET /api/personas`'s
         `orchestrates` must match `settings.persona_orchestrates()` for every
         persona it returns — this is the actual public contract clients read,
         not just the settings helper underneath it."""
@@ -1028,7 +1027,7 @@ class TestConversationPersonaScoping:
         assert len(store.list_conversations()) == 2
 
     def test_migration_backfills_existing_rows(self):
-        # A pre-#351 conversations table (no persona_id column) must migrate and
+        # A legacy conversations table (no persona_id column) must migrate and
         # backfill existing rows to 'primary'.
         import sqlite3
         from api.services.conversation_store import ConversationStore
@@ -1188,9 +1187,9 @@ def test_primary_persona_still_parses_and_resolves():
 
 @pytest.mark.unit
 def test_no_primary_hermes_variant_file_created():
-    """#746 deliberately defers extracting shared orchestration-invariant prose
-    into a common block until a second orchestrator exists — no primary.hermes.md
-    or similar sibling should appear as a side effect of this change."""
+    """Shared orchestration-invariant prose stays deferred from extraction
+    into a common block until a second orchestrator exists — no
+    primary.hermes.md or similar sibling file should exist."""
     personas_dir = _PRIMARY_FILE.parent
     variants = sorted(p.name for p in personas_dir.glob("primary.*.md"))
     assert variants == [], f"unexpected primary surface-variant file(s): {variants}"
