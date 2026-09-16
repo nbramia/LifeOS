@@ -1,4 +1,4 @@
-"""Tests for POST /api/agents/cli-sessions/events (issue #849).
+"""Tests for POST /api/agents/cli-sessions/events.
 
 Covers the bearer-token gate (mirrors `hermes_proxy._check_hermes_inbound_auth`)
 and the `cli_sessions` status machine driven by `scripts/lifeos-agent-hook.sh`
@@ -177,7 +177,7 @@ def test_unknown_engine_returns_422(client, stores):
 
 
 # ---------------------------------------------------------------------------
-# Pane store mirroring (#849 trap: local host events go into cc_wezterm_store)
+# Pane store mirroring: local host events go into cc_wezterm_store
 # ---------------------------------------------------------------------------
 
 
@@ -220,8 +220,8 @@ def test_pane_id_from_non_loopback_client_with_spoofed_host_not_written_to_pane_
 ):
     """A non-loopback, bearer-authenticated caller naming this API's own
     hostname must NOT be able to write into the shared pane store — that
-    would let it redirect Go To for a real local session (#849 round-1
-    security finding). The default `client` fixture is non-loopback
+    would let it redirect Go To for a real local session. The default
+    `client` fixture is non-loopback
     (TestClient's default host is "testclient"), so this exercises exactly
     that path: body.host matches api_host_name() but request.client.host
     does not pass the loopback gate.

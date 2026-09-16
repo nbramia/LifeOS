@@ -1,4 +1,4 @@
-"""Tests for the generalised backup_retention helper (issue #227).
+"""Tests for the generalised backup_retention helper.
 
 The integration tests over ``interaction_store._prune_backups`` live in
 ``tests/test_interaction_store.py::TestBackupRetention`` and exercise the
@@ -149,7 +149,7 @@ class TestNoOps:
 
 
 class TestCreateSnapshot:
-    """Snapshotting a live database (#562 — crm.db had no backup at all)."""
+    """Snapshotting a live database (crm.db had no backup at all)."""
 
     @staticmethod
     def _db(path: Path, rows: int = 3) -> Path:
@@ -248,7 +248,7 @@ class TestCreateSnapshot:
 
 class TestVerificationGatesRetention:
     """
-    Tight retention is only safe if the copy being kept is known good (#562).
+    Tight retention is only safe if the copy being kept is known good.
 
     With a long tail, a corrupt snapshot was survivable — older tiers remained.
     Keeping only a couple means a bad snapshot could be the last one standing,
