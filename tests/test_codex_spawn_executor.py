@@ -13,6 +13,7 @@ from api.services.agent_worker.codex_executor import (
     REASON_BINARY_NOT_FOUND,
     REASON_KILLED,
 )
+from api.services.agent_worker.executor_lifecycle import adapter_for
 from api.services.agent_worker.session_store import (
     STATUS_COMPLETED,
     STATUS_FAILED,
@@ -210,9 +211,9 @@ def test_codex_completed_event_and_outcome_carry_exit_meta(stores, tmp_path):
     """#760: the terminal transcript event (and the ExecutorOutcome the
     worker's earned-completion gate reads) both carry how the subprocess
     ended — returncode, timed_out, and whether a genuine terminal stream
-    event (`session.completed`/`exec.completed`) was actually seen, not just
-    inferred from a clean returncode. Also: codex has no [NOTIFY]
-    convention, so notifications_sent is always 0."""
+    event (`turn.completed`) was actually seen, not just inferred from a
+    clean returncode. Also: codex has no [NOTIFY] convention, so
+    notifications_sent is always 0."""
     sess_store, tr_store = stores
     session = sess_store.create(
         task_id="t-exit", session_id="sess_codex_exit", status="claimed",
@@ -221,7 +222,7 @@ def test_codex_completed_event_and_outcome_carry_exit_meta(stores, tmp_path):
     lines = [
         {"type": "thread.started", "thread_id": "thread-exit"},
         {"type": "item.completed", "item": {"type": "agent_message", "text": "All finished."}},
-        {"type": "session.completed"},
+        {"type": "turn.completed"},
     ]
     executor = CodexExecutor(
         session_store=sess_store,
@@ -245,11 +246,11 @@ def test_codex_completed_event_and_outcome_carry_exit_meta(stores, tmp_path):
 
 @pytest.mark.unit
 def test_codex_returncode_zero_without_terminal_event_flags_exit_meta(stores, tmp_path):
-    """A subprocess that exits 0 WITHOUT ever emitting a
-    `session.completed`/`exec.completed` event still lands on the
-    returncode==0 fallback in `_run` — but `stream_terminal_event_seen` is
-    False, the signal the worker's WIP-branch/interrupted diagnosis needs to
-    tell "the CLI told us it finished" apart from "stdout just closed"."""
+    """A subprocess that exits 0 WITHOUT ever emitting a `turn.completed`
+    event still lands on the returncode==0 fallback in `_run` — but
+    `stream_terminal_event_seen` is False, the signal the worker's
+    WIP-branch/interrupted diagnosis needs to tell "the CLI told us it
+    finished" apart from "stdout just closed"."""
     sess_store, tr_store = stores
     session = sess_store.create(
         task_id="t-noterm", session_id="sess_codex_noterm", status="claimed",
@@ -258,7 +259,7 @@ def test_codex_returncode_zero_without_terminal_event_flags_exit_meta(stores, tm
     lines = [
         {"type": "thread.started", "thread_id": "thread-noterm"},
         {"type": "item.completed", "item": {"type": "agent_message", "text": "partial..."}},
-        # No session.completed/exec.completed — stdout just ends here.
+        # No turn.completed — stdout just ends here.
     ]
     executor = CodexExecutor(
         session_store=sess_store,
@@ -741,3 +742,141 @@ def test_codex_clean_completion_wins_over_raced_failed_flip(stores, tmp_path):
     kinds = [e["kind"] for e in tr_store.read(session.session_id)]
     assert "codex_completed" in kinds
     assert "codex_killed" not in kinds
+
+
+@pytest.mark.unit
+def test_real_codex_event_shape_completes_through_the_adapter(stores, tmp_path):
+    """Reproduces the exact event shape a live Codex CLI run produces for a
+    single-turn `codex exec` — `thread.started`, `turn.started`, one or more
+    `item.completed`, then `turn.completed`, with returncode 0. Codex never
+    emits a `session.completed`/`exec.completed` event, so `turn.completed`
+    is the only real terminal marker available; going through
+    `executor_lifecycle.adapter_for` (the same seam `Worker._lifecycle_adapter`
+    uses) must not downgrade this outcome to FAILED for lack of a terminal
+    marker that will never arrive."""
+    sess_store, tr_store = stores
+    session = _seed_codex_session(sess_store, task_id="cx-real-shape")
+    lines = [
+        {"type": "thread.started", "thread_id": "thread-real"},
+        {"type": "turn.started"},
+        {"type": "item.completed", "item": {
+            "type": "agent_message", "text": "I'll count files recursively under `api/`.",
+        }},
+        {"type": "item.completed", "item": {
+            "type": "agent_message", "text": "There are **194 Python files** under `api/`.",
+        }},
+        {"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 5}},
+    ]
+    executor = CodexExecutor(
+        session_store=sess_store,
+        transcript_store=tr_store,
+        spawn_fn=_spawn_capturing({}, _FakeProc(lines, returncode=0),
+                                   final_text="There are **194 Python files** under `api/`."),
+        binary_resolver=lambda: "/usr/bin/true",
+        heartbeat_interval=9999,
+    )
+    adapter = adapter_for("codex", executor, session_store=sess_store, transcript_store=tr_store)
+
+    outcome = adapter.start(session, {"description": "count files", "working_dir": str(tmp_path)})
+
+    assert outcome.status == STATUS_COMPLETED
+    assert outcome.reason != "terminal success evidence missing"
+    assert sess_store.get(session.task_id).status == STATUS_COMPLETED
+    kinds = [e["kind"] for e in tr_store.read(session.session_id)]
+    assert "terminal_evidence_downgrade" not in kinds
+
+
+@pytest.mark.unit
+def test_stream_cut_off_before_turn_completed_stays_failed_with_recorded_reason(stores, tmp_path):
+    """The genuine-interruption shape — stdout closes after partial output,
+    with no `turn.completed` ever parsed, but the subprocess still exits 0 —
+    must NOT be treated as a success: `executor_lifecycle.normalize_outcome`
+    downgrades it to FAILED. That downgrade itself must leave a transcript
+    event naming the evidence field that decided it, since the executor's own
+    `codex_completed` event already reported the (false) COMPLETED status."""
+    sess_store, tr_store = stores
+    session = _seed_codex_session(sess_store, task_id="cx-cutoff")
+    lines = [
+        {"type": "thread.started", "thread_id": "thread-cutoff"},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "partial..."}},
+        # No turn.completed — stdout just ends here.
+    ]
+    executor = CodexExecutor(
+        session_store=sess_store,
+        transcript_store=tr_store,
+        spawn_fn=_spawn_capturing({}, _FakeProc(lines, returncode=0), final_text="partial..."),
+        binary_resolver=lambda: "/usr/bin/true",
+        heartbeat_interval=9999,
+    )
+    adapter = adapter_for("codex", executor, session_store=sess_store, transcript_store=tr_store)
+
+    outcome = adapter.start(session, {"description": "task", "working_dir": str(tmp_path)})
+
+    assert outcome.status == STATUS_FAILED
+    assert outcome.reason == "terminal success evidence missing"
+    downgrades = [
+        e for e in tr_store.read(session.session_id) if e["kind"] == "terminal_evidence_downgrade"
+    ]
+    assert len(downgrades) == 1
+    assert downgrades[0]["payload"]["evidence_field"] == "stream_terminal_event_seen"
+    assert downgrades[0]["payload"]["route"] == "codex"
+
+
+@pytest.mark.unit
+def test_nonzero_returncode_stays_failed_through_the_adapter(stores, tmp_path):
+    """A codex subprocess that exits non-zero is a real failure; the
+    executor/adapter chain must record it as FAILED, not COMPLETED."""
+    sess_store, tr_store = stores
+    session = _seed_codex_session(sess_store, task_id="cx-real-failure")
+    lines = [
+        {"type": "thread.started", "thread_id": "thread-fail"},
+    ]
+    executor = CodexExecutor(
+        session_store=sess_store,
+        transcript_store=tr_store,
+        spawn_fn=_spawn_capturing({}, _FakeProc(lines, returncode=1)),
+        binary_resolver=lambda: "/usr/bin/true",
+        heartbeat_interval=9999,
+    )
+    adapter = adapter_for("codex", executor, session_store=sess_store, transcript_store=tr_store)
+
+    outcome = adapter.start(session, {"description": "task", "working_dir": str(tmp_path)})
+
+    assert outcome.status == STATUS_FAILED
+    assert sess_store.get(session.task_id).status == STATUS_FAILED
+    kinds = [e["kind"] for e in tr_store.read(session.session_id)]
+    assert "codex_failed" in kinds
+
+
+@pytest.mark.unit
+def test_turn_completed_then_nonzero_exit_stays_failed(stores, tmp_path):
+    """`turn.completed` records that the CLI itself reported the turn done,
+    but the subprocess exiting non-zero afterward is a real failure signal
+    from the process, not something a parsed stream event should override —
+    a turn that completed just before a bad exit is exactly the "stopped
+    mid-thought but looks done" shape the terminal-evidence gate exists to
+    catch. The kill/cancel/timeout guards above this branch don't apply here
+    (no cancellation, no FAILED row, no timeout), so this exercises the
+    returncode check directly."""
+    sess_store, tr_store = stores
+    session = _seed_codex_session(sess_store, task_id="cx-term-then-bad-exit")
+    lines = [
+        {"type": "thread.started", "thread_id": "thread-badexit"},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "done, I think"}},
+        {"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}},
+    ]
+    executor = CodexExecutor(
+        session_store=sess_store,
+        transcript_store=tr_store,
+        spawn_fn=_spawn_capturing({}, _FakeProc(lines, returncode=1), final_text="done, I think"),
+        binary_resolver=lambda: "/usr/bin/true",
+        heartbeat_interval=9999,
+    )
+
+    outcome = executor.execute(session, {"description": "task", "working_dir": str(tmp_path)})
+
+    assert outcome.status == STATUS_FAILED
+    assert sess_store.get(session.task_id).status == STATUS_FAILED
+    kinds = [e["kind"] for e in tr_store.read(session.session_id)]
+    assert "codex_failed" in kinds
+    assert "codex_completed" not in kinds

@@ -43,6 +43,32 @@ class _StubCodexExecutor:
         return self.outcome
 
 
+class _RealFakeProc:
+    """Minimal subprocess.Popen substitute mirroring test_codex_spawn_executor's
+    ``_FakeProc`` — this file has no fixture of its own for CLI-shaped
+    subprocess stdout."""
+
+    def __init__(self, lines: list[dict], returncode: int = 0, pid: int = 24680):
+        import io as _io
+        import json as _json
+        self.stdout = _io.StringIO("\n".join(_json.dumps(line) for line in lines) + "\n")
+        self.stderr = _io.StringIO("")
+        self.returncode = returncode
+        self.pid = pid
+
+    def wait(self):
+        return self.returncode
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        pass
+
+    def kill(self):
+        pass
+
+
 def _make_worker(tmp_path: Path, codex_executor, *, plain_sends, withid_sends):
     transport = httpx.MockTransport(lambda _req: httpx.Response(200, json={"tasks": []}))
     client = httpx.Client(transport=transport, base_url="http://api")
@@ -641,3 +667,124 @@ def test_codex_child_session_bypasses_interrupted_gate(tmp_path: Path):
     kinds = [e["kind"] for e in worker.transcript_store.read(child.session_id)]
     assert "cli_session_interrupted" not in kinds
     assert "codex_handled_completion" in kinds
+
+
+def test_codex_session_with_real_executor_reaches_completed_disposition(tmp_path: Path):
+    """A real ``CodexExecutor`` driving a subprocess through the exact event
+    shape a live Codex CLI run produces (`thread.started`, `item.completed`,
+    `turn.completed`, returncode 0) ends the worker dispatch at the completed
+    disposition — session row COMPLETED, final text delivered to the
+    operator, `codex_handled_completion` recorded."""
+    from api.services.agent_worker.codex_executor import CodexExecutor
+
+    session_store = SessionStore(db_path=tmp_path / "sessions.db")
+    transcript_store = TranscriptStore(transcripts_dir=tmp_path / "transcripts")
+    final_text = "There are **194 Python files** under `api/`."
+
+    def fake_spawn(cmd, **kwargs):
+        for i, tok in enumerate(cmd):
+            if tok == "-o" and i + 1 < len(cmd):
+                with open(cmd[i + 1], "w") as f:
+                    f.write(final_text + "\n")
+        lines = [
+            {"type": "thread.started", "thread_id": "thread-real"},
+            {"type": "turn.started"},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": final_text}},
+            {"type": "turn.completed", "usage": {"input_tokens": 10, "output_tokens": 5}},
+        ]
+        return _RealFakeProc(lines, returncode=0)
+
+    codex_executor = CodexExecutor(
+        session_store=session_store,
+        transcript_store=transcript_store,
+        spawn_fn=fake_spawn,
+        binary_resolver=lambda: "/usr/bin/true",
+        heartbeat_interval=9999,
+    )
+
+    plain_sends: list[str] = []
+    withid_sends: list[str] = []
+    transport = httpx.MockTransport(lambda _req: httpx.Response(200, json={"tasks": []}))
+    client = httpx.Client(transport=transport, base_url="http://api")
+    worker = Worker(
+        api_base="http://api",
+        session_store=session_store,
+        conversation_store=ConversationStore(db_path=str(tmp_path / "conversations.db")),
+        transcript_store=transcript_store,
+        spend_tracker=SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=100.0),
+        poll_seconds=0.01,
+        telegram_send=lambda text, chat_id=None: plain_sends.append(text) or True,
+        telegram_send_with_id=lambda text: withid_sends.append(text) or [777],
+        http_client=client,
+        codex_executor=codex_executor,
+    )
+    session = worker.session_store.create(task_id="cx-real-e2e", routing="codex", origin="operator")
+
+    worker._dispatch_codex_session(session, [{"content": "count the Python files"}])
+
+    assert worker.session_store.get("cx-real-e2e").status == STATUS_COMPLETED
+    assert withid_sends == [final_text]
+    kinds = [e["kind"] for e in worker.transcript_store.read(session.session_id)]
+    assert "codex_handled_completion" in kinds
+    assert "cli_session_interrupted" not in kinds
+    assert "terminal_evidence_downgrade" not in kinds
+
+
+@dataclass
+class _CrashingCodexExecutor:
+    """Raises from execute()/resume() instead of returning an outcome — drives
+    the dispatch's own exception handling rather than an executor result."""
+    error: Exception
+
+    def execute(self, session, task):
+        raise self.error
+
+    def resume(self, session, message):
+        raise self.error
+
+
+def test_codex_execute_crash_records_dispatch_crashed_event(tmp_path: Path):
+    """An exception escaping the executor's execute() call (not a clean FAILED
+    outcome — e.g. a bug in the executor itself) must not leave the session
+    FAILED with no transcript record of why: `codex_dispatch_crashed` names
+    the phase and the error before the terminal status is written."""
+    plain_sends: list[str] = []
+    withid_sends: list[str] = []
+    stub = _CrashingCodexExecutor(error=RuntimeError("boom-execute"))
+    worker = _make_worker(tmp_path, codex_executor=stub, plain_sends=plain_sends, withid_sends=withid_sends)
+    session = worker.session_store.create(task_id="cx-crash-execute", routing="codex", origin="operator")
+
+    worker._dispatch_codex_session(session, [{"content": "do the thing"}])
+
+    assert worker.session_store.get("cx-crash-execute").status == STATUS_FAILED
+    crashed = [
+        e for e in worker.transcript_store.read(session.session_id)
+        if e["kind"] == "codex_dispatch_crashed"
+    ]
+    assert len(crashed) == 1
+    assert crashed[0]["payload"]["phase"] == "execute"
+    assert "boom-execute" in crashed[0]["payload"]["error"]
+
+
+def test_codex_resume_crash_records_dispatch_crashed_event(tmp_path: Path):
+    """Same as the execute-crash case, on the resume branch (a persisted CLI
+    session id routes dispatch there)."""
+    plain_sends: list[str] = []
+    withid_sends: list[str] = []
+    stub = _CrashingCodexExecutor(error=RuntimeError("boom-resume"))
+    worker = _make_worker(tmp_path, codex_executor=stub, plain_sends=plain_sends, withid_sends=withid_sends)
+    worker.session_store.create(task_id="cx-crash-resume", routing="codex", origin="operator")
+    worker.session_store.set_claude_code_session_id("cx-crash-resume", "codex-uuid-crash")
+    session = worker.session_store.get("cx-crash-resume")
+
+    worker._dispatch_codex_session(session, [{"content": "follow up"}])
+
+    assert worker.session_store.get("cx-crash-resume").status == STATUS_FAILED
+    crashed = [
+        e for e in worker.transcript_store.read(session.session_id)
+        if e["kind"] == "codex_dispatch_crashed"
+    ]
+    assert len(crashed) == 1
+    assert crashed[0]["payload"]["phase"] == "resume"
+    assert "boom-resume" in crashed[0]["payload"]["error"]
+

@@ -537,7 +537,15 @@ class CodexExecutor:
             })
             return ExecutorOutcome(status=STATUS_FAILED, reason=REASON_TIMEOUT)
 
-        if proc.returncode == 0 or state.terminal:
+        # A non-zero exit is authoritative even when `turn.completed` was
+        # parsed: the CLI process itself is reporting a bad end-of-run, and
+        # a turn that completed just before that is exactly the "stopped
+        # mid-thought but looks done" shape the terminal-evidence gate in
+        # normalize_outcome exists to catch, not a case for this executor to
+        # paper over. `state.terminal` still reaches `exit_meta` below either
+        # way, so a genuinely-clean run with no `turn.completed` (an
+        # interrupted stream that happens to exit 0) is still flagged there.
+        if proc.returncode == 0:
             exit_meta = self._exit_metadata(proc, timed_out, state)
             completed = self.session_store.update_status(
                 session.task_id, STATUS_COMPLETED,
@@ -604,8 +612,8 @@ class CodexExecutor:
     def _exit_metadata(proc, timed_out: threading.Event, state: "_RunState") -> dict:
         """Best-effort description of how the subprocess ended (#760).
         Mirrors ClaudeCodeExecutor._exit_metadata; ``stream_terminal_event_seen``
-        is True only when a `session.completed`/`exec.completed` event was
-        actually parsed, not merely inferred from a clean returncode."""
+        is True only when a `turn.completed` event was actually parsed, not
+        merely inferred from a clean returncode."""
         rc = proc.returncode
         meta: dict = {
             "returncode": rc,
@@ -711,9 +719,9 @@ class CodexExecutor:
                 # cost to cap. Only the managed/API route enforces max_dollars.
                 # Wall-clock and the CLI's own limits still bound runaway sessions.
                 state.cost_usd = _cost_from_usage(usage, state.model)
-            return
-
-        if etype in ("session.completed", "exec.completed"):
+            # `turn.completed` is the CLI's own signal that it finished the
+            # turn (the module docstring's event list) — this is the terminal
+            # marker `_exit_metadata` reports as `stream_terminal_event_seen`.
             state.terminal = True
             return
 

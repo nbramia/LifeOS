@@ -93,38 +93,49 @@ def normalize_outcome(
     *,
     route: str | None = None,
     continuation_id: str | None = None,
+    transcript_store: Any | None = None,
 ) -> ExecutorOutcome:
     """Attach durable identity and enforce explicit terminal evidence.
 
     Existing drivers predate this adapter and expose terminal evidence in
     ``exit_meta``.  We only reject a completed result when a driver explicitly
     reports missing evidence; absence of an old field remains compatible.
+
+    When a completed outcome is downgraded this way, ``transcript_store`` (if
+    given) records which evidence field decided it — this is the one point
+    that can flip a session's terminal status without the driver itself
+    having appended an event naming the reason.
     """
     route = route or getattr(session, "routing", None)
     evidence = dict(getattr(outcome, "termination_evidence", {}) or {})
     evidence.update(getattr(outcome, "exit_meta", {}) or {})
+    downgrade_field: str | None = None
     if outcome.status == STATUS_COMPLETED:
         if evidence.get("terminal_success") is False:
-            outcome = replace(
-                outcome,
-                status=STATUS_FAILED,
-                reason="terminal success evidence missing",
-            )
+            downgrade_field = "terminal_success"
         elif evidence.get("done_seen") is False:
-            outcome = replace(
-                outcome,
-                status=STATUS_FAILED,
-                reason="terminal success evidence missing",
-            )
+            downgrade_field = "done_seen"
         elif evidence.get("stream_terminal_event_seen") is False:
+            downgrade_field = "stream_terminal_event_seen"
+        if downgrade_field is not None:
             outcome = replace(
                 outcome,
                 status=STATUS_FAILED,
                 reason="terminal success evidence missing",
             )
+    session_id = getattr(outcome, "session_id", None) or getattr(session, "session_id", None)
+    if downgrade_field is not None and transcript_store is not None and session_id:
+        try:
+            transcript_store.append(session_id, "terminal_evidence_downgrade", {
+                "route": route,
+                "evidence_field": downgrade_field,
+                "evidence": evidence,
+            })
+        except Exception:
+            pass
     return replace(
         outcome,
-        session_id=getattr(outcome, "session_id", None) or getattr(session, "session_id", None),
+        session_id=session_id,
         attempt_id=getattr(outcome, "attempt_id", None) or attempt_id_for(session),
         turn_id=getattr(outcome, "turn_id", None) or turn_id_for(session),
         executor=getattr(outcome, "executor", None) or route,
@@ -149,6 +160,7 @@ class _Adapter:
         child_resume: Callable[[Any, Any, list[Any]], ExecutorOutcome] | None = None,
         cancel_fn: Callable[[Any, str], CancelResult] | None = None,
         session_store: Any | None = None,
+        transcript_store: Any | None = None,
     ) -> None:
         self.route = route
         self.executor = executor
@@ -156,6 +168,7 @@ class _Adapter:
         self._child_resume = child_resume
         self._cancel_fn = cancel_fn
         self._session_store = session_store
+        self._transcript_store = transcript_store
 
     def _outcome(self, outcome: ExecutorOutcome, session: Any) -> ExecutorOutcome:
         # Executors persist the turn immediately before their side effect.  A
@@ -168,7 +181,9 @@ class _Adapter:
                 persisted = self._session_store.get(getattr(session, "task_id", "")) or session
             except Exception:
                 persisted = session
-        return normalize_outcome(outcome, persisted, route=self.route)
+        return normalize_outcome(
+            outcome, persisted, route=self.route, transcript_store=self._transcript_store,
+        )
 
     def start(self, session: Any, request: Any) -> ExecutorOutcome:
         if hasattr(self.executor, "start") and self.route == "claude":
@@ -398,6 +413,7 @@ def adapter_for(
     session_store: Any | None = None,
     child_resume: Callable[[Any, Any, list[Any]], ExecutorOutcome] | None = None,
     cancel_fn: Callable[[Any, str], CancelResult] | None = None,
+    transcript_store: Any | None = None,
 ) -> ExecutorAdapter:
     """Build a route adapter; unknown routes are deliberately rejected."""
     if route not in _CAPABILITIES:
@@ -409,6 +425,7 @@ def adapter_for(
         child_resume=child_resume,
         cancel_fn=cancel_fn,
         session_store=session_store,
+        transcript_store=transcript_store,
     )
 
 

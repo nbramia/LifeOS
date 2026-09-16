@@ -656,7 +656,10 @@ def test_child_executor_crash_records_failure_reason(tmp_path: Path):
     """An executor crash (execute() raising) bypasses the dispatch tail via
     the except-handler's early return — the crash handler must still record
     the child's failure reason so the parent's resume turn carries a
-    `reason:` line (#433 review round 1)."""
+    `reason:` line (#433 review round 1).
+
+    It also appends a `claude_code_dispatch_crashed` transcript event naming
+    the phase and the error before the terminal status is written."""
     class _CrashingExecutor:
         def execute(self, session, task):
             raise RuntimeError("synthetic launch crash")
@@ -681,6 +684,40 @@ def test_child_executor_crash_records_failure_reason(tmp_path: Path):
     events = worker.transcript_store.read(child.session_id)
     reasons = [e["payload"]["reason"] for e in events if e["kind"] == "child_failed_internal"]
     assert reasons == ["claude_code execute crashed: synthetic launch crash"]
+    crashed = [e for e in events if e["kind"] == "claude_code_dispatch_crashed"]
+    assert len(crashed) == 1
+    assert crashed[0]["payload"]["phase"] == "execute"
+    assert "synthetic launch crash" in crashed[0]["payload"]["error"]
+
+
+def test_resume_crash_records_dispatch_crashed_event(tmp_path: Path):
+    """Same as the execute-crash case, on the resume branch (a persisted CLI
+    session id routes dispatch there) — covers a top-level (non-child)
+    session, which the failure-reason recorder is a no-op for, so the
+    `claude_code_dispatch_crashed` event is the only record of the crash."""
+    class _CrashingExecutor:
+        def execute(self, session, task):
+            raise RuntimeError("synthetic resume crash")
+
+        def resume(self, session, message):
+            raise RuntimeError("synthetic resume crash")
+
+    worker, store, _, sent = _capturing_worker(
+        tmp_path, claude_code_executor=_CrashingExecutor())
+    store.create(task_id="op-resume-crash", routing="claude_code", origin="operator")
+    store.set_claude_code_session_id("op-resume-crash", "cli-uuid-crash")
+    session = store.get("op-resume-crash")
+
+    worker._dispatch_claude_code_session(session, [{"content": "follow up"}])
+
+    assert store.get("op-resume-crash").status == STATUS_FAILED
+    crashed = [
+        e for e in worker.transcript_store.read(session.session_id)
+        if e["kind"] == "claude_code_dispatch_crashed"
+    ]
+    assert len(crashed) == 1
+    assert crashed[0]["payload"]["phase"] == "resume"
+    assert "synthetic resume crash" in crashed[0]["payload"]["error"]
 
 
 def test_child_failure_does_not_mirror(tmp_path: Path):
