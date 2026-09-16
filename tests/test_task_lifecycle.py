@@ -7,11 +7,13 @@ import pytest
 
 from types import SimpleNamespace
 
-from api.services.agent_board import COMPLETED_TAG, RUNNING_TAG, derive_lane
+from api.services.agent_board import BLOCKED_TAG, COMPLETED_TAG, RUNNING_TAG, derive_lane
 from api.services.agent_worker.lifecycle import FAILED_TAG, LifecycleEvent, LifecycleProjector
 from api.services.agent_worker.session_store import (
     STATUS_BLOCKED,
+    STATUS_BUDGET_EXCEEDED,
     STATUS_CLAIMED,
+    STATUS_COMPLETED,
     STATUS_FAILED,
     STATUS_RUNNING,
     OCCURRENCE_DISPATCHED,
@@ -20,18 +22,29 @@ from api.services.agent_worker.session_store import (
     WAIT_OPERATOR,
     WAIT_PROVIDER,
 )
+
 from api.services.task_manager import TaskManager
 
 pytestmark = pytest.mark.unit
+
+BUDGET_EXCEEDED_TAG = "agent-budget-exceeded"
 
 
 def _make_worker(sessions: SessionStore, manager: TaskManager):
     """A tick-free `Worker` stub wired just enough for the lifecycle-drift
     sweep: real store + real projector, no HTTP/Telegram/executors.
 
-    `_list_tasks_by_tag` reads straight from `manager` instead of hitting
-    the API, returning the same shape (`task.to_dict()`) the real method's
-    `resp.json()["tasks"]` would.
+    The HTTP helpers read and write `manager` directly instead of hitting
+    the API, each standing in for one endpoint and returning what that
+    endpoint's payload would reduce to: `_list_tasks_by_tag` yields the
+    `task.to_dict()` shape of `resp.json()["tasks"]`, and `_swap_tag`
+    returns the route's `swapped` flag.
+
+    This stub pins the sweep's *selection* logic cheaply — which cards it
+    picks and which it leaves alone. It deliberately does not stand in for
+    the route layer's own guards, so it cannot prove a write the sweep
+    issues is one the API would accept; that is
+    `test_drift_sweep_heals_through_the_real_task_routes`' job.
     """
     from api.services.agent_worker.worker import Worker
 
@@ -42,7 +55,50 @@ def _make_worker(sessions: SessionStore, manager: TaskManager):
         manager.get(task_id).to_dict() if manager.get(task_id) else None
     )
     worker._list_tasks_by_tag = lambda tag: [t.to_dict() for t in manager.list_tasks(tag=tag)]
+    worker._swap_tag = lambda task_id, from_tag, to_tag: manager.swap_tag(
+        task_id, from_tag, to_tag,
+    )
+    worker._complete_task = lambda task_id: manager.complete(task_id) is not None
+    worker._set_task_status = lambda task_id, status: manager.update(
+        task_id, status=status,
+    ) is not None
     return worker
+
+
+def _make_route_worker(tmp_path, monkeypatch):
+    """A `Worker` whose vault reads and writes go through the REAL FastAPI
+    task routes, over a temp vault and a temp session DB.
+
+    Returns `(worker, manager, sessions)`. `worker._http` is a `TestClient`
+    bound to the app and `worker.api_base` is empty, so every
+    `self._http.<verb>(f"{self.api_base}/api/tasks/...")` call in the worker
+    resolves against the app itself — nothing is stubbed between the sweep
+    and the route handlers, including their claim-tag guards.
+    """
+    from fastapi.testclient import TestClient
+
+    from api import main as api_main
+    from api.routes import tasks as tasks_route
+    import api.services.task_manager as task_manager_module
+    from api.services.agent_worker.worker import Worker, _WorkerLifecycleTaskManager
+
+    manager = TaskManager(
+        vault_path=tmp_path / "vault", index_path=tmp_path / "task_index.json",
+    )
+    monkeypatch.setattr(task_manager_module, "_task_manager", manager)
+    sessions = SessionStore(tmp_path / "sessions.db")
+    monkeypatch.setattr(tasks_route, "_session_store", sessions)
+
+    worker = Worker.__new__(Worker)
+    worker.session_store = sessions
+    worker._http = TestClient(api_main.app)
+    worker.api_base = ""
+    # Same wiring `Worker.__init__` uses: the projector writes through the
+    # worker's own HTTP client, not straight into a TaskManager.
+    worker.lifecycle_projector = LifecycleProjector(
+        sessions, _WorkerLifecycleTaskManager(worker),
+    )
+    return worker, manager, sessions
 
 
 def test_occurrence_claim_is_single_winner_and_reusable(tmp_path):
@@ -136,10 +192,9 @@ def test_project_session_status_cas_guard_fires_and_terminal_status_self_heals(t
     state, not the same fetch it derived `expected_version` from. Stale
     `_fetch_task` output simulates the session's view of the task being
     behind; the manager (what `transition` re-fetches through) has already
-    moved on. The write must back off, and the drift sweep must
-    subsequently heal the stranded tag under a different event_id (the
-    hook's event_id carries the turn_id suffix; the sweep's carries
-    `lifecycle_drift_sweep`), since it was never marked applied."""
+    moved on. The write must back off, leaving the vault tag stranded —
+    and the drift sweep, which reads the vault's current tags rather than
+    any projection bookkeeping, must then heal it on the next tick."""
     manager = TaskManager(tmp_path / "vault", tmp_path / "task-index.json")
     task = manager.create(
         "Synthetic terminal-status task", status="in_progress",
@@ -367,43 +422,96 @@ def test_drift_sweep_reconciles_a_kill_that_landed_while_worker_was_down(tmp_pat
     assert RUNNING_TAG not in refreshed.tags
 
 
-def test_drift_sweep_does_not_clobber_a_concurrent_operator_edit(tmp_path):
-    """The sweep's CAS check must compare against the task's *live* state,
-    not the same tag-listing snapshot it derived `expected_version` from —
-    otherwise the guard always matches itself and can never catch a real
-    conflict. Seed a genuinely-drifted task, capture the stale snapshot the
-    sweep's tag listing would see this tick, let an operator edit land
-    (advancing the live `updated_at` past that snapshot), then run the
-    sweep against the stale listing and confirm it backs off entirely."""
-    manager = TaskManager(tmp_path / "vault", tmp_path / "task-index.json")
+def test_drift_sweep_does_not_clobber_a_concurrent_operator_edit(tmp_path, monkeypatch):
+    """An operator pulling a card back off the agent between the sweep's
+    tag listing and its write must win: the sweep must leave that card
+    completely untouched, tags and status alike.
+
+    The guard is `POST /swap-tag` refusing to swap a `from` tag the card no
+    longer carries, and it is load-bearing for the status write too — a
+    card whose swap did not apply must not then have its status forced to
+    `cancelled`/`done` behind the operator's back. Driven through the real
+    routes, since the guard lives there; the tag listing is frozen at this
+    tick's (now stale) snapshot so the operator's retag genuinely lands in
+    the window between the read and the write."""
+    worker, manager, sessions = _make_route_worker(tmp_path, monkeypatch)
     task = manager.create(
-        "Synthetic concurrently-edited task", status="blocked",
+        "Synthetic concurrently-retagged task", status="blocked",
         tags=["claude_code", RUNNING_TAG],
     )
-    sessions = SessionStore(tmp_path / "sessions.db")
     session = sessions.create(task.id, status=STATUS_BLOCKED, routing="claude_code")
     assert sessions.mark_cancelled(
         task.id, attempt_id=session.attempt_id, reason="operator_killed",
     )
 
-    worker = _make_worker(sessions, manager)
-    # Freeze the sweep's tag listing at this tick's (now stale) snapshot.
+    # Freeze the sweep's tag listing at this tick's snapshot.
     stale_snapshot = worker._list_tasks_by_tag(RUNNING_TAG)
+    assert [t["id"] for t in stale_snapshot] == [task.id]
     worker._list_tasks_by_tag = lambda tag: stale_snapshot if tag == RUNNING_TAG else []
 
-    # An operator edit lands between the listing and the sweep's CAS check —
-    # the live version has moved past what the sweep's snapshot captured.
-    manager.update(task.id, description="Operator edited mid-sweep")
+    # The operator hands the card back to the queue between the listing and
+    # the sweep's write.
+    assert manager.swap_tag(task.id, RUNNING_TAG, "agent")
     edited = manager.get(task.id)
 
     healed = worker._reconcile_lifecycle_drift()
 
     refreshed = manager.get(task.id)
     assert healed == 0
-    assert refreshed.description == "Operator edited mid-sweep"
     assert refreshed.tags == edited.tags
-    assert refreshed.status == edited.status
-    assert refreshed.updated_at == edited.updated_at
+    assert FAILED_TAG not in refreshed.tags
+    assert refreshed.status == edited.status  # no forced `cancelled` write
+    assert refreshed.updated_at == edited.updated_at  # nothing was written at all
+
+
+def test_drift_sweep_heals_through_the_real_task_routes(tmp_path, monkeypatch):
+    """End-to-end proof that the heal the sweep issues is a write the API
+    actually accepts.
+
+    Every card the sweep targets carries `#agent-running` or
+    `#agent-blocked`, which makes it claimed as far as `agent_board` is
+    concerned, and the task routes refuse a lifecycle-tag write on a
+    claimed card through anything but `POST /swap-tag`. A sweep wired to a
+    `TaskManager` in-process never meets that guard, so this test drives
+    the sweep against the real FastAPI app over a temp vault: the writes it
+    issues are exactly the HTTP requests the deployed worker sends.
+
+    Covers both `from` tags and all three terminal session statuses, since
+    the `from` tag comes from whichever listing produced the candidate and
+    the status picks both the terminal tag and the follow-up status
+    write."""
+    worker, manager, sessions = _make_route_worker(tmp_path, monkeypatch)
+
+    cases = [
+        (RUNNING_TAG, STATUS_RUNNING, STATUS_FAILED, FAILED_TAG, "cancelled"),
+        (BLOCKED_TAG, STATUS_BLOCKED, STATUS_COMPLETED, COMPLETED_TAG, "done"),
+        (RUNNING_TAG, STATUS_RUNNING, STATUS_BUDGET_EXCEEDED, BUDGET_EXCEEDED_TAG, "cancelled"),
+    ]
+    tasks = []
+    for drifted_tag, live_status, terminal_status, _tag, _status in cases:
+        task = manager.create(
+            f"Synthetic route-level {terminal_status} task",
+            status="in_progress", tags=["claude_code", drifted_tag],
+        )
+        session = sessions.create(task.id, status=live_status, routing="claude_code")
+        # A raw terminal status write, exactly as an operator kill's
+        # `mark_cancelled` / `teardown_session` leaves the row: no projector
+        # hook fires, so Markdown is never touched and the card drifts.
+        assert sessions.update_status(
+            task.id, terminal_status,
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
+        assert drifted_tag in manager.get(task.id).tags
+        tasks.append(task)
+
+    healed = worker._reconcile_lifecycle_drift()
+
+    assert healed == 3
+    for task, (drifted_tag, _live, _terminal, expected_tag, expected_status) in zip(tasks, cases):
+        refreshed = manager.get(task.id)
+        assert expected_tag in refreshed.tags, task.description
+        assert drifted_tag not in refreshed.tags, task.description
+        assert refreshed.status == expected_status, task.description
 
 
 def test_drift_sweep_does_not_double_project_a_live_kill_already_reconciled(tmp_path):
@@ -456,14 +564,10 @@ def test_drift_sweep_leaves_a_live_session_alone_regardless_of_status(tmp_path, 
     sweep only ever heals a task whose session has reached a terminal
     status.
 
-    For CLAIMED specifically, `healed == 0` alone doesn't pin the sweep's
-    own guard: a projector call with `target_status="claimed"` falls
-    through the terminal-tag/task-status mapping to the literal string
-    "claimed", which `TaskManager.update` rejects as an invalid status,
-    so `transition` catches the `ValueError` and returns `applied=False`
-    on its own — `healed` would still land on 0 even if the sweep's guard
-    never ran. Spying on the projector call pins the guard itself: it must
-    never be invoked for a live session, for any of the three statuses."""
+    Spying on `_swap_tag` pins the guard itself rather than just its
+    outcome: the sweep must skip a live session before issuing any write at
+    all, for any of the three statuses. `healed == 0` alone is weaker —
+    a swap that no-ops for an unrelated reason would also leave it at 0."""
     manager = TaskManager(tmp_path / "vault", tmp_path / "task-index.json")
     task = manager.create(
         "Synthetic live task", status="in_progress", tags=["claude_code", RUNNING_TAG],
@@ -472,16 +576,16 @@ def test_drift_sweep_leaves_a_live_session_alone_regardless_of_status(tmp_path, 
     sessions.create(task.id, status=live_status, routing="claude_code")
 
     worker = _make_worker(sessions, manager)
-    calls = []
-    real_transition = worker.lifecycle_projector.transition
-    worker.lifecycle_projector.transition = lambda event, **kwargs: (
-        calls.append(event) or real_transition(event, **kwargs)
+    swaps = []
+    real_swap_tag = worker._swap_tag
+    worker._swap_tag = lambda task_id, from_tag, to_tag: (
+        swaps.append((task_id, from_tag, to_tag)) or real_swap_tag(task_id, from_tag, to_tag)
     )
 
     healed = worker._reconcile_lifecycle_drift()
 
     refreshed = manager.get(task.id)
-    assert calls == []  # the sweep's own guard must skip before ever projecting
+    assert swaps == []  # the sweep's own guard must skip before ever writing
     assert healed == 0
     assert RUNNING_TAG in refreshed.tags
     assert refreshed.tags == task.tags

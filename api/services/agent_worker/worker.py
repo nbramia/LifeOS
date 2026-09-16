@@ -2650,7 +2650,7 @@ class Worker:
 
     def _reconcile_lifecycle_drift(self) -> int:
         """Heal a vault tag left stranded by a terminal status write that
-        bypassed the projector.
+        bypassed the ordinary reconciliation path.
 
         `update_status` fires the `set_status_projector` hook (installed at
         construction time) whenever it lands a terminal status, which
@@ -2676,28 +2676,42 @@ class Worker:
         live — including a task reopened for a follow-up turn, which flips
         the tag back to `RUNNING_TAG` but leaves the session non-terminal —
         so it's left alone too. Only a task tagged non-terminal with a
-        *terminal* session is genuine drift, and it's healed through the
-        same projector a terminal write reaching `update_status` would have
-        used, so a session already reconciled by that path can't be
-        double-projected: its tag is already terminal, so it was never a
-        candidate in the first place.
+        *terminal* session is genuine drift, and a session already
+        reconciled by the ordinary path can't be healed twice: its tag is
+        already terminal, so it was never a candidate in the first place.
 
-        A BLOCKED target is outside that "non-terminal is legitimately
-        live" scope: if the projector's own CAS write for a BLOCKED
-        transition (`_handle_cli_interrupted`'s resumable-park write, for
-        instance) loses a concurrent-edit race, the session row still lands
-        BLOCKED but the vault tag keeps whatever it held before. Because
-        BLOCKED is non-terminal, this sweep treats that session as
-        legitimately live and never revisits it. The stale tag self-corrects
-        only if a later status transition fires the projector again for that
-        same session — a session parked BLOCKED and never resumed or killed
-        keeps the stale tag indefinitely.
+        The heal itself goes through exactly the endpoints
+        `_reconcile_vault_terminal` uses, with the same status-to-action
+        mapping. `POST /api/tasks/{id}/swap-tag` is the only write the API
+        accepts for a lifecycle tag on a claimed card — a `PUT` carrying a
+        `tags` list is refused outright (see the claim-tag guard in
+        `api/routes/tasks.py`), and every card this sweep looks at is
+        claimed by definition. The swap is also what gates the rest: it
+        reports `swapped: false` when the tag it was told to replace is no
+        longer there, so an operator retagging the card between the tag
+        listing and this write is never overwritten, and the task status is
+        only written for a card whose tag swap actually landed. The `from`
+        tag is the one the candidate was listed under, so a `#agent-blocked`
+        card swaps out of `BLOCKED_TAG` rather than no-opping against
+        `RUNNING_TAG`.
 
-        Cost per tick: exactly two HTTP calls (one per tag), regardless of
-        how many sessions or tasks exist. A failure listing one tag is
-        logged and skipped — that tag simply contributes no candidates this
-        tick, so a transient blip heals nothing and writes no durable state,
-        and the next tick retries normally once the API recovers.
+        A BLOCKED target is outside the "non-terminal is legitimately live"
+        scope: if the projector's own CAS write for a BLOCKED transition
+        (`_handle_cli_interrupted`'s resumable-park write, for instance)
+        loses a concurrent-edit race, the session row still lands BLOCKED
+        but the vault tag keeps whatever it held before. Because BLOCKED is
+        non-terminal, this sweep treats that session as legitimately live
+        and never revisits it. The stale tag self-corrects only if a later
+        status transition fires the projector again for that same session —
+        a session parked BLOCKED and never resumed or killed keeps the stale
+        tag indefinitely.
+
+        Cost per tick: two HTTP calls for the listing (one per tag),
+        regardless of how many sessions or tasks exist, plus two writes per
+        card actually healed. A failure listing one tag is logged and
+        skipped — that tag simply contributes no candidates this tick, so a
+        transient blip heals nothing and writes no durable state, and the
+        next tick retries normally once the API recovers.
         """
         healed = 0
         for tag in (RUNNING_TAG, BLOCKED_TAG):
@@ -2720,34 +2734,21 @@ class Worker:
                     continue
                 if session.status not in TERMINAL_STATUSES:
                     continue  # legitimately live — nothing to reconcile
-                event_id = LifecycleProjector.event_id(
-                    session.task_id, session.attempt_id, session.status,
-                    suffix="lifecycle_drift_sweep",
-                )
-                event = LifecycleEvent(
-                    event_id=event_id,
-                    task_id=session.task_id,
-                    session_id=session.session_id,
-                    attempt_id=session.attempt_id,
-                    target_status=session.status,
-                    expected_version=task.get("updated_at"),
-                    reason="lifecycle_drift_sweep",
-                )
-                try:
-                    # `expected_version` above came from the same tag-listing
-                    # fetch, so passing that snapshot as `task=` would make
-                    # the CAS check tautological. Let `transition` re-fetch
-                    # live so a concurrent operator edit is actually caught.
-                    applied = self.lifecycle_projector.transition(event)
-                except Exception as exc:
-                    logger.warning(
-                        "lifecycle drift reconciliation failed for %s: %s", session.task_id, exc,
-                    )
+                terminal_tag = {
+                    STATUS_COMPLETED: COMPLETED_TAG,
+                    STATUS_BUDGET_EXCEEDED: BUDGET_EXCEEDED_TAG,
+                    STATUS_FAILED: FAILED_TAG,
+                }[session.status]
+                if not self._swap_tag(task_id, tag, terminal_tag):
+                    # The tag moved (or the swap failed) between the listing
+                    # and this write — leave the rest of the card alone and
+                    # let the next tick re-examine it with fresh state.
                     continue
-                if applied:
-                    healed += 1
-                # else: `expected_version` conflicted with a concurrent edit
-                # — the next tick re-examines with fresh state.
+                if session.status == STATUS_COMPLETED:
+                    self._complete_task(task_id)
+                else:
+                    self._set_task_status(task_id, "cancelled")
+                healed += 1
         return healed
 
     def _check_human_queue_done_when(self, done_when: dict) -> tuple[bool, str]:
