@@ -654,7 +654,7 @@ Return ONLY valid JSON (no markdown, no explanation):
     {{
       "category": "{category}",
       "text": "Specific insight text here",
-      "source_title": {"\"20230115 Couples Therapy\"" if category != "ai_suggestions" else "null"}
+      "source_title": {'"20230115 Couples Therapy"' if category != "ai_suggestions" else "null"}
     }}
   ]
 }}

@@ -18,7 +18,7 @@ from api.services.slack_integration import (
     SlackAPIError,
 )
 from api.services.slack_indexer import get_slack_indexer
-from api.services.slack_sync import get_slack_sync, run_slack_sync
+from api.services.slack_sync import run_slack_sync
 
 router = APIRouter(prefix="/api/slack", tags=["slack"])
 
