@@ -3,8 +3,15 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Agents" />
 <title>Agents · LifeOS</title>
 <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+<!-- iOS reads this, not the SVG favicon, when the page is added to the Home
+     Screen; without it the icon is a generated letter tile. -->
+<link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png" />
+<link rel="manifest" href="/manifests/agents.webmanifest" />
 <script src="https://d3js.org/d3.v7.min.js"></script>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -1254,7 +1261,6 @@
     border-top: 1px solid var(--border);
     background: var(--bg-secondary);
     color: var(--text-secondary);
-    touch-action: pan-x;
   }
   /* Pulled out of flex flow and pinned to the tray's own edges so
      `justify-content: center` above centers just the assignee/Done
@@ -1291,10 +1297,6 @@
     color: var(--text-primary);
     font-size: 0.78rem;
     cursor: pointer;
-    /* Horizontal is reserved for the custom assignment drag. The tray
-       itself remains pan-x for scrolling when the gesture starts on its
-       label/gaps rather than a draggable control. */
-    touch-action: pan-y;
     flex: 0 0 auto;
   }
   /* After the shared sizing rule above, which would otherwise reset this
@@ -1451,9 +1453,10 @@
     padding: 0.5rem 0.6rem;
     font-size: 0.8rem;
     cursor: pointer;
-    /* Reserve horizontal movement for the custom drag; vertical movement
-       stays native so the page/lane can scroll. */
-    touch-action: pan-y;
+    /* No `touch-action` reservation: dragging is mouse/pen only, so a touch
+       gesture starting on a card must keep both axes — horizontal scrolling
+       across the lane strip is how a phone reaches another lane. */
+    touch-action: auto;
   }
   .board-card:hover { border-color: var(--accent); }
   .board-card.dragging-source { opacity: 0.4; }

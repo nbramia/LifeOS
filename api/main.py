@@ -49,12 +49,13 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import socket
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from email.utils import formatdate
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from fastapi.exceptions import RequestValidationError
@@ -1048,9 +1049,12 @@ def data_integrity_check():
     return response
 
 
-@app.get("/manifest.webmanifest")
-async def web_manifest():
-    """Serve the web app manifest.
+_MANIFEST_DIR = Path(__file__).parent.parent / "web" / "manifests"
+_MANIFEST_SLUG = re.compile(r"^[a-z0-9-]+$")
+
+
+def _manifest_response(slug: str):
+    """Serve one page's web app manifest.
 
     Served from its own route rather than through /static so the
     Content-Type is guaranteed to be application/manifest+json — some
@@ -1058,10 +1062,28 @@ async def web_manifest():
     relying on the OS's mimetypes registry to know the .webmanifest
     extension isn't portable across a fresh install.
     """
-    manifest_path = Path(__file__).parent.parent / "web" / "manifest.webmanifest"
-    if manifest_path.exists():
-        return FileResponse(str(manifest_path), media_type="application/manifest+json")
-    return {"message": "Manifest not found"}
+    if not _MANIFEST_SLUG.match(slug):
+        raise HTTPException(status_code=404, detail="Manifest not found")
+    manifest_path = _MANIFEST_DIR / f"{slug}.webmanifest"
+    if not manifest_path.is_file():
+        raise HTTPException(status_code=404, detail="Manifest not found")
+    return FileResponse(str(manifest_path), media_type="application/manifest+json")
+
+
+@app.get("/manifests/{slug}.webmanifest")
+async def page_manifest(slug: str):
+    """Each page has its own manifest so an installed Home Screen icon
+    launches that page — a shared manifest's `start_url` would send every
+    icon to the same one — and carries that page's own name.
+    """
+    return _manifest_response(slug)
+
+
+@app.get("/manifest.webmanifest")
+async def web_manifest():
+    """The chat manifest, also served here because Home Screen icons
+    installed from this path keep fetching it."""
+    return _manifest_response("chat")
 
 
 @app.get("/")

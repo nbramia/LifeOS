@@ -1,7 +1,8 @@
 {
-    "name": "LifeOS",
-    "short_name": "LifeOS",
-    "start_url": "/chat",
+    "id": "/agents",
+    "name": "LifeOS Agents",
+    "short_name": "Agents",
+    "start_url": "/agents",
     "scope": "/",
     "display": "standalone",
     "background_color": "#1a1a2e",

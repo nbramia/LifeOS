@@ -880,6 +880,29 @@ def _wait_for(predicate, page: Page, timeout_ms=5000, interval_ms=25):
     assert predicate(), f"condition not met within {timeout_ms}ms"
 
 
+def _swipe_left(page: Page, context, x: float, y: float, distance: int = 200):
+    """Swipe leftward from (x, y) with a real touch stream.
+
+    Playwright's own touchscreen only taps, and a dispatched `PointerEvent`
+    bypasses the compositor entirely, so neither can tell whether the browser
+    would actually scroll. CDP touch events go through the real input
+    pipeline, where a `touch-action` reservation on the element under the
+    finger is honoured — which is the whole point of the assertion.
+    """
+    cdp = context.new_cdp_session(page)
+    steps = 10
+    cdp.send("Input.dispatchTouchEvent", {
+        "type": "touchStart", "touchPoints": [{"x": x, "y": y, "id": 1}],
+    })
+    for step in range(1, steps + 1):
+        cdp.send("Input.dispatchTouchEvent", {
+            "type": "touchMove",
+            "touchPoints": [{"x": x - distance * step / steps, "y": y, "id": 1}],
+        })
+        page.wait_for_timeout(16)
+    cdp.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+
+
 def _drag_card(page: Page, card_id: str, target_lane: str):
     card = page.locator(f'[data-card-id="{card_id}"]')
     card_box = card.bounding_box()
@@ -1049,6 +1072,35 @@ class TestMobileDrawerLayout:
         finally:
             context.close()
 
+    def test_touch_swipe_across_a_card_scrolls_the_lane_strip(
+        self, browser: Browser, agents_base_url,
+    ):
+        """Horizontal swipe is how a phone reaches another lane, and most of
+        the strip's surface is card. A `touch-action` reservation on a card
+        would hand that axis to a custom drag and leave the strip stuck, so
+        this drives a real synthesized touch gesture (which honours
+        `touch-action`, unlike a dispatched PointerEvent) starting on a card
+        and asserts the strip actually scrolled.
+        """
+        context = browser.new_context(
+            viewport={"width": 390, "height": 844}, is_mobile=True, has_touch=True,
+        )
+        page = context.new_page()
+        try:
+            _open_board(page, agents_base_url)
+            assert page.evaluate(
+                "() => { const l = document.getElementById('board-lanes');"
+                " return l.scrollWidth - l.clientWidth; }"
+            ) > 100, "lane strip is not horizontally scrollable at phone width"
+            card = page.locator('[data-card-id="t1"]').bounding_box()
+            _swipe_left(page, context, card["x"] + card["width"] / 2, card["y"] + card["height"] / 2)
+            _wait_for(
+                lambda: page.evaluate("() => document.getElementById('board-lanes').scrollLeft") > 100,
+                page,
+            )
+        finally:
+            context.close()
+
     def test_drawer_width_change_is_scoped_to_phone_width(self, page: Page, agents_base_url):
         page.set_viewport_size({"width": 1280, "height": 800})
         _open_board(page, agents_base_url)
@@ -1138,7 +1190,10 @@ class TestBoardLoad:
         expect(page.locator("#board-filter-assignee")).to_have_value("all")
         expect(page.locator(".board-assignee-drop[data-assignee='codex']")).not_to_have_class(re.compile(r"\bselected\b"))
 
-    def test_touch_pointer_drag_from_assignee_tray_assigns_a_card(self, page: Page, agents_base_url):
+    def test_touch_pointer_on_the_assignee_tray_never_starts_a_drag(self, page: Page, agents_base_url):
+        """Touch does not drag — the lane strip keeps both axes so a phone can
+        scroll across lanes. A touch gesture from an assignee control onto a
+        card assigns nothing and leaves the card where it was."""
         lane_calls = []
         page.set_viewport_size({"width": 390, "height": 844})
         _open_board(page, agents_base_url, lane_calls=lane_calls)
@@ -1153,18 +1208,14 @@ class TestBoardLoad:
                     pointerType: 'touch', isPrimary: true,
                 });
                 source.dispatchEvent(event('pointerdown', a.left + 20, a.top + 20));
-                // `.board-assignee-drop` reserves the horizontal axis for the
-                // custom drag (`touch-action: pan-y`). A real touch gesture
-                // must cross that axis first; once the drag starts, board.js
-                // captures the pointer and the gesture can travel vertically
-                // to the card without handing control back to page scrolling.
                 source.dispatchEvent(event('pointermove', a.left + 120, a.top + 20));
                 document.dispatchEvent(event('pointermove', b.left + 20, b.top + 20));
                 document.dispatchEvent(event('pointerup', b.left + 20, b.top + 20));
             }"""
         )
-        expect(page.locator(".board-lane[data-lane='assigned'] [data-card-id='t1']")).to_be_visible(timeout=5000)
-        assert lane_calls == [{"lane": "assigned", "assignee": "codex"}]
+        expect(page.locator(".board-lane[data-lane='unassigned'] [data-card-id='t1']")).to_be_visible()
+        assert page.locator(".board-card-ghost").count() == 0
+        assert lane_calls == []
 
     def test_done_target_click_toggles_the_done_lane_and_stays_visible_both_ways(
         self, page: Page, agents_base_url,
@@ -1208,7 +1259,9 @@ class TestBoardLoad:
 
 
 class TestDragBetweenLanes:
-    def test_touch_pointer_drag_moves_a_card_between_lanes(self, page: Page, agents_base_url):
+    def test_touch_pointer_never_moves_a_card_between_lanes(self, page: Page, agents_base_url):
+        """A touch drag across lanes is not a drag at all — it is a scroll the
+        browser owns, so the card stays put and no lane write is issued."""
         lane_calls = []
         page.set_viewport_size({"width": 390, "height": 844})
         _open_board(page, agents_base_url, lane_calls=lane_calls)
@@ -1228,8 +1281,10 @@ class TestDragBetweenLanes:
                 document.dispatchEvent(event('pointerup', b.left + 20, b.top + 20));
             }"""
         )
-        expect(page.locator(".board-lane[data-lane='in_progress'] [data-card-id='t1']")).to_be_visible(timeout=5000)
-        assert lane_calls == [{"lane": "in_progress"}]
+        expect(page.locator(".board-lane[data-lane='unassigned'] [data-card-id='t1']")).to_be_visible()
+        assert page.locator(".board-card-ghost").count() == 0
+        assert not page.evaluate("() => document.body.classList.contains('board-dragging')")
+        assert lane_calls == []
 
     def test_drag_issues_lane_put_with_expected_body(self, page: Page, agents_base_url):
         lane_calls = []

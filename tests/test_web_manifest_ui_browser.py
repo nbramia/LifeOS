@@ -1,11 +1,12 @@
-"""Browser tests for the web app manifest + standalone metadata.
+"""Browser tests for the web app manifests + standalone metadata.
 
-`web/home.html` (`/`) must declare `apple-mobile-web-app-capable` (matching
-`web/index.html` and `web/crm.html`) — without it, a Home Screen shortcut
-added from the root URL would open in the user's default browser instead
-of its own standalone container. A real web app manifest is also linked
-from all three served pages, since Apple documents the legacy meta alone
-as deprecated in favor of the manifest's `display` member.
+Every served page declares `apple-mobile-web-app-capable` and links its own
+manifest, so a Home Screen shortcut added from any of them opens in its own
+standalone container rather than the default browser — Apple documents the
+legacy meta alone as deprecated in favor of the manifest's `display`
+member. These assertions read the markup as a browser parses it;
+tests/test_web_manifest_api.py covers the same contract through the real
+routes.
 
 Like tests/test_mode_pill_ui_browser.py, this serves `web/` itself from an
 ephemeral port rather than pointing at a running API — the assertions are
@@ -26,16 +27,24 @@ pytestmark = [pytest.mark.browser, pytest.mark.slow]
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
 
-class _SiteHandler(http.server.SimpleHTTPRequestHandler):
-    """Mimics api/main.py's routing: `/`, `/chat`, `/crm` are pages served
-    from web/*.html, `/manifest.webmanifest` is served from web/ with the
-    correct extension (so this test's plain file server assigns it a
-    manifest-ish type too), and `/static/` maps straight onto web/."""
+# The route each page is served at -> its HTML file and its own manifest.
+PAGES = {
+    "/": ("home.html", "/manifests/home.webmanifest"),
+    "/chat": ("index.html", "/manifests/chat.webmanifest"),
+    "/crm": ("crm.html", "/manifests/crm.webmanifest"),
+    "/agents": ("agents.html", "/manifests/agents.webmanifest"),
+    "/journal": ("journal.html", "/manifests/journal.webmanifest"),
+    "/journal/trends": ("journal-trends.html", "/manifests/journal-trends.webmanifest"),
+}
 
-    _PAGES = {
-        "/": "home.html",
-        "/chat": "index.html",
-        "/crm": "crm.html",
+
+class _SiteHandler(http.server.SimpleHTTPRequestHandler):
+    """Mimics api/main.py's routing: each page route serves its own
+    web/*.html, `/manifests/` and `/static/` map straight onto web/ (so this
+    test's plain file server assigns the .webmanifest extension a
+    manifest-ish type too)."""
+
+    _PAGES = {route: html for route, (html, _) in PAGES.items()} | {
         # crm.html's own JS redirects a bare /crm load to /me (its default
         # dashboard) via window.location.replace — mirror api/main.py's
         # /me route so that redirect doesn't 404 against this test server.
@@ -46,8 +55,6 @@ class _SiteHandler(http.server.SimpleHTTPRequestHandler):
         path = path.split("?", 1)[0].split("#", 1)[0]
         if path in self._PAGES:
             return str(WEB_DIR / self._PAGES[path])
-        if path == "/manifest.webmanifest":
-            return str(WEB_DIR / "manifest.webmanifest")
         if path.startswith("/static/"):
             return str(WEB_DIR / path[len("/static/"):])
         return str(WEB_DIR / path.lstrip("/"))
@@ -75,11 +82,11 @@ def _open(page: Page, base_url, path):
     page.goto(f"{base_url}{path}")
 
 
-@pytest.mark.parametrize("path", ["/", "/chat", "/crm"])
+@pytest.mark.parametrize("path", list(PAGES))
 class TestStandaloneMetaAndManifestLink:
-    """Every served entry point must declare the same standalone capability
-    and link the same manifest — all three pages must behave identically
-    on a Home Screen shortcut."""
+    """Every served entry point declares the same standalone capability and
+    links its own manifest, so each behaves the same on a Home Screen
+    shortcut while opening its own page."""
 
     def test_apple_mobile_web_app_capable(self, page: Page, site_base_url, path):
         _open(page, site_base_url, path)
@@ -91,10 +98,10 @@ class TestStandaloneMetaAndManifestLink:
         meta = page.locator('meta[name="apple-mobile-web-app-status-bar-style"]')
         expect(meta).to_have_count(1)
 
-    def test_manifest_link_present(self, page: Page, site_base_url, path):
+    def test_manifest_link_is_this_pages_own(self, page: Page, site_base_url, path):
         _open(page, site_base_url, path)
         link = page.locator('link[rel="manifest"]')
-        expect(link).to_have_attribute("href", "/manifest.webmanifest")
+        expect(link).to_have_attribute("href", PAGES[path][1])
 
     def test_apple_touch_icon_link_present(self, page: Page, site_base_url, path):
         _open(page, site_base_url, path)
@@ -102,35 +109,36 @@ class TestStandaloneMetaAndManifestLink:
         expect(link).to_have_attribute("href", "/static/icons/apple-touch-icon.png")
 
 
-class TestManifestContent:
-    """The manifest itself must parse and point at a real, standalone-ready
-    route — not the /static prefix."""
+def _fetch_manifest(page: Page, href: str):
+    return page.evaluate(
+        "async href => { const r = await fetch(href); return r.json(); }", href,
+    )
 
-    def test_manifest_parses_as_standalone(self, page: Page, site_base_url):
-        _open(page, site_base_url, "/chat")
-        manifest = page.evaluate(
-            "async () => { const r = await fetch('/manifest.webmanifest'); return r.json(); }"
-        )
+
+@pytest.mark.parametrize("path", list(PAGES))
+class TestManifestContent:
+    """A page's own manifest must parse and point at a real,
+    standalone-ready route — not the /static prefix."""
+
+    def test_manifest_parses_as_standalone(self, page: Page, site_base_url, path):
+        _open(page, site_base_url, path)
+        manifest = _fetch_manifest(page, PAGES[path][1])
         assert manifest["display"] == "standalone"
         assert manifest["name"]
         assert manifest["short_name"]
 
-    def test_manifest_start_url_and_scope_are_real_routes(self, page: Page, site_base_url):
-        _open(page, site_base_url, "/chat")
-        manifest = page.evaluate(
-            "async () => { const r = await fetch('/manifest.webmanifest'); return r.json(); }"
-        )
-        # start_url must land on the chat SPA as actually routed (/chat),
-        # never the /static prefix.
-        assert manifest["start_url"] == "/chat"
+    def test_manifest_start_url_and_scope_are_real_routes(self, page: Page, site_base_url, path):
+        _open(page, site_base_url, path)
+        manifest = _fetch_manifest(page, PAGES[path][1])
+        # start_url must land on the page as actually routed, never the
+        # /static prefix.
+        assert manifest["start_url"] == path
         assert not manifest["start_url"].startswith("/static")
         assert manifest["scope"] == "/"
 
-    def test_manifest_icons_resolve_under_static(self, page: Page, site_base_url):
-        _open(page, site_base_url, "/chat")
-        manifest = page.evaluate(
-            "async () => { const r = await fetch('/manifest.webmanifest'); return r.json(); }"
-        )
+    def test_manifest_icons_resolve_under_static(self, page: Page, site_base_url, path):
+        _open(page, site_base_url, path)
+        manifest = _fetch_manifest(page, PAGES[path][1])
         sizes = {icon["sizes"] for icon in manifest["icons"]}
         assert {"192x192", "512x512"} <= sizes
         for icon in manifest["icons"]:
