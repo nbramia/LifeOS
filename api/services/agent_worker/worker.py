@@ -2687,24 +2687,25 @@ class Worker:
         `tags` list is refused outright (see the claim-tag guard in
         `api/routes/tasks.py`), and every card this sweep looks at is
         claimed by definition. The swap is also what gates the rest: it
-        reports `swapped: false` when the tag it was told to replace is no
-        longer there, so an operator retagging the card between the tag
+        reports `swapped: false` when the tag it was told to replace is
+        absent, so an operator retagging the card between the tag
         listing and this write is never overwritten, and the task status is
         only written for a card whose tag swap actually landed. The `from`
         tag is the one the candidate was listed under, so a `#agent-blocked`
         card swaps out of `BLOCKED_TAG` rather than no-opping against
         `RUNNING_TAG`.
 
-        A BLOCKED target is outside the "non-terminal is legitimately live"
-        scope: if the projector's own CAS write for a BLOCKED transition
-        (`_handle_cli_interrupted`'s resumable-park write, for instance)
-        loses a concurrent-edit race, the session row still lands BLOCKED
-        but the vault tag keeps whatever it held before. Because BLOCKED is
-        non-terminal, this sweep treats that session as legitimately live
-        and never revisits it. The stale tag self-corrects only if a later
-        status transition fires the projector again for that same session —
-        a session parked BLOCKED and never resumed or killed keeps the stale
-        tag indefinitely.
+        A session parked at BLOCKED is non-terminal, so it falls in the
+        "legitimately live" set and this sweep never touches its vault tag,
+        whatever that tag currently reads. Bringing a park's tag into line
+        belongs to the path that performs the park, not here: a session
+        parked BLOCKED and never resumed or killed is never a subject of
+        this sweep, only ever a candidate it skips.
+
+        `BLOCKED_TAG` is still swept for candidates even so — the tag is a
+        legitimate resting place for a card whose session later goes
+        terminal, and a card reaching that state through any path this
+        module doesn't own is exactly what the sweep exists to catch.
 
         Cost per tick: two HTTP calls for the listing (one per tag),
         regardless of how many sessions or tasks exist, plus two writes per
@@ -3124,10 +3125,8 @@ class Worker:
         round-trips through ``_resume_as_followup``, which for
         claude_code/codex routing just re-enqueues the reply and flips the
         session to CLAIMED so the next dispatch drains it through
-        ``resume()`` on the persisted CLI session id. The session row moves
-        to BLOCKED through ``session_store.update_status``, which fires the
-        status projector and swaps the vault tag to ``#agent-blocked`` so
-        ``/agents`` reflects it.
+        ``resume()`` on the persisted CLI session id. The vault tag is left
+        at ``#agent-running``; only the session row moves to BLOCKED.
 
         Fallback (no CLI session id persisted — ``init`` never fired, so
         there is nothing to resume against, or Telegram delivery failed and

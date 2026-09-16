@@ -335,8 +335,8 @@ def test_human_queue_wake_cas_guard_fires_and_self_heals_on_next_tick(tmp_path):
     stale_snapshot = task.to_dict()
     worker._fetch_task = lambda task_id: stale_snapshot
 
-    # Operator edits the task after the stale snapshot was captured but
-    # before this tick's CAS check runs.
+    # Operator edits the task in the window between that stale snapshot
+    # and the CAS check this tick performs.
     manager.update(task.id, description="Operator edited during wait")
     edited = manager.get(task.id)
 
@@ -542,8 +542,8 @@ def test_drift_sweep_does_not_double_project_a_live_kill_already_reconciled(tmp_
     assert FAILED_TAG in reconciled.tags
     assert RUNNING_TAG not in reconciled.tags
 
-    # The live-kill path already fixed the tag before the sweep ever runs —
-    # the task no longer carries RUNNING_TAG/BLOCKED_TAG, so it's not even a
+    # The live-kill path leaves the tag terminal, so by the time the sweep runs
+    # the task carries neither RUNNING_TAG nor BLOCKED_TAG and is not even a
     # candidate the sweep's tag listing would return.
     healed = worker._reconcile_lifecycle_drift()
 
