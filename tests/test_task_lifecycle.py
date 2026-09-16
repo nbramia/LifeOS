@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import threading
+import time
 
 import pytest
 
@@ -27,15 +28,26 @@ pytestmark = pytest.mark.unit
 
 def _make_worker(sessions: SessionStore, manager: TaskManager):
     """A tick-free `Worker` stub wired just enough for the lifecycle-drift
-    sweep: real store + real projector, no HTTP/Telegram/executors."""
+    sweep: real store + real projector, no HTTP/Telegram/executors.
+
+    `_fetch_task_or_absent` treats a task missing from `manager` as a
+    definitive absence (`is_absent=True`) — the vault-backed equivalent of a
+    404 — matching how these tests simulate a deleted task by simply never
+    creating it. A test that needs to simulate a merely *unavailable* fetch
+    (transient error, not a confirmed deletion) overrides
+    `worker._fetch_task_or_absent` directly to return `(None, False)`.
+    """
     from api.services.agent_worker.worker import Worker
+
+    def _fetch_task_or_absent(task_id):
+        task = manager.get(task_id)
+        return (None, True) if task is None else (task.to_dict(), False)
 
     worker = Worker.__new__(Worker)
     worker.session_store = sessions
     worker.lifecycle_projector = LifecycleProjector(sessions, manager)
-    worker._fetch_task = lambda task_id: (
-        manager.get(task_id).to_dict() if manager.get(task_id) else None
-    )
+    worker._fetch_task_or_absent = _fetch_task_or_absent
+    worker._fetch_task = lambda task_id: _fetch_task_or_absent(task_id)[0]
     return worker
 
 
@@ -341,6 +353,101 @@ def test_drift_sweep_leaves_a_settled_task_alone_when_no_projection_was_ever_rec
     assert refreshed.updated_at == task.updated_at
 
 
+def test_drift_sweep_marks_a_settled_row_resolved_so_it_stops_being_a_candidate(tmp_path):
+    """Unlike a genuinely-drifted row, a settled row's vault tag is already
+    terminal and never flips back to running/blocked on its own — so once
+    the sweep confirms it isn't drifted, it must record a resolved marker
+    the same way the `task is None` branch does. Without one, the row
+    matches `list_terminal_unprojected` on every future tick forever,
+    permanently holding a slot in the bounded per-tick batch."""
+    manager = TaskManager(tmp_path / "vault", tmp_path / "task-index.json")
+    task = manager.create(
+        "Synthetic settled task", status="done",
+        tags=["claude_code", COMPLETED_TAG, "accepted"],
+    )
+    sessions = SessionStore(tmp_path / "sessions.db")
+    session = sessions.create(task.id, status=STATUS_RUNNING, routing="claude_code")
+    sessions.update_status(
+        task.id, STATUS_FAILED, attempt_id=session.attempt_id, turn_id=session.turn_id,
+    )
+    assert sessions.list_terminal_unprojected(since=0, limit=10) != []  # candidate, not yet filtered
+
+    worker = _make_worker(sessions, manager)
+    first_healed = worker._reconcile_lifecycle_drift()
+    assert first_healed == 0
+    # The resolved marker must be durable, not just an in-memory skip — a
+    # fresh query against the store shows the row is no longer a candidate.
+    assert sessions.list_terminal_unprojected(since=0, limit=10) == []
+
+    second_healed = worker._reconcile_lifecycle_drift()
+    assert second_healed == 0
+    assert manager.get(task.id).tags == task.tags
+
+
+def test_drift_sweep_marks_a_definitively_deleted_task_resolved(tmp_path):
+    """A definitive 404 means the task is gone from the vault — nothing
+    left to reconcile. The row must get a resolved marker so a second
+    sweep neither re-fetches it nor re-marks it. Pins half (a) of the
+    resolved-marker write: the definitively-absent path."""
+    manager = TaskManager(tmp_path / "vault", tmp_path / "task-index.json")
+    sessions = SessionStore(tmp_path / "sessions.db")
+    session = sessions.create("deleted-task", status=STATUS_BLOCKED, routing="claude_code")
+    assert sessions.mark_cancelled(
+        session.task_id, attempt_id=session.attempt_id, reason="operator_killed",
+    )
+    # No corresponding task was ever created in `manager` — `_make_worker`'s
+    # `_fetch_task_or_absent` reports that as a definitive absence, the
+    # vault-backed equivalent of a 404.
+    assert sessions.list_terminal_unprojected(since=0, limit=10) != []  # candidate
+
+    worker = _make_worker(sessions, manager)
+    healed = worker._reconcile_lifecycle_drift()
+    assert healed == 0
+    assert sessions.list_terminal_unprojected(since=0, limit=10) == []
+
+    second_healed = worker._reconcile_lifecycle_drift()
+    assert second_healed == 0
+
+
+def test_drift_sweep_does_not_heal_or_mark_resolved_on_a_transient_fetch_failure(tmp_path):
+    """A `_fetch_task_or_absent` call that fails without a definitive 404 —
+    a transient error, timeout, or malformed payload, e.g. the API
+    restarting mid-tick after a deploy — must NOT be treated as "task
+    deleted". Recording a resolved marker in that case would permanently
+    suppress healing of genuine drift behind a routine one-tick blip. This
+    is the regression test for a defect introduced by an earlier round-1
+    fix: the row must stay an unmarked candidate through the failure and
+    heal on a later tick once the fetch succeeds."""
+    manager = TaskManager(tmp_path / "vault", tmp_path / "task-index.json")
+    task = manager.create(
+        "Synthetic flaky-fetch task", status="blocked", tags=["claude_code", RUNNING_TAG],
+    )
+    sessions = SessionStore(tmp_path / "sessions.db")
+    session = sessions.create(task.id, status=STATUS_BLOCKED, routing="claude_code")
+    assert sessions.mark_cancelled(
+        task.id, attempt_id=session.attempt_id, reason="operator_killed",
+    )
+
+    worker = _make_worker(sessions, manager)
+    real_fetch = worker._fetch_task_or_absent
+    worker._fetch_task_or_absent = lambda task_id: (None, False)  # unavailable, not a 404
+
+    first_healed = worker._reconcile_lifecycle_drift()
+    assert first_healed == 0
+    assert RUNNING_TAG in manager.get(task.id).tags  # still drifted
+    # No resolved marker was written for the failed fetch — still a
+    # candidate for the next tick.
+    assert sessions.list_terminal_unprojected(since=0, limit=10) != []
+
+    worker._fetch_task_or_absent = real_fetch
+    second_healed = worker._reconcile_lifecycle_drift()
+
+    refreshed = manager.get(task.id)
+    assert second_healed == 1
+    assert FAILED_TAG in refreshed.tags
+    assert RUNNING_TAG not in refreshed.tags
+
+
 def test_drift_sweep_heals_a_second_drift_after_reopen_with_new_attempt(tmp_path):
     """A task can legitimately be killed at the same terminal status twice
     across separate reopened executions. The first kill's applied
@@ -377,6 +484,66 @@ def test_drift_sweep_heals_a_second_drift_after_reopen_with_new_attempt(tmp_path
     second_healed = worker._reconcile_lifecycle_drift()
     refreshed = manager.get(task.id)
     assert second_healed == 1
+    assert FAILED_TAG in refreshed.tags
+    assert RUNNING_TAG not in refreshed.tags
+
+
+def test_drift_sweep_batch_self_advances_past_non_actionable_rows(tmp_path):
+    """A backlog of settled (non-actionable) candidate rows must not
+    permanently crowd a genuinely-drifted row out of the bounded per-tick
+    batch. Seed more settled rows than `_LIFECYCLE_DRIFT_SWEEP_LIMIT`, all
+    with an older `last_activity_at` than one genuinely-drifted row, and
+    confirm the drifted row is still reached and healed within a bounded
+    number of ticks: `list_terminal_unprojected` orders oldest-first, so
+    each settled row gets a resolved marker and clears the way for the next
+    tick's batch to reach further down the queue."""
+    from api.services.agent_worker.worker import _LIFECYCLE_DRIFT_SWEEP_LIMIT
+
+    manager = TaskManager(tmp_path / "vault", tmp_path / "task-index.json")
+    sessions = SessionStore(tmp_path / "sessions.db")
+    base_time = int(time.time()) - 10_000
+
+    backlog_size = _LIFECYCLE_DRIFT_SWEEP_LIMIT + 5
+    for i in range(backlog_size):
+        task = manager.create(
+            f"Synthetic settled task {i}", status="done",
+            tags=["claude_code", COMPLETED_TAG, "accepted"],
+        )
+        session = sessions.create(task.id, status=STATUS_RUNNING, routing="claude_code")
+        sessions.update_status(
+            task.id, STATUS_FAILED, attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
+        with sessions._connect() as conn:
+            conn.execute(
+                "UPDATE sessions SET last_activity_at = ? WHERE task_id = ?",
+                (base_time + i, task.id),
+            )
+
+    drifted_task = manager.create(
+        "Synthetic genuinely drifted task", status="blocked",
+        tags=["claude_code", RUNNING_TAG],
+    )
+    drifted_session = sessions.create(
+        drifted_task.id, status=STATUS_BLOCKED, routing="claude_code",
+    )
+    assert sessions.mark_cancelled(
+        drifted_task.id, attempt_id=drifted_session.attempt_id, reason="operator_killed",
+    )
+    with sessions._connect() as conn:
+        conn.execute(
+            "UPDATE sessions SET last_activity_at = ? WHERE task_id = ?",
+            (base_time + backlog_size + 100, drifted_task.id),
+        )
+
+    worker = _make_worker(sessions, manager)
+    healed_total = 0
+    for _ in range(3):  # bounded: one tick to drain the backlog, one to reach the drift
+        healed_total += worker._reconcile_lifecycle_drift()
+        if FAILED_TAG in manager.get(drifted_task.id).tags:
+            break
+
+    refreshed = manager.get(drifted_task.id)
+    assert healed_total == 1
     assert FAILED_TAG in refreshed.tags
     assert RUNNING_TAG not in refreshed.tags
 
@@ -420,6 +587,52 @@ def test_tick_wires_in_the_lifecycle_drift_sweep(tmp_path, monkeypatch):
     assert RUNNING_TAG not in refreshed.tags
 
 
+def test_tick_runs_the_lifecycle_drift_sweep_even_when_the_spend_cap_blocks(tmp_path, monkeypatch):
+    """The sweep reconciles existing state and never starts new work, so it
+    must run even on a tick where `can_start_task` blocks everything else
+    (daily cap reached, or the worker paused) — a parked drift must still
+    heal on a day the worker can't afford to start anything.
+    `test_tick_wires_in_the_lifecycle_drift_sweep` above hardcodes
+    `can_start_task=lambda estimate: True`, so it cannot catch a regression
+    that moves the sweep call after the cap gate; this test pins that the
+    call site stays before it."""
+    manager = TaskManager(tmp_path / "vault", tmp_path / "task-index.json")
+    task = manager.create(
+        "Synthetic capped-day task", status="blocked", tags=["claude_code", RUNNING_TAG],
+    )
+    sessions = SessionStore(tmp_path / "sessions.db")
+    session = sessions.create(task.id, status=STATUS_BLOCKED, routing="claude_code")
+    assert sessions.mark_cancelled(
+        task.id, attempt_id=session.attempt_id, reason="operator_killed",
+    )
+
+    worker = _make_worker(sessions, manager)
+    worker.spend_tracker = SimpleNamespace(
+        can_start_task=lambda estimate: False,
+        daily_cap_dollars=0.0,
+        today_total=lambda: 0.0,
+    )
+    for step in (
+        "_process_human_queue",
+        "_replay_wait_wakeups",
+        "_wake_sleeping_sessions",
+        "_poll_managed_sessions",
+        "_resume_yielded_for_children",
+        "_dispatch_spawned_sessions",
+        "_process_clarification_answers",
+        "_timeout_stale_clarifications",
+    ):
+        monkeypatch.setattr(worker, step, lambda: None)
+    monkeypatch.setattr(worker, "_list_agent_tasks", lambda: [])
+
+    handled = worker.tick()
+
+    refreshed = manager.get(task.id)
+    assert handled == 0  # the cap gate still short-circuits the rest of the tick
+    assert FAILED_TAG in refreshed.tags
+    assert RUNNING_TAG not in refreshed.tags
+
+
 class TestListTerminalUnprojectedHasVaultTaskGate:
     """`has_vault_task` (origin != 'operator' and no parent_session_id) must
     exclude operator root-spawns and spawned children from the drift-sweep
@@ -457,3 +670,45 @@ class TestListTerminalUnprojectedHasVaultTaskGate:
         )
         rows = sessions.list_terminal_unprojected(since=0, limit=10)
         assert {row.task_id for row in rows} == {"normal-task"}
+
+
+class TestListTerminalUnprojectedNullAttemptScoping:
+    """The exists-check that scopes a candidate row's applied-projection
+    lookup to its own `attempt_id` uses `IS`, not `=`, specifically so a
+    legacy session with no attempt recorded at all (`attempt_id IS NULL`)
+    still matches. SQL's `=` never matches NULL against NULL, so with `=`
+    a NULL-attempt row could apply a projection but would remain an
+    unfilterable permanent candidate forever afterward."""
+
+    def test_null_attempt_row_is_a_candidate_and_is_excluded_once_projected(self, tmp_path):
+        sessions = SessionStore(tmp_path / "sessions.db")
+        session = sessions.create("null-attempt-task")
+        sessions.update_status(
+            session.task_id, STATUS_FAILED,
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
+        with sessions._connect() as conn:
+            conn.execute(
+                "UPDATE sessions SET attempt_id = NULL WHERE task_id = ?",
+                (session.task_id,),
+            )
+
+        rows = sessions.list_terminal_unprojected(since=0, limit=10)
+        assert {row.task_id for row in rows} == {"null-attempt-task"}
+        assert rows[0].attempt_id is None
+
+        event_id = LifecycleProjector.event_id(
+            session.task_id, None, STATUS_FAILED, suffix="lifecycle_drift_sweep",
+        )
+        sessions.begin_projection(
+            event_id, task_id=session.task_id, session_id=session.session_id,
+            attempt_id=None, expected_version=None,
+            target_status=STATUS_FAILED, payload={},
+        )
+        sessions.acknowledge_projection(event_id)
+
+        # A NULL-safe `IS` match against the row's own NULL attempt_id
+        # excludes it now that a matching projection is applied. (`=`
+        # against NULL would never match, leaving this row a candidate
+        # forever even after the marker above was written.)
+        assert sessions.list_terminal_unprojected(since=0, limit=10) == []

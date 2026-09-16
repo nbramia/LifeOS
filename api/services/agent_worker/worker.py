@@ -2687,25 +2687,40 @@ class Worker:
                 session.task_id, session.attempt_id, session.status,
                 suffix="lifecycle_drift_sweep",
             )
-            task = self._fetch_task(session.task_id)
+            task, is_absent = self._fetch_task_or_absent(session.task_id)
             if task is None:
-                # Task deleted from the vault — nothing left to reconcile.
-                # Record a resolved marker so this row stops matching the
-                # candidate query on every future tick: `_fetch_task` is an
-                # HTTP GET per row and this state can never heal, so leaving
-                # it unmarked would cost that GET forever.
-                self.session_store.begin_projection(
-                    event_id, task_id=session.task_id, session_id=session.session_id,
-                    attempt_id=session.attempt_id, expected_version=None,
-                    target_status=session.status, payload={},
-                )
-                self.session_store.acknowledge_projection(event_id)
+                if not is_absent:
+                    # The fetch was merely unavailable — a transient error,
+                    # timeout, or malformed payload — not a confirmed
+                    # deletion (e.g. the API restarting mid-tick after a
+                    # deploy). Recording a resolved marker here would read
+                    # this row as permanently settled and stop it ever being
+                    # rechecked, silently turning a one-tick blip into
+                    # unhealable drift. Skip without a marker so the next
+                    # tick retries.
+                    continue
+                # Task definitively deleted from the vault (404) — nothing
+                # left to reconcile. Record a resolved marker so this row
+                # stops matching the candidate query on every future tick:
+                # the fetch above is an HTTP GET per row and this state can
+                # never heal, so leaving it unmarked would cost that GET
+                # forever.
+                self._mark_drift_row_settled(event_id, session, expected_version=None)
                 continue
             tags = self._norm_task_tags(task)
             if RUNNING_TAG not in tags and BLOCKED_TAG not in tags:
                 # Not actually drifted — the vault tag is already terminal
                 # (settled by the live-kill path, an operator edit, or a
                 # historical session that predates this sweep entirely).
+                # Record a resolved marker here too: a terminal vault tag
+                # never flips back to running/blocked on its own, so this
+                # row can never become real drift later, and leaving it
+                # unmarked would hold it in the candidate query — and thus a
+                # batch slot under `_LIFECYCLE_DRIFT_SWEEP_LIMIT` — on every
+                # future tick until it ages out of the window.
+                self._mark_drift_row_settled(
+                    event_id, session, expected_version=task.get("updated_at"),
+                )
                 continue
             event = LifecycleEvent(
                 event_id=event_id,
@@ -2724,6 +2739,19 @@ class Worker:
                     "lifecycle drift reconciliation failed for %s: %s", session.task_id, exc,
                 )
         return healed
+
+    def _mark_drift_row_settled(
+        self, event_id: str, session: Session, *, expected_version: str | None,
+    ) -> None:
+        """Record an already-applied lifecycle-projection marker for a
+        drift-sweep candidate that needs no tag change, so it stops matching
+        `list_terminal_unprojected` on every future tick."""
+        self.session_store.begin_projection(
+            event_id, task_id=session.task_id, session_id=session.session_id,
+            attempt_id=session.attempt_id, expected_version=expected_version,
+            target_status=session.status, payload={},
+        )
+        self.session_store.acknowledge_projection(event_id)
 
     def _check_human_queue_done_when(self, done_when: dict) -> tuple[bool, str]:
         """Evaluate one card's `done_when`. Returns `(passed, description)`;
@@ -4163,10 +4191,23 @@ class Worker:
         return self._hermes_executor
 
     def _fetch_task(self, task_id: str) -> dict[str, Any] | None:
+        task, _ = self._fetch_task_or_absent(task_id)
+        return task
+
+    def _fetch_task_or_absent(self, task_id: str) -> tuple[dict[str, Any] | None, bool]:
+        """Fetch a task, distinguishing a definitive 404 from a merely
+        unavailable fetch (exception, or a malformed/mismatched payload).
+
+        Returns `(task, is_absent)`. `is_absent` is True only when the API
+        affirmatively reported the task doesn't exist — callers that need to
+        tell "deleted" apart from "transiently unreachable" (e.g. the
+        lifecycle drift sweep) must check it rather than treating any `None`
+        task the same way.
+        """
         try:
             resp = self._http.get(f"{self.api_base}/api/tasks/{task_id}")
             if resp.status_code == 404:
-                return None
+                return None, True
             resp.raise_for_status()
             payload = resp.json()
             # A task lookup must return the addressed row, not a generic API
@@ -4174,11 +4215,11 @@ class Worker:
             # an empty object). Treat malformed/mismatched payloads as an
             # unavailable recheck rather than a false ownership signal.
             if not isinstance(payload, dict) or payload.get("id") != task_id:
-                return None
-            return payload
+                return None, False
+            return payload, False
         except Exception as exc:
             logger.warning("fetch_task %s failed: %s", task_id, exc)
-            return None
+            return None, False
 
     def _last_reassignment(self, session_id: str) -> dict[str, Any] | None:
         """Return the latest board reassign marker, if any."""
