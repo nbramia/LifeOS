@@ -8,7 +8,7 @@ Slack to 10 — and then reported a bare "No X found." that never named what was
 searched. The orchestrator could not tell "the data isn't there" from "I looked
 in the wrong place", so it invented a backend fault for data that was present.
 
-These tests pin the fix: widen when the caller stated no scope, honor an
+These tests pin the invariant: widen when the caller stated no scope, honor an
 explicit scope exactly, disclose truncation, and make every empty result name
 the scope it searched instead of implying a fault.
 """
@@ -894,10 +894,10 @@ class TestSlackHonestEmpty:
     def test_nothing_indexed_empty_does_not_suggest_a_backend_fault(self, fake_slack):
         """The misdiagnosis guard, with no exceptions.
 
-        This branch used to deny a fault in the words "not that the search
-        failed", which forced a carve-out in this invariant. The wording was
-        changed to "not a sign the search broke" so the guard could stay literal
-        and apply to every empty-result path identically — a blanket ban is a
+        This branch denies a fault in the words "not a sign the search
+        broke" rather than "not that the search failed", so the guard
+        stays literal and applies to every empty-result path identically
+        — a blanket ban is a
         stronger contract than one with a permitted phrase inside it.
         """
         out = _tool_search_slack({"query": "release plan"}).lower()
@@ -1031,11 +1031,11 @@ class TestToolDefinitions:
 class TestCalendarDaysRangeValidation:
     """An invalid days_range must not reach CalendarService.
 
-    It used to: `timedelta(days="30")` raises inside search_events, the
-    per-account handler swallowed it, and the tool reported "No calendar events
-    found. Searched ±30d" — a scoped-looking empty for a search that never
-    validly ran. Invalid values are now treated as *unstated* so the ladder
-    applies, and the drop is disclosed.
+    An unvalidated `timedelta(days="30")` raises inside search_events; if
+    the per-account handler swallowed it, the tool would report "No
+    calendar events found. Searched ±30d" — a scoped-looking empty for a
+    search that never validly ran. Invalid values are treated as
+    *unstated* so the ladder applies, and the drop is disclosed.
     """
 
     async def test_numeric_string_is_coerced_and_honored(self, fake_calendar):
@@ -1104,9 +1104,9 @@ class TestCalendarDaysRangeValidation:
 class TestCalendarAccountFailureDisclosure:
     """A failing account must not be rendered as an empty calendar.
 
-    An expired token was logged and the tool still said "No calendar events
-    found" — a genuine backend fault dressed as absence, which is exactly the
-    misdiagnosis this change exists to prevent.
+    An expired token being logged must not let the tool still say "No
+    calendar events found" — that would dress a genuine backend fault as
+    absence, the exact misdiagnosis this guard exists to prevent.
     """
 
     @pytest.fixture
@@ -1564,10 +1564,10 @@ class TestFinancesCategoryRowCapInteraction:
     category filter to the returned page. So a window dense enough to fill the
     cap yields a filtered handful drawn from only the newest N rows — and every
     wider ladder rung re-fetches that same newest page, since wider windows can
-    only add older rows the cap already excluded. Before this was handled, a
-    category with no recent activity produced "There are no transactions on
-    record in category 'X'" over data that was present: the original
-    misdiagnosis, reintroduced through the cap.
+    only add older rows the cap already excluded. Without a guard for
+    this, a category with no recent activity would produce "There are no
+    transactions on record in category 'X'" over data that was present:
+    the original misdiagnosis, reintroduced through the cap.
     """
 
     def _dense_recent(self, n: int = _TXN_ROW_CAP + 100) -> list:
@@ -1638,10 +1638,11 @@ class TestCalendarDaysRangeUpperBound:
     """A huge days_range must not be blamed on the account.
 
     search_events does `now - timedelta(days=days_back)`, which raises
-    OverflowError past a few million days. That lands in the per-account handler
-    and — now that the handler speaks up instead of staying silent — was reported
-    as an account needing re-authorisation. A bad argument dressed as expired
-    credentials is this same misdiagnosis in a new costume.
+    OverflowError past a few million days. That lands in the per-account handler,
+    and since the handler speaks up instead of staying silent, it must not
+    be reported as an account needing re-authorisation. A bad argument
+    dressed as expired credentials is this same misdiagnosis in a new
+    costume.
     """
 
     @pytest.mark.parametrize("huge", [_CALENDAR_MAX_DAYS + 1, 10**9, 4 * 10**8])
@@ -1671,11 +1672,12 @@ class TestCalendarDaysRangeUpperBound:
 class TestCalendarTotalAccountFailure:
     """With every account down, nothing was searched — so nothing was established.
 
-    `CalendarService._fetch_events` used to resolve its lazy `service` property
-    inside its own `try/except Exception -> return []`, so an expired token came
-    back as an empty list. The per-account disclosure could never fire for the
-    case it exists for, and the widening ladder then reported "Searched ±180d,
-    then ±365d, then ±1095d. Nothing on the calendar matches ..." over a broken
+    `CalendarService._fetch_events` must not resolve its lazy `service`
+    property inside its own `try/except Exception -> return []`: that
+    would let an expired token come back as an empty list, so the
+    per-account disclosure could never fire for the case it exists for,
+    and the widening ladder would report "Searched ±180d, then ±365d,
+    then ±1095d. Nothing on the calendar matches ..." over a broken
     connection — three windows it claimed to search and never did.
     """
 
@@ -1736,11 +1738,11 @@ class TestCalendarTotalAccountFailure:
 class TestFailureAttribution:
     """The remedy named must be the one the status actually establishes.
 
-    An earlier version grouped every non-rate-limit failure together and always
-    suggested re-authorising. For a 500 or 503 that is a wrong remedy — the fault
-    is on Google's side and clears on its own — so it sent the reader to repair
-    credentials that were working. Same defect class as the rest of this file: a
-    cause asserted that the code had not established.
+    Grouping every non-rate-limit failure together and always suggesting
+    re-authorising is wrong for a 500 or 503 — the fault is on Google's
+    side and clears on its own — so it would send the reader to repair
+    credentials that were working. Same defect class as the rest of this
+    file: a cause asserted that the code had not established.
     """
 
     @pytest.fixture
