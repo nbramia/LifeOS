@@ -25,6 +25,11 @@ from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
+# Output token budget for the preflight completion call. A reasoning model
+# (e.g. Fireworks DeepSeek v4 Flash under `LIFEOS_AGENT_PREFLIGHT_ENGINE=remote`)
+# spends output tokens on hidden reasoning before it emits the JSON reply, so
+# this must be large enough to leave room for both.
+_PREFLIGHT_MAX_TOKENS = 4096
 
 # Routing destinations. Anything else from the model is treated as `ask`.
 ROUTE_LOCAL = "local"
@@ -104,14 +109,17 @@ class PreflightResult:
     sane: bool = True
     sane_reason: str = ""
     # True only when a sane=False verdict is grounded in something the *code*
-    # established deterministically — an empty title, a preflight-call
-    # failure/unparseable reply, or a title matched against
-    # `_DESTRUCTIVE_TITLE_RE` — rather than merely the model's own inferred
+    # established deterministically — an empty title, or a title matched
+    # against `_DESTRUCTIVE_TITLE_RE` — rather than merely the model's own inferred
     # "this isn't executable" opinion (#747). The worker fails the task
-    # closed (cancels it) only when this is True; a non-fatal sane=False is
-    # parked like an ambiguous task instead, since a cheap classifier
-    # ignoring the prompt's "mundane tasks are sane" rule has already been
-    # observed to silently destroy real work. Meaningless when sane is True.
+    # closed (cancels it) only when `sane_fatal` is True; a non-fatal
+    # sane=False is parked like an ambiguous task instead, since a cheap
+    # classifier ignoring the prompt's "mundane tasks are sane" rule has
+    # already been observed to silently destroy real work. A failed or
+    # unparseable preflight call carries no verdict at all, so it sets
+    # `sane=True`/`sane_fatal=False` and records `preflight_error` instead
+    # (see that field) rather than a sane_fatal verdict. Meaningless when
+    # sane is True.
     sane_fatal: bool = False
     # Whether the cloud (API) route was *asked for* rather than inferred (#584).
     # Only an explicit request — a `#cloud*` tag, or a model/engine named in the
@@ -180,10 +188,21 @@ class PreflightResult:
     # `demoted_routing` are logged. `sane` itself is set to True in the same
     # step, since a demoted sanity objection must not park or block the
     # task. None when nothing was demoted. `sane_fatal` verdicts (empty
-    # title, the deterministic destructive-title regex, preflight-call/parse
-    # errors) are never touched — see `_apply_sanity_gate` and
-    # `_apply_default_route`.
+    # title, or the deterministic destructive-title regex) are never
+    # touched — see `_apply_sanity_gate` and `_apply_default_route`. A
+    # preflight-call/parse error is never `sane_fatal` in the first place
+    # (see `preflight_error`), so there is nothing here for it to demote.
     demoted_sanity: str | None = None
+    # Set when the preflight classifier call itself failed (an exception
+    # from the LLM client) or returned a reply `parse_preflight_response`
+    # could not parse — holds a short description of that failure. This is
+    # a statement about the classifier call, not a judgement about the
+    # task: these paths set `sane=True`, `sane_reason=""`, `sane_fatal=False`
+    # and leave `routing=ROUTE_ASK`, so a task with no routing tag is parked
+    # for the operator rather than cancelled, while a task with an explicit
+    # routing tag (applied afterward by `_apply_tag_overrides`) still runs
+    # on that route. None when a verdict was actually obtained.
+    preflight_error: str | None = None
     raw: dict = field(default_factory=dict)  # the parsed JSON for debugging
 
 
@@ -353,10 +372,12 @@ def _apply_sanity_gate(result: PreflightResult, title: str) -> PreflightResult:
     pattern present doesn't get automatic fatal status from that alone.
 
     Every other sane=False is left exactly as constructed: the empty-title
-    short-circuit and the LLM-call/parse-error fallbacks already set
-    `sane_fatal=True` directly (genuine code-level failures), and a parsed
-    LLM reply defaults `sane_fatal=False` (the model's own inferred opinion,
-    non-fatal — the worker parks it instead of cancelling the task).
+    short-circuit already sets `sane_fatal=True` directly (a genuine
+    code-level finding), a parsed LLM reply defaults `sane_fatal=False` (the
+    model's own inferred opinion, non-fatal — the worker parks it instead of
+    cancelling the task), and the LLM-call/parse-error fallbacks set
+    `sane=True`/`sane_fatal=False` with `preflight_error` recorded instead —
+    a failed call carries no verdict to be fatal about.
     """
     if _DESTRUCTIVE_TITLE_RE.search(title or ""):
         result.sane = False
@@ -370,8 +391,10 @@ def parse_preflight_response(text: str) -> PreflightResult:
     """Parse the LLM's reply into a PreflightResult.
 
     Hardens against the common failure modes: ```json``` fences, leading prose,
-    missing keys, wrong types. On any parse failure we return a "sane=false"
-    result so the worker parks the task rather than running with junk.
+    missing keys, wrong types. On any parse failure we return a defensible
+    default result with `preflight_error` set and `routing=ROUTE_ASK`, so the
+    worker parks an untagged task rather than running with junk, while a task
+    carrying an explicit routing tag still runs on that route.
     """
     raw: dict = {}
     try:
@@ -388,9 +411,10 @@ def parse_preflight_response(text: str) -> PreflightResult:
             routing_reason="preflight could not parse classifier output",
             expected_output="text",
             ambiguity=None,
-            sane=False,
-            sane_reason=f"preflight parse error: {exc}",
-            sane_fatal=True,  # genuine preflight error, not a model opinion — keep fail-closed
+            sane=True,
+            sane_reason="",
+            sane_fatal=False,
+            preflight_error=f"preflight parse error: {exc}",
             raw={},
         )
 
@@ -523,7 +547,7 @@ def _default_llm_caller(prompt: str) -> str:
             client = _remote_preflight_client()
             response = client.create(
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=1024,
+                max_tokens=_PREFLIGHT_MAX_TOKENS,
                 temperature=0.0,
             )
             return response.text
@@ -544,7 +568,7 @@ def _default_llm_caller(prompt: str) -> str:
             client = AnthropicLLMClient(model=settings.agent_preflight_model)
             response = client.create(
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=1024,
+                max_tokens=_PREFLIGHT_MAX_TOKENS,
                 temperature=0.0,
             )
             return response.text
@@ -564,7 +588,7 @@ def _default_llm_caller(prompt: str) -> str:
             )
         response = local_client.create(
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=1024,
+            max_tokens=_PREFLIGHT_MAX_TOKENS,
             temperature=0.0,
         )
         return response.text
@@ -579,7 +603,7 @@ def _default_llm_caller(prompt: str) -> str:
         client = AnthropicLLMClient(model=settings.agent_preflight_model)
         response = client.create(
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=1024,
+            max_tokens=_PREFLIGHT_MAX_TOKENS,
             temperature=0.0,
         )
         return response.text
@@ -599,7 +623,7 @@ def _default_llm_caller(prompt: str) -> str:
 
     response = client.create(
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=1024,
+        max_tokens=_PREFLIGHT_MAX_TOKENS,
         temperature=0.0,
     )
     return response.text
@@ -973,35 +997,43 @@ def _apply_default_route(result: PreflightResult, original_routing: str) -> Pref
        non-empty and valid, a `sane=False` that is NOT `sane_fatal` is
        demoted the same way ambiguity is: `sane_reason` is stashed on
        `result.demoted_sanity` and `result.sane` is set back to True.
-       `sane_fatal` verdicts — the empty-title short-circuit, the
-       deterministic destructive-title regex (`_apply_sanity_gate`), and
-       preflight-call/parse errors — are code-established, not the model's
-       opinion, and this check's `not result.sane_fatal` guard leaves them
-       completely untouched: they still fail closed in the worker
-       regardless of this setting. Demoting sanity here (rather than only
+       `sane_fatal` verdicts — the empty-title short-circuit and the
+       deterministic destructive-title regex (`_apply_sanity_gate`) — are
+       code-established, not the model's opinion, and this check's `not
+       result.sane_fatal` guard leaves them completely untouched: they
+       still fail closed in the worker regardless of this setting. A failed
+       or unparseable preflight call sets `sane=True`/`sane_fatal=False`
+       already (see `preflight_error`), so it has nothing left for this
+       step to demote. Demoting sanity here (rather than only
        logging it) also means part 3's `not result.sane` half of its gate
        no longer blocks route substitution for a demoted verdict — a
        demoted sanity objection is exactly as "resolved" as a demoted
        ambiguity, so it should be able to reach the default route the same
        way.
 
-    3. **Route substitution (#707), unchanged shape.** Gate:
-       `result.routing == ROUTE_ASK and result.sane` (the `ambiguity is
-       None` half of the old gate is now always true here, since part 1 just
-       cleared it; and `result.sane` is now True whenever part 2 demoted a
-       non-fatal objection) `and original_routing == ROUTE_ASK`. Deliberately
-       NOT a string match against `routing_reason` — the LLM's reason text is
-       free-form prose ("no tag and no title cue" today, but not a stable
-       contract), so matching on it would be brittle. This one structural
-       gate covers both "lack of cues" paths:
-         - the LLM's own rule-5 answer ("none of the routing rules matched")
-         - `parse_preflight_response`'s deterministic fallback when the model
-           omitted `routing` or returned a value outside `KNOWN_ROUTES`
-       and it correctly excludes the "ask" outcome the issue says must stay
-       ask: *fatal* sanity failures — including the empty-title short-circuit
-       and the LLM-call-failure fallback in `run_preflight`, both of which
-       set `sane=False` and `sane_fatal=True`, so part 2 never demotes them
-       and this gate still blocks on `not result.sane`.
+    3. **Route substitution.** Gate: `result.routing == ROUTE_ASK and
+       result.sane` (the `ambiguity is None` half of the old gate is now
+       always true here, since part 1 just cleared it; and `result.sane` is
+       now True whenever part 2 demoted a non-fatal objection)
+       `and original_routing == ROUTE_ASK and not result.preflight_error`.
+       Deliberately NOT a string match against `routing_reason` — the LLM's
+       reason text is free-form prose ("no tag and no title cue" today, but
+       not a stable contract), so matching on it would be brittle. The
+       `result.sane` half of this gate covers the one remaining fail-closed
+       case: a *fatal* sanity failure (the empty-title short-circuit or the
+       deterministic destructive-title regex), which part 2 never demotes,
+       so `not result.sane` still blocks it here.
+
+       The `not result.preflight_error` clause excludes a second case that
+       `result.sane` alone can't: a failed or unparseable classifier call
+       never obtained a verdict at all, so it sets `sane=True` (there is
+       nothing to be un-sane about) rather than a fatal sanity failure — but
+       it must still not be silently auto-dispatched onto the configured
+       default route. Without a routing tag telling it otherwise, that case
+       stays `ask` so the operator is asked, exactly like the
+       "lack of cues" case this gate exists to substitute — the difference
+       being that here the classifier never got to render an opinion, cues
+       or no cues.
 
        One more `ask` source needs excluding: `_apply_tag_overrides`'s #584
        downgrade, which turns an *inferred* (unconfirmed) cloud route into
@@ -1055,6 +1087,8 @@ def _apply_default_route(result: PreflightResult, original_routing: str) -> Pref
     if result.routing != ROUTE_ASK or not result.sane:
         return result
     if original_routing != ROUTE_ASK:
+        return result
+    if result.preflight_error:
         return result
 
     result.routing = default_route
@@ -1234,8 +1268,11 @@ def _finish(result: PreflightResult, tags_list: list[str], title: str = "") -> P
          since that gate also requires `result.sane`. `sane_fatal` verdicts never reach this
          demotion (step 1 already established `sane_fatal` and the demotion
          is gated on `not result.sane_fatal`), so fail-closed behavior for
-         empty titles, destructive-title matches, and preflight-call/parse
-         errors is unaffected regardless of the setting. This step's own
+         empty titles and destructive-title matches is unaffected regardless
+         of the setting. A preflight-call/parse error is excluded from route
+         substitution by this same step's own `not result.preflight_error`
+         clause instead — see `_apply_default_route` — since it carries no
+         verdict for this demotion to act on in the first place. This step's own
          `original_routing` exclusion (only substitutes when the *pre-tag*
          routing was already `ask`) is what keeps #584's downgraded-to-`ask`
          cloud case from being rescued here too — see 3a.
@@ -1266,7 +1303,11 @@ def run_preflight(
     caller: PreflightCaller | None = None,
 ) -> PreflightResult:
     """Run the Haiku preflight call. Returns a defensible PreflightResult even
-    on errors (sane=False routing=ask) so the worker can always make a decision.
+    on errors — a failed or unparseable classifier call routes to `ask` (with
+    `preflight_error` set) rather than raising, so the worker can always make
+    a decision. An empty title is the one path that still fails closed
+    (sane=False, sane_fatal=True) — that's a deterministic finding, not a
+    failed call.
     """
     tags_list = list(tags or [])
     # Short-circuit: empty title is always unsafe, no need to spend a Haiku call.
@@ -1301,9 +1342,10 @@ def run_preflight(
                 routing_reason="preflight LLM call failed",
                 expected_output="text",
                 ambiguity=None,
-                sane=False,
-                sane_reason=f"preflight error: {exc}",
-                sane_fatal=True,  # genuine preflight error, not a model opinion — keep fail-closed
+                sane=True,
+                sane_reason="",
+                sane_fatal=False,
+                preflight_error=f"preflight LLM call failed: {exc}",
                 raw={},
             ),
             tags_list,

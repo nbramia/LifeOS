@@ -122,13 +122,12 @@ class TestHealthReportsHonestly:
 
 
 class TestPreflightDegradesInsteadOfRaising:
-    """#704 (landed) -- with no Anthropic key, no reachable local server,
-    and #699's remote provider unconfigured, `_default_llm_caller`'s final
-    `raise RuntimeError(...)` used to propagate straight out of
-    `run_preflight`. It's now caught by `run_preflight`'s own
-    except-clause, which resolves to the same fail-closed
-    sane=False/sane_fatal=True/routing=ask result any other preflight
-    error produces -- never an unhandled exception reaching the worker."""
+    """With no Anthropic key, no reachable local server, and the remote
+    provider unconfigured, `_default_llm_caller`'s final
+    `raise RuntimeError(...)` is caught by `run_preflight`'s own
+    except-clause, which resolves to a routing=ask result with
+    `preflight_error` set -- never an unhandled exception reaching the
+    worker."""
 
     def test_default_caller_degrades_to_ask_not_an_exception(self, keyless_settings):
         from api.services.agent_worker import preflight as pf
@@ -137,8 +136,9 @@ class TestPreflightDegradesInsteadOfRaising:
         with patch.object(LocalLLMClient, "is_available", return_value=False):
             result = pf.run_preflight(title="build a feature", tags=["agent"])
 
-        assert result.sane is False
-        assert result.sane_fatal is True
+        assert result.sane is True
+        assert result.sane_fatal is False
+        assert result.preflight_error
         assert result.routing == pf.ROUTE_ASK
 
 

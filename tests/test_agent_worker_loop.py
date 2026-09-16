@@ -453,6 +453,42 @@ def test_insane_task_lands_in_failed(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_preflight_parse_error_with_explicit_tag_does_not_reach_mark_failed(tmp_path: Path):
+    """A preflight reply that fails to parse (a reasoning model's output-
+    token budget exhausted before it emitted JSON) must not cancel a task
+    that carries its own explicit routing tag — the tag alone already fully
+    determines routing, independent of the classifier's advisory verdict."""
+    calls: list = []
+
+    class _Executor:
+        def execute(self, session, task):
+            calls.append((session.task_id, task.get("description")))
+            return ExecutorOutcome(status=STATUS_COMPLETED, final_text="done", notifications_sent=1)
+
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "Fix the login bug", "status": "todo", "tags": ["claude"]},
+    ])
+    pool = _CapturingPool()
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=lambda prompt: "totally not json",
+                     local_executor=None,
+                     claude_code_executor=_Executor(),
+                     cli_pool=pool)
+
+    handled = w.tick()
+
+    assert handled == 1
+    assert FAILED_TAG not in api.tasks["t1"]["tags"]
+    assert BLOCKED_TAG not in api.tasks["t1"]["tags"]
+
+    pool.run_all()
+
+    assert calls == [("t1", "Fix the login bug")]
+    assert COMPLETED_TAG in api.tasks["t1"]["tags"]
+    assert FAILED_TAG not in api.tasks["t1"]["tags"]
+
+
+@pytest.mark.unit
 def test_mundane_sane_false_task_lands_in_blocked_not_cancelled(tmp_path: Path):
     """#747: a preflight sanity rejection of an ordinary, non-destructive
     title must park the task (blocked, still actionable) rather than

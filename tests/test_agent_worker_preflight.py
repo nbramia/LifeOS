@@ -130,20 +130,22 @@ def test_empty_title_sanity_failure_is_fatal():
 
 
 @pytest.mark.unit
-def test_preflight_llm_error_sanity_failure_is_fatal():
+def test_preflight_llm_error_sanity_is_not_fatal():
     def boom(prompt):
         raise RuntimeError("haiku is down")
 
     result = pf.run_preflight(title="x", tags=["agent"], caller=boom)
-    assert result.sane is False
-    assert result.sane_fatal is True
+    assert result.sane is True
+    assert result.sane_fatal is False
+    assert "haiku is down" in result.preflight_error
 
 
 @pytest.mark.unit
-def test_preflight_unparseable_reply_sanity_failure_is_fatal():
+def test_preflight_unparseable_reply_sanity_is_not_fatal():
     result = pf.run_preflight(title="x", tags=["agent"], caller=_stub("totally not json"))
-    assert result.sane is False
-    assert result.sane_fatal is True
+    assert result.sane is True
+    assert result.sane_fatal is False
+    assert "no JSON object" in result.preflight_error
 
 
 # ---------------------------------------------------------------------------
@@ -222,20 +224,23 @@ def test_preflight_handles_json_in_code_fence():
 
 
 @pytest.mark.unit
-def test_preflight_unparseable_reply_defaults_to_unsafe_ask():
+def test_preflight_unparseable_reply_defaults_to_ask():
     result = pf.run_preflight(title="x", tags=["agent"], caller=_stub("totally not json"))
-    assert result.sane is False
+    assert result.sane is True
+    assert result.sane_fatal is False
+    assert "no JSON object" in result.preflight_error
     assert result.routing == pf.ROUTE_ASK
 
 
 @pytest.mark.unit
-def test_preflight_caller_exception_defaults_to_unsafe_ask():
+def test_preflight_caller_exception_defaults_to_ask():
     def boom(prompt):
         raise RuntimeError("haiku is down")
 
     result = pf.run_preflight(title="x", tags=["agent"], caller=boom)
-    assert result.sane is False
-    assert "haiku is down" in result.sane_reason
+    assert result.sane is True
+    assert result.sane_fatal is False
+    assert "haiku is down" in result.preflight_error
     assert result.routing == pf.ROUTE_ASK
 
 
@@ -820,7 +825,7 @@ def test_default_llm_caller_uses_anthropic_when_key_set_no_probe(monkeypatch):
     assert result == "anthropic reply"
     assert captured["model"] == "claude-haiku-4-5"
     assert captured["messages"] == [{"role": "user", "content": "some prompt"}]
-    assert captured["max_tokens"] == 1024
+    assert captured["max_tokens"] == pf._PREFLIGHT_MAX_TOKENS
     assert captured["temperature"] == 0.0
 
 
@@ -895,8 +900,8 @@ def test_default_llm_caller_falls_back_to_remote_when_local_unreachable(monkeypa
 @pytest.mark.unit
 def test_default_llm_caller_raises_when_no_client_usable(monkeypatch):
     """Order 4: no key, no reachable local server, no remote provider ⇒
-    raise. `run_preflight`'s existing except-clause degrades this to
-    sane=False/routing=ask, unchanged by #704."""
+    raise. `run_preflight`'s existing except-clause degrades this to a
+    non-fatal `preflight_error`/routing=ask result rather than propagating."""
     from config.settings import settings
     from api.services.llm_client import LocalLLMClient
 
@@ -914,7 +919,9 @@ def test_default_llm_caller_raises_when_no_client_usable(monkeypatch):
     # And the run_preflight integration point: the raise degrades to the
     # existing safe path rather than propagating.
     result = pf.run_preflight("do the thing", tags=["agent"], caller=None)
-    assert result.sane is False
+    assert result.sane is True
+    assert result.sane_fatal is False
+    assert result.preflight_error
     assert result.routing == pf.ROUTE_ASK
 
 
@@ -951,6 +958,7 @@ def test_preflight_engine_auto_explicit_matches_704_order(monkeypatch):
         captured["model"] = model
 
     def fake_create(self, messages, *, system=None, max_tokens=4096, tools=None, temperature=None):
+        captured["max_tokens"] = max_tokens
         return _FakeLLMResponse("anthropic reply")
 
     monkeypatch.setattr(AnthropicLLMClient, "__init__", fake_init)
@@ -965,6 +973,7 @@ def test_preflight_engine_auto_explicit_matches_704_order(monkeypatch):
 
     assert result == "anthropic reply"
     assert captured["model"] == "claude-haiku-4-5"
+    assert captured["max_tokens"] == pf._PREFLIGHT_MAX_TOKENS
 
 
 @pytest.mark.unit
@@ -1012,7 +1021,7 @@ def test_preflight_engine_remote_configured_builds_remote_client(monkeypatch):
     assert captured["timeout"] == 42
     assert captured["auth"] == {"Authorization": "Bearer fw_test_key"}
     assert captured["messages"] == [{"role": "user", "content": "some prompt"}]
-    assert captured["max_tokens"] == 1024
+    assert captured["max_tokens"] == pf._PREFLIGHT_MAX_TOKENS
     assert captured["temperature"] == 0.0
 
 
@@ -1125,6 +1134,7 @@ def test_preflight_engine_local_forced_uses_probe(monkeypatch):
 
     def fake_create(self, messages, *, system=None, max_tokens=4096, tools=None, temperature=None):
         captured["model"] = self.model
+        captured["max_tokens"] = max_tokens
         return _FakeLLMResponse("local reply")
 
     monkeypatch.setattr(LocalLLMClient, "create", fake_create)
@@ -1134,6 +1144,7 @@ def test_preflight_engine_local_forced_uses_probe(monkeypatch):
     assert result == "local reply"
     assert probed["called"] is True
     assert captured["model"] == "local"
+    assert captured["max_tokens"] == pf._PREFLIGHT_MAX_TOKENS
 
 
 @pytest.mark.unit
@@ -1141,7 +1152,8 @@ def test_preflight_engine_local_forced_raises_when_unreachable(monkeypatch):
     """engine="local" forced with an unreachable server raises rather than
     silently falling back to another engine — there's no further engine to
     fall back to for a forced value. `run_preflight`'s existing except-
-    clause still degrades this to sane=False/ask, unchanged."""
+    clause still degrades this to a non-fatal `preflight_error`/ask
+    result, unchanged."""
     from config.settings import settings
     from api.services.llm_client import LocalLLMClient
 
@@ -1153,7 +1165,9 @@ def test_preflight_engine_local_forced_raises_when_unreachable(monkeypatch):
         pf._default_llm_caller("some prompt")
 
     result = pf.run_preflight("do the thing", tags=["agent"], caller=None)
-    assert result.sane is False
+    assert result.sane is True
+    assert result.sane_fatal is False
+    assert result.preflight_error
     assert result.routing == pf.ROUTE_ASK
 
 
@@ -1288,7 +1302,9 @@ def test_default_route_does_not_apply_on_empty_title(monkeypatch):
 
 @pytest.mark.unit
 def test_default_route_does_not_apply_on_llm_error(monkeypatch):
-    """Set + preflight LLM call failed -> still ask."""
+    """Set + preflight LLM call failed -> still ask, not substituted onto
+    the configured default route, because the classifier never obtained a
+    verdict (`preflight_error` set)."""
     from config.settings import settings
     monkeypatch.setattr(settings, "agent_default_route", "local")
 
@@ -1297,7 +1313,8 @@ def test_default_route_does_not_apply_on_llm_error(monkeypatch):
 
     result = pf.run_preflight(title="do the thing", tags=["agent"], caller=boom)
     assert result.routing == pf.ROUTE_ASK
-    assert result.sane is False
+    assert result.sane is True
+    assert result.preflight_error
 
 
 @pytest.mark.unit
@@ -1471,9 +1488,10 @@ def test_default_route_does_not_demote_fatal_sanity_destructive_title(monkeypatc
 
 
 @pytest.mark.unit
-def test_default_route_does_not_demote_fatal_sanity_llm_error(monkeypatch):
-    """Fatal verdicts stay fail-closed regardless of default route: the
-    preflight LLM call itself failing."""
+def test_default_route_does_not_substitute_on_llm_error(monkeypatch):
+    """The preflight LLM call itself failing carries no verdict to demote —
+    `preflight_error` is set and routing stays `ask`, not substituted onto
+    the configured default route."""
     from config.settings import settings
     monkeypatch.setattr(settings, "agent_default_route", "local")
 
@@ -1481,21 +1499,24 @@ def test_default_route_does_not_demote_fatal_sanity_llm_error(monkeypatch):
         raise RuntimeError("no client available")
 
     result = pf.run_preflight(title="do the thing", tags=["agent"], caller=boom)
-    assert result.sane is False
-    assert result.sane_fatal is True
+    assert result.sane is True
+    assert result.sane_fatal is False
+    assert result.preflight_error
     assert result.demoted_sanity is None
     assert result.routing == pf.ROUTE_ASK
 
 
 @pytest.mark.unit
-def test_default_route_does_not_demote_fatal_sanity_unparseable_reply(monkeypatch):
-    """Fatal verdicts stay fail-closed regardless of default route: an
-    unparseable preflight reply."""
+def test_default_route_does_not_substitute_on_unparseable_reply(monkeypatch):
+    """An unparseable preflight reply carries no verdict to demote —
+    `preflight_error` is set and routing stays `ask`, not substituted onto
+    the configured default route."""
     from config.settings import settings
     monkeypatch.setattr(settings, "agent_default_route", "local")
     result = pf.run_preflight(title="x", tags=["agent"], caller=_stub("totally not json"))
-    assert result.sane is False
-    assert result.sane_fatal is True
+    assert result.sane is True
+    assert result.sane_fatal is False
+    assert result.preflight_error
     assert result.demoted_sanity is None
     assert result.routing == pf.ROUTE_ASK
 
@@ -1678,3 +1699,69 @@ def test_no_default_route_uncorroborated_local_route_is_unaffected():
     result = pf.run_preflight(title=title, tags=["agent"], caller=_stub(reply))
     assert result.routing == pf.ROUTE_LOCAL
     assert result.demoted_routing is None
+
+
+# ---------------------------------------------------------------------------
+# A failed/unparseable preflight call must never cancel a task that carries
+# an explicit routing tag — the operator's own tag already fully determines
+# routing, independent of the classifier's advisory opinion.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_unparseable_reply_with_explicit_tag_still_runs():
+    """The reported live failure: a reasoning-model reply truncated before
+    it emitted JSON must not cancel a `#claude`-tagged task."""
+    result = pf.run_preflight(
+        title="Fix the login bug", tags=["claude"], caller=_stub("totally not json"),
+    )
+    assert result.routing == pf.ROUTE_CLAUDE_CODE
+    assert result.sane is True
+    assert result.sane_fatal is False
+    assert result.preflight_error
+
+
+@pytest.mark.unit
+def test_llm_call_failure_with_explicit_tag_still_runs():
+    def boom(prompt):
+        raise RuntimeError("preflight provider unreachable")
+
+    result = pf.run_preflight(title="Refactor the parser", tags=["local"], caller=boom)
+    assert result.routing == pf.ROUTE_LOCAL
+    assert result.sane is True
+
+
+@pytest.mark.unit
+def test_unparseable_reply_untagged_with_default_route_stays_ask(monkeypatch):
+    """A default route must not rescue a failed classifier call onto it —
+    without a routing tag, the task stays `ask` so the operator is asked,
+    rather than being silently auto-dispatched."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_default_route", "local")
+    result = pf.run_preflight(
+        title="Do the thing", tags=["agent"], caller=_stub("totally not json"),
+    )
+    assert result.routing == pf.ROUTE_ASK
+    assert result.preflight_error
+
+
+@pytest.mark.unit
+def test_truncated_json_reply_is_not_fatal():
+    """A real captured provider payload: a reasoning model's JSON reply cut
+    off mid-object by an exhausted output-token budget. Untagged, this
+    parks; tagged, it must still run on the tagged route."""
+    truncated = (
+        '{\n  "budget": {\n    "wall_seconds": 14400,\n    "max_tokens": 500000,\n'
+        '    "max_dollars": 5.0\n  },\n  "routing": "claude",\n'
+        '  "routing_reason": "explicit #claude tag",\n  "routing_explicit": true,'
+    )
+    untagged = pf.run_preflight(title="Fix the login bug", tags=["agent"], caller=_stub(truncated))
+    assert untagged.sane is True
+    assert untagged.sane_fatal is False
+    assert untagged.preflight_error
+    assert untagged.routing == pf.ROUTE_ASK
+
+    tagged = pf.run_preflight(title="Fix the login bug", tags=["claude"], caller=_stub(truncated))
+    assert tagged.routing == pf.ROUTE_CLAUDE_CODE
+    assert tagged.sane is True
+    assert tagged.sane_fatal is False
+    assert tagged.preflight_error
