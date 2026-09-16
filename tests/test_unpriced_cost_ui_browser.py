@@ -1,11 +1,11 @@
 """Browser tests for the session-cost display distinguishing an unpriced
-turn from a real zero-cost turn (#602).
+turn from a real zero-cost turn.
 
-`web/chat/ask-stream.js`'s `data.type === 'usage'` handler used to do
-`state.sessionCost += data.cost_usd || 0` -- a fallback that treats an
+`web/chat/ask-stream.js`'s `data.type === 'usage'` handler must not do
+`state.sessionCost += data.cost_usd || 0` -- that fallback would treat an
 absent/non-numeric `cost_usd` exactly like a real `0`. A backend that
 genuinely can't price a turn sends no `cost_usd` at all (rather than
-inventing a zero), so that fallback silently turned "unknown" into a
+inventing a zero), so that fallback would silently turn "unknown" into a
 confident (and wrong) "free". This file drives four turns through the
 native `/api/ask/stream` SSE contract -- a priced turn, a real-zero turn, an
 absent-cost turn, and a mixed session -- and asserts the display distinguishes
@@ -152,7 +152,7 @@ def test_absent_cost_marks_total_as_lower_bound(page: Page, chat_base_url):
     _send_turn(page, "unpriceable model turn")
     _wait_settled(page)
 
-    # Nothing was added (still $0.000), but the total must now read as
+    # Nothing got added (still $0.000), but the total must read as
     # incomplete -- the whole point being that it can't be mistaken for a
     # cheaper (or free) session.
     cost_el = page.locator("#sessionCost")

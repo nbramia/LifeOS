@@ -74,12 +74,11 @@ class TestQueryRouter:
     @pytest.mark.asyncio
     async def test_route_thinking_enabled_payload_byte_identical(self):
         """With thinking ENABLED, the actual JSON body sent over HTTP is
-        byte-identical to before LIFEOS_ROUTER_ENABLE_THINKING existed
-        (#566 PR 2).
+        byte-identical to a request with no thinking-control flag at all.
 
         The setting is patched explicitly rather than relying on the field
-        default: the default flipped to False in #566/#567 once the 12-case
-        A/B showed identical correctness at 8.2x the speed. This guards the
+        default: the default is False, since a 12-case A/B showed identical
+        correctness at 8.2x the speed. This guards the
         enabled path regardless of which way the default points.
 
         Runs the real generate_text -> LocalLLMClient.acreate path (only the
@@ -87,8 +86,7 @@ class TestQueryRouter:
         itself — a mock-call-shape assertion (enable_thinking=None was
         passed to generate_text) would still pass even if acreate later
         started serializing that as chat_template_kwargs:
-        {"enable_thinking": None}; this asserts the wire body directly
-        (#569 review)."""
+        {"enable_thinking": None}; this asserts the wire body directly."""
         from unittest.mock import AsyncMock, MagicMock
         from api.services import llm_client as llm_mod
         from api.services.query_router import QueryRouter, ROUTER_PROMPT

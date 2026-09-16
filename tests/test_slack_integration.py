@@ -285,7 +285,7 @@ class TestCreateSlackSourceEntity:
 
 @patch("api.services.slack_integration.SLACK_USER_TOKEN", "")
 class TestListChannelsMemberOnly:
-    """Issue #439: member_only=True must enumerate via users.conversations
+    """member_only=True must enumerate via users.conversations
     (channels the authed user belongs to) instead of conversations.list
     (every channel in the workspace)."""
 
@@ -394,7 +394,7 @@ class TestGetAllChannelHistoryNoiseFiltering:
 
 @patch("api.services.slack_integration.SLACK_USER_TOKEN", "")
 class TestGetThreadReplies:
-    """Issue #440: conversations.replies fetch — paginated, parent excluded."""
+    """conversations.replies fetch — paginated, parent excluded."""
 
     def _client(self, pages):
         from api.services.slack_integration import SlackClient
@@ -479,7 +479,7 @@ class TestGetThreadReplies:
 
 @patch("api.services.slack_integration.SLACK_USER_TOKEN", "")
 class TestSearchMessages:
-    """Issue #441: search.messages client — page-number pagination, GET form."""
+    """search.messages client — page-number pagination, GET form."""
 
     def _client_with_pages(self, pages):
         from api.services.slack_integration import SlackClient
