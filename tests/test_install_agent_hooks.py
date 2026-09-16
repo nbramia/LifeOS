@@ -1,4 +1,4 @@
-"""Tests for scripts/install-agent-hooks.sh (issue #849).
+"""Tests for scripts/install-agent-hooks.sh.
 
 Runs the installer via subprocess against temp copies of a Claude Code
 settings.json and a Codex hooks.json — NEVER the operator's real

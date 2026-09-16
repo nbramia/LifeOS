@@ -64,7 +64,7 @@ class TestVectorStore:
 
         vector_store.add_document(chunks, metadata)
 
-        # Verify chunks were added
+        # Verify chunks are present
         count = vector_store.get_document_count()
         assert count == 2
 

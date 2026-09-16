@@ -291,9 +291,9 @@ More content.
     def test_chunk_resplits_oversize_section(self):
         """A section whose body exceeds max_chunk_size must be re-split.
 
-        Regression: a single H2 section with tens of thousands of tokens
-        used to be emitted as one giant chunk, triggering >100 GB embedding
-        allocations that crashed the nightly vault reindex.
+        A single H2 section with tens of thousands of tokens must not be
+        emitted as one giant chunk — that would trigger >100 GB embedding
+        allocations and crash the nightly vault reindex.
         """
         from api.services.chunker import count_tokens
 

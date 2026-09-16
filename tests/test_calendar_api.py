@@ -129,7 +129,7 @@ class TestCalendarSearchEndpoint:
 
 
 class TestCalendarWriteFailures:
-    """#609: a failed create/update/delete must be a non-2xx, never a 200
+    """A failed create/update/delete must be a non-2xx, never a 200
     that merely omits the fields a successful write would have."""
 
     def test_create_event_failure_returns_500(self, mock_calendar_service):
