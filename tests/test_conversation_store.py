@@ -225,7 +225,7 @@ class TestCreateConversation:
         assert len(ids) == 3  # All unique
 
     def test_create_with_caller_supplied_id_used_verbatim(self, store):
-        """#592: a caller-supplied id (the Hermes proxy adopting an
+        """A caller-supplied id (the Hermes proxy adopting an
         upstream-minted id) is used as-is, not replaced with a fresh uuid."""
         conv = store.create_conversation(title="t", conv_id="hermes-abc-123")
         assert conv.id == "hermes-abc-123"
@@ -237,7 +237,7 @@ class TestCreateConversation:
         assert len(conv.id) == 36
 
     def test_create_with_existing_id_returns_existing_not_duplicate(self, store):
-        """#592: calling create_conversation() again with an id that already
+        """Calling create_conversation() again with an id that already
         exists returns the existing row rather than raising or duplicating
         it — the Hermes proxy does this on every turn of a thread it already
         created."""
@@ -341,9 +341,9 @@ class TestListConversations:
 
 @pytest.mark.unit
 class TestConversationBackendTagging:
-    """The `backend` column (#596): a sidebar-filtering label only, never
-    used to route. Defaults to 'lifeos' — the native backend — for both a
-    fresh create and a pre-#596 database."""
+    """The `backend` column is a sidebar-filtering label only; routing
+    never reads it. Defaults to 'lifeos' — the native backend — for both a
+    fresh create and a legacy database."""
 
     def test_create_defaults_to_lifeos(self, store):
         conv = store.create_conversation(title="t")
@@ -379,7 +379,7 @@ class TestConversationBackendTagging:
         assert {c.title for c in result} == {"a"}
 
     def test_migration_backfills_existing_rows_to_lifeos(self):
-        # A pre-#596 conversations table (no backend column) must migrate and
+        # A legacy conversations table (no backend column) must migrate and
         # backfill existing rows to 'lifeos', idempotently across restarts.
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
@@ -618,7 +618,7 @@ class TestGetMessages:
         assert messages == []
 
     def test_order_is_deterministic_on_a_timestamp_tie(self, store, conversation, monkeypatch):
-        """MINOR (#592 review): a user message and its assistant reply are
+        """A user message and its assistant reply are
         two separate add_message() calls; `created_at` alone left their
         order undefined if `datetime.now()` ever ties between them. Freeze
         the clock so both calls get the identical timestamp, then confirm

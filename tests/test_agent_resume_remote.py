@@ -1,4 +1,4 @@
-"""Tests for #851's remote resume/focus: a session whose `cli_sessions.host`
+"""Tests for remote resume/focus: a session whose `cli_sessions.host`
 names a REGISTERED (settings.agent_hosts) machine other than this API host
 runs the configured launcher over ssh instead of a local wezterm spawn, and
 an unregistered host still 409s. No real ssh/wezterm is invoked — every
@@ -39,8 +39,8 @@ def wezterm_store(tmp_path: Path, monkeypatch):
 @pytest.fixture
 def remote_cc_session(tmp_path: Path, monkeypatch):
     """Register a `cc:`-prefixed session on a remote host via the same
-    `cli_sessions` path `scripts/lifeos-agent-hook.sh` uses (#849), and
-    register that host's ssh target in the #851 registry."""
+    `cli_sessions` path `scripts/lifeos-agent-hook.sh` uses, and
+    register that host's ssh target in the remote-host registry."""
     from config.settings import settings
     from api.routes import agents as agents_route
 
@@ -120,7 +120,7 @@ def test_remote_codex_resume_wraps_launcher_in_ssh(client, remote_cc_session, mo
     assert argv[0] == "ssh"
     assert "user@laptop.example" in argv
 
-    # Round 1, finding #7 (codex sibling).
+    # A remote ssh round trip needs extra timeout budget over the connect timeout (codex sibling).
     from config.settings import settings
     communicate_timeout = proc.communicate.call_args.kwargs["timeout"]
     assert communicate_timeout == settings.agent_ssh_connect_timeout + 1.5
@@ -130,7 +130,7 @@ def test_remote_codex_resume_wraps_launcher_in_ssh(client, remote_cc_session, mo
 def test_remote_resume_does_not_upsert_local_wezterm_store(
     client, remote_cc_session, wezterm_store, monkeypatch,
 ):
-    """Round 1, finding #10: a remote resume's pane and wezterm process
+    """A remote resume's pane and wezterm process
     live on the REMOTE host — upserting the parsed pane id into the LOCAL
     `cc_wezterm_store` (keyed by `wezterm_pid` from THIS host's own
     `_current_wezterm_pid`) would record a host-mismatched mapping that a
@@ -152,7 +152,7 @@ def test_remote_resume_does_not_upsert_local_wezterm_store(
 def test_remote_codex_resume_does_not_upsert_local_wezterm_store(
     client, remote_cc_session, wezterm_store, monkeypatch,
 ):
-    """Round 1, finding #10 (codex sibling)."""
+    """Same non-upsert guarantee as the claude_code resume test above, for the codex path."""
     from api.routes import agents as agents_route
 
     store = agents_route._get_session_store()
@@ -177,7 +177,7 @@ def test_remote_codex_resume_does_not_upsert_local_wezterm_store(
 
 def test_unregistered_host_still_409s(client, remote_cc_session, monkeypatch):
     from config.settings import settings
-    monkeypatch.setattr(settings, "agent_hosts", {}, raising=False)  # "laptop" no longer registered
+    monkeypatch.setattr(settings, "agent_hosts", {}, raising=False)  # "laptop" is not in the registry
 
     popen_mock = MagicMock()
     monkeypatch.setattr("subprocess.Popen", popen_mock)
