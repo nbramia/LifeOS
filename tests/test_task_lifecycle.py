@@ -130,6 +130,63 @@ def test_projection_preserves_operator_edit_on_stale_version(tmp_path):
     assert sessions.list_pending_projections()[0]["state"] == "conflicted"
 
 
+def test_project_session_status_cas_guard_fires_and_terminal_status_self_heals(tmp_path):
+    """`_project_session_status` — the hook `update_status` fires on every
+    terminal/blocked write — must check its CAS against the task's live
+    state, not the same fetch it derived `expected_version` from. Stale
+    `_fetch_task` output simulates the session's view of the task being
+    behind; the manager (what `transition` re-fetches through) has already
+    moved on. The write must back off, and the drift sweep must
+    subsequently heal the stranded tag under a different event_id (the
+    hook's event_id carries the turn_id suffix; the sweep's carries
+    `lifecycle_drift_sweep`), since it was never marked applied."""
+    manager = TaskManager(tmp_path / "vault", tmp_path / "task-index.json")
+    task = manager.create(
+        "Synthetic terminal-status task", status="in_progress",
+        tags=["claude_code", RUNNING_TAG],
+    )
+    sessions = SessionStore(tmp_path / "sessions.db")
+    session = sessions.create(task.id, status=STATUS_RUNNING, routing="claude_code")
+
+    worker = _make_worker(sessions, manager)
+    stale_snapshot = task.to_dict()
+    worker._fetch_task = lambda task_id: stale_snapshot
+
+    # Operator edits the task after the stale snapshot was captured but
+    # before the projection's CAS check runs.
+    manager.update(task.id, description="Operator edited before terminal write")
+    edited = manager.get(task.id)
+
+    projected = worker._project_session_status(
+        task.id, "completed", attempt_id=session.attempt_id, turn_id=session.turn_id,
+    )
+
+    refreshed = manager.get(task.id)
+    assert projected is False
+    assert refreshed.description == "Operator edited before terminal write"
+    assert refreshed.tags == edited.tags
+    assert RUNNING_TAG in refreshed.tags  # still drifted — the write backed off
+
+    # Mirrors what `update_status` does immediately before firing this hook
+    # in production: the session row itself still advances to terminal even
+    # though the vault projection above was left pending.
+    assert sessions.update_status(
+        task.id, "completed", attempt_id=session.attempt_id, turn_id=session.turn_id,
+    )
+
+    # Next tick: the sweep sees a terminal session still tagged #agent-running
+    # and heals it under its own event_id, unblocked by the conflicted one.
+    worker._fetch_task = lambda task_id: (
+        manager.get(task_id).to_dict() if manager.get(task_id) else None
+    )
+    healed = worker._reconcile_lifecycle_drift()
+
+    final = manager.get(task.id)
+    assert healed == 1
+    assert COMPLETED_TAG in final.tags
+    assert RUNNING_TAG not in final.tags
+
+
 def test_resolved_operator_wake_is_durable_and_machine_wait_is_ignored(tmp_path):
     sessions = SessionStore(tmp_path / "sessions.db")
     session = sessions.create("wake-task")
@@ -192,6 +249,66 @@ def test_human_queue_wake_replays_through_projector_and_is_single_path(tmp_path)
     assert len(dispatched) == 1
 
 
+def test_human_queue_wake_cas_guard_fires_and_self_heals_on_next_tick(tmp_path):
+    """The wake replay's CAS check must compare against the task's live
+    state, not the same fetch it derived `expected_version` from. A stale
+    `_fetch_task` simulates an operator edit landing between the listing
+    and the check: the projection must back off, the session must NOT
+    rearm to CLAIMED, and the wait must stay resolved-but-unconsumed so the
+    next tick retries it. No other mechanism recovers this path (it targets
+    a non-terminal STATUS_RUNNING rearm, so the terminal drift sweep never
+    sees it) — retrying with a fresh fetch on the next tick is what
+    recovers it, proven here directly rather than assumed."""
+    manager = TaskManager(tmp_path / "vault", tmp_path / "task-index.json")
+    task = manager.create("Synthetic contested wake task", status="blocked", tags=["agent-blocked", "local"])
+    sessions = SessionStore(tmp_path / "sessions.db")
+    session = sessions.create(task.id, status=STATUS_BLOCKED, routing="local")
+    wait_id = sessions.record_wait(
+        task_id=task.id, session_id=session.session_id,
+        attempt_id=session.attempt_id, wait_type=WAIT_OPERATOR, card_id="card-1",
+    )
+    sessions.mark_wait_resolved(wait_id)
+
+    from api.services.agent_worker.worker import Worker
+
+    worker = Worker.__new__(Worker)
+    worker.session_store = sessions
+    worker.lifecycle_projector = LifecycleProjector(sessions, manager)
+    dispatched = []
+    worker._dispatch = lambda payload: dispatched.append(payload)
+
+    stale_snapshot = task.to_dict()
+    worker._fetch_task = lambda task_id: stale_snapshot
+
+    # Operator edits the task after the stale snapshot was captured but
+    # before this tick's CAS check runs.
+    manager.update(task.id, description="Operator edited during wait")
+    edited = manager.get(task.id)
+
+    worker._replay_wait_wakeups()
+
+    conflicted = manager.get(task.id)
+    assert conflicted.description == "Operator edited during wait"
+    assert conflicted.tags == edited.tags
+    assert sessions.get(task.id).status == STATUS_BLOCKED  # rearm did not happen
+    assert not dispatched
+    resolved = sessions.list_resolved_waits()
+    assert len(resolved) == 1 and resolved[0]["wait_id"] == wait_id  # left for retry
+
+    # Next tick: a fresh, current fetch — no concurrent edit racing this time.
+    worker._fetch_task = lambda task_id: (
+        manager.get(task_id).to_dict() if manager.get(task_id) else None
+    )
+    worker._replay_wait_wakeups()
+
+    refreshed_task = manager.get(task.id)
+    refreshed_session = sessions.get(task.id)
+    assert refreshed_task.status == "in_progress"
+    assert refreshed_session.status == STATUS_CLAIMED
+    assert dispatched and dispatched[0]["id"] == task.id
+    assert sessions.list_resolved_waits() == []
+
+
 def test_drift_sweep_reconciles_a_kill_parked_at_blocked(tmp_path):
     """A kill landing on a session parked at BLOCKED bypasses the projector
     (`mark_cancelled` is a raw status write) and there's no poll left on a
@@ -248,6 +365,45 @@ def test_drift_sweep_reconciles_a_kill_that_landed_while_worker_was_down(tmp_pat
     assert healed == 1
     assert FAILED_TAG in refreshed.tags
     assert RUNNING_TAG not in refreshed.tags
+
+
+def test_drift_sweep_does_not_clobber_a_concurrent_operator_edit(tmp_path):
+    """The sweep's CAS check must compare against the task's *live* state,
+    not the same tag-listing snapshot it derived `expected_version` from —
+    otherwise the guard always matches itself and can never catch a real
+    conflict. Seed a genuinely-drifted task, capture the stale snapshot the
+    sweep's tag listing would see this tick, let an operator edit land
+    (advancing the live `updated_at` past that snapshot), then run the
+    sweep against the stale listing and confirm it backs off entirely."""
+    manager = TaskManager(tmp_path / "vault", tmp_path / "task-index.json")
+    task = manager.create(
+        "Synthetic concurrently-edited task", status="blocked",
+        tags=["claude_code", RUNNING_TAG],
+    )
+    sessions = SessionStore(tmp_path / "sessions.db")
+    session = sessions.create(task.id, status=STATUS_BLOCKED, routing="claude_code")
+    assert sessions.mark_cancelled(
+        task.id, attempt_id=session.attempt_id, reason="operator_killed",
+    )
+
+    worker = _make_worker(sessions, manager)
+    # Freeze the sweep's tag listing at this tick's (now stale) snapshot.
+    stale_snapshot = worker._list_tasks_by_tag(RUNNING_TAG)
+    worker._list_tasks_by_tag = lambda tag: stale_snapshot if tag == RUNNING_TAG else []
+
+    # An operator edit lands between the listing and the sweep's CAS check —
+    # the live version has moved past what the sweep's snapshot captured.
+    manager.update(task.id, description="Operator edited mid-sweep")
+    edited = manager.get(task.id)
+
+    healed = worker._reconcile_lifecycle_drift()
+
+    refreshed = manager.get(task.id)
+    assert healed == 0
+    assert refreshed.description == "Operator edited mid-sweep"
+    assert refreshed.tags == edited.tags
+    assert refreshed.status == edited.status
+    assert refreshed.updated_at == edited.updated_at
 
 
 def test_drift_sweep_does_not_double_project_a_live_kill_already_reconciled(tmp_path):

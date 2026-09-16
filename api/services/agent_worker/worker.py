@@ -712,7 +712,11 @@ class Worker:
             wait_reason=wait_reason,
             reason=status,
         )
-        return self.lifecycle_projector.transition(event, task=SimpleNamespace(**task))
+        # `expected_version` above is captured from this same fetch, so
+        # passing that snapshot as `task=` here would make the CAS check
+        # tautological — it would always match itself. Let `transition`
+        # re-fetch live so a genuine concurrent edit is actually caught.
+        return self.lifecycle_projector.transition(event)
 
     @staticmethod
     def _warn_deprecated_settings() -> None:
@@ -2609,13 +2613,17 @@ class Worker:
                 reason=f"Human queue card {wait.get('card_id') or 'resolved'} resolved",
             )
             try:
-                projected = self.lifecycle_projector.transition(
-                    event, task=SimpleNamespace(**task),
-                )
+                # `expected_version` above came from this same fetch, so
+                # passing that snapshot as `task=` would make the CAS check
+                # tautological. Let `transition` re-fetch live instead.
+                projected = self.lifecycle_projector.transition(event)
                 # A projection can have completed before a worker crash. In
                 # that case transition() is idempotently false, but the
                 # session rearm still needs to be retried before consuming the
-                # wake marker. Conflicts remain pending for reconciliation.
+                # wake marker. A genuine CAS conflict also leaves `projected`
+                # False; the wait stays resolved-but-unconsumed (this method
+                # never marks it complete below), so the next tick's fresh
+                # fetch retries this same event_id with a current version.
                 if not projected and not self.lifecycle_projector.projection_applied(event_id):
                     continue
                 if not self.session_store.update_status(
@@ -2715,9 +2723,11 @@ class Worker:
                     reason="lifecycle_drift_sweep",
                 )
                 try:
-                    applied = self.lifecycle_projector.transition(
-                        event, task=SimpleNamespace(**task),
-                    )
+                    # `expected_version` above came from the same tag-listing
+                    # fetch, so passing that snapshot as `task=` would make
+                    # the CAS check tautological. Let `transition` re-fetch
+                    # live so a concurrent operator edit is actually caught.
+                    applied = self.lifecycle_projector.transition(event)
                 except Exception as exc:
                     logger.warning(
                         "lifecycle drift reconciliation failed for %s: %s", session.task_id, exc,
