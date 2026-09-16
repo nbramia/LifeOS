@@ -298,7 +298,16 @@ def test_drift_sweep_leaves_a_live_session_alone_regardless_of_status(tmp_path, 
     its session row non-terminal — superficially similar to a
     freshly-dispatched task, but excluded by session status alone: the
     sweep only ever heals a task whose session has reached a terminal
-    status."""
+    status.
+
+    For CLAIMED specifically, `healed == 0` alone doesn't pin the sweep's
+    own guard: a projector call with `target_status="claimed"` falls
+    through the terminal-tag/task-status mapping to the literal string
+    "claimed", which `TaskManager.update` rejects as an invalid status,
+    so `transition` catches the `ValueError` and returns `applied=False`
+    on its own — `healed` would still land on 0 even if the sweep's guard
+    never ran. Spying on the projector call pins the guard itself: it must
+    never be invoked for a live session, for any of the three statuses."""
     manager = TaskManager(tmp_path / "vault", tmp_path / "task-index.json")
     task = manager.create(
         "Synthetic live task", status="in_progress", tags=["claude_code", RUNNING_TAG],
@@ -307,9 +316,16 @@ def test_drift_sweep_leaves_a_live_session_alone_regardless_of_status(tmp_path, 
     sessions.create(task.id, status=live_status, routing="claude_code")
 
     worker = _make_worker(sessions, manager)
+    calls = []
+    real_transition = worker.lifecycle_projector.transition
+    worker.lifecycle_projector.transition = lambda event, **kwargs: (
+        calls.append(event) or real_transition(event, **kwargs)
+    )
+
     healed = worker._reconcile_lifecycle_drift()
 
     refreshed = manager.get(task.id)
+    assert calls == []  # the sweep's own guard must skip before ever projecting
     assert healed == 0
     assert RUNNING_TAG in refreshed.tags
     assert refreshed.tags == task.tags
@@ -346,6 +362,26 @@ def test_drift_sweep_leaves_a_settled_task_alone(tmp_path):
     assert healed == 0
     assert refreshed.tags == task.tags
     assert refreshed.status == task.status
+    assert refreshed.updated_at == task.updated_at
+
+
+def test_drift_sweep_leaves_a_tagged_task_with_no_backing_session_alone(tmp_path):
+    """A task can carry a non-terminal lifecycle tag with no backing session
+    row at all — an operator hand-editing the tag directly in Markdown, or a
+    session row that was pruned after the fact. `session_store.get` returns
+    None for it, and the sweep must skip it without raising."""
+    manager = TaskManager(tmp_path / "vault", tmp_path / "task-index.json")
+    task = manager.create(
+        "Synthetic tag-only task", status="in_progress", tags=["claude_code", RUNNING_TAG],
+    )
+    sessions = SessionStore(tmp_path / "sessions.db")
+
+    worker = _make_worker(sessions, manager)
+    healed = worker._reconcile_lifecycle_drift()
+
+    refreshed = manager.get(task.id)
+    assert healed == 0
+    assert refreshed.tags == task.tags
     assert refreshed.updated_at == task.updated_at
 
 
