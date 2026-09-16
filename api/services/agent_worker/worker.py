@@ -4307,6 +4307,10 @@ class Worker:
             "sane": pre.sane,
             "sane_reason": pre.sane_reason,
             "sane_fatal": pre.sane_fatal,
+            # Set when the classifier call itself failed or its reply was
+            # unparseable — no verdict was obtained (see
+            # `preflight.PreflightResult.preflight_error`).
+            "preflight_error": pre.preflight_error,
             "budget": {
                 "wall_seconds": pre.budget.wall_seconds,
                 "max_tokens": pre.budget.max_tokens,
@@ -4374,9 +4378,11 @@ class Worker:
                 )
 
         # Sanity gate (#747). Only a *fatal* sane=False fails the task
-        # closed — an empty title, a preflight-call error, or a title the
-        # code itself matched as a deterministically destructive shape (see
-        # `preflight._DESTRUCTIVE_TITLE_RE`). Everything else is the
+        # closed — an empty title, or a title the code itself matched as a
+        # deterministically destructive shape (see
+        # `preflight._DESTRUCTIVE_TITLE_RE`). A failed or unparseable
+        # preflight call is never fatal — it carries no verdict at all; see
+        # `preflight.PreflightResult.preflight_error`. Everything else is the
         # classifier's own inferred "this isn't executable" opinion, which
         # has been observed ignoring the prompt's "mundane tasks are sane"
         # rule — treating that single cheap-model judgement as authoritative
@@ -4411,6 +4417,14 @@ class Worker:
         if pre.ambiguity:
             question_parts.append(pre.ambiguity.question)
         if pre.routing == ROUTE_ASK:
+            if pre.preflight_error:
+                question_parts.append(
+                    f"The preflight classifier was unavailable "
+                    f"({pre.preflight_error}), so this task couldn't be "
+                    f"auto-routed. Reply with a route, or tag the task "
+                    f"(#claude, #codex, #local, #hermes) and it will run "
+                    f"without asking next time."
+                )
             question_parts.append(ROUTING_ASK_QUESTION)
         if question_parts:
             self._mark_blocked(session, task, " ".join(question_parts))
