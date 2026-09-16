@@ -773,6 +773,16 @@ def test_subscription_routes_are_unaffected_by_the_gate():
         assert result.routing == route, tag
 
 
+@pytest.mark.unit
+def test_preflight_max_tokens_floor():
+    """`_PREFLIGHT_MAX_TOKENS` must stay large enough for a reasoning model
+    to emit its hidden reasoning before the JSON reply: at 1024 tokens the
+    configured remote classifier's reply was truncated
+    (finish_reason='length') on 5 of 8 trials against a real task title,
+    and the worst observed successful completion used 1621 output tokens."""
+    assert pf._PREFLIGHT_MAX_TOKENS >= 4096
+
+
 # ---------------------------------------------------------------------------
 # #704 — `_default_llm_caller` client-selection fallback order
 # ---------------------------------------------------------------------------
@@ -806,7 +816,7 @@ def test_default_llm_caller_uses_anthropic_when_key_set_no_probe(monkeypatch):
         captured["model"] = model
         captured["api_key"] = api_key
 
-    def fake_create(self, messages, *, system=None, max_tokens=4096, tools=None, temperature=None):
+    def fake_create(self, messages, *, system=None, max_tokens, tools=None, temperature=None):
         captured["messages"] = messages
         captured["max_tokens"] = max_tokens
         captured["temperature"] = temperature
@@ -845,9 +855,10 @@ def test_default_llm_caller_falls_back_to_local_when_reachable(monkeypatch):
     captured = {}
     monkeypatch.setattr(LocalLLMClient, "is_available", lambda self: True)
 
-    def fake_create(self, messages, *, system=None, max_tokens=4096, tools=None, temperature=None):
+    def fake_create(self, messages, *, system=None, max_tokens, tools=None, temperature=None):
         captured["base_url"] = self.base_url
         captured["model"] = self.model
+        captured["max_tokens"] = max_tokens
         return _FakeLLMResponse("local reply")
 
     monkeypatch.setattr(LocalLLMClient, "create", fake_create)
@@ -857,6 +868,7 @@ def test_default_llm_caller_falls_back_to_local_when_reachable(monkeypatch):
     assert result == "local reply"
     assert captured["model"] == "local"
     assert captured["base_url"] == LocalLLMClient().base_url
+    assert captured["max_tokens"] == pf._PREFLIGHT_MAX_TOKENS
 
 
 @pytest.mark.unit
@@ -877,11 +889,12 @@ def test_default_llm_caller_falls_back_to_remote_when_local_unreachable(monkeypa
 
     captured = {}
 
-    def fake_create(self, messages, *, system=None, max_tokens=4096, tools=None, temperature=None):
+    def fake_create(self, messages, *, system=None, max_tokens, tools=None, temperature=None):
         captured["base_url"] = self.base_url
         captured["model"] = self.model
         captured["timeout"] = self.timeout
         captured["auth"] = self._auth_headers()
+        captured["max_tokens"] = max_tokens
         return _FakeLLMResponse("remote reply")
 
     monkeypatch.setattr(LocalLLMClient, "create", fake_create)
@@ -895,6 +908,7 @@ def test_default_llm_caller_falls_back_to_remote_when_local_unreachable(monkeypa
     assert captured["model"] == "accounts/fireworks/models/deepseek-v4-flash-0731"
     assert captured["timeout"] == 42
     assert captured["auth"] == {"Authorization": "Bearer fw_test_key"}
+    assert captured["max_tokens"] == pf._PREFLIGHT_MAX_TOKENS
 
 
 @pytest.mark.unit
@@ -957,7 +971,7 @@ def test_preflight_engine_auto_explicit_matches_704_order(monkeypatch):
     def fake_init(self, api_key=None, model=None):
         captured["model"] = model
 
-    def fake_create(self, messages, *, system=None, max_tokens=4096, tools=None, temperature=None):
+    def fake_create(self, messages, *, system=None, max_tokens, tools=None, temperature=None):
         captured["max_tokens"] = max_tokens
         return _FakeLLMResponse("anthropic reply")
 
@@ -1000,7 +1014,7 @@ def test_preflight_engine_remote_configured_builds_remote_client(monkeypatch):
 
     captured = {}
 
-    def fake_create(self, messages, *, system=None, max_tokens=4096, tools=None, temperature=None):
+    def fake_create(self, messages, *, system=None, max_tokens, tools=None, temperature=None):
         captured["base_url"] = self.base_url
         captured["model"] = self.model
         captured["timeout"] = self.timeout
@@ -1071,7 +1085,8 @@ def test_preflight_engine_anthropic_forced(monkeypatch):
     def fake_init(self, api_key=None, model=None):
         captured["model"] = model
 
-    def fake_create(self, messages, *, system=None, max_tokens=4096, tools=None, temperature=None):
+    def fake_create(self, messages, *, system=None, max_tokens, tools=None, temperature=None):
+        captured["max_tokens"] = max_tokens
         return _FakeLLMResponse("anthropic reply")
 
     monkeypatch.setattr(AnthropicLLMClient, "__init__", fake_init)
@@ -1086,6 +1101,7 @@ def test_preflight_engine_anthropic_forced(monkeypatch):
 
     assert result == "anthropic reply"
     assert captured["model"] == "claude-haiku-4-5"
+    assert captured["max_tokens"] == pf._PREFLIGHT_MAX_TOKENS
 
 
 @pytest.mark.unit
@@ -1132,7 +1148,7 @@ def test_preflight_engine_local_forced_uses_probe(monkeypatch):
 
     captured = {}
 
-    def fake_create(self, messages, *, system=None, max_tokens=4096, tools=None, temperature=None):
+    def fake_create(self, messages, *, system=None, max_tokens, tools=None, temperature=None):
         captured["model"] = self.model
         captured["max_tokens"] = max_tokens
         return _FakeLLMResponse("local reply")
@@ -1191,7 +1207,10 @@ def test_preflight_engine_invalid_value_falls_back_to_auto(monkeypatch, caplog):
     def fake_init(self, api_key=None, model=None):
         pass
 
-    def fake_create(self, messages, *, system=None, max_tokens=4096, tools=None, temperature=None):
+    captured = {}
+
+    def fake_create(self, messages, *, system=None, max_tokens, tools=None, temperature=None):
+        captured["max_tokens"] = max_tokens
         return _FakeLLMResponse("anthropic reply")
 
     monkeypatch.setattr(AnthropicLLMClient, "__init__", fake_init)
@@ -1207,6 +1226,7 @@ def test_preflight_engine_invalid_value_falls_back_to_auto(monkeypatch, caplog):
 
     assert result == "anthropic reply"
     assert any("invalid" in rec.message.lower() for rec in caplog.records)
+    assert captured["max_tokens"] == pf._PREFLIGHT_MAX_TOKENS
 
 
 # ---------------------------------------------------------------------------
