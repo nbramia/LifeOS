@@ -1057,3 +1057,136 @@ class TestLifecycleProjectorRealHTTPRoute:
         assert response.status_code == 409
         assert "answer or kill the session first" in response.json()["detail"]
         assert manager.get(task.id).status == "todo"
+
+
+class TestDeleteTaskPurgesWorkerBookkeeping:
+    """`DELETE /api/tasks/{id}` clears the worker's own session-store
+    bookkeeping for the deleted task, through `SessionStore.purge_task`
+    (called by the route), so nothing keeps acting on it afterward."""
+
+    def test_delete_stops_replay_from_retrying_an_unapplied_projection(self, tmp_path, monkeypatch):
+        """A crash-recovery marker left `pending` by a prior process must
+        not be picked back up by `replay_pending` once its task is gone —
+        proven by the projector's `transition` never being invoked for it,
+        not merely by the row's absence (a row could vanish while some
+        other path still retried the same transition by other means)."""
+        worker, manager, sessions = _make_route_worker(tmp_path, monkeypatch)
+        task = manager.create("Synthetic task with an unapplied projection", tags=["local"])
+        session = sessions.create(task.id, routing="local")
+        event_id = "pending-event"
+        assert sessions.begin_projection(
+            event_id, task_id=task.id, session_id=session.session_id,
+            attempt_id=session.attempt_id, expected_version=task.updated_at,
+            target_status=STATUS_COMPLETED,
+            payload={
+                "wait_type": None, "wait_reason": "", "human_card_id": None,
+                "dependencies": [], "reason": "",
+            },
+        )
+        assert sessions.list_pending_projections() != []
+
+        response = worker._http.delete(f"/api/tasks/{task.id}")
+        assert response.status_code == 200
+
+        projector = worker.lifecycle_projector
+        attempted: list[str] = []
+        original_transition = projector.transition
+
+        def _spy_transition(event, **kwargs):
+            attempted.append(event.event_id)
+            return original_transition(event, **kwargs)
+
+        projector.transition = _spy_transition
+
+        replayed = projector.replay_pending()
+
+        assert event_id not in attempted
+        assert replayed == 0
+        assert sessions.list_pending_projections() == []
+
+    def test_delete_stops_the_worker_fetching_the_deleted_task(self, tmp_path, monkeypatch):
+        """A live (non-terminal) session for the deleted task must not
+        survive the delete — proven by `_fetch_task` never being called for
+        it across a startup recovery pass, not merely by the session row's
+        absence."""
+        from api.services.agent_worker.transcript_store import TranscriptStore
+
+        worker, manager, sessions = _make_route_worker(tmp_path, monkeypatch)
+        worker.transcript_store = TranscriptStore(transcripts_dir=tmp_path / "transcripts")
+        task = manager.create(
+            "Synthetic task with a live session", status="in_progress",
+            tags=["local", RUNNING_TAG],
+        )
+        sessions.create(task.id, status=STATUS_RUNNING, routing="local")
+
+        fetched: list[str] = []
+        original_fetch_task = worker._fetch_task
+
+        def _spy_fetch_task(task_id):
+            fetched.append(task_id)
+            return original_fetch_task(task_id)
+
+        worker._fetch_task = _spy_fetch_task
+
+        response = worker._http.delete(f"/api/tasks/{task.id}")
+        assert response.status_code == 200
+        assert sessions.get(task.id) is None
+
+        worker.resume_pending()
+
+        assert task.id not in fetched
+
+    def test_delete_with_no_session_behaves_exactly_as_before(self, tmp_path, monkeypatch):
+        """The common case — a task with no agent session at all — must
+        stay a plain, unaffected delete."""
+        worker, manager, sessions = _make_route_worker(tmp_path, monkeypatch)
+        task = manager.create("Synthetic task with no session", tags=["local"])
+        assert sessions.get(task.id) is None
+
+        response = worker._http.delete(f"/api/tasks/{task.id}")
+
+        assert response.status_code == 200
+        assert response.json() == {"status": "deleted", "id": task.id}
+        assert manager.get(task.id) is None
+        assert sessions.get(task.id) is None
+
+    def test_delete_of_missing_task_still_404s(self, tmp_path, monkeypatch):
+        """A delete for a task id that was never created reports not-found,
+        unaffected by the added purge step."""
+        worker, _manager, _sessions = _make_route_worker(tmp_path, monkeypatch)
+
+        response = worker._http.delete("/api/tasks/does-not-exist")
+
+        assert response.status_code == 404
+
+    def test_delete_leaves_an_unrelated_applied_projection_alone(self, tmp_path, monkeypatch):
+        """Deleting one task must not touch an already-applied lifecycle
+        projection belonging to a different, surviving task."""
+        worker, manager, sessions = _make_route_worker(tmp_path, monkeypatch)
+        surviving_task, surviving_session = (
+            self._claimed_task_and_session(manager, sessions)
+        )
+        doomed_task = manager.create("Synthetic doomed task", tags=["local"])
+        event = LifecycleEvent(
+            event_id="surviving-event", task_id=surviving_task.id,
+            session_id=surviving_session.session_id, attempt_id=surviving_session.attempt_id,
+            target_status=STATUS_COMPLETED, expected_version=surviving_task.updated_at,
+        )
+        assert worker.lifecycle_projector.transition(event) is True
+        assert sessions.projection_applied(event.event_id)
+
+        response = worker._http.delete(f"/api/tasks/{doomed_task.id}")
+        assert response.status_code == 200
+
+        assert sessions.projection_applied(event.event_id)
+        assert sessions.get(surviving_task.id) is not None
+        assert manager.get(surviving_task.id) is not None
+
+    @staticmethod
+    def _claimed_task_and_session(manager, sessions, *, tag=RUNNING_TAG, session_status=STATUS_RUNNING):
+        task = manager.create(
+            "Synthetic route-level lifecycle task", status="in_progress",
+            tags=["claude", tag],
+        )
+        session = sessions.create(task.id, status=session_status, routing="claude_code")
+        return task, session

@@ -810,4 +810,11 @@ async def delete_task(task_id: str):
         raise HTTPException(status_code=409, detail=str(e))
     if not deleted:
         raise HTTPException(status_code=404, detail="Task not found")
+    try:
+        _get_session_store().purge_task(task_id)
+    except Exception:
+        # The operator's delete already succeeded against the task store;
+        # the worker's own bookkeeping is a separate database and its
+        # unavailability must not turn a successful delete into an error.
+        logger.warning("purge_task failed for %s", task_id, exc_info=True)
     return {"status": "deleted", "id": task_id}
