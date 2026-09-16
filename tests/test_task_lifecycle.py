@@ -1010,6 +1010,41 @@ class TestLifecycleProjectorRealHTTPRoute:
         assert "answer or kill the session first" in response.json()["detail"]
         assert manager.get(task.id).tags == task.tags
 
+    def test_worker_actor_marker_does_not_exempt_an_engine_reassignment(self, tmp_path, monkeypatch):
+        """The worker-actor carve-out never applies to a request that also
+        changes the assignee-tag set — even one that otherwise looks
+        exactly like the worker's own terminal transition (claimed card,
+        status actually changing, a tracked claim tag replacing the
+        one on file). Changing the assignee tag is what a reassignment
+        is; the carve-out must never cover it, marker or not."""
+        worker, manager, sessions = _make_route_worker(tmp_path, monkeypatch)
+        task, _session = self._claimed_task_and_session(manager, sessions)
+        response = worker._http.put(f"/api/tasks/{task.id}", json={
+            "status": "done", "tags": ["codex", COMPLETED_TAG], "actor": "worker",
+        })
+        assert response.status_code == 409
+        assert "answer or kill the session first" in response.json()["detail"]
+        refreshed = manager.get(task.id)
+        assert refreshed.tags == task.tags
+        assert refreshed.status == task.status
+
+    def test_worker_actor_marker_requires_an_actual_status_change(self, tmp_path, monkeypatch):
+        """The worker-actor carve-out never applies to a request whose
+        `status` doesn't actually move off the task's current one — a
+        claim tag can never be added on the strength of the marker alone
+        without the status transition it's supposed to accompany, even
+        though the assignee-tag set and the claimed state both look
+        exactly like the worker's own write."""
+        worker, manager, sessions = _make_route_worker(tmp_path, monkeypatch)
+        task, _session = self._claimed_task_and_session(manager, sessions)
+        response = worker._http.put(f"/api/tasks/{task.id}", json={
+            "status": task.status, "tags": ["claude", COMPLETED_TAG], "actor": "worker",
+        })
+        assert response.status_code == 409
+        assert "answer or kill the session first" in response.json()["detail"]
+        refreshed = manager.get(task.id)
+        assert refreshed.tags == task.tags
+
     def test_worker_actor_marker_cannot_manufacture_a_claim_on_an_unclaimed_card(self, tmp_path, monkeypatch):
         """A worker-actor marker on a card the worker never actually
         claimed must not add a claim tag — the exemption only ever applies
