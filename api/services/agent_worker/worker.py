@@ -173,18 +173,6 @@ _INLINE_SUMMARY_MAX_CHARS = 2000
 _BLOCKED_PROMPT_SEND_ATTEMPTS = 3
 _BLOCKED_PROMPT_RETRY_DELAY_S = 0.5
 
-# Lifecycle drift sweep (kill landing on a BLOCKED/parked session, or while
-# the worker is down, bypasses the projector hook — see
-# `_reconcile_lifecycle_drift`). Window and limit both bound the per-tick
-# scan: only recently-terminal sessions are considered, and at most this
-# many are reconciled in one tick. 90 days comfortably covers a worker
-# outage on the order of the longest one observed on this host (18 days)
-# with margin; a row the sweep has already examined and found nothing to do
-# for is stamped with `drift_swept_at` so it doesn't cost a rescan on every
-# subsequent tick, which is what makes a window this wide safe to hold open.
-_LIFECYCLE_DRIFT_SWEEP_WINDOW_S = 90 * 24 * 60 * 60
-_LIFECYCLE_DRIFT_SWEEP_LIMIT = 50
-
 # Answered-question claims use the existing `processed` integer as a small
 # durable lease: 0 = queued, 2 = claimed, 1 = conclusively handled. SessionStore
 # releases only claims inherited at process start; live claims are cleaned up by
@@ -2641,6 +2629,17 @@ class Worker:
             except Exception as exc:
                 logger.warning("human-queue wake replay failed for %s: %s", wait["wait_id"], exc)
 
+    def _list_tasks_by_tag(self, tag: str) -> list[dict[str, Any]]:
+        """Fetch every task currently carrying `tag`, in any status.
+
+        `GET /api/tasks?tag=...` is case-insensitive, works with or without
+        a leading `#`, and takes no limit/pagination param — it returns
+        every match, so there's no truncation to worry about here.
+        """
+        resp = self._http.get(f"{self.api_base}/api/tasks", params={"tag": tag})
+        resp.raise_for_status()
+        return resp.json().get("tasks", [])
+
     def _reconcile_lifecycle_drift(self) -> int:
         """Heal a vault tag left stranded by a terminal status write that
         bypassed the projector.
@@ -2658,98 +2657,76 @@ class Worker:
         poll to do that — the vault tag is stranded at `#agent-running` /
         `#agent-blocked` forever.
 
-        `SessionStore.list_terminal_unswept` finds sessions the sweep hasn't
-        examined since their last state change (terminal status, and either
-        never swept or swept before their most recent `last_activity_at`)
-        and is already scoped to vault-backed sessions and bounded in size —
-        see its docstring for the cost argument. It only narrows the
-        *candidate* set: an already-settled terminal session (reconciled by
-        the live path, an operator edit, or a historical session that
-        predates this sweep entirely) is also a candidate until the sweep
-        has looked at it once, so the actual drift signature — the task's
-        vault tag is still non-terminal (`RUNNING_TAG` / `BLOCKED_TAG`) — is
-        checked below before anything is touched. Reconciling on the
-        candidate signature alone would rewrite tasks that were already
-        settled by another path (e.g. an operator's `#accepted
-        #agent-completed`), clobbering that decision.
+        The candidate set here IS the drift set: every task currently
+        carrying `RUNNING_TAG` or `BLOCKED_TAG` is, by construction, a task
+        whose vault tag claims the agent is still working it. For each one,
+        `session_store.get` (a primary-key lookup keyed on `task_id`, local
+        SQLite — no HTTP) finds the backing session. A session that doesn't
+        exist, or belongs to an operator root-spawn/spawned child (no real
+        vault task — see `has_vault_task` elsewhere in this module), is
+        skipped. A session whose status is still non-terminal is legitimately
+        live — including a task reopened for a follow-up turn, which flips
+        the tag back to `RUNNING_TAG` but leaves the session non-terminal —
+        so it's left alone too. Only a task tagged non-terminal with a
+        *terminal* session is genuine drift, and it's healed through the
+        same projector a terminal write reaching `update_status` would have
+        used, so a session already reconciled by that path can't be
+        double-projected: its tag is already terminal, so it was never a
+        candidate in the first place.
 
-        Every row examined here and found to need no action right now is
-        stamped via `mark_drift_swept` so it drops out of the next tick's
-        candidate query. That stamp is only a statement about the past: a
-        vault tag that's currently terminal can legitimately flip back to
-        `#agent-running`/`#agent-blocked` later — the reopen-for-followup
-        path (see `code_reopened_for_pending_messages`) does exactly that,
-        on the very same attempt, with no `begin_new_execution` in between.
-        `update_status`/`mark_cancelled` bump `last_activity_at` on every
-        write, including that reopen and any terminal write that follows
-        it, so a genuine re-drift on the same attempt always re-qualifies
-        the row for another look rather than staying masked by the earlier
-        stamp.
-
-        A genuinely-drifted row is healed via the shared projector, the same
-        one a terminal write reaching `update_status` would have used, so a
-        session already reconciled by that path (or re-opened for a
-        follow-up turn, which flips the row back to non-terminal and so
-        isn't a candidate at all) is left untouched rather than
-        double-projected.
+        Cost per tick: exactly two HTTP calls (one per tag), regardless of
+        how many sessions or tasks exist. A failure listing one tag is
+        logged and skipped — that tag simply contributes no candidates this
+        tick, so a transient blip heals nothing and writes no durable state,
+        and the next tick retries normally once the API recovers.
         """
         healed = 0
-        since = int(time.time()) - _LIFECYCLE_DRIFT_SWEEP_WINDOW_S
-        for session in self.session_store.list_terminal_unswept(
-            since=since, limit=_LIFECYCLE_DRIFT_SWEEP_LIMIT,
-        ):
-            task, is_absent = self._fetch_task_or_absent(session.task_id)
-            if task is None:
-                if not is_absent:
-                    # The fetch was merely unavailable — a transient error,
-                    # timeout, or malformed payload — not a confirmed
-                    # deletion (e.g. the API restarting mid-tick after a
-                    # deploy). The row was not definitively examined: skip
-                    # without stamping so the next tick retries rather than
-                    # silently turning a one-tick blip into unhealable
-                    # drift.
-                    continue
-                # Task definitively deleted from the vault (404) — nothing
-                # left to reconcile, and this can never change. Stamp so
-                # this row stops costing an HTTP GET on every future tick.
-                self.session_store.mark_drift_swept(session.session_id)
-                continue
-            tags = self._norm_task_tags(task)
-            if RUNNING_TAG not in tags and BLOCKED_TAG not in tags:
-                # Not actually drifted — the vault tag is already terminal.
-                # Definitively examined: stamp so this row doesn't hold a
-                # batch slot under `_LIFECYCLE_DRIFT_SWEEP_LIMIT` on every
-                # future tick. A later genuine re-drift on this same session
-                # still re-qualifies it, since whatever causes that also
-                # bumps `last_activity_at` past this stamp.
-                self.session_store.mark_drift_swept(session.session_id)
-                continue
-            event_id = LifecycleProjector.event_id(
-                session.task_id, session.attempt_id, session.status,
-                suffix="lifecycle_drift_sweep",
-            )
-            event = LifecycleEvent(
-                event_id=event_id,
-                task_id=session.task_id,
-                session_id=session.session_id,
-                attempt_id=session.attempt_id,
-                target_status=session.status,
-                expected_version=task.get("updated_at"),
-                reason="lifecycle_drift_sweep",
-            )
+        for tag in (RUNNING_TAG, BLOCKED_TAG):
             try:
-                applied = self.lifecycle_projector.transition(event, task=SimpleNamespace(**task))
+                tasks = self._list_tasks_by_tag(tag)
             except Exception as exc:
                 logger.warning(
-                    "lifecycle drift reconciliation failed for %s: %s", session.task_id, exc,
+                    "lifecycle drift sweep: failed to list #%s tasks: %s", tag, exc,
                 )
                 continue
-            if applied:
-                healed += 1
-                self.session_store.mark_drift_swept(session.session_id)
-            # else: `expected_version` conflicted with a concurrent edit —
-            # leave unstamped so the next tick re-examines with fresh state
-            # rather than treating a raced write as "nothing to do".
+            for task in tasks:
+                task_id = task.get("id")
+                if not task_id:
+                    continue
+                session = self.session_store.get(task_id)
+                if session is None:
+                    continue
+                has_vault_task = session.origin != "operator" and not session.parent_session_id
+                if not has_vault_task:
+                    continue
+                if session.status not in TERMINAL_STATUSES:
+                    continue  # legitimately live — nothing to reconcile
+                event_id = LifecycleProjector.event_id(
+                    session.task_id, session.attempt_id, session.status,
+                    suffix="lifecycle_drift_sweep",
+                )
+                event = LifecycleEvent(
+                    event_id=event_id,
+                    task_id=session.task_id,
+                    session_id=session.session_id,
+                    attempt_id=session.attempt_id,
+                    target_status=session.status,
+                    expected_version=task.get("updated_at"),
+                    reason="lifecycle_drift_sweep",
+                )
+                try:
+                    applied = self.lifecycle_projector.transition(
+                        event, task=SimpleNamespace(**task),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "lifecycle drift reconciliation failed for %s: %s", session.task_id, exc,
+                    )
+                    continue
+                if applied:
+                    healed += 1
+                # else: `expected_version` conflicted with a concurrent edit
+                # — the next tick re-examines with fresh state.
         return healed
 
     def _check_human_queue_done_when(self, done_when: dict) -> tuple[bool, str]:
@@ -4190,23 +4167,10 @@ class Worker:
         return self._hermes_executor
 
     def _fetch_task(self, task_id: str) -> dict[str, Any] | None:
-        task, _ = self._fetch_task_or_absent(task_id)
-        return task
-
-    def _fetch_task_or_absent(self, task_id: str) -> tuple[dict[str, Any] | None, bool]:
-        """Fetch a task, distinguishing a definitive 404 from a merely
-        unavailable fetch (exception, or a malformed/mismatched payload).
-
-        Returns `(task, is_absent)`. `is_absent` is True only when the API
-        affirmatively reported the task doesn't exist — callers that need to
-        tell "deleted" apart from "transiently unreachable" (e.g. the
-        lifecycle drift sweep) must check it rather than treating any `None`
-        task the same way.
-        """
         try:
             resp = self._http.get(f"{self.api_base}/api/tasks/{task_id}")
             if resp.status_code == 404:
-                return None, True
+                return None
             resp.raise_for_status()
             payload = resp.json()
             # A task lookup must return the addressed row, not a generic API
@@ -4214,11 +4178,11 @@ class Worker:
             # an empty object). Treat malformed/mismatched payloads as an
             # unavailable recheck rather than a false ownership signal.
             if not isinstance(payload, dict) or payload.get("id") != task_id:
-                return None, False
-            return payload, False
+                return None
+            return payload
         except Exception as exc:
             logger.warning("fetch_task %s failed: %s", task_id, exc)
-            return None, False
+            return None
 
     def _last_reassignment(self, session_id: str) -> dict[str, Any] | None:
         """Return the latest board reassign marker, if any."""

@@ -233,15 +233,6 @@ class Session:
     # Doctor repair this session executes for. NULL for every session outside
     # a repair workflow, which is the default for ordinary #agent tasks.
     workflow_id: str | None = None
-    # Unix time the lifecycle drift sweep last examined this row and found
-    # nothing actionable (or successfully healed it). NULL means "never
-    # examined". Compared against `last_activity_at`, not read alone: every
-    # status write that can create real drift (`update_status`,
-    # `mark_cancelled`, the attempt-CAS update) bumps `last_activity_at`, so
-    # a stamp older than the current `last_activity_at` means something
-    # changed since the sweep last looked and the row is due for another
-    # look. See `list_terminal_unswept`.
-    drift_swept_at: int | None = None
 
 
 @dataclass(frozen=True)
@@ -347,11 +338,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     turn_id                    TEXT,
     turn_number                INTEGER NOT NULL DEFAULT 0,
     persona_id                 TEXT,
-    workflow_id                TEXT,  -- doctor repair this session executes for; NULL = not a repair session
-    drift_swept_at              INTEGER  -- last lifecycle-drift-sweep examination; NULL = never examined
+    workflow_id                TEXT  -- doctor repair this session executes for; NULL = not a repair session
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
-CREATE INDEX IF NOT EXISTS idx_sessions_status_activity ON sessions(status, last_activity_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_root ON sessions(root_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_yield ON sessions(status) WHERE status = 'yielded';
@@ -442,8 +431,6 @@ CREATE TABLE IF NOT EXISTS lifecycle_projections (
 );
 CREATE INDEX IF NOT EXISTS idx_lifecycle_projections_pending
     ON lifecycle_projections(state, created_at);
-CREATE INDEX IF NOT EXISTS idx_lifecycle_projections_task
-    ON lifecycle_projections(task_id, target_status, state);
 
 -- Exact cancellation fences.  A FAILED status alone is not enough to tell a
 -- cancellation apart from an ordinary failure (the latter may race a clean
@@ -873,12 +860,6 @@ class SessionStore:
                 "CREATE INDEX IF NOT EXISTS idx_sessions_workflow "
                 "ON sessions(workflow_id)"
             )
-            # Additive and nullable for legacy rows, same as the other
-            # lifecycle columns above. NULL reads as "never examined by the
-            # drift sweep", which is the correct default for a pre-existing
-            # row exactly as much as for a brand-new one.
-            if "drift_swept_at" not in sess_cols:
-                conn.execute("ALTER TABLE sessions ADD COLUMN drift_swept_at INTEGER")
             wait_cols = {row["name"] for row in conn.execute("PRAGMA table_info(lifecycle_waits)")}
             if "wake_consumed" not in wait_cols:
                 conn.execute(
@@ -1831,69 +1812,6 @@ class SessionStore:
                 tuple(TERMINAL_STATUSES),
             ).fetchall()
         return [self._row_to_session(r) for r in rows]
-
-    def list_terminal_unswept(
-        self, *, since: int, limit: int = 50,
-    ) -> list[Session]:
-        """Terminal, vault-backed sessions the lifecycle drift sweep hasn't
-        examined since their last state change.
-
-        A row is a candidate when `drift_swept_at` is NULL (never examined)
-        or older than `last_activity_at` (something changed since the last
-        examination). Every status write that can create real drift —
-        `update_status`, `mark_cancelled`, the attempt-CAS update — already
-        bumps `last_activity_at`, so a genuine re-drift re-qualifies a row
-        automatically; the caller stamps `drift_swept_at` (via
-        `mark_drift_swept`) only once it has definitively examined a row and
-        found nothing left to do. This is a candidate signature, not the
-        drift signature itself: it also matches a session that's terminal
-        and already correctly settled (nothing ever bumped `drift_swept_at`
-        past its creation), so the caller must still confirm the task's
-        current vault tag is non-terminal before touching anything.
-
-        Operator root-spawns and spawned children carry no vault task and
-        are never candidates (`has_vault_task` in worker.py) — excluded here
-        rather than by the caller, so they can't crowd out real drift under
-        `limit`.
-
-        Bounded on both axes so this is safe to call every tick: `since`
-        restricts the scan to recently-terminal sessions via the
-        `(status, last_activity_at)` index rather than the full history of
-        terminal sessions, and `limit` caps how many are returned.
-        """
-        placeholders = ",".join("?" for _ in TERMINAL_STATUSES)
-        with self._connect() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT * FROM sessions AS s
-                WHERE s.status IN ({placeholders})
-                  AND s.last_activity_at >= ?
-                  AND (s.origin IS NULL OR s.origin != 'operator')
-                  AND s.parent_session_id IS NULL
-                  AND (s.drift_swept_at IS NULL OR s.drift_swept_at < s.last_activity_at)
-                ORDER BY s.last_activity_at ASC
-                LIMIT ?
-                """,
-                (*TERMINAL_STATUSES, since, limit),
-            ).fetchall()
-        return [self._row_to_session(r) for r in rows]
-
-    def mark_drift_swept(self, session_id: str) -> None:
-        """Stamp a session as examined by the lifecycle drift sweep.
-
-        Called only once a candidate row has been definitively examined —
-        a confirmed-absent task, a task whose vault tag is already
-        terminal, or a drift the sweep just healed — and found to need no
-        further action right now. The row drops out of
-        `list_terminal_unswept` until `last_activity_at` advances past this
-        stamp, which happens automatically the next time anything writes a
-        real status change for this session.
-        """
-        with self._connect() as conn:
-            conn.execute(
-                "UPDATE sessions SET drift_swept_at = ? WHERE session_id = ?",
-                (_now(), session_id),
-            )
 
     def set_claude_code_session_id(
         self, task_id: str, claude_code_session_id: str, *,
@@ -4196,7 +4114,4 @@ class SessionStore:
             turn_number=(row["turn_number"] if "turn_number" in row.keys() else 0),
             persona_id=(row["persona_id"] if "persona_id" in row.keys() else None),
             workflow_id=(row["workflow_id"] if "workflow_id" in row.keys() else None),
-            drift_swept_at=(
-                row["drift_swept_at"] if "drift_swept_at" in row.keys() else None
-            ),
         )
