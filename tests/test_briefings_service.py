@@ -138,7 +138,7 @@ class TestBriefingsServiceV2Integration:
     NOTE: These tests require database access and will be skipped if
     the server is running (database locked). Only test_service_has_v2_properties
     below actually touches the real default entity_resolver/interaction_store —
-    the rest inject temp-store fixtures and are genuinely isolated (#682).
+    the rest inject temp-store fixtures and are genuinely isolated.
     """
 
     @pytest.mark.integration
@@ -248,7 +248,7 @@ class TestBriefingsServiceGenerateBriefing:
 
     NOTE: usefixtures("require_db") is inherited from the sibling classes'
     convention, but both methods here inject temp-store fixtures and mock the
-    synthesizer — genuinely isolated, so `unit` (#682).
+    synthesizer — genuinely isolated, so `unit`.
     """
 
     @pytest.mark.asyncio
@@ -322,7 +322,7 @@ class TestBriefingsServiceGenerateBriefing:
 @pytest.mark.integration
 @pytest.mark.usefixtures("require_db")
 class TestVaultSearchImprovement:
-    """Tests for improved vault search behavior.
+    """Tests for enhanced vault search behavior.
 
     NOTE: These tests require database access and will be skipped if
     the server is running (database locked).

@@ -236,7 +236,7 @@ class TestGpuToCpuFallback:
 
 class TestBatchSizeCap:
     """The encode batch is bounded so a large document can't spike VRAM in one
-    allocation and exhaust the iGPU's SDMA queues, freezing the host (#483)."""
+    allocation and exhaust the iGPU's SDMA queues, freezing the host."""
 
     @staticmethod
     def _fake_encode(data, **kwargs):
@@ -298,7 +298,7 @@ class TestBatchSizeCap:
 
 
 class TestGpuLock:
-    """Cross-process lock serializing GPU embedding across processes (#521).
+    """Cross-process lock serializing GPU embedding across processes.
 
     All tests mock ``fcntl.flock`` and/or ``SentenceTransformer`` rather than
     touching a real GPU — this host's iGPU freezes the machine if multiple
@@ -469,7 +469,7 @@ class TestGpuLock:
 
 
 class TestGpuLockPathResolution:
-    """A relative lock path must resolve against the project root, not cwd (#521).
+    """A relative lock path must resolve against the project root, not cwd.
 
     Every LifeOS service pins cwd via systemd WorkingDirectory, but an ad-hoc
     `python scripts/...` run from another directory would otherwise open a

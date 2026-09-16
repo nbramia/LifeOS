@@ -1,7 +1,7 @@
 """
-Tests that the chat orchestrator's caching wiring is live end-to-end (#383 Phase 1).
+Tests that the chat orchestrator's caching wiring is live end-to-end.
 
-These guard the two halves of the fix that live in run_agent_loop:
+These guard the two halves of the caching path that live in run_agent_loop:
 1. Tool definitions are forwarded with their ``cache_control`` marker intact
    (we stopped stripping it on the Anthropic path).
 2. Cache-token usage reported by the client flows into AgentResult so caching
@@ -110,7 +110,7 @@ class _MockAnthropicStream:
 
 @pytest.mark.asyncio
 async def test_synthesis_round_drives_real_client_with_timeout():
-    """End-to-end regression for #385. run_agent_loop exhausts its tool rounds
+    """End-to-end coverage: run_agent_loop exhausts its tool rounds
     and the synthesis round drives the REAL AnthropicLLMClient.astream with
     timeout=180 (only the SDK is mocked). If astream loses its timeout param the
     synthesis call raises TypeError, the loop yields "(Error during synthesis…)"
