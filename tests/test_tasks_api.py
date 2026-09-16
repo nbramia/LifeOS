@@ -802,6 +802,25 @@ class TestTasksAPI:
         response = client.delete("/api/tasks/abc12345")
         assert response.status_code == 409
 
+    def test_delete_task_succeeds_even_if_worker_bookkeeping_purge_fails(
+        self, client, mock_task_manager, monkeypatch,
+    ):
+        """The operator's delete must not depend on the worker's own
+        session-store database being reachable — a `purge_task` failure is
+        logged and swallowed, never surfaced as a failed delete."""
+        from api.routes import tasks as tasks_route
+
+        class _BrokenSessionStore:
+            def purge_task(self, task_id):
+                raise RuntimeError("worker session db unavailable")
+
+        monkeypatch.setattr(tasks_route, "_session_store", _BrokenSessionStore())
+        response = client.delete("/api/tasks/abc12345")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "deleted"
+        assert data["id"] == "abc12345"
+
     # --- RESPONSE SHAPE ---
 
     def test_task_response_shape(self, client, mock_task_manager):

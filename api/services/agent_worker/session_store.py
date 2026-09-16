@@ -3151,6 +3151,46 @@ class SessionStore:
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
 
+    def purge_task(self, task_id: str) -> None:
+        """Clear worker bookkeeping for `task_id` so nothing keeps acting on it.
+
+        Called when a task is deleted from the operator-facing store. Clears
+        exactly the rows that drive periodic worker activity against
+        `task_id`:
+
+        - `sessions` (plus, for that session, `pending_messages`/`messages`
+          — the same set `delete_session` clears for a hard session
+          removal): removes the row every non-terminal/active-session scan
+          (startup recovery, managed-agent polling, sleep wake-up,
+          clarification handling) would otherwise keep fetching the task
+          for.
+        - `lifecycle_projections`: stops `LifecycleProjector.replay_pending`
+          from retrying a non-applied transition against the task on every
+          worker start.
+        - `pending_questions`: stops a stale clarification from firing its
+          one-time "still waiting on your reply" nudge for a task that no
+          longer exists.
+
+        A no-op when `task_id` has no session, which is the common case.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT session_id FROM sessions WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if row is not None:
+                session_id = row["session_id"]
+                conn.execute(
+                    "DELETE FROM pending_messages WHERE session_id = ?", (session_id,)
+                )
+                conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM sessions WHERE task_id = ?", (task_id,))
+            conn.execute(
+                "DELETE FROM lifecycle_projections WHERE task_id = ?", (task_id,)
+            )
+            conn.execute(
+                "DELETE FROM pending_questions WHERE task_id = ?", (task_id,)
+            )
+
     def enqueue_web_followup(self, session_id: str, task_id: str, answer: str) -> int:
         """Queue a follow-up turn from a non-Telegram surface (web /chat, #236).
 

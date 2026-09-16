@@ -444,6 +444,39 @@ def test_timeout_marks_question_and_nudges(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_timeout_does_not_nudge_for_a_clarification_whose_task_was_deleted(tmp_path: Path):
+    """`list_timed_out_questions` never checks whether the task still
+    exists — it fires the "still waiting on your reply" nudge purely off
+    the `pending_questions` row. Deleting the task must clear that row
+    (`SessionStore.purge_task`), or the nudge still fires for a task the
+    operator already removed."""
+    api = FakeApi([{"id": "t1", "description": "x", "status": "todo", "tags": ["agent-blocked"]}])
+    executor = _StubExecutor(ExecutorOutcome(status=STATUS_COMPLETED, final_text=""))
+    w = _make_worker(tmp_path, api, preflight_caller=_local_ok_preflight(), local_executor=executor)
+
+    session = w.session_store.create(
+        task_id="t1", status=STATUS_BLOCKED, routing="local",
+        budget={"wall_seconds": 60, "max_tokens": 100, "max_dollars": 1.0},
+    )
+    qid = w.session_store.create_pending_question(
+        session_id=session.session_id, task_id="t1",
+        question="Which John?", sent_message_id=42,
+    )
+    # Backdate the sent_at by 4 days so it's past the 72h default cutoff.
+    with w.session_store._connect() as conn:
+        conn.execute(
+            "UPDATE pending_questions SET sent_at = ? WHERE id = ?",
+            (int(time.time()) - 4 * 86400, qid),
+        )
+
+    w.session_store.purge_task("t1")
+
+    w._timeout_stale_clarifications()
+
+    assert w._sent == []
+
+
+@pytest.mark.unit
 def test_init_migrates_legacy_code_followup_rows_processed(tmp_path: Path):
     """Legacy ``kind='code_followup'`` rows left over from the retired
     ClaudeOrchestrator are unresumable. The SessionStore init sweep marks
