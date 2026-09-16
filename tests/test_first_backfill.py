@@ -1,5 +1,5 @@
 """Tests for scripts/first_backfill.py, the one-time deep backfill entry
-point for full-history-capable sync sources (issue #778).
+point for full-history-capable sync sources.
 
 The nightly sync (run_all_syncs.py) deliberately narrows Gmail/Calendar to
 a 30-day window; a fresh install never gets its older history filled in on
@@ -70,8 +70,8 @@ class TestFullDepthArgs:
     def test_does_not_mutate_the_input_list(self):
         """SYNC_SCRIPTS is shared, module-level state — run_all_syncs.py's
         nightly job reads the same list objects. Stripping --days must
-        never mutate them in place (#778's regression guard: "the nightly
-        sync job's existing per-source arguments shall be unchanged")."""
+        never mutate them in place: the nightly sync job's existing
+        per-source arguments must be unaffected."""
         import scripts.first_backfill as fb
 
         original = ["--execute", "--gmail-only", "--account", "personal", "--days", "30"]
@@ -155,7 +155,7 @@ class TestRunBackfillSource:
         assert "work" in captured["cmd"]
 
     def test_unconfigured_source_is_a_clean_skip_not_a_failure(self, monkeypatch):
-        """Consistent with #687: a source with nothing configured must be
+        """A source with nothing configured must be
         reported as skipped, never as a failure, so one missing
         integration doesn't fail the whole backfill."""
         import scripts.first_backfill as fb
@@ -208,8 +208,7 @@ class TestCoverageReport:
         """sqlite3.connect silently creates an empty file at a missing
         path -- this script claims to write nothing of its own (a totally
         fresh or all-unconfigured install has no interactions.db yet), so
-        calling the "read-only" coverage report must not leave one behind
-        (Codex review of #778)."""
+        calling the "read-only" coverage report must not leave one behind."""
         import scripts.first_backfill as fb
 
         db_path = tmp_path / "interactions.db"
@@ -310,7 +309,7 @@ class TestMainOrchestration:
         fb.main()  # must not raise SystemExit
 
     def test_rerun_issues_identical_commands(self, monkeypatch):
-        """The orchestration-level half of #778's idempotence criterion:
+        """The orchestration-level half of the idempotence criterion:
         this script keeps no local state between runs, so re-running it
         against an install that already has full history issues the exact
         same commands both times. Row-level dedup is the underlying

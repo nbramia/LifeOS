@@ -1,4 +1,4 @@
-"""Tests for POST /api/agents/board/cards/{id}/open (#851, AC9) and the
+"""Tests for POST /api/agents/board/cards/{id}/open and the
 GET /api/agents/models catalog endpoint wired through the same router.
 """
 from __future__ import annotations
@@ -40,7 +40,7 @@ def session_store(tmp_path: Path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _clear_opening_guard():
-    """`agent_assignment._opening_card_ids` (round 1, finding #6) is
+    """`agent_assignment._opening_card_ids` is
     module-level, process-lifetime state — clear it around every test so
     one test's card_id can't spuriously 409 a later test that reuses it."""
     agent_assignment._opening_card_ids.clear()
@@ -126,7 +126,7 @@ def test_open_card_with_running_session_is_409(client, manager, session_store):
 
 
 def test_open_card_double_click_is_serialized(client, manager, session_store, monkeypatch):
-    """Round 1, finding #6: a genuine double-click — two OS threads racing
+    """A genuine double-click — two OS threads racing
     the SAME check-then-spawn window — must produce exactly one spawn and
     one 409, not two terminals opened onto the same card. A `threading.Lock`
     alone doesn't guarantee this (neither `task.status` nor `session_store`
@@ -170,10 +170,10 @@ def test_open_card_double_click_is_serialized(client, manager, session_store, mo
 
 
 def test_open_card_reopens_after_grace_period_following_success(client, manager, session_store, monkeypatch):
-    """Round 2, finding #1: `_opening_card_ids` used to be discarded ONLY on
-    a spawn failure, so a card that opened successfully stayed 409'd for
-    the rest of the process lifetime even after the session reached a
-    terminal status and the task went back to `todo`. Advancing past
+    """`_opening_card_ids` must not be discarded ONLY on
+    a spawn failure — a card that opens successfully must not stay 409'd
+    for the rest of the process lifetime after the session reaches a
+    terminal status and the task goes back to `todo`. Advancing past
     `_OPENING_GRACE_SECONDS` must let a second, genuinely new open through."""
     task = manager.create(description="fix the printer", tags=["claude"])
 
@@ -202,7 +202,7 @@ def test_open_card_reopens_after_grace_period_following_success(client, manager,
     manager.update(task.id, status="todo")
 
     # Still within the grace window: stays 409'd even though the task/
-    # session state now looks fully reopenable.
+    # session state is fully reopenable again.
     resp = client.post(f"/api/agents/board/cards/{task.id}/open")
     assert resp.status_code == 409
     assert popen_mock.call_count == 1
