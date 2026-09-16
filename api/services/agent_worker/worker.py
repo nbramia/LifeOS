@@ -1384,7 +1384,13 @@ class Worker:
                 if refreshed.status in TERMINAL_STATUSES and not same_turn:
                     return
                 else:
-                    self._handle_outcome(refreshed, task, normalize_outcome(outcome, refreshed, route="hermes"))
+                    self._handle_outcome(
+                        refreshed, task,
+                        normalize_outcome(
+                            outcome, refreshed, route="hermes",
+                            transcript_store=self.transcript_store,
+                        ),
+                    )
             except Exception as exc:
                 logger.exception("hermes executor crashed for %s", session.task_id, exc_info=exc)
                 current = self.session_store.get(session.task_id) or session
@@ -1435,7 +1441,13 @@ class Worker:
                     "children": [getattr(child, "session_id", "") for child in child_sessions],
                     "continuation_id": getattr(outcome, "continuation_id", None),
                 })
-                self._handle_outcome(current, task, normalize_outcome(outcome, current, route="hermes"))
+                self._handle_outcome(
+                    current, task,
+                    normalize_outcome(
+                        outcome, current, route="hermes",
+                        transcript_store=self.transcript_store,
+                    ),
+                )
             except Exception as exc:
                 logger.exception("Hermes child resume crashed for %s", session.task_id)
                 current = self.session_store.get(session.task_id) or session
@@ -1475,6 +1487,7 @@ class Worker:
                 executor,
                 session_store=self.session_store,
                 cancel_fn=self._cancel_executor,
+                transcript_store=self.transcript_store,
             )
         except ValueError:
             return None
@@ -1579,6 +1592,7 @@ class Worker:
             refreshed = self.session_store.get(session.task_id)
             outcome = normalize_outcome(
                 outcome, refreshed or session, route=ROUTE_CLAUDE,
+                transcript_store=self.transcript_store,
             )
             if not self._same_lifecycle_snapshot(session, refreshed):
                 continue
@@ -3478,6 +3492,9 @@ class Worker:
                 )
             except Exception as exc:
                 logger.exception("claude_code resume crashed for %s: %s", session.task_id, exc)
+                self.transcript_store.append(sid, "claude_code_dispatch_crashed", {
+                    "phase": "resume", "error": str(exc),
+                })
                 self._record_child_failure_reason(
                     session, STATUS_FAILED, f"claude_code resume crashed: {exc}")
                 self.session_store.update_status(
@@ -3506,6 +3523,9 @@ class Worker:
                 outcome = self._execute_start(session, task)
             except Exception as exc:
                 logger.exception("claude_code execute crashed for %s: %s", session.task_id, exc)
+                self.transcript_store.append(sid, "claude_code_dispatch_crashed", {
+                    "phase": "execute", "error": str(exc),
+                })
                 self._record_child_failure_reason(
                     session, STATUS_FAILED, f"claude_code execute crashed: {exc}")
                 self.session_store.update_status(
@@ -3917,6 +3937,9 @@ class Worker:
                 )
             except Exception as exc:
                 logger.exception("codex resume crashed for %s: %s", session.task_id, exc)
+                self.transcript_store.append(sid, "codex_dispatch_crashed", {
+                    "phase": "resume", "error": str(exc),
+                })
                 self._record_child_failure_reason(
                     session, STATUS_FAILED, f"codex resume crashed: {exc}")
                 self.session_store.update_status(
@@ -3944,6 +3967,9 @@ class Worker:
                 outcome = self._execute_start(session, task)
             except Exception as exc:
                 logger.exception("codex execute crashed for %s: %s", session.task_id, exc)
+                self.transcript_store.append(sid, "codex_dispatch_crashed", {
+                    "phase": "execute", "error": str(exc),
+                })
                 self._record_child_failure_reason(
                     session, STATUS_FAILED, f"codex execute crashed: {exc}")
                 self.session_store.update_status(
@@ -4625,7 +4651,10 @@ class Worker:
             and not self._same_lifecycle_snapshot(session, current)
         ):
             return
-        outcome = normalize_outcome(outcome, current or session, route=session.routing)
+        outcome = normalize_outcome(
+            outcome, current or session, route=session.routing,
+            transcript_store=self.transcript_store,
+        )
         if current is None or not self._outcome_matches_snapshot(outcome, current):
             # A cancelled callback may finish after the same task has been
             # deliberately reopened.  Its task tags, notifications, and

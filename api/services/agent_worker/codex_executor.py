@@ -604,8 +604,8 @@ class CodexExecutor:
     def _exit_metadata(proc, timed_out: threading.Event, state: "_RunState") -> dict:
         """Best-effort description of how the subprocess ended (#760).
         Mirrors ClaudeCodeExecutor._exit_metadata; ``stream_terminal_event_seen``
-        is True only when a `session.completed`/`exec.completed` event was
-        actually parsed, not merely inferred from a clean returncode."""
+        is True only when a `turn.completed` event was actually parsed, not
+        merely inferred from a clean returncode."""
         rc = proc.returncode
         meta: dict = {
             "returncode": rc,
@@ -711,9 +711,9 @@ class CodexExecutor:
                 # cost to cap. Only the managed/API route enforces max_dollars.
                 # Wall-clock and the CLI's own limits still bound runaway sessions.
                 state.cost_usd = _cost_from_usage(usage, state.model)
-            return
-
-        if etype in ("session.completed", "exec.completed"):
+            # `turn.completed` is the CLI's own signal that it finished the
+            # turn (the module docstring's event list) — this is the terminal
+            # marker `_exit_metadata` reports as `stream_terminal_event_seen`.
             state.terminal = True
             return
 
