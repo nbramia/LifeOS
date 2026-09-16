@@ -338,7 +338,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     turn_id                    TEXT,
     turn_number                INTEGER NOT NULL DEFAULT 0,
     persona_id                 TEXT,
-    workflow_id                TEXT   -- doctor repair this session executes for; NULL = not a repair session
+    workflow_id                TEXT  -- doctor repair this session executes for; NULL = not a repair session
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);

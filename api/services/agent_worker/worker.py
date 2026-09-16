@@ -712,7 +712,11 @@ class Worker:
             wait_reason=wait_reason,
             reason=status,
         )
-        return self.lifecycle_projector.transition(event, task=SimpleNamespace(**task))
+        # `expected_version` above is captured from this same fetch, so
+        # passing that snapshot as `task=` here would make the CAS check
+        # tautological — it would always match itself. Let `transition`
+        # re-fetch live so a genuine concurrent edit is actually caught.
+        return self.lifecycle_projector.transition(event)
 
     @staticmethod
     def _warn_deprecated_settings() -> None:
@@ -946,6 +950,11 @@ class Worker:
         # worker is paused or near its daily cap (#852 R2).
         self._process_human_queue()
         self._replay_wait_wakeups()
+        # Heal any vault tag left stranded by a terminal status write that
+        # bypassed the projector (e.g. a kill landing on a parked/offline
+        # session — see `_reconcile_lifecycle_drift`). Also never gated on
+        # the spend cap: it reconciles existing state, never starts new work.
+        self._reconcile_lifecycle_drift()
 
         # Use the configured per-task default budget as the "can I afford to
         # start the cheapest task right now?" estimate. Calling with 0.0 would
@@ -2618,13 +2627,17 @@ class Worker:
                 reason=f"Human queue card {wait.get('card_id') or 'resolved'} resolved",
             )
             try:
-                projected = self.lifecycle_projector.transition(
-                    event, task=SimpleNamespace(**task),
-                )
+                # `expected_version` above came from this same fetch, so
+                # passing that snapshot as `task=` would make the CAS check
+                # tautological. Let `transition` re-fetch live instead.
+                projected = self.lifecycle_projector.transition(event)
                 # A projection can have completed before a worker crash. In
                 # that case transition() is idempotently false, but the
                 # session rearm still needs to be retried before consuming the
-                # wake marker. Conflicts remain pending for reconciliation.
+                # wake marker. A genuine CAS conflict also leaves `projected`
+                # False; the wait stays resolved-but-unconsumed (this method
+                # never marks it complete below), so the next tick's fresh
+                # fetch retries this same event_id with a current version.
                 if not projected and not self.lifecycle_projector.projection_applied(event_id):
                     continue
                 if not self.session_store.update_status(
@@ -2637,6 +2650,121 @@ class Worker:
                 self.session_store.complete_wait_wakeup(wait["wait_id"])
             except Exception as exc:
                 logger.warning("human-queue wake replay failed for %s: %s", wait["wait_id"], exc)
+
+    def _list_tasks_by_tag(self, tag: str) -> list[dict[str, Any]]:
+        """Fetch every task currently carrying `tag`, in any status.
+
+        `GET /api/tasks?tag=...` is case-insensitive, works with or without
+        a leading `#`, and takes no limit/pagination param — it returns
+        every match, so there's no truncation to worry about here.
+        """
+        resp = self._http.get(f"{self.api_base}/api/tasks", params={"tag": tag})
+        resp.raise_for_status()
+        return resp.json().get("tasks", [])
+
+    def _reconcile_lifecycle_drift(self) -> int:
+        """Heal a vault tag left stranded by a terminal status write that
+        bypassed the ordinary reconciliation path.
+
+        `update_status` fires the `set_status_projector` hook (installed at
+        construction time) whenever it lands a terminal status, which
+        reconciles the vault tag through `lifecycle_projector`. A kill
+        instead flips the row via `mark_cancelled` (`teardown_session`,
+        inter_agent.py) — a raw status write with no projector hook. A kill
+        landing on a session that's still being actively polled is still
+        fine: the executor observes the terminal row on its own next poll
+        and reconciles it through the ordinary `update_status` +
+        `_reconcile_vault_terminal` path. But a kill landing on a session
+        parked at BLOCKED, or while the worker itself is down, leaves no
+        poll to do that — the vault tag is stranded at `#agent-running` /
+        `#agent-blocked` forever.
+
+        The candidate set here IS the drift set: every task currently
+        carrying `RUNNING_TAG` or `BLOCKED_TAG` is, by construction, a task
+        whose vault tag claims the agent is still working it. For each one,
+        `session_store.get` (a primary-key lookup keyed on `task_id`, local
+        SQLite — no HTTP) finds the backing session. A session that doesn't
+        exist, or belongs to an operator root-spawn/spawned child (no real
+        vault task — see `has_vault_task` elsewhere in this module), is
+        skipped. A session whose status is still non-terminal is legitimately
+        live — including a task reopened for a follow-up turn, which flips
+        the tag back to `RUNNING_TAG` but leaves the session non-terminal —
+        so it's left alone too. Only a task tagged non-terminal with a
+        *terminal* session is genuine drift, and a session already
+        reconciled by the ordinary path can't be healed twice: its tag is
+        already terminal, so it was never a candidate in the first place.
+
+        The heal itself goes through exactly the endpoints
+        `_reconcile_vault_terminal` uses, with the same status-to-action
+        mapping. `POST /api/tasks/{id}/swap-tag` is the only write the API
+        accepts for a lifecycle tag on a claimed card — a `PUT` carrying a
+        `tags` list is refused outright (see the claim-tag guard in
+        `api/routes/tasks.py`), and every card this sweep looks at is
+        claimed by definition. The swap is also what gates the rest: it
+        reports `swapped: false` when the tag it was told to replace is
+        absent, so an operator retagging the card between the tag
+        listing and this write is never overwritten, and the task status is
+        only written for a card whose tag swap actually landed. The `from`
+        tag is the one the candidate was listed under, so a `#agent-blocked`
+        card swaps out of `BLOCKED_TAG` rather than no-opping against
+        `RUNNING_TAG`.
+
+        A session parked at BLOCKED is non-terminal, so it falls in the
+        "legitimately live" set and this sweep never touches its vault tag,
+        whatever that tag currently reads. Bringing a park's tag into line
+        belongs to the path that performs the park, not here: a session
+        parked BLOCKED and never resumed or killed is never a subject of
+        this sweep, only ever a candidate it skips.
+
+        `BLOCKED_TAG` is still swept for candidates even so — the tag is a
+        legitimate resting place for a card whose session later goes
+        terminal, and a card reaching that state through any path this
+        module doesn't own is exactly what the sweep exists to catch.
+
+        Cost per tick: two HTTP calls for the listing (one per tag),
+        regardless of how many sessions or tasks exist, plus two writes per
+        card actually healed. A failure listing one tag is logged and
+        skipped — that tag simply contributes no candidates this tick, so a
+        transient blip heals nothing and writes no durable state, and the
+        next tick retries normally once the API recovers.
+        """
+        healed = 0
+        for tag in (RUNNING_TAG, BLOCKED_TAG):
+            try:
+                tasks = self._list_tasks_by_tag(tag)
+            except Exception as exc:
+                logger.warning(
+                    "lifecycle drift sweep: failed to list #%s tasks: %s", tag, exc,
+                )
+                continue
+            for task in tasks:
+                task_id = task.get("id")
+                if not task_id:
+                    continue
+                session = self.session_store.get(task_id)
+                if session is None:
+                    continue
+                has_vault_task = session.origin != "operator" and not session.parent_session_id
+                if not has_vault_task:
+                    continue
+                if session.status not in TERMINAL_STATUSES:
+                    continue  # legitimately live — nothing to reconcile
+                terminal_tag = {
+                    STATUS_COMPLETED: COMPLETED_TAG,
+                    STATUS_BUDGET_EXCEEDED: BUDGET_EXCEEDED_TAG,
+                    STATUS_FAILED: FAILED_TAG,
+                }[session.status]
+                if not self._swap_tag(task_id, tag, terminal_tag):
+                    # The tag moved (or the swap failed) between the listing
+                    # and this write — leave the rest of the card alone and
+                    # let the next tick re-examine it with fresh state.
+                    continue
+                if session.status == STATUS_COMPLETED:
+                    self._complete_task(task_id)
+                else:
+                    self._set_task_status(task_id, "cancelled")
+                healed += 1
+        return healed
 
     def _check_human_queue_done_when(self, done_when: dict) -> tuple[bool, str]:
         """Evaluate one card's `done_when`. Returns `(passed, description)`;
@@ -3012,9 +3140,7 @@ class Worker:
         claude_code/codex routing just re-enqueues the reply and flips the
         session to CLAIMED so the next dispatch drains it through
         ``resume()`` on the persisted CLI session id. The vault tag is left
-        at ``#agent-running`` (mirrors the CLARIFY/GOAL/PLAN block path,
-        which also doesn't swap it) — only the session row moves to BLOCKED
-        so ``/agents`` reflects it.
+        at ``#agent-running``; only the session row moves to BLOCKED.
 
         Fallback (no CLI session id persisted — ``init`` never fired, so
         there is nothing to resume against, or Telegram delivery failed and
