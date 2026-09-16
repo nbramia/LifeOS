@@ -1,9 +1,9 @@
-"""#615: a native turn that ends via `asyncio.CancelledError` (explicit
+"""A native turn that ends via `asyncio.CancelledError` (explicit
 cancel, supersede, or the detached-lifetime deadline) must still record its
 usage row -- the tokens were already spent and billed even though the loop
 never reached its terminal `result` event.
 
-`run_agent_loop` now yields a `turn_state` event carrying a live, mutable
+`run_agent_loop` yields a `turn_state` event carrying a live, mutable
 reference to its `AgentResult` before doing any work; `chat.py` stashes it
 and reads accrued usage from it in the `CancelledError` handler if the
 normal end-of-turn write never ran. These tests exercise that path directly
@@ -101,10 +101,10 @@ def _fake_loop_turn_state_before_any_round(hold):
 
 
 def _fake_loop_anthropic_backend_mid_round(hold, first_chunk="Hello "):
-    """#629: mimics an AnthropicLLMClient-backed turn cancelled mid-round.
+    """Mimics an AnthropicLLMClient-backed turn cancelled mid-round.
     Text streams, then a "usage_update" event (from message_start/
     message_delta) sets provisional_input_tokens/provisional_output_tokens
-    -- exactly as agent_loop.run_agent_loop does now -- before the round's
+    -- exactly as agent_loop.run_agent_loop does -- before the round's
     "done" event (which would fold them into total_* and reset them to 0,
     per _track_usage) ever arrives."""
     async def fake_loop(**kwargs):
@@ -124,13 +124,13 @@ def _fake_loop_anthropic_backend_mid_round(hold, first_chunk="Hello "):
 
 
 def _fake_loop_local_backend_mid_round(hold, first_chunk="Hello "):
-    """#629: mimics a LocalLLMClient-backed turn cancelled mid-round. Text
+    """Mimics a LocalLLMClient-backed turn cancelled mid-round. Text
     streams, but -- unlike the Anthropic-backed case above -- the local
     backend's OpenAI-compatible protocol has no mid-stream usage signal at
     all, so there is no "usage_update" event to set provisional_* from.
-    Usage stays at its initial zero right up to cancellation, exactly as it
-    did before #629 -- this backend gets no incremental-usage improvement,
-    by design (see LocalLLMClient.astream's docstring)."""
+    Usage stays at its initial zero right up to cancellation -- this
+    backend gets no incremental usage tracking, by design (see
+    LocalLLMClient.astream's docstring)."""
     async def fake_loop(**kwargs):
         live = SimpleNamespace(
             total_input_tokens=0, total_output_tokens=0, total_cost_usd=0.0,
@@ -146,9 +146,9 @@ def _fake_loop_local_backend_mid_round(hold, first_chunk="Hello "):
 
 
 class TestIncrementalUsageOnCancellation:
-    """#629: a mid-round cancellation on the Anthropic backend now credits
+    """A mid-round cancellation on the Anthropic backend credits
     the tokens already billed instead of reporting zero for the whole
-    round; the local backend's documented, unclosed gap is unchanged."""
+    round; the local backend's documented, unclosed gap is unaffected."""
 
     async def test_anthropic_backed_mid_round_cancel_records_provisional_usage(
         self, api_client, store, monkeypatch,
@@ -191,8 +191,8 @@ class TestIncrementalUsageOnCancellation:
         """The local backend's documented, unclosed gap: its streaming
         protocol carries no mid-stream usage signal, so
         provisional_input_tokens/provisional_output_tokens never move off
-        0, and a mid-round cancellation writes no usage row -- unchanged
-        from #615's behavior, not a regression introduced by #629."""
+        0, and a mid-round cancellation writes no usage row -- expected
+        behavior, not a regression."""
         import api.services.agent_loop as agent_loop_mod
 
         hold = asyncio.Event()
@@ -255,7 +255,7 @@ class TestCancelledTurnRecordsUsage:
         assert usage["output_tokens"] == 7
         assert usage["cost_usd"] == pytest.approx(0.0123)
 
-        # The partial-text persistence #611 already guarantees is unaffected.
+        # Partial-text persistence still holds, unaffected by usage recording.
         messages = store.get_messages(conversation_id)
         assert "Hello " in messages[1].content
         assert "cut off" in messages[1].content
@@ -329,7 +329,7 @@ class TestCancelledTurnRecordsUsage:
 
 class TestCompletedTurnStillRecordsExactlyOneRow:
     async def test_no_double_write_on_normal_completion(self, store, monkeypatch):
-        """Regression guard for #611's own acceptance criterion: a turn that
+        """A turn that
         completes normally (never cancelled) must still write exactly one
         usage row, via the pre-existing end-of-turn path -- the new
         `turn_state` reference must not cause a second write."""
@@ -371,10 +371,10 @@ class TestFakeLoopWithoutTurnStateEvent:
     async def test_a_loop_that_never_emits_turn_state_still_cancels_cleanly(
         self, api_client, store, monkeypatch,
     ):
-        """A consumer (or, as here, a test double) that predates #615 and
-        never emits `turn_state` must be unaffected: `live_result` simply
+        """A consumer (or, as here, a test double) that never emits
+        `turn_state` must be unaffected: `live_result` simply
         stays None, no usage row is invented, and cancellation still
-        persists the partial text exactly as #611 designed it."""
+        persists the partial text as usual."""
         import api.services.agent_loop as agent_loop_mod
 
         hold = asyncio.Event()
