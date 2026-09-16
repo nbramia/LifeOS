@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-09-05
+> **Last Updated:** 2026-09-16
 
 Engineering view of the agent worker — the stand-alone process that consumes engine-assigned tasks and runs them on either a local LLM or Anthropic Managed Agents. For consumer-facing behavior, see [product/agent-worker.md](../product/agent-worker.md). For operator setup, see [guides/agent-worker-setup.md](../../guides/agent-worker-setup.md).
 
@@ -23,11 +23,12 @@ Engineering view of the agent worker — the stand-alone process that consumes e
 11. [Inter-agent coordination](#inter-agent-coordination)
 12. [Budget enforcement](#budget-enforcement)
 13. [Restart resumability](#restart-resumability)
-14. [Telegram clarification flow](#telegram-clarification-flow)
-15. [Transcripts](#transcripts)
-16. [Agent Output notes](#agent-output-notes)
-17. [Configuration surface](#configuration-surface)
-18. [Related Documents](#related-documents)
+14. [Lifecycle drift reconciliation](#lifecycle-drift-reconciliation)
+15. [Telegram clarification flow](#telegram-clarification-flow)
+16. [Transcripts](#transcripts)
+17. [Agent Output notes](#agent-output-notes)
+18. [Configuration surface](#configuration-surface)
+19. [Related Documents](#related-documents)
 
 ---
 
@@ -243,6 +244,9 @@ One row per Claude Code / Codex CLI session registered from any host via `POST /
 poll → resolve Human-queue cards whose done_when now passes (throttled by
         LIFEOS_HUMAN_QUEUE_POLL_SECONDS; runs before the spend guard — it
         never spends)
+     → heal stranded lifecycle tags (#agent-running / #agent-blocked) whose
+        backing session is at a terminal status — also ungated by the spend
+        guard, since it reconciles existing state and starts no work
      → spend tracker check (`can_start_task(default_budget)`)
      → wake sleeping sessions whose timer expired
      → poll managed sessions for state advancement
@@ -310,7 +314,7 @@ Each session also tracks `routing`, `budget`, `expected_output`, `total_input_to
 
 The preflight classifies a task before executor dispatch, cheap (~$0.001) and fast (~1s). Which LLM client runs the classifier call is controlled by `LIFEOS_AGENT_PREFLIGHT_ENGINE` (#808), default `auto`:
 
-- **`auto`** (default) — Anthropic (`claude-haiku-4-5` by default) when `ANTHROPIC_API_KEY` is set, without a reachability probe; else the local llama-server if reachable; else the remote provider described under "Local executor" below, if configured and enabled (`LIFEOS_AGENT_REMOTE_EXECUTOR` + `remote_llm_configured`); else the call raises, which `run_preflight()` degrades to `sane=False`/`routing=ask` like any other preflight failure. This keeps an install with no Anthropic key from failing every engine-assigned task at the classification step, before the local-executor fallback below ever gets a chance to run.
+- **`auto`** (default) — Anthropic (`claude-haiku-4-5` by default) when `ANTHROPIC_API_KEY` is set, without a reachability probe; else the local llama-server if reachable; else the remote provider described under "Local executor" below, if configured and enabled (`LIFEOS_AGENT_REMOTE_EXECUTOR` + `remote_llm_configured`); else the call raises, which `run_preflight()` degrades to `sane=True` (with `preflight_error` recorded)/`routing=ask` like any other preflight failure. This keeps an install with no Anthropic key from failing every engine-assigned task at the classification step, before the local-executor fallback below ever gets a chance to run.
 - **`remote`** — build the remote OpenAI-compatible provider (e.g. Fireworks running DeepSeek) first, when `remote_llm_configured`. Built the same way the `auto` chain's own remote fallback is, and used **unprobed** by design (the same #706 convention the `auto` chain already follows for that branch — the remote client is trusted, not health-checked) — so this never adds a reachability check that wasn't already implicit in the request itself. A failure of the completion call is not caught specially; it propagates to `run_preflight()`'s existing except-clause exactly like a failure on any other engine. If the provider *isn't* configured, the call raises — a forced engine never silently falls back to another one, and in particular never to the Anthropic API, which is the spend `remote` exists to avoid; `run_preflight()` degrades the raise to `routing=ask`, so the operator sees a confirmation question rather than a surprise API bill. Operator motivation (#808): all five observed field instruction-deviations were Haiku's, while the remote provider has executed real tasks cleanly — classifier engine choice is a quality lever, not a safety dependency (routing/ambiguity/sanity opinions already can't cancel, bypass the default route, or block under one — see #747/#751/#757/#803 below).
 - **`anthropic`** — force the Anthropic branch. Falls through to `auto` (with a logged warning) if no API key is configured.
 - **`local`** — force the local llama-server client. Still probed via `is_available()`, same as the `auto` chain's own local branch — but since there's no further engine to fall back to for a forced value, an unreachable server raises (degrading via the same except-clause) rather than silently trying something else.
@@ -346,7 +350,7 @@ Routing precedence (per the prompt instructions):
 
 **Ambiguity demotion (#751).** When `LIFEOS_AGENT_DEFAULT_ROUTE` is set to a valid route, a non-null `ambiguity` no longer blocks the task, regardless of what routing was ultimately picked (default-route substitution, a corroborated LLM route, or a tag override). Configuring a default route is the operator saying "run untagged tasks without asking me"; a cheap classifier's hedging shouldn't override that standing instruction — especially since string-matching the hedge's prose (the #748 fix) proved to be whack-a-mole once the model started rephrasing around the pattern. The question is preserved on `demoted_ambiguity` and logged to the session transcript as advisory context rather than discarded, and the executing agent can still ask a specific question mid-run via `lifeos_agent_user_ask` if it genuinely needs to. The #584 unconfirmed-cloud downgrade still blocks either way (never auto-spend on inferred cloud routing). With no default route configured, ambiguity blocks exactly as before.
 
-**Sanity demotion (#803).** The same standing-instruction argument applies to sanity: a *non-fatal* `sane=false` — the classifier's own inferred "this isn't executable" opinion, as opposed to a `sane_fatal` verdict the code itself established (empty title, the deterministic destructive-title regex, or a preflight-call/parse error) — is demoted to advisory under the identical gate (`LIFEOS_AGENT_DEFAULT_ROUTE` set and valid). This exists because the classifier has repeatedly misjudged ordinary feature requests as "a product specification or feature request, not a task an agent can execute" — building features is half the point of this pipeline, and #747 turning that misjudgment into a park (rather than a cancel) still cost the operator a confirmation round-trip for legitimate work every time it fired. `sane_reason` is preserved on `demoted_sanity` and logged to the session transcript the same way `demoted_ambiguity` is, and `sane` itself flips back to `True` — which also means a demoted sanity objection no longer blocks the default-route substitution below it (a task that was both sanity-flagged and routing-`ask` now both demotes *and* routes on the same pass). `sane_fatal` verdicts are completely unaffected by this setting in either direction — they fail closed regardless of whether a default route is configured. The preflight prompt itself was also updated with an explicit line ("feature requests and product specifications ARE executable tasks... never mark them insane") as defense in depth, not the fix — the classifier has ignored negative constraints in its prompt before, so the demotion is what actually holds. With no default route configured, non-fatal sanity still parks exactly as under #747.
+**Sanity demotion.** The same standing-instruction argument applies to sanity: a *non-fatal* `sane=false` — the classifier's own inferred "this isn't executable" opinion, as opposed to a `sane_fatal` verdict the code itself established (empty title, or the deterministic destructive-title regex) — is demoted to advisory under the identical gate (`LIFEOS_AGENT_DEFAULT_ROUTE` set and valid). A failed or unparseable preflight call carries no verdict at all, so it is never `sane_fatal` in the first place — it sets `sane=True`/`sane_fatal=False` and records `preflight_error` instead. This matters because the classifier can misjudge ordinary feature requests as "a product specification or feature request, not a task an agent can execute" — building features is half the point of this pipeline — and turning that misjudgment into a park (rather than a cancel) still costs the operator a confirmation round-trip for legitimate work every time it fires. `sane_reason` is preserved on `demoted_sanity` and logged to the session transcript the same way `demoted_ambiguity` is, and `sane` itself flips back to `True` — which also means a demoted sanity objection does not block the default-route substitution below it (a task that is both sanity-flagged and routing-`ask` both demotes *and* routes on the same pass). `sane_fatal` verdicts are completely unaffected by this setting in either direction — they fail closed regardless of whether a default route is configured. The preflight prompt itself carries an explicit line ("feature requests and product specifications ARE executable tasks... never mark them insane") as defense in depth, since the classifier can ignore negative constraints in its prompt — the demotion is what actually holds. With no default route configured, non-fatal sanity still parks.
 
 **Route corroboration (#757).** A default route only rescues a genuine `ask` outcome for a *cloud* route — the classifier naming `local`/`claude_code`/`codex` on its own used to always stand unchallenged, because those routes aren't `ask` and so skipped the substitution above entirely. That let a noncompliant classifier invent an explicit-looking route (e.g. `routing="local"` with a plausible-sounding but non-cue reason) and have it silently beat a configured default. Now, whenever a default route is configured and valid, an LLM-chosen `local`/`claude_code`/`codex` route must be corroborated by the title — `routing_explicit=true` from the model *and* a matching cue (the rule-3 phrasing for `local`; "claude code" / "codex" for the CLI routes) — or it's demoted to the configured default and logged, mirroring the ambiguity demotion above (`demoted_routing` holds the route the model actually picked). `routing_explicit=false` never corroborates, regardless of the title. Tag overrides are unaffected (a tag is the operator's own corroboration, checked first). `ROUTE_CLAUDE` is out of scope for this check — the pre-existing #584 downgrade below already corroborates cloud routes against the title, and on a miss sends them to `ask` (a confirmation question) rather than to the default, since unconfirmed API spend must stay a question even on a default-route install. With no default route configured, this is a no-op.
 
@@ -553,7 +557,7 @@ Lineage budgets: every session tracks `root_session_id` + `spawn_depth`. Budget 
 
 ### Earned completion / interrupted CLI sessions (#760)
 
-A CLI subprocess exiting cleanly (`returncode == 0`) or emitting a terminal-looking stream event is **not** proof the agent actually finished its turn — it can hit `--max-turns`, get OOM-killed, or otherwise die mid-thought and still reach the executor's `STATUS_COMPLETED` fallback with a mid-sentence `final_text` and zero notifications sent. Marking that `#agent-completed` hides the interruption from the operator (field case: `sess_099c0b8ca254486f` — final text a 64-char instruction fragment to itself, `notifications_sent: 0`, no PR, unpushed WIP branch — tagged completed anyway).
+A CLI subprocess exiting cleanly (`returncode == 0`) is **not** proof the agent actually finished its turn — it can hit `--max-turns`, get OOM-killed, or otherwise die mid-thought and still reach the executor's `STATUS_COMPLETED` fallback with a mid-sentence `final_text` and zero notifications sent. A non-zero exit is authoritative regardless of any parsed terminal stream event: both `claude_code_executor.py` and `codex_executor.py` gate their `STATUS_COMPLETED` branch on `if proc.returncode == 0:` alone, so a bad end-of-run can never reach the completed fallback just because a `result`/`turn.completed` event was seen before it. Marking that `#agent-completed` hides the interruption from the operator (field case: `sess_099c0b8ca254486f` — final text a 64-char instruction fragment to itself, `notifications_sent: 0`, no PR, unpushed WIP branch — tagged completed anyway).
 
 Both `_dispatch_claude_code_session` and `_dispatch_codex_session` gate their `STATUS_COMPLETED` branch on `completion_signal.has_positive_completion_signal(final_text, notifications_sent)` before treating the outcome as real completion — a **root** session only; a spawned child (`parent_session_id` set) is exempt, same as the empty-result/no-side-effect-tool-use guard `_handle_outcome` applies to the local/managed routes (that guard lives in a different dispatch path — the CLI routes bypass `_handle_outcome` entirely — so this is a parallel, composing check, not a replacement for it). A cheap, deterministic — not LLM — check is earned by any one of:
 
@@ -572,7 +576,7 @@ Failing all three routes the outcome to `Worker._handle_cli_interrupted`, which 
 
 **Terminal evidence downgrade.** `executor_lifecycle.normalize_outcome` rejects a completed outcome whose evidence (`termination_evidence` merged with `exit_meta`) explicitly reports `terminal_success`, `done_seen`, or `stream_terminal_event_seen` as `False`, flipping it to `FAILED` with reason `"terminal success evidence missing"`. Because this can turn a session's terminal status without the driver itself ever appending an event, `normalize_outcome` appends a `terminal_evidence_downgrade` transcript event (`route`, `evidence_field`, `evidence`) whenever it fires — every caller (`_Adapter._outcome`, the Hermes and managed-poll call sites, `_handle_outcome`) passes its `transcript_store` through for this.
 
-New transcript event kinds: `cli_session_interrupted` (the interrupted disposition itself, payload above), `cli_interrupted_prompt_registered` (message ids + WIP branch once the notice is sent), `cli_interrupted_prompt_undelivered` (Telegram delivery failed, falling through to the unresumable-failed path).
+**Transcript event kinds.** `cli_session_interrupted` (the interrupted disposition itself, payload above), `cli_interrupted_prompt_registered` (message ids + WIP branch once the notice is sent), `cli_interrupted_prompt_undelivered` (Telegram delivery failed, falling through to the unresumable-failed path), `claude_code_dispatch_crashed` / `codex_dispatch_crashed` (the executor's `execute()`/`resume()` call itself raised — `phase` records which — and the session is marked `FAILED` directly, with no `STATUS_COMPLETED` fallback in play).
 
 Deliberately out of scope for #760: the CLI system prompt's canonical-checkout discipline (the field session also left the shared checkout on its WIP branch, stalling autodeploy) — that's prompt/wrapper text touching live sessions and is tracked separately.
 
@@ -666,6 +670,18 @@ The worker is signal-safe and crash-resumable. `resume_pending()` runs on startu
 - Anything else (`CLAIMED` / `RUNNING` mid-execution) → undo the claim tag (swap `#agent-running` → `#agent` when the card had no engine assignee; otherwise remove `#agent-running` alone so an engine-only card is not injected with `#agent`), mark session `FAILED` in the DB, notify operator.
 
 A managed session's `managed_agent_session_id` is durable across worker restarts — on resume the worker reattaches via `GET /v1/sessions/{id}` and continues polling from `managed_cursor.last_event_id`.
+
+---
+
+## Lifecycle drift reconciliation
+
+`Worker._reconcile_lifecycle_drift()` runs once per `tick()`, after `_process_human_queue()` and `_replay_wait_wakeups()` and ahead of the spend-cap check — deliberately ungated by that cap, since it reconciles existing state and starts no new work.
+
+`update_status` fires the `set_status_projector` hook whenever it lands a terminal status, which reconciles the vault tag through `lifecycle_projector`. A kill instead flips the session row via `mark_cancelled` — a raw status write with no projector hook. A kill landing on a session still being actively polled still gets reconciled on the executor's next poll, but a kill landing on a session parked at `BLOCKED`, or while the worker itself is down, leaves no poll to do that — the vault tag stays stranded at `#agent-running`/`#agent-blocked`.
+
+The sweep lists every task currently carrying `RUNNING_TAG` or `BLOCKED_TAG` via the task API, and for each one looks up its backing session with a local primary-key lookup (`session_store.get`, keyed on `task_id`). A session that doesn't exist, or belongs to an operator root-spawn/spawned child with no real vault task, is skipped. A session whose status is still non-terminal is legitimately live — including one reopened for a follow-up turn — and is left alone; only a task tagged non-terminal with a terminal session is genuine drift.
+
+The heal writes through the same endpoints `_reconcile_vault_terminal` uses: `POST /api/tasks/{id}/swap-tag`, followed by `/complete` or a status write matching the session's terminal outcome. The swap gates the status write — it reports no change when the tag it was told to replace is absent, so an operator retagging the card in the same window is never overwritten.
 
 ---
 

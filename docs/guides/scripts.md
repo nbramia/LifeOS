@@ -1,7 +1,7 @@
 # Scripts Reference
 
 > **Status:** Complete
-> **Last Updated:** 2026-09-10
+> **Last Updated:** 2026-09-16
 > **Audience:** Operators
 
 Reference for the operator-facing scripts under `scripts/`, with usage examples. One-off CRM entity-repair scripts (`merge_people.py`, `split_person.py`, `fix_*`, etc.), git hooks, and Claude Code worktree/session-diagnostic helpers aren't covered here — they're self-documenting via `--help` or their own docstring.
@@ -392,6 +392,20 @@ Authenticate with Google OAuth.
 ```
 
 Opens browser for Google sign-in, saves token to configured path.
+
+### eero_login.py
+
+Two-step, non-interactive eero login (see [home-eero.md](home-eero.md)).
+
+```bash
+# Step 1: request a verification code
+python scripts/eero_login.py --login you@example.com
+
+# Step 2: verify the code once it arrives by SMS/email
+python scripts/eero_login.py --code 123456
+```
+
+Stores the session in `data/home/eero_session.json` (mode 0600); never prints the token.
 
 ---
 
