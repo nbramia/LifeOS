@@ -23,7 +23,7 @@ API surface (verbatim from the Managed Agents docs):
 - `GET  /v1/sessions/{id}` — returns current session state (status + cumulative usage
   + recent events; events are the primary terminal-state signal).
 - `POST /v1/sessions/{id}/events` — body: `{events: [{type: "user.message", content: [{type: "text", text}]}]}`.
-  Used to post the initial user message and any follow-up turns (e.g. Telegram clarification answers).
+  Posts the initial user message and any follow-up turns (e.g. Telegram clarification answers).
 - `DELETE /v1/sessions/{id}` — terminate a session early (budget breach / cascade-kill).
 """
 from __future__ import annotations
@@ -351,8 +351,8 @@ class ManagedAgentsDriver:
     def post_user_message(self, session_id: str, content: str) -> None:
         """Post a user turn to a running session.
 
-        Used to send the initial task description and to resume the session
-        after a Telegram clarification reply.
+        Sends the initial task description and resumes the session after a
+        Telegram clarification reply.
         """
         body = {
             "events": [
@@ -396,7 +396,7 @@ class ManagedAgentsDriver:
         resp.raise_for_status()
 
     def update_session(self, session_id: str, agent_payload: dict) -> None:
-        """Replace the session's agent config — used to filter tools per-class.
+        """Replace the session's agent config — filters tools per-class.
 
         Per the Managed Agents docs, `POST /v1/sessions/{id}` accepts an
         `agent.tools` and `agent.mcp_servers` array (full replacement). The
@@ -511,7 +511,7 @@ def _synthesize_status_from_events(events: list[dict]) -> str | None:
 def _extract_init_failed_mcps(events: list[dict]) -> list[str]:
     """Return the names of MCP servers that failed to initialize.
 
-    Used to surface the failed connectors in the completion summary so the
+    Surfaces the failed connectors in the completion summary so the
     operator can fix or remove them from the agent preset. Init failures
     don't fail the session per `_synthesize_status_from_events`, so the
     operator's only signal is this list in the Telegram message.

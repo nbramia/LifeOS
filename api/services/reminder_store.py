@@ -1,11 +1,11 @@
 """
-Backward-compatibility shim for the renamed scheduler subsystem.
+Backward-compatibility shim for the Scheduler subsystem.
 
-The reminder store was renamed to the Scheduler (see issue #244): the canonical
-module is now ``api/services/scheduler_store.py``. This module re-exports the
-new symbols under their legacy ``Reminder*`` names so existing callers (HTTP
-routes, chat orchestrator, agent tools, seed scripts) keep working until the
-public surfaces are renamed in #246.
+The canonical module for reminders/scheduling is
+``api/services/scheduler_store.py``. This module re-exports its symbols
+under their legacy ``Reminder*`` names so existing callers (HTTP routes,
+chat orchestrator, agent tools, seed scripts) keep working until they
+migrate to the new names directly.
 
 Prefer importing from ``api.services.scheduler_store`` in new code.
 """

@@ -1,4 +1,4 @@
-"""Tests for #787: when a chat turn's model call exhausts its retries, the
+"""Tests for chat turn error messages: when a chat turn's model call exhausts its retries, the
 user-facing message must be fixed and generic — never the underlying
 exception's own text. On a keyless or misconfigured install that text would
 otherwise be a provider SDK's raw internal message, surfacing at exactly the

@@ -1,15 +1,16 @@
 """
 Tests for Drive search scope disclosure in the chat tool surface.
 
-Regression context: same bug class as tests/test_agent_tools_scope_widening.py.
-search_drive asked Drive for only the five most recently modified matches per
-account, said nothing about the cut or the ordering, and swallowed a failing
-account into the same bare "No drive files found." An old document was therefore
-systematically unreachable whenever a handful of newer files also matched, and
-an expired token was indistinguishable from an empty Drive — so chat denied the
-existence of a document that was present and indexed.
+Same bug class as tests/test_agent_tools_scope_widening.py: search_drive
+must not silently ask Drive for only the five most recently modified
+matches per account, say nothing about the cut or the ordering, or
+swallow a failing account into the same bare "No drive files found."
+Any of those would make an old document systematically unreachable
+whenever a handful of newer files also matched, and would make an
+expired token indistinguishable from an empty Drive — so chat would deny
+the existence of a document that is present and indexed.
 
-These tests pin the fix: a cap that matches the service default and discloses
+These tests pin: a cap that matches the service default and discloses
 itself when it binds, an explicit modification-time ordering (Drive has no
 relevance sort — see _DRIVE_ORDERINGS) so old files stay reachable, per-account
 failures named even when other accounts return files, and an empty result that
@@ -499,10 +500,9 @@ class TestDriveAccountFailureDisclosure:
         assert "accounts that responded" in partial
         assert "accounts that responded" not in healthy
 
-    # -- API failures, not just credential failures (issue #536) -------------
-    # The credential path was fixed first, so an expired token surfaced. A 403, a
-    # 429, a 500 or a quota event still died in `DriveService.search`'s
-    # `except Exception: return []` and came back as "no Drive files".
+    # -- API failures, not just credential failures ---------------------------
+    # A 403, a 429, a 500 or a quota event still dies in `DriveService.search`'s
+    # `except Exception: return []` and comes back as "no Drive files".
 
     async def test_the_tool_asks_the_service_to_propagate_failures(
         self, fake_drive, accounts
@@ -794,10 +794,10 @@ class TestDriveToolDefinition:
 class TestDriveServiceContract:
     """DriveService.search() swallows API errors into an empty list.
 
-    That is fine for a bad query, but the credential fetch used to sit inside the
-    same handler, so an expired token returned [] and the tool could not tell an
-    unreachable account from one with no matching files. These pin the boundary
-    the per-account disclosure relies on.
+    That is fine for a bad query, but the credential fetch must not sit inside
+    the same handler — otherwise an expired token would return [] and the
+    tool could not tell an unreachable account from one with no matching
+    files. These pin the boundary the per-account disclosure relies on.
     """
 
     def test_auth_failure_propagates_instead_of_returning_empty(self):
@@ -837,7 +837,7 @@ class TestDriveServiceContract:
         kwargs = service._service.files().list.call_args.kwargs
         assert kwargs["orderBy"] == "modifiedTime desc"
 
-    # -- Opt-in API-failure propagation (issue #536) --------------------------
+    # -- Opt-in API-failure propagation ----------------------------------------
 
     @pytest.fixture
     def service(self):
@@ -866,7 +866,7 @@ class TestDriveServiceContract:
 
     def test_the_flag_does_not_leak_into_the_other_read_paths(self, service):
         """Only search() is opted in; get_file/get_file_content keep their own
-        contract, which this change is not in scope to touch."""
+        contract, out of scope here."""
         svc = service(raise_on_api_error=True)
         svc._service.files().get().execute.side_effect = _http_error(500)
         assert svc.get_file("synthetic-id") is None

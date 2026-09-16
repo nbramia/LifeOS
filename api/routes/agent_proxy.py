@@ -1,4 +1,4 @@
-"""Agent text-backend proxy (#361).
+"""Agent text-backend proxy.
 
 The `/chat` "Agent" backend talks to the OpenClaw voice-adapter, which speaks the
 same `/api/ask/stream` SSE contract as LifeOS but is reached at
@@ -8,7 +8,7 @@ reaches the browser. The browser stays same-origin and treats the response
 exactly like a normal ask/stream (minus handoff — the agent backend has none).
 
 The status/ask-stream/bearer-injection logic itself is shared with the Hermes
-backend via `make_backend_router()` in `_proxy.py` (#587); this module just
+backend via `make_backend_router()` in `_proxy.py`; this module just
 supplies this backend's settings fields and its own `_client()` test seam.
 """
 

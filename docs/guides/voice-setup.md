@@ -46,7 +46,7 @@ The microphone requires HTTPS. On Tailscale, the tailnet provides a valid certif
 systemctl --user enable --now lifeos-tailscale.service
 ```
 
-`install-systemd-tailscale.sh` writes a user systemd unit (`lifeos-tailscale.service`) that waits for the local API to report healthy, then runs `scripts/setup-tailscale.sh` — which calls `tailscale serve` to publish LifeOS on the tailnet HTTPS front. After this, open `/chat` at your tailnet HTTPS URL (`https://<your-machine>.<your-tailnet>.ts.net/chat`); voice will not work over plain `http://` or a bare LAN IP.
+`install-systemd-tailscale.sh` writes a user systemd unit (`lifeos-tailscale.service`) that waits for the local API to report healthy, then runs `scripts/setup-tailscale.sh` — which calls `tailscale serve` to publish LifeOS on the tailnet HTTPS front. Once that's running, open `/chat` at your tailnet HTTPS URL (`https://<your-machine>.<your-tailnet>.ts.net/chat`); voice will not work over plain `http://` or a bare LAN IP.
 
 `TAILNET_HTTPS_URL` is an **optional** env var. `scripts/setup-tailscale.sh` and `scripts/server.sh` echo it as a bookmark hint, and `GET /api/chat/config` returns it as `secure_url` so the web client can offer a one-tap **Open over HTTPS** link when the mic is blocked by an insecure context. Leave it unset and that link is simply omitted — nothing else changes.
 
@@ -80,15 +80,15 @@ device's default browser. This matters for voice specifically: a page
 running inside the standalone container gets its own microphone-permission
 grant, separate from — and not inherited from — the regular browser tab.
 On iOS, add the shortcut from Safari (not another default browser) via
-Share → Add to Home Screen, from the tailnet HTTPS URL above. A shortcut
-added before this feature shipped won't upgrade itself — re-add it.
+Share → Add to Home Screen, from the tailnet HTTPS URL above. An existing Home Screen shortcut
+added earlier won't upgrade itself to pick this up automatically — re-add it.
 
-### Action Button deep link (iPhone Shortcuts) (#731)
+### Action Button deep link (iPhone Shortcuts)
 
 An iPhone's Action Button can't call LifeOS directly — it triggers a Shortcut, and the Shortcut opens a URL. `/chat` accepts two independent URL params for this:
 
 - **`?mode=voice`** — puts the page in voice mode. On a cold launch, if the **Listening** dock toggle is on (the default), this only *arms wake-listening*: the page holds a live mic and waits for a spoken wake burst ("Hermes") before it starts an actual recording — see "Listening" below. It does **not** start recording by itself, and never has.
-- **`?record=1`** (added for #731) — begins an actual recording immediately on page load, the same code path a manual tap on the talk button uses. It only fires **alongside** `?mode=voice` in the same URL (it has no effect on its own, and `?mode=voice` alone never implies it) and only on the navigation that actually carries it — reloading the page later without the param doesn't replay it. It respects the same secure-context/mic-permission guard as a manual tap: if the mic isn't usable yet (no HTTPS, permission not yet granted, etc.), you get the normal blocked-mic message in the thread instead of a silent hang.
+- **`?record=1`** — begins an actual recording immediately on page load, the same code path a manual tap on the talk button uses. It only fires **alongside** `?mode=voice` in the same URL (it has no effect on its own, and `?mode=voice` alone never implies it) and only on the navigation that actually carries it — reloading the page later without the param doesn't replay it. It respects the same secure-context/mic-permission guard as a manual tap: if the mic isn't usable yet (no HTTPS, permission not yet granted, etc.), you get the normal blocked-mic message in the thread instead of a silent hang.
 
 Given the Action Button press already *is* the intent to speak, point the Shortcut at both params together:
 
@@ -112,7 +112,7 @@ In voice mode the text composer is replaced by the dock:
   - **Mute** — suppress spoken playback (the reply still returns as text).
   - **2×** — play spoken replies at double speed.
   - **Auto** — auto-continue: after a reply finishes, start listening for the next turn without another tap. While Auto is on, a recording also **ends itself**: once you sound done, see "Smart turn endpointing" below; if you never say anything at all, see "Idle timeout" below — instead of always waiting for another tap.
-  - **Listening** — wake-word mode, default off (#710). While on, the page holds its own mic stream and runs a local energy-based VAD (no third-party wake-word engine, no Web Speech API — that ships audio to Google). When it hears a speech burst end, it POSTs the short clip to `${voice gateway}/api/voice/transcribe` and fuzzy-matches the transcript against "Hermes" (tolerating whisper-isms like "Hermès" or "her mes" — see `matchesWakeWord()` in `web/chat/voice.js`); a match plays a short confirmation chime, then starts recording exactly as a talk-button tap would. Detection is suspended while recording, while a turn is in flight, and while a spoken reply or the chime is playing (so the assistant — or the chime itself — can never wake it), and resumes after. Leaving voice mode or unchecking Listening releases its mic entirely. **Requires a `/api/voice/transcribe` route on the voice gateway that does not exist yet as of this writing** — see the note below.
+  - **Listening** — wake-word mode, default off. While on, the page holds its own mic stream and runs a local energy-based VAD (no third-party wake-word engine, no Web Speech API — that ships audio to Google). When it hears a speech burst end, it POSTs the short clip to `${voice gateway}/api/voice/transcribe` and fuzzy-matches the transcript against "Hermes" (tolerating whisper-isms like "Hermès" or "her mes" — see `matchesWakeWord()` in `web/chat/voice.js`); a match plays a short confirmation chime, then starts recording exactly as a talk-button tap would. Detection is suspended while recording, while a turn is in flight, and while a spoken reply or the chime is playing (so the assistant — or the chime itself — can never wake it), and resumes after. Leaving voice mode or unchecking Listening releases its mic entirely. **Requires a `/api/voice/transcribe` route on the voice gateway that does not exist yet as of this writing** — see the note below.
 
 ### The wake-confirmation chime
 
@@ -124,7 +124,7 @@ Both the sound files and the manifest are optional. If `web/chat/wake-sounds/` o
 
 ### Smart turn endpointing
 
-While **Auto** is on, a voice recording no longer only stops when you tap the talk button again — it also infers, mid-recording, when you've likely finished speaking, and ends and sends the turn itself. This runs entirely inside `web/chat/voice.js`, on the **same** recording stream the talk button already acquired (never a second microphone request), so it composes with Listening's own mic hold and wake detection above without conflict.
+While **Auto** is on, a voice recording does not only stop when you tap the talk button again — it also infers, mid-recording, when you've likely finished speaking, and ends and sends the turn itself. This runs entirely inside `web/chat/voice.js`, on the **same** recording stream the talk button already acquired (never a second microphone request), so it composes with Listening's own mic hold and wake detection above without conflict.
 
 The pipeline (`checkEndpointCandidate()`/`isTranscriptComplete()`/`handleEndpointFrame()` in `web/chat/voice.js`):
 
@@ -153,11 +153,11 @@ The **idle timeout** covers exactly that gap: if a recording captures `LIFEOS_VO
 
 The discriminator between the two timers — smart-turn-endpointing's trailing-silence timers and the idle timeout — is simply whether any speech has been detected yet in the current recording, using the same energy-VAD signal `handleEndpointFrame()` already computes for step 1 above: once speech has been heard, endpointing's timers own the rest of that recording; until then, the idle timeout owns it. The two can never fire for the same recording, since each covers a mutually exclusive phase of it (before vs. after the first speech is heard).
 
-Like smart turn endpointing, the idle timeout only ever runs while Auto is on, voice mode is active, and a recording is actually in progress — with Auto off, a recording with no speech is already discarded without a turn on a manual stop-tap (silence detection has skipped empty/silent recordings since before this feature), so there is nothing further for Auto-off to change.
+Like smart turn endpointing, the idle timeout only ever runs while Auto is on, voice mode is active, and a recording is actually in progress — with Auto off, a recording with no speech is already discarded without a turn on a manual stop-tap (silence detection skips empty/silent recordings independent of Auto), so there is nothing further for Auto-off to change.
 
-### Weak network (#801)
+### Weak network
 
-A voice turn submitted on a flaky connection no longer just fails outright. `web/chat/voice.js` retries the *initial* submission (`POST /api/voice/turn/stream`) up to 3 times with jittered backoff (~1s/3s/9s) on network-class failures only — a `fetch()` rejection, or a `502` from LifeOS's own `/api/voice/*` proxy, which means "the voice gateway itself was unreachable," never that a turn actually ran. A `4xx` never retries. The top status bar shows a subtle "Retrying…" note while this is in progress, and — if a bubble for the turn already exists — so does the bubble itself.
+A voice turn submitted on a flaky connection does not just fail outright. `web/chat/voice.js` retries the *initial* submission (`POST /api/voice/turn/stream`) up to 3 times with jittered backoff (~1s/3s/9s) on network-class failures only — a `fetch()` rejection, or a `502` from LifeOS's own `/api/voice/*` proxy, which means "the voice gateway itself was unreachable," never that a turn actually ran. A `4xx` never retries. The top status bar shows a subtle "Retrying…" note while this is in progress, and — if a bubble for the turn already exists — so does the bubble itself.
 
 The recording is **held** until the turn definitively completes: success, an explicit cancel, or an explicit dismiss — never merely because a submission attempt failed. If every retry is exhausted, the turn's bubble gets an inline failed state with **Retry** (resubmit the same recording — reconciles into the same bubble, never a duplicate) and **✕** (discard it) buttons. Only one recording is ever held at a time; starting a fresh one replaces whatever was there.
 
@@ -171,7 +171,7 @@ Each spoken response bubble is also **tap-to-replay** — tap it to hear the rep
 
 ### Optional Agent and Hermes text backends
 
-`/chat` carries a backend selector — **LifeOS | Agent | Hermes** — where Agent and Hermes each only appear once configured server-side. Both are separate text backends that speak the same `/api/ask/stream` contract; LifeOS proxies each and injects its bearer token server-side so it never reaches the browser (the same generalized proxy factory backs both, #587). The Agent backend has **no personas and no handoff**, so the persona picker and model picker are hidden while it's active. Hermes keeps the persona picker visible but hides the per-turn model picker — model selection there is the harness's concern, not LifeOS's. Configure them with:
+`/chat` carries a backend selector — **LifeOS | Agent | Hermes** — where Agent and Hermes each only appear once configured server-side. Both are separate text backends that speak the same `/api/ask/stream` contract; LifeOS proxies each and injects its bearer token server-side so it never reaches the browser (the same generalized proxy factory backs both). The Agent backend has **no personas and no handoff**, so the persona picker and model picker are hidden while it's active. Hermes keeps the persona picker visible but hides the per-turn model picker — model selection there is the harness's concern, not LifeOS's. Configure them with:
 
 | Variable | Default | Effect |
 |----------|---------|--------|
@@ -184,7 +184,7 @@ When Hermes is configured and there's no stored backend preference yet, `/chat` 
 
 An **orchestrating** persona (below) stays selectable on Hermes and works there on both text and voice: Hermes drives its own background Claude Code worker for that persona (`lifeos_agent_spawn`) instead of answering inline, conversing with you as it triages, spawns, and supervises. This is deliberately different from the same persona on the LifeOS backend, where it spawns a fire-and-forget session and reports back later via Telegram/`/agents` with no mid-flight visibility — see [client-surfaces.md](../specs/technical/client-surfaces.md) for why both are kept rather than one replacing the other. The web client's pending-question polling (for a LifeOS-spawned session's `[CLARIFY]`/`[GOAL]`) only ever starts for a LifeOS-backend orchestrating turn — a Hermes-backend one has no LifeOS-linked session to poll for, since Hermes handles the whole exchange itself.
 
-A spoken turn on the Hermes backend is *eventually* meant to route through LifeOS's **own** Hermes proxy (`POST /api/hermes/ask/stream`) rather than the harness directly, exactly as the browser calls it for a typed Hermes turn — that's the seam where persona resolution and the `lifeos_context` envelope live (see [client-surfaces.md](../specs/technical/client-surfaces.md)). As of this writing the gateway doesn't do that yet (`nbramia/whisper-relay#32`, still open): it calls the Hermes harness directly, so a spoken Hermes turn carries no persona context or spoken-style rules today. Conversation persistence doesn't depend on #32 landing, though — `api/routes/voice.py` tees `POST /api/voice/turn/stream` into the conversation store directly (#711), so a Hermes-backend voice conversation still survives a page refresh even without persona context.
+A spoken turn on the Hermes backend is *eventually* meant to route through LifeOS's **own** Hermes proxy (`POST /api/hermes/ask/stream`) rather than the harness directly, exactly as the browser calls it for a typed Hermes turn — that's the seam where persona resolution and the `lifeos_context` envelope live (see [client-surfaces.md](../specs/technical/client-surfaces.md)). As of this writing the gateway doesn't do that yet (`nbramia/whisper-relay#32`, still open): it calls the Hermes harness directly, so a spoken Hermes turn carries no persona context or spoken-style rules today. Conversation persistence doesn't depend on #32 landing, though — `api/routes/voice.py` tees `POST /api/voice/turn/stream` into the conversation store directly, so a Hermes-backend voice conversation still survives a page refresh even without persona context.
 
 Like the voice vars, these live in `config/settings.py` and are not in `.env.example`.
 

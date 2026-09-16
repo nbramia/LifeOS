@@ -1,4 +1,4 @@
-"""Tests for scripts/register_persona_bot.py (#794).
+"""Tests for scripts/register_persona_bot.py.
 
 Exercises the script against a temporary directory standing in for the repo
 (a fake .env, config/telegram_bots.json template, and no committed registry
@@ -86,7 +86,7 @@ def test_appends_safely_when_env_has_no_trailing_newline(tmp_path: Path):
 
 def test_env_symlink_survives(tmp_path: Path):
     """A symlinked .env keeps pointing at the same target after the append
-    (the exact landmine #601 warns against: a rewrite-in-place would replace
+    (a real landmine: a rewrite-in-place would replace
     the symlink with a plain file)."""
     root = tmp_path
     _init_project(root)
@@ -281,6 +281,6 @@ def test_rolls_back_registry_entry_when_env_append_fails(tmp_path: Path):
         (root / ".env").chmod(0o644)
 
     assert result.returncode != 0
-    # The override didn't exist before this call, so a failed run must not
+    # No override file exists yet, so a failed run must not
     # leave one behind.
     assert not (root / "config" / "telegram_bots.local.json").exists()

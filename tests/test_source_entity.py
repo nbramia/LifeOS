@@ -364,12 +364,12 @@ class TestGetForPeopleBatch:
 
 
 class TestRematchingEligibility:
-    """Tests for the #507 backoff retry policy on capped source entities.
+    """Tests for the backoff retry policy on capped source entities.
 
     `store.add()` never persists match_attempted_at/match_attempt_count (those
     are only ever set via `record_match_attempt`), so tests write them
     directly via raw SQL to simulate an entity with a specific attempt
-    history at a specific point in the past.
+    history at a specific earlier time.
     """
 
     def _set_attempts(self, store, entity_id, count, days_ago):
@@ -497,7 +497,7 @@ class TestBlocklistedExcludedFromRematching:
 
     They can never resolve to a person, but the linking script recorded a match
     attempt on every skip, so they were re-queued under backoff forever and made
-    up 70% of the reported capped backlog (#550).
+    up 70% of the reported capped backlog.
     """
 
     # A marketing ESP domain, not a personal address.
@@ -737,7 +737,7 @@ class TestFactoryFunctions:
 
     def test_create_phone_source_entity(self):
         """Phone factory uses the canonical ``phone_{e164}`` source_id and
-        sets observed_phone (issue #228 — single definition of the format).
+        sets observed_phone (single definition of the format).
         """
         from api.services.source_entity import create_phone_source_entity
 

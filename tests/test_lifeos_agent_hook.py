@@ -1,4 +1,4 @@
-"""Tests for scripts/lifeos-agent-hook.sh (issue #849).
+"""Tests for scripts/lifeos-agent-hook.sh.
 
 Runs the script via subprocess against a stub HTTP server (a bare
 `http.server` in a thread on an ephemeral port) and asserts on what it

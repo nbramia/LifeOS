@@ -1,4 +1,4 @@
-"""Tests for card-assignment threading (#851) into CodexExecutor:
+"""Tests for card-assignment threading into CodexExecutor:
 model/effort flags, host resolution, remote ssh wrapping + pgid capture,
 and the unknown-host failure path (no ssh call).
 """
@@ -113,7 +113,7 @@ def test_model_and_effort_flags_in_argv(tmp_path, monkeypatch):
 
 
 def test_board_assigned_model_reaches_argv_via_set_assignment(tmp_path, monkeypatch):
-    """Round 1, finding #1 (Codex mirror): drives the real dispatch write
+    """Codex mirror: drives the real dispatch write
     path — `SessionStore.create` then `SessionStore.set_assignment`, like
     `worker._dispatch` does — rather than passing `model=` straight to
     `create()`, so a regression in how `CodexExecutor` reads `session.model`
@@ -167,7 +167,7 @@ def test_remote_host_wraps_argv_in_ssh_and_captures_pgid(tmp_path, monkeypatch):
     session = store.create(task_id="t1", routing="codex", host="studio", model="gpt-5.5")
     outcome = executor.execute(session, {"description": "do the thing"})
     assert outcome.status != STATUS_FAILED
-    # Round 1, finding #9: prove the pgid-line strip leaves the JSON stream
+    # Prove the pgid-line strip leaves the JSON stream
     # aligned for codex too — a real completion event's text must still
     # reach `final_text`.
     assert outcome.final_text == "done remotely"
@@ -227,7 +227,7 @@ class _FailingSshProc:
 
 
 def test_remote_ssh_failure_reason_includes_stderr(tmp_path, monkeypatch):
-    """Round 1, finding #4 (Codex mirror): an unreachable-host ssh
+    """Codex mirror: an unreachable-host ssh
     failure's stderr must land in `outcome.reason`."""
     spawn_calls: list = []
     ssh_stderr = "ssh: connect to host studio port 22: Connection refused\n"
@@ -283,7 +283,7 @@ class _HangingProc:
 
 
 def test_remote_host_unresponsive_pgid_read_fails_within_deadline(tmp_path, monkeypatch):
-    """Round 1, finding #3 (Codex mirror): a hung ssh client whose `PGID:`
+    """Codex mirror: a hung ssh client whose `PGID:`
     line never arrives must not block the executor forever."""
     from config.settings import settings
     monkeypatch.setattr(settings, "agent_ssh_connect_timeout", 0, raising=False)

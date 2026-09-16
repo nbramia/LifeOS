@@ -12,7 +12,7 @@ breakdown was cut to the top ten silently, so the 11th category read as zero
 spend, and an empty budget month reported "No budgets found." as though none
 were configured.
 
-These tests pin the fix: every figure carries its period, the breakdown
+These tests pin the invariant: every figure carries its period, the breakdown
 discloses its own cut, an empty budget result names the period it searched
 instead of asserting absence, and an unparseable date is dropped and disclosed.
 """
@@ -199,9 +199,10 @@ class TestCashflowBreakdownTruncation:
     async def test_truncated_note_discloses_without_claiming_amounts(self, fake_monarch):
         """A category outside the cut must not read as zero spend.
 
-        An earlier version said "the rest are not zero", which the code cannot
-        establish — an omitted category may legitimately be 0. The note now
-        discloses the omission by count and asserts nothing about the amounts.
+        The note must not claim "the rest are not zero" — the code cannot
+        establish that, since an omitted category may legitimately be 0.
+        The note discloses the omission by count and asserts nothing
+        about the amounts.
         """
         fake_monarch.categories = _categories(_CASHFLOW_CATEGORY_CAP + 1)
         out = await _cashflow()

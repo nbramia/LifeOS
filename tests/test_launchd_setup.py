@@ -1,4 +1,4 @@
-"""macOS launchd setup coverage (#776).
+"""macOS launchd setup coverage.
 
 A real second-user deployment crash-looped twice from the same root cause:
 `scripts/setup-launchd.sh` filled in a plist template with `sed`, then
@@ -151,7 +151,7 @@ def test_sed_escape_replacement_round_trips_special_characters(tmp_path: Path):
 
 @pytest.mark.unit
 def test_xml_escape_escapes_ampersand_lt_gt(tmp_path: Path):
-    """#830: values that flow into a plist <string> element (llama.cpp dir,
+    """Values that flow into a plist <string> element (llama.cpp dir,
     model-source args) need real XML escaping, not just sed-safety — a raw
     `&`, `<`, or `>` is invalid XML outside an entity reference."""
     if not SETUP_LAUNCHD.exists():
@@ -608,7 +608,7 @@ def _make_main_sandbox(tmp_path: Path, template_body: str) -> tuple[Path, Path, 
     (repo / "config" / "launchd" / "com.lifeos.api.plist.template").write_text(
         template_body, encoding="utf-8"
     )
-    # _GOOD_TEMPLATE's ProgramArguments routes through this wrapper (#776) —
+    # _GOOD_TEMPLATE's ProgramArguments routes through this wrapper —
     # check_paths_exist validates it exists and is executable.
     wrapper = repo / "scripts" / "launchd-env-wrapper.sh"
     wrapper.write_text("#!/bin/bash\n")
@@ -659,12 +659,12 @@ def test_main_installs_a_well_formed_plist(tmp_path: Path):
 
 @pytest.mark.unit
 def test_main_with_yes_and_no_vault_arg_fails_fast_instead_of_blocking(tmp_path: Path):
-    """Found on review: --yes is meant for unattended automation, but with
-    no vault argument and no LIFEOS_VAULT_PATH in .env, this used to block
-    on an interactive `read` anyway — the opposite of what --yes asks for.
-    A 5s timeout stands in for "would have hung forever": if the fix
-    regresses, this test itself times out rather than merely failing an
-    assertion, making the failure mode obvious."""
+    """--yes is meant for unattended automation: with
+    no vault argument and no LIFEOS_VAULT_PATH in .env, it must not block
+    on an interactive `read` anyway — that would be the opposite of what
+    --yes asks for. A 5s timeout stands in for "would hang forever": if
+    this guard regresses, the test itself times out rather than merely
+    failing an assertion, making the failure mode obvious."""
     if not SETUP_LAUNCHD.exists():
         pytest.skip("scripts/setup-launchd.sh not present")
     repo, _vault, fake_home, _venv = _make_main_sandbox(tmp_path, _GOOD_TEMPLATE)
@@ -754,7 +754,7 @@ def test_main_does_not_abort_over_the_never_installed_chromadb_template(tmp_path
 
 
 # ---------------------------------------------------------------------------
-# #774 — conditionally-installed agent-worker and mcp-http services
+# Conditionally-installed agent-worker and mcp-http services
 # ---------------------------------------------------------------------------
 _AGENT_WORKER_TEMPLATE = (
     REPO_ROOT / "config" / "launchd" / "com.lifeos.agent-worker.plist.template"
@@ -764,8 +764,8 @@ _MCP_HTTP_TEMPLATE = REPO_ROOT / "config" / "launchd" / "com.lifeos.mcp-http.pli
 
 def _add_real_template(repo: Path, template_path: Path) -> None:
     """Copy an actual repo template (not a synthetic fixture) into the
-    sandbox's config/launchd/, so #774's tests exercise the real templates
-    this change ships, not a stand-in."""
+    sandbox's config/launchd/, so these tests exercise the real shipped
+    templates, not a stand-in."""
     dest = repo / "config" / "launchd" / template_path.name
     dest.write_text(template_path.read_text(encoding="utf-8"), encoding="utf-8")
 
@@ -888,7 +888,7 @@ def test_main_rerun_with_autostart_still_enabled_leaves_agent_worker_untouched(t
 
 
 # ---------------------------------------------------------------------------
-# #830 — conditionally-installed local LLM (llama-server) service
+# Conditionally-installed local LLM (llama-server) service
 # ---------------------------------------------------------------------------
 _LLM_TEMPLATE = REPO_ROOT / "config" / "launchd" / "com.lifeos.llm.plist.template"
 
@@ -1178,9 +1178,8 @@ def test_main_rerun_with_llm_autostart_still_enabled_leaves_it_untouched(tmp_pat
 @pytest.mark.unit
 def test_main_names_the_gpu_and_network_watchdog_gap_on_macos(tmp_path: Path):
     """No macOS equivalent exists for these two — the run must say so
-    explicitly rather than leave the gap silent (the exact ambiguity #774
-    was filed over: an operator couldn't tell 'not applicable here' from
-    'just never built')."""
+    explicitly rather than leave the gap silent (otherwise an operator
+    can't tell 'not applicable here' from 'just never built')."""
     if not SETUP_LAUNCHD.exists():
         pytest.skip("scripts/setup-launchd.sh not present")
     repo, vault, fake_home, _venv = _make_main_sandbox(tmp_path, _GOOD_TEMPLATE)

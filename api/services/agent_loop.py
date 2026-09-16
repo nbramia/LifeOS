@@ -9,7 +9,7 @@ Uses the local LLM (OpenAI-compatible llama-server) by default.
 
 Event types yielded:
   {"type": "turn_state", "result": AgentResult} -- live, mutable accumulator
-                                                     (first event; #615)
+                                                     (first event)
   {"type": "text",   "content": "..."}       -- streamed text chunk
   {"type": "status", "message": "..."}       -- tool execution status
   {"type": "self_correction"}                -- model retrying (consumers should clear buffered text)
@@ -89,7 +89,7 @@ def _claims_write_without_tools(text: str) -> bool:
     return bool(_WRITE_CLAIM_PATTERN.match(text))
 
 
-# Cross-turn escalation (#303). A weak orchestrator sometimes declares something
+# Cross-turn escalation. A weak orchestrator sometimes declares something
 # impossible / unavailable / "not released" from stale training and won't budge.
 # When the PRIOR assistant turn refused like that AND the user's NEW message pushes
 # back, we retry the turn on a stronger model rather than re-refusing.
@@ -157,7 +157,7 @@ def should_escalate(conversation_history, question: str) -> bool:
 
 
 def _count_escalation_cycles(conversation_history) -> int:
-    """Count *completed* refusal→pushback cycles in the trailing chain (#305c).
+    """Count *completed* refusal→pushback cycles in the trailing chain.
 
     The current (in-flight) pushback isn't in history; this counts how many
     times the user already pushed back against a refusal in the immediately
@@ -194,7 +194,7 @@ def _original_request(conversation_history, fallback: str) -> str:
 # per-token API cost: `claude_code` and `codex` bill the operator's CLI
 # subscriptions, `local` runs the on-box Gemma. An Anthropic model id is NOT on
 # this list — automatic escalation must never spend API credits, so a model rung
-# is dropped from the climb (#584). The operator can still name a model
+# is dropped from the climb. The operator can still name a model
 # themselves ("escalate to opus"), which is an explicit request, not an
 # escalation LifeOS chose.
 NON_API_RUNGS = ("claude_code", "codex", "local")
@@ -210,10 +210,10 @@ def _escalation_ladder(escalation_model: str) -> list[str]:
     """Ordered escalation rungs the orchestrator may climb automatically.
 
     Only non-API rungs (see ``NON_API_RUNGS``) survive: LifeOS escalating on its
-    own must not put a turn on the Anthropic API (#584). A configured
+    own must not put a turn on the Anthropic API. A configured
     ``agent_escalation_ladder`` is filtered rather than rejected, so an existing
     'claude-sonnet-4-6,claude_code' setting keeps working — it just climbs
-    straight to the engine. ``escalation_model`` no longer contributes a rung of
+    straight to the engine. ``escalation_model`` does not contribute a rung of
     its own; it survives only as the gate that says escalation is configured at
     all, and as the target for a user-directed "escalate" (handled separately in
     ``resolve_orchestrator_model``).
@@ -242,7 +242,7 @@ def _escalation_ladder(escalation_model: str) -> list[str]:
     return out
 
 
-# User-directed escalation (#305). Tier words the operator can name in a chat
+# User-directed escalation. Tier words the operator can name in a chat
 # message map to concrete Anthropic model ids. Update the opus id here if the
 # account is pinned to a different opus release.
 _MODEL_ALIASES = {
@@ -317,7 +317,7 @@ _TRAILING_MODEL_RE = re.compile(r"(?i)\b(?:with|using|on)\s+(?:claude\s+)?(?:opu
 
 
 def parse_engine_directive(question: str) -> tuple[str, str]:
-    """Detect an explicit CLI-engine handoff directive (#305 part b).
+    """Detect an explicit CLI-engine handoff directive.
 
     Returns ``(engine, task)`` where engine is "codex" / "claude_code" / "".
     Two imperative shapes route — leading ("use codex to add X") and trailing
@@ -385,7 +385,7 @@ def resolve_orchestrator_model(
          generic "use a smarter model") — honored regardless of the heuristic,
          since the intent is unambiguous. A named tier works even when
          ``escalation_model`` is unset.
-      2. The auto-escalation ladder (#305c): on refuse→pushback, climb to the
+      2. The auto-escalation ladder: on refuse→pushback, climb to the
          rung matching how many times the model has consecutively refused
          (1st → rung 0, 2nd → rung 1, …). The returned model may be an engine
          name (codex / claude_code) for the top rung — the caller hands that
@@ -397,8 +397,8 @@ def resolve_orchestrator_model(
         return directed, True
     if should_escalate(conversation_history, question):
         # Auto-escalation is on when an explicit ladder is configured, or when
-        # escalation_model is set to something other than base (the #304 gate —
-        # escalation_model == base means "no stronger model", i.e. disabled).
+        # escalation_model is set to something other than base (escalation_model
+        # == base means "no stronger model", i.e. disabled).
         explicit_ladder = bool((getattr(settings, "agent_escalation_ladder", "") or "").strip())
         if explicit_ladder or (escalation_model and escalation_model != base_model):
             # Drop base_model from the ladder so a mid-ladder base doesn't stop
@@ -420,7 +420,7 @@ def resolve_model_alias(name: str) -> str:
 def _select_client(model: str = "", force_local: bool = False, force_remote: bool = False):
     """Pick the LLM client for a turn.
 
-    - `force_remote` (#654): build a per-turn client for the configured paid
+    - `force_remote`: build a per-turn client for the configured paid
       OpenAI-compatible remote provider (e.g. Fireworks) — the chat model
       picker's explicit "Remote" option. Checked before `force_local` since
       both are per-turn backend switches and can't both be requested; callers
@@ -430,7 +430,7 @@ def _select_client(model: str = "", force_local: bool = False, force_remote: boo
       option. Context is preserved the same way as any per-turn switch: the full
       conversation_history is replayed into the new client, and llm_client does
       the Anthropic↔OpenAI format translation.
-    - a per-turn `model` on the Anthropic backend (escalation, #303) builds a
+    - a per-turn `model` on the Anthropic backend (escalation) builds a
       dedicated client for that model; otherwise the shared singleton is used.
     """
     if force_remote:
@@ -446,7 +446,7 @@ def _select_client(model: str = "", force_local: bool = False, force_remote: boo
             return get_local_llm()  # already local — reuse the singleton
         # Anthropic or remote backend: the picker's "Gemma" option always
         # means the on-box llama-server specifically, never whatever the
-        # remote-backend singleton happens to point at (#771).
+        # remote-backend singleton happens to point at.
         from api.services.llm_client import LocalLLMClient
         return LocalLLMClient()
     if model and getattr(settings, "llm_backend", "anthropic").lower() == "anthropic":
@@ -466,17 +466,17 @@ class AgentResult:
     total_cache_creation_tokens: int = 0
     total_cost_usd: float = 0.0
     model: str = ""
-    # (#661) True when `model` has no known rate -- either no entry in
-    # pricing.PRICING, or (#654) the configured remote provider with no
+    # True when `model` has no known rate -- either no entry in
+    # pricing.PRICING, or the configured remote provider with no
     # configured per-token rate. The dollar figure in total_cost_usd is then
     # a placeholder 0.0, not a claim that the turn was actually free. See
     # _track_usage.
     unpriced: bool = False
-    # (#629) the current in-flight round's cumulative usage-so-far, from
+    # The current in-flight round's cumulative usage-so-far, from
     # AnthropicLLMClient.astream's "usage_update" event. Only that backend
     # emits it -- LocalLLMClient.astream never does (its protocol has no
-    # mid-stream usage signal), so these stay 0 for a local-backed turn,
-    # same as before this field existed. Folded into total_input_tokens /
+    # mid-stream usage signal), so these stay 0 for a local-backed turn.
+    # Folded into total_input_tokens /
     # total_output_tokens (and reset to 0) as soon as the round's "done"
     # event arrives -- see _track_usage -- so a caller reading "usage
     # accrued so far" must add these to the total_* fields rather than
@@ -515,7 +515,7 @@ async def run_agent_loop(
         attachments: Optional file attachments (list of dicts with filename, media_type, data).
         model_tier: "haiku", "sonnet", or "opus" (ignored for local model, kept for API compat).
         max_tool_rounds: Max number of tool-use rounds before forcing a text response.
-        model: Optional Anthropic model id override for this turn (escalation, #303).
+        model: Optional Anthropic model id override for this turn (escalation).
             When set on the Anthropic backend, the turn runs on a dedicated
             AnthropicLLMClient with this model instead of the default singleton.
             Ignored on the local backend.
@@ -527,7 +527,7 @@ async def run_agent_loop(
             even when the global backend is Anthropic — the chat model picker's
             "Gemma (local)" option. Builds a per-turn LocalLLMClient.
         force_remote: Run this turn on the configured paid OpenAI-compatible
-            remote provider (#654) — the chat model picker's explicit "Remote"
+            remote provider — the chat model picker's explicit "Remote"
             option. Builds a per-turn LocalLLMClient pointed at
             settings.remote_llm_*. Usage is priced from the configured rates
             (or marked unpriced if none are set) instead of the free-local
@@ -544,28 +544,28 @@ async def run_agent_loop(
             invented.
 
     Yields:
-        Dicts with "type" key: "turn_state" (first event, #615 -- a live
+        Dicts with "type" key: "turn_state" (first event -- a live
         reference to the mutable AgentResult, for a caller that needs
-        accrued usage before the loop reaches its terminal event; #629
+        accrued usage before the loop reaches its terminal event --
         extends what "accrued so far" means -- see AgentResult's
         provisional_input_tokens/provisional_output_tokens), "text",
         "status", or "result".
     """
     client = _select_client(model, force_local=force_local, force_remote=force_remote)
-    # (#661) The turn's actual served model -- LocalLLMClient.model is
+    # The turn's actual served model -- LocalLLMClient.model is
     # "local" by default or the configured remote provider's id when
-    # force_remote built it (#654, LocalLLMClient.model docstring);
+    # force_remote built it (LocalLLMClient.model docstring);
     # AnthropicLLMClient.model is the resolved default
     # (settings.anthropic_model) or the per-turn override above (escalation,
     # an explicit picker choice). `getattr(..., "local")` tolerates a test
     # double that predates this property (several unit tests patch
     # _select_client with a bare fake astream() object) by falling back to
-    # the same default this used to be hardcoded to.
+    # the same default value.
     resolved_model = getattr(client, "model", "local")
     system_prompt = build_system_prompt(persona=persona, max_tool_rounds=max_tool_rounds,
                                         voice_rules=voice_rules, personal_context=personal_context)
 
-    # Thinking control (#567): only LocalLLMClient.astream accepts
+    # Thinking control: only LocalLLMClient.astream accepts
     # enable_thinking — AnthropicLLMClient.astream has no such kwarg, and
     # passing it unconditionally would break the (default) Anthropic backend.
     # isinstance is the simplest correct gate here: there are exactly two
@@ -574,7 +574,7 @@ async def run_agent_loop(
     # a single kwarg on a two-class module. settings.local_agent_enable_thinking
     # defaults True (current behaviour) -> mapped to None so the request body
     # stays byte-identical until an operator opts out.
-    # `not force_remote` (#654): the remote provider is also a LocalLLMClient
+    # `not force_remote`: the remote provider is also a LocalLLMClient
     # instance (same OpenAI-compatible plumbing) but isn't llama-server —
     # it doesn't understand llama-server's chat_template_kwargs switch, so
     # this local-only knob must never reach it regardless of the setting.
@@ -621,7 +621,7 @@ async def run_agent_loop(
     messages.append({"role": "user", "content": user_content})
 
     result = AgentResult(full_text="", model=resolved_model)
-    # #615: hand the caller a live reference to `result` before the loop does
+    # Hand the caller a live reference to `result` before the loop does
     # any work. `_track_usage` below mutates it in place every round, so a
     # caller that stashes this object can read accrued usage at any point --
     # in particular from a cancel/deadline handler that never reaches the
@@ -634,7 +634,7 @@ async def run_agent_loop(
         result.total_output_tokens += usage.output_tokens
         result.total_cache_read_tokens += usage.cache_read_input_tokens
         result.total_cache_creation_tokens += usage.cache_creation_input_tokens
-        # (#661) Derive cost from the model that actually served the turn,
+        # Derive cost from the model that actually served the turn,
         # recomputed from the running totals each round (mirrors the
         # accumulation above -- cost_for is cheap and this keeps
         # total_cost_usd correct if a caller reads it mid-loop via the
@@ -646,7 +646,7 @@ async def run_agent_loop(
         # docstring for why this caller doesn't want cost_for's
         # budget-enforcement Opus-rate fallback.
         #
-        # (#654) The one exception: the configured remote provider's rates
+        # The one exception: the configured remote provider's rates
         # come from settings, not pricing.PRICING. The whole point of that
         # slot is an operator-flippable model id (Fireworks today, anything
         # OpenAI-compatible tomorrow) -- a static dict keyed by literal model
@@ -679,7 +679,7 @@ async def run_agent_loop(
         else:
             result.total_cost_usd = 0.0
             result.unpriced = True
-        # (#629) this round's usage is now folded into the totals above --
+        # This round's usage is now folded into the totals above --
         # clear the provisional (in-flight) figures so a caller that adds
         # provisional_* to total_* (chat.py's cancel handler) doesn't
         # double-count them once the round has actually closed out.
@@ -718,7 +718,7 @@ async def run_agent_loop(
                         elif event["type"] == "tool_calls":
                             tool_use_blocks = openai_tool_calls_to_anthropic(event["calls"])
                         elif event["type"] == "usage_update":
-                            # (#629) Anthropic-only -- see AgentResult's
+                            # Anthropic-only -- see AgentResult's
                             # provisional_* fields. Folded into total_* (and
                             # cleared) by _track_usage once "done" arrives
                             # below, so this is never added twice.
@@ -739,7 +739,7 @@ async def run_agent_loop(
                         await asyncio.sleep(delay)
                         continue
                     print(f"[agent] Round {round_num} API error: {e}")
-                    # Deliberately not str(e) here (#787) -- this reaches the
+                    # Deliberately not str(e) here -- this reaches the
                     # user verbatim, and on a keyless/misconfigured install
                     # it would otherwise be the provider SDK's raw internal
                     # message. The full exception is still logged above.
@@ -880,7 +880,7 @@ async def run_agent_loop(
                     # log and ignore (the text, if any, was already captured)
                     print(f"[agent] Synthesis round produced tool_calls (ignored): {[c.get('function', {}).get('name', '?') for c in event.get('calls', [])]}")
                 elif event["type"] == "usage_update":
-                    # (#629) same provisional tracking as the tool-round loop above.
+                    # Same provisional tracking as the tool-round loop above.
                     result.provisional_input_tokens = event["usage"].input_tokens
                     result.provisional_output_tokens = event["usage"].output_tokens
                 elif event["type"] == "done":
@@ -889,7 +889,7 @@ async def run_agent_loop(
         except Exception as e:
             error_msg = str(e) or f"{type(e).__name__} (no message)"
             print(f"[agent] Synthesis round error: {error_msg}")
-            # Deliberately not error_msg here (#787) -- see the matching
+            # Deliberately not error_msg here -- see the matching
             # comment in the tool-round loop above. Full detail is still
             # logged on the line above.
             result.error_message = "The request could not be completed."

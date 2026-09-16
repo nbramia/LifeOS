@@ -117,10 +117,10 @@ from api.services.runtime_identity import (
 from config.settings import settings
 
 
-# The engine-choice confirmation (#584). Every route offered here except the
+# The engine-choice confirmation. Every route offered here except the
 # last is free of per-token cost or is the operator's own cheaper remote
 # provider — the two CLIs bill the operator's subscriptions, Gemma runs
-# on-box, and 'cloud' is the configured remote provider (#809) — so the
+# on-box, and 'cloud' is the configured remote provider — so the
 # Anthropic-API option is listed last and labelled, and nothing reaches it
 # without the operator naming Anthropic/a Claude model specifically.
 ROUTING_ASK_QUESTION = (
@@ -134,11 +134,11 @@ ROUTING_ASK_QUESTION = (
 # matches before the bare "claude" alternative. Each named group maps to the
 # routing it selects.
 #
-# (#809) 'cloud' moved from the `api` group to its own `remote` group: the
-# tag means the configured remote provider now, not Anthropic, and a reply
-# is held to the same standard as the tag. Reaching the Anthropic API via a
-# typed reply now requires 'anthropic', 'api', 'managed', or a model name
-# ('opus'/'sonnet'/'haiku') — 'cloud' no longer implies it.
+# 'cloud' has its own `remote` group, separate from `api`: the tag means
+# the configured remote provider, not Anthropic, and a reply is held to the
+# same standard as the tag. Reaching the Anthropic API via a typed reply
+# requires 'anthropic', 'api', 'managed', or a model name
+# ('opus'/'sonnet'/'haiku') — 'cloud' alone does not imply it.
 _ROUTING_ANSWER_RE = re.compile(
     r"(?i)"
     r"(?P<claude_code>claude[\s_-]*code)"
@@ -169,7 +169,7 @@ _INLINE_SUMMARY_MAX_CHARS = 2000
 # When a BLOCKED session's reply-prompt (the resume anchor the operator replies
 # to) can't be delivered, retry a bounded number of times before escalating —
 # rather than leaving the session BLOCKED forever with no way to resume it
-# (#402). The delay is a module constant so tests can zero it out.
+#. The delay is a module constant so tests can zero it out.
 _BLOCKED_PROMPT_SEND_ATTEMPTS = 3
 _BLOCKED_PROMPT_RETRY_DELAY_S = 0.5
 
@@ -185,7 +185,7 @@ _QUESTION_CLAIM_RECOVERY_LIMIT = 100
 # schedule instead of a new note per fire.
 _SCHED_TAG_RE = re.compile(r"^sched-(\w+)$")
 
-# Affirmative replies that lock a proposed [GOAL] (#398). A goal-approval reply
+# Affirmative replies that lock a proposed [GOAL]. A goal-approval reply
 # that isn't affirmative is treated as a refinement and passed back verbatim.
 _GOAL_AFFIRMATIVE = {
     "yes", "y", "yep", "yeah", "approve", "approved", "ok", "okay", "k",
@@ -212,7 +212,7 @@ _GOAL_DECLINE = {
 
 # Filename of the self-restart marker the detached worker-restart primitive
 # (`scripts/server.sh restart-worker-detached`) drops next to the session DB
-# before bouncing `lifeos-agent-worker` (#401). `resume_pending()` consults it
+# before bouncing `lifeos-agent-worker`. `resume_pending()` consults it
 # on startup: a session named here was killed by a *deliberate* end-of-goal
 # restart, not a crash, so it's finalized quietly (COMPLETED, no rollback /
 # "could not be safely resumed" notice). The marker is JSON
@@ -263,7 +263,7 @@ def write_self_restart_marker(
     db_path: Path | str | None = None,
 ) -> Path:
     """Write the self-restart marker before a deliberate end-of-goal worker
-    restart (#401). Called by `scripts/server.sh restart-worker-detached` (via
+    restart. Called by `scripts/server.sh restart-worker-detached` (via
     `python -m api.services.agent_worker.worker --mark-self-restart …`) so the
     bash primitive and the worker share one marker format. Returns the path
     written. `db_path` defaults to the SessionStore default so the caller
@@ -290,7 +290,7 @@ def write_self_restart_marker(
 
 # Telegram reply affordance markers. Every operator-facing session message
 # ends with exactly one of these so the operator can tell at a glance whether
-# a threaded reply will reach the session (see #458: any anchored message is
+# a threaded reply will reach the session (see any anchored message is
 # replyable; replies queue as context notes and ride the next turn boundary).
 REPLYABLE_FOOTER = "\u21a9\ufe0f reply in thread"
 NO_REPLY_FOOTER = "\U0001f6ab do not reply"
@@ -302,7 +302,7 @@ def _with_reply_footer(text: str, replyable: bool = True) -> str:
 
 
 def _is_affirmative(text: str) -> bool:
-    """True when a goal-approval reply means 'lock it and go' (#398).
+    """True when a goal-approval reply means 'lock it and go'.
 
     A refinement signal anywhere in the reply wins over the affirmative prefix
     so "yes but make it stricter" / "approve with changes" don't lock the stale
@@ -366,11 +366,11 @@ def _worker_label(routing: str | None, served_by: str = "") -> str:
     Claude. Defaults to the generic "Agent worker" when the routing
     isn't known yet (e.g., startup recovery messages).
 
-    (#699) `served_by` is the model id that actually ran the session when
+    `served_by` is the model id that actually ran the session when
     it differs from what the routing name implies — currently only the
     flag-gated remote fallback on the "local" route. Empty (the default,
     and every session not on that fallback) leaves the label unchanged —
-    report observed, not configured (#658), only when there's something
+    report observed, not configured, only when there's something
     to report."""
     if routing == ROUTE_LOCAL:
         label = "Local agent worker"
@@ -411,7 +411,7 @@ def _resume_cli_executor(executor, session, message: str, working_dir: str | Non
 
 
 # Friendly names for the engine a child session ran on, used in the escalation
-# flag (#349) so the operator sees where delegated work actually executed.
+# flag so the operator sees where delegated work actually executed.
 _ENGINE_LABELS = {
     "claude_code": "Claude Code",
     "codex": "Codex",
@@ -528,7 +528,7 @@ _AGENT_ASSIGNEE_SET = frozenset(_BOARD_AGENT_ASSIGNEES)
 _CONSENT_TAG_SET = frozenset(_MANAGED_AGENTS_CONSENT_TAGS)
 _PICKUP_TAG_SET = frozenset(AGENT_PICKUP_TAGS)
 
-# #760: best-effort WIP-branch discovery for an interrupted CLI session — a
+# best-effort WIP-branch discovery for an interrupted CLI session — a
 # regex over past tool_use transcript events, never a live `git` call.
 _WIP_BRANCH_RE = re.compile(r"git\s+(?:switch\s+-c|checkout\s+-b)\s+([A-Za-z0-9._/-]+)")
 _TASK_NOTES_MAX_CHARS = 6000
@@ -592,17 +592,17 @@ class Worker:
         http_client: httpx.Client | None = None,
         preflight_caller=None,    # injectable; defaults to Anthropic Haiku
         local_executor=None,      # injectable LocalExecutor for tests
-        remote_executor=None,     # injectable LocalExecutor (remote-forced, #809) for tests
+        remote_executor=None, # injectable LocalExecutor (remote-forced) for tests
         managed_executor=None,    # injectable ManagedExecutor for tests
         claude_code_executor=None,  # injectable ClaudeCodeExecutor for tests
         codex_executor=None,        # injectable CodexExecutor for tests
-        hermes_executor=None,       # injectable HermesExecutor for tests (#851)
+        hermes_executor=None, # injectable HermesExecutor for tests
         cli_pool=None,              # injectable dispatch pool; tests pass _SynchronousPool
         execution_facts_provider=None,  # injectable immutable resolver observation
     ) -> None:
         self.api_base = (api_base or os.environ.get("LIFEOS_API_URL", "http://localhost:8000")).rstrip("/")
         self.session_store = session_store or SessionStore()
-        # #311: resolves a spawned session back to the web/voice conversation it
+        # resolves a spawned session back to the web/voice conversation it
         # originated from, so the session's progress + result can be mirrored
         # into that thread (additive — Telegram routing is untouched).
         self.conversation_store = conversation_store or ConversationStore()
@@ -643,23 +643,23 @@ class Worker:
             self.session_store, _WorkerLifecycleTaskManager(self),
         )
         self.session_store.set_status_projector(self._project_session_status)
-        # Human-queue done_when poll (#852) — throttled independently of the
+        # Human-queue done_when poll — throttled independently of the
         # main tick interval, which runs far more often (60s) than the
         # default human-queue poll (300s). 0.0 so the very first tick always
         # checks.
         self._last_human_queue_check = 0.0
         self._preflight_caller = preflight_caller  # None → use Anthropic SDK by default
         self._local_executor = local_executor  # lazily instantiated on first use
-        self._remote_executor = remote_executor  # lazily instantiated on first #cloud task (#809)
+        self._remote_executor = remote_executor # lazily instantiated on first #cloud task
         self._managed_executor = managed_executor  # lazily instantiated on first claude task
         self._claude_code_executor = claude_code_executor  # lazily instantiated on first /claude task
-        # Per-bot ClaudeCodeExecutor cache (#348). An orchestration bot (doctor)
+        # Per-bot ClaudeCodeExecutor cache. An orchestration bot (doctor)
         # needs its [NOTIFY]/[CLARIFY] notices routed to its own Telegram bot, so
         # each bot gets an executor whose notification_callback is bound to that
         # bot. Bypassed entirely when a test injects `_claude_code_executor`.
         self._claude_code_executors: dict[str, object] = {}
         self._codex_executor = codex_executor  # lazily instantiated on first /codex task
-        self._hermes_executor = hermes_executor  # lazily instantiated on first hermes task (#851)
+        self._hermes_executor = hermes_executor # lazily instantiated on first hermes task
         self._execution_facts_provider = execution_facts_provider
         # CLI dispatches (claude_code/codex) and Hermes HTTP turns can be
         # long-running — spawned children/operator root-spawns and top-level
@@ -778,7 +778,7 @@ class Worker:
             self.api_base, self.poll_seconds, self.spend_tracker.daily_cap_dollars,
         )
         # Recover any sessions left non-terminal by a previous crash before
-        # starting fresh poll cycles (issue #100 acceptance: restart-resumable).
+        # starting fresh poll cycles (issue acceptance: restart-resumable).
         self.resume_pending()
         while not self._stop:
             try:
@@ -813,7 +813,7 @@ class Worker:
           safely re-enter a partially-driven LLM conversation without risking
           duplicate side effects (file writes, API calls, etc.).
 
-        Exception — deliberate self-restart (#401): a session named in the
+        Exception — deliberate self-restart: a session named in the
         self-restart marker was killed by an end-of-goal `restart-worker-detached`
         (the doctor restarting the worker after shipping an agent-worker-code
         change), not by a crash. Its final `[NOTIFY]` was already delivered
@@ -865,7 +865,7 @@ class Worker:
                 # _finalize_terminal): advance the vault checkbox to done ([x])
                 # AND swap the tag — gated on has_vault_task. Operator-spawned
                 # roots and spawned children carry a synthetic task_id with no
-                # vault row, so both vault ops are skipped for them (#401 review).
+                # vault row, so both vault ops are skipped for them.
                 # The session-row update_status above stays unconditional.
                 has_vault_task = session.origin != "operator" and not session.parent_session_id
                 if has_vault_task:
@@ -877,11 +877,11 @@ class Worker:
                 )
                 recovered += 1
                 continue
-            # #198: a remote Managed Agents session survives a worker restart —
+            # a remote Managed Agents session survives a worker restart —
             # it keeps running on Anthropic's infrastructure, making MCP tool
             # calls with real side effects (task creation, vault writes, sends)
-            # long after this rollback tells the operator the task was rolled
-            # back. Kill it before finalizing. Best-effort: a kill failure
+            # long after the rollback here tells the operator the task was
+            # rolled back. Kill it before finalizing. Best-effort: a kill failure
             # (404, network) must not block the rollback.
             if session.managed_agent_session_id:
                 managed = self._get_managed_executor()
@@ -908,7 +908,7 @@ class Worker:
             # Spawned children belong to a parent's lineage — they have no
             # backing vault task (`spawn_xxx` task_id is synthetic), so
             # tag/status updates are no-ops, and the operator-facing
-            # rollback notification should not fire (PR #132 invariant:
+            # rollback notification should not fire (PR invariant:
             # children's terminal state stays parent-internal).
             if session.parent_session_id:
                 recovered += 1
@@ -949,10 +949,10 @@ class Worker:
 
     def tick(self) -> int:
         """Process one poll cycle. Returns the number of tasks handled (for tests)."""
-        # Resolve Human-queue cards whose done_when condition now passes.
+        # Resolve Human-queue cards whose done_when condition currently passes.
         # Runs before the spend-cap guard below: it never starts a new
         # task or spends money, so it must not stop just because the
-        # worker is paused or near its daily cap (#852 R2).
+        # worker is paused or near its daily cap.
         self._process_human_queue()
         self._replay_wait_wakeups()
         # Heal any vault tag left stranded by a terminal status write that
@@ -1125,7 +1125,7 @@ class Worker:
                 self._submit_hermes_resume(session, task, resume_message, child_sessions)
                 continue
 
-            # (#809) A remote-routed parent keeps its conversation history in
+            # A remote-routed parent keeps its conversation history in
             # session_store like local does (it's the same LocalExecutor,
             # just pointed at the remote provider) — no fresh-session
             # restatement needed, unlike the cloud/Managed-Agents branch
@@ -1168,7 +1168,7 @@ class Worker:
         task backing — they show up with status=claimed and an explicit routing.
 
         CLI children (claude_code/codex) are long-running subprocesses, so they
-        run on the bounded `_cli_pool` rather than blocking the tick (#299). The
+        run on the bounded `_cli_pool` rather than blocking the tick. The
         `local` route stays inline — it's in-process, GPU-bound, and capped at
         one concurrent session, so a pool wouldn't buy real parallelism.
         """
@@ -1176,7 +1176,7 @@ class Worker:
         for session in claimed:
             # Skip top-level claimed sessions from the #agent tick claim path
             # (those are dispatched by _dispatch). Pick up spawned children
-            # (parent set) and operator root-spawns (#235, no parent but
+            # (parent set) and operator root-spawns (no parent but
             # origin='operator').
             if not session.parent_session_id and session.origin != "operator":
                 continue
@@ -1317,8 +1317,8 @@ class Worker:
         `_dispatch_codex_session`) on the pool instead of inline.
 
         Shared by two callers: `_dispatch_spawned_sessions` (spawned children
-        and operator root-spawns, #299) and `_dispatch` (top-level `#agent`
-        tasks routed to a CLI engine, #753) — both hand the same long-running
+        and operator root-spawns) and `_dispatch` (top-level `#agent`
+        tasks routed to a CLI engine) — both hand the same long-running
         subprocess call off the tick thread through the same pool + guard.
 
         Guards with `_cli_inflight` so a re-scan on the next tick doesn't submit
@@ -1844,7 +1844,7 @@ class Worker:
                 self.session_store.mark_question_processed(q["id"])
                 self._handle_outcome(session, task, outcome)
             elif session.routing == ROUTE_REMOTE:
-                # (#809) A "cloud" reply to the engine-choice question resolves
+                # A "cloud" reply to the engine-choice question resolves
                 # here. Same not-configured guard as the tag path in
                 # `_dispatch` (never fall through to another engine), just
                 # via `_mark_failed` rather than a re-block — mirrors how the
@@ -2206,7 +2206,7 @@ class Worker:
                     "version": proposal["version"],
                     "answer_chars": len(answer),
                 })
-        # Operator root-spawns (#235) have no backing vault task, so skip the
+        # Operator root-spawns have no backing vault task, so skip the
         # tag/status mutations (they would 404).
         if session.origin != "operator":
             if not self.session_store.question_claimed(q["id"]):
@@ -2316,7 +2316,7 @@ class Worker:
 
         # The task may be parked at any terminal tag — completed, failed, or
         # budget-exceeded are all replyable now. Swap whichever is current
-        # back to running. Operator root-spawns (#235) have no backing vault
+        # back to running. Operator root-spawns have no backing vault
         # task, so skip the tag/status mutations (they would 404).
         if session.origin != "operator":
             lifecycle_swapped = False
@@ -2350,7 +2350,7 @@ class Worker:
 
         if session.routing in (ROUTE_LOCAL, ROUTE_REMOTE):
             # Surface-neutral prefix: follow-ups arrive from Telegram replies and
-            # the web /chat thread view (#236), so don't hardcode "Telegram".
+            # the web /chat thread view, so don't hardcode "Telegram".
             if not self.session_store.question_claimed(q["id"]):
                 return
             if self.session_store.append_message(
@@ -2359,7 +2359,7 @@ class Worker:
             ) is None:
                 self.session_store.mark_question_processed(q["id"])
                 return
-            # (#809) Remote-routed follow-ups resume the same way local ones
+            # Remote-routed follow-ups resume the same way local ones
             # do — conversation history lives in session_store either way, so
             # only the executor's target LLM client differs.
             if not self.session_store.question_claimed(q["id"]):
@@ -2492,14 +2492,14 @@ class Worker:
         scanning anywhere in the text; when several engines are named, the one
         mentioned LAST wins (the operator's most recent statement).
 
-        A bare "claude" resolves to the Claude Code CLI, not the API (#584).
-        That is the safe reading of an ambiguous word now that both exist: the
+        A bare "claude" resolves to the Claude Code CLI, not the API.
+        That is the safe reading of an ambiguous word, since both exist: the
         CLI is subscription-billed, so a misread costs nothing, while the same
         misread in the other direction spends credits the operator didn't
         agree to. Reaching the API takes a word that can only mean the API —
-        "anthropic", "api", "managed", or a model name (#809: "cloud" no
-        longer qualifies — it resolves to the configured remote provider
-        instead, mirroring the `#cloud` tag's own remapped meaning).
+        "anthropic", "api", "managed", or a model name ("cloud" does not
+        qualify — it resolves to the configured remote provider instead,
+        mirroring the `#cloud` tag's own meaning).
         """
         if not answer:
             return None
@@ -2521,7 +2521,7 @@ class Worker:
         for q in stale:
             # Close every stale row, but only nudge for actual clarifications
             # (agent BLOCKED awaiting input). Completion follow-ups
-            # (kind='followup', #234) are just replyable notifications; a
+            # (kind='followup') are just replyable notifications; a
             # "re-tag with an engine assignee to retry" nudge is wrong for
             # them. Marking them timed out also keeps stale follow-up rows
             # from accumulating.
@@ -2542,8 +2542,8 @@ class Worker:
             )
 
     def _process_human_queue(self) -> None:
-        """Resolve open Human-queue cards whose `done_when` check now passes
-        (#852). Throttled to `settings.human_queue_poll_seconds` — `tick()`
+        """Resolve open Human-queue cards whose `done_when` check currently
+        passes. Throttled to `settings.human_queue_poll_seconds` — `tick()`
         itself may run far more often. Talks to the store through the HTTP
         API, not the in-process TaskManager, matching every other cross-
         process access in this worker (the worker and the API may run on
@@ -2892,7 +2892,7 @@ class Worker:
             if task is None:
                 task = {"id": session.task_id, "description": ""}
             task = self._task_with_execution_snapshot(session, task)
-            # (#809) A remote-routed session that slept must wake back onto
+            # A remote-routed session that slept must wake back onto
             # the remote provider, not silently switch to local Gemma — same
             # conversation-history-based resume, different target client.
             try:
@@ -3105,7 +3105,7 @@ class Worker:
     def _discover_wip_branch(self, session_id: str) -> str | None:
         """Best-effort scan of this session's OWN past transcript for a WIP
         branch the CLI created via ``git switch -c <branch>`` / ``git
-        checkout -b <branch>`` (#760). Returns the LAST such branch name
+        checkout -b <branch>``. Returns the LAST such branch name
         found (a later branch supersedes an earlier one across resumes), or
         None if none was ever recorded. Read-only — this never runs git
         itself, only greps tool_use events the executor already wrote.
@@ -3134,7 +3134,7 @@ class Worker:
 
     def _handle_cli_interrupted(self, session: Session, outcome, *, bot: str | None = None) -> None:
         """A claude_code/codex session's subprocess reached a nominal
-        STATUS_COMPLETED without an earned completion signal (#760,
+        STATUS_COMPLETED without an earned completion signal (see
         ``completion_signal.has_positive_completion_signal``) — treat it as
         interrupted mid-work rather than done.
 
@@ -3232,7 +3232,7 @@ class Worker:
             # Delivery failed after retries would just repeat the same
             # failure — no anchor means the operator can't reply to resume,
             # so a BLOCKED row would sit silent forever. Escalate to
-            # failed-with-preserved-context (documented fallback, #760).
+            # failed-with-preserved-context (a documented fallback).
             self.transcript_store.append(sid, "cli_interrupted_prompt_undelivered", {})
 
         self.session_store.update_status(
@@ -3366,7 +3366,7 @@ class Worker:
         )
 
     def _get_remote_executor(self, caller_session_id: str | None = None):
-        """(#809) Return the executor for `ROUTE_REMOTE` (`#cloud`) tasks —
+        """Return the executor for `ROUTE_REMOTE` (`#cloud`) tasks —
         a `LocalExecutor` forced onto the configured remote provider via
         `local_executor._remote_only_llm_client`, never the local
         llama-server. Callers must confirm `settings.remote_llm_configured`
@@ -3422,7 +3422,7 @@ class Worker:
           - `agent_preset_id` — `agent_…` ID created in the Anthropic console.
             Holds the model, system prompt, MCP servers, and tools.
           - `agent_environment_id` — `env_…` ID for where tool calls execute
-            (cloud container by default; self-hosted sandbox in #111).
+            (cloud container by default; self-hosted sandbox in).
         Optional:
           - `agent_vault_id` — `vlt_…` ID supplying OAuth credentials for
             MCP servers declared in the agent preset. Without it, OAuth-
@@ -3459,7 +3459,7 @@ class Worker:
     ) -> int:
         """How many times a CLI subprocess *actually launched* for this session.
 
-        Defense-in-depth signal for the CLI dispatch fork (#400). The executor
+        Defense-in-depth signal for the CLI dispatch fork. The executor
         writes ``spawn_kind`` immediately *before* the spawn call — but on a
         missing-binary misconfig it then writes ``not_found_kind`` and the
         subprocess never launched (no side effects, safe to re-execute). So a raw
@@ -3491,7 +3491,7 @@ class Worker:
             return 0
 
     def _mirror_to_conversation(self, session_id: str, text: str) -> None:
-        """#311: mirror a web-spawned session's operator-facing output into its
+        """mirror a web-spawned session's operator-facing output into its
         linked conversation thread (additive — Telegram is untouched).
 
         No-op when the session isn't linked to a conversation (i.e.
@@ -3543,8 +3543,8 @@ class Worker:
         bot = session.bot
         sid = session.session_id
 
-        # Only thread `bot` when set so the primary path's send signature is
-        # byte-identical to before this change (#348). bot=None → primary.
+        # Only thread `bot` when set so the primary path's send signature
+        # stays byte-identical to the plain call. bot=None → primary.
         def _send(text):
             return self._telegram_send(text, bot=bot) if bot else self._telegram_send(text)
 
@@ -3558,11 +3558,11 @@ class Worker:
         is_resume = bool(session.claude_code_session_id)
 
         # Defense-in-depth: don't re-execute a fresh spawn whose subprocess
-        # already launched once (#400). The fresh-spawn branch below calls
+        # already launched once. The fresh-spawn branch below calls
         # execute() with the original prompt; the CLI session UUID only persists
         # on the `init` event (executor :615), which fires *after* the subprocess
         # spawns. A genuine worker crash mid-run is already handled — resume_pending()
-        # finalizes RUNNING/CLAIMED → FAILED at startup, before this tick loop —
+        # finalizes RUNNING/CLAIMED → FAILED at startup, ahead of this tick loop —
         # so the real case this guards is a *non-restart* re-dispatch of a session
         # that already launched a subprocess (init never persisted ⇒ session id
         # still NULL). Re-running could repeat side effects (for a doctor turn:
@@ -3574,7 +3574,7 @@ class Worker:
         # misdiagnosed as a side-effecting interruption — that case re-executes
         # safely once Fix A (terminal-status persistence below) stops the loop.
         # The codex path (_dispatch_codex_session) carries the same guard via the
-        # shared _cli_subprocess_launch_count helper (#411).
+        # shared _cli_subprocess_launch_count helper.
         prior_launches = self._cli_subprocess_launch_count(
             sid, "claude_code_spawn", "claude_code_binary_not_found"
         )
@@ -3608,7 +3608,7 @@ class Worker:
 
         if is_resume:
             # Every drained message rides the resume turn, in order. Draining
-            # returns ALL pending rows, and reopen-on-send (#428) makes
+            # returns ALL pending rows, and reopen-on-send makes
             # multi-enqueue likely (e.g. a parent answers twice before the
             # dispatch tick claims the reopened child) — resuming with only
             # pending[0] would silently drop messages `lifeos_agent_send`
@@ -3709,7 +3709,7 @@ class Worker:
             else:
                 prompt = "Awaiting your reply to continue."
             # Goal-approval replies route through `_resume_goal` (which injects
-            # `/goal <condition>` on a yes); everything else is a followup (#398).
+            # `/goal <condition>` on a yes); everything else is a followup.
             kind = "goal_approval" if outcome.reason == REASON_AWAITING_GOAL_APPROVAL else "followup"
             sent_ids: list = []
             for attempt in range(_BLOCKED_PROMPT_SEND_ATTEMPTS):
@@ -3727,10 +3727,10 @@ class Worker:
                     time.sleep(_BLOCKED_PROMPT_RETRY_DELAY_S)
             if sent_ids:
                 # kind='followup' so _resume_as_followup picks the reply up
-                # alongside agent threads (unified routing model, #248). The
+                # alongside agent threads (unified routing model). The
                 # session.routing == 'code' tells _resume_as_followup which
                 # executor branch to take. `bot` scopes the reply match so a
-                # doctor reply can't collide with a primary question (#348).
+                # doctor reply can't collide with a primary question.
                 question_id = self.session_store.create_pending_question(
                     session_id=sid,
                     task_id=session.task_id,
@@ -3760,7 +3760,7 @@ class Worker:
             # BLOCKED forever, unresumable and silent. Escalate instead: record
             # the undelivered question, mark the session FAILED so recovery and
             # the /agents view reflect reality, and best-effort notify the owning
-            # surface that a question is stuck (#402).
+            # surface that a question is stuck.
             self.transcript_store.append(sid, "code_block_prompt_undelivered", {
                 "reason": outcome.reason, "attempts": _BLOCKED_PROMPT_SEND_ATTEMPTS,
             })
@@ -3780,7 +3780,7 @@ class Worker:
             return
 
         if outcome.status == STATUS_COMPLETED:
-            # #760: a subprocess exiting cleanly (or emitting a degenerate
+            # a subprocess exiting cleanly (or emitting a degenerate
             # terminal event) doesn't mean the agent actually finished — it
             # can hit --max-turns or die mid-turn and still land here with a
             # mid-thought final_text and zero notifications. Require an
@@ -3799,7 +3799,7 @@ class Worker:
             # during execution are stripped from final_text by the executor.
             # Spawned children (have a parent) stay silent to the operator —
             # the parent relays their findings in its own single completion
-            # message (#349); the child's final_text reaches the parent via
+            # message; the child's final_text reaches the parent via
             # _child_final_text instead.
             body = outcome.final_text.strip() if outcome.final_text else ""
             if body and not session.parent_session_id:
@@ -3820,7 +3820,7 @@ class Worker:
                         attempt_id=session.attempt_id,
                         turn_id=session.turn_id,
                     )
-                # #311: also land the final result in the web/voice thread that
+                # also land the final result in the web/voice thread that
                 # spawned this session (no-op for Telegram-origin). Gated the same
                 # way as the Telegram send above — non-empty, non-child.
                 self._mirror_to_conversation(sid, body)
@@ -3829,10 +3829,10 @@ class Worker:
             })
             self._apply_repair_result(session, outcome.final_text)
             self._reconcile_vault_terminal(session, STATUS_COMPLETED)
-            # A reply that arrived MID-RUN (status-anchor route, #458) is
+            # A reply that arrived MID-RUN (status-anchor route) is
             # queued in pending_messages with nothing to deliver it — the
-            # dispatch tick only drains CLAIMED sessions. Reopen now that the
-            # turn boundary is here, mirroring reopen-on-send (#428): resume
+            # dispatch tick only drains CLAIMED sessions. Reopen once the
+            # turn boundary is here, mirroring reopen-on-send: resume
             # needs the persisted CLI id (re-fetch the row — the executor sets
             # it during this very run, so the claim-time snapshot may predate
             # it), and children stay parent-driven.
@@ -3860,13 +3860,13 @@ class Worker:
         if outcome.status == STATUS_BUDGET_EXCEEDED:
             notice = f"⚠️ {label} hit its budget ({outcome.reason})."
         elif outcome.status == STATUS_FAILED and outcome.reason != REASON_KILLED:
-            # #379: an operator-killed session must NOT emit a post-kill notice —
+            # an operator-killed session must NOT emit a post-kill notice —
             # the operator stopped it deliberately. The row is already FAILED and
             # the kill endpoint owns the operator_killed transcript event; here we
             # just skip the spurious "failed" notice + web mirror. (Status
             # persistence and vault reconciliation below still run.)
             notice = f"⚠️ {label} failed: {outcome.reason}."
-        # #431: spawned children stay silent to the operator on failure/budget
+        # spawned children stay silent to the operator on failure/budget
         # too — the parent's resume turn carries the child's [failed] /
         # [budget_exceeded] status header, so the notice would be duplicate
         # noise for a session the operator never directly started.
@@ -3874,7 +3874,7 @@ class Worker:
             # A failed/budget session with a persisted CLI id is resumable
             # (`_resume_as_followup` swaps any terminal tag), so register the
             # notice as a followup anchor and mark it replyable; without the
-            # CLI id there is nothing to resume — say so (#458).
+            # CLI id there is nothing to resume — say so.
             current = self.session_store.get_by_session_id(sid)
             resumable = bool(current is not None and current.claude_code_session_id)
             sent_ids = []
@@ -3899,14 +3899,14 @@ class Worker:
                 # No registered anchor (unresumable, or id capture failed) —
                 # a "reply in thread" footer would be a lie either way.
                 _send(_with_reply_footer(notice, replyable=False))
-            # #311: mirror the same failure/budget notice into the web/voice
+            # mirror the same failure/budget notice into the web/voice
             # thread (no-op for Telegram-origin); a child is never
             # conversation-linked, so the child gate above also keeps this correct.
             self._mirror_to_conversation(sid, notice)
-        # #433: persist the failure reason so the parent's resume turn can
+        # persist the failure reason so the parent's resume turn can
         # carry a `reason:` line (no-op for non-children).
         self._record_child_failure_reason(session, outcome.status, outcome.reason)
-        # Persist the terminal status to the session ROW (#400). The executor
+        # Persist the terminal status to the session ROW. The executor
         # sets RUNNING on launch but doesn't always flip to a terminal status on
         # failure (e.g. the binary-not-found path returns FAILED while leaving the
         # row CLAIMED/RUNNING). _reconcile_vault_terminal only touches the vault,
@@ -3925,7 +3925,7 @@ class Worker:
         heartbeat) with reply-anchor registration: the message ends with the
         "reply in thread" footer, its Telegram message id(s) are captured and
         registered against the session, and a threaded reply to it routes back
-        into the session as a context note (#458). Falls back to the plain
+        into the session as a context note. Falls back to the plain
         one-way sender (no footer — the affordance would be a lie) when id
         capture is unavailable or fails.
         """
@@ -3965,7 +3965,7 @@ class Worker:
         builds one executor per owning bot, each wired to a notification callback
         bound to that bot so [NOTIFY]/[CLARIFY] bodies stream live to the right
         Telegram surface — the doctor bot's notices go to the doctor bot, not the
-        primary (#348). ``bot=None`` is the primary.
+        primary. ``bot=None`` is the primary.
         """
         if self._claude_code_executor is not None:
             return self._claude_code_executor
@@ -3974,27 +3974,27 @@ class Worker:
         if cached is not None:
             return cached
         from api.services.agent_worker.claude_code_executor import ClaudeCodeExecutor
-        # Primary keeps the original callback (byte-identical to pre-#348). An
-        # orchestration bot gets a callback bound to its bot so streaming
+        # Primary keeps the original callback (byte-identical to the plain
+        # call). An orchestration bot gets a callback bound to its bot so streaming
         # [NOTIFY]/[CLARIFY] bodies land on its Telegram surface.
         notify = (lambda text: self._telegram_send(text, bot=bot)) if bot else self._telegram_send
         executor = ClaudeCodeExecutor(
             session_store=self.session_store,
             transcript_store=self.transcript_store,
             notification_callback=notify,
-            # Preferred operator sender (#458): captures Telegram ids and
+            # Preferred operator sender: captures Telegram ids and
             # registers them as reply anchors so a threaded reply to ANY
             # streamed message routes back into the session. The session's own
             # `bot` picks the surface, so one binding serves every bot.
             operator_send=self._send_session_message,
-            # #311: mirror each streamed [NOTIFY]/[CLARIFY]/[GOAL] into the
+            # mirror each streamed [NOTIFY]/[CLARIFY]/[GOAL] into the
             # web/voice thread that spawned the session (no-op when unlinked).
             conversation_mirror=self._mirror_to_conversation,
         )
         # CLI dispatch runs on a thread pool, so two same-bot sessions can reach
         # here concurrently. The executor is cheap and stateless (per-session
         # state lives in SessionStore), so the race is benign — setdefault just
-        # makes both callers return the same cached instance (#354 review).
+        # makes both callers return the same cached instance.
         return self._claude_code_executors.setdefault(key, executor)
 
     def _dispatch_codex_session(self, session, pending: list[dict]) -> None:
@@ -4019,7 +4019,7 @@ class Worker:
 
         is_resume = bool(session.claude_code_session_id)
 
-        # Re-execute guard (#411) — mirrors the claude_code dispatch (#400/#408).
+        # Re-execute guard — mirrors the claude_code dispatch.
         # The codex executor writes `codex_spawn` immediately before launching the
         # subprocess and only persists the session id on `codex_init`. A spawn with
         # a still-NULL claude_code_session_id (the reused session-id column) means a
@@ -4057,7 +4057,7 @@ class Worker:
             # All drained messages ride the resume turn in order — same
             # multi-enqueue rationale as the claude_code dispatch above
             # (a codex child can collect both an operator threaded reply
-            # and a parent reopen answer before the tick claims it, #428).
+            # and a parent reopen answer before the tick claims it).
             resume_message = "\n\n".join(m["content"] for m in pending) if pending else ""
             task: dict = {"id": session.task_id, "description": resume_message}
             self.transcript_store.append(sid, "codex_user_prompt", {
@@ -4120,9 +4120,9 @@ class Worker:
         session = current
 
         if outcome.status == STATUS_COMPLETED:
-            # #760: parity with the claude_code gate — a clean exit doesn't
+            # parity with the claude_code gate — a clean exit doesn't
             # mean the agent finished. Codex has no [NOTIFY] convention, so
-            # this always falls through to the PR-mention / summary-shape
+            # this always falls through to PR-mention / summary-shape
             # checks. Spawned children are exempt, same rationale as claude_code.
             if not session.parent_session_id and not has_positive_completion_signal(
                 outcome.final_text, outcome.notifications_sent,
@@ -4131,10 +4131,11 @@ class Worker:
                 return
             # Spawned children (have a parent) stay silent to the operator —
             # the parent relays their findings in its own completion message
-            # (#429, the #349 gate the codex path never got). The child's
+            # (mirroring the same silent-child gate other routes already
+            # have). The child's
             # final_text reaches the parent via the codex_completed transcript
             # event / _child_final_text instead. Gating the followup anchor too
-            # matters for reopen-on-send (#428): an operator threaded reply and
+            # matters for reopen-on-send: an operator threaded reply and
             # a parent answer must not both enqueue against the same child.
             body = outcome.final_text.strip() if outcome.final_text else ""
             if body and not session.parent_session_id:
@@ -4154,7 +4155,7 @@ class Worker:
                         attempt_id=session.attempt_id,
                         turn_id=session.turn_id,
                     )
-                # #311: mirror the final result into the web/voice thread that
+                # mirror the final result into the web/voice thread that
                 # spawned this codex session (no-op for Telegram-origin). Codex
                 # has no rich [NOTIFY] stream, so this terminal mirror is the
                 # whole web round-trip for it. A child is never
@@ -4173,26 +4174,26 @@ class Worker:
         if outcome.status == STATUS_BUDGET_EXCEEDED:
             notice = f"⚠️ {label} hit its budget ({outcome.reason})."
         elif outcome.status == STATUS_FAILED and outcome.reason != REASON_KILLED:
-            # #379: an operator-killed codex session must NOT emit a post-kill
+            # an operator-killed codex session must NOT emit a post-kill
             # notice — the operator stopped it deliberately. Parity with the
             # claude_code dispatch; status persistence + vault reconciliation
             # below still run.
             notice = f"⚠️ {label} failed: {outcome.reason}."
-        # #431: spawned children stay silent to the operator on failure/budget
+        # spawned children stay silent to the operator on failure/budget
         # too — parity with the claude_code branch; the parent's resume turn
         # carries the child's terminal status header.
         if notice and not session.parent_session_id:
             self._telegram_send(notice)
-            # #311: mirror the same failure/budget notice into the web/voice
+            # mirror the same failure/budget notice into the web/voice
             # thread (no-op for Telegram-origin). A child is never
             # conversation-linked, so the child gate above also keeps this correct.
             self._mirror_to_conversation(sid, notice)
-        # #433: persist the failure reason for the parent's resume turn —
+        # persist the failure reason for the parent's resume turn —
         # parity with the claude_code branch (no-op for non-children).
         self._record_child_failure_reason(session, outcome.status, outcome.reason)
         # Persist the terminal status to the session row so an operator/child codex
         # session (no vault row → _reconcile_vault_terminal is a no-op for it) can't
-        # linger CLAIMED and be re-dispatched every tick (mirrors #408 / #400).
+        # linger CLAIMED and be re-dispatched every tick (mirrors /).
         self.session_store.update_status(
             session.task_id, outcome.status,
             attempt_id=session.attempt_id, turn_id=session.turn_id,
@@ -4213,7 +4214,7 @@ class Worker:
 
     def _get_hermes_executor(self):
         """Lazy-construct the HermesExecutor for board-assigned #hermes
-        sessions (#851)."""
+        sessions."""
         if self._hermes_executor is not None:
             return self._hermes_executor
         from api.services.agent_worker.hermes_executor import HermesExecutor
@@ -4459,19 +4460,19 @@ class Worker:
             "routing_reason": pre.routing_reason,
             "expected_output": pre.expected_output,
             "ambiguity": pre.ambiguity.question if pre.ambiguity else None,
-            # (#751) A default route demotes ambiguity to advisory rather than
+            # A default route demotes ambiguity to advisory rather than
             # discarding it — logged here as context for whoever reads the
             # transcript, not as a blocking question to the operator.
             "demoted_ambiguity": pre.demoted_ambiguity,
-            # (#757) A default route also demotes an uncorroborated LLM-chosen
+            # A default route also demotes an uncorroborated LLM-chosen
             # route (no title cue backing it) to the configured default —
             # logged here the same way, so the route the model actually
             # picked isn't lost even though it didn't take effect.
             "demoted_routing": pre.demoted_routing,
-            # (#803) A default route also demotes a non-fatal sane=False —
+            # A default route also demotes a non-fatal sane=False —
             # the model's own inferred "not executable" opinion, never a
             # sane_fatal one — to advisory the same way. Logged here so the
-            # opinion isn't lost even though it no longer blocks or parks
+            # opinion isn't lost even though it doesn't block or park
             # the task; `pre.sane` already reads True by the time we get
             # here when this fired, so `sane_reason` alone wouldn't show it.
             "demoted_sanity": pre.demoted_sanity,
@@ -4503,13 +4504,13 @@ class Worker:
             preset_class=pre.preset_class,
             attempt_id=session.attempt_id, turn_id=session.turn_id,
         )
-        # (#851) Board-assignment fields — model/effort/host, plus
+        # Board-assignment fields — model/effort/host, plus
         # assigned_by (bookkeeping only; routing itself already comes from
         # the assignee tag, see assignment.py's module docstring and
         # preflight's `_apply_route_corroboration`, which never
         # second-guesses a tagged route). Set unconditionally: an
         # untagged/non-board task's fields are simply empty, so this is a
-        # no-op write of NULLs for every pre-#851 task shape.
+        # no-op write of NULLs for every pre-task shape.
         assignment = extract_assignment(task.get("fields"))
         self.session_store.set_assignment(
             task_id, host=assignment.host, model=assignment.model, effort=assignment.effort,
@@ -4548,7 +4549,7 @@ class Worker:
                     + dispatch_task["notes"],
                 )
 
-        # Sanity gate (#747). Only a *fatal* sane=False fails the task
+        # Sanity gate. Only a *fatal* sane=False fails the task
         # closed — an empty title, or a title the code itself matched as a
         # deterministically destructive shape (see
         # `preflight._DESTRUCTIVE_TITLE_RE`). A failed or unparseable
@@ -4559,10 +4560,10 @@ class Worker:
         # rule — treating that single cheap-model judgement as authoritative
         # would silently cancel real work, so it's parked below instead,
         # same as an ambiguous task: a wrong inference costs one question,
-        # not the task. As of #803, a non-fatal opinion is parked here only
+        # not the task. A non-fatal opinion is parked here only
         # when no default route is configured (or the setting is invalid) —
-        # `run_preflight` already demoted it to `pre.sane=True` before this
-        # function ever sees it when a valid default route IS configured
+        # `run_preflight` already demoted it to `pre.sane=True` ahead of this
+        # function ever seeing it when a valid default route IS configured
         # (see `_apply_default_route`), so `pre.sane` below already reads
         # True on that path and neither gate fires; `pre.demoted_sanity`
         # carries the opinion into the transcript event above instead.
@@ -4655,7 +4656,7 @@ class Worker:
             self._handle_outcome(session, task, outcome)
             return
 
-        # Remote route (#809, `#cloud` tag): the configured remote
+        # Remote route (`#cloud` tag): the configured remote
         # OpenAI-compatible provider — never the Anthropic API. If it isn't
         # configured, park the task rather than falling through to any other
         # engine; the operator's standing rule is that the Anthropic API is
@@ -4732,13 +4733,13 @@ class Worker:
         # title is the prompt; working_dir is picked from the description so
         # the CLI runs inside the relevant project.
         #
-        # #753: these subprocesses can run for the session's full budget wall
+        # these subprocesses can run for the session's full budget wall
         # (up to 4h) — calling _dispatch_*_session inline here would block
         # this tick thread for that whole span, starving every other tick
         # responsibility (new claims, sleeping-session wakes, managed
         # polling, clarification processing/timeouts) exactly like a spawned
         # CLI child would. Reuse _submit_cli_dispatch — the same pool +
-        # _cli_inflight machinery spawned sessions already use (#299) — so a
+        # _cli_inflight machinery spawned sessions already use — so a
         # top-level #agent task gets the identical off-tick treatment.
         if session.routing in (ROUTE_CLAUDE_CODE, ROUTE_CODEX):
             working_dir = execution.spec.working_dir or resolve_working_directory(title)
@@ -4851,7 +4852,7 @@ class Worker:
         # leaks to the operator with the parent's internal prompt as
         # the "task description" — confusing and operator-irrelevant.
         is_spawned = bool(session.parent_session_id)
-        # Operator root-spawns (#235) are root sessions (no parent) so they DO
+        # Operator root-spawns are root sessions (no parent) so they DO
         # notify the operator, but they have no backing #agent vault task — the
         # vault mutations (complete / swap-tag / set-status) would 404. Gate
         # those on `has_vault_task`; notifications + follow-up still fire.
@@ -4865,8 +4866,8 @@ class Worker:
             # failure — the operator sees `#agent-completed` and assumes work
             # happened. Route these through the failure path instead so the
             # tag becomes `#agent-failed` and the operator can decide whether
-            # to retry. Spawned children keep the old behavior; their parent
-            # consumes their outcome and decides what to surface.
+            # to retry. Spawned children are exempt from this guard; their
+            # parent consumes their outcome and decides what to surface.
             #
             # Cost gate: when the agent spent real money, give the benefit of
             # the doubt even if the transcript looks light — Anthropic's events
@@ -4969,7 +4970,7 @@ class Worker:
         logger.warning("unhandled outcome status %r for %s", outcome.status, session.task_id)
 
     def _escalation_note(self, session: Session) -> str:
-        """One-line flag naming the engine(s) a session delegated work to (#349).
+        """One-line flag naming the engine(s) a session delegated work to.
 
         Empty when the session spawned no children. When it did, the operator
         gets a single completion message (the children stayed silent), so this
@@ -5032,7 +5033,7 @@ class Worker:
                     f"`data/agent_transcripts/{session.session_id}.jsonl` for tool-use detail)"
                 )
         else:
-            # Every completed task now lands a durable note in the vault's
+            # Every completed task lands a durable note in the vault's
             # Agent Output folder — one-off tasks get a new note, recurring
             # (cron-scheduled) tasks append to one shared note per schedule.
             # The agent's system prompts also ask it to create artifacts for
@@ -5051,7 +5052,7 @@ class Worker:
                     )
             elif written is None:
                 # Over-length but vault not configured / write failed —
-                # preserve the old behavior so the operator still gets
+                # truncate so the operator still gets
                 # *something* readable instead of an empty message.
                 result_blurb = final_text[:_INLINE_SUMMARY_MAX_CHARS] + "…"
             else:
@@ -5269,7 +5270,7 @@ class Worker:
             header = f"- [{c.status}] {c.session_id} — {tokens} tokens, ${c.total_dollars:.4f}"
             parts.append(header)
             if c.status in (STATUS_FAILED, STATUS_BUDGET_EXCEEDED):
-                # #433: tell the parent WHY the child died so it can decide
+                # tell the parent WHY the child died so it can decide
                 # retry vs re-spawn vs escalate — status alone can't
                 # distinguish "binary not found" from "tests failed".
                 reason = self._child_failure_reason(c)
@@ -5290,7 +5291,7 @@ class Worker:
         """Pull a failed/budget child's failure reason from its transcript —
         the `child_failed_internal` / `child_budget_exceeded_internal` events
         written by _handle_outcome (local/managed children) and
-        _record_child_failure_reason (CLI failure paths, #433). Latest event
+        _record_child_failure_reason (CLI failure paths). Latest event
         wins; returns "" when absent (transcripts from before the CLI paths
         wrote these)."""
         path = self.transcript_store.dir / f"{child.session_id}.jsonl"
@@ -5305,7 +5306,7 @@ class Worker:
     def _record_child_failure_reason(
         self, session: Session, status: str, reason: str | None
     ) -> None:
-        """#433: persist a child's failure reason for the parent's resume turn —
+        """persist a child's failure reason for the parent's resume turn —
         same child_*_internal vocabulary _handle_outcome writes for local/managed
         children; read back by _child_failure_reason. No-op for non-children."""
         if not session.parent_session_id:
@@ -5331,9 +5332,9 @@ class Worker:
         # `claude_code_completed` / `codex_completed` events. The LATEST
         # event's final_text wins — even when empty — so a reopened child's
         # second run can't re-carry the first run's "[needs clarification] …"
-        # question into the parent's resume turn (#428). All four kinds
+        # question into the parent's resume turn. All four kinds
         # persist a `final_text` key today; the key-presence guard keeps a
-        # legacy event (final_chars only, pre-#349 claude_code / pre-#429
+        # legacy event (final_chars only, pre-claude_code / pre-
         # codex) from clobbering a real value.
         path = self.transcript_store.dir / f"{child.session_id}.jsonl"
         last_text = ""
@@ -5497,7 +5498,7 @@ class Worker:
                 )
             else:
                 # Suffix with a short session id so two same-day tasks with
-                # the same slug don't clobber each other now that every
+                # the same slug don't clobber each other, since every
                 # completion writes a note.
                 slug = _slugify(title) or session.task_id
                 sid = session.session_id[-6:]
@@ -5752,7 +5753,7 @@ def _mark_self_restart_cli(argv: list[str]) -> int:
     self-restart marker, then exit. Invoked by the detached-restart primitive
     (`scripts/server.sh restart-worker-detached`) before it bounces the worker,
     so `resume_pending()` finalizes the named session quietly instead of firing
-    the rollback notice (#401). Kept tiny and import-light so the bash primitive
+    the rollback notice. Kept tiny and import-light so the bash primitive
     can call it without spinning up the full worker."""
     import argparse
     parser = argparse.ArgumentParser(prog="agent_worker --mark-self-restart")
@@ -5775,7 +5776,7 @@ def main() -> None:
     )
     # This worker sends progress/completion updates via Telegram. Without
     # this, httpx's request logger (INFO by default, logs the full request
-    # URL — which embeds the bot token) would leak the token every send (#519).
+    # URL — which embeds the bot token) would leak the token every send.
     configure_telegram_log_redaction()
     # Wire up real Telegram senders in production. Worker() defaults to
     # no-op senders so tests can't accidentally hit a real chat — see

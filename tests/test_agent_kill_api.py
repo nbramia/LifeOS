@@ -1,4 +1,4 @@
-"""API + helper tests for operator kill (issue #134).
+"""API + helper tests for operator kill.
 
 Covers the new POST /api/agents/sessions/{sid}/kill endpoint and the
 shared `teardown_session` helper that agent-initiated kill and operator
@@ -189,7 +189,7 @@ def test_kill_calls_managed_driver_when_present(client, stores, monkeypatch):
 
 @pytest.mark.unit
 def test_operator_kill_signals_local_claude_code_subprocess(client, stores, monkeypatch):
-    """#379: an operator kill of a routing='claude_code' session with a recorded
+    """An operator kill of a routing='claude_code' session with a recorded
     pid must signal the worker-owned subprocess (killpg on the pgid) while
     preserving the cascade, the operator_killed/cascade_killed transcript events,
     and the `{"killed": [...], "failures": [...]}` response shape."""

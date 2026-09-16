@@ -3,7 +3,7 @@
 Clean up orphaned records after people_entities.json recovery.
 
 This script removes or nullifies records that reference person IDs
-that no longer exist in people_entities.json.
+that don't exist in people_entities.json.
 
 Run this after vault_reindex completes to clean up orphaned data.
 

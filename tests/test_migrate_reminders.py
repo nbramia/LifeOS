@@ -1,5 +1,5 @@
 """
-Tests for the reminders.json → Scheduler store migration (#247).
+Tests for the reminders.json → Scheduler store migration.
 """
 import json
 

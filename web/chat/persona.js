@@ -1,4 +1,4 @@
-// Persona picker for /chat (#359).
+// Persona picker for /chat.
 //
 // The user chooses which LifeOS persona to talk to — `primary` or any
 // configured specialized bot. The selection scopes the conversation sidebar
@@ -38,7 +38,7 @@ export async function loadPersonas() {
   // Testability hook only (same pattern as backend.js's STATUS_TIMEOUT_MS):
   // lets a browser test force this function's promise to reject, so it can
   // assert that initBackend()'s single listing still fires even when persona
-  // resolution fails outright (#607) — rather than trusting that every path
+  // resolution fails outright — rather than trusting that every path
   // in this function stays guarded forever.
   if (typeof window !== 'undefined' && window.__LIFEOS_TEST_FORCE_PERSONAS_REJECT__) {
     throw new Error('forced persona-resolution failure (test only)');
@@ -79,15 +79,15 @@ export async function loadPersonas() {
   }
 
   renderPersonaOptions();
-  // Deliberately does NOT call loadConversations() here (#607): config.backend
-  // hasn't been resolved yet at this point (initBackend() runs after this),
+  // Deliberately does NOT call loadConversations() here: config.backend
+  // hasn't been resolved yet at this point (initBackend() runs afterward),
   // so a fetch fired now would always ask for the `lifeos` fallback and could
   // still be in flight — and resolve arbitrarily late — when initBackend()'s
   // own listing lands, racing it for the last write to state.allConversations.
   // config.personaId is only FULLY resolved (validated against the fetched
   // list, above) once this whole async function's promise settles — a caller
   // that only waits for the synchronous assignment at the top of this
-  // function (before this function's first await) would still race the
+  // function (ahead of this function's first await) would still race the
   // validation above. initBackend() awaits this function's promise (passed in
   // as personasReady) before its single listing, precisely to avoid that.
 }
@@ -109,7 +109,7 @@ function renderPersonaOptions() {
   }
   picker.value = config.personaId;
   // If the stored id isn't among the offered options (e.g. discovery failed and
-  // a non-primary persona was previously chosen), fall back to the first option
+  // a non-primary persona was chosen earlier), fall back to the first option
   // and keep config in sync so the picker is never blank.
   if (picker.selectedIndex < 0 && picker.options.length > 0) {
     picker.selectedIndex = 0;
@@ -133,8 +133,8 @@ export function onPersonaChange() {
 // Shows/hides the toolbar badge telling the user an orchestrating persona
 // (e.g. doctor) runs on LifeOS as a background Claude Code session — visible
 // whenever personaOrchestrates() is true, which by construction excludes the
-// agent backend (no persona pass-through there) and, since #642, the hermes
-// backend too (Hermes now drives orchestrating personas itself rather than
+// agent backend (no persona pass-through there) and the hermes
+// backend too (Hermes drives orchestrating personas itself rather than
 // having their turn diverted to LifeOS). Called on persona change and
 // whenever the backend selector changes (backend.js), since
 // personaOrchestrates() depends on both.
@@ -147,19 +147,19 @@ export function updateOrchestratesBadge() {
 // True iff the selected persona advertises the `handoff` capability. Gates the
 // claude_intent handoff on capabilities rather than a hardcoded `primary`
 // check. Until the list loads (or if discovery failed) we fail open ONLY for
-// the default persona — preserving its pre-#359 handoff behavior — and fail
+// the default persona — preserving its default handoff behavior — and fail
 // closed for any explicitly-selected persona whose capabilities we can't yet
 // confirm (a returning non-handoff persona restored from sessionStorage must
 // not trigger a handoff during the /api/personas load window).
 export function personaSupportsHandoff() {
   const { personas, personaId } = config;
-  // Neither the agent nor the hermes backend has handoff. Hermes now carries
+  // Neither the agent nor the hermes backend has handoff. Hermes carries
   // the full persona (preamble, voice rules) to its backend server-side via
-  // the `lifeos_context` envelope (#590), but that backend has no claude_intent
+  // the `lifeos_context` envelope, but that backend has no claude_intent
   // classifier to hand off to — so this stays false regardless of persona.
   // An orchestrating persona on Hermes (personaOrchestrates() below) doesn't
   // change that either: handoff and orchestration are different mechanisms,
-  // and since #642 an orchestrating persona's Hermes turn is driven by Hermes
+  // and an orchestrating persona's Hermes turn is driven by Hermes
   // itself (lifeos_agent_spawn) inside its own ordinary streamed reply, not
   // handed off mid-stream.
   if (config.backend === 'agent' || config.backend === 'hermes') return false;
@@ -170,12 +170,12 @@ export function personaSupportsHandoff() {
 
 // True iff the selected persona spawns a background Claude Code session on
 // the LifeOS backend specifically (e.g. doctor) rather than answering inline.
-// Reads the server's own `orchestrates` flag (#643 — sourced from
+// Reads the server's own `orchestrates` flag (sourced from
 // `settings.persona_orchestrates()`) rather than inferring it from
 // `capabilities`, which look identical for `primary` and an orchestrating bot
-// like `doctor`. Used to decide whether a turn should poll for a
+// like `doctor`. Consulted to decide whether a turn should poll for a
 // `[CLARIFY]`/`[GOAL]` on surfaces (voice) whose stream doesn't expose the
-// `claude_code` routing the text path keys off (#412), and to show the
+// `claude_code` routing the text path keys off, and to show the
 // "Runs on LifeOS" badge.
 //
 // Before `/api/personas` resolves (or if discovery failed), `personas` is
@@ -188,12 +188,9 @@ export function personaOrchestrates() {
   const { personas, personaId } = config;
   // Only the LifeOS backend's own spawn path (chat.py) starts a session this
   // client tracks. The agent backend has no persona pass-through at all (no
-  // persona_id is ever sent, see askStream). Hermes used to be deliberately
-  // NOT excluded here (#596: an orchestrating persona's Hermes turn was
-  // diverted to LifeOS, so it still "orchestrated" from this client's point
-  // of view) — #642 removed that divert, so a Hermes turn is now driven by
-  // Hermes itself (lifeos_agent_spawn) with no LifeOS-linked session for this
-  // client to track, and is excluded here like the agent backend.
+  // persona_id is ever sent, see askStream). Hermes is excluded here too:
+  // a Hermes turn is driven by Hermes itself (lifeos_agent_spawn) with no
+  // LifeOS-linked session for this client to track.
   if (config.backend === 'agent' || config.backend === 'hermes') return false;
   if (!personaId || personaId === DEFAULT_PERSONA_ID) return false;  // primary answers inline
   const p = personas && personas.find(x => x.id === personaId);

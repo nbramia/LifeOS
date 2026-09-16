@@ -1,4 +1,4 @@
-"""Tests for the per-class tool filter helper (#139 §3, partial)."""
+"""Tests for the per-class tool filter helper."""
 from __future__ import annotations
 
 import pytest
@@ -127,7 +127,7 @@ def test_all_classes_constant_matches_handled_classes():
 
 
 # ---------------------------------------------------------------------------
-# Per-class cost estimates (#139 §6 — hardcoded floor pending live probe)
+# Per-class cost estimates
 # ---------------------------------------------------------------------------
 
 def test_estimated_cache_creation_tokens_positive_for_every_class():

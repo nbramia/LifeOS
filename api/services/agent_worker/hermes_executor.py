@@ -1,4 +1,4 @@
-"""Drives one Hermes turn from inside the agent worker (#851).
+"""Drives one Hermes turn from inside the agent worker.
 
 Mirrors the executor surface used by `ClaudeCodeExecutor`/`CodexExecutor`/
 `LocalExecutor` — one `execute(session, task)` call, one `ExecutorOutcome`

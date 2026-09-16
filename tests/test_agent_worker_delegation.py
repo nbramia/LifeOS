@@ -1,4 +1,4 @@
-"""Tests for the shared inter-agent delegation source (#383 Phase 3).
+"""Tests for the shared inter-agent delegation source.
 
 All three worker executors (claude_code, codex, local) build their delegation
 guidance from api.services.agent_worker.delegation, so renaming a lifeos_agent_*

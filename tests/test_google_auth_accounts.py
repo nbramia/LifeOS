@@ -1,8 +1,8 @@
 """
-Tests for google_auth account helpers (issue #330).
+Tests for google_auth account helpers.
 
-Locks in the WORK2-aware behavior of resolve_account / get_configured_accounts
-that was previously dead — shadowed by simpler duplicate definitions. Guards
+Locks in the WORK2-aware behavior of resolve_account / get_configured_accounts,
+which a simpler duplicate definition could shadow into dead code. Guards
 against the duplicates (or a re-simplification) coming back.
 """
 import pytest
@@ -20,8 +20,8 @@ class TestResolveAccount:
         assert resolve_account("work") == GoogleAccount.WORK
 
     def test_work2_is_not_collapsed_to_work(self):
-        # The bug fixed in #330: the shadowing duplicate mapped anything != "personal"
-        # to WORK, losing WORK2.
+        # A shadowing duplicate that maps anything != "personal"
+        # to WORK would lose WORK2.
         assert resolve_account("work2") == GoogleAccount.WORK2
 
     def test_unknown_defaults_to_personal(self):

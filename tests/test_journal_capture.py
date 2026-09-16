@@ -1,10 +1,11 @@
-"""#674: journal capture actually writes the fragment.
+"""Journal capture must actually write the fragment.
 
-The bug these cover: the `journal` persona was told to append the bullet
-itself via `lifeos_vault_write`, a tool the native agentic loop does not have.
-The model emitted the bullet as chat prose, the reply looked like a successful
-capture, and nothing was written — while #659's and #660's tests passed,
-because both mock the chat pipeline and assert it was *called*, never that a
+The risk this guards against: the `journal` persona telling the model
+to append the bullet itself via `lifeos_vault_write`, a tool the native
+agentic loop does not have. The model could emit the bullet as chat
+prose instead — the reply looking like a successful capture while
+nothing was written — a failure mode that mocked pipeline tests miss
+entirely, since they assert the pipeline was *called*, never that a
 fragment lands.
 
 So these deliberately do the opposite: they assert on the **content of the
@@ -284,7 +285,7 @@ class TestReservedJournalDir:
         assert [p.name for p in (vault / "LifeOS" / "Log").iterdir()] == ["Journal"]
 
     def test_vault_write_route_still_rejects_the_reserved_prefix(self, vault, monkeypatch):
-        # Since #769 the reservation only applies with the journal persona
+        # The reservation only applies with the journal persona
         # enabled; enable it so this regression guard still exercises the
         # reserved path (an install running the journal persona, like this
         # one, keeps today's behavior unchanged).
@@ -329,7 +330,7 @@ class TestCaptureThroughChatPipeline:
         assert _today_log(vault).read_text().rstrip().endswith(f"· {_FRAGMENT}")
 
     async def test_capture_does_not_depend_on_the_model(self, vault, journal_persona, monkeypatch):
-        """The actual #674 failure: the model calls nothing and just talks.
+        """The exact failure mode: the model calls nothing and just talks.
         The fragment must still be on disk."""
         import api.services.agent_loop as agent_loop_mod
 
@@ -395,7 +396,7 @@ def ingest_client(tmp_path, monkeypatch, vault, journal_persona, fake_model):
     """`POST /api/journal/ingest` wired to the REAL chat pipeline (via a
     `chat_via_api` that drives `ask_stream` in-process rather than over
     localhost) — so this exercises endpoint → pipeline → file, the chain
-    #660's mocked tests could not see through."""
+    mocked tests could not see through."""
     store = JournalIngestStore(db_path=str(tmp_path / "journal_ingest.db"))
     monkeypatch.setattr(journal_ingest_store, "_store_instance", store)
     journal_ingest._conversations.clear()
@@ -458,9 +459,9 @@ class TestIngestEndToEnd:
     def test_unconfirmed_capture_reports_failure_and_leaves_key_retryable(
         self, ingest_client, vault,
     ):
-        """The #674 compounding failure: a capture that didn't happen used to
-        return `logged` AND burn the dedupe key, so the retry that would have
-        saved the fragment was suppressed forever."""
+        """A capture that fails must not
+        return `logged` AND burn the dedupe key — otherwise the retry that
+        would have saved the fragment is suppressed forever."""
         client, store = ingest_client
         fragment = "synthetic fragment that must survive a failure"
         payload = _payload(text=fragment)
@@ -473,7 +474,7 @@ class TestIngestEndToEnd:
             assert resp.status_code != 200
             assert not (vault / "LifeOS").exists()
 
-        # The key was NOT burned: the genuine retry now lands.
+        # The key was NOT burned: the genuine retry lands.
         resp = client.post("/api/journal/ingest", json=payload, headers=_auth())
         assert resp.status_code == 200, resp.text
         assert resp.json()["status"] == "logged"

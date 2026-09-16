@@ -1,5 +1,5 @@
 """Tests for the Hermes-Telegram reply-thread persona mapping
-(api/services/hermes_persona_thread_store.py, #644 follow-up).
+(api/services/hermes_persona_thread_store.py).
 
 Endpoint-level behavior (resolution order, the register-persona-message
 call) lives in tests/test_hermes_proxy.py; this file covers the store in

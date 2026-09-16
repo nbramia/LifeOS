@@ -1,9 +1,9 @@
-"""#661: every native chat turn used to be recorded as model="local" at
-$0.00 regardless of which backend actually served it -- `run_agent_loop`
-hardcoded `AgentResult(model="local")` at construction and then
-unconditionally zeroed `total_cost_usd` in `_track_usage`, with a comment
-("Local model has no cost") that was true only for the local backend but
-ran for every backend.
+"""Every native chat turn must record the actual model that served it and
+the actual cost -- not the hardcoded `model="local"` at $0.00 that
+`AgentResult(model="local")`'s default and an unconditional zeroing of
+`total_cost_usd` in `_track_usage` would produce regardless of which
+backend served the turn ("Local model has no cost" is true only for the
+local backend, not every backend).
 
 These are unit tests of run_agent_loop's own wiring, exercised the same way
 as tests/test_agent_loop_caching.py and tests/test_agent_loop_incremental_
@@ -117,9 +117,8 @@ async def test_unknown_model_records_unpriced_not_free():
 @pytest.mark.asyncio
 async def test_cost_matches_pricing_cost_for():
     """The recorded cost is exactly what pricing.cost_for computes for the
-    same tokens -- not a made-up figure -- confirming #661's fix routes
-    through the sole live pricing table (#656) rather than reintroducing a
-    second one."""
+    same tokens -- not a made-up figure -- confirming recording routes
+    through the sole live pricing table rather than a second one."""
     from api.services.agent_worker.pricing import cost_for
     result = await _run(_FakeAnthropicClient("claude-sonnet-5", input_tokens=500, output_tokens=100))
     assert result.total_cost_usd == cost_for("claude-sonnet-5", 500, 100, 0, 0)

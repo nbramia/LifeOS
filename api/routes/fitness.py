@@ -1,10 +1,10 @@
 """
 Fitness API routes.
 
-The authenticated Apple Health ingest endpoint (#333) — the on-device
+The authenticated Apple Health ingest endpoint — the on-device
 HealthBridge app POSTs its payload here over Tailscale, and it lands in
 fitness.db via the same ingest core the nightly file importer uses — plus
-`/workouts` (#603), the REST surface behind the `lifeos_workout_manage` MCP
+`/workouts`, the REST surface behind the `lifeos_workout_manage` MCP
 tool so external clients can log/query the fitness bot's own store.
 """
 import hmac
@@ -27,7 +27,7 @@ _MAX_INGEST_ITEMS = 1_000_000
 
 
 class HealthIngestRequest(BaseModel):
-    """Apple Health payload — matches the health.json schema (see #333 / guide)."""
+    """Apple Health payload — matches the health.json schema (see the guide)."""
     workouts: list[dict] = Field(default_factory=list)
     metrics: list[dict] = Field(default_factory=list)
 
@@ -82,7 +82,7 @@ async def health_ingest(request: Request):
 
 
 # ---------------------------------------------------------------------------
-# manage_workouts over REST (#603) — the MCP surface has no in-process agent
+# manage_workouts over REST — the MCP surface has no in-process agent
 # loop to call, so this exposes the same action-dispatch tool over HTTP. It
 # calls the exact `_tool_manage_workouts` dispatcher the native orchestrator
 # uses, so both paths write through the same FitnessStore with no separate

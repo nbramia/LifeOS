@@ -1,18 +1,18 @@
-"""Guard against real personal data in committed test fixtures (#598).
+"""Guard against real personal data in committed test fixtures.
 
-`tests/fixtures/` is committed to a public, open-source repo. #598 found
-that a real, machine-specific `.env` could leak into a test process (via
-`api/main.py`'s old upward-searching `load_dotenv()` -- see
-`tests/test_env_isolation.py`) and get baked into a golden fixture by
-whoever captured it, without the capturing agent necessarily noticing.
-Fixing the leak (this issue) removes the mechanism going forward, but
-doesn't by itself prove a *future* fixture can't be captured carelessly
-against a real `.env` on someone's dev machine and committed with real
-values in it.
+`tests/fixtures/` is committed to a public, open-source repo. A real,
+machine-specific `.env` could leak into a test process (see
+`tests/test_env_isolation.py` for the mechanism an unanchored
+`load_dotenv()` in `api/main.py` would create) and get baked into a
+golden fixture by whoever captured it, without the capturing agent
+necessarily noticing. Anchoring `load_dotenv()` closes that specific
+mechanism, but doesn't by itself prove a *future* fixture can't be
+captured carelessly against a real `.env` on someone's dev machine and
+committed with real values in it.
 
 This test is that proof: on a machine where a real `.env` is actually
 reachable (any dev machine, including the one this was written on), it
-reads the real values of the identity-sensitive settings audited in #598
+reads the real values of the identity-sensitive settings audited
 directly from that file -- without ever loading them into `os.environ` --
 and fails if any committed fixture file quotes one of them verbatim. On a
 fresh clone or CI, where no such `.env` exists, there is nothing to compare
@@ -29,7 +29,7 @@ pytestmark = pytest.mark.unit
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 
-# Identity-sensitive settings keys found in #598's audit of module-level
+# Identity-sensitive settings keys audited from module-level
 # constants computed from `settings` at import time -- see config/settings.py
 # for the corresponding fields.
 #
@@ -58,7 +58,7 @@ _SENSITIVE_KEYS = (
 
 def _find_real_dotenv_upward(start: Path) -> Path | None:
     """Walk upward from `start` looking for a `.env` -- deliberately the
-    same search #598 found unsafe for api/main.py to perform on real
+    same search that would be unsafe for api/main.py to perform on real
     process environment, reproduced here only for read-only comparison
     (dotenv_values never touches os.environ). Returns None when nothing is
     found (fresh clone, CI): there is then nothing to check fixtures

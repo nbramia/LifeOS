@@ -69,7 +69,7 @@ see Step 3. See [launchd-setup.md](launchd-setup.md) for why
 macOS-as-primary-server was superseded by the Linux migration and what's
 preserved from it.
 
-**The local LLM is packaged for macOS too (#830).** Setting
+**The local LLM is packaged for macOS too.** Setting
 `LIFEOS_LOCAL_LLM_AUTOSTART=true` in `.env` before running
 `./scripts/setup-launchd.sh` installs `com.lifeos.llm`, running
 `llama-server` against the same `-hf <repo>` / `-m <gguf>` model-source
@@ -188,7 +188,7 @@ LIFEOS_USER_NAME=YourFirstName
 
 The full env-var reference (defaults, types, when-to-change notes for every `LIFEOS_*` and third-party variable) lives in [configuration.md](configuration.md).
 
-> **Note:** `OLLAMA_*` variables are legacy and ignored — Ollama is no longer part of LifeOS. Do not install it.
+> **Note:** `OLLAMA_*` variables are legacy and ignored — Ollama is not part of LifeOS. Do not install it.
 
 ---
 

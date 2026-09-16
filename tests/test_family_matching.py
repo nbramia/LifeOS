@@ -1,5 +1,5 @@
 """
-Tests for family-name matching (#765): compound surnames, whitespace/case
+Tests for family-name matching: compound surnames, whitespace/case
 normalization, and warning on configured names that match zero people.
 
 Family matching has two parallel implementations that must stay in sync:
@@ -48,8 +48,8 @@ class TestIsFamilyMemberUtils:
         monkeypatch.setattr(utils_mod, "FAMILY_LAST_NAMES", {"van buren"})
         monkeypatch.setattr(utils_mod, "FAMILY_EXACT_NAMES", set())
 
-        # Old behavior only ever checked the last whitespace-split token
-        # ("buren"), so neither of these could ever match before this fix.
+        # A check that only looked at the last whitespace-split token
+        # ("buren") would miss both of these.
         assert utils_mod.is_family_member("Alice Van Buren") is True
         assert utils_mod.is_family_member("Alice VanBuren") is True
 

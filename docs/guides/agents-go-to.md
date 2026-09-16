@@ -78,7 +78,7 @@ Open two wezterm panes in the same project directory, run `claude` in each, then
 If the toast says "Couldn't locate pane" — meaning the session isn't running where we can reach it, wezterm itself can't be queried, or no cached mapping exists — the most likely causes are:
 
 - The SessionStart hook isn't installed yet for sessions started *before* the hook landed. Restart the `claude` invocation; the hook will fire and bind on the new session.
-- WezTerm has been restarted since the session began *and* `claude` is no longer running. The Go To cache invalidates automatically when wezterm's pid changes, but the probe still needs a live `claude` process holding the session's transcript file open. Restart `claude` so the SessionStart hook re-binds, or click **Resume** to open a fresh pane.
+- WezTerm has been restarted since the session began *and* `claude` is not currently running. The Go To cache invalidates automatically when wezterm's pid changes, but the probe still needs a live `claude` process holding the session's transcript file open. Restart `claude` so the SessionStart hook re-binds, or click **Resume** to open a fresh pane.
 - WezTerm is unreachable (`wezterm cli list` errors, the gui-sock socket is gone, or the binary isn't on PATH).
 - `lsof` isn't on PATH (the probe fallback uses it).
 - The session is in a non-wezterm terminal — Go To only works for wezterm.
@@ -107,7 +107,7 @@ The installer prints, but does not create, the two things registration needs:
 
    `chmod 600` this file — it holds the bearer token in plaintext, and under a default `umask 022` a newly created file is world-readable to every other local account on the machine.
 
-   **On the API host itself**, keep `LIFEOS_API_URL=http://localhost:8000` (the default) rather than pointing it at the Tailscale hostname. The event endpoint only mirrors `pane_id`/`wezterm_pid` into the local WezTerm pane store — the table Go To reads — for requests that both name this host **and** arrive from loopback; posting to the Tailscale address instead of localhost means the request no longer looks like loopback to the API, so Go To stops working for sessions started on this machine.
+   **On the API host itself**, keep `LIFEOS_API_URL=http://localhost:8000` (the default) rather than pointing it at the Tailscale hostname. The event endpoint only mirrors `pane_id`/`wezterm_pid` into the local WezTerm pane store — the table Go To reads — for requests that both name this host **and** arrive from loopback; posting to the Tailscale address instead of localhost means the request stops looking like loopback to the API, so Go To stops working for sessions started on this machine.
 
 Until that file (or the equivalent environment variables) exists, `lifeos-agent-hook.sh` exits silently without posting anything — a machine you haven't set up yet just doesn't show up, it doesn't error.
 

@@ -1,4 +1,4 @@
-"""Browser test for the /agents Kanban board (#850).
+"""Browser test for the /agents Kanban board.
 
 Serves `web/` itself from an ephemeral port (like
 `test_voice_mic_block_ui_browser.py`) rather than pointing at a running API,
@@ -10,7 +10,7 @@ No `requires_server` marker, so this runs at pre-push
 Covers: drag between lanes (asserts the stubbed PUT lane body; asserts the
 card does NOT move and a toast shows when the stub returns 500), drawer
 notes edit + blur (asserts the stubbed PUT /api/tasks body carries `notes`),
-filters including assignee=me and lane=human_queue combined, and (#859) the
+filters including assignee=me and lane=human_queue combined, and the
 assignment pickers mounted in the drawer — render from the model catalog,
 one save per picker, the Open action's success and 409 paths, and that
 scheduled cards render no pickers.
@@ -33,7 +33,7 @@ pytestmark = [pytest.mark.browser, pytest.mark.slow]
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
-# Obviously synthetic — same shape GET /api/agents/models returns (#851).
+# Obviously synthetic — same shape GET /api/agents/models returns.
 _MODEL_CATALOG = {
     "engines": {
         "claude": [
@@ -59,8 +59,7 @@ _HOST_CATALOG = {
 
 # Assignee-name tags board.js's own drawer strips/re-adds on an assignee
 # change (web/agents/board.js ASSIGNEES) — used by the lane stub below to
-# mirror plan_lane_move's tag bookkeeping on a drawer-driven assign (#859
-# review round 2 finding 1).
+# mirror plan_lane_move's tag bookkeeping on a drawer-driven assign.
 _ASSIGNEE_TAGS = {"me", "claude", "codex", "hermes", "local", "cloud"}
 
 
@@ -112,7 +111,7 @@ def _board_fixture():
                     "session": None, "pending_question": None,
                 },
                 {
-                    # #859: assignee claude/codex (unlike t2's "me") — used
+                    # Assignee claude/codex (unlike t2's "me") — used
                     # by the assignment-picker and Open-action tests.
                     "kind": "task", "id": "t7", "title": "Deploy the release candidate",
                     "notes": "", "status": "todo", "tags": ["claude"], "assignee": "claude",
@@ -361,10 +360,10 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
     *block* here (`stream_gate.wait()`) — or fulfilling from a separate
     thread to work around that — either freezes every other Playwright call
     the test makes or raises `greenlet.error: Cannot switch to a different
-    thread` from `route.fulfill()`. Polling `is_set()` avoids both. Used to
-    prove a frame provably arrives only after a specific point in the test
+    thread` from `route.fulfill()`. Polling `is_set()` avoids both, proving
+    a frame arrives only after a specific point in the test
     (e.g. once a drawer is open and mid-edit) instead of racing page load on
-    a fixed timer (#850 round-2 finding 5). `board_stream_frames` (and
+    a fixed timer. `board_stream_frames` (and
     `board_state`, if the test wants the two to stay consistent) may be
     mutated by the caller any time before calling `stream_gate.set()` — the
     handler reads them fresh on the connection that delivers them.
@@ -477,14 +476,12 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
                 # `lane_response`, when given, lets a test simulate the
                 # server landing a card somewhere other than the requested
                 # lane (e.g. a human_queue card that stays put on an
-                # assign) — one popped entry per successful PUT (#850
-                # round-3 finding 2a).
+                # assign) — one popped entry per successful PUT.
                 landed = lane_response.pop(0) if lane_response else body.get("lane")
                 _move_card_in_state(board_state, lane_match.group(1), landed)
                 # Mirror plan_lane_move's assignee bookkeeping: the drawer's
-                # assignee select PUTs `assignee` alongside `lane` (#859
-                # review round 2 finding 1) — a drag move omits the key
-                # entirely, so key on `"assignee" in body`, not truthiness,
+                # assignee select PUTs `assignee` alongside `lane` — a drag
+                # move omits the key entirely, so key on `"assignee" in body`, not truthiness,
                 # and also clear on an explicit move to unassigned.
                 if "assignee" in body or body.get("lane") == "unassigned":
                     assignee = body.get("assignee")
@@ -698,7 +695,7 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
                 return
             # Mutate the fixture card the way a real PUT would, so a test
             # that reopens the drawer to check a saved value doesn't see
-            # the stale fixture (mirrors _move_card_in_state; #859 trap 3).
+            # the stale fixture (mirrors _move_card_in_state).
             card_ref = None
             for cards in board_state["lanes"].values():
                 for card in cards:
@@ -1556,7 +1553,7 @@ class TestDrawerTagsEdit:
         expect(page.locator(".drawer-tag-chip")).to_have_count(0)
 
     def test_invalid_and_assignee_tokens_are_dropped(self, page: Page, agents_base_url):
-        """Round-1 finding 8: the Tags field must not let a vault-comment
+        """The Tags field must not let a vault-comment
         injection or a duplicate assignee token reach the task store. t2 is
         assigned #me — typing an assignee token, a plain word, and an
         HTML-comment-shaped token must send only the plain word in the
@@ -1682,7 +1679,7 @@ class TestDrawerTagsEdit:
 
 class TestDrawerAssigneeRevert:
     def test_failed_assignee_change_snaps_select_back(self, page: Page, agents_base_url):
-        """Round-1 finding 9: a rejected assignee change (the lane PUT 409s)
+        """A rejected assignee change (the lane PUT 409s)
         must not leave the unsaved value showing in the select."""
         lane_calls = []
         _open_board(page, agents_base_url, lane_calls=lane_calls, lane_status_code=[500])
@@ -1753,12 +1750,10 @@ class TestDrawerContextRemoved:
 
 class TestScheduledCardDrawer:
     def test_editing_title_message_and_enabled_all_save_through_scheduler_api(self, page: Page, agents_base_url):
-        """Round-1 finding 4: the scheduled card's title, message, and
-        enabled checkbox save through PUT /api/scheduler/{id}, not a new
-        board write path. Round-2 finding 9: the docstring claimed all
-        three but only title was ever exercised — the message textarea's
-        blur handler and the enabled checkbox's change handler
-        (web/agents/board.js) were untested."""
+        """The scheduled card's title, message, and
+        enabled checkbox all save through PUT /api/scheduler/{id}, not a
+        board write path — including the message textarea's blur handler
+        and the enabled checkbox's change handler (web/agents/board.js)."""
         schedule_puts = []
         _open_board(page, agents_base_url, schedule_puts=schedule_puts)
         page.locator('[data-card-id="s1"]').click()
@@ -1774,7 +1769,7 @@ class TestScheduledCardDrawer:
         # Blur message straight into the checkbox (never back through title —
         # title's own blur handler compares against the value captured when
         # its DOM node was created, and staying focused inside the drawer
-        # deliberately skips re-rendering it (#850 round-2 finding 4), so a
+        # deliberately skips re-rendering it, so a
         # second title blur here would re-save the same unchanged value).
         message.fill("Good evening")
         expect(enabled).to_be_checked()
@@ -1790,17 +1785,16 @@ class TestScheduledCardDrawer:
 
 
 class TestLiveUpdates:
-    """Round-1 finding 12(b): the SSE live-update path itself was never
-    driven by a browser test — the stub only ever sent the empty ": ok"
+    """The SSE live-update path must be
+    driven by a browser test, not just the stub's empty ": ok"
     comment. These deliver a real "event: board" frame on a reconnect."""
 
     def test_board_frame_moves_a_card_with_no_navigation(self, page: Page, agents_base_url):
-        """#862: withhold the frame behind `stream_gate` (see the sibling
+        """Withhold the frame behind `stream_gate` (see the sibling
         drawer tests below) so the "still in unassigned" assertion can't
         lose a race with the stub's `retry: 20` reconnect on a slow first
-        paint — previously flaky (measured 6/30 and 3/30 in #860's
-        verification) because that frame could already have landed by the
-        time the first assertion polled."""
+        paint, since that frame could otherwise land before the first
+        assertion polls."""
         stream_gate = threading.Event()
         moved_board = copy.deepcopy(_board_fixture())
         _move_card_in_state(moved_board, "t1", "in_progress")
@@ -1849,20 +1843,13 @@ class TestLiveUpdates:
         expect(page.locator("#board-drawer-backdrop")).to_be_visible()
 
     def test_drawer_notes_survive_a_board_frame_while_typing_and_flushes_on_blur(self, page: Page, agents_base_url):
-        """Round-2 finding 5 (reworks round-1 finding 12(b)'s test, which was
-        a false positive): the prior version delivered its frame on the
-        stub's *second* SSE connection, which — thanks to the `retry: 20`
-        reconnect — landed ~20ms after page load, before the drawer was
-        even opened. The guarded path (updateOpenDrawer's `!focused` check,
-        #850 round-2 finding 4) was therefore never entered; the test
-        passed even with that check deleted.
-
-        This version withholds every `/board/stream` response behind a
+        """This test withholds every `/board/stream` response behind a
         Python-side `threading.Event` the route handler polls non-blockingly
         (`stream_gate` — see `_stub_routes`'s docstring for why an actual
         block would deadlock Playwright's driver thread), so the frame
         provably cannot arrive until the test releases it — after the
-        drawer is open and mid-edit. It also
+        drawer is open and mid-edit, genuinely exercising
+        updateOpenDrawer's `!focused` guard. It also
         changes a field on a DIFFERENT card (t1) so there's an unambiguous,
         drawer-independent signal that the frame was actually applied."""
         stream_gate = threading.Event()
@@ -1882,7 +1869,7 @@ class TestLiveUpdates:
 
         # Mutate the board (a tag on a DIFFERENT card, t1; a title change on
         # the OPEN card, t2) and only now let the withheld stream connection
-        # respond — proving the frame arrives after this point, not before.
+        # respond — proving the frame arrives only after release, not before.
         for card in board_state["lanes"]["unassigned"]:
             if card["id"] == "t1":
                 card["tags"] = ["urgent"]
@@ -1910,7 +1897,7 @@ class TestLiveUpdates:
         expect(title).to_have_value("Ship the release (renamed in the vault)")
 
     def test_deferred_frame_flushes_when_focus_leaves_drawer_without_an_edit(self, page: Page, agents_base_url):
-        """#850 round-3 finding 1: the drawerEl `focusout` listener itself
+        """The drawerEl `focusout` listener itself
         must flush a deferred render once focus actually leaves the drawer
         (blur() to <body>), independent of any field edit. Clicking into
         notes WITHOUT typing means the notes blur handler's own
@@ -1918,9 +1905,7 @@ class TestLiveUpdates:
         fetchBoard() — the ONLY path left that can flush the deferred
         frame is the focusout listener. This isolates that listener from
         the sibling test above, which types text and so is flushed by the
-        notes PUT's own fetchBoard(), never by the listener (verified by
-        temporarily deleting the listener: this test fails, the sibling
-        test above still passes)."""
+        notes PUT's own fetchBoard(), never by the listener."""
         stream_gate = threading.Event()
         board_state = _board_fixture()
         board_stream_frames: list[str] = []
@@ -1957,7 +1942,7 @@ class TestLiveUpdates:
         expect(title).to_have_value("Ship the release (renamed in the vault)")
 
     def test_action_button_click_survives_a_deferred_frame(self, page: Page, agents_base_url):
-        """#850 round-3 finding 1: without a `relatedTarget` guard on the
+        """Without a `relatedTarget` guard on the
         focusout listener, mousedown on a drawer action button fires
         focusout while `document.activeElement` is briefly <body> (focus
         hasn't landed on the button yet). If a deferred frame is pending at
@@ -1997,7 +1982,7 @@ class TestLiveUpdates:
         expect(page.locator("#answer-title")).to_be_visible(timeout=3000)
 
     def test_lane_mismatch_toast_shows_landed_lane(self, page: Page, agents_base_url):
-        """#850 round-2 finding 2b, untested until now: when the server
+        """When the server
         lands a card in a different lane than requested (e.g. a
         human_queue card that stays put on an assign attempt), the client
         must toast the actual landed lane instead of leaving the operator
@@ -2013,7 +1998,7 @@ class TestLiveUpdates:
         expect(page.locator('.board-lane[data-lane="human_queue"] [data-card-id="t4"]')).to_be_visible()
 
     def test_stale_answer_button_cleared_when_pending_question_resolves(self, page: Page, agents_base_url):
-        """#850 round-2 finding 3, untested until now: when a card's
+        """When a card's
         pending_question is cleared elsewhere (the agent gets an answer
         via another channel), the open drawer must swap out the stale
         Answer button rather than leaving it behind for a second click
@@ -2040,13 +2025,13 @@ class TestLiveUpdates:
         expect(page.get_by_role("button", name="Mark Done")).to_be_visible()
 
     def test_kill_button_cleared_when_linked_session_reaches_terminal_status(self, page: Page, agents_base_url):
-        """#850 round-2 finding 3's other half (round-4 finding 1): when the
+        """When the
         card's linked session reaches a terminal status elsewhere (e.g. the
         CLI process exits on its own), the open drawer must drop the stale
         Kill button rather than leaving it behind for a click that would
         404. Every card in _board_fixture() has session: None, so this half
         of updateOpenDrawer's `prevSessionStatus !== freshSessionStatus`
-        clause (web/agents/board.js) was never exercised by any test."""
+        clause (web/agents/board.js) needs its own dedicated coverage here."""
         stream_gate = threading.Event()
         board_state = copy.deepcopy(_board_fixture())
         board_stream_frames: list[str] = []
@@ -2435,13 +2420,12 @@ class TestHostAssignmentChipAndFilter:
 
 
 class TestTabSwitching:
-    """#850 verify-1 findings 1 and 2: `#board-view { display: flex }`
+    """`#board-view { display: flex }`
     (specificity 1-0-0) and `.chips { display: flex }` (0-1-0) each beat
-    the generic `[hidden]` rule they were relying on, so setting
-    `.hidden = true` on either element never actually hid it. Assert on
+    the generic `[hidden]` rule they rely on, so setting
+    `.hidden = true` on either element never actually hides it. Assert on
     COMPUTED style, not element reachability — Playwright's own visibility
-    helpers auto-scroll to an element, which hid this bug from every prior
-    test."""
+    helpers auto-scroll to an element, which can mask this bug entirely."""
 
     def _computed_display(self, page: Page, selector: str) -> str:
         return page.evaluate(
@@ -2465,13 +2449,12 @@ class TestTabSwitching:
 
 
 class TestDragThenClick:
-    """#850 verify-1 finding 3: `suppressNextClick` was cleared only inside
-    the card's own click handler, but a drop's re-render replaces every
-    card node and the drag's trailing click often lands on a different
+    """`suppressNextClick` must be cleared even when the
+    card's own click handler never runs: a drop's re-render replaces every
+    card node, and the drag's trailing click often lands on a different
     element (the drop target lane), so it never reaches that handler — the
     flag then lingers and swallows the operator's NEXT genuine click on the
-    same card id. Reproduced for both the success path and a rejected
-    (409) move, matching what the verify agent observed live."""
+    same card id. Covers both the success path and a rejected (409) move."""
 
     def test_click_after_successful_drag_opens_drawer(self, page: Page, agents_base_url):
         lane_calls = []
@@ -2550,7 +2533,7 @@ def _hold_task_field_puts(page: Page, task_puts: list, board_state: dict):
 
 
 class TestAssignmentPickers:
-    """#859: web/agents/assignment.js's model/effort/host pickers mounted
+    """web/agents/assignment.js's model/effort/host pickers mounted
     into the task drawer. t7 (assignee claude, lane Assigned) is the fixture
     card for these — t2's assignee "me" can't drive the module's own engine
     select (it only knows claude/codex/local/hermes)."""
@@ -2584,7 +2567,7 @@ class TestAssignmentPickers:
         expect(assignment.locator('[data-row="host"]')).to_be_hidden()
 
     def test_assignee_change_with_focus_held_remounts_pickers_and_open(self, page: Page, agents_base_url):
-        """#859 review round 1 finding 1: a native <select> keeps focus
+        """A native <select> keeps focus
         after firing `change`, so `updateOpenDrawer`'s `!focused` check
         would otherwise skip the rebuild and leave the pickers/Open button
         hidden until focus later left the drawer. board.js's assignee
@@ -5838,7 +5821,7 @@ class TestDeleteCard:
         assert task_deletes == []
         assert call_log == []
 
-        # Second confirm click: the note now promises the kill, so it happens.
+        # Second confirm click: the note already promises the kill, so it happens.
         page.locator("#delete-confirm").click()
         expect(page.locator(".toast")).to_contain_text("Deleted.", timeout=5000)
         assert kill_calls == ["s-t24-live"]
@@ -6928,7 +6911,7 @@ class TestStaleRefreshGuard:
     def test_a_failed_refresh_does_not_repaint_the_drawer_from_stale_data(
         self, page: Page, agents_base_url,
     ):
-        """The issue's own repro: hold an effort save, change the assignee,
+        """Hold an effort save, change the assignee,
         let the fields PUT commit, and fail the follow-up board GETs. The
         deferred rebuild must not paint the pre-save snapshot over the
         committed value, and must leave the drawer's snapshot unadvanced so a

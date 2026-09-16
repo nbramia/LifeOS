@@ -7,13 +7,12 @@ Uses a separate test collection to avoid polluting production data.
 NOTE: Imports are deferred to avoid loading heavy dependencies (ChromaDB,
 sentence-transformers) during pytest collection, which would slow down unit tests.
 """
+from datetime import datetime
+
 import pytest
 
 # These tests require ChromaDB server (slow)
 pytestmark = pytest.mark.slow
-
-# Standard library imports are fine at module level (lightweight)
-from datetime import datetime
 
 
 class TestVectorStore:
@@ -65,7 +64,7 @@ class TestVectorStore:
 
         vector_store.add_document(chunks, metadata)
 
-        # Verify chunks were added
+        # Verify chunks are present
         count = vector_store.get_document_count()
         assert count == 2
 

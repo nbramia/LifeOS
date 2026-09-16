@@ -58,7 +58,7 @@ A refused drag shows a toast with the reason instead of moving the card; the boa
 
 ### Assignee
 
-Assignee is a single tag, one of `#me`, `#claude`, `#codex`, `#hermes`, `#local`, `#cloud`. Dropping a card into Assigned sets that tag and clears any other assignee tag; dropping into Unassigned clears it. An engine assignee is the worker handoff, so a separate `#agent` tag is not required. The drawer's **Open** action can still start a CLI session immediately on an Assigned `#claude`/`#codex` card, and the worker reads the card's model/effort/host fields when it claims it (see [Card assignment](../technical/agent-worker.md#card-assignment-851)).
+Assignee is a single tag, one of `#me`, `#claude`, `#codex`, `#hermes`, `#local`, `#cloud`. Dropping a card into Assigned sets that tag and clears any other assignee tag; dropping into Unassigned clears it. An engine assignee is the worker handoff, so a separate `#agent` tag is not required. The drawer's **Open** action can still start a CLI session immediately on an Assigned `#claude`/`#codex` card, and the worker reads the card's model/effort/host fields when it claims it (see [Card assignment](../technical/agent-worker.md#card-assignment)).
 
 The bottom of the Board tab keeps a touch-sized assignee tray with one control per supported assignee. The controls share two thirds of the tray's width on desktop. On a phone, every assignee and Done share one non-scrolling row of equal-width controls; all labels use a smaller type size, and any that don't fit end in an ellipsis, while their full names remain available as accessible labels and tooltips. The tray's own label and drop-status line share a fixed-height row above the controls so neither ever changes the tray's height mid-drag. Assignment works in either drag direction — a control dragged onto an eligible task card, or a card dragged onto a control — and both apply the same assignment write and policy checks as the drawer; selecting a control and then activating a card is the accessible click/tap alternative. Every one of those paths clears any armed selection, so a control can never stay armed after an assignment and silently claim the next card. A successful assignment confirms with a toast carrying an **Undo** action that restores the card's previous lane and assignee. Lane drags and **Mark Done** — a drop onto Done under the hood — confirm the same way, and every one of these Undos restores the card's exact prior status and tags, not just the lane it was in: a card whose move stripped or added a tag (dragging a `#human` card to Done, for instance, drops that tag) gets it back exactly, and a card the move left in a different status is restored to that status rather than to a lane-derived one. Two moves keep their own dedicated restore instead: accepting a Review card (Done) is undone by reverting the acceptance rather than writing a status, and a card that was snoozed before the drag has its snooze re-applied once the rest of the restore completes. **Cancel** tears down the card's session subtree, so its toast says the action can't be undone rather than offering a link that would only restore a status over a stopped agent. A card the server lands in a lane other than the one requested gets only the toast naming where it really went — never a second one claiming the requested move. Refused targets expose the server-provided reason and do not write. When the Done lane is hidden, the tray also keeps a compact Done target available for permitted lane moves; dropping a Review card there uses the same acceptance transition as **Accept**.
 
@@ -218,7 +218,7 @@ The Graph tab unions three ingest paths into one rendered surface:
 
 All three sources are normalized to the same shape before rendering, so filters, chips, and the side panel work identically on each kind of session. Disable an ingest path with `LIFEOS_CLAUDE_CODE_VIZ_ENABLED=false` or `LIFEOS_CODEX_VIZ_ENABLED=false` if you only want a subset.
 
-Every session, from every source, now carries a `host` field — the machine it's running on. LifeOS agent worker sessions and locally-scanned CLI transcripts always report the machine hosting the API; a session registered from elsewhere (see below) reports its own hostname.
+Every session, from every source, carries a `host` field — the machine it's running on. LifeOS agent worker sessions and locally-scanned CLI transcripts always report the machine hosting the API; a session registered from elsewhere (see below) reports its own hostname.
 
 ### Cross-machine CLI session registration
 
@@ -234,7 +234,7 @@ This is opt-in: the endpoint is disabled (503) until an operator sets `LIFEOS_AG
 Registration alone gives a remote session status and a prompt preview, but
 not the rest — token counts, dollar cost, tool-call counts, and the
 transcript feed only exist for a jsonl this API host can read off its own
-disk. For every host in the [operator's host registry](../../guides/agent-worker-setup.md#card-assignment-running-a-card-on-another-machine-851),
+disk. For every host in the [operator's host registry](../../guides/agent-worker-setup.md#card-assignment-running-a-card-on-another-machine),
 a background loop periodically pulls that host's Claude Code and Codex
 transcript files onto this box over ssh (read-only, incremental — see
 [technical/agent-viz.md](../technical/agent-viz.md#remote-transcript-mirror)
@@ -258,12 +258,12 @@ A node's stroke colour is its status. The set is slightly different per source �
 | **running** | Currently executing tool calls or LLM turns. | A live `claude` / `codex` process is running with this jsonl's cwd, **or** the file was modified in the last 10 minutes. The first is authoritative; the second is inferred. |
 | **claimed** | Worker has picked up the task but hasn't fired the executor yet (preflight is in flight). | n/a |
 | **yielded** | Paused waiting for spawned children to finish. | n/a |
-| **idle** | n/a | Registered via the session hook (#849): open and waiting for input, after a `session_start` or `stop` event. Live, not finished. |
+| **idle** | n/a | Registered via the session hook: open and waiting for input, after a `session_start` or `stop` event. Live, not finished. |
 | **inactive** | n/a | Modified within 24h but no live process — typically you closed the terminal mid-session. Resumable. |
 | **blocked** | Waiting on a Telegram clarification from you. | n/a |
 | **completed** | Task ran to completion successfully. | jsonl is >24h old, no error in the last event. |
 | **failed** | Executor crashed, preflight rejected, or runtime error. | Last event in the jsonl was an error/tool failure (and >24h old). |
-| **ended** | n/a | Registered via the session hook (#849): a `session_end` event was received — finished. Hidden by default like completed/failed; Resume available. |
+| **ended** | n/a | Registered via the session hook: a `session_end` event was received — finished. Hidden by default like completed/failed; Resume available. |
 | **budget_exceeded** | Token / wall / dollar cap breached and the session was killed externally. | n/a |
 
 A small `(inferred)` hint appears next to the status on CLI sessions whenever the status came from mtime rather than from a confirmed live process — useful to know when reading "running" on a session you don't remember starting.
@@ -362,7 +362,7 @@ If a cached pane has gone stale (typical: user closed the tab), the activate-pan
 
 Resume + Go To are **off by default** because spawning GUI terminals from a systemd service depends on the operator's desktop environment. Enable with `LIFEOS_CC_RESUME_ENABLED=true` for Claude Code sessions and `LIFEOS_CODEX_RESUME_ENABLED=true` for Codex; each flag also gates Go To for its respective source. Customize launchers via `LIFEOS_CC_RESUME_CMD` / `LIFEOS_CODEX_RESUME_CMD` if you don't use WezTerm — substitutions `{cwd}`, `{cwd_url}`, `{session_id}`, `{session_id_url}`, and `{inner_command}` are available. The probe-based Go To is WezTerm-specific (it reads `wezterm cli list`'s `tty_name`); non-WezTerm launchers can still use Resume but Go To will respond 404.
 
-A session registered from another host (see "Cross-machine CLI session registration" above) resumes and focuses over ssh when that host is one of the operator's registered hosts (see [Card assignment](../technical/agent-worker.md#card-assignment-851)) — the same launcher runs remotely, so Resume and Go To work wherever the session actually lives. Only a host the operator hasn't registered still 409s: the error names that host, so the operator knows to go there instead of getting a silent no-op or a misleading 404.
+A session registered from another host (see "Cross-machine CLI session registration" above) resumes and focuses over ssh when that host is one of the operator's registered hosts (see [Card assignment](../technical/agent-worker.md#card-assignment)) — the same launcher runs remotely, so Resume and Go To work wherever the session actually lives. Only a host the operator hasn't registered still 409s: the error names that host, so the operator knows to go there instead of getting a silent no-op or a misleading 404.
 
 ### Resume here
 

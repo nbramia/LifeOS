@@ -52,7 +52,7 @@ class TestCodeIntent:
         "tell me about server.py",
         "why does the test fail",
         "describe the architecture",
-        # Non-code phrases that previously over-matched code-action verbs
+        # Non-code phrases that can look like code-action verbs
         "restart the dishwasher",
         "restart my conversation",
         "restart the workout",
@@ -158,7 +158,7 @@ class TestEverythingElseFallsThrough:
 
 
 class TestNoLLMCallOnHotPath:
-    """The classifier must not call an LLM — that's the whole point of this change."""
+    """The classifier must not call an LLM — that's the whole point of this path."""
 
     @pytest.mark.asyncio
     async def test_classify_action_intent_does_not_call_synthesizer(self, monkeypatch):

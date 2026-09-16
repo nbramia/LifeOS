@@ -1,8 +1,8 @@
 """Worker dispatch wiring for routing='codex' sessions.
 
-Verifies the two behaviors issue #295 hardened on the Codex completion path:
+Verifies two behaviors on the Codex completion path:
 1. The final agent message is sent to Telegram exactly once (no duplicate) via
-   the id-capturing sender — the executor no longer streams it separately.
+   the id-capturing sender — the executor must not stream it separately.
 2. That single completion message is registered as a ``kind='followup'``
    anchor so a threaded Telegram reply resumes the session (parity with
    ``#claude``).
@@ -99,7 +99,7 @@ def _make_worker(tmp_path: Path, codex_executor, *, plain_sends, withid_sends):
 def test_codex_completion_sends_final_once_and_registers_anchor(tmp_path: Path):
     plain_sends: list[str] = []
     withid_sends: list[str] = []
-    # Long enough and non-fragment-shaped to earn completion (#760) — codex
+    # Long enough and non-fragment-shaped to earn completion — codex
     # has no [NOTIFY] convention, so this test's final text must itself read
     # as a finished summary rather than exercise the earned-completion gate.
     final_text = "Done: found 3 events on the calendar for today."
@@ -153,9 +153,10 @@ def test_codex_completion_empty_final_registers_no_anchor(tmp_path: Path):
 
 def test_codex_child_completion_stays_silent_to_operator(tmp_path: Path):
     """A spawned codex child (parent set) must not stream its completion to
-    the operator nor register an operator-replyable followup anchor (#429 —
-    the #349 gate the codex path never got). Its output reaches the parent
-    via the codex_completed transcript event / _child_final_text instead."""
+    the operator nor register an operator-replyable followup anchor — the
+    codex path has no equivalent operator-facing gate. Its output reaches
+    the parent via the codex_completed transcript event / _child_final_text
+    instead."""
     plain_sends: list[str] = []
     withid_sends: list[str] = []
     stub = _StubCodexExecutor(
@@ -185,8 +186,8 @@ def test_codex_child_completion_stays_silent_to_operator(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Crash-before-init re-execute guard + terminal-status persistence (#411,
-# mirroring #400/#408 for the claude_code path)
+# Crash-before-init re-execute guard + terminal-status persistence
+# (mirrors the claude_code path)
 # ---------------------------------------------------------------------------
 
 
@@ -202,7 +203,7 @@ class _ResumableStubCodexExecutor(_StubCodexExecutor):
 def test_codex_resume_delivers_all_pending_messages(tmp_path: Path):
     """A codex resume dispatch carries EVERY drained pending message in order —
     not just pending[0]. A codex child can collect both an operator threaded
-    reply and a parent reopen answer (#428) before the tick claims it; each
+    reply and a parent reopen answer before the tick claims it; each
     send already returned delivered=true."""
     plain_sends: list[str] = []
     withid_sends: list[str] = []
@@ -296,7 +297,7 @@ def _seed_codex_child(worker):
 
 def test_codex_child_failure_sends_no_operator_notice(tmp_path: Path):
     """A spawned codex child that FAILS must not send the operator a
-    "⚠️ … failed" notice (#431) — the parent's resume turn already carries
+    "⚠️ … failed" notice — the parent's resume turn already carries
     the child's [failed] status header. FAILED is still persisted."""
     plain_sends: list[str] = []
     withid_sends: list[str] = []
@@ -309,7 +310,7 @@ def test_codex_child_failure_sends_no_operator_notice(tmp_path: Path):
     assert not any("failed" in s.lower() for s in plain_sends)
     assert withid_sends == []
     assert worker.session_store.get("cx-child").status == STATUS_FAILED
-    # #433: the reason is persisted for the parent's resume turn.
+    # The reason is persisted for the parent's resume turn.
     events = worker.transcript_store.read(child.session_id)
     reasons = [e["payload"]["reason"] for e in events if e["kind"] == "child_failed_internal"]
     assert reasons == ["boom"]
@@ -317,7 +318,7 @@ def test_codex_child_failure_sends_no_operator_notice(tmp_path: Path):
 
 def test_codex_child_budget_notice_gated(tmp_path: Path):
     """A spawned codex child that exceeds budget must not send the operator a
-    "⚠️ … budget" notice (#431); the terminal status is still persisted."""
+    "⚠️ … budget" notice; the terminal status is still persisted."""
     from api.services.agent_worker.session_store import STATUS_BUDGET_EXCEEDED
 
     plain_sends: list[str] = []
@@ -332,7 +333,7 @@ def test_codex_child_budget_notice_gated(tmp_path: Path):
 
     assert not any("budget" in s.lower() for s in plain_sends)
     assert worker.session_store.get("cx-child").status == STATUS_BUDGET_EXCEEDED
-    # #433: the reason is persisted for the parent's resume turn.
+    # The reason is persisted for the parent's resume turn.
     events = worker.transcript_store.read(child.session_id)
     reasons = [e["payload"]["reason"]
                for e in events if e["kind"] == "child_budget_exceeded_internal"]
@@ -343,7 +344,7 @@ def test_codex_child_executor_crash_records_failure_reason(tmp_path: Path):
     """An executor crash (execute() raising) bypasses the dispatch tail via
     the except-handler's early return — the crash handler must still record
     the child's failure reason so the parent's resume turn carries a
-    `reason:` line (#433 review round 1). Parity with the claude_code test."""
+    `reason:` line. Parity with the claude_code test."""
     class _CrashingCodexExecutor:
         def execute(self, session, task):
             raise RuntimeError("synthetic launch crash")
@@ -366,7 +367,7 @@ def test_codex_child_executor_crash_records_failure_reason(tmp_path: Path):
 
 
 def test_codex_operator_killed_sends_no_telegram_notice(tmp_path: Path):
-    """#379 parity: a FAILED codex outcome carrying reason=REASON_KILLED is the
+    """A FAILED codex outcome carrying reason=REASON_KILLED is the
     executor's signal that the operator deliberately killed the session. The
     dispatch path must NOT send the "⚠️ ... failed" Telegram notice (the kill
     endpoint already wrote operator_killed), while still persisting FAILED."""
@@ -387,8 +388,9 @@ def test_codex_operator_killed_sends_no_telegram_notice(tmp_path: Path):
 
 
 def test_codex_operator_killed_does_not_mirror_to_web(tmp_path: Path):
-    """#379 + #311 parity: a REASON_KILLED FAILED codex outcome must NOT mirror a
-    failure notice into the linked web/voice conversation."""
+    """A REASON_KILLED FAILED codex outcome must NOT mirror a
+    failure notice into the linked web/voice conversation, matching the
+    claude_code path's parity behavior."""
     from api.services.agent_worker.codex_executor import REASON_KILLED
 
     stub = _StubCodexExecutor(outcome=ExecutorOutcome(status=STATUS_FAILED, reason=REASON_KILLED))
@@ -403,7 +405,7 @@ def test_codex_operator_killed_does_not_mirror_to_web(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Web-thread result mirroring (#311). Codex has no rich [NOTIFY] stream, so the
+# Web-thread result mirroring. Codex has no rich [NOTIFY] stream, so the
 # terminal completion/failure mirror is the whole web round-trip for it.
 # ---------------------------------------------------------------------------
 
@@ -510,7 +512,7 @@ def test_codex_child_failure_does_not_mirror(tmp_path: Path):
 def test_codex_clean_env_drops_anthropic_credentials(monkeypatch):
     """Codex doesn't use Anthropic credentials — but it has a shell, and
     `claude` is on the PATH. An inherited key would let a codex session start
-    an API-billed Claude Code session that no dollar cap covers (#578).
+    an API-billed Claude Code session that no dollar cap covers.
     """
     from api.services.agent_worker.codex_executor import CodexExecutor
 
@@ -524,7 +526,7 @@ def test_codex_clean_env_drops_anthropic_credentials(monkeypatch):
 
 
 # =============================================================================
-# #760 — earned completion / interrupted CLI sessions (codex parity)
+# Earned completion / interrupted CLI sessions (codex parity)
 # =============================================================================
 
 FIELD_FRAGMENT = "Now update the cancel test to drop the no-longer-needed release:"

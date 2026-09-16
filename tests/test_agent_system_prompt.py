@@ -97,7 +97,7 @@ def test_existing_tags_block_helper_returns_none_when_empty(tm):
 
 
 # ---------------------------------------------------------------------------
-# build_turn_context (#591) — the per-turn context shared with the
+# build_turn_context — the per-turn context shared with the
 # turn-context endpoint and the Hermes envelope. See
 # tests/test_agent_system_prompt_golden.py for the byte-identical native
 # prompt guarantee and tests/test_turn_context_api.py / test_hermes_proxy.py
@@ -117,7 +117,7 @@ def test_build_turn_context_shape(tm):
     assert turn["existing_tags"] == []
     assert turn["personal_context"] == ""
     # No conversation_id given -- a fresh/unscoped session reports zero
-    # rather than omitting the fields or erroring (#610).
+    # rather than omitting the fields or erroring.
     assert turn["session_cost_usd"] == 0.0
     assert turn["session_turn_count"] == 0
     assert turn["session_input_tokens"] == 0
@@ -154,12 +154,13 @@ def test_build_turn_context_personal_context_scoped_to_persona_id(tm, monkeypatc
 
 
 # ---------------------------------------------------------------------------
-# Session-to-date cost (#610) — a model that can't see what its own
-# conversation has cost so far can't reason about its own expense (issue
-# #610). `build_turn_context()`'s `session_*` fields expose the verbatim
+# Session-to-date cost — a model that can't see what its own
+# conversation has cost so far can't reason about its own expense.
+# `build_turn_context()`'s `session_*` fields expose the verbatim
 # sum already recorded in the usage store (never recomputed), scoped to
 # `conversation_id`, excluding the in-flight turn (its own usage isn't
-# written until its stream finishes, after this context is built).
+# written until its stream finishes, which happens once this context has
+# already been built).
 # ---------------------------------------------------------------------------
 
 def test_build_turn_context_sums_prior_turns_for_the_conversation(tm):
@@ -227,10 +228,10 @@ def test_build_turn_context_zero_cost_turn_still_reports_a_truthful_sum(tm):
 
 
 def test_build_turn_context_unpriced_turn_marks_session_cost_as_lower_bound(tm):
-    """#613: a turn recorded `unpriced=True` (its provider reported no
+    """A turn recorded `unpriced=True` (its provider reported no
     cost) must surface as `session_cost_is_lower_bound=True` -- the real
-    distinction this field exists to carry, as opposed to #610's original
-    unconditional-floor wording."""
+    distinction this field exists to carry, not an unconditional-floor
+    reading."""
     from api.services.usage_store import get_usage_store
 
     store = get_usage_store()
@@ -275,14 +276,14 @@ def test_blank_persona_adds_no_block(tm):
 
 def test_search_finances_prompt_advertises_investments(tm):
     """The orchestrator prompt must list the 'investments' action so agents
-    prefer the portfolio snapshot over Monarch for net-worth questions (#447)."""
+    prefer the portfolio snapshot over Monarch for net-worth questions."""
     text = "\n".join(_text_blocks(build_system_prompt()))
     assert "accounts/transactions/cashflow/budgets/investments" in text
     assert "'investments'" in text
 
 
 def test_prompt_describes_human_queue_tool(tm):
-    """#852: the orchestrator must know to file via manage_human_queue, use
+    """The orchestrator must know to file via manage_human_queue, use
     'list' for "what's waiting on me", and never file work it can do itself."""
     text = "\n".join(_text_blocks(build_system_prompt()))
     assert "manage_human_queue" in text

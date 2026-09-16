@@ -1,4 +1,4 @@
-"""Tests for the `journal` persona (#659) — disjointed-fragment capture into
+"""Tests for the `journal` persona — disjointed-fragment capture into
 `LifeOS/Log/Journal/YYYY-MM-DD.md`, distinct from the generated `Personal/Journal/`
 daily journal that `journal_trends.py` analyzes.
 
@@ -9,13 +9,13 @@ without one:
 
 - the registry wiring (the bot appears/disappears with its token, like every
   other specialized bot — mirrors test_persona_api.py / test_doctor_bot.py);
-- the persona file itself states the behavior the issue specifies (mirrors
+- the persona file itself states the behavior it specifies (mirrors
   test_doctor_bot.py's needle-based check on doctor.md);
 - that capture lands where the persona says it lands, driven through the real
-  capture path (#674 moved capture out of the persona's prompt and into
-  `api/services/journal_capture.py`, because the tool it used to be told to
-  call — `lifeos_vault_write` — is MCP-only and absent from the native agentic
-  loop, so nothing was ever written; the mechanism's full behavior, including
+  capture path in `api/services/journal_capture.py` (code-driven, not a
+  model tool call — `lifeos_vault_write` is MCP-only and absent from the
+  native agentic loop, so a persona instructing the model to call it would
+  never actually write anything; the mechanism's full behavior, including
   end-to-end captures through `/chat` and the ring-ingest endpoint, lives in
   tests/test_journal_capture.py);
 - the reserved-path guard (tested directly in test_vault_write_route.py) is
@@ -132,10 +132,10 @@ class TestPersonaContent:
         assert "date:" in text
 
     def test_does_not_instruct_a_tool_the_agentic_loop_lacks(self):
-        """#674: the persona used to tell the model to append the bullet via
+        """The persona must not tell the model to append the bullet via
         `lifeos_vault_write` — MCP-only, absent from the native loop's
-        TOOL_DEFINITIONS. The model could not call it, wrote the bullet as
-        prose, and every fragment was lost. Capture is code now
+        TOOL_DEFINITIONS. A model that can't call it would write the bullet
+        as prose instead, losing the fragment. Capture is code
         (api/services/journal_capture.py); the persona must not claim
         otherwise."""
         text = _PERSONA_PATH.read_text()
@@ -202,7 +202,7 @@ class TestPersonaContent:
 
 
 # ---------------------------------------------------------------------------
-# Where capture actually lands, driven through the real capture path (#674).
+# Where capture actually lands, driven through the real capture path.
 # Mechanism detail lives in tests/test_journal_capture.py; this file only
 # holds the persona-level invariants to its word.
 # ---------------------------------------------------------------------------
@@ -252,9 +252,9 @@ class TestCaptureTarget:
         assert not (vault / "Personal" / "Journal").exists()
 
     def test_vault_write_route_still_reserves_personal_journal(self, vault, monkeypatch):
-        # The prompt-level "never write here" is backed by a route-level guard;
-        # #674 must not have weakened it. Since #769 the guard only applies
-        # when the journal persona is enabled — enable it here (as this
+        # The prompt-level "never write here" is backed by a route-level
+        # guard. The guard only applies when the journal persona is
+        # enabled — enable it here (as this
         # install, running the journal persona, would have it) so this stays
         # a true regression guard rather than exercising the unenabled default.
         monkeypatch.setenv("TELEGRAM_JOURNAL_BOT_TOKEN", "test-token")

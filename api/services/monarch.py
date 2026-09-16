@@ -24,8 +24,8 @@ logger = logging.getLogger(__name__)
 
 SESSION_PATH = Path(__file__).parent.parent.parent / "data" / "monarch_session.pickle"
 
-# Empirically observed Monarch session lifetime. Re-auth before this is hit
-# so the monthly sync doesn't silently 401/525. See issue #199 §3.
+# Empirically observed Monarch session lifetime. Re-auth ahead of this limit
+# so the monthly sync doesn't silently 401/525.
 SESSION_EXPIRY_DAYS = 30
 SESSION_WARNING_DAYS = 25  # Surface in health endpoints before things break.
 
@@ -39,7 +39,7 @@ def is_monarch_configured() -> bool:
     is not configured — the nightly sync should skip quietly rather than
     fail. Anything else (a stale/invalid session, a wrong password, a
     network outage) still reaches ``_get_client()`` and raises for real,
-    which must keep surfacing as a failure — issue #687.
+    which must keep surfacing as a failure.
     """
     return SESSION_PATH.exists() or bool(settings.monarch_email and settings.monarch_password)
 
@@ -158,7 +158,7 @@ class MonarchClient:
     async def get_holdings(self, account_id: str) -> list[dict]:
         """Investment holdings for one account (via Plaid, where supported).
 
-        Added 2026-07-09 for the Schwab-portfolio dashboard: Guideline 401(k)
+        For the Schwab-portfolio dashboard: Guideline 401(k)
         has no consumer API, but Plaid supplies fund-level holdings through
         Monarch for many institutions. Returns [] rather than erroring when
         the institution provides no holdings data.
@@ -181,7 +181,7 @@ class MonarchClient:
     async def get_history(self, account_id: str) -> list[dict]:
         """Daily balance snapshots for one account.
 
-        Added 2026-07-10 for the Schwab-portfolio dashboard: external
+        For the Schwab-portfolio dashboard: external
         accounts (Guideline 401(k)) have no ledger, but Monarch records a
         balance snapshot per day, which the dashboard folds into its
         wealth-over-time history.
@@ -205,7 +205,7 @@ class MonarchClient:
 
         sort_order: "asc" or "desc" to sort by date; None (default) leaves
         results in whatever order the Monarch API returns — unchanged for
-        callers that don't ask for a specific order (#779).
+        callers that don't ask for a specific order.
         """
         mm = await self._get_client()
         kwargs = {"limit": limit, "offset": 0, "search": search}

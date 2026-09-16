@@ -79,7 +79,7 @@ class TestRemindersAPI:
         assert response.status_code == 400
 
     def test_create_reminder_failure_is_never_success_shaped(self, mock_reminder_store):
-        """#609: a store write failure must be a non-2xx, never a 200 with
+        """A store write failure must be a non-2xx, never a 200 with
         the created reminder's own shape."""
         from fastapi.testclient import TestClient
         from api.main import app

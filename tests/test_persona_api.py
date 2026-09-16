@@ -1,5 +1,5 @@
 """
-Tests for HTTP persona discovery and persona_id chat scoping (issue #351).
+Tests for HTTP persona discovery and persona_id chat scoping.
 
 Covers the settings registry helpers (list_http_personas / resolve_persona),
 the GET /api/personas discovery endpoint, persona_id resolution + 400 handling
@@ -271,13 +271,13 @@ class TestListHttpPersonas:
         by_id = {p.id: p for p in settings.list_http_personas()}
         assert by_id["doctor"].capabilities == ["handoff", "agent"]
         assert by_id["fitness"].capabilities == []
-        # #643: orchestrates is real, not inferred from capabilities — doctor
+        # Orchestrates is real, not inferred from capabilities — doctor
         # and primary share identical capabilities but only doctor orchestrates.
         assert by_id["doctor"].orchestrates is True
         assert by_id["fitness"].orchestrates is False
 
     def test_orchestrates_matches_persona_orchestrates_for_every_persona(self, tmp_path, monkeypatch):
-        """Drift guard for #643: list_http_personas()'s `orchestrates` must
+        """Drift guard: list_http_personas()'s `orchestrates` must
         never diverge from `settings.persona_orchestrates()`, which is what
         real routing (api/routes/chat.py, api/routes/hermes_proxy.py) actually
         checks. This is the test that couldn't exist before the field did —
@@ -305,16 +305,16 @@ class TestListHttpPersonas:
 
 class TestResolvePersona:
     def test_primary_resolves_to_primary_md(self):
-        # #390 P2: primary's personality now lives in config/personas/primary.md.
+        # primary's personality lives in config/personas/primary.md.
         from config.settings import settings
         pre = settings.resolve_persona("primary")
-        assert pre and "general-purpose" in pre  # body loaded (no longer empty)
+        assert pre and "general-purpose" in pre  # body loaded (non-empty)
         assert not pre.lstrip().startswith("---")  # frontmatter stripped
         # The primary Telegram bot draws from the same file (single source).
         assert settings.telegram_primary_bot.persona == pre
 
     def test_primary_personality_moved_out_of_static_prompt(self):
-        # The proactivity/tone now lives in primary.md, not the shared static prompt.
+        # The proactivity/tone lives in primary.md, not the shared static prompt.
         import api.services.agent_system_prompt as asp
         from config.settings import _load_primary_persona
         body = _load_primary_persona()[0]
@@ -369,7 +369,7 @@ class TestResolvePersona:
 
 
 # ---------------------------------------------------------------------------
-# Surface-specific persona variants (#641): doctor's execution model differs
+# Surface-specific persona variants: doctor's execution model differs
 # on Hermes (MCP tools, no shell) from Telegram/web (a headless Claude Code
 # session) — resolve_persona(surface=...) picks a sibling `<stem>.<surface>
 # <suffix>` file when one exists and falls back to the default body otherwise.
@@ -401,7 +401,7 @@ class TestSurfaceVariantPersona:
         for marker in ("[NOTIFY]", "[CLARIFY]", "[GOAL]"):
             assert marker not in hermes_pre, f"{marker} wrapper marker leaked into the Hermes preamble"
 
-        # No claim of shell/git/filesystem access (the false claim #641 fixes);
+        # No claim of shell/git/filesystem access (that would be a false claim);
         # it must instead plainly deny having it.
         assert "full shell, git, `gh`, and filesystem access" not in hermes_pre
         assert "no shell" in hermes_pre.lower()
@@ -473,7 +473,7 @@ class TestSurfaceVariantPersona:
 
 
 # ---------------------------------------------------------------------------
-# Persona frontmatter loader (#390 Phase 1)
+# Persona frontmatter loader
 # ---------------------------------------------------------------------------
 
 class TestPersonaFrontmatter:
@@ -550,7 +550,7 @@ class TestPersonaFrontmatter:
 
 
 # ---------------------------------------------------------------------------
-# Voice-awareness (#390 Phase 3)
+# Voice-awareness
 # ---------------------------------------------------------------------------
 
 class TestVoiceAwareness:
@@ -632,7 +632,7 @@ class TestVoiceAwareness:
 
 
 # ---------------------------------------------------------------------------
-# Personal-context resolution (#390 Phase 4)
+# Personal-context resolution
 # ---------------------------------------------------------------------------
 
 class TestPersonalContext:
@@ -694,7 +694,7 @@ class TestPersonalContext:
 
 
 # ---------------------------------------------------------------------------
-# Web-spawn for orchestrating personas (#390 Phase 5)
+# Web-spawn for orchestrating personas
 # ---------------------------------------------------------------------------
 
 class TestOrchestratingPersonaSpawn:
@@ -767,14 +767,13 @@ class TestOrchestratingPersonaSpawn:
         """A doctor turn sent directly to this LifeOS endpoint with
         `backend: "hermes"` spawns exactly as it does natively, and the
         conversation it creates is tagged "hermes" rather than silently
-        reclassified as a lifeos thread. Through #641 this exact request
-        shape was what the client sent when diverting an orchestrating
-        persona's Hermes-selected turn here (#596); #642 removed that divert
-        (an orchestrating persona's Hermes turn now reaches the Hermes proxy
-        instead, see tests/test_hermes_proxy.py), so the first-party client
-        no longer constructs this request — but `backend` stays a generic,
-        supported field on this endpoint (client-surfaces.md), and this spawn
-        + tagging behavior is unchanged for any caller that still sends it."""
+        reclassified as a lifeos thread. The first-party client does not
+        construct this request shape itself (an orchestrating persona's
+        Hermes turn reaches the Hermes proxy instead, see
+        tests/test_hermes_proxy.py) — but `backend` stays a generic,
+        supported field on this endpoint (client-surfaces.md), and this
+        spawn + tagging behavior must hold for any caller that still sends
+        it."""
         import re
         import api.services.agent_worker.claude_code_spawn as ccs
         self._doctor_registry(tmp_path, monkeypatch)
@@ -838,7 +837,7 @@ class TestPersonasEndpoint:
         assert data["personas"][1]["orchestrates"] is False
 
     def test_orchestrates_field_matches_settings_for_every_persona(self, client, tmp_path, monkeypatch):
-        """Endpoint-level drift guard for #643: `GET /api/personas`'s
+        """Endpoint-level drift guard: `GET /api/personas`'s
         `orchestrates` must match `settings.persona_orchestrates()` for every
         persona it returns — this is the actual public contract clients read,
         not just the settings helper underneath it."""
@@ -865,7 +864,7 @@ class TestPersonasEndpoint:
 
 class TestChatConfigEndpoint:
     def test_default_voice_reflects_setting(self, client, monkeypatch):
-        # remote_llm_* left at their unconfigured defaults (#654) — this test
+        # remote_llm_* left at their unconfigured defaults — this test
         # only cares about default_voice/secure_url.
         monkeypatch.setattr("api.routes.chat.settings.tailnet_https_url", "", raising=False)
         monkeypatch.setattr("api.routes.chat.settings.remote_llm_base_url", "", raising=False)
@@ -882,7 +881,7 @@ class TestChatConfigEndpoint:
             "voice_endpoint_silence_ms": 1600, "voice_endpoint_hard_cap_ms": 3000,
             "voice_endpoint_semantic": False, "voice_idle_timeout_ms": 10000}
 
-    # voice_endpoint_* (#718) drive the web client's smart turn endpointing
+    # voice_endpoint_* drive the web client's smart turn endpointing
     # VAD timing in auto-mode voice recording — see web/chat/voice.js.
     def test_voice_endpoint_settings_reflect_config(self, client, monkeypatch):
         monkeypatch.setattr("api.routes.chat.settings.voice_endpoint_silence_ms", 2200, raising=False)
@@ -893,7 +892,7 @@ class TestChatConfigEndpoint:
         assert data["voice_endpoint_hard_cap_ms"] == 4500
         assert data["voice_endpoint_semantic"] is True
 
-    # voice_idle_timeout_ms (#723): disjoint from voice_endpoint_* above --
+    # voice_idle_timeout_ms: disjoint from voice_endpoint_* above --
     # governs a recording that captured no speech at all, not trailing
     # silence after speech.
     def test_voice_idle_timeout_setting_reflects_config(self, client, monkeypatch):
@@ -902,7 +901,7 @@ class TestChatConfigEndpoint:
         assert data["voice_idle_timeout_ms"] == 7500
 
     # secure_url is the web client's one-tap escape from an insecure context to
-    # the HTTPS origin the mic needs (#516).
+    # the HTTPS origin the mic needs.
     def test_secure_url_reflects_tailnet_setting(self, client, monkeypatch):
         monkeypatch.setattr(
             "api.routes.chat.settings.tailnet_https_url",
@@ -1028,7 +1027,7 @@ class TestConversationPersonaScoping:
         assert len(store.list_conversations()) == 2
 
     def test_migration_backfills_existing_rows(self):
-        # A pre-#351 conversations table (no persona_id column) must migrate and
+        # A legacy conversations table (no persona_id column) must migrate and
         # backfill existing rows to 'primary'.
         import sqlite3
         from api.services.conversation_store import ConversationStore
@@ -1080,7 +1079,7 @@ class TestConversationsListPersonaParam:
 
 
 # ---------------------------------------------------------------------------
-# Finance persona (#458, renamed from "advisor") — validate the shipped config directly (the
+# Finance persona — validate the shipped config directly (the
 # live registry depends on the token being set, which a fresh clone won't have).
 # ---------------------------------------------------------------------------
 
@@ -1128,7 +1127,7 @@ def test_finance_registered_in_bot_registry():
 
 
 # ---------------------------------------------------------------------------
-# doctor.hermes.md — repo-scoping section stays generic (#744 revision)
+# doctor.hermes.md — repo-scoping section stays generic
 # ---------------------------------------------------------------------------
 
 _DOCTOR_HERMES_FILE = Path(__file__).parent.parent / "config" / "personas" / "doctor.hermes.md"
@@ -1157,7 +1156,7 @@ def test_doctor_hermes_still_scopes_every_spawn_goal_to_a_repo():
 
 
 # ---------------------------------------------------------------------------
-# primary.md — hands LifeOS-repair requests to doctor (#746)
+# primary.md — hands LifeOS-repair requests to doctor
 # ---------------------------------------------------------------------------
 
 _PRIMARY_FILE = Path(__file__).parent.parent / "config" / "personas" / "primary.md"
@@ -1188,9 +1187,9 @@ def test_primary_persona_still_parses_and_resolves():
 
 @pytest.mark.unit
 def test_no_primary_hermes_variant_file_created():
-    """#746 deliberately defers extracting shared orchestration-invariant prose
-    into a common block until a second orchestrator exists — no primary.hermes.md
-    or similar sibling should appear as a side effect of this change."""
+    """Shared orchestration-invariant prose stays deferred from extraction
+    into a common block until a second orchestrator exists — no
+    primary.hermes.md or similar sibling file should exist."""
     personas_dir = _PRIMARY_FILE.parent
     variants = sorted(p.name for p in personas_dir.glob("primary.*.md"))
     assert variants == [], f"unexpected primary surface-variant file(s): {variants}"

@@ -1,4 +1,4 @@
-"""Deterministic "did this CLI session actually finish" signal (#760).
+"""Deterministic "did this CLI session actually finish" signal.
 
 A ``claude_code``/``codex`` session ends when its subprocess exits. A clean
 exit code — or even a terminal-looking stream event — says nothing about
@@ -20,7 +20,7 @@ from __future__ import annotations
 import re
 
 # A URL is the strong signal — unambiguous evidence a PR/issue was actually
-# opened. A bare "#123" is kept conservative: it only counts alongside
+# opened. A bare issue-number mention is kept conservative: it only counts alongside
 # merge/PR-ish phrasing nearby, so a passing mention of an issue number isn't
 # mistaken for "I opened/merged it".
 _PR_URL_RE = re.compile(r"github\.com/\S+/(?:pull|issues)/\d+", re.IGNORECASE)
@@ -73,7 +73,7 @@ def has_positive_completion_signal(final_text: str | None, notifications_sent: i
         no notify convention and always passes 0 here, falling through to
         the other two signals);
       - the final text references a PR/issue (a URL is decisive; a bare
-        ``#123`` only counts alongside merge/PR-ish phrasing);
+        issue-number mention only counts alongside merge/PR-ish phrasing);
       - the final text reads like a finished summary rather than an
         instruction fragment to itself.
 

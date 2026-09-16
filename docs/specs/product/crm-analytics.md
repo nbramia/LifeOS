@@ -190,7 +190,7 @@ Unlike the Family dashboard's fixed year dropdown (defaulting to 10 years), the 
 | `GET /api/crm/me/stats` | Aggregated owner stats (interaction counts, health score) |
 | `GET /api/crm/me/timeline` | Owner's interaction timeline, paginated |
 | `GET /api/crm/me/interactions` | Interaction data with trend and health-period support (heatmap, volume chart, trend visualizations) |
-| `GET /api/crm/me/interactions/span` | Earliest/latest interaction dates and a suggested heatmap year count; used to size the heatmap window before the first `/me/interactions` request |
+| `GET /api/crm/me/interactions/span` | Earliest/latest interaction dates and a suggested heatmap year count; for sizing the heatmap window before the first `/me/interactions` request |
 
 ---
 
@@ -233,7 +233,7 @@ Three-column grid:
 | **For Me** | Commitments and things to work on (extracted from therapy notes). |
 | **For Partner** | Things the partner is working on. |
 | **Fresh Ideas** | AI-generated therapist-style suggestions. |
-| **Growth Patterns** | How the relationship has improved over time. |
+| **Growth Patterns** | How the relationship has grown over time. |
 | **Recurring Themes** | Patterns to watch. |
 | **Strengths** | What's working well. |
 

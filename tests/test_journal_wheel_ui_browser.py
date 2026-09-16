@@ -1,4 +1,4 @@
-"""Browser test for the /journal emotion-wheel view (#212).
+"""Browser test for the /journal emotion-wheel view.
 
 Serves `web/` itself from an ephemeral port and stubs every `/api/journal/`
 call, so this runs without a live server — same pattern as

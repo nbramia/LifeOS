@@ -76,7 +76,7 @@ class TestTasksAPI:
         assert kwargs["context"] == "Inbox"
 
     def test_create_task_forwards_context(self, client, mock_task_manager):
-        """#853: unlike the chat `manage_tasks` tool (which always lands in
+        """Unlike the chat `manage_tasks` tool (which always lands in
         Inbox to avoid an LLM guessing a wrong context), the raw HTTP API
         honors an explicit context on create — a direct API client (the
         Kanban board) knows exactly where it wants the task filed. This
@@ -125,10 +125,10 @@ class TestTasksAPI:
         assert response.status_code in (400, 422)  # Validation error
 
     def test_create_task_failure_is_never_success_shaped(self, mock_task_manager):
-        """#609: if the write itself fails (disk error, index corruption,
+        """If the write itself fails (disk error, index corruption,
         whatever `TaskManager.create` raises for), the caller must see a
         non-2xx status — never a 200 with the created task's own shape,
-        which is the false-confirmation pattern this issue exists to close.
+        which would be a false-confirmation.
 
         Uses `raise_server_exceptions=False` because this route has no
         try/except of its own — it relies on FastAPI's default unhandled-
@@ -149,7 +149,7 @@ class TestTasksAPI:
         assert response.status_code == 409
 
     def test_create_task_hostile_field_value_is_422(self, client, mock_task_manager):
-        """#853 round 1 finding #2: a `ValueError` from `TaskManager.create`
+        """A `ValueError` from `TaskManager.create`
         (hostile description/notes/fields content) maps to 422, not an
         unhandled 500."""
         mock_task_manager.create.side_effect = ValueError("description must not contain '\\n'")
@@ -158,7 +158,7 @@ class TestTasksAPI:
         assert "must not contain" in response.json()["detail"]
 
     def test_create_task_reserved_field_key_is_422(self, client, mock_task_manager):
-        """#853 round 1 finding #3: a reserved `fields` key (e.g. `updated`)
+        """A reserved `fields` key (e.g. `updated`)
         maps to 422."""
         mock_task_manager.create.side_effect = ValueError(
             "'updated' is a reserved field and cannot be set via fields"
@@ -170,7 +170,7 @@ class TestTasksAPI:
         assert response.status_code == 422
         assert "reserved" in response.json()["detail"]
 
-    # --- DRY RUN (#138) ---
+    # --- DRY RUN ---
 
     def test_dry_run_with_engine_tag_returns_preflight_preview(self, client, mock_task_manager):
         """dry_run=true on an engine-assigned task runs preflight and returns
@@ -205,7 +205,7 @@ class TestTasksAPI:
         mock_task_manager.create.assert_not_called()
 
     def test_dry_run_remote_route_prices_from_remote_settings(self, client, mock_task_manager, monkeypatch):
-        """(#809) `#cloud`'s dry-run preview prices from
+        """`#cloud`'s dry-run preview prices from
         `settings.remote_llm_{input,output}_price_per_mtok` — never the
         Anthropic `cost_for` table `ROUTE_CLAUDE` uses."""
         from config.settings import settings
@@ -238,7 +238,7 @@ class TestTasksAPI:
         assert data["estimated_dollars"] == pytest.approx(expected)
 
     def test_dry_run_remote_route_floors_at_zero_when_unpriced(self, client, mock_task_manager, monkeypatch):
-        """(#809) Unset remote rates mean 'unknown, not free' (#669) — the
+        """Unset remote rates mean 'unknown, not free' — the
         dry-run estimate floors at 0 rather than guessing a rate, the same
         convention actual spend recording uses."""
         from config.settings import settings
@@ -411,7 +411,7 @@ class TestTasksAPI:
         assert response.status_code == 409
 
     def test_update_task_hostile_field_value_is_422(self, client, mock_task_manager):
-        """#853 round 1 finding #2: a `ValueError` from `TaskManager.update`
+        """A `ValueError` from `TaskManager.update`
         maps to 422, not an unhandled 500."""
         mock_task_manager.update.side_effect = ValueError("fields['x'] must not contain ']'")
         response = client.put("/api/tasks/abc12345", json={"fields": {"x": "bad]value"}})

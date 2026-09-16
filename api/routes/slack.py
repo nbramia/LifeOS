@@ -18,7 +18,7 @@ from api.services.slack_integration import (
     SlackAPIError,
 )
 from api.services.slack_indexer import get_slack_indexer
-from api.services.slack_sync import get_slack_sync, run_slack_sync
+from api.services.slack_sync import run_slack_sync
 
 router = APIRouter(prefix="/api/slack", tags=["slack"])
 
@@ -496,8 +496,8 @@ async def get_channel_messages(
     Args:
         channel_id: Slack channel ID
         limit: Max messages to return
-        oldest: Only return messages after this ISO timestamp
-        latest: Only return messages before this ISO timestamp
+        oldest: Only return messages newer than this ISO timestamp
+        latest: Only return messages older than this ISO timestamp
     """
     _require_slack_enabled()
 

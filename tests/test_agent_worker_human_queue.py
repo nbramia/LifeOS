@@ -1,4 +1,4 @@
-"""Tests for the agent worker's Human-queue done_when poll tick (#852).
+"""Tests for the agent worker's Human-queue done_when poll tick.
 
 The worker talks to the human queue over the HTTP API (never the in-process
 TaskManager), so these tests fake that surface with httpx.MockTransport,
@@ -144,7 +144,7 @@ class TestPollThrottle:
         # A non-default value (production default is 300) — proves
         # _process_human_queue actually reads settings.human_queue_poll_
         # seconds rather than a hardcoded 300 that would happen to pass
-        # the old version of this test too.
+        # a test that hardcodes 300 too.
         monkeypatch.setattr(settings, "human_queue_poll_seconds", 9999.0)
         flag = tmp_path / "flag"
         flag.write_text("x")
@@ -224,9 +224,9 @@ class TestTickInvokesHumanQueue:
         assert result == 0
 
     def test_tick_calls_process_human_queue_even_at_spend_cap(self, tmp_path, monkeypatch):
-        """R2-3: tick() used to return on the spend-cap guard before ever
-        reaching _process_human_queue(), so auto-resolve silently stopped
-        while the worker was paused or near its daily cap. done_when
+        """tick() must reach _process_human_queue() regardless of the
+        spend-cap guard — otherwise auto-resolve would silently stop while
+        the worker is paused or near its daily cap. done_when
         resolution never starts a new task or spends money, so it must run
         regardless of the cap."""
         api = FakeHumanQueueApi(cards=[])

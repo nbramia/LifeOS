@@ -1,4 +1,4 @@
-"""Turn lifecycle registry (#611).
+"""Turn lifecycle registry.
 
 A chat turn's lifetime is owned by the server, not the SSE connection that
 happened to be watching it when it started. `ChatTurn` decouples the two:
@@ -27,8 +27,8 @@ logger = logging.getLogger(__name__)
 # interrupted (cancelled, hit its detached-lifetime deadline, was cancelled
 # by a shutdown drain, or died on a genuine stream error) — visible, no
 # client change needed, so a truncated reply is never mistaken for a
-# finished one (the #611 problem statement: "a partial answer... looks like
-# a complete answer that trails away").
+# finished one: a partial answer can look like a complete answer that
+# trails away.
 TRUNCATION_MARKER = "\n\n_[cut off — the turn ended before it finished]_"
 
 
@@ -65,7 +65,7 @@ class ChatTurn:
     ):
         self.turn_id = turn_id
         self.conversation_id = conversation_id
-        # Opaque, client-generated key (#611 review) — known to the client
+        # Opaque, client-generated key — known to the client
         # BEFORE it ever sends the request, unlike `conversation_id` (which
         # doesn't exist yet for a brand-new conversation) or `turn_id`
         # (server-generated, never sent to the client). This is what makes a
@@ -75,10 +75,9 @@ class ChatTurn:
         self.client_turn_id = client_turn_id
         # Recorded for parity with the request (voice turns get spoken-style
         # system-prompt rules elsewhere, e.g. `api/routes/chat.py`'s
-        # `build_system_prompt()` call) and for observability. #616 lifted
-        # the modality-keyed detachment gate `reader()` used to check here —
-        # a voice turn's disconnect now detaches exactly like a text turn's,
-        # so this field no longer changes cancellation behavior on its own.
+        # `build_system_prompt()` call) and for observability. A voice turn's
+        # disconnect detaches exactly like a text turn's, so this field does
+        # not change cancellation behavior on its own.
         self.modality = modality
         self.started_at = time.time()
         self.detached_at: Optional[float] = None
@@ -93,10 +92,9 @@ class ChatTurn:
         self._deadline_task: Optional[asyncio.Task] = None
         # maxsize=1: while a reader is attached, `emit()` blocks until that
         # frame has been consumed — the same backpressure a bare `yield`
-        # gives a StreamingResponse today. This is what keeps a connected
-        # turn's frame sequence byte-identical to before #611; it is not
-        # needed once detached (emit() short-circuits instead of queuing,
-        # see below).
+        # gives a StreamingResponse. This keeps a connected turn's frame
+        # sequence byte-identical to that baseline; it is not needed once
+        # detached (emit() short-circuits instead of queuing, see below).
         self._queue: "asyncio.Queue[Any]" = asyncio.Queue(maxsize=1)
 
     async def emit(self, frame: Any) -> None:
@@ -104,7 +102,7 @@ class ChatTurn:
         raw upstream byte chunk on the Hermes pump) to the reader.
 
         While attached this awaits exactly the backpressure a bare `yield`
-        gave the old generator. Once detached, frames are dropped rather
+        gives a generator. Once detached, frames are dropped rather
         than queued: nobody will ever call `reader()` again for this turn,
         so queuing would either block the producer forever (bounded queue,
         nothing draining it) or grow without bound (unbounded one) for a
@@ -120,8 +118,8 @@ class ChatTurn:
         raised here, at the suspended `await self._queue.get()`, when
         Starlette closes this generator on client disconnect — detaches the
         turn. It must NEVER cancel `self.task`: the task keeps running to
-        completion server-side regardless, which is the entire point of
-        #611. `finally` runs on every exit path (normal drain via the
+        completion server-side regardless — that is the entire point of
+        detaching rather than cancelling. `finally` runs on every exit path (normal drain via the
         sentinel, or GeneratorExit), so `not self.finalized` is what tells
         the two apart: by the time the sentinel is queued the task has
         already finalized, so a normal drain never re-arms anything here.
@@ -136,16 +134,13 @@ class ChatTurn:
             self.reader_attached = False
             if not self.finalized:
                 self.detached_at = time.time()
-                # #616 lifted the modality-keyed gate that used to live here:
-                # a voice-modality turn's disconnect immediately cancelled
-                # the task instead of arming the deadline below, because
-                # whisper-relay's adapter (src/voice_gateway/adapters/lifeos.py
-                # in the whisper-relay repo) used to only abandon this stream
-                # on barge-in/hangup, with no explicit way to say "stop". Now
-                # that it calls `POST /api/chat/cancel` with its
-                # `client_turn_id` instead, every modality detaches and
-                # survives its client identically — see ADR-019 (as amended
-                # by ADR-020) for the full history.
+                # Every modality detaches and survives its client
+                # identically: whisper-relay's adapter
+                # (src/voice_gateway/adapters/lifeos.py in the whisper-relay
+                # repo) calls `POST /api/chat/cancel` with its
+                # `client_turn_id` on barge-in/hangup rather than merely
+                # abandoning the stream. See ADR-019 (as amended by
+                # ADR-020).
                 get_turn_registry().arm_deadline(self)
 
     def request_cancel(self, reason: str) -> bool:
@@ -191,7 +186,7 @@ class ChatTurn:
 class TurnRegistry:
     """Process-global (but instance-per-test-via-`reset_turn_registry`)
     lookup of in-flight turns, keyed by their own id, the conversation they
-    belong to, and (#611 review) an opaque client-supplied key."""
+    belong to, and an opaque client-supplied key."""
 
     def __init__(self):
         self._by_turn_id: dict[str, ChatTurn] = {}
@@ -228,7 +223,7 @@ class TurnRegistry:
         binds it when the first `conversation_id` SSE frame is observed. In
         both cases there's a sub-second window before the bind where the
         turn exists but isn't yet reachable by conversation id (so it can't
-        be cancelled or superseded) — acceptable per the #611 design.
+        be cancelled or superseded) — acceptable by design.
         `client_turn_id`, if the client sent one, closes exactly this gap:
         it's known and registered from the moment `create()` runs, before
         this bind ever happens."""
@@ -269,8 +264,8 @@ class TurnRegistry:
         return turn.request_cancel(reason)
 
     def cancel_by_client_turn_id(self, client_turn_id: str, reason: str = "cancelled") -> bool:
-        """Cancel whatever turn is in flight under this client-supplied key
-        (#611 review). This is the key a client has BEFORE it ever gets a
+        """Cancel whatever turn is in flight under this client-supplied key.
+        This is the key a client has BEFORE it ever gets a
         `conversation_id` back — closing the "first-turn barge-in" gap
         `cancel_conversation` alone can't: a request that hasn't reached its
         first SSE frame yet has no conversation id to cancel by."""
@@ -301,8 +296,7 @@ class TurnRegistry:
     async def shutdown(self) -> None:
         """Cancel every in-flight turn and await its finalization. Called
         from `api/main.py`'s lifespan shutdown so a mid-turn auto-redeploy
-        (#437) stores an honest partial instead of silently losing the
-        turn."""
+        stores an honest partial instead of silently losing the turn."""
         turns = list(self._by_turn_id.values())
         tasks = []
         for turn in turns:

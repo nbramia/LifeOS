@@ -37,7 +37,7 @@ LifeOS uses checkbox symbols to represent task states:
 | Todo | `[ ]` | Not started |
 | Done | `[x]` | Completed |
 | In Progress | `[/]` | Currently working on |
-| Cancelled | `[-]` | No longer relevant |
+| Cancelled | `[-]` | Not relevant anymore |
 | Deferred | `[>]` | Postponed |
 | Blocked | `[?]` | Waiting on dependency |
 | Urgent | `[!]` | High priority |

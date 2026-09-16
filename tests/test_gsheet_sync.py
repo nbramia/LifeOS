@@ -391,7 +391,7 @@ sheets:
     def test_sync_all_reports_skipped_when_missing_config(self):
         """sync_all() must flow "no config" through the structured
         status/reason contract, not just a zero-count dict indistinguishable
-        from a real (if quiet) success -- issue #687. This is the
+        from a real (if quiet) success. This is the
         gsheet-journal case: no config/gsheet_sync.yaml means the Google
         Form -> Sheet -> vault pipeline was never set up.
         """
@@ -416,12 +416,12 @@ sheets:
     def test_sync_all_reports_error_when_config_malformed(self):
         """A config file that EXISTS but fails to parse (e.g. hand-edited
         YAML with broken indentation) must be reported as a real error, not
-        a quiet "not configured" skip -- adversarial review of #687 caught
-        that the pre-existing `except Exception` swallow in _load_config()
-        left self.configs empty either way, which the naive "not self.configs
-        -> skipped" branch couldn't tell apart from a genuinely absent file.
-        Absence of config and presence of errors must not be conflated --
-        the same principle #687 applies to Monarch.
+        a quiet "not configured" skip -- a bare `except Exception` swallow
+        in _load_config() would leave self.configs empty either way, and a
+        naive "not self.configs -> skipped" branch can't tell that apart
+        from a genuinely absent file. Absence of config and presence of
+        errors must not be conflated -- the same principle applies to
+        Monarch.
         """
         from api.services.gsheet_sync import GSheetSyncService
 
@@ -475,7 +475,7 @@ sheets:
 
 
 class TestJournalNotesConfigured:
-    """journal_notes_configured() -- the signal api/routes/vault.py (#769)
+    """journal_notes_configured() -- the signal api/routes/vault.py
     uses, alongside the journal persona's Telegram bot, to decide whether
     Personal/Journal/ is reserved. Independent of GSheetSyncService/its
     SQLite state db -- these patch CONFIG_PATH only.
@@ -545,7 +545,7 @@ sheets:
         """A config file that exists but fails to parse is treated as
         configured (conservative default) rather than silently reserving
         nothing -- mirrors the config_load_error distinction in
-        _load_config (#687): unreadable must never look like "not set up"."""
+        _load_config: unreadable must never look like "not set up"."""
         from api.services.gsheet_sync import journal_notes_configured
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -565,9 +565,9 @@ sheets:
     def test_true_when_config_structurally_malformed(self, config_content):
         """Valid YAML syntax but a shape the `.get()` chain can't walk (parses
         fine, so yaml.safe_load itself doesn't raise) must still fall back to
-        the conservative "configured" default, not crash the caller (Codex
-        review of #769: api/routes/vault.py would otherwise see a 500 on a
-        vault-write instead of the reserved-path 400)."""
+        the conservative "configured" default, not crash the caller -- a
+        crash here would surface as a 500 on a vault-write instead of the
+        reserved-path 400 in api/routes/vault.py."""
         from api.services.gsheet_sync import journal_notes_configured
 
         with tempfile.TemporaryDirectory() as tmpdir:

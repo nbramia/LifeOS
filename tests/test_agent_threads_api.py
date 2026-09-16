@@ -1,4 +1,4 @@
-"""API tests for the web /chat agent-threads endpoints (#236, Phase 3).
+"""API tests for the web /chat agent-threads endpoints (thread view).
 
 Covers GET /api/agents/threads, GET /api/agents/threads/{id},
 POST /api/agents/threads/{id}/reply, and POST /api/agents/spawn.

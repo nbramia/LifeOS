@@ -53,14 +53,14 @@ class MessageResponse(BaseModel):
 
 
 class PendingQuestionResponse(BaseModel):
-    """An open [CLARIFY]/[GOAL] from this conversation's spawned session (#403)."""
+    """An open [CLARIFY]/[GOAL] from this conversation's spawned session."""
     session_id: str
     question: str
     kind: str  # clarification | goal_approval | followup
 
 
 class ActiveTurnResponse(BaseModel):
-    """A chat turn (#611) currently running for this conversation — server-
+    """A chat turn currently running for this conversation — server-
     side, regardless of whether any client is watching it. Lets a
     reconnecting client show "still working..." and reach the Stop
     affordance even after a reload."""
@@ -77,17 +77,17 @@ class ConversationDetailResponse(BaseModel):
     updated_at: str
     messages: list[MessageResponse]
     # Present only when an orchestrating-persona session spawned by this
-    # conversation is currently awaiting an answer (#403). The client renders
+    # conversation is currently awaiting an answer. The client renders
     # an answer affordance and POSTs to `{id}/answer`. Absent/None otherwise.
     pending_question: Optional[PendingQuestionResponse] = None
-    # Whether a session spawned by this conversation is still running (#311).
+    # Whether a session spawned by this conversation is still running.
     # True iff the conversation links a session whose status is non-terminal.
     # False when there's no linked session or it has reached a terminal status
     # (completed/failed/budget_exceeded). The client's result-streaming poll
     # uses this to STOP once the session is done and nothing awaits an answer —
     # otherwise the 4s poll would run forever after the session finishes.
     agent_session_active: bool = False
-    # Present iff a #611 chat turn is currently in flight for this
+    # Present iff a chat turn is currently in flight for this
     # conversation (native or Hermes-relayed) — absent/None otherwise,
     # including for an ordinary completed turn.
     active_turn: Optional[ActiveTurnResponse] = None
@@ -118,7 +118,7 @@ async def list_conversations(persona_id: str = "primary", backend: Optional[str]
     pass e.g. ``?persona_id=fitness`` to scope to a specialized persona.
     ``backend`` is optional and unset by default, preserving today's
     unfiltered-by-backend behavior; pass e.g. ``?backend=hermes`` to scope the
-    sidebar to threads tagged with that backend (#596).
+    sidebar to threads tagged with that backend.
     """
     store = get_store()
     conversations = store.list_conversations(persona_id=persona_id, backend=backend)
@@ -172,8 +172,8 @@ async def get_conversation(conversation_id: str):
     messages = store.get_messages(conversation_id)
 
     # Surface an open [CLARIFY]/[GOAL] from a session this conversation spawned
-    # (#403) so the client can show an answer affordance, and report whether that
-    # session is still running (#311) so the client's result-streaming poll can
+    # so the client can show an answer affordance, and report whether that
+    # session is still running so the client's result-streaming poll can
     # stop once it's done. Both are best-effort: a lookup failure (or no spawned
     # session) just leaves pending_question=None / agent_session_active=False and
     # never breaks the read.
@@ -226,7 +226,7 @@ async def get_conversation(conversation_id: str):
 
 
 def _active_turn_response(conversation_id: str) -> Optional[ActiveTurnResponse]:
-    """The in-flight #611 turn for this conversation, if any, as the
+    """The in-flight turn for this conversation, if any, as the
     response shape. `None` for a conversation with no turn registered, or
     whose registered turn has already finished (its task exists but is
     done) — a narrow window that closes as soon as the task's own `finally`
@@ -243,7 +243,7 @@ def _active_turn_response(conversation_id: str) -> Optional[ActiveTurnResponse]:
 
 @router.post("/{conversation_id}/cancel")
 async def cancel_conversation_turn(conversation_id: str):
-    """Stop a #611 chat turn in flight for this conversation, if any (native
+    """Stop a chat turn in flight for this conversation, if any (native
     or Hermes-relayed — both register in the same turn registry).
 
     404 if the conversation itself doesn't exist; otherwise 200 with
@@ -387,7 +387,7 @@ async def ask_in_conversation(conversation_id: str, request: AskRequest):
 async def answer_in_conversation(conversation_id: str, request: AnswerRequest):
     """Answer the [CLARIFY]/[GOAL] question of the session this conversation spawned.
 
-    Web/voice parity for orchestrating personas (#403). When an orchestrating
+    Web/voice parity for orchestrating personas. When an orchestrating
     persona (e.g. doctor) is selected on `/api/ask/stream`, the turn spawns a
     background Claude Code session and links it to this conversation. If that
     session emits `[CLARIFY]`/`[GOAL]`, the worker registers an open
@@ -398,7 +398,7 @@ async def answer_in_conversation(conversation_id: str, request: AnswerRequest):
     resume mechanism, no Telegram `message_id` needed.
 
     The complementary output direction (streaming the session's results back
-    into this thread) is #311.
+    into this thread) is handled elsewhere.
     """
     text = (request.answer or "").strip()
     if not text:
@@ -429,6 +429,6 @@ async def answer_in_conversation(conversation_id: str, request: AnswerRequest):
         )
 
     # Echo the answer into the conversation so the thread reflects the
-    # round-trip (the session's resumed output arrives separately, #311).
+    # round-trip (the session's resumed output arrives separately).
     store.add_message(conversation_id, "user", text)
     return {"ok": True, "session_id": session_id, "status": "answer_deposited"}

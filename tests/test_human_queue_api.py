@@ -1,5 +1,5 @@
 """
-Tests for the /api/tasks/human-queue REST routes (#852).
+Tests for the /api/tasks/human-queue REST routes.
 
 Uses the real FastAPI app + a real TaskManager against a temp vault (not
 mocks) — the behavior under test (dedupe, resolve, done_when validation) is

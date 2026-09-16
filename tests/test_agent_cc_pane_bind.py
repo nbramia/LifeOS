@@ -1,5 +1,5 @@
 """Tests for the /api/agents/cc-pane-bind endpoint + the FD-probe fallback
-in /api/agents/sessions/{id}/focus (issue #251).
+in /api/agents/sessions/{id}/focus.
 
 `cc-pane-bind` is called by the SessionStart hook each time a `claude`
 process starts in a wezterm pane. The fallback path in /focus runs the
@@ -249,7 +249,7 @@ def test_focus_reprobes_when_cached_pane_is_stale_and_finds_new_one(
     monkeypatch.setattr(settings, "cc_resume_enabled", True)
     _, sid = synthetic_session
 
-    # Cache the mapping with the current wezterm boot id so #257's
+    # Cache the mapping with the current wezterm boot id so the boot-id
     # invalidation doesn't pre-empt the activate-then-stale flow this
     # test exercises.
     wezterm_store.upsert(sid, pane_id=17, cwd="/repo", wezterm_pid=99001)
@@ -372,7 +372,7 @@ def test_focus_resolves_session_without_calling_discover_sessions(
     instead of running the full `discover_sessions` walk (which parses
     every transcript under ~/.claude/projects/). Build a layout with
     ≥2 project dirs and monkeypatch `discover_sessions` to fail loudly —
-    if focus still works, we've confirmed the helper no longer relies on it.
+    if focus still works, that confirms the helper does not rely on it.
     """
     from config.settings import settings
     from api.services.claude_code import session_ingest as cc
@@ -423,7 +423,7 @@ def test_focus_resolves_session_without_calling_discover_sessions(
 
 
 # ---------------------------------------------------------------------------
-# #257 — cache invalidation across wezterm restart
+# Cache invalidation across wezterm restart
 # ---------------------------------------------------------------------------
 
 
@@ -431,7 +431,7 @@ def test_focus_resolves_session_without_calling_discover_sessions(
 def test_focus_invalidates_cache_when_wezterm_pid_no_longer_live(
     client, wezterm_store, synthetic_session, monkeypatch,
 ):
-    """The acceptance test for #257: a cached mapping written under one
+    """A cached mapping written under one
     wezterm boot must NOT be honored after a wezterm restart (pane ids
     reset, so cached pane_id=5 could activate a different session's pane
     in the new wezterm). The focus endpoint should drop the stale mapping
@@ -445,7 +445,7 @@ def test_focus_invalidates_cache_when_wezterm_pid_no_longer_live(
     wezterm_store.upsert(sid, pane_id=5, cwd="/repo", wezterm_pid=11111)
 
     # Post-restart: live wezterm pid is now 22222 (a different process).
-    # The cached pid is no longer in the live set → mapping is stale.
+    # The cached pid is absent from the live set → mapping is stale.
     monkeypatch.setattr("api.routes.agents._live_wezterm_pids", lambda xdg: {22222})
 
     # Probe finds pane 7 in the new wezterm — the session has a fresh pane.
@@ -492,7 +492,7 @@ def test_focus_invalidates_cache_when_wezterm_pid_no_longer_live(
 def test_focus_invalidates_pre_257_rows_with_wezterm_pid_zero(
     client, wezterm_store, synthetic_session, monkeypatch,
 ):
-    """Mappings written before #257 lack a wezterm boot id (DEFAULT 0 on
+    """A legacy mapping lacks a wezterm boot id (DEFAULT 0 on
     migration). The focus endpoint treats wezterm_pid=0 as stale so the
     first Go To after the upgrade re-probes and pins a real pid.
     """
@@ -500,7 +500,7 @@ def test_focus_invalidates_pre_257_rows_with_wezterm_pid_zero(
     monkeypatch.setattr(settings, "cc_resume_enabled", True)
     _, sid = synthetic_session
 
-    # wezterm_pid defaults to 0 — simulates a row migrated from pre-#257.
+    # wezterm_pid defaults to 0 — simulates a legacy row from before the boot-id column existed.
     wezterm_store.upsert(sid, pane_id=5, cwd="/repo")
     assert wezterm_store.get(sid).wezterm_pid == 0
 
@@ -523,7 +523,7 @@ def test_focus_invalidates_pre_257_rows_with_wezterm_pid_zero(
     assert r.status_code == 200, r.text
     assert r.json()["pane_id"] == 9
 
-    # Refreshed mapping now carries a real wezterm_pid.
+    # Refreshed mapping carries a real wezterm_pid.
     mapping = wezterm_store.get(sid)
     assert mapping.pane_id == 9
     assert mapping.wezterm_pid == 33333

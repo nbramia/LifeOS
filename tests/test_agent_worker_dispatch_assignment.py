@@ -1,4 +1,4 @@
-"""Worker `_dispatch()` wiring for card assignment (#851): a task's
+"""Worker `_dispatch()` wiring for card assignment: a task's
 `fields` (model/effort/host) are extracted and recorded on the session row
 before the executor is invoked, and the new `#hermes` tag routes through
 `HermesExecutor`.
@@ -147,7 +147,7 @@ def test_dispatch_records_host_field_on_session(tmp_path, monkeypatch):
 
 def test_dispatch_untagged_task_has_no_assignment(tmp_path, monkeypatch):
     """A task with no fields at all records NULL host/model/effort — the
-    #851 write is a no-op for every pre-existing task shape."""
+    write is a no-op for every pre-existing task shape."""
     from config.settings import settings
     monkeypatch.setattr(settings, "agent_hosts", {}, raising=False)
 

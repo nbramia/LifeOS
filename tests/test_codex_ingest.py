@@ -241,7 +241,7 @@ def test_parse_session_populates_metadata(tmp_path):
     # gpt-5.4 has placeholder pricing — verify > 0 so a regression to "model
     # missing" silently zeroing is caught.
     assert parsed.total_dollars > 0
-    # Developer message was dropped.
+    # Developer message is dropped.
     kinds = [e["kind"] for e in events]
     assert "user_message" in kinds
     assert "context_message" in kinds  # response_item user bundle

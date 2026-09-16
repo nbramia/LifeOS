@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # override=True: the .env file deterministically wins over inherited env vars.
 # A present-but-empty inherited credential var would otherwise shadow the file
-# value (config.settings merges os.environ over dotenv_values) — issue #438.
+# value (config.settings merges os.environ over dotenv_values).
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent / ".env", override=True)
 
@@ -157,9 +157,9 @@ def sync_gmail_interactions(
             existing_base_ids.add(base_id)
     logger.info(f"Found {len(existing)} existing gmail interactions ({len(existing_base_ids)} unique message IDs)")
 
-    # Messages previously fetched and discarded as marketing. They produce no
+    # Messages already fetched and discarded as marketing. They produce no
     # interaction row, so existing_base_ids alone can never remember them and
-    # they were re-fetched every night for their whole 30-day life (#552).
+    # they were re-fetched every night for their whole 30-day life.
     skip_cache = get_gmail_skip_cache()
     if not dry_run:
         pruned = skip_cache.prune()
@@ -228,7 +228,7 @@ def sync_gmail_interactions(
         # interaction row, so it never lands in existing_base_ids and is
         # re-fetched every night for the full window. On the personal account
         # that is ~13k messages, and fetching them one at a time cost ~42 min
-        # per run — most of it the per-call rate-limit sleep (#552).
+        # per run — most of it the per-call rate-limit sleep.
         new_message_ids = [
             m["id"] for m in messages
             if m["id"] not in existing_base_ids
@@ -516,7 +516,7 @@ def sync_gmail_interactions(
         stats['errors'] += 1
         # Account-level failure (not a per-message hiccup) — main() exits
         # nonzero so the orchestrator records FAILED instead of silent
-        # success — issue #438.
+        # success.
         stats['fatal_error'] = str(e)
 
     conn.close()
@@ -583,7 +583,7 @@ def sync_calendar_interactions(
         api_start = time.time()
         # No cap: follow every page so a deep backfill doesn't silently
         # truncate to the oldest 2,500 events and leave a recent window
-        # empty (#701). Mirrors the Gmail path above, which also pages to
+        # empty. Mirrors the Gmail path above, which also pages to
         # exhaustion rather than capping.
         events = calendar.get_events_in_range(
             start_date=start_date,
@@ -613,7 +613,7 @@ def sync_calendar_interactions(
                 continue
 
             # Count other attendees (excluding self) for meeting size classification
-            # This is used to determine calendar_1on1 vs calendar_small_group vs calendar_large_meeting
+            # Feeds the calendar_1on1 vs calendar_small_group vs calendar_large_meeting classification
             other_attendee_count = len(attendees)  # All attendees here are "other" (self excluded by resolver)
 
             # Mass meetings are not evidence of a relationship — drop the whole
@@ -720,7 +720,7 @@ def sync_calendar_interactions(
         import traceback
         traceback.print_exc()
         stats['errors'] += 1
-        # Account-level failure — see the matching Gmail handler (issue #438).
+        # Account-level failure — see the matching Gmail handler.
         stats['fatal_error'] = str(e)
 
     conn.close()
@@ -962,7 +962,7 @@ def main(argv=None):
     # Account-level (fatal) failures must exit nonzero so run_all_syncs
     # records FAILED and alerts. Per-message errors are tolerated — a few
     # unparseable emails out of thousands is normal — but a whole account
-    # failing (e.g. expired credentials) is not — issue #438.
+    # failing (e.g. expired credentials) is not.
     fatal_failures = {
         name: stats["fatal_error"]
         for name, stats in all_stats.items()

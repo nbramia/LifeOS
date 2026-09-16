@@ -286,7 +286,7 @@ async def send_draft(
     """
     **Send an existing Gmail draft.**
 
-    Sends a draft previously created via `POST /api/gmail/drafts`, identified by
+    Sends an existing draft created via `POST /api/gmail/drafts`, identified by
     its `draft_id`. The exact draft is sent — there is no compose-and-send
     shortcut — which keeps a review step in front of every outbound email.
 

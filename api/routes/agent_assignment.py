@@ -1,12 +1,10 @@
-"""New card-assignment endpoints (#851): the model catalog and the
+"""Card-assignment endpoints: the model catalog and the
 Assigned-card "open" action.
 
-Kept in its OWN router module rather than appended to `api/routes/agents.py`
-— that file is being extended concurrently (and independently) by the
-Kanban board UI issue with a *different* set of endpoints (`/board`,
-`/board/cards/{id}/lane`, `/accept`, `/pending-questions...`); putting this
-issue's two new paths here means the two branches touch different files and
-merge without conflict. Both routers share the `/api/agents` prefix —
+Kept in its OWN router module rather than appended to `api/routes/agents.py`,
+which holds a *different* set of endpoints (`/board`,
+`/board/cards/{id}/lane`, `/accept`, `/pending-questions...`). Both routers
+share the `/api/agents` prefix —
 FastAPI accepts two routers on one prefix as long as the paths differ,
 which they do here.
 """
@@ -48,7 +46,7 @@ _HOSTS_ROUTE_TIMEOUT_SECONDS = 1.8
 # terminal to open).
 _ASSIGNEE_TAGS = ("claude", "codex", "hermes")
 
-# (round 1, finding #6) Serializes the todo/running-session checks and the
+# Serializes the todo/running-session checks and the
 # actual spawn in `open_board_card` — without it, two concurrent requests
 # (a double-click) can both pass the checks before either has spawned,
 # opening two terminals onto the same card. A single process-wide lock is
@@ -69,7 +67,7 @@ _ASSIGNEE_TAGS = ("claude", "codex", "hermes")
 # say, until an actual registered session (or a failed spawn, which frees
 # the card_id again) supersedes it.
 #
-# (round 2, finding #1) That gap is only ever a few seconds wide — the CLI
+# That gap is only ever a few seconds wide — the CLI
 # registers its own lifecycle event shortly after it starts. So the claim
 # doesn't need to live forever: `_opening_card_ids` maps card_id ->
 # `time.monotonic()` at claim time, and the membership check below only
@@ -180,8 +178,8 @@ async def open_board_card(card_id: str) -> dict[str, Any]:
     `claude`/`codex`: spawns the CLI locally (or over ssh when the card
     names a registered `host` field) with `LIFEOS_TASK_ID=<card_id>` set —
     `scripts/lifeos-agent-hook.sh` already forwards that as `task_id` on
-    every lifecycle event it posts (#849), and `POST /cli-sessions/events`
-    now moves the card to `in_progress` the moment that session registers
+    every lifecycle event it posts, and `POST /cli-sessions/events`
+    moves the card to `in_progress` the moment that session registers
     (see `cli_session_event` in `api/routes/agents.py`).
 
     `hermes`: no terminal to spawn — returns `open_url` pointing at the
@@ -210,7 +208,7 @@ async def open_board_card(card_id: str) -> dict[str, Any]:
             raise HTTPException(status_code=409, detail="no Hermes conversation yet for this card")
         return {"open_url": f"/chat?conversation={session.conversation_id}"}
 
-    # (round 1, finding #6) Hold the lock across the checks AND the spawn —
+    # Hold the lock across the checks AND the spawn —
     # not just the spawn — so a double-click can't have both requests pass
     # the checks before either has actually spawned anything.
     with _open_lock:

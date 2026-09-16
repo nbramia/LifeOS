@@ -13,7 +13,7 @@ Key behaviors:
 - Entities with 3+ failed attempts are NOT locked out forever: they're retried
   under exponential backoff (attempt 4 at 30d, 5 at 90d, 6 at 270d, ...), capped
   at `max_capped_per_run` retries per run so a large backlog drains gradually
-  instead of spiking one night's fuzzy-match cost (#507)
+  instead of spiking one night's fuzzy-match cost
 - Records match attempts to avoid re-processing
 
 This script is the "safety net" that catches source entities that:
@@ -73,7 +73,7 @@ def link_source_entities(
         min_days_since_attempt: Skip if attempted within this many days
         max_attempts: Attempts before exponential backoff kicks in (see
             SourceEntityStore.get_unlinked_for_rematching) instead of a hard
-            stop (#507)
+            stop
         backoff_multiplier: Growth factor applied per attempt past max_attempts
         max_capped_per_run: Max capped (attempt_count >= max_attempts) entities
             to retry in a single run, so a large backlog drains gradually
@@ -95,8 +95,8 @@ def link_source_entities(
         'by_source': {},
         'by_match_type': {},
         # Total backlog stuck at/above max_attempts, regardless of whether
-        # backoff currently makes any of it eligible. Surfacing this is the
-        # whole point of #507 — without it, a saturated backlog silently
+        # backoff currently makes any of it eligible. Surfacing this matters —
+        # without it, a saturated backlog silently
         # looks identical to "nothing to do".
         'capped_backlog': source_store.count_capped_backlog(
             source_type=source_type, max_attempts=max_attempts,
@@ -150,7 +150,7 @@ def link_source_entities(
         logger.info("No unlinked entities to process!")
         # Emit on the early-return path too. A stats call that only runs at the
         # bottom of the function is invisible whenever the function returns
-        # early — the exact reason sync_apple_contacts never reported (#497).
+        # early — the exact reason sync_apple_contacts never reported anything.
         # An explicit zero here is meaningful: it says "ran, nothing eligible".
         from api.services.sync_health import emit_sync_stats
         emit_sync_stats({
@@ -184,7 +184,7 @@ def link_source_entities(
             # of the eligible pool. Deliberately no record_match_attempt() here:
             # bumping the count re-queued these under backoff forever, and since
             # the blocklist is a permanent property of the address there is
-            # nothing for a retry to discover (#550).
+            # nothing for a retry to discover.
             if entity.observed_email and is_blocklisted_domain(entity.observed_email):
                 stats['blocklist_skipped'] += 1
                 continue
@@ -249,7 +249,7 @@ def link_source_entities(
 
     # Canonical line consumed by run_all_syncs._parse_sync_output. The prose
     # above uses {n:,} thousands separators, which the \d+ fallback patterns
-    # can never match — so real work reported 0/0/0 (#497).
+    # can never match — so real work reported 0/0/0.
     from api.services.sync_health import emit_sync_stats
     emit_sync_stats({
         "processed": int(stats.get("entities_processed", 0) or 0),

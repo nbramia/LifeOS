@@ -92,7 +92,7 @@ class TestHandlerScheduling:
 
 
 class TestIsAlive:
-    """Liveness reporting for /health (#766)."""
+    """Liveness reporting for /health."""
 
     def test_false_before_start(self, store):
         watcher = SchedulerWatcher(scheduler_dir=store.scheduler_dir)

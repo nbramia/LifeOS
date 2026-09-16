@@ -8,7 +8,7 @@ memory search was the one search on the tool surface with no caller lever at
 all: ten results, two relevance floors and a 1000-memory corpus bound, none of
 them adjustable or disclosed, behind a bare "No matching memories found."
 
-These tests pin the fix: the result cap is caller-supplied and normalised, every
+These tests pin the invariant: the result cap is caller-supplied and normalised, every
 bound that binds is disclosed, and an empty result says whether nothing is saved
 or whether candidates were scored and fell below the relevance floors — because
 only the first justifies telling the user the memory is gone.

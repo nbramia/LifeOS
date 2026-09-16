@@ -291,7 +291,7 @@ The default assumption is that your code is wrong, not the test. Before modifyin
 
 1. **What was this test originally meant to verify?** Read the test name, docstring, and assertions carefully.
 2. **Why is it failing now — what specific change caused the failure?** Trace the failure to your diff.
-3. **Is the correct fix to (a) fix your code, (b) update the test to match intentionally changed behavior, or (c) remove the test because the behavior no longer exists?**
+3. **Is the correct fix to (a) fix your code, (b) update the test to match intentionally changed behavior, or (c) remove the test because the behavior isn't there anymore?**
 
 Option (a) is the default. Options (b) and (c) require explicit justification in the commit message.
 

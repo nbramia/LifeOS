@@ -1,4 +1,4 @@
-"""Coverage for scripts/launchd-env-wrapper.sh (#776).
+"""Coverage for scripts/launchd-env-wrapper.sh.
 
 launchd's `EnvironmentVariables` dict is static at load time, so every
 generated plist's ProgramArguments routes through this wrapper first, which

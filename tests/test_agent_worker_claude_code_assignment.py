@@ -1,4 +1,4 @@
-"""Tests for card-assignment threading (#851) into ClaudeCodeExecutor:
+"""Tests for card-assignment threading into ClaudeCodeExecutor:
 model/effort flags, host resolution, remote ssh wrapping + pgid capture,
 and the unknown-host failure path (no ssh call).
 """
@@ -113,7 +113,7 @@ def test_model_and_effort_flags_in_argv(tmp_path, monkeypatch):
 
 
 def test_board_assigned_model_reaches_argv_via_set_assignment(tmp_path, monkeypatch):
-    """Round 1, finding #1: the board-assignment `model` field — written by
+    """The board-assignment `model` field — written by
     the real dispatch path (`SessionStore.create` then
     `SessionStore.set_assignment`, exactly like `worker._dispatch` does),
     NOT `claude_code_model` (the unrelated child-spawn escalation tier) —
@@ -157,7 +157,7 @@ def test_remote_host_wraps_argv_in_ssh_and_captures_pgid(tmp_path, monkeypatch):
     session = store.create(task_id="t1", routing="claude_code", host="studio", claude_code_model="opus")
     outcome = executor.execute(session, {"description": "do the thing"})
     assert outcome.status != STATUS_FAILED
-    # Round 1, finding #9: prove the pgid-line strip leaves the JSON stream
+    # Prove the pgid-line strip leaves the JSON stream
     # aligned — the `_RESULT_EVENT`'s own text must still reach `final_text`
     # unscathed, not just status/argv/pgid.
     assert outcome.final_text == "done"
@@ -222,7 +222,7 @@ class _HangingProc:
 
 
 def test_remote_host_unresponsive_pgid_read_fails_within_deadline(tmp_path, monkeypatch):
-    """Round 1, finding #3: a remote ssh client whose `PGID:` line never
+    """A remote ssh client whose `PGID:` line never
     arrives (hung post-TCP-connect) must not block forever — the executor
     fails within the configured connect-timeout-derived deadline instead."""
     from config.settings import settings
@@ -305,7 +305,7 @@ class _UnblockableProc:
 
 
 def test_remote_pid_event_recorded_before_pgid_line_arrives(tmp_path, monkeypatch):
-    """Round 2, finding #2: the `claude_code_pid` transcript event must be
+    """The `claude_code_pid` transcript event must be
     recorded IMMEDIATELY after `Popen` — before the deadline-bounded pgid
     read — not only once (if) the pgid line arrives. Otherwise the
     operator-kill fallback (`inter_agent._kill_local_subprocess`) finds no
@@ -339,8 +339,8 @@ def test_remote_pid_event_recorded_before_pgid_line_arrives(tmp_path, monkeypatc
     try:
         # Poll for the pid event to appear WHILE the pgid read is still
         # blocked (well inside the 5s+5s deadline) — this is the assertion
-        # that would fail before the fix, since the event used to be
-        # appended only after this read returned.
+        # that fails unless the pid event is recorded before the pgid read
+        # returns, not only after it.
         deadline = time.monotonic() + 3.0
         pid_events: list[dict] = []
         while time.monotonic() < deadline:
@@ -400,7 +400,7 @@ class _FailingSshProc:
 
 
 def test_remote_ssh_failure_reason_includes_stderr(tmp_path, monkeypatch):
-    """Round 1, finding #4: an unreachable-host ssh failure's stderr must
+    """An unreachable-host ssh failure's stderr must
     land in `outcome.reason` (what `worker.py` uses verbatim for the
     #agent-failed card), not just the transcript's `stderr_tail`."""
     spawn_calls: list = []

@@ -200,7 +200,7 @@ class ApplePhotosSync:
         Sync all Photos face recognition data to LifeOS.
 
         Args:
-            since: Only sync faces from photos after this timestamp (for incremental sync)
+            since: Only sync faces from photos newer than this timestamp (for incremental sync)
 
         Returns:
             SyncStats with sync results
@@ -382,7 +382,7 @@ def sync_apple_photos(
     Run Apple Photos sync.
 
     Args:
-        since: Only sync photos after this timestamp
+        since: Only sync photos newer than this timestamp
 
     Returns:
         Sync statistics dict

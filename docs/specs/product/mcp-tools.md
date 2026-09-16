@@ -283,7 +283,7 @@ Create a draft email in Gmail.
 
 ### lifeos_gmail_send
 
-Send an existing Gmail draft by its draft ID. Sends the exact draft; there is no compose-and-send shortcut. **Only send after the user has reviewed the draft and explicitly confirmed.** A send with the same `turn_id` used to create the draft is refused regardless of elapsed time, as long as that record is still in the ledger (turn-tagged rows are capped by count, oldest-first, rather than expiring by age). If no exact different turn id is available, LifeOS-created drafts are refused during the configured cooling-off window. Drafts not created by LifeOS are not in the ledger and send normally.
+Send an existing Gmail draft by its draft ID. Sends the exact draft; there is no compose-and-send shortcut. **Only send after the user has reviewed the draft and explicitly confirmed.** A send whose `turn_id` matches the one that created the draft is refused regardless of elapsed time, as long as that record is still in the ledger (turn-tagged rows are capped by count, oldest-first, rather than expiring by age). If no exact different turn id is available, LifeOS-created drafts are refused during the configured cooling-off window. Drafts not created by LifeOS are not in the ledger and send normally.
 
 **Parameters:**
 | Name | Type | Required | Description |

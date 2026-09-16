@@ -54,7 +54,7 @@ HEARTBEAT_INTERVAL = 300  # 5 minutes between progress pings
 _NOTIFY_RE = re.compile(r"\[NOTIFY\]\s*(.*?)(?=\[(?:NOTIFY|CLARIFY|GOAL)\]|\Z)", re.DOTALL)
 _CLARIFY_RE = re.compile(r"\[CLARIFY\]\s*(.*?)(?=\[(?:NOTIFY|CLARIFY|GOAL)\]|\Z)", re.DOTALL)
 # [GOAL] proposes a success condition for the operator to approve; once
-# approved, the worker injects `/goal <condition>` at resume (#398). It mirrors
+# approved, the worker injects `/goal <condition>` at resume. It mirrors
 # the [NOTIFY]/[CLARIFY] split so an interleaved GOAL doesn't bleed into an
 # adjacent tag's body.
 _GOAL_RE = re.compile(r"\[GOAL\]\s*(.*?)(?=\[(?:NOTIFY|CLARIFY|GOAL)\]|\Z)", re.DOTALL)
@@ -62,7 +62,7 @@ _GOAL_RE = re.compile(r"\[GOAL\]\s*(.*?)(?=\[(?:NOTIFY|CLARIFY|GOAL)\]|\Z)", re.
 # through its matching closing fence on its own line. Tags inside these are
 # illustrative — the agent quoting the protocol or showing example output — so
 # they must NOT be treated as real notifications nor stripped from the
-# narrative (#402). Anchoring to line starts (proper Markdown semantics) means
+# narrative. Anchoring to line starts (proper Markdown semantics) means
 # an *inline* triple-backtick span inside a tag body is not mistaken for a
 # fence and so doesn't truncate the body. Tag bodies are short operator-facing
 # prose by contract, so a multi-line fenced block embedded *inside* a tag body
@@ -72,7 +72,7 @@ _GOAL_RE = re.compile(r"\[GOAL\]\s*(.*?)(?=\[(?:NOTIFY|CLARIFY|GOAL)\]|\Z)", re.
 _FENCE_RE = re.compile(r"^[ \t]*(`{3,}|~{3,}).*?^[ \t]*\1[ \t]*$", re.MULTILINE | re.DOTALL)
 # Orphaned/malformed control-tag markers left after well-formed extraction
 # (e.g. an unclosed "[NOTIFY" with no closing bracket). Scrubbed from the
-# operator-facing narrative so raw control tokens never leak (#402). The
+# operator-facing narrative so raw control tokens never leak. The
 # closing bracket is optional to catch unclosed tags; the (?![A-Za-z]) boundary
 # stops it from eating the prefix of unrelated words like "[NOTIFYING ...]".
 _ORPHAN_TAG_RE = re.compile(r"\[(?:NOTIFY|CLARIFY|GOAL)(?![A-Za-z])\]?")
@@ -203,7 +203,7 @@ You already have a browser (--chrome), filesystem, and shell. {delegation}
 
 
 # Operator sessions really do pause on [CLARIFY] — the worker goes BLOCKED and
-# relays the Telegram reply. A spawned child does NOT (#356): its question is
+# relays the Telegram reply. A spawned child does NOT: its question is
 # folded into its output as "[needs clarification] …" and the turn completes;
 # the parent may answer via lifeos_agent_send, which resumes the child's CLI
 # session. Each variant states only what actually happens to that session.
@@ -235,7 +235,7 @@ REASON_AWAITING_CLARIFICATION = "awaiting_clarification"
 REASON_AWAITING_GOAL_APPROVAL = "awaiting_goal_approval"
 REASON_TIMEOUT = "timeout"
 REASON_BINARY_NOT_FOUND = "binary_not_found"
-# #379: the operator kill endpoint flips the session row to FAILED and signals
+# the operator kill endpoint flips the session row to FAILED and signals
 # our subprocess. When `proc.wait()` returns after such a kill, we exit silently
 # under this reason so the worker doesn't fire a spurious "session failed" notice.
 REASON_KILLED = "killed"
@@ -253,14 +253,14 @@ class _RunState:
     plan_mode: bool = False
     # True when this session was spawned by another agent (has a parent). Child
     # sessions report back to their parent, not the operator: their [NOTIFY]
-    # bodies and heartbeats are NOT streamed to Telegram (#349). Instead the
+    # bodies and heartbeats are NOT streamed to Telegram. Instead the
     # bodies accumulate in `notify_bodies` and get folded into final_text so the
     # parent — which only reads final_text — still receives the substance.
     is_child: bool = False
     notify_bodies: list[str] = field(default_factory=list)
     awaiting_approval: bool = False   # plan-mode result event reached
     awaiting_clarification: bool = False
-    pending_goal: str = ""            # Last [GOAL] body, awaiting approval (#398)
+    pending_goal: str = "" # Last [GOAL] body, awaiting approval
     awaiting_goal: bool = False
     cost_usd: float = 0.0
     last_activity: str = ""
@@ -337,7 +337,7 @@ class ClaudeCodeExecutor:
         # anchors (threaded replies route back into the session). Falls back to
         # the plain `notification_callback` when unset (tests, legacy wiring).
         self._operator_send = operator_send
-        # #311: optional (session_id, body) sink that mirrors each streamed
+        # optional (session_id, body) sink that mirrors each streamed
         # [NOTIFY]/[CLARIFY]/[GOAL] body into the web/voice conversation thread
         # that spawned the session. Additive — `notification_callback` (the
         # Telegram relay) is unchanged. None → no mirroring (the default; tests
@@ -397,7 +397,7 @@ class ClaudeCodeExecutor:
         ))
 
     def resume(self, session, message: str, working_dir: Optional[str] = None) -> ExecutorOutcome:
-        """Resume a previously-completed /claude session by passing
+        """Resume an already-completed /claude session by passing
         `-r <claude_code_session_id>` to the CLI.
 
         Used by the worker's follow-up reply path — the reply text becomes
@@ -458,7 +458,7 @@ class ClaudeCodeExecutor:
                     trigger="To run background work in parallel,",
                     # Deliberately not "claude": that routes the child through
                     # Managed Agents (Anthropic API), which a subscription-
-                    # billed CLI lineage is refused anyway (#578). Advertise
+                    # billed CLI lineage is refused anyway. Advertise
                     # only the routes a child can actually be spawned on.
                     model='"claude_code" with tier="haiku"/"sonnet"/"opus", '
                           'or "local" for the on-box model',
@@ -469,7 +469,7 @@ class ClaudeCodeExecutor:
             cmd.extend(["--model", model])
         if resume_session_id:
             cmd.extend(["-r", resume_session_id])
-        # (#851) Board-assigned effort, mapped to the CLI's own vocabulary.
+        # Board-assigned effort, mapped to the CLI's own vocabulary.
         # None (no assignment, or an engine that ignores effort) omits the
         # flag entirely — the CLI keeps its own default.
         claude_effort = map_effort_for_engine(ENGINE_CLAUDE_CODE, effort)
@@ -485,8 +485,8 @@ class ClaudeCodeExecutor:
         interactive Claude Code context, and the child would claim it is
         already inside a session and refuse to run. ``ANTHROPIC_*`` would hand
         the CLI API credentials, which *take precedence over the claude.ai
-        login* — the session then runs correctly but bills the Anthropic API
-        (#578). The worker inherits the LifeOS ``.env`` through systemd's
+        login* — the session then runs correctly but bills the Anthropic API.
+        The worker inherits the LifeOS ``.env`` through systemd's
         ``EnvironmentFile``, and that file carries ``ANTHROPIC_API_KEY`` for
         the API-backed services running in-process, so without this strip
         every headless session the worker spawns is silently API-billed.
@@ -507,7 +507,7 @@ class ClaudeCodeExecutor:
 
     @staticmethod
     def _remote_unset_env_names() -> list[str]:
-        """(#851) Env var names to `env -u` on a remote-spawned subprocess —
+        """Env var names to `env -u` on a remote-spawned subprocess —
         mirrors `_clean_env`'s own prefix strip, applied to the remote
         command instead of the local one (the local ssh client's own env is
         already cleaned via `_clean_env` at the Popen call site)."""
@@ -517,7 +517,7 @@ class ClaudeCodeExecutor:
     def _effective_final_text(state: _RunState) -> str:
         """Text handed back to the worker as the session's result.
 
-        For child sessions (#349) the [NOTIFY] bodies never streamed to the
+        For child sessions the [NOTIFY] bodies never streamed to the
         operator, so fold them into final_text — the parent only reads
         final_text and would otherwise lose everything the child reported.
         Operator sessions return final_text unchanged (their notifies already
@@ -543,17 +543,17 @@ class ClaudeCodeExecutor:
         sid = session.session_id
         cmd = self._build_command(
             prompt, resume_session_id, session_id=sid,
-            # (round 1, finding #1) `session.model` is the board-assignment
+            # `session.model` is the board-assignment
             # field (`SessionStore.set_assignment`, written by
             # `worker._dispatch`) — it must win over `claude_code_model`,
             # which only exists for the child-spawn escalation tier
-            # (#349/#578) and was never populated by a board assignment.
+            # and was never populated by a board assignment.
             model=getattr(session, "model", None) or session.claude_code_model,
             is_child=bool(session.parent_session_id),
             effort=getattr(session, "effort", None),
         )
 
-        # (#851) Board-assigned host: resolve BEFORE any spawn call. An
+        # Board-assigned host: resolve BEFORE any spawn call. An
         # unknown host name fails the task closed with no ssh invocation —
         # never a fallback to local.
         host = getattr(session, "host", None)
@@ -588,12 +588,12 @@ class ClaudeCodeExecutor:
                 cwd=working_dir,
                 text=True,
                 env=self._clean_env(sid),
-                # #379: own session/process-group leader so the operator kill can
+                # own session/process-group leader so the operator kill can
                 # `os.killpg(pgid, ...)` the CLI + every child it spawns WITHOUT
                 # touching this worker process (which shares the worker's group).
                 # For a remote spawn this is the local `ssh` client's own group —
                 # harmless (nothing kills it via killpg) since the remote kill
-                # path (#851) reaches the actual CLI process over ssh instead.
+                # path reaches the actual CLI process over ssh instead.
                 start_new_session=True,
             )
         except FileNotFoundError as exc:
@@ -612,21 +612,21 @@ class ClaudeCodeExecutor:
         )
 
         if is_remote:
-            # (#851) The remote wrapper echoes `PGID:<n>` as its very first
+            # The remote wrapper echoes `PGID:<n>` as its very first
             # stdout line before the CLI's own output begins — strip it here
             # rather than in `_consume_stream` (which would just silently
             # discard it as unparseable JSON) so the pgid is actually
             # captured for the remote kill path.
             #
-            # (round 1, finding #3) Bounded wait: this read runs BEFORE the
+            # Bounded wait: this read runs BEFORE the
             # wall-clock watchdog below even exists, and `ssh -o
             # ConnectTimeout` bounds only the TCP handshake — a stall during
             # auth, or a host that accepts the connection but never
             # answers, would otherwise hang this thread (and the worker's
             # `_cli_pool`) forever with no watchdog to rescue it.
             #
-            # (round 2, finding #2) Record the pid event immediately after
-            # Popen — BEFORE this deadline-bounded read, not after — so the
+            # Record the pid event immediately after
+            # Popen — ahead of this deadline-bounded read, not after — so the
             # operator-kill fallback (`inter_agent._kill_local_subprocess`)
             # can reach a stalled local ssh client during the read's own
             # deadline window instead of finding no pid event and silently
@@ -665,11 +665,11 @@ class ClaudeCodeExecutor:
                     "pid": proc.pid, "pgid": pgid, "remote": True, "host": host,
                 })
         else:
-            # #379: record the subprocess PID + process-group id so the operator
+            # record the subprocess PID + process-group id so the operator
             # kill endpoint (a separate process) can signal it. `start_new_session`
             # makes pid==pgid, but resolve the pgid explicitly so the teardown can
             # `killpg` the whole group. Separate from the `claude_code_spawn` marker
-            # above, which is the #400 crash-guard written *before* the Popen.
+            # above, which is the crash-guard written *before* the Popen.
             try:
                 pgid = os.getpgid(proc.pid)
             except Exception:  # pragma: no cover — defensive; fall back to the pid
@@ -708,7 +708,7 @@ class ClaudeCodeExecutor:
             stop_heartbeat.set()
         self._record_usage(session, state)
 
-        # #379: the kill endpoint flips status to FAILED and signals our
+        # the kill endpoint flips status to FAILED and signals our
         # subprocess. If the row is already FAILED *and the subprocess did not
         # exit cleanly*, treat it as an operator kill — exit silently
         # (REASON_KILLED) so the worker doesn't fire a spurious "session failed"
@@ -823,10 +823,9 @@ class ClaudeCodeExecutor:
                 "final_chars": len(final_text),
                 # Persist the text itself so a parent that spawned this session
                 # can read it via _child_final_text — for children the bodies
-                # never streamed to Telegram, so this is their only path out (#349).
+                # never streamed to Telegram, so this is their only path out.
                 "final_text": final_text,
-                # #760: how the subprocess ended — the diagnosis that used to
-                # require reconstructing from prose logs.
+                # how the subprocess ended
                 "exit_meta": exit_meta,
             })
             return ExecutorOutcome(
@@ -852,7 +851,7 @@ class ClaudeCodeExecutor:
             "returncode": proc.returncode,
             "stderr_tail": stderr_tail[-500:],
         })
-        # (round 1, finding #4) On the remote path, fold the ssh failure's
+        # On the remote path, fold the ssh failure's
         # stderr into the reason itself — `worker.py` uses `outcome.reason`
         # verbatim for the #agent-failed card/notice, so without this an
         # unreachable-host failure (`Connection refused`, `Permission
@@ -948,7 +947,7 @@ class ClaudeCodeExecutor:
                 # Fence-aware scan: extract [NOTIFY]/[CLARIFY] bodies from
                 # outside code fences, and keep `final_text` as the agent's
                 # narrative with tags (and any orphaned markers) stripped. Tags
-                # inside ``` fences are illustrative and left untouched (#402).
+                # inside ``` fences are illustrative and left untouched.
                 # Streaming the tags out here would otherwise make the worker's
                 # terminal summary repeat each tagged body verbatim.
                 scan = _scan_protocol_tags(text)
@@ -958,12 +957,12 @@ class ClaudeCodeExecutor:
                     state.notifications_sent += 1
                     state.last_notify_at = time.time()
                     if state.is_child:
-                        # #356: a spawned child must not pause on an operator reply.
+                        # a spawned child must not pause on an operator reply.
                         # The operator owns no thread to a child, and a BLOCKED child
                         # would strand its yielded parent (which only resumes once
                         # every child is terminal). So fold the question into the
                         # child's output — prefixed so the parent recognizes it as a
-                        # request, like [NOTIFY] folding (#349) — and let the turn
+                        # request, like [NOTIFY] folding — and let the turn
                         # complete. The PARENT, which owns the operator conversation,
                         # reads it on resume and decides (answer via a re-spawn,
                         # relay to the operator, or proceed). Crucially DON'T set
@@ -980,7 +979,7 @@ class ClaudeCodeExecutor:
                     # lands on the message that shows the question itself
                     # (same treatment [GOAL] gets). The web thread still gets
                     # the body live via the mirror.
-                    if self._conversation_mirror:  # #311: stream into the web thread
+                    if self._conversation_mirror: # stream into the web thread
                         try:
                             self._conversation_mirror(session.session_id, body)
                         except Exception as exc:  # pragma: no cover — defensive
@@ -993,7 +992,7 @@ class ClaudeCodeExecutor:
                     state.last_notify_at = time.time()
                     state.notify_bodies.append(body)
                     # Child sessions don't stream to the operator — their bodies
-                    # are folded into final_text for the parent instead (#349).
+                    # are folded into final_text for the parent instead.
                     if not state.is_child:
                         try:
                             if self._operator_send is not None:
@@ -1002,7 +1001,7 @@ class ClaudeCodeExecutor:
                                 self._notify(body)
                         except Exception as exc:  # pragma: no cover — defensive
                             logger.warning("notification callback raised: %s", exc)
-                        if self._conversation_mirror:  # #311: stream into the web thread
+                        if self._conversation_mirror: # stream into the web thread
                             try:
                                 self._conversation_mirror(session.session_id, body)
                             except Exception as exc:  # pragma: no cover — defensive
@@ -1013,14 +1012,14 @@ class ClaudeCodeExecutor:
                     if state.plan_mode and not state.awaiting_approval:
                         state.plan_text += body + "\n"
                 for body in scan.goal:
-                    # The agent proposed a success condition (#398). NOT
+                    # The agent proposed a success condition. NOT
                     # streamed to Telegram here: the worker sends ONE anchored
                     # message — goal body + reply instructions — when the
                     # session blocks, so the operator's threaded reply lands on
-                    # the message that shows the goal itself (previously the
-                    # goal streamed as its own message and a separate
-                    # instruction message was the reply anchor, which made
-                    # "reply yes — but to which message?" ambiguous). The web
+                    # the message that shows the goal itself (streaming the
+                    # goal as its own message, separate from the reply-
+                    # instruction message, would make "reply yes — but to
+                    # which message?" ambiguous). The web
                     # thread still gets the body live via the mirror. The
                     # notify timestamps still advance so the heartbeat doesn't
                     # race the blocked-prompt send with a "Still working".
@@ -1028,7 +1027,7 @@ class ClaudeCodeExecutor:
                     state.notifications_sent += 1
                     state.last_notify_at = time.time()
                     if not state.is_child and self._conversation_mirror:
-                        try:  # #311: stream into the web thread
+                        try: # stream into the web thread
                             self._conversation_mirror(session.session_id, body)
                         except Exception as exc:  # pragma: no cover — defensive
                             logger.warning("conversation mirror raised: %s", exc)
@@ -1067,7 +1066,7 @@ class ClaudeCodeExecutor:
             return
 
         if state.pending_goal:
-            # Agent proposed a goal — block for operator approval (#398). On
+            # Agent proposed a goal — block for operator approval. On
             # approval the worker injects `/goal <condition>` at resume.
             # Clarification is checked first above: a same-turn [CLARIFY]
             # supersedes [GOAL], so the goal must be re-proposed after the
@@ -1096,7 +1095,7 @@ class ClaudeCodeExecutor:
 
     @staticmethod
     def _exit_metadata(proc, timed_out: threading.Event, state: "_RunState") -> dict:
-        """Best-effort description of how the subprocess ended (#760).
+        """Best-effort description of how the subprocess ended.
 
         ``returncode`` is whatever ``proc.wait()`` observed (negative on
         POSIX when the process died to a signal — decoded into ``signal``
@@ -1122,7 +1121,7 @@ class ClaudeCodeExecutor:
     @staticmethod
     def _terminate_unresponsive(proc) -> None:
         """Best-effort terminate an ssh client that never answered the
-        `PGID:` read within its deadline (round 1, finding #3). Mirrors
+        `PGID:` read within its deadline. Mirrors
         `_on_timeout`'s terminate/wait/kill sequence minus the timed_out
         flag (there is no watchdog running yet at this point — this read
         happens BEFORE it starts)."""
@@ -1138,7 +1137,7 @@ class ClaudeCodeExecutor:
 
     @staticmethod
     def _on_timeout(proc, timed_out: threading.Event) -> None:
-        # MUST NOT write a terminal status to the session row. The #379 kill-guard
+        # MUST NOT write a terminal status to the session row. The kill-guard
         # (in execute(), after proc.wait()) keys on the row being FAILED to detect
         # an operator kill; a timed-out session must still be RUNNING when the
         # guard checks so the timeout path — not REASON_KILLED — claims it. This
@@ -1166,7 +1165,7 @@ class ClaudeCodeExecutor:
             if now - state.last_notify_at < self._heartbeat_interval:
                 continue
             # Child sessions stay silent to the operator — the parent reports
-            # progress on their behalf (#349).
+            # progress on their behalf.
             if state.is_child:
                 state.last_notify_at = now
                 continue

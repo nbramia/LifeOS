@@ -1,4 +1,4 @@
-"""Card-assignment plumbing shared by the executors and the worker (#851).
+"""Card-assignment plumbing shared by the executors and the worker.
 
 The Kanban board assigns a card to an engine (`claude`/`codex`/`local`/
 `hermes` tags), a model, an effort level, and a host — written onto the

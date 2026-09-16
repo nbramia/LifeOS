@@ -22,7 +22,7 @@ pytestmark = pytest.mark.slow
 
 
 class _StubHybridSearch:
-    """Deterministic stand-in for HybridSearch (#828): these tests are
+    """Deterministic stand-in for HybridSearch: these tests are
     about /api/ask's retrieval -> prompt -> synthesis wiring and response
     shape (source dedup, field presence), not the live vault's actual
     content -- and Claude synthesis is already mocked per-test via

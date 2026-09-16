@@ -1,9 +1,9 @@
-"""Regression tests for #598: api/main.py's load_dotenv() must not search
-upward past this checkout's own root.
+"""api/main.py's load_dotenv() must not search upward past this checkout's
+own root.
 
-## The bug
+## Why this matters
 
-`api/main.py` used to call the bare, argument-less `load_dotenv()`. With no
+A bare, argument-less `load_dotenv()` call would be dangerous here: with no
 explicit path, python-dotenv (`usecwd=False`, the default) walks upward
 from `api/main.py`'s own directory -- not the process cwd; see
 `dotenv.main.find_dotenv`, which inspects the call stack to find the
@@ -11,41 +11,43 @@ calling file -- looking for the first `.env` it finds, all the way to the
 filesystem root if necessary. From a normal checkout that finds the
 checkout's own `.env` one level up, which looks correct -- but from a git
 worktree (which has no `.env` of its own; it's gitignored and not copied by
-`git worktree add`), the search keeps climbing and can find a *different*,
-real, machine-specific `.env` belonging to the checkout the worktree was
-created from.
+`git worktree add`), the search would keep climbing and could find a
+*different*, real, machine-specific `.env` belonging to the checkout the
+worktree was created from.
 
-That mutates `os.environ` for the rest of the process. Every module-level
-constant computed from `config.settings.settings` at import time then bakes
-in whatever that real config happened to contain -- for whichever test
-process reaches that import first. See the PR for #598 for the full audit:
-at minimum `agent_system_prompt._STATIC_PROMPT`, `synthesizer.SYSTEM_CONTEXT`,
+That would mutate `os.environ` for the rest of the process. Every
+module-level constant computed from `config.settings.settings` at import
+time would then bake in whatever that real config happened to contain --
+for whichever test process reaches that import first: at minimum
+`agent_system_prompt._STATIC_PROMPT`, `synthesizer.SYSTEM_CONTEXT`,
 `agent_tools._user`, `crm.WORK_EMAIL_DOMAIN`/`MY_PERSON_ID`, and
 `slack_integration.SLACK_TEAM_ID` (already worked around locally in
-test_slack_sync.py -- see the comment there) are all affected by the same
-mechanism.
+test_slack_sync.py -- see the comment there) would all be affected by the
+same mechanism.
 
-## The fix
+## The anchored path
 
-Anchor the path explicitly: `load_dotenv(Path(__file__).resolve().parent.parent / ".env")`,
-matching the pattern every other entry point in this repo already uses
+`load_dotenv()` is anchored explicitly:
+`load_dotenv(Path(__file__).resolve().parent.parent / ".env")`, matching
+the pattern every other entry point in this repo uses
 (`scripts/sync_slack.py`, `scripts/run_all_syncs.py`, etc). For the real
-checkout this resolves to the exact same file the old upward search found
-first, so server behavior is unchanged. For a worktree (or anything else
+checkout this resolves to the exact same file an upward search would find
+first, so server behavior is unaffected. For a worktree (or anything else
 nested with no `.env` of its own) it loads nothing rather than escaping
-upward -- there is no longer an "upward" to search.
+upward -- there is no "upward" to search.
 
 ## What these tests prove
 
-`test_bare_load_dotenv_leaks_from_a_worktree_parent` reproduces the original
-bug directly, in isolation from the rest of the app, so it's clear what was
-actually wrong. `test_pinned_load_dotenv_does_not_leak` proves the fix
-removes exactly that behavior. `test_main_py_does_not_use_bare_load_dotenv`
-is a static guard against silently reverting the fix.
+`test_bare_load_dotenv_leaks_from_a_worktree_parent` shows what a bare,
+unanchored `load_dotenv()` call would do, in isolation from the rest of the
+app, so it's clear what could go wrong. `test_pinned_load_dotenv_does_not_leak`
+proves the anchored path avoids exactly that behavior.
+`test_main_py_does_not_use_bare_load_dotenv` is a static guard against
+regressing to the unanchored form.
 `test_settings_user_name_is_deterministic_regardless_of_import_order` then
-demonstrates the downstream effect is fixed too: a config-derived value
-comes out the same regardless of what else has already imported `api.main`
-in this process -- which is what makes it safe under `pytest -n N
+demonstrates the downstream effect holds too: a config-derived value comes
+out the same regardless of what else has already imported `api.main` in
+this process -- which is what makes it safe under `pytest -n N
 --dist loadscope`, where that ordering is an accident of work distribution,
 not something a test can control.
 """
@@ -101,8 +103,7 @@ def _run_probe(probe_path: Path) -> str:
 
 
 def test_bare_load_dotenv_leaks_from_a_worktree_parent(tmp_path):
-    """Reproduce the original defect: the exact idiom api/main.py used to
-    use (bare `load_dotenv()`), run from a file nested under a checkout with
+    """A bare `load_dotenv()`, run from a file nested under a checkout with
     no `.env` of its own, picks up an ancestor directory's `.env`.
     """
     api_dir = _build_nested_checkout(tmp_path)
@@ -118,7 +119,7 @@ def test_bare_load_dotenv_leaks_from_a_worktree_parent(tmp_path):
 
 
 def test_pinned_load_dotenv_does_not_leak(tmp_path):
-    """The fix: anchoring load_dotenv() to this file's own repo root (one
+    """Anchoring load_dotenv() to this file's own repo root (one
     level up, matching api/main.py's actual layout) finds nothing in the
     nested checkout and does not escape upward to the parent's `.env`.
     """
@@ -151,36 +152,35 @@ def test_main_py_does_not_use_bare_load_dotenv():
     )
 
 def test_settings_user_name_is_deterministic_regardless_of_import_order():
-    """The downstream effect of the fix: `settings.user_name` (read into a
-    module-level constant at import time by several modules -- see this
-    file's module docstring) comes from *this checkout's own* config, whether
-    or not `api.main` has already been imported by something else in this
-    worker process. Before the fix, whichever test triggered that import
-    first decided the answer for the rest of the process; there was no way
-    for a single test to assert this, because the outcome depended on
-    collection order under xdist.
+    """`settings.user_name` (read into a module-level constant at import
+    time by several modules -- see this file's module docstring) comes
+    from *this checkout's own* config, whether or not `api.main` has
+    already been imported by something else in this worker process. There
+    is no way for a single test to assert order-independence directly,
+    because the outcome depends on collection order under xdist.
 
     The expected value is derived from whether this checkout has its own
-    `.env`, rather than assumed absent (#623). Asserting the bare field
-    default only holds in a worktree; in the canonical checkout a real `.env`
-    sits at the repo root and *is* the correct thing to have loaded. Pinning
-    the default there made a correct environment look broken and blocked
-    `git push` outright, since the pre-push hook runs the suite in the
-    pushing repository.
+    `.env`, rather than assumed absent. Asserting the bare field default
+    only holds in a worktree; in the canonical checkout a real `.env` sits
+    at the repo root and *is* the correct thing to have loaded. Pinning
+    the default there would make a correct environment look broken and
+    would block `git push` outright, since the pre-push hook runs the
+    suite in the pushing repository.
 
     Be clear about how much this test guards, because it is less than it
     looks. It is a demonstration of the downstream effect, not the primary
     regression catcher:
 
     - In the canonical checkout a bare `load_dotenv()` finds this same
-      repo-root file anyway, so the regression is invisible *by value* here.
-    - Even in a worktree it only catches the regression when `config.settings`
+      repo-root file anyway, so a regression there is invisible *by value*
+      here.
+    - Even in a worktree it only catches a regression when `config.settings`
       is imported *after* `api.main` in the same process. `settings` is a
       module-level singleton built at its own import time, so when something
       (conftest, another test) has already imported it, a later leak into
-      `os.environ` no longer changes `settings.user_name`. Verified by
-      reverting `api/main.py` to a bare `load_dotenv()`: this test still
-      passed, and only the static guard below failed.
+      `os.environ` does not change `settings.user_name`. A bare
+      `load_dotenv()` in `api/main.py` still passes this test; only the
+      static guard below catches it.
 
     So the real coverage lives elsewhere in this file, and both of those are
     location-independent: `test_bare_load_dotenv_leaks_from_a_worktree_parent`

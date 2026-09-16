@@ -3,11 +3,11 @@ Tests for the journal trend views: the strip, the unexplored wheel, and
 the scalar stack.
 
 All fixtures use invented dates, names, and values — never the real
-journal, the real CRM, or the real interactions database. A fourth view
-(felt-vs-recorded connection) was removed after operator feedback that it
-wasn't useful — see docs/specs/product/journal-analytics.md's Removed
-section — which is why there's no longer a fake entity resolver or temp
-interactions database here.
+journal, the real CRM, or the real interactions database. This suite
+covers only the strip, wheel, and scalar stack views (see
+docs/specs/product/journal-analytics.md's Removed section for why a
+fourth, felt-vs-recorded connection view isn't covered here) — so there
+is no fake entity resolver or temp interactions database in this file.
 """
 import json
 import sqlite3
@@ -427,8 +427,8 @@ class TestPublishedTaxonomyFallback:
     precedence order."""
 
     @pytest.mark.parametrize("label,expected_primary", [
-        # The exact branches a real vault left unplaced before this
-        # fallback existed (a representative subset of the reported 25).
+        # The exact branches a real vault can leave unplaced without this
+        # fallback (a representative subset of the reported 25).
         ("Accepted", "Happy"),
         ("Aggressive", "Angry"),
         ("Anxious", "Fearful"),

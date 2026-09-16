@@ -38,10 +38,9 @@ def sync_with_mocks(monkeypatch):
 class TestIncrementalSyncCallsSyncUsers:
     """``incremental_sync`` must refresh the user list before each nightly run.
 
-    Issue #224: prior behaviour only called ``sync_messages``, so new Slack
-    users added to the workspace between manual ``full_sync`` runs never
-    landed in ``source_entities`` — silent drift for 83 days in the
-    incident that motivated this fix.
+    Without it, new Slack users added to the workspace between manual
+    ``full_sync`` runs would never land in ``source_entities`` — silent,
+    unbounded drift.
     """
 
     def test_sync_users_invoked_before_messages(self, sync_with_mocks):
@@ -104,8 +103,7 @@ class TestIncrementalSyncCallsSyncUsers:
 
     def test_new_workspace_user_persists_to_source_entities(self, tmp_path):
         """End-to-end: a user added between full_syncs lands in source_entities on
-        the next nightly run. This is issue #224 AC #2 — the regression the PR
-        actually exists to fix. Uses a real ``SourceEntityStore`` against a
+        the next nightly run. Uses a real ``SourceEntityStore`` against a
         tmp_path so we exercise the persistence layer, not just mocks.
         """
         from api.services.slack_integration import SlackUser
@@ -190,10 +188,10 @@ class TestIncrementalSyncCallsSyncUsers:
 
 
 class TestChannelIndexing:
-    """Issue #439: nightly entry points must index channel messages, not just DMs.
+    """Nightly entry points must index channel messages, not just DMs.
 
-    The index historically contained zero public/private channel messages
-    because full_sync/incremental_sync hardcoded ``dm_only=True``.
+    Hardcoding ``dm_only=True`` in full_sync/incremental_sync would leave
+    the index with zero public/private channel messages.
     """
 
     def _messages_payload(self):
@@ -301,9 +299,10 @@ class TestChannelIndexing:
 
 
 class TestThreadReplySync:
-    """Issue #440: thread replies must be fetched via conversations.replies and
+    """Thread replies must be fetched via conversations.replies and
     indexed like normal messages — conversations.history only returns
-    top-level messages, so replies were invisible to the index."""
+    top-level messages, so replies would otherwise be invisible to the
+    index."""
 
     def _parent(self, ts="1700000000.000100", reply_count=2, latest_reply=None):
         from datetime import datetime, timezone

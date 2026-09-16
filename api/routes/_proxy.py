@@ -1,5 +1,4 @@
-"""Shared helpers for the streaming reverse proxies (voice, agent, hermes) —
-#361, generalized in #587.
+"""Shared helpers for the streaming reverse proxies (voice, agent, hermes).
 
 Keeps the security-relevant header-filtering and timeout in one place so the
 voice, agent, and hermes proxies stay in lockstep.
@@ -20,7 +19,7 @@ from api.services.chat_turns import get_turn_registry
 
 logger = logging.getLogger(__name__)
 
-# Reachability probe cache (#688): base_url -> (expires_at monotonic, reachable).
+# Reachability probe cache: base_url -> (expires_at monotonic, reachable).
 # A backend can be *configured* (a URL is set) while its process is actually
 # down, and treating "configured" alone as "available" left `/chat` defaulting
 # to a dead backend and failing every turn at send time instead of falling
@@ -40,7 +39,7 @@ _REACHABILITY_LOCKS: dict[str, asyncio.Lock] = {}
 
 
 async def _probe_reachable(client_factory: Callable[[], httpx.AsyncClient], base_url: str, backend_label: str) -> bool:
-    """Cheap, cached reachability probe for a configured backend (#688).
+    """Cheap, cached reachability probe for a configured backend.
 
     Any HTTP response at all — even a 404 — proves the process behind
     `base_url` is up and answering; this isn't assumed to expose `/health`,
@@ -57,7 +56,7 @@ async def _probe_reachable(client_factory: Callable[[], httpx.AsyncClient], base
 
     lock = _REACHABILITY_LOCKS.setdefault(base_url, asyncio.Lock())
     async with lock:
-        # Re-check now that we hold the lock: whoever got here first may
+        # Re-check while holding the lock: whoever got here first may
         # have already refreshed the cache while we were waiting.
         now = time.monotonic()
         cached = _REACHABILITY_CACHE.get(base_url)
@@ -98,15 +97,14 @@ def filter_headers(headers) -> dict:
 
 
 def _sniff_modality(raw_body: bytes) -> str:
-    """Best-effort read of the request's `modality` field (#611), straight
+    """Best-effort read of the request's `modality` field, straight
     off the same raw pre-transform body `transform_body`/`make_observer`
     already receive — generic across whatever backend uses this router, not
     Hermes-specific. Recorded on the `ChatTurn` for parity with the native
-    path's own turn (and, until #616, used to gate a relayed voice turn out
-    of detachment the same way ChatTurn.reader() gated the native path — that
-    gate is now lifted, so this no longer affects cancellation on its own);
-    anything unparseable defaults to "text" rather than raising, since a
-    malformed body is `transform_body`'s problem to reject, not this one's."""
+    path's own turn; modality by itself has no effect on cancellation or
+    detachment. Anything unparseable defaults to "text" rather than raising,
+    since a malformed body is `transform_body`'s problem to reject, not this
+    one's."""
     try:
         data = json.loads(raw_body)
     except (json.JSONDecodeError, UnicodeDecodeError):
@@ -117,8 +115,8 @@ def _sniff_modality(raw_body: bytes) -> str:
 
 
 def _sniff_client_turn_id(raw_body: bytes) -> Optional[str]:
-    """Best-effort read of the request's opaque `client_turn_id` field
-    (#611 review), the same way `_sniff_modality` reads `modality` — off
+    """Best-effort read of the request's opaque `client_turn_id` field,
+    the same way `_sniff_modality` reads `modality` — off
     the raw pre-transform body, generic across whatever backend uses this
     router. `None` for anything missing, wrong-typed, or unparseable;
     length/character validation already happened at the native
@@ -143,33 +141,33 @@ def make_backend_router(
 ):
     """Build a `status` + `ask/stream` reverse-proxy router for a text backend.
 
-    Originally the Agent proxy's own routes (`agent_proxy.py`, #361); pulled out
-    here so a second backend (Hermes, #587) can mount the identical status/503/502
-    and bearer-injection behavior without duplicating it. `url_attr`/`token_attr`
+    Shared by the Agent and Hermes backends so both mount the identical
+    status/503/502 and bearer-injection behavior without duplicating it.
+    `url_attr`/`token_attr`
     are `settings` field names, read fresh on every request (so tests that
     monkeypatch `settings.<url_attr>` take effect with no extra wiring).
     `client_factory` is the caller's own `_client()` seam — passed in (rather
     than imported) so each backend module keeps an independently-monkeypatchable
     `_client`.
 
-    `transform_body` (#590) lets a caller rewrite the JSON body before it's
+    `transform_body` lets a caller rewrite the JSON body before it's
     forwarded — the Hermes route uses it to attach the `lifeos_context`
     envelope. Its absence (the Agent route's default) keeps the body an
-    unbuffered `request.stream()`, exactly as before; supplying it buffers the
+    unbuffered `request.stream()`; supplying it buffers the
     body via `request.body()` so it can be parsed, rewritten, and re-serialized.
     It may raise `HTTPException` (e.g. a 400 for a bad persona) — that happens
     before `client_factory()` runs, so a rejected turn never reaches the
     backend.
 
-    `make_observer` (#592) is a read-only tee on the relayed response: called
+    `make_observer` is a read-only tee on the relayed response: called
     once per request with the same raw, pre-transform body `transform_body`
     receives, it returns either `None` (nothing to observe) or an object with
     `observe(chunk: bytes) -> None` and `finalize() -> None`. `observe()` is
     called with a copy of each chunk *before* that chunk is yielded to the
     browser, and must never alter it — the chunk object handed to `yield` is
     always the untouched original, so the browser's bytes are unaffected.
-    Calling `observe()` first (rather than after, as an earlier version of
-    this hook did) matters for an early client disconnect: closing this
+    Calling `observe()` before the chunk is yielded matters for an early
+    client disconnect: closing this
     generator raises `GeneratorExit` at the point it's currently suspended
     (the `yield`), which skips any code written *after* that yield in the
     same loop iteration — so a chunk already handed to the browser could be
@@ -183,28 +181,28 @@ def make_backend_router(
     disconnect, so partial content is still handed off — this is the place
     a slower operation (e.g. a store write) belongs, since by the time it
     runs there is no further byte left to delay. Its absence (the Agent
-    route's default) leaves the relay loop exactly as it was before this
-    parameter existed. Sharing `transform_body`'s "only buffer when actually
+    route's default) leaves the relay loop unmodified. Sharing
+    `transform_body`'s "only buffer when actually
     needed" gate means Hermes (which already buffers for the envelope)
     doesn't pay for a second `request.body()` read, and Agent (neither hook
     set) still never buffers.
 
-    `make_observer` being set ALSO gates a second behavior (#611): the
+    `make_observer` being set ALSO gates a second behavior: the
     upstream drain runs as a registry-owned background pump
     (`api/services/chat_turns.py`) rather than the browser-facing generator
-    itself, so a disconnect no longer aborts it mid-relay — the pump keeps
-    draining upstream and calls `observer.observe()`/`finalize()` exactly as
-    before, now from its own `finally` instead of the response generator's.
+    itself, so a disconnect does not abort it mid-relay — the pump keeps
+    draining upstream and calls `observer.observe()`/`finalize()` from its
+    own `finally`, not the response generator's.
     The client-visible bytes and their order are unaffected either way: the
     browser reads from a `ChatTurn.reader()` that receives the identical
     sequence of chunks the plain `relay()` below would have yielded it. This
-    is why Agent (no observer, ever) is untouched by #611 — detaching a
-    relay nothing persists would only spend money with nothing to show for
-    it — and why an observer that returns `None` for a given request (a
+    is why Agent (no observer, ever) always takes this plain path —
+    detaching a relay nothing persists would only spend money with nothing
+    to show for it — and why an observer that returns `None` for a given request (a
     `make_observer` configured but declining to observe this one) falls
     through to the plain, still-client-tied `relay()` for that request.
 
-    `pre_send` (#685) runs a side-effecting precondition — the journal
+    `pre_send` runs a side-effecting precondition — the journal
     persona's deterministic capture is the motivating case — before the
     backend is contacted at all. Called once per request with the same raw,
     pre-transform body the other two hooks receive, AFTER `transform_body`/
@@ -218,11 +216,10 @@ def make_backend_router(
     this module — an SSE `data: ...` string, in practice) to hand the
     browser BEFORE any backend byte. An empty list — the default for every
     request this hook doesn't apply to — changes nothing; its absence (every
-    other backend) leaves this router exactly as it was before this
-    parameter existed.
+    other backend) leaves this router unmodified.
 
     A non-empty return ALSO changes how this request's backend call itself
-    is handled (#685 adversarial-review follow-up): a caller like
+    is handled: a caller like
     `chat_via_api()` (api/services/telegram.py) or the ring ingest
     (api/routes/journal_ingest.py) treats a non-200 response as "nothing
     happened" and never inspects its body, so if the backend call could
@@ -243,11 +240,11 @@ def make_backend_router(
     that returns `[]` for this particular request — e.g. every non-journal
     Hermes turn) takes the plain path, completely unchanged.
 
-    `probe_reachability` (#688) opts `/status` into a cached reachability
+    `probe_reachability` opts `/status` into a cached reachability
     probe (see `_probe_reachable`) rather than reporting configuration alone.
-    Default False leaves a caller (the Agent backend, as of this writing)
-    byte-identical to before this parameter existed: `available` is exactly
-    `bool(getattr(settings, url_attr))`, no network call. True (Hermes) makes
+    Default False leaves a caller (the Agent backend) with `available`
+    computed as exactly `bool(getattr(settings, url_attr))`, no network
+    call. True (Hermes) makes
     `available` true only when the backend is BOTH configured and reachable,
     and adds `configured`/`reachable` fields so a caller can distinguish "not
     set up" from "set up but down" — `available` alone collapsed those into
@@ -287,10 +284,10 @@ def make_backend_router(
             headers["authorization"] = f"Bearer {token}"
 
         # Buffer + rewrite the body only when the caller asked for it (Hermes);
-        # otherwise stream straight through unbuffered (Agent), unchanged from
-        # before #590. transform_body may raise HTTPException (e.g. a bad
+        # otherwise stream straight through unbuffered (Agent). transform_body
+        # may raise HTTPException (e.g. a bad
         # persona) — that happens before client_factory(), so nothing is sent.
-        # make_observer (#592) and pre_send (#685) share this same raw body
+        # make_observer and pre_send share this same raw body
         # rather than a second/third request.body() read.
         raw_body = await request.body() if (transform_body or make_observer or pre_send) else None
         body = transform_body(raw_body) if transform_body else request.stream()
@@ -303,7 +300,7 @@ def make_backend_router(
         client = client_factory()
 
         if prelude_frames:
-            # #685 adversarial-review follow-up — see make_backend_router's
+            # See make_backend_router's
             # docstring on `pre_send` for the full reasoning. Short version:
             # a precondition's proof (journal capture) has already succeeded
             # by the time there are frames here, and that proof must reach
@@ -312,7 +309,7 @@ def make_backend_router(
             # already queued) and its failure becomes an in-stream event
             # rather than an HTTP-level 502/passed-through status.
             #
-            # Reuses the same turn-registry/detached-pump machinery (#611)
+            # Reuses the same turn-registry/detached-pump machinery
             # the observer branch below uses, so a journal turn survives a
             # client disconnect and is cancellable the same way any other
             # turn is.
@@ -391,7 +388,7 @@ def make_backend_router(
             raise HTTPException(status_code=502, detail=f"{backend_label} backend unreachable: {exc}")
 
         if observer is not None:
-            # Registry-owned pump (#611): gated on `observer` (not just
+            # Registry-owned pump: gated on `observer` (not just
             # `make_observer` being configured) — this is the ONLY backend
             # with something to persist for THIS request; if `make_observer`
             # returned None (e.g. an unparseable body it chose not to raise
@@ -400,7 +397,7 @@ def make_backend_router(
             # backend never sets `make_observer` at all, so `observer` is
             # always None there and it always takes the plain path —
             # detaching would only spend money on a relay nothing observes.
-            # Supersede (#611 review): a reused client_turn_id cancels
+            # Supersede: a reused client_turn_id cancels
             # whatever turn is still holding it, same as the native path —
             # a stale/duplicate key resolves to the newest claimant, never
             # a stray old one.
@@ -418,7 +415,7 @@ def make_backend_router(
             async def _pump():
                 try:
                     async for chunk in upstream.aiter_raw():
-                        # Observe before emitting (#592 review, preserved) —
+                        # Observe before emitting —
                         # see make_backend_router's docstring above for why
                         # the order matters for an early client disconnect.
                         observer.observe(chunk)
@@ -441,7 +438,7 @@ def make_backend_router(
         async def relay():
             try:
                 async for chunk in upstream.aiter_raw():
-                    # Observe before yielding (#592 review) — see
+                    # Observe before yielding — see
                     # make_backend_router's docstring for why the order
                     # matters for an early client disconnect.
                     if observer is not None:

@@ -1,5 +1,4 @@
-"""Browser test for the `?conversation=<id>` deep link's URL-encoding
-(round 1 review, PR #858, finding #5).
+"""Browser test for the `?conversation=<id>` deep link's URL-encoding.
 
 `web/chat/conversations.js`'s `loadConversation()` — the function
 `main.js`'s `maybeOpenDeepLinkedConversation()` calls with the raw

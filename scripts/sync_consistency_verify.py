@@ -15,7 +15,7 @@ Checks performed:
   4. Self-loop and hidden-person relationships — always cleaned up
   5. Orphaned CRM records — per-table threshold for relationships, facts,
      overrides, source_entities with invalid person_ids
-  6. Missing vault files — interactions pointing at notes that were moved or
+  6. Missing vault files — interactions pointing at notes that moved or were
      deleted; re-points moves, drops duplicates, flags ambiguous cases
 
 Usage:
@@ -423,7 +423,7 @@ def _classify_missing_vault_files() -> dict:
     Sort vault interactions whose file is gone into what should happen to them.
 
     Moving a note in Obsidian leaves the old interaction pointing at a path that
-    no longer exists, and the next reindex creates fresh interactions at the new
+    doesn't exist anymore, and the next reindex creates fresh interactions at the new
     path. So a dangling row is usually a *duplicate*, not lost history — but not
     always, and blanket-deleting them would destroy the exceptions.
 
@@ -492,7 +492,7 @@ def _classify_missing_vault_files() -> dict:
 
 def _check_missing_vault_files(dry_run: bool, fix_threshold: int) -> dict:
     """
-    Check 6: vault interactions pointing at files that no longer exist.
+    Check 6: vault interactions pointing at files that don't exist.
 
     Notes get moved between folders, which silently strands their interactions
     (78 of 3,022 on the corpus that prompted this). Re-point where the history
@@ -663,8 +663,8 @@ def main():
 
     # Canonical line consumed by run_all_syncs._parse_sync_output. The
     # CONSISTENCY_SUMMARY keys above have no columns in record_sync_complete,
-    # so they never reached sync_health and this phase always recorded 0/0/0
-    # (#496). Repairs are genuine record updates; issues found are what was
+    # so they never reached sync_health and this phase always recorded 0/0/0.
+    # Repairs are genuine record updates; issues found are what was
     # examined, so they map onto `updated` and `processed` respectively.
     from api.services.sync_health import emit_sync_stats
     emit_sync_stats({

@@ -1,4 +1,4 @@
-"""Tests for the #851 remote-kill path: `POST /sessions/{id}/kill` for a
+"""Tests for the remote-kill path: `POST /sessions/{id}/kill` for a
 session whose `host` names a machine other than the API host runs
 `ssh <target> kill -- -<pgid>` through the injectable runner instead of a
 local `killpg` — and never touches the network in tests.
@@ -72,7 +72,7 @@ def test_kill_remote_session_calls_injected_runner(client, stores, monkeypatch):
 
 
 def test_kill_remote_session_unregistered_host_is_best_effort_noop(client, stores, monkeypatch):
-    """A session whose host isn't (or is no longer) in the registry must
+    """A session whose host isn't (or is not currently) in the registry must
     not crash the kill endpoint — it degrades to a DB-only kill."""
     session_store, transcript_store = stores
     session = session_store.create(
@@ -91,7 +91,7 @@ def test_kill_remote_session_unregistered_host_is_best_effort_noop(client, store
 
 
 def test_kill_remote_host_with_no_remote_pgid_falls_back_to_local_pid(client, stores, monkeypatch):
-    """Round 1, finding #3: if the executor's `PGID:` read never completed
+    """If the executor's `PGID:` read never completed
     (a hung ssh client stuck past TCP connect), no `remote_pgid` was ever
     recorded — the operator kill must fall through to signalling the LOCAL
     ssh client's own pid (from the `claude_code_pid` transcript event)

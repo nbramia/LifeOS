@@ -1,5 +1,5 @@
-"""Tests for scripts/sync_imessage_interactions.py's direct-export step
-(issue #698, the imessage-shaped sibling of #687's clean-skip pattern).
+"""Tests for scripts/sync_imessage_interactions.py's direct-export step,
+the imessage-shaped sibling of the clean-skip pattern used elsewhere.
 
 STEP 1 of sync_imessage_interactions() tries to export straight from the
 local Messages.app database. On a host that isn't configured for that (not

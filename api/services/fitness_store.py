@@ -7,7 +7,7 @@ the orchestrator's `manage_workouts` tool) and queried for history/trends.
 
 Self-referential data — it deliberately sits OUTSIDE the person-centric
 SourceEntity/PersonEntity model (the CRM is about people; this is about the
-user's own training). Apple Health import (issue #323) writes into the same
+user's own training). Apple Health import writes into the same
 `health_metrics`/`workout_sessions` tables with source="apple_health".
 """
 import json

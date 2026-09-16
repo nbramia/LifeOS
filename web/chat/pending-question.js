@@ -1,8 +1,8 @@
-// Answer affordance for web/voice orchestrating-persona parity (#412).
+// Answer affordance for web/voice orchestrating-persona parity.
 //
 // When an orchestrating persona (e.g. doctor) is selected on /chat and a message
 // is sent, the SSE returns a "🩺 On it…" ack + `done` and the conversation is
-// linked server-side to the spawned Claude Code session (#403). If that session
+// linked server-side to the spawned Claude Code session. If that session
 // emits a `[CLARIFY]`/`[GOAL]`, `GET /api/conversations/{id}` surfaces a
 // `pending_question` ({session_id, question, kind}) while it awaits an answer.
 //
@@ -25,7 +25,7 @@ const CARD_ID = 'pendingQuestionCard';
 let pollTimer = null;
 let pollingConversationId = null;
 
-// #311: ids of conversation messages already on screen, so a late-arriving
+// ids of conversation messages already on screen, so a late-arriving
 // message (the spawned session's streamed [NOTIFY] or terminal result) is
 // rendered exactly once. Seeded on the FIRST poll from the messages already in
 // the thread (those were rendered by askStream / loadConversation, not by us),
@@ -34,7 +34,7 @@ let pollingConversationId = null;
 let seenMessageIds = new Set();
 let seededSeenSet = false;
 
-// #311: count consecutive polls that report the spawned session terminal AND
+// count consecutive polls that report the spawned session terminal AND
 // have no pending question. We require TWO in a row before stopping, to close a
 // race: the executor flips the session row to a terminal status BEFORE the
 // dispatch handler writes the terminal-result mirror into the conversation (the
@@ -63,7 +63,7 @@ export function startPendingQuestionPolling(conversationId) {
   if (pollTimer && pollingConversationId === conversationId) return;
   stopPendingQuestionPolling();
   pollingConversationId = conversationId;
-  // #311: the first poll seeds the seen-message set from whatever is already in
+  // the first poll seeds the seen-message set from whatever is already in
   // the thread (so we don't re-render existing messages); subsequent polls
   // render only newly-arrived ones.
   seenMessageIds = new Set();
@@ -81,7 +81,7 @@ export function stopPendingQuestionPolling() {
     pollTimer = null;
   }
   pollingConversationId = null;
-  // #311: drop the dedup state so the next polled conversation seeds fresh.
+  // drop the dedup state so the next polled conversation seeds fresh.
   seenMessageIds = new Set();
   seededSeenSet = false;
   terminalPollCount = 0;
@@ -109,7 +109,7 @@ async function pollOnce() {
   // A late response can arrive after the user navigated away; ignore it.
   if (state.currentConversationId !== conversationId) return;
 
-  // #311: render messages that arrived since the thread was last rendered —
+  // render messages that arrived since the thread was last rendered —
   // the spawned session's streamed [NOTIFY]/[GOAL] and its terminal result,
   // written into the conversation by the worker out-of-band. The first poll
   // only SEEDS the seen-set (those messages are already on screen, rendered by
@@ -128,7 +128,7 @@ async function pollOnce() {
     // yet. Drop any stale card but keep polling so the next [CLARIFY]/[GOAL]
     // (a session can ask more than once) still surfaces.
     clearAffordance();
-    // #311: terminate the poll once the spawned session is done AND nothing is
+    // terminate the poll once the spawned session is done AND nothing is
     // awaiting an answer — but only after TWO consecutive terminal polls, to
     // avoid stopping inside the status-flip→mirror-write race (see
     // terminalPollCount above). `agent_session_active === false` is the
@@ -150,7 +150,7 @@ async function pollOnce() {
   }
 }
 
-// #311: append conversation messages that aren't on screen yet, deduped by id.
+// append conversation messages that aren't on screen yet, deduped by id.
 // On the first poll we only record ids (seed) without rendering — those came
 // from the initial thread render. Afterward, any id we haven't recorded is a
 // late arrival from the worker, so we render it and record it. Idempotent: a
@@ -265,8 +265,8 @@ async function submitAnswer(conversationId, input, sendBtn, card) {
     // Answer deposited; the server echoed it into the thread and the worker
     // resumes the session. Echo the answer into the thread (the server records
     // it as a user message too, but the thread isn't re-rendered until reopen),
-    // then clear the card and keep polling so a follow-up question (or, via
-    // #311, the resumed output) surfaces here. A re-render of the just-answered
+    // then clear the card and keep polling so a follow-up question (or the
+    // resumed output) surfaces here. A re-render of the just-answered
     // question on the next poll (≤4s, before the worker consumes the deposit) is
     // idempotent — a re-submit returns 409 and clears.
     addMessage(answer, 'user');
@@ -275,8 +275,8 @@ async function submitAnswer(conversationId, input, sendBtn, card) {
   }
 
   if (resp.status === 409) {
-    // No longer awaiting — already answered elsewhere (e.g. Telegram), timed
-    // out, or resolved. Drop the affordance with a brief note.
+    // Not awaiting an answer anymore — already answered elsewhere (e.g.
+    // Telegram), timed out, or resolved. Drop the affordance with a brief note.
     clearAffordance();
     return;
   }

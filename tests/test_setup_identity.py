@@ -1,5 +1,5 @@
 """
-Tests for scripts/setup_identity.py's write/merge logic (#763).
+Tests for scripts/setup_identity.py's write/merge logic.
 
 Only the pure filesystem write/merge functions are tested here -- the
 interactive search-and-prompt flow in main() is a thin wrapper around them

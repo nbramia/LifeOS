@@ -1,26 +1,26 @@
 """Browser tests for the wake-confirmation chime in /chat's Listening mode.
 
-When Listening (#710) recognizes the wake word "Hermes", `triggerWakeRecording()`
-in `web/chat/voice.js` now plays one randomly-chosen sound from the bundled
+When Listening recognizes the wake word "Hermes", `triggerWakeRecording()`
+in `web/chat/voice.js` plays one randomly-chosen sound from the bundled
 set at `web/chat/wake-sounds/` (described by `web/chat/wake-sounds/manifest.json`
 -- see docs/guides/voice-setup.md for the set and its attribution) before
 handing off to `beginRecordingFromTap()`, the same function a talk-button tap
 calls. This suite never touches the real bundled files or the real fetch of
-`manifest.json` -- it stubs the manifest response (the repo now ships real
-audio under `web/chat/wake-sounds/`, but this suite keeps using fake
+`manifest.json` -- it stubs the manifest response (the repo ships real
+audio under `web/chat/wake-sounds/`, but this suite uses fake
 filenames for determinism) and intercepts `HTMLMediaElement`'s `src`/`play()`
 at the prototype level, so it also stands in for a build that ships without
 the bundled assets (the graceful-absence behavior under test).
 
-#725: the chime used to always play via a fresh `new Audio()` -- an element
-never unlocked by a user gesture, which iOS/Android's autoplay policy
-silently blocks. `playWakeChime()` now branches on `useSharedTtsAudio()`:
-mobile plays through the same shared, gesture-unlocked `<audio>` element
-(`getTtsAudioElement()`) every other non-gesture voice playback already
-uses, via `playUrlOnElement()`; desktop keeps the original fresh-element
-path. The `src`/`play()` interception below is prototype-level (not a
-constructor wrap alone) specifically so it catches both: the shared
-element's `.src` is assigned directly, not via `new Audio(url)`.
+A fresh `new Audio()` element is never unlocked by a user gesture, which
+iOS/Android's autoplay policy silently blocks, so `playWakeChime()` branches
+on `useSharedTtsAudio()`: mobile plays through the same shared,
+gesture-unlocked `<audio>` element (`getTtsAudioElement()`) every other
+non-gesture voice playback already uses, via `playUrlOnElement()`; desktop
+uses a fresh-element path. The `src`/`play()` interception below is
+prototype-level (not a constructor wrap alone) specifically so it catches
+both: the shared element's `.src` is assigned directly, not via
+`new Audio(url)`.
 
 Covers:
   - A populated manifest: a chime is attempted against a
@@ -42,7 +42,7 @@ Covers:
     -locked one.
   - Desktop (default UA): unchanged -- no shared/unlock element is ever
     touched; the chime still gets its own fresh `<audio>`.
-  - The #608 regression guard: a wake match while a real TTS clip is still
+  - A wake match while a real TTS clip is still
     in flight on the shared element must not let the chime steal it (and
     the real clip must finish undisturbed).
 
@@ -118,10 +118,10 @@ _DOCK_BASELINE = (
 # without touching real hardware.
 #
 # Audio interception is at the `HTMLMediaElement.prototype` level (`src`
-# setter + `play()`), not just a wrapped `Audio` constructor -- #725's mobile
+# setter + `play()`), not just a wrapped `Audio` constructor -- the mobile
 # path assigns `.src` directly on a *reused* element (`getTtsAudioElement()`),
-# it doesn't construct a fresh one per clip the way desktop and the old code
-# did. A src assignment under `/static/chat/wake-sounds/` never hits the real
+# it doesn't construct a fresh one per clip the way desktop does. A src
+# assignment under `/static/chat/wake-sounds/` never hits the real
 # network (this repo's fixture doesn't ship files matching the fake names
 # below, and no real audio decode needs to happen for these tests): it's
 # logged to `window.__audioLog`, marked pending, and the element's
@@ -288,7 +288,7 @@ def _open_voice_chat(page: Page, base_url, manifest=_NO_MANIFEST_OVERRIDE, andro
     not present at all); a dict overrides `window.__manifestResponse` with
     that JSON; omitting it entirely keeps the instrument script's own
     default (two fake chime entries). `android=True` sets a mobile UA so
-    `useSharedTtsAudio()` takes the shared-element path (#725)."""
+    `useSharedTtsAudio()` takes the shared-element path."""
     if android:
         page.add_init_script(
             "Object.defineProperty(navigator, 'userAgent', { value: %r });" % ANDROID_UA
@@ -447,11 +447,11 @@ class TestNoManifestIsIdentitcalToNoChime:
 
 
 class TestMobileSharedElement:
-    """#725: on iOS/Android the chime must route through the shared,
+    """On iOS/Android the chime must route through the shared,
     gesture-unlocked `<audio>` element (getTtsAudioElement()) instead of a
     fresh `new Audio()` -- a fresh element is never unlocked, so mobile
-    silently dropped the chime while every other voice playback (which
-    already used the shared element) worked fine."""
+    would silently drop the chime while every other voice playback (which
+    already uses the shared element) works fine."""
 
     def test_chime_plays_on_the_shared_element_not_a_fresh_audio(self, page: Page, chat_base_url):
         _open_voice_chat(page, chat_base_url, android=True)
@@ -519,8 +519,7 @@ class TestMobileSharedElement:
 class TestDesktopUnchanged:
     """Desktop has no autoplay-unlock requirement to route around, so
     unlockTtsAudio() no-ops there (useSharedTtsAudio() is false) and the
-    chime keeps constructing its own fresh, throwaway `<audio>` exactly like
-    before #725."""
+    chime keeps constructing its own fresh, throwaway `<audio>`."""
 
     def test_desktop_chime_never_touches_a_shared_unlock_element(self, page: Page, chat_base_url):
         _open_voice_chat(page, chat_base_url)  # no android=True -- desktop UA
@@ -549,8 +548,7 @@ class TestDesktopUnchanged:
 
 
 class TestClipInFlightGuard:
-    """#608 regression guard, applied to the new shared-element chime path:
-    a wake match while a real TTS clip is still loading/playing on the
+    """A wake match while a real TTS clip is still loading/playing on the
     shared element must not let the chime steal it out from under that
     clip. baseWakeGuardsOk() (checked at the very top of
     triggerWakeRecording(), before the chime's manifest fetch even starts)

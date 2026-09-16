@@ -1,4 +1,4 @@
-"""Browser tests for turn-ownership across overlapping voice turns (#832).
+"""Browser tests for turn-ownership across overlapping voice turns.
 
 `submitTurn()`'s cleanup (the `finally`, the AbortError branch, mid-stream-
 drop recovery, terminal failure) and the SSE handlers in `consumeTurnStream()`
@@ -7,15 +7,15 @@ all touch module-level state shared across turns -- `activeTurnId`,
 the user-transcript bubble, the Cancel button, the status text. A turn whose
 own async work (network retry, SSE stream, mid-stream recovery poll) settles
 *after* a newer turn has already started must not touch any of that -- the
-newer turn now owns it. `isOwnTurn()` (an identity check against the settling
-turn's own captured `AbortController`, the pattern #827 introduced for one
-branch and #832 generalized to every exit path) is what prevents it.
+newer turn owns it. `isOwnTurn()` (an identity check against the settling
+turn's own captured `AbortController`, applied across every exit path)
+is what prevents it.
 
 Drives `submitTurn()`/`cancelActiveTurn()` directly (the seam voice.js
 exports so a headless harness can run turns without a real mic -- same
 pattern as tests/test_voice_transcript_ui_browser.py). Two turns are put in
 flight at once by firing `submitTurn()` twice without ever cancelling the
-first -- a real trigger per #832's own issue (a slow server response, or a
+first -- a real trigger (a slow server response, or a
 double Retry tap, reconciling after the user has already moved on) -- and
 each gets its own independently-gated SSE stream via `window.__turnQueue`,
 so "the older turn settles AFTER the newer one already exists" is an
@@ -224,7 +224,7 @@ def _fire_turn(page: Page):
     returns. The promise is stashed on window.__turns (in fire order, which
     matches window.__turnQueue's fetch-call order: submitTurn()'s first
     await is its own POST) so _await_turn() can wait on it precisely later,
-    instead of a sleep-and-hope (#832/F4). Never passes a blob (headless --
+    instead of a sleep-and-hope. Never passes a blob (headless --
     nothing here exercises heldRecording)."""
     page.evaluate(
         "() => { window.__turns = window.__turns || []; "
@@ -264,7 +264,7 @@ def _is_loading(page: Page):
 
 
 class TestOverlappingTurnOwnership:
-    """AC (#832): a stale turn settling late must not clobber a newer turn's
+    """A stale turn settling late must not clobber a newer turn's
     id/abort/busy/loading state, and Cancel must still target the newer
     turn."""
 
@@ -292,7 +292,7 @@ class TestOverlappingTurnOwnership:
         # A's 'started' event (a decoy turn_id) and its 'done' both arrive
         # only now, well after B took over.
         _release(page, 0)
-        _await_turn(page, 0)  # wait for A's own submitTurn() promise to settle, never a sleep (#832/F4)
+        _await_turn(page, 0)  # wait for A's own submitTurn() promise to settle, never a sleep
 
         # Every bit of B's still-in-flight bookkeeping must be untouched:
         # A's 'started' must not have overwritten activeTurnId, its 'done'
@@ -311,14 +311,14 @@ class TestOverlappingTurnOwnership:
         # supersession already aborted A's controller the moment B started --
         # before A's id was ever known, so there is nothing for the 'started'
         # handler's else-branch (consumeTurnStream()'s own best-effort late-
-        # cancel, #832/F2) to reach here. That branch is real defense-in-depth
+        # cancel) to reach here. That branch is real defense-in-depth
         # for a genuine race a live network can still produce (an already-
-        # in-flight frame landing microtasks after abort() -- see #832/F1's
+        # in-flight frame landing microtasks after abort() -- see the
         # postTurnStart()-resolves-post-abort comment for the same class of
         # race), but this specific "gate held before the id was ever sent"
         # shape can't reach it: an aborted stream never gets to deliver a
-        # frame that was never even in flight yet. Confirmed empirically
-        # (#832/N1): the only way to make it reach that branch is to hold
+        # frame that was never even in flight yet. Confirmed empirically:
+        # the only way to make it reach that branch is to hold
         # the mock's gate open through an abort, which a real `fetch()`
         # cannot do once its own signal fires.
         assert page.evaluate("() => window.__cancelLog") == []
@@ -354,7 +354,7 @@ class TestOverlappingTurnOwnership:
         assert _user_texts(page) == ["first", "second"]
         # A's id was already known (its 'started' frame arrived before B ever
         # started), so B's own supersession logic could cancel it immediately
-        # -- no need to wait for anything server-side (#832/F2).
+        # -- no need to wait for anything server-side.
         assert page.evaluate("() => window.__cancelLog") == ["turn-A"]
 
         # A's server-side cancel arrives only now anyway (a real, if now rarer,
@@ -362,8 +362,8 @@ class TestOverlappingTurnOwnership:
         # the abort signal, controls delivery here). Unguarded,
         # clearUserTranscript() would delete whatever turnTranscriptEl
         # currently points at -- B's "second" bubble, not A's already-
-        # rendered "first" -- exactly the bug #832 describes ("a slow server
-        # cancel arriving after the user has moved on").
+        # rendered "first" -- exactly the failure mode this guards against
+        # ("a slow server cancel arriving after the user has moved on").
         _release(page, 0)
         _await_turn(page, 0)
 
@@ -417,7 +417,7 @@ class TestOverlappingTurnOwnership:
         exported test seam). This one instead drives the real Cancel button
         (onTalkClick's sibling handler, voice.js:492-495 -- `if (voiceBusy ||
         clipInFlight) cancelActiveTurn()`), so the UI wiring itself is
-        proven, not just the function it calls (#832/F10)."""
+        proven, not just the function it calls."""
         _open_voice_chat(page, chat_base_url)
         _set_queue(page, [
             {"frames": [
@@ -453,13 +453,12 @@ class TestOverlappingTurnOwnership:
         expect(page.locator("#statusText")).to_have_text("Ready")
 
     def test_midstream_drop_poll_is_abort_aware(self, page: Page, chat_base_url):
-        """#832/F5: pollForCompletedAudio() used to run its own ~3s budget
-        deaf to cancellation -- neither its inter-attempt sleep nor its HEAD
-        fetch carried the turn's own AbortController signal, so nothing
-        stopped it early: not a Cancel tap, not a newer turn's own
+        """pollForCompletedAudio()'s inter-attempt sleep and its HEAD fetch
+        must both carry the turn's own AbortController signal, so
+        something stops it early: a Cancel tap, or a newer turn's own
         supersession abort. Proven here by checking the signal was actually
         passed through to the probe's fetch call, not by racing an abort
-        against the poll's timing (flaky either way this could be fixed)."""
+        against the poll's timing (flaky either way)."""
         _open_voice_chat(page, chat_base_url)
         _set_queue(page, [
             {"frames": [
@@ -475,7 +474,7 @@ class TestOverlappingTurnOwnership:
         _await_turn(page, 0)
 
     def test_sleep_abortable_actually_interrupts_the_poll_wait(self, page: Page, chat_base_url):
-        """#832/N5: it's not enough for pollForCompletedAudio()'s inter-
+        """It's not enough for pollForCompletedAudio()'s inter-
         attempt sleep (sleepAbortable()) to merely accept a signal parameter
         -- it has to actually register an abort listener and reject early,
         or a cancellation arriving during that 1500ms wait (rather than
@@ -530,7 +529,7 @@ class TestOverlappingTurnOwnership:
         verdict despite already being superseded (the audio-probe gate here
         is deliberately release-only, decoupled from the abort signal, same
         reasoning as the SSE streams' own gates above), neither a 'found' nor
-        a 'not found' verdict may act on shared state B now owns (#832/F5)."""
+        a 'not found' verdict may act on shared state B already owns."""
         _open_voice_chat(page, chat_base_url)
         page.evaluate("(found) => { window.__audioFound = found; }", audio_found)
         _set_queue(page, [
@@ -587,7 +586,7 @@ class TestOverlappingTurnOwnership:
         expect(page.locator("#voiceCancelBtn")).to_have_class("voice-cancel-btn")
         assert _is_loading(page) is False
 
-    # N3 (#832, "if cheap") asked for a committed test of F9's identity-
+    # N3 asked for a committed test of F9's identity-
     # checked heldRecording clear on the stale-SUCCESS early return
     # specifically. Attempted and dropped after verifying it was vacuous:
     # with this file's gate mock realistically abort-aware (N1), gating A's
@@ -609,7 +608,7 @@ class TestOverlappingTurnOwnership:
     # the one place that guarantee doesn't hold, which is exactly why it
     # alone needed the identity check.
 
-# --- post-playback continuation guard (df9bf88, #832 follow-up) -----------
+# --- post-playback continuation guard -----------
 #
 # submitTurn()'s tail after `await playbackChain` -- showCancel(false);
 # setStatus('', 'Ready'); await maybeAutoContinue() -- runs only if this turn
@@ -618,9 +617,9 @@ class TestOverlappingTurnOwnership:
 # exactly what settles playbackChain early and ALSO already resets
 # activeTurnAbort itself -- so by the time this resumes, isOwnTurn() is
 # already false regardless of whether some OTHER turn has started. Unguarded,
-# maybeAutoContinue() would re-arm a fresh recording anyway (the #721
+# maybeAutoContinue() would re-arm a fresh recording anyway (a
 # regression this guard prevents, in the "stop playback" variant rather than
-# the "manual recording stop" one #721 was originally about) -- confirmed by
+# the "manual recording stop" variant) -- confirmed by
 # checking getUserMedia call count directly, not by asserting silence.
 #
 # Needs real playback (unlike the rest of this file, which runs muted) to put
@@ -806,12 +805,12 @@ class TestPostPlaybackCancelGuard:
 class TestStaleAudioNeverPlays:
     def test_stale_turns_audio_never_plays_and_newer_turns_status_survives(
             self, page: Page, chat_base_url):
-        """#832/N4: F1 was the HIGH-severity finding in independent review
-        and had no committed regression test -- consumeTurnStream()'s
-        'status_audio'/'main_audio' handlers gated `setStatus` on isOwnTurn
-        but left `enqueueClip()` ungated, so a stale turn's own clip queued
-        onto the shared playbackChain a newer turn's `await playbackChain`
-        then waited on and played, audibly, over the newer turn's own reply.
+        """consumeTurnStream()'s
+        'status_audio'/'main_audio' handlers must gate `enqueueClip()` on
+        isOwnTurn the same way they gate `setStatus` -- otherwise a stale
+        turn's own clip queues onto the shared playbackChain a newer
+        turn's `await playbackChain` then waits on and plays, audibly,
+        over the newer turn's own reply.
         Needs real playback (this file's main mock runs muted), so this
         reuses TestPostPlaybackCancelGuard's real-WAV-clip instrumentation,
         extended to two independently-gated overlapping turns."""

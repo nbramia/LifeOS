@@ -203,12 +203,12 @@ class TestCalendarAdminEndpoints:
         assert data["events_indexed"] == 50
 
     def test_trigger_calendar_sync_failure_carries_top_level_error(self, client, mock_indexer):
-        """#609 made a total sync failure legible (top-level `error` key);
-        #614 decided a total failure must also report non-2xx, since
-        consumers that only check HTTP status (`raise_for_status()`) — per
-        #609's own audit — need correct behavior without knowing about the
-        body convention. 500 because this is an unhandled exception from
-        the sync call, not a classified upstream/dependency failure."""
+        """A total sync failure must be legible (top-level `error` key)
+        and must also report non-2xx, since consumers that only check
+        HTTP status (`raise_for_status()`) need correct behavior without
+        knowing about the body convention. 500 because this is an
+        unhandled exception from the sync call, not a classified
+        upstream/dependency failure."""
         mock_indexer.sync.side_effect = RuntimeError("calendar API unreachable")
         response = client.post("/api/admin/calendar/sync")
 
@@ -221,7 +221,7 @@ class TestCalendarAdminEndpoints:
     def test_trigger_calendar_sync_partial_status_stays_200(self, client, mock_indexer):
         """A `partial` outcome (some calendar accounts synced, one failed)
         is a legitimate degraded-but-real result, not a total failure —
-        #614's non-2xx change must not collapse it into one."""
+        The non-2xx requirement must not collapse it into one."""
         mock_indexer.sync.return_value = {
             "status": "partial",
             "events_indexed": 12,

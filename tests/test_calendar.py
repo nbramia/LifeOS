@@ -241,8 +241,8 @@ class TestCalendarService:
     def test_get_events_in_range_follows_pagination(self, calendar_service):
         """A range spanning more than one page (max_results=None) should
         follow nextPageToken and return events from every page, not just
-        the first (#701 — a deep backfill used to silently cap at the first
-        page and leave the rest of the range empty)."""
+        the first — otherwise a deep backfill would silently cap at the
+        first page and leave the rest of the range empty."""
         page1 = {
             "items": [
                 {

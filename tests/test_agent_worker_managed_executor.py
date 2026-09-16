@@ -130,7 +130,7 @@ def test_start_creates_remote_session_with_agent_and_environment_ids(stores):
     assert cw["vault_ids"] == VAULT_IDS
     assert cw["metadata"]["lifeos_session_id"] == session.session_id
     assert cw["metadata"]["task_id"] == "t1"
-    # Per #139 §3 the initial message is NOT in the create_session kwargs —
+    # The initial message is NOT in the create_session kwargs —
     # it's posted as a separate user.message AFTER an optional update_session.
     assert "initial_message" not in cw
     # The initial user message landed via post_user_message.
@@ -184,7 +184,7 @@ def test_start_omits_title_when_description_empty(stores):
 def test_start_applies_tool_filter_when_preset_class_set(stores):
     """When session.preset_class is set, the executor calls update_session
     between create and the first user message — scoping cache_creation
-    to the class's filtered tool list (#139 §3)."""
+    to the class's filtered tool list."""
     store, _, transcript = stores
     store.set_routing_and_budget(
         "t1",
@@ -824,7 +824,7 @@ def test_poll_persists_cache_creation_and_cache_read_deltas(stores):
 
 @pytest.mark.unit
 def test_poll_unknown_model_still_uses_fallback_rate_not_unpriced(stores):
-    """This is a budget-kill **estimate** path (#669), not a record path: an
+    """This is a budget-kill **estimate** path, not a record path: an
     unrecognized configured model must keep using cost_for's conservative
     fallback (priciest) rate so an operator can't accidentally blow past a
     dollar budget on a typo'd model id — it must NOT regress to $0/unpriced,
@@ -925,9 +925,9 @@ def test_poll_kills_remote_session_on_dollar_budget_breach(stores):
 
 @pytest.mark.unit
 def test_poll_dollar_breach_fires_from_cache_creation_cost_alone(stores):
-    """The whole point of #137: cache_creation-heavy sessions must trip
-    max_dollars even when uncached input + output are negligible. Previously
-    the dollar count missed cache cost entirely, so this didn't fire."""
+    """Cache_creation-heavy sessions must trip
+    max_dollars even when uncached input + output are negligible — the
+    dollar count must include cache cost, not just input/output."""
     store, session, transcript = stores
     store.set_routing_and_budget(
         "t1",
@@ -1062,7 +1062,7 @@ def test_poll_returns_running_on_transient_driver_error(stores):
 
 
 # ---------------------------------------------------------------------------
-# Runaway detection (#139 Section 5)
+# Runaway detection
 # ---------------------------------------------------------------------------
 
 def _tool_use(tool_name: str, args: dict, event_id: str = "evt") -> dict:

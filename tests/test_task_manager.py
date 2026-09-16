@@ -971,12 +971,10 @@ class TestParseTaskLine:
         assert task is None
 
     def test_parse_checkbox_without_todo_keyword_still_parses(self):
-        """#853: the literal TODO keyword is no longer required to parse a
+        """The literal TODO keyword is not required to parse a
         checkbox line as a task — any `- [.] ...` line counts, so a hand-
         written checklist item gets an id comment written back on reindex
-        instead of being silently ignored forever. (This intentionally
-        replaces the old test_parse_checkbox_without_todo_keyword_returns_none,
-        which pinned the opposite behavior.)"""
+        instead of being silently ignored forever."""
         line = "- [ ] Regular checklist item"
 
         task = _parse_task_line(line, "/path/to/Inbox.md", 1)
@@ -1261,11 +1259,11 @@ class TestReindexFile:
         assert retrieved is None
 
     def test_external_edit_detection_survives_repeated_reindexes(self, task_manager):
-        """#853 round 1 finding #1: `reindex_file` used to pop
+        """`reindex_file` must not pop
         `_last_written_line` for every task whose `source_file` matched —
-        exactly the set it had just repopulated — which erased the record
-        `reindex_file` itself needs to detect the NEXT external edit. A
-        second consecutive external edit would then go undetected."""
+        exactly the set it had just repopulated — that would erase the
+        record `reindex_file` itself needs to detect the NEXT external
+        edit. A second consecutive external edit must still be detected."""
         task = task_manager.create("Edit twice", context="RepeatEdit")
         file_path = task_manager.tasks_dir / "RepeatEdit.md"
 
@@ -1287,10 +1285,10 @@ class TestReindexFile:
 
 
 class TestReindexWriteBackCas:
-    """#853 round 1 finding #14: `reindex_file`'s own write-back (minting an
-    id, restamping an external edit) had no compare-and-swap check against a
-    write landing between its read and its write — a concurrent writer's
-    change could be silently lost."""
+    """`reindex_file`'s own write-back (minting an
+    id, restamping an external edit) needs a compare-and-swap check against
+    a write landing between its read and its write — otherwise a
+    concurrent writer's change could be silently lost."""
 
     def test_single_mismatch_then_writes_id_back_on_retry(self, task_manager, monkeypatch):
         file_path = task_manager.tasks_dir / "ReindexCas.md"
@@ -1339,12 +1337,13 @@ class TestReindexWriteBackCas:
     def test_persistent_mismatch_does_not_merge_unwritten_parse_into_index(
         self, task_manager, monkeypatch
     ):
-        """#853 round 2 finding #2: on a persistent conflict the write-back
-        is correctly skipped, but `self._tasks` used to be updated anyway
-        from a parse that never reached disk — seeding a "ghost" id (minted
-        while appending a missing id comment) that nothing on disk carries —
-        and every abandoned attempt's `_reparse_lines` mutations to
-        `self._last_written_line` leaked through, not just the final one."""
+        """On a persistent conflict the write-back
+        is correctly skipped, and `self._tasks` must not be updated anyway
+        from a parse that never reached disk — that would seed a "ghost" id
+        (minted while appending a missing id comment) that nothing on disk
+        carries — and every abandoned attempt's `_reparse_lines` mutations
+        to `self._last_written_line` must not leak through, only the final
+        one."""
         file_path = task_manager.tasks_dir / "ReindexCasGhost.md"
         original_content = "- [ ] TODO Buy milk\n"
         file_path.write_text(original_content, encoding="utf-8")
@@ -1614,7 +1613,7 @@ class TestListFilterSemanticsMatchDocs:
 
 
 # =============================================================================
-# #853 — Task store hardening: id write-back, atomic writes, id-addressed
+# Task store hardening: id write-back, atomic writes, id-addressed
 # writes, notes body, unknown-field round-trip, cache-field merge-forward,
 # external-edit-wins, CAS retry + conflict, and Syncthing conflict-file skip.
 # =============================================================================
@@ -1682,7 +1681,7 @@ class TestIdWriteBack:
             assert lines_out[i] == original, f"non-task line {i} changed: {lines_out[i]!r}"
 
         # The fenced checkbox line (idx 18) is untouched byte-for-byte and
-        # never indexed as a task — #853 round 1 finding #7.
+        # never indexed as a task.
         assert lines_out[18] == lines_in[18]
         assert task_manager.list_tasks(query="example checkbox") == []
 
@@ -1702,7 +1701,7 @@ class TestIdWriteBack:
         assert file_path.read_bytes() == out_bytes
 
     def test_reindex_preserves_crlf_line_endings(self, task_manager):
-        """#853 round 1 finding #9: a CRLF file must not become LF wholesale
+        """A CRLF file must not become LF wholesale
         when an id gets written back."""
         file_path = task_manager.tasks_dir / "Crlf.md"
         original_bytes = b"# CRLF Tasks\r\n\r\n- [ ] TODO Buy milk\r\n"
@@ -1712,7 +1711,7 @@ class TestIdWriteBack:
 
         out_bytes = file_path.read_bytes()
         assert out_bytes.endswith(b"\r\n")
-        # No bare LF was introduced — every newline is part of a CRLF pair.
+        # No bare LF appears — every newline is part of a CRLF pair.
         assert out_bytes.count(b"\n") == out_bytes.count(b"\r\n")
         lines_out = out_bytes.decode("utf-8").split("\r\n")
         assert lines_out[0] == "# CRLF Tasks"
@@ -1721,7 +1720,7 @@ class TestIdWriteBack:
         assert lines_out[3] == ""  # trailing terminator preserved
 
     def test_reindex_preserves_missing_trailing_newline(self, task_manager):
-        """#853 round 1 finding #9: a file with no final newline must not
+        """A file with no final newline must not
         gain one just because an id got written back to one of its lines."""
         file_path = task_manager.tasks_dir / "NoTrailingNewline.md"
         content = "# No Trailing Newline\n\n- [ ] TODO Buy milk"
@@ -1737,7 +1736,7 @@ class TestIdWriteBack:
 
 
 class TestFencedCodeBlocks:
-    """#853 round 1 finding #7: a checkbox line inside a fenced (``` or
+    """A checkbox line inside a fenced (``` or
     ~~~) code block is documentation/example text, never a real task."""
 
     def test_create_inserts_above_first_real_task_not_inside_fence(self, task_manager):
@@ -1768,7 +1767,7 @@ class TestFencedCodeBlocks:
 
 
 class TestDuplicateIds:
-    """#853 round 1 finding #8: two task lines sharing the same id comment
+    """Two task lines sharing the same id comment
     (e.g. a hand-copied line) must not fight over it forever."""
 
     def test_duplicate_id_gets_a_fresh_id_and_both_are_indexed(self, task_manager):
@@ -1804,7 +1803,7 @@ class TestDuplicateIds:
         assert file_path.read_bytes() == before
 
     def test_cross_file_duplicate_id_resolved_on_rebuild(self, task_manager):
-        """#853 round 2 finding #3: a same-file duplicate id is deduplicated
+        """A same-file duplicate id is deduplicated
         by `_reparse_lines` already, but two DIFFERENT files each carrying
         `<!-- id:dupe0001 -->` were never deduplicated — `rebuild_index`
         just let whichever file was parsed last silently win in
@@ -1863,7 +1862,7 @@ class TestIdAddressedWrites:
         updated = task_manager.update(task_a.id, description="Task A updated")
 
         assert updated.description == "Task A updated"
-        # #853 round 1 finding #16: every line except task A's own must be
+        # Every line except task A's own must be
         # byte-identical before and after — not just spot-checked strings.
         after_lines = file_path.read_text(encoding="utf-8").splitlines()
         assert len(after_lines) == len(before_lines)
@@ -1893,7 +1892,7 @@ class TestNotesBody:
         body_end = task_line_idx + 1
         while body_end < len(before_lines) and before_lines[body_end].lstrip().startswith(">"):
             body_end += 1
-        # #853 round 1 finding #16: the remaining file must equal the
+        # The remaining file must equal the
         # fixture minus exactly the task's line and its body lines — not
         # just "the description string is gone somewhere."
         expected_lines = before_lines[:task_line_idx] + before_lines[body_end:]
@@ -2061,10 +2060,11 @@ class TestExternalEditWins:
 
 
 class TestCasRewriteAbsorbsUnreindexedExternalEdit:
-    """#853 round 1 finding #5: `_cas_rewrite` used to build its replacement
-    purely from `self._tasks`, so an external edit that had landed on disk
+    """`_cas_rewrite` must not build its replacement
+    purely from `self._tasks`: an external edit that had landed on disk
     but not yet been through `reindex_file` (the normal case under the
-    watcher's 2s debounce, not a rare race) was silently reverted by an
+    watcher's 2s debounce, not a rare race) must not be silently reverted
+    by an
     unrelated field update."""
 
     def test_update_preserves_unreindexed_external_retitle_and_body(self, task_manager):
@@ -2106,7 +2106,7 @@ class TestCasRewriteAbsorbsUnreindexedExternalEdit:
         assert "#agent-running" in final_content
 
     def test_update_preserves_unreindexed_external_body_only_edit(self, task_manager):
-        """#853 round 2 finding #4: `test_update_preserves_unreindexed_
+        """`test_update_preserves_unreindexed_
         external_retitle_and_body` changes the task LINE (a retitle) and the
         body together, so it stays green even if `_external_edit_pending`'s
         notes-comparison branch is deleted — the raw-line comparison alone
@@ -2131,10 +2131,10 @@ class TestCasRewriteAbsorbsUnreindexedExternalEdit:
 
 
 class TestMoveTaskConflict:
-    """#853 round 1 finding #6: a context-change move used to remove the
+    """A context-change move must not remove the
     block from the source file BEFORE inserting into the destination — if
-    the destination insert then raised, the task was in neither file while
-    the index still pointed at the source."""
+    the destination insert then raises, the task must not end up in
+    neither file while the index still points at the source."""
 
     def test_destination_conflict_leaves_task_in_source_only(self, task_manager, monkeypatch):
         task = task_manager.create("Move me", context="MoveSrc", notes="keep this body")
@@ -2167,9 +2167,9 @@ class TestMoveTaskConflict:
     def test_source_conflict_rollback_leaves_index_pointing_at_intact_source(
         self, task_manager, monkeypatch
     ):
-        """#853 round 2 finding #1: when the destination insert succeeds and
+        """When the destination insert succeeds and
         the SOURCE removal then raises `TaskConflictError`, the best-effort
-        rollback used to run `_external_edit_pending` against a stale
+        rollback must not run `_external_edit_pending` against a stale
         (still-the-source) `self._last_written_line`, treat the freshly
         inserted destination block as an unabsorbed external edit, restamp
         and absorb it into `self._tasks` via `reindex_file` (context/
@@ -2219,10 +2219,10 @@ class TestMoveTaskConflict:
         assert "[priority:: high]" in final_content
 
     def test_uncontended_move_does_not_reindex_or_extra_write(self, task_manager, monkeypatch):
-        """#853 round 3 finding #1: seeding `self._last_written_line[task.id]`
+        """Seeding `self._last_written_line[task.id]`
         with the destination's just-written line unconditionally, right
         after the destination insert (rather than only if the source-side
-        removal later raises), made the source removal's
+        removal later raises), would make the source removal's
         `_external_edit_pending` check compare the still-on-disk source
         line against that destination line. They always mismatch (fresh
         `updated_at`), so an ordinary, uncontended move triggered a
@@ -2268,7 +2268,7 @@ class TestMoveTaskConflict:
 
 
 class TestFieldValidation:
-    """#853 round 1 findings #2 and #3: description/notes/fields content
+    """Description/notes/fields content
     that would corrupt the task line's format, or a `fields` key that
     shadows a reserved attribute (or the id comment), is rejected with
     `ValueError` rather than silently corrupting the line or hijacking
@@ -2341,10 +2341,11 @@ class TestFieldValidation:
 
 
 class TestStatusValidation:
-    """#853 round 1 finding #11: `status` was accepted unchecked by the
-    manager — `status="Done"` silently wrote a `[ ]` (unrecognized symbol
-    falls back to a blank checkbox) and round-tripped as `Done` until the
-    next reindex flipped it back to `todo`."""
+    """`status` must be validated by the
+    manager, not accepted unchecked — an unvalidated `status="Done"` would
+    silently write a `[ ]` (unrecognized symbol falls back to a blank
+    checkbox) and round-trip as `Done` until the next reindex flipped it
+    back to `todo`."""
 
     def test_create_rejects_unrecognized_status(self, task_manager):
         with pytest.raises(ValueError):
@@ -2384,10 +2385,11 @@ class TestCasRetryAndConflict:
         assert len(reindex_calls) == 3
 
     def test_update_conflict_leaves_in_memory_task_unchanged(self, task_manager, monkeypatch):
-        """#853 round 1 finding #4: `update.apply()` used to mutate
-        `self._tasks[task_id]` in place via `setattr`, so even a losing CAS
-        attempt's edits were visible through `get()` — the file kept the old
-        description but memory had the new one. `compute()` must build a
+        """`update.apply()` must not mutate
+        `self._tasks[task_id]` in place via `setattr`: that would leave a
+        losing CAS attempt's edits visible through `get()` — the file
+        keeping the old description while memory had the new one.
+        `compute()` must build a
         new `Task` from a copy and `_cas_rewrite` must rebind
         `self._tasks[task_id]` only on the success branch."""
         task = task_manager.create("Original description", context="CasTest3")
@@ -2408,9 +2410,9 @@ class TestCasRetryAndConflict:
         assert file_path.read_text(encoding="utf-8") == before_content
 
     def test_swap_tag_conflict_leaves_in_memory_task_unchanged(self, task_manager, monkeypatch):
-        """#853 round 1 finding #4, swap_tag half: same in-place-mutation
-        bug in swap_tag's `compute()` closure — the index would show the new
-        tag while the vault still had the old one."""
+        """The same in-place-mutation risk applies to
+        swap_tag's `compute()` closure — a mutating closure would let the
+        index show the new tag while the vault still had the old one."""
         task = task_manager.create("Swap conflict", context="CasTest4", tags=["agent"])
         file_path = task_manager.tasks_dir / "CasTest4.md"
         before_content = file_path.read_text(encoding="utf-8")
@@ -2435,8 +2437,8 @@ class TestCasRetryAndConflict:
 
 
 class TestCreateCasRetryAndConflict:
-    """#853 round 1 finding #15: `_cas_insert_at_top` (the create path) had
-    no manager-level retry/conflict test — only a mocked-manager route test
+    """`_cas_insert_at_top` (the create path) needs a
+    manager-level retry/conflict test, not just a mocked-manager route test
     (`test_create_task_conflict_is_409`)."""
 
     def test_create_retries_three_times_then_raises_conflict(self, task_manager, monkeypatch):
@@ -2506,7 +2508,7 @@ class TestConflictFiles:
         assert not is_conflict_file(Path("Inbox.md"))
 
     def test_is_conflict_file_matches_any_suffix_after_the_marker(self):
-        """#853 round 1 finding #10: the criterion is `*.sync-conflict-*`,
+        """The criterion is `*.sync-conflict-*`,
         not Syncthing's own `-YYYYMMDD-HHMMSS-DEVICEID` timestamp format —
         match the substring regardless of what follows it."""
         assert is_conflict_file(Path("Inbox.sync-conflict-foo.md"))
@@ -2555,7 +2557,7 @@ class TestAtomicWriteIntegration:
         assert len(calls) >= 1
         for src, dst in calls:
             assert Path(src).parent == Path(dst).parent
-        # #853 round 1 finding #16: the task markdown file itself must be
+        # The task markdown file itself must be
         # among the atomically-written destinations, not just "some file
         # was written via os.replace" (the index write alone satisfies the
         # old assertion).

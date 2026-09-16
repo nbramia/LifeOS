@@ -1,7 +1,7 @@
 """Unit tests for the shared post-turn conversation titling seam
 (api/services/conversation_titler.py) — the one titling implementation
 shared by the native chat turn (api/routes/chat.py), the Hermes proxy tee
-(api/routes/hermes_proxy.py), and the #711 voice tee (api/routes/voice.py).
+(api/routes/hermes_proxy.py), and the voice tee (api/routes/voice.py).
 
 Wiring — that each of those three surfaces actually calls
 ``schedule_retitle()`` at the right point — is covered by call-site tests in

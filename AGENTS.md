@@ -161,7 +161,7 @@ For smaller tasks, a brief inline plan suffices:
 The default assumption is that your code is wrong, not the test. Before modifying any test, answer:
 1. What was this test originally meant to verify?
 2. Why is it failing — what specific change caused it?
-3. Is the correct fix to (a) fix your code, (b) update the test for intentionally changed behavior, or (c) remove the test because the behavior no longer exists?
+3. Is the correct fix to (a) fix your code, (b) update the test for intentionally changed behavior, or (c) remove the test because the behavior isn't there anymore?
 
 Option (a) is the default. Options (b) and (c) require explicit justification.
 
@@ -416,7 +416,7 @@ Full standards in [docs/AGENTS.md](docs/AGENTS.md). Key rules:
 - **No task lists in specs.** Specs describe target state. Tasks go in `docs/plans/` or GitHub issues.
 - **Synthetic data only** in all examples and test fixtures.
 - **Completed plans** must be moved to `docs/plans/archive/`.
-- **Current behavior only, everywhere.** Docs, code comments, docstrings, and test docstrings describe the system as it is — no "before/now", review rounds, findings, or issue/PR numbers cited as history. Git history holds that narrative.
+- **Current behavior only, everywhere.** Docs, code comments, docstrings, and test docstrings describe the system as it is — no temporal before/after comparisons, no review-round or reviewer-finding narration, and no issue/PR numbers cited as history. Git history holds that narrative.
 - **PR descriptions are short summaries.** No verification matrix, evidence section, or risk table required for work outside the named risk triggers — see [Development Lifecycle](docs/specs/standards/development-lifecycle.md#risk-and-review).
 
 ---

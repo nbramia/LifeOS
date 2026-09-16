@@ -85,7 +85,7 @@ class _FakeProc:
     """Minimal subprocess.Popen substitute for stream-parsing tests.
 
     `on_wait` lets a test simulate the operator (or a lineage cascade) flipping
-    the session row to FAILED while `wait()` blocks — the #379 kill-guard case.
+    the session row to FAILED while `wait()` blocks — the kill-guard case.
     """
     def __init__(self, lines: list[dict], returncode: int = 0, stderr_text: str = "",
                  pid: int = 12345, on_wait=None):
@@ -160,7 +160,7 @@ def test_executor_handles_full_stream(stores, monkeypatch, tmp_path):
     outcome = executor.execute(session, {"description": "say hi", "working_dir": str(tmp_path)})
     assert outcome.status == STATUS_COMPLETED
     assert outcome.final_text == "Hello world"
-    # The executor no longer streams agent messages to Telegram — the worker
+    # The executor must not stream agent messages to Telegram — the worker
     # sends the final message once on completion. Only heartbeats (suppressed
     # here) would reach the callback mid-run, so it stays empty.
     assert notifications == []
@@ -171,10 +171,10 @@ def test_executor_handles_full_stream(stores, monkeypatch, tmp_path):
 
 @pytest.mark.unit
 def test_codex_completed_event_persists_final_text(stores, tmp_path):
-    """The `codex_completed` transcript event carries the final text itself
-    (#429): a spawned codex child never streams to the operator, so this event
+    """The `codex_completed` transcript event carries the final text itself:
+    a spawned codex child never streams to the operator, so this event
     is the parent's only path to the child's output (via _child_final_text) —
-    parity with claude_code_completed (#349)."""
+    parity with claude_code_completed."""
     sess_store, tr_store = stores
     session = sess_store.create(
         task_id="t-ft", session_id="sess_codex_ft", status="claimed",
@@ -208,7 +208,7 @@ def test_codex_completed_event_persists_final_text(stores, tmp_path):
 
 @pytest.mark.unit
 def test_codex_completed_event_and_outcome_carry_exit_meta(stores, tmp_path):
-    """#760: the terminal transcript event (and the ExecutorOutcome the
+    """The terminal transcript event (and the ExecutorOutcome the
     worker's earned-completion gate reads) both carry how the subprocess
     ended — returncode, timed_out, and whether a genuine terminal stream
     event (`turn.completed`) was actually seen, not just inferred from a
@@ -279,8 +279,8 @@ def test_codex_returncode_zero_without_terminal_event_flags_exit_meta(stores, tm
 def test_high_cost_does_not_cap_subscription_route(stores, monkeypatch, tmp_path):
     """Codex is subscription-billed — a high reported cost must NOT cap the task.
     Only the managed/API route enforces a dollar cap. Here the turn reports
-    2M+2M tokens (~$70 rolled up) against a $0.001 cap; under the old behavior
-    that was BUDGET_EXCEEDED, now it completes (cost is tracked, not enforced)."""
+    2M+2M tokens (~$70 rolled up) against a $0.001 cap; the cost is tracked,
+    not enforced, so it completes rather than hitting BUDGET_EXCEEDED."""
     monkeypatch.setattr(
         "api.services.agent_worker.codex_executor.settings.claude_max_cost_usd",
         0.001,
@@ -572,7 +572,7 @@ def test_executor_rejects_empty_prompt(stores, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# #379 — operator kill terminates the local codex subprocess (parity with
+# Operator kill terminates the local codex subprocess (parity with
 # the claude_code executor coverage)
 # ---------------------------------------------------------------------------
 
@@ -708,7 +708,7 @@ def test_codex_cancelled_clean_return_cannot_publish_completion(stores, tmp_path
 
 @pytest.mark.unit
 def test_codex_clean_completion_wins_over_raced_failed_flip(stores, tmp_path):
-    """#379 cascade-race guard: if the row is flipped FAILED mid-run (e.g. a
+    """Cascade-race guard: if the row is flipped FAILED mid-run (e.g. a
     lineage-budget cascade) but the codex subprocess exits 0 — it finished its
     work — the COMPLETED path wins: status COMPLETED, a `codex_completed` event,
     and NOT REASON_KILLED / no `codex_killed`. The returncode gate prevents the

@@ -210,11 +210,11 @@ class TestQueryMessagesDateFilters:
     """Regression tests for date-bound handling in query_messages.
 
     Guards the orchestrator's get_message_history path, which passes date
-    bounds as 'YYYY-MM-DD' strings (previously crashed on str.isoformat) and
-    issues single-day queries for 'yesterday'/'on <date>' (previously returned
-    nothing because a date-only end collapsed to midnight). Timestamps are at
-    11:00/13:00 UTC so the target day resolves correctly for any realistic
-    local timezone.
+    bounds as 'YYYY-MM-DD' strings (str.isoformat must not be called on a
+    plain string) and issues single-day queries for 'yesterday'/'on <date>'
+    (a date-only end must not collapse to midnight and return nothing).
+    Timestamps are at 11:00/13:00 UTC so the target day resolves correctly
+    for any realistic local timezone.
     """
 
     @pytest.fixture
@@ -233,7 +233,7 @@ class TestQueryMessagesDateFilters:
             Path(f.name).unlink(missing_ok=True)
 
     def test_string_bounds_do_not_crash(self, store_with_dated_msgs):
-        # Regression: string bounds previously raised AttributeError on .isoformat()
+        # String bounds must not raise AttributeError on .isoformat()
         msgs = store_with_dated_msgs.query_messages(
             entity_id="entity-date", start_date="2024-06-01", end_date="2024-06-30"
         )
@@ -269,13 +269,11 @@ class TestQueryMessagesDateFilters:
 
 
 class TestResolveEntityId:
-    """resolve_entity_id / resolve_entity_id_confidence (#346).
+    """resolve_entity_id / resolve_entity_id_confidence.
 
-    imessage.py used to define resolve_entity_id twice: a people_aggregator-
-    based version and an entity_resolver-based version that silently shadowed
-    it (the second definition wins in Python). These tests pin the surviving,
-    entity_resolver-based behavior, and the confidence signal it now surfaces
-    separately — a bare id can't tell a confident match from an ambiguous one.
+    These tests pin the entity_resolver-based resolve_entity_id behavior,
+    and the confidence signal it surfaces separately — a bare id can't
+    tell a confident match from an ambiguous one.
     """
 
     ENTITY_ID = "11111111-2222-3333-4444-555555555555"
@@ -501,7 +499,7 @@ def _make_synthetic_chat_db(path: Path, message_count: int) -> None:
 
 
 class TestExportConnectionLifecycle:
-    """Regression tests for the file-descriptor leak in the export path (#647).
+    """Tests for the file-descriptor leak risk in the export path.
 
     `with sqlite3.connect(...)` is a *transaction* context manager, not a
     closing one: it commits but leaves the connection (and its fds) open. One
@@ -622,8 +620,7 @@ class TestExportConnectionLifecycle:
 
         The store runs in WAL mode, so an export's writes can still be sitting
         in the -wal sidecar. `shutil.copy2` takes only the main database file,
-        which is how the Apple export shipped a database missing its newest
-        messages (#647).
+        which risks shipping a database missing its newest messages.
 
         SQLite checkpoints on its own when the *last* connection closes, so the
         gap only opens when something else holds the database open — the API
@@ -648,8 +645,8 @@ class TestExportConnectionLifecycle:
 
 
 class TestQueryPathConnectionsClose:
-    """Regression tests for #678: the 9 query-path connections now use
-    `contextlib.closing`, matching the export-path fix in #647.
+    """The 9 query-path connections use
+    `contextlib.closing`, matching the export-path connection handling.
 
     Counting live fds (as TestExportConnectionLifecycle does) can't tell a
     real fix from a no-op here: CPython's refcounting already closes a

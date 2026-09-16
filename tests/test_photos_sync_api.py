@@ -41,12 +41,12 @@ class TestPhotosSyncEndpoint:
         assert "error" not in data
 
     def test_sync_failure_carries_top_level_error(self, client, photos_enabled):
-        """#609 made a total sync failure legible (top-level `error` key,
-        previously the failure detail only lived nested inside
-        `stats["error"]`, invisible to the generic top-level check); #614
-        decided a total failure must also report non-2xx, since a consumer
-        that only checks HTTP status (`raise_for_status()`) should get
-        correct behavior without knowing about the body convention. 500
+        """A total sync failure must be legible (top-level `error` key,
+        not nested inside `stats["error"]` where the generic top-level
+        check would miss it) and must also report non-2xx, since a
+        consumer that only checks HTTP status (`raise_for_status()`)
+        should get correct behavior without knowing about the body
+        convention. 500
         because this is an unhandled exception, not a classified
         upstream/dependency failure."""
         with patch(

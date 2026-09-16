@@ -79,7 +79,7 @@ class TestHandlerScheduling:
         assert calls == []
 
     def test_skips_sync_conflict_file(self):
-        """#853: a Syncthing conflict copy is never a reindex source."""
+        """A Syncthing conflict copy is never a reindex source."""
         calls = []
         handler = _TaskFileHandler(lambda p: calls.append(p))
         handler.on_modified(_FakeEvent("/x/Tasks/Inbox.sync-conflict-20260101-120000-ABCDEFG.md"))
@@ -87,7 +87,7 @@ class TestHandlerScheduling:
         assert calls == []
 
     def test_skips_syncthing_temp_file(self):
-        """#853: a Syncthing in-progress temp file is never a reindex source.
+        """A Syncthing in-progress temp file is never a reindex source.
 
         This particular path is dropped by `on_modified`'s `.endswith(".md")`
         check before `is_conflict_file` ever runs — kept as-is because it

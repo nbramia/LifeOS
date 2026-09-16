@@ -334,7 +334,7 @@ class IMessageStore:
 
         # One destination connection for the whole export. Reconnecting per
         # batch leaks a file descriptor each time and dies at the default
-        # macOS `ulimit -n` of 256 partway through a full export (#647).
+        # macOS `ulimit -n` of 256 partway through a full export.
         with closing(sqlite3.connect(self.storage_path)) as dest_conn:
             batch = []
             max_rowid = last_rowid
@@ -411,7 +411,7 @@ class IMessageStore:
         generator itself is running, so a sqlite3.OperationalError raised by
         the consumer's loop body — i.e. while writing to the *destination*
         database — can never be misreported as a Full Disk Access problem on
-        the source (#647).
+        the source.
         """
         try:
             with closing(
@@ -438,7 +438,7 @@ class IMessageStore:
             conn: Optional caller-owned connection to reuse. Exports pass the
                 connection they hold open for the whole run; opening one per
                 batch exhausts the process file-descriptor limit on a full
-                export (see issue #647).
+                export.
         """
         sql = """
             INSERT OR REPLACE INTO messages
@@ -459,7 +459,7 @@ class IMessageStore:
         The store runs in WAL mode, so recent writes live in a ``-wal`` sidecar
         until a checkpoint. Anything that copies ``storage_path`` as a single
         file — the Apple export does — silently ships a stale database unless
-        the WAL has been folded in first (#647).
+        the WAL has been folded in first.
 
         SQLite checkpoints automatically when the last connection closes, but
         that is skipped whenever any other connection is still open, which
@@ -545,7 +545,7 @@ class IMessageStore:
         Args:
             phone: E.164 format phone number
             limit: Maximum messages to return
-            since: Only return messages after this time
+            since: Only return messages newer than this time
 
         Returns:
             List of IMessageRecord objects, most recent first
@@ -595,7 +595,7 @@ class IMessageStore:
         Args:
             entity_id: PersonEntity ID
             limit: Maximum messages to return
-            since: Only return messages after this time
+            since: Only return messages newer than this time
 
         Returns:
             List of IMessageRecord objects, most recent first
@@ -709,8 +709,8 @@ class IMessageStore:
             entity_id: Filter by PersonEntity ID
             phone: Filter by E.164 phone number
             search_term: Search within message text (case-insensitive)
-            start_date: Only messages after this datetime
-            end_date: Only messages before this datetime
+            start_date: Only messages newer than this datetime
+            end_date: Only messages older than this datetime
             direction: "sent" for is_from_me=1, "received" for is_from_me=0
             limit: Maximum messages to return
 
@@ -1109,8 +1109,8 @@ def query_person_messages(
     Args:
         entity_id: PersonEntity ID to query messages for
         search_term: Optional text to search within messages
-        start_date: Only include messages after this date
-        end_date: Only include messages before this date
+        start_date: Only include messages newer than this date
+        end_date: Only include messages older than this date
         limit: Maximum messages to return (default 100)
 
     Returns:

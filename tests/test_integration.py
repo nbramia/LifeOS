@@ -222,7 +222,7 @@ Had an interesting thought about product strategy today.
 """)
 
         # Wait for the watcher's batch debounce to flush and index the file,
-        # rather than sleeping a fixed duration that can undershoot it (#839).
+        # rather than sleeping a fixed duration that can undershoot it.
         def _indexed():
             return any(fp.endswith("new_thought.md") for fp in indexer.vector_store.get_all_file_paths())
 

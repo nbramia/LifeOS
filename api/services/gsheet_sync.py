@@ -35,7 +35,7 @@ def journal_notes_configured() -> bool:
     output enabled — i.e. this install actually generates files under
     `Personal/Journal/` via this pipeline.
 
-    `api/routes/vault.py` (#769) uses this alongside the journal persona's
+    `api/routes/vault.py` uses this alongside the journal persona's
     Telegram-bot signal to decide whether to reserve that subtree: the two
     are independent config surfaces (a sheet can be wired up here with no
     Telegram bot ever configured, or vice versa), so either one alone must
@@ -60,7 +60,7 @@ def journal_notes_configured() -> bool:
         # breaks the `.get()` chain above (e.g. `sheets: null`, a sheet
         # entry that isn't a mapping) — be conservative rather than
         # silently treating this the same as "not configured" (mirrors the
-        # config_load_error distinction in _load_config below, #687): a
+        # config_load_error distinction in _load_config below): a
         # config typo must not silently drop the reservation an install
         # depends on. Broad on purpose — this only ever *loosens* nothing,
         # since the caller (api/routes/vault.py) only reserves more when
@@ -124,10 +124,10 @@ class GSheetSyncService:
         self.vault_path = vault_path or settings.vault_path
         self.db_path = db_path or get_gsheet_sync_db_path()
         self.configs: list[SheetConfig] = []
-        # Distinguishes "no config" (skip -- issue #687) from "config present
+        # Distinguishes "no config" (skip) from "config present
         # but failed to parse/load" (a real error -- a hand-edited YAML with
         # broken indentation must not be reported as "not configured" while
-        # the file sits right there. Adversarial review of #687.)
+        # the file sits right there.)
         self.config_load_error: Optional[str] = None
         self._load_config()
         self._init_db()
@@ -221,7 +221,7 @@ class GSheetSyncService:
             conn.commit()
 
     def _get_all_synced_entries(self, sheet_id: str) -> list[dict]:
-        """Get all previously synced entries for rebuilding rolling doc."""
+        """Get all synced entries for rebuilding rolling doc."""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute(
                 """SELECT entry_date, raw_data FROM synced_rows
@@ -657,9 +657,9 @@ class GSheetSyncService:
                 # hand-edited gsheet_sync.yaml with broken indentation) --
                 # this is a real error, not "not configured", and must not
                 # be reported as a quiet skip while the broken file sits
-                # right there. Same principle #687 applies to Monarch:
+                # right there. The same principle applies to Monarch:
                 # absence of config and presence of errors must not be
-                # conflated. Adversarial review of #687.
+                # conflated.
                 logger.error(
                     f"GSheet sync config exists but failed to load: {self.config_load_error}"
                 )
@@ -672,7 +672,7 @@ class GSheetSyncService:
             # gsheet_sync.yaml pipeline set up, there's nothing to sync.
             # Flagging this distinctly lets the caller emit SYNC_SKIPPED
             # instead of a zero-count "success" that's indistinguishable
-            # from a real (if quiet) run — issue #687.
+            # from a real (if quiet) run.
             logger.info("No sheets configured for GSheet sync")
             stats["status"] = "skipped"
             stats["reason"] = "gsheet_sync_not_configured"

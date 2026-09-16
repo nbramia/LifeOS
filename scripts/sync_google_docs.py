@@ -45,7 +45,7 @@ def sync_google_docs(dry_run: bool = True) -> dict:
 
         # Canonical line consumed by run_all_syncs._parse_sync_output. "Docs
         # synced" matches none of the fallback regexes, so this phase reported
-        # 0/0/0 nightly despite doing real work (#496).
+        # 0/0/0 nightly despite doing real work.
         from api.services.sync_health import emit_sync_stats
         emit_sync_stats({
             "processed": int(results.get("synced", 0) or 0),
@@ -66,7 +66,7 @@ def main(argv=None):
 
     # A sync that died outright (e.g. expired OAuth before any doc synced)
     # must exit nonzero so run_all_syncs records FAILED and alerts instead of
-    # silent success — issue #438. The duration-collapse backstop can't catch
+    # silent success. The duration-collapse backstop can't catch
     # this source: its typical ~12s is below the 60s detection gate.
     if results.get("status") == "error":
         logger.error(

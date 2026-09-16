@@ -88,7 +88,7 @@ class TestManageTasksCreate:
         assert tasks[0].context == "Inbox"
 
     def test_create_forwards_status_notes_fields(self, tm):
-        """#853: status/notes/fields are threaded through the chat tool too."""
+        """status/notes/fields are threaded through the chat tool too."""
         _tool_manage_tasks({
             "action": "create",
             "description": "Waiting on legal",
@@ -125,7 +125,7 @@ class TestUnknownAction:
 
 
 class TestManageTasksCreateBadStatus:
-    """#853 round 1 finding #11: `TaskManager.create` now raises `ValueError`
+    """`TaskManager.create` raises `ValueError`
     for an unrecognized `status`. Through the chat tool boundary
     (`execute_tool`, which wraps every handler in try/except and formats an
     exception as an "Error: ..." string) that must come back as an error
@@ -182,7 +182,7 @@ class TestManageTasksFilterDocs:
         assert "cancelled" in lowered and "todo" in lowered
 
     def test_tags_rule_forbids_uninvited_routing_tags(self, props):
-        """#804: an assistant that invents a routing tag (#local, #claude, ...)
+        """An assistant that invents a routing tag (#local, #claude, ...)
         on a task the operator didn't ask to be routed launders its own engine
         preference into the highest-precedence slot — routing tags outrank
         every other routing safeguard. The tags field must say so."""

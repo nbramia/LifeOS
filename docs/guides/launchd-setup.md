@@ -6,7 +6,7 @@
 
 > **This guide is superseded by [ADR-007: Linux Migration](../adr/007-linux-migration.md).**
 >
-> LifeOS no longer ships a macOS-as-primary-server deployment. The Linux migration (ADR-007) moved the API server, ChromaDB, embedding pipeline, sync, agent worker, and LLM orchestration to a Linux workstation under **systemd** (`./scripts/setup-systemd.sh`).
+> LifeOS does not ship a macOS-as-primary-server deployment. The Linux migration (ADR-007) moved the API server, ChromaDB, embedding pipeline, sync, agent worker, and LLM orchestration to a Linux workstation under **systemd** (`./scripts/setup-systemd.sh`).
 >
 > The original content of this guide (`com.lifeos.api`, `com.lifeos.crm-sync`, `com.lifeos.chromadb` launchd plists and the ChromaDB cron watchdog) is preserved in git history if you need it for a legacy Mac Mini deployment.
 

@@ -133,14 +133,13 @@ class TestMCPServerToolDiscovery:
             assert expected in tool_names, f"Missing tool: {expected}"
 
     def test_task_create_tags_advertised_as_array(self, openapi_spec):
-        """Regression for #609: the incident that prompted this issue traced
-        back to `lifeos_task_create`'s `tags` field being advertised as
-        `"type": "string"` before #603's `_unwrap_optional` fix. A
-        schema-following model sent a string, the write 400'd, and (per the
-        incident) the failure wasn't surfaced as such. `_unwrap_optional` is
-        exactly the code that could regress and reintroduce the mistyping —
-        pin the schema shape directly so a regression is caught here instead
-        of by another incident.
+        """`lifeos_task_create`'s `tags` field must be advertised as
+        `"type": "array"`, not `"type": "string"` — a schema-following
+        model that sees the wrong type sends a string, and the write
+        400s without the failure being surfaced as a schema problem.
+        `_unwrap_optional` is exactly the code that could regress and
+        reintroduce the mistyping — pin the schema shape directly so a
+        regression is caught here.
         """
         import importlib.util
         from unittest.mock import patch
@@ -163,7 +162,7 @@ class TestMCPServerToolDiscovery:
         assert "items" in tags_schema, "'tags' array schema is missing 'items'"
 
     def test_task_tags_description_forbids_uninvited_routing_tags(self, openapi_spec):
-        """#804: an assistant filing a task must add exactly the tags the
+        """An assistant filing a task must add exactly the tags the
         operator named — a routing tag (#local/#claude/#codex/#cloud*) only
         if the operator explicitly named that engine, because routing tags
         are operator-authority and outrank every other routing safeguard.
@@ -342,7 +341,7 @@ class TestAPIOpenAPISync:
 
 
 # ---------------------------------------------------------------------------
-# Tool description sizing (#139 §1) — keep cache_creation cheap.
+# Tool description sizing — keep cache_creation cheap.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
@@ -375,7 +374,7 @@ def test_curated_endpoint_descriptions_average_under_30_words():
 
 
 # ---------------------------------------------------------------------------
-# Per-session tool result cache integration (#139 §4)
+# Per-session tool result cache integration
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
@@ -617,7 +616,7 @@ def test_people_search_formatter_falls_back_to_page_size_without_total():
 
 
 # ---------------------------------------------------------------------------
-# Investments snapshot tool (#447)
+# Investments snapshot tool
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
@@ -691,9 +690,10 @@ def test_investments_format_digest():
 
 @pytest.mark.unit
 def test_investments_format_lists_all_positions():
-    """The MCP digest must include a beyond-top-15 holding (regression for #452,
-    where SPCX at rank 44 was silently dropped by a [:15] cap). Mirrors the
-    search_finances 'investments' digest, so header/format stay consistent."""
+    """The MCP digest must include a beyond-top-15 holding — a [:15] cap
+    would silently drop a low-rank position like SPCX at rank 44. Mirrors
+    the search_finances 'investments' digest, so header/format stay
+    consistent."""
     import importlib.util
     spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
     module = importlib.util.module_from_spec(spec)
@@ -776,18 +776,18 @@ def test_investments_format_tolerates_null_fields():
 
 
 # ---------------------------------------------------------------------------
-# Turn-context tool (#591)
+# Turn-context tool
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
 def test_turn_context_tool_curated_and_registered(openapi_spec, monkeypatch):
-    """lifeos_turn_context is a curated GET tool exposing the #591 per-turn
+    """lifeos_turn_context is a curated GET tool exposing the per-turn
     context endpoint, with a description telling clients to read it at the
     start of a turn, and it appears on the built tool surface.
 
     Builds the server against the in-process OpenAPI spec (this checkout's
     code), not whatever's live on localhost:8000 — a running server may
-    still be on pre-#591 code and wouldn't have this path yet.
+    not have this path yet.
     """
     import importlib.util
     spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
@@ -834,7 +834,7 @@ def test_investments_route_404_matches_mcp_not_synced_branch(tmp_path, monkeypat
 
 
 # ---------------------------------------------------------------------------
-# _handle_sync_trigger (#609) — the custom_handler for lifeos_sync_trigger.
+# _handle_sync_trigger — the custom_handler for lifeos_sync_trigger.
 # It bypasses the generic _call_api HTTP wrapper, so its own error-signaling
 # needs its own coverage rather than inheriting the generic tests above.
 # ---------------------------------------------------------------------------
@@ -881,7 +881,7 @@ def test_sync_trigger_known_source_routes_to_the_right_endpoint():
 def test_sync_trigger_whatsapp_is_no_longer_invalid():
     """WhatsApp has no dedicated route_map entry — it has no standalone
     nightly sync of its own, its data arrives via the combined apple_import
-    step (#784) — so it must fall through to the same fallback-list
+    step — so it must fall through to the same fallback-list
     handling gmail/imessage/linkedin already get, not "Invalid source"."""
     from unittest.mock import MagicMock
     server = _fresh_server()
@@ -917,9 +917,9 @@ def test_sync_trigger_whatsapp_is_no_longer_invalid():
     ],
 )
 def test_sync_trigger_every_source_routes_as_expected(source, expected_url_suffix):
-    """Regression guard for #784: every pre-existing source must keep
-    routing exactly as it does today, with whatsapp now joining the
-    fallback list rather than replacing or shifting anything."""
+    """Every source must keep routing exactly as expected, with whatsapp
+    joining the fallback list rather than replacing or shifting
+    anything."""
     from unittest.mock import MagicMock
     server = _fresh_server()
     fake = MagicMock()
@@ -940,7 +940,7 @@ def test_sync_source_route_accepts_whatsapp():
     """The MCP-level tests above only check the outgoing request URL
     against a mocked client — they'd pass even if the underlying
     `POST /api/crm/sources/{source_type}/sync` route (api/routes/crm.py)
-    still 400'd on "whatsapp". Exercise the real route directly (#784);
+    still 400'd on "whatsapp". Exercise the real route directly;
     it does no DB access, so this is safe as a unit test."""
     from fastapi.testclient import TestClient
     from api.main import app
@@ -974,10 +974,9 @@ def test_sync_trigger_downstream_non_2xx_is_an_error():
 @pytest.mark.unit
 def test_sync_trigger_2xx_with_embedded_error_sets_is_error():
     """Defense in depth, generically: even if some future sync source ever
-    reported a failure as a 200 carrying only a top-level `error` key (as
-    `POST /api/admin/calendar/sync` and `POST /api/photos/sync` did before
-    #614 additionally made a total failure non-2xx), `_handle_sync_trigger`
-    passes a 2xx body through unmodified and needs no source-specific
+    reports a failure as a 200 carrying only a top-level `error` key,
+    `_handle_sync_trigger` passes a 2xx body through unmodified and needs
+    no source-specific
     handling — a 200 whose body already carries `error` must still flip
     `dispatch()`'s `isError`, exactly like
     `test_tools_call_sets_is_error_on_tool_failure` in
@@ -1016,7 +1015,7 @@ def test_sync_trigger_2xx_with_embedded_error_sets_is_error():
 
 
 # ---------------------------------------------------------------------------
-# #609: generic, code-driven safety net over every curated write endpoint.
+# Generic, code-driven safety net over every curated write endpoint.
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
@@ -1029,19 +1028,19 @@ class TestWriteEndpointNeverReturnsSuccessShapedFailure:
 
     Flags any `except` block in a route handler that returns normally
     (implicit or explicit 2xx) instead of raising or setting an explicit
-    non-2xx status — the exact shape #603 fixed in `fitness.py` and #609
-    found in two sync routes. This is a static approximation of the real
+    non-2xx status — the shape of failure this scanner exists to catch,
+    both in a route handler like `fitness.py` and in the two sync routes.
+    This is a static approximation of the real
     guarantee, not a substitute for the failure-injection tests elsewhere in
     this suite (e.g. `test_create_task_failure_is_never_success_shaped`) —
     it exists so *future* endpoints get some coverage by construction.
     """
 
     # No current exemptions: `POST /api/admin/calendar/sync` and
-    # `POST /api/photos/sync` were fixed for #609 by adding a top-level
-    # `error` key to their failure body, and #614 additionally made a total
-    # failure return a non-2xx status (see docs/specs/technical/
-    # architecture.md, "Write Endpoint Failure Contract") — both signals are
-    # present now, which this scanner recognizes as safe either way.
+    # `POST /api/photos/sync` carry both signals — a top-level `error` key
+    # in their failure body, and a non-2xx status for a total failure (see
+    # docs/specs/technical/architecture.md, "Write Endpoint Failure
+    # Contract") — which this scanner recognizes as safe either way.
     # Add an entry here (with a tracking issue and a doc note) only for a
     # deliberately accepted gap — never to silence a finding.
     _KNOWN_EXEMPTIONS: set[tuple[str, str]] = set()
@@ -1111,9 +1110,9 @@ class TestWriteEndpointNeverReturnsSuccessShapedFailure:
         """Describe every `except` block in `func` that returns normally
         without either raising, setting an explicit non-2xx status, or
         carrying a top-level `error` key in the response body — the AC's
-        "non-2xx status *or* top-level error" (#609 review discussion),
-        which is what let #609 fix the two sync-trigger routes by adding an
-        additive `error` key instead of changing their status code."""
+        "non-2xx status *or* top-level error", which lets a sync-trigger
+        route add an additive `error` key instead of changing its status
+        code."""
         import ast
         import inspect
         import textwrap

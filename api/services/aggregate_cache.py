@@ -271,7 +271,7 @@ class AggregateCache:
 
         `should_cache`, if given, is called with the resolved kwargs dict
         before anything else; a `False` return bypasses the cache entirely
-        for that call (no read, no store) -- used to keep `/people` search
+        for that call (no read, no store) -- keeps `/people` search
         text and unbounded-`limit` pages out of a long-lived in-memory key.
 
         Intended for a FastAPI route handler, applied directly under
@@ -282,8 +282,8 @@ class AggregateCache:
         parameters from the wrapped function normally.
 
         Only a successful return is ever cached: an exception (including a
-        raised HTTPException for a non-200 response) propagates before this
-        reaches the cache-store step, so an error response is never cached.
+        raised HTTPException for a non-200 response) propagates ahead of
+        the cache-store step, so an error response is never cached.
 
         The returned value is always a deep copy, on both a hit and a miss:
         a caller that mutates its own result in place can never poison the
@@ -389,7 +389,7 @@ class AggregateCache:
                         # read before computing, not whatever it is now: a
                         # commit that lands while `func()` above is running
                         # advances `self._generation` (via a later request's
-                        # own version read) before this store runs, so
+                        # own version read) ahead of this store's write, so
                         # storing unconditionally would cache a pre-write
                         # result under the post-write generation and serve
                         # it for the full TTL -- exactly the staleness this

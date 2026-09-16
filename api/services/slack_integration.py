@@ -46,7 +46,7 @@ SLACK_SCOPES = [
     "im:history",           # Read DM messages
     "mpim:read",            # List group DMs
     "mpim:history",         # Read group DM messages
-    "search:read",          # search.messages (day-pull endpoint — issue #441)
+    "search:read",          # search.messages (day-pull endpoint)
 ]
 
 # Token storage path (anchored to the repo root — see AGENTS.md's data-path idiom
@@ -450,7 +450,7 @@ class SlackClient:
                 channels the authed user is a member of) instead of
                 ``conversations.list`` (every channel in the workspace).
                 Membership scoping avoids ``not_in_channel`` errors on history
-                calls and cuts API volume on large workspaces — issue #439.
+                calls and cuts API volume on large workspaces.
                 Archived channels are excluded (``exclude_archived``) so
                 channels the user was ever a member of don't cost a nightly
                 history call. Note: ``users.conversations`` does not return
@@ -580,8 +580,8 @@ class SlackClient:
         Args:
             channel_id: Channel ID to fetch history for
             workspace_id: Workspace ID
-            oldest: Only fetch messages after this time
-            latest: Only fetch messages before this time
+            oldest: Only fetch messages newer than this time
+            latest: Only fetch messages older than this time
             max_messages: Maximum messages to fetch (safety limit)
 
         Returns:
@@ -642,8 +642,8 @@ class SlackClient:
         Get a thread's replies via ``conversations.replies`` with pagination.
 
         ``conversations.history`` returns only top-level messages, so thread
-        replies are invisible to it — this is the only way to fetch them
-        (issue #440). The parent message (ts == thread_ts) is excluded
+        replies are invisible to it — this is the only way to fetch them.
+        The parent message (ts == thread_ts) is excluded
         whenever the API returns it — it leads the response on unwindowed
         calls, while with ``oldest`` set it is typically absent entirely.
         The parent is already indexed from the history fetch.
@@ -652,7 +652,7 @@ class SlackClient:
             channel_id: Channel containing the thread
             thread_ts: The parent message's ts
             workspace_id: Workspace ID
-            oldest: Only fetch replies after this time (incremental sync)
+            oldest: Only fetch replies newer than this time (incremental sync)
             max_messages: Maximum replies to fetch (safety limit)
 
         Returns:
@@ -734,7 +734,7 @@ class SlackClient:
         bot tokens cannot call this method. Unlike the conversations APIs,
         ``search.messages`` paginates by page number (``paging.pages``), not
         cursors, and searches everything the user can see — including thread
-        replies — in one call (issue #441).
+        replies — in one call.
 
         Args:
             query: Slack search query (e.g. ``from:<@U123> on:2026-07-08``)

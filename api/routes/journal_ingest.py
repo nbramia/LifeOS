@@ -1,9 +1,9 @@
 """
-Journal ring ingestion endpoint (#660).
+Journal ring ingestion endpoint.
 
 Lets a capture device outside the tailnet — the Pebble Index ring is the
 motivating case, transcribing speech on-phone and posting the text — feed
-fragments into the `journal` persona built in #659. It intentionally does
+fragments into the `journal` persona. It intentionally does
 NOT reimplement capture: `_ingest_fragment` below calls the exact same chat
 pipeline entry point (`api.services.telegram.chat_via_api`, with the journal
 persona's preamble) that the journal Telegram bot uses for a typed fragment,
@@ -15,8 +15,8 @@ it calls a delivery captured.
 
 Our own contract (see docs/guides/journal-ring-ingest.md) — the exact shape a
 real Pebble Index webhook sends is unknown until the device ships in March
-2026 (issue #660 is explicit: build against a contract we control, adapt when
-the device is in hand). `_adapt_payload` is the ONLY function that knows the
+2026, so this endpoint is built against a contract we control and adapts
+once the device is in hand. `_adapt_payload` is the ONLY function that knows the
 request body's shape; if a real device's webhook doesn't match, only that
 function should need to change.
 
@@ -66,7 +66,7 @@ def _adapt_payload(body: dict) -> _IngestFields:
     not read any "action" field: the device's on-device LLM may include one
     (its guess at create-note/add-reminder/etc), but honoring it would mean a
     spoken fragment and a typed one get interpreted by two different brains.
-    The ring is transport; the journal persona (#659) is the interpreter.
+    The ring is transport; the journal persona is the interpreter.
     """
     text = str(body.get("text") or "").strip()
     device_id = str(body.get("device_id") or "").strip()
@@ -77,7 +77,7 @@ def _adapt_payload(body: dict) -> _IngestFields:
 
 
 def _dedupe_key(fields: _IngestFields) -> str:
-    """A retried delivery must log once (#660 AC). Prefer a device-supplied
+    """A retried delivery must log once. Prefer a device-supplied
     id when present; otherwise derive the key from the payload itself
     (device_id + timestamp + text) rather than trusting the device to send a
     unique id at all — a flaky-connection retry resends the same three
@@ -109,7 +109,7 @@ def _check_ingest_auth(request: Request) -> None:
 
 
 def _parse_timestamp(value: str) -> None:
-    """Validate the timestamp parses as ISO 8601. Only used to reject a
+    """Validate the timestamp parses as ISO 8601, solely to reject a
     malformed payload cleanly (422) — the log bullet's own HH:MM comes from
     the journal persona's normal "now, local time" convention (same as a
     typed fragment, which carries no separate authored-at time either), not
@@ -125,7 +125,7 @@ async def journal_ring_ingest(request: Request):
 
     Authenticates and validates BEFORE any write: an unauthenticated or
     malformed request writes nothing, not even a log line containing the
-    payload. A previously-seen delivery (same dedupe key) is acknowledged
+    payload. An already-seen delivery (same dedupe key) is acknowledged
     without being reprocessed, so a retry logs once.
     """
     _check_ingest_auth(request)
@@ -186,7 +186,7 @@ async def journal_ring_ingest(request: Request):
         logger.error(f"Journal ring ingest: pipeline error for device {fields.device_id}")
         raise HTTPException(status_code=502, detail="capture pipeline error")
 
-    # #674: "the pipeline returned without raising" is NOT "the fragment was
+    # "the pipeline returned without raising" is NOT "the fragment was
     # written" — that inference is what let a silently-failed capture report
     # `status: "logged"` and burn the delivery's dedupe key, permanently
     # suppressing a genuine retry. Require the pipeline's explicit capture

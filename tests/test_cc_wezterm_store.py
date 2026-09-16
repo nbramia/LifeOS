@@ -74,7 +74,7 @@ def test_db_path_parent_is_created(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# #257 — wezterm_pid column + migration
+# wezterm_pid column + migration
 # ---------------------------------------------------------------------------
 
 

@@ -3,9 +3,9 @@ Remembers Gmail messages that were fetched and deliberately discarded.
 
 The Gmail sync decides a message is marketing only *after* fetching it, and a
 discarded message never produces an interaction row. Since the sync's
-"already seen" set is derived from the interactions table, promotional mail was
-invisible to it and got re-fetched every night for the full 30-day window —
-~13k messages on a busy personal account, dominating the nightly run (#552).
+"already seen" set is derived from the interactions table, promotional mail is
+invisible to it and would be re-fetched every night for the full 30-day window —
+~13k messages on a busy personal account, dominating the nightly run.
 
 This is a sidecar sync-state database, following the pattern already used by
 ``data/slack_sync_timestamps.db`` and ``data/imessage.db``'s ``sync_state``:
@@ -68,7 +68,7 @@ class GmailSkipCache:
             conn.close()
 
     def get_skipped_ids(self, account: str) -> set[str]:
-        """Every message id previously skipped for this account."""
+        """Every message id already skipped for this account."""
         conn = sqlite3.connect(self.db_path)
         try:
             cursor = conn.execute(

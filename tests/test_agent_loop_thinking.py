@@ -1,7 +1,7 @@
 """
-Tests for thinking control on the orchestrator path (#567, follow-up to #566/#570).
+Tests for thinking control on the orchestrator path.
 
-PR #570 added LIFEOS_ROUTER_ENABLE_THINKING for query_router, but run_agent_loop
+LIFEOS_ROUTER_ENABLE_THINKING exists for query_router, but run_agent_loop
 had no equivalent — its two client.astream(...) call sites always let a local
 reasoning model think with no way to turn it off. settings.local_agent_enable_thinking
 closes that gap.
@@ -77,14 +77,14 @@ def _local_client_with_chunks(chunks):
 @pytest.mark.asyncio
 async def test_local_thinking_enabled_omits_enable_thinking_from_wire_body():
     """With thinking ENABLED, the orchestrator's outgoing body to a LOCAL client
-    is byte-identical to before this setting existed (mirrors #566 PR 2's
-    router-level payload assertion) — asserted at the actual wire body, not a
-    mocked call-kwargs shape.
+    is byte-identical to the plain request shape without this setting
+    (mirrors the router-level payload assertion) — asserted at the actual
+    wire body, not a mocked call-kwargs shape.
 
     The setting is patched explicitly rather than relying on the field default:
-    the default flipped to False in #567 once the measurement showed thinking
-    OFF was 3.2x faster with no quality regression, and this test guards the
-    enabled path regardless of which way the default points."""
+    the default is False because measurement showed thinking OFF is 3.2x
+    faster with no quality regression, and this test guards the enabled
+    path regardless of which way the default points."""
     from api.services import agent_loop
 
     client, async_client = _local_client_with_chunks([

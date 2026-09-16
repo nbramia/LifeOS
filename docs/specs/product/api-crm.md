@@ -671,7 +671,7 @@ Sync Apple Contacts to the CRM. Creates SourceEntity records for all contacts. O
 ## Related Documents
 
 - [api-reference.md](api-reference.md) — Non-CRM API endpoints (chat, search, Google, messaging, tasks, photos, Monarch, admin, etc.)
-- [mcp-tools.md](mcp-tools.md) — MCP tool catalog (the canonical home — was previously duplicated in api-reference.md)
+- [mcp-tools.md](mcp-tools.md) — MCP tool catalog (the canonical home for this content)
 - [crm-ui.md](crm-ui.md) — CRM index pointing at the four product sub-specs
 - [crm-people.md](crm-people.md) — Consumer view of the people endpoints above
 - [crm-interactions.md](crm-interactions.md) — Consumer view of timeline + source integrations

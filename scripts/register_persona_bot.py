@@ -6,7 +6,7 @@ Adding a persona bot today is entirely manual: register the bot with
 variables correctly, and restart the service — with a real landmine along
 the way, since rewriting the environment file in place (rather than
 appending to it) can silently turn a symlink into a plain file and break a
-symlink-based config-sync setup (#601).
+symlink-based config-sync setup.
 
 This script replaces the "hand-edit" step only:
 
@@ -190,7 +190,7 @@ def register_bot(
         # Roll back the registry write so a failed .env append (e.g. a
         # permissions or disk error) never leaves behind a registry entry
         # for env vars that were never actually set. If the override didn't
-        # exist before this call, remove it rather than leaving behind a new
+        # already exist, remove it rather than leaving behind a new
         # file that merely duplicates the template.
         if registry_existed:
             _write_registry(registry_path, entries)

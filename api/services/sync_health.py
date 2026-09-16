@@ -83,8 +83,7 @@ def _is_source_disabled(source: str) -> bool:
     # before ever invoking the script. Without this, an unconfigured
     # install would show gmail_personal/calendar_personal as permanently
     # "never run" in the health summary instead of quietly excluded, since
-    # no sync_runs row is ever written for a source that's pre-skipped —
-    # issue #687.
+    # no sync_runs row is ever written for a source that's pre-skipped.
     if source in ("gmail_personal", "calendar_personal"):
         from pathlib import Path
         credentials_path = Path(__file__).parent.parent.parent / "config" / "credentials-personal.json"
@@ -402,7 +401,7 @@ def _init_schema(conn: sqlite3.Connection):
     if "trigger_source" not in columns:
         migrations.append("ALTER TABLE sync_runs ADD COLUMN trigger_source TEXT DEFAULT 'unknown'")
     if "attempt_count" not in columns:
-        # Issue #541: within-run retry for transient (connectivity/rate-limit)
+        # Within-run retry for transient (connectivity/rate-limit)
         # failures. 1 = succeeded or failed on the first try (no retry
         # attempted); >1 = a retry was needed before the final status. This
         # single column is enough to derive all three states the health
@@ -411,9 +410,9 @@ def _init_schema(conn: sqlite3.Connection):
         # attempt_count>1), and gave-up (status=failed, attempt_count>1 means
         # retries were exhausted; attempt_count=1 means the failure was
         # classified non-transient and never retried).
-        # DEFAULT 1 makes every pre-existing row (from before this column
-        # existed) read as "no retry" rather than NULL, so historical rows
-        # stay queryable without special-casing NULL everywhere.
+        # DEFAULT 1 makes every row that predates this column read as
+        # "no retry" rather than NULL, so historical rows stay queryable
+        # without special-casing NULL everywhere.
         migrations.append("ALTER TABLE sync_runs ADD COLUMN attempt_count INTEGER DEFAULT 1")
 
     for sql in migrations:
@@ -527,7 +526,7 @@ def record_sync_complete(
 
     ``attempt_count`` is the total number of attempts the orchestrator made
     before reaching this final status (1 = no retry needed; >1 = one or more
-    transient-failure retries happened first — see issue #541). One row per
+    transient-failure retries happened first). One row per
     logical run still gets one update, keeping the row *count* history
     detectors see unchanged by retries.
 
@@ -540,8 +539,8 @@ def record_sync_complete(
     ``started_at`` (set once, at the first attempt) would let a retried
     run's failed-attempt-plus-backoff time inflate that baseline upward
     every time a retry happens, making the collapse detector progressively
-    less sensitive given how often retries are expected to fire (issue #541
-    adversarial review). When omitted (e.g. a caller outside the retry
+    less sensitive given how often retries are expected to fire. When
+    omitted (e.g. a caller outside the retry
     loop), duration still falls back to the ``started_at``-derived value.
     """
     conn = get_sync_health_db()
@@ -638,10 +637,10 @@ def get_typical_duration_seconds(
 ) -> Optional[float]:
     """Median duration of the last ``n`` eligible successful runs for ``source``.
 
-    Used by run_all_syncs to detect duration collapse: a sync that historically
+    Used by run_all_syncs to detect duration collapse: a sync that typically
     takes minutes suddenly completing in a fraction of a second is the
-    signature of a silent no-op (e.g. credentials missing from the child env —
-    issue #438). Runs shorter than ``min_duration_seconds`` are excluded from
+    signature of a silent no-op (e.g. credentials missing from the child
+    env). Runs shorter than ``min_duration_seconds`` are excluded from
     the history because they are exactly the pathology being hunted; letting
     them into the median would make consecutive silent no-ops look "typical"
     after a few days.
@@ -784,9 +783,9 @@ def get_repeated_yield_streak(source: str, value: float, limit: int = 50) -> int
     Complements :func:`get_consecutive_zero_yield_runs`, which only catches
     a source going silent (yield drops to zero). A source re-importing the
     same byte-identical stale upstream file every night can instead report
-    the *same non-zero* count forever — e.g. issue #646, where a dead Mac
-    Mini export agent left ten nights reporting an identical "1294 created"
-    while nothing had actually changed. A long streak of an identical
+    the *same non-zero* count forever — e.g. a dead export agent
+    that leaves ten nights reporting an identical "1294 created" while
+    nothing had actually changed. A long streak of an identical
     non-zero count is the signature of that: real nightly variation almost
     never lands on the exact same number twice in a row.
     """
@@ -817,7 +816,7 @@ def get_repeated_yield_streak(source: str, value: float, limit: int = 50) -> int
 def get_yield_history(source: str) -> dict:
     """Lifetime yield stats for ``source``: run count and best run ever.
 
-    Used to spot a source that has *never* produced anything across many runs —
+    Spots a source that has *never* produced anything across many runs —
     the signature of a dead or misconfigured source that no per-run check can
     see, because every run looks exactly like the last one.
     """
@@ -997,8 +996,8 @@ def detect_silent_source_entity_drift(
 ) -> list[dict]:
     """Return per-source warnings when interactions are flowing but source_entities aren't.
 
-    Diagnoses the silent regression pattern from issue #199 §2: a source still
-    persists new interactions every night, but stops producing new
+    Diagnoses a silent regression pattern: a source still persists new
+    interactions every night, but stops producing new
     ``source_entities`` rows. Without this detector, ``sync_runs`` happily
     records ``success`` and the dashboard reads "healthy" while entity
     resolution rots in the background.
@@ -1109,7 +1108,7 @@ def check_sync_health() -> tuple[bool, str]:
         total = summary["total_sources"]
         disabled = summary["disabled"]
         if disabled:
-            # Self-explanatory breakdown (issue #494 follow-up): total tracked
+            # Self-explanatory breakdown: total tracked
             # sources includes ones that are intentionally disabled (e.g.
             # macOS-only "phone" on a Linux host) and therefore don't appear
             # in the nightly run order — without the breakdown this line

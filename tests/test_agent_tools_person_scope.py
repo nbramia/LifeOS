@@ -15,7 +15,7 @@ The person surface presented narrow or truncated views as complete ones:
 - `days_since_contact` carries 999 as a never-contacted sentinel; printed
   verbatim it reads as a real gap of about 2.7 years.
 
-These tests pin the fix: widen when the caller stated no window, honour a stated
+These tests pin the invariant: widen when the caller stated no window, honour a stated
 one exactly, order and disclose truncated facts, disclose the confidence floor,
 and never render the sentinel as a number.
 
@@ -149,7 +149,7 @@ class TestLookupNoMatch:
     """A miss must name what was searched, without implying a fault.
 
     The match threshold itself is unchanged — a loose threshold would merge real
-    people, which is worse than a miss. Only the message improves.
+    people, which is worse than a miss. Only the message changes.
     """
 
     def test_names_the_search_term(self, fake_person):
@@ -367,9 +367,9 @@ class TestNeverContactedSentinel:
         assert _summary(3, None).contact_on_record is True
 
     def test_indexed_profile_does_not_invent_a_recency_bucket(self):
-        """The sentinel used to bucket into "over a year ago" — a fabricated
-        interval written into the searchable corpus, where a later retrieval
-        reads it as an established fact.
+        """The sentinel must not bucket into "over a year ago" — that would
+        fabricate an interval written into the searchable corpus, where a
+        later retrieval reads it as an established fact.
         """
         from api.services.person_entity import PersonEntity
         from api.services.person_indexer import generate_person_document

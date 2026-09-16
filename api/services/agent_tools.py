@@ -53,7 +53,7 @@ JOURNAL_EXCLUDED_TOOLS = frozenset({
 # created via HTTP, and a draft it creates is invisible to any other caller
 # (including the HTTP send endpoint). So both tools additionally go through
 # api.services.gmail_draft_ledger.check_send_gate(), the same choke point the
-# HTTP route uses, before reaching GmailService.send_draft() (#588).
+# HTTP route uses, before reaching GmailService.send_draft().
 _drafts_created_this_turn: contextvars.ContextVar = contextvars.ContextVar(
     "drafts_created_this_turn", default=None
 )
@@ -87,7 +87,7 @@ def _draft_created_this_turn(draft_id: str) -> bool:
     return bool(drafts) and draft_id in drafts
 
 # The operator's local timezone, from `LIFEOS_TIMEZONE` (defaults to
-# America/New_York). Used to format message timestamps in tool output.
+# America/New_York). Formats message timestamps in tool output.
 LOCAL_TZ = ZoneInfo(settings.timezone)
 
 # ---------------------------------------------------------------------------
@@ -1194,7 +1194,7 @@ _VAULT_TOP_K_MAX = 49
 # over a real index, the same number of results varied by roughly 2.3x in bytes
 # depending on how long the matched chunks happened to be. A character budget
 # lets a query with short chunks keep the full set, while one with long chunks
-# stays near the worst case the old count-based cap allowed.
+# stays near the worst case a count-based cap would allow.
 _VAULT_CHAR_BUDGET = 24000
 
 
@@ -1386,7 +1386,7 @@ def _failure_causes(failures: dict[str, str]) -> str:
 
 # Widening ladder for a calendar keyword search with no caller-supplied range.
 # ±180d covers "did we meet recently"; the wider rungs catch anniversaries and
-# one-off events from previous years that the old fixed ±180d silently hid.
+# one-off events from previous years that a fixed ±180d window would silently hide.
 _CALENDAR_LADDER_DAYS = (180, 365, 1095)
 
 # Ceiling for a caller-supplied days_range — a century either side of today,
@@ -1404,8 +1404,8 @@ async def _tool_search_calendar(inp: dict) -> str:
     # timedelta(days=...) per account, get swallowed by the handler below, and
     # come back as "No calendar events found. Searched ±30d" — a scoped-looking
     # empty for a search that never validly ran. Treat it as unstated (so the
-    # ladder applies) and say the value was dropped, rather than clamping it to
-    # some nearby number the caller never asked for.
+    # ladder applies) and say the value was ignored, rather than clamping it
+    # to some nearby number the caller never asked for.
     # The upper bound matters as much as the lower one: search_events does
     # `now - timedelta(days=days_back)`, which raises OverflowError past a few
     # million days. That would land in the per-account handler below and get
@@ -1429,12 +1429,12 @@ async def _tool_search_calendar(inp: dict) -> str:
         else ""
     )
 
-    # Accounts that errored during the search, mapped to a failure category. An
-    # expired token used to be logged and then reported as "no events" — a real
-    # fault dressed up as an empty result, which is the misdiagnosis this whole
-    # change exists to stop. Failures accumulate across rungs rather than being
-    # reset per rung: an account that dropped out on the first window is still
-    # missing from the answer, so it still has to be disclosed.
+    # Accounts that errored during the search, mapped to a failure category.
+    # Reporting an expired token as "no events" would be a real fault dressed
+    # up as an empty result — the misdiagnosis this dict exists to prevent.
+    # Failures accumulate across rungs rather than being reset per rung: an
+    # account that dropped out on the first window is still missing from the
+    # answer, so it still has to be disclosed.
     failures: dict[str, str] = {}
     # Accounts that completed at least one window without error. "Nothing was
     # searched" is only true if this stays empty — an account that answered the
@@ -1514,9 +1514,9 @@ async def _tool_search_calendar(inp: dict) -> str:
 
     failed_note = ""
     if failures:
-        # Say the account was dropped, but only when a wider rung actually ran:
-        # otherwise "Searched ±180d, then ±365d" reads as if every account was
-        # asked in every window.
+        # Say the account was excluded, but only when a wider rung actually
+        # ran: otherwise "Searched ±180d, then ±365d" reads as if every
+        # account was asked in every window.
         dropped = ""
         if len(windows_tried) > 1:
             subject = "They were" if len(failures) > 1 else "It was"
@@ -1665,8 +1665,9 @@ async def _tool_search_email(inp: dict) -> str:
 
 
 # Per-account page size for a Drive search. 20 matches the DriveService default;
-# the old 5 meant any query whose terms also appeared in five newer files could
-# never surface an older one, with nothing in the output to hint at the cut.
+# a page size of 5 would mean any query whose terms also appeared in five newer
+# files could never surface an older one, with nothing in the output to hint at
+# the cut.
 _DRIVE_DEFAULT_RESULTS = 20
 _DRIVE_MAX_RESULTS = 100
 
@@ -1698,8 +1699,8 @@ def _drive_modified_key(f) -> datetime:
 async def _tool_search_drive(inp: dict) -> str:
     from api.services.drive import DriveService
 
-    # Read before the loop: this used to be inp["query"] inside the per-account
-    # try, so a missing query raised KeyError once per account and came back as
+    # Read before the loop: reading inp["query"] inside the per-account try
+    # would raise KeyError once per account on a missing query, coming back as
     # "Could not reach personal, work" — a malformed argument reported as
     # expired credentials.
     query = str(inp.get("query") or "").strip()
@@ -1728,10 +1729,10 @@ async def _tool_search_drive(inp: dict) -> str:
         else ""
     )
 
-    # Accounts that raised during the search, mapped to a failure category. An
-    # expired token used to be logged and the tool still said "No drive files
-    # found." — a broken connection rendered as absent data, which is the
-    # misdiagnosis this change exists to stop.
+    # Accounts that raised during the search, mapped to a failure category.
+    # Logging an expired token but still saying "No drive files found." would
+    # render a broken connection as absent data — the misdiagnosis this dict
+    # exists to stop.
     failures: dict[str, str] = {}
     all_files = []
     truncated = False
@@ -2482,7 +2483,7 @@ def _tool_manage_tasks(inp: dict):
     return f"Error: Unknown manage_tasks action '{action}'"
 
 
-# -- Human queue helpers (#852) --
+# -- Human queue helpers --
 
 def _human_queue_add(inp: dict) -> str:
     from api.services import human_queue
@@ -2714,7 +2715,7 @@ async def _tool_create_email_draft(inp: dict) -> str:
     _mark_draft_created_this_turn(draft.draft_id)
     # Also record it in the shared ledger — the same store the HTTP
     # /api/gmail/send route consults — so the guarantee holds even if this
-    # draft is later sent through a different caller/process (#588).
+    # draft is later sent through a different caller/process.
     try:
         ledger = get_gmail_draft_ledger()
         ledger.record_created(
@@ -2757,7 +2758,7 @@ async def _tool_send_email_draft(inp: dict) -> str:
     # SAFETY GATE, layer 2: the shared ledger check every caller of
     # GmailService.send_draft() must pass — same helper the HTTP
     # /api/gmail/send route uses, so a draft created by this tool (or by the
-    # HTTP route, or by a fresh turn/process) is gated consistently (#588).
+    # HTTP route, or by a fresh turn/process) is gated consistently.
     try:
         check_send_gate(
             account=account.value,
@@ -2885,7 +2886,7 @@ def _tool_search_memories(inp: dict) -> str:
     if not memories:
         if stats.near_misses:
             # Candidates existed and were scored; only the relevance floors kept
-            # them out. Rewording is the fix, not concluding the memory is gone.
+            # them out. Rewording addresses it, not concluding the memory is gone.
             #
             # The claim is deliberately narrow. This count includes any keyword
             # overlap under min_relevance — one common word shared with a long
@@ -2970,7 +2971,7 @@ def _summarize_session(session) -> str:
     return f"{session.date}: {body}"
 
 
-# Validation for `log`/`update` (#603 review). This is the trust boundary for
+# Validation for `log`/`update`. This is the trust boundary for
 # both call paths into `_tool_manage_workouts` — the native orchestrator's own
 # tool-calling loop and the REST/MCP surface both pass raw, model-authored
 # dicts through here, so a garbage or destructive write can't reach the store
@@ -3230,11 +3231,10 @@ def _workout_log_metric(inp: dict) -> str:
 
 # Sample cap for `metrics`. A metric question is a trend question, and its
 # natural span is a year: 365 covers a year of the cumulative path (one row per
-# day) and over a year of the densest measured metric, where the old 100 was
-# under four months of either. The metrics that arrive at most daily fit a year
-# with room to spare. One row is a date and a number, ~30 characters, so 365
-# rows is ~11 KB and the 1000 ceiling bounds a caller-supplied request to
-# ~30 KB.
+# day) and over a year of the densest measured metric. The metrics that arrive
+# at most daily fit a year with room to spare. One row is a date and a number,
+# ~30 characters, so 365 rows is ~11 KB and the 1000 ceiling bounds a
+# caller-supplied request to ~30 KB.
 _WORKOUT_METRICS_LIMIT = 365
 _WORKOUT_METRICS_MAX = 1000
 
@@ -3317,18 +3317,19 @@ def _workout_set_profile(inp: dict) -> str:
     return f"Training profile updated: {key} = {value}"
 
 
-# Recovery metrics worth citing for a readiness read (manual + Apple Health #323).
+# Recovery metrics worth citing for a readiness read (manual + Apple Health).
 _RECOVERY_METRICS = ("body_weight", "resting_hr", "hrv", "sleep_hours")
 
 # Cumulative metrics: Apple Health emits many intraday buckets per day, so the
-# meaningful view is a daily SUM, not the raw per-sample list (see #333).
+# meaningful view is a daily SUM, not the raw per-sample list.
 _CUMULATIVE_METRICS = frozenset({"steps", "active_energy"})
 
 
 def _workout_readiness(inp: dict) -> str:
     """One-call snapshot for trainer recommendations: recent volume + recovery
     signals + profile. Degrades gracefully when little data exists (e.g. before
-    Apple Health #323 lands, only manual metrics like body weight are present).
+    any Apple Health sync has run, only manual metrics like body weight are
+    present).
     """
     from datetime import date, timedelta
     from api.services.fitness_store import get_fitness_store, _today
@@ -3449,10 +3450,10 @@ def _tool_read_vault_file(inp: dict) -> str:
 _TXN_LADDER_DAYS = (90, 365, None)
 
 # Row cap for a transactions fetch, passed explicitly so the number is known
-# here and can be disclosed. Monarch's own default is also 500, so before this
-# was passed a widened window silently topped out with no indication. Ordering
-# is newest-first (the client hardcodes orderBy="date", verified descending),
-# so hitting the cap drops the OLDEST rows, not the most recent.
+# here and can be disclosed. Monarch's own default is also 500, so leaving it
+# unpassed would let a widened window silently top out with no indication.
+# Ordering is newest-first (the client hardcodes orderBy="date", verified
+# descending), so hitting the cap drops the OLDEST rows, not the most recent.
 _TXN_ROW_CAP = 500
 
 # Spending categories shown in a cashflow breakdown, highest amount first.

@@ -1,4 +1,4 @@
-"""Browser tests for the Text|Voice input-mode pill (#684).
+"""Browser tests for the Text|Voice input-mode pill.
 
 Drives `web/chat/voice.js`'s `setVoiceMode()` through the real toolbar pill
 that replaced the old mic (🎙️)/keyboard (⌨️) icon toggle: explicit-choice
@@ -69,7 +69,7 @@ def _is_voice_mode(page: Page):
 
 
 class TestModePillClicks:
-    """The Text|Voice pill (#684) is the sole control now wired to
+    """The Text|Voice pill is the sole control wired to
     setVoiceMode() — no mic/keyboard icons remain."""
 
     def test_default_is_text_mode(self, page: Page, chat_base_url):

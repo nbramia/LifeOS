@@ -77,7 +77,7 @@ class UsageStore:
                 CREATE INDEX IF NOT EXISTS idx_usage_timestamp
                 ON usage(timestamp)
             """)
-            # `unpriced` (#613) distinguishes a row whose upstream backend
+            # `unpriced` distinguishes a row whose upstream backend
             # sent no `cost_usd` at all (an external-backend turn from a
             # model the calculator doesn't price) from a row that reported
             # a real cost of zero (a free local model). Both otherwise land
@@ -86,9 +86,9 @@ class UsageStore:
             # cost is still recorded verbatim, never invented), so without
             # this flag the two are indistinguishable once persisted. Added
             # via ALTER rather than in CREATE TABLE above so it lands on a
-            # pre-existing usage.db too; a row written before this column
-            # existed defaults to 0 (treated as priced) — that history is
-            # unrecoverable, not retroactively fixed.
+            # pre-existing usage.db too; a row that predates this column
+            # defaults to 0 (treated as priced) — that distinction is
+            # unrecoverable for those rows.
             try:
                 conn.execute("ALTER TABLE usage ADD COLUMN unpriced INTEGER NOT NULL DEFAULT 0")
             except sqlite3.OperationalError:
@@ -112,14 +112,12 @@ class UsageStore:
             )
             conn.commit()
 
-    # Cutover note (#661, 2026-08-23): every native `/chat` turn recorded
-    # before this date has model="local" and cost_usd=0.0 regardless of
-    # which backend actually served it -- run_agent_loop hardcoded the model
-    # at construction and zeroed the cost unconditionally in _track_usage.
-    # Both bugs are fixed as of this date; rows written after it carry the
-    # real served model and a cost derived from pricing.cost_for. The
-    # pre-cutover rows are NOT backfilled: the true model was never stored,
-    # so any reconstruction would be invention, not recovery. A query over
+    # Every native `/chat` turn recorded before 2026-08-23 has
+    # model="local" and cost_usd=0.0 regardless of which backend actually
+    # served it. Rows recorded from that date on carry the real served
+    # model and a cost derived from pricing.cost_for. The earlier rows are
+    # NOT backfilled: the true model was never stored, so any
+    # reconstruction would be invention, not recovery. A query over
     # historical model or cost needs to account for this discontinuity
     # rather than trust every row equally.
 
@@ -147,24 +145,22 @@ class UsageStore:
             input_tokens: Number of input tokens
             output_tokens: Number of output tokens
             cost_usd: Cost in USD. A negative value is clamped to 0.0 and
-                logged loudly (#657) -- see below.
+                logged loudly -- see below.
             conversation_id: Optional conversation ID
             unpriced: True when the caller has no real cost for this turn
                 (an external backend that sent no `cost_usd`) — `cost_usd`
                 is still stored as given (verbatim, never invented) but
                 marked so a later reader can tell it apart from a turn that
-                genuinely cost zero (#613).
+                genuinely cost zero.
 
         Returns:
             ID of the created record
         """
         # A negative cost is never legitimate -- money spent can't be less
         # than zero -- and it silently shrinks every SUM(cost_usd) it feeds
-        # (GET /api/admin/usage, session-cost totals). #657 traced one
-        # historical cause (a cache-token accounting bug in a long-gone
-        # version of agent_loop.py that subtracted cache tokens from an
-        # already-non-cached input_tokens count), but this guard is a
-        # backstop against *any* upstream miscalculation, not just that one.
+        # (GET /api/admin/usage, session-cost totals). This guard is a
+        # backstop against any upstream miscalculation that could produce a
+        # negative value, not just one specific cause.
         # Clamp rather than reject so the call still succeeds and the
         # (accurate) token counts are still recorded -- but log loudly so a
         # recurrence is visible instead of silently absorbed.
@@ -258,7 +254,7 @@ class UsageStore:
 
     def get_conversation_usage(self, conversation_id: Optional[str]) -> dict:
         """
-        Session-to-date usage for one conversation (#610, extended by #613):
+        Session-to-date usage for one conversation:
         the sum of every turn already recorded under `conversation_id`, for
         a caller that wants to report "what has this conversation cost so
         far" without recomputing anything.
@@ -278,7 +274,7 @@ class UsageStore:
             sums), turn_count (how many recorded turns the sum covers),
             and is_lower_bound (True if any summed turn was `unpriced`,
             i.e. some contributing row's cost is unknown rather than
-            genuinely zero -- see the `unpriced` column, #613. Rows written
+            genuinely zero -- see the `unpriced` column. Rows written
             before that column existed default to priced/`0`, since that
             history can't be reclassified; a sum spanning any such row is
             still a floor even when this flag reads False).

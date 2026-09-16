@@ -1,4 +1,4 @@
-"""Tests for the Monarch session-age detector (issue #199 §3).
+"""Tests for the Monarch session-age detector.
 
 The real bug we're guarding against: the cached Monarch session token is just
 a pickle on disk that silently expires every ~30 days. The monthly sync
@@ -70,13 +70,13 @@ class TestGetSessionStatus:
 
 
 class TestIsMonarchConfigured:
-    """Pins the exact "not configured" condition for issue #687: the
+    """Pins the exact "not configured" condition: the
     nightly sync must skip cleanly ONLY when there is truly no way to
     authenticate (no cached session AND no credentials). Anything else
     (a session that exists but might be stale, or credentials present but
     wrong) has to keep reaching the real client so a genuine outage still
     fails loud -- conflating the two would hide a real Monarch outage on
-    the maintainer's own box, the exact regression #646 fixed elsewhere.
+    the maintainer's own box.
     """
 
     def test_no_session_no_credentials_is_not_configured(self, temp_session, monkeypatch):
@@ -112,9 +112,9 @@ class TestIsMonarchConfigured:
 
 
 class TestWriteMonthlyReportVaultDir:
-    """Pins that write_monthly_report() honors LIFEOS_MONARCH_VAULT_DIR
-    (issue #687 #4) -- both the unset-default (must match the previously
-    hardcoded path exactly) and an explicit override."""
+    """Pins that write_monthly_report() honors LIFEOS_MONARCH_VAULT_DIR --
+    both the unset-default (must match the hardcoded path exactly) and an
+    explicit override."""
 
     @pytest.mark.asyncio
     async def test_default_vault_dir_matches_hardcoded_path(self, tmp_path, monkeypatch):

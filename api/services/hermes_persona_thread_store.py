@@ -1,10 +1,10 @@
-"""Reply-thread persona inheritance for Hermes-Telegram (#644 follow-up).
+"""Reply-thread persona inheritance for Hermes-Telegram.
 
 Threading a reply (Telegram's native reply-to) inherits the persona of the
 message being replied to, without re-tagging. That needs a small amount of
 state — a `(chat_id, message_id) -> persona_id` mapping — and it has to live
 on the LifeOS side: putting it in Hermes would make persona resolution
-two-sourced again, which the #644 AC forbids.
+two-sourced, which is not permitted.
 
 Design choices:
 - **No message content, ever.** Only the id -> persona mapping is stored —

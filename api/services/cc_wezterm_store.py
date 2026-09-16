@@ -42,10 +42,11 @@ class PaneMapping:
     # PID of the wezterm-gui process at the time this mapping was written.
     # Used by /focus to invalidate the cache across wezterm restarts: pane
     # ids reset when wezterm-gui restarts, so a mapping pointing at "pane 5"
-    # before the restart no longer corresponds to the same terminal session
-    # afterwards. wezterm_pid=0 means "unknown" — pre-migration rows or
-    # writers that couldn't determine the live pid. Always treated as stale
-    # at read time so the focus endpoint falls through to a fresh probe.
+    # in one wezterm-gui process doesn't correspond to the same terminal
+    # session in a different one. wezterm_pid=0 means "unknown" — rows with
+    # no `wezterm_pid` column value, or writers that couldn't determine the
+    # live pid. Always treated as stale at read time so the focus endpoint
+    # falls through to a fresh probe.
     wezterm_pid: int = 0
 
 
@@ -56,7 +57,7 @@ class CCWezTermStore:
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
-        # Forward-migrate pre-#257 schemas that lack `wezterm_pid`. ALTER
+        # Forward-migrate schemas that lack `wezterm_pid`. ALTER
         # TABLE ADD COLUMN is idempotent-safe via the PRAGMA check; SQLite
         # has no `IF NOT EXISTS` for columns.
         self._migrate_add_column("wezterm_pid", "INTEGER NOT NULL DEFAULT 0")

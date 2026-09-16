@@ -1,33 +1,31 @@
-"""Browser tests for the 2x-toggle spoken-playback regression (#608).
+"""Browser tests for the 2x-toggle spoken-playback regression.
 
-Reported symptom: TTS worked for the first replies in a conversation, then
-stopped -- later replies printed text but were never spoken. The transition
-coincided with toggling the **2x** control.
+Symptom this guards against: TTS working for the first replies in a
+conversation, then stopping -- later replies printing text but never
+being spoken, coinciding with toggling the **2x** control.
 
-Reproduction (see the PR description for the full trace): the actual defect
-is not in `getPlaybackRate()`/`syncActivePlaybackRates()` -- toggling the
-rate while a clip is genuinely mid-playback works fine and applies to the
-clip already sounding. The real bug is in `unlockTtsAudio()`, which the talk
-button calls on *every* tap, unconditionally, on the shared-audio-element
-path used on iOS/Android (`useSharedTtsAudio()`). If a tap lands while a real
-clip is still loading on that shared `<audio>` element -- its
-`oncanplaythrough` handler armed but not yet fired -- `unlockTtsAudio()`
-reassigns `.src` to a silent unlock ping out from under it. The real clip's
-handler is never cleared, so it fires against the *silent* resource once
-that becomes ready instead: `playUrlOnElement()`'s promise resolves, the
-turn completes normally (text renders, no error), and the real clip is
-simply never heard. `getPlaybackRate()` correlates with the bug only because
-the user is more likely to tap talk again shortly after speeding a reply up
--- see `test_interrupting_tap_during_clip_load_...` below for the isolated
+The failure mode: `unlockTtsAudio()`, which the talk button calls on
+*every* tap, unconditionally, on the shared-audio-element path used on
+iOS/Android (`useSharedTtsAudio()`), must not steal a real clip that is
+still loading on that shared `<audio>` element -- its
+`oncanplaythrough` handler armed but not yet fired. If a tap reassigns
+`.src` to a silent unlock ping out from under a loading clip, the real
+clip's handler is never cleared, so it fires against the *silent*
+resource once that becomes ready instead: `playUrlOnElement()`'s
+promise resolves, the turn completes normally (text renders, no
+error), and the real clip is simply never heard. `getPlaybackRate()`
+correlates with the bug only because the user is more likely to tap
+talk again shortly after speeding a reply up -- see
+`test_interrupting_tap_during_clip_load_...` below for the isolated
 trigger, with no rate toggle involved at all.
 
-Fix: `unlockTtsAudio()` now no-ops while a real clip is loading or playing on
-the shared element, instead of unconditionally stealing it, via a new
-`clipInFlight` flag (see `TestStrandedIsPlayingAfterAFailedTurn` below for why
-that flag replaced the turn-lifecycle `isPlaying` it was first built on top
-of, rather than just patching `isPlaying`'s own reset gap). Also adds the AC's
-"say so" requirement: a genuine (non-benign) playback failure now surfaces in
-the thread instead of only a console warning.
+`unlockTtsAudio()` no-ops while a real clip is loading or playing on
+the shared element, instead of unconditionally stealing it, via a
+`clipInFlight` flag (see `TestStrandedIsPlayingAfterAFailedTurn` below
+for why that flag, rather than the turn-lifecycle `isPlaying` used
+elsewhere, tracks this). Also covers the "say so" requirement: a
+genuine (non-benign) playback failure must surface in the thread
+instead of only a console warning.
 
 Unlike most of the browser suite this serves `web/` itself from an ephemeral
 port rather than pointing at a running API, and drives `submitTurn()`
@@ -339,7 +337,7 @@ class TestToggleMidPlaybackKeepsSpeaking:
         assert (span[1] - span[0]) > 50
 
     def test_desktop_one_element_per_clip_path_is_unaffected(self, page: Page, chat_base_url):
-        """Control: the AC requires the fix to hold on the shared-element
+        """Control: this guard must hold on the shared-element
         path *without* regressing the desktop (one-`Audio`-per-clip) path,
         which unlockTtsAudio() never touches."""
         _open_voice_chat(page, chat_base_url, android=False)
@@ -394,41 +392,23 @@ class TestSmallestTrigger:
 
 
 class TestStrandedIsPlayingAfterAFailedTurn:
-    """A second, independent bug found while fixing the first, in an earlier
-    version of this fix that guarded unlockTtsAudio() with the pre-existing
-    `isPlaying` flag: `isPlaying` is set true by the `status_audio`/
-    `main_audio` SSE events, but its success-path reset (`isPlaying = false`
-    after `await playbackChain`) sat inside submitTurn()'s `try`, after the
-    point where a turn that throws post-audio-event (a dropped stream, a
-    server-side `error` event) exits. Unlike voiceBusy/state.isLoading,
-    nothing in the `catch`/`finally` covered it -- stranding `isPlaying`
-    true. Confirmed by reading the code, not conjecture, and independently
-    by tracing the actual events.
+    """`isPlaying`/`clipInFlight` tracking must not go stale when a turn
+    throws after its audio events but before playback finishes (a dropped
+    stream, a server-side `error` event) -- `catch`/`finally` doesn't
+    otherwise reset a flag that success-path code only clears after
+    `await playbackChain`.
 
-    That stranding does NOT, empirically, produce "TTS silenced until
-    reload": the very next tap's `if (isPlaying) { stopAllAudio(); return; }`
-    branch in onTalkClick reset the flag (that's the cancel/replay-interrupt
-    path, not a talk-to-record tap). But that self-correction fired at the
-    wrong time -- before the real clip that triggered `isPlaying` had
-    necessarily finished -- which could re-open the exact #608 race the
-    first fix closed. `test_unlock_...` below pins that the unlock still
-    works once the flag would otherwise be stuck.
+    A tap in the window where a real clip is still audibly playing but
+    the turn-lifecycle flag already reads "not playing" must stop the
+    audio rather than record over it --
+    `test_a_tap_while_the_reply_is_still_playing_stops_it_...` below pins
+    this. `test_unlock_...` below pins that the unlock still works once
+    the flag would otherwise be stuck.
 
-    Simply moving the reset into `finally` looked like the fix, but traded
-    that bug for a worse one: clips already handed to `playbackChain` keep
-    playing after the SSE loop throws (the chain isn't cancelled by the
-    generator unwinding), so a `finally`-only reset creates a window where
-    real audio is audibly playing while the turn-lifecycle flag already
-    reads "not playing" -- exactly when onTalkClick's stop-vs-record branch
-    needs it most. `test_a_tap_while_the_reply_is_still_playing_stops_it_...`
-    below pins that a tap in that window stops the audio rather than
-    recording over it.
-
-    The actual fix collapses `isPlaying` into `clipInFlight` entirely --
-    tracked by playSingleUrl() itself, tied via `.finally()` to that
-    specific clip's own promise, used by both unlockTtsAudio() and the
-    stop-vs-record checks. There is no separate turn-lifecycle flag left to
-    go stale."""
+    `clipInFlight` -- tracked by playSingleUrl() itself, tied via
+    `.finally()` to that specific clip's own promise, used by both
+    unlockTtsAudio() and the stop-vs-record checks -- is what makes this
+    hold: there is no separate turn-lifecycle flag left to go stale."""
 
     def test_unlock_still_fires_on_the_next_tap_after_a_turn_fails_post_audio_event(
             self, page: Page, chat_base_url):
@@ -479,16 +459,12 @@ class TestStrandedIsPlayingAfterAFailedTurn:
         `clipInFlight` branch), not fall through to start recording over
         the assistant's own still-sounding reply.
 
-        This passes on unmodified `main` too -- there, `isPlaying` is never
-        reset on this path at all, so it's accidentally still true and the
-        tap happens to hit the stop branch anyway. It is not a guard against
-        `main`. It guards against the *intermediate*, obvious-looking fix
-        this PR considered and rejected: resetting `isPlaying` in `finally`.
-        That reset is exactly what reopens this failure mode, because
-        clips already handed to `playbackChain` keep playing after the SSE
-        loop throws -- the turn-lifecycle flag goes stale exactly when this
-        check needs it to still read "yes, something is playing." See the
-        class docstring."""
+        This test specifically guards the case where `isPlaying` gets
+        reset in `finally`: clips already handed to `playbackChain` keep
+        playing after the SSE loop throws, so a `finally`-only reset would
+        leave the turn-lifecycle flag stale exactly when this check needs
+        it to still read "yes, something is playing." See the class
+        docstring."""
         _open_voice_chat(page, chat_base_url, android=True)
         # A getUserMedia call would mean onTalkClick fell through to
         # beginRecordingFromTap() instead of stopping the still-playing clip.
@@ -531,9 +507,9 @@ class TestStrandedIsPlayingAfterAFailedTurn:
 
 
 class TestGenuinePlaybackFailureIsReported:
-    """AC: if speech genuinely cannot be played, the interface must say so
+    """If speech genuinely cannot be played, the interface must say so
     rather than silently rendering text only -- the same idiom voice.js
-    already uses for mic-block reasons (#516)."""
+    already uses for mic-block reasons."""
 
     def test_a_rejected_play_promise_surfaces_in_the_thread(self, page: Page, chat_base_url):
         _open_voice_chat(page, chat_base_url, android=True)

@@ -1,6 +1,6 @@
 """
-Integration tests for Phase 9 retrieval improvements.
-Tests all four improvements working together.
+Integration tests for Phase 9 retrieval features.
+Tests all four features working together.
 
 P9.1: Contextual Chunking
 P9.2: Cross-Encoder Re-ranking
@@ -16,7 +16,7 @@ from unittest.mock import MagicMock
 
 @pytest.mark.integration
 class TestPhase9Integration:
-    """Integration tests for all Phase 9 improvements."""
+    """Integration tests for all Phase 9 features."""
 
     @pytest.fixture
     def temp_db(self):

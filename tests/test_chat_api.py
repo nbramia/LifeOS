@@ -133,7 +133,7 @@ class TestAskStreamEndpoint:
 
 
 class TestBackendTaggingField:
-    """AskStreamRequest.backend (#596): tags a newly created conversation's
+    """AskStreamRequest.backend tags a newly created conversation's
     sidebar-filtering label ONLY — never routing, model selection, or persona
     resolution. Omitted reproduces today's tagging ("lifeos") exactly."""
 
@@ -456,7 +456,7 @@ class TestHandoffEndpoint:
 
 
 class TestAskStreamRemoteModelOverride:
-    """model_override="remote" (#654): dispatches to the configured paid
+    """model_override="remote" dispatches to the configured paid
     OpenAI-compatible provider only when it's actually configured -- the
     picker hides the option otherwise, but a raw API caller could still send
     it, and an unconfigured pick must fall back to auto rather than being
@@ -522,7 +522,7 @@ class TestAskStreamRemoteModelOverride:
 
 
 class TestChatConfigRemoteFields:
-    """GET /api/chat/config (#654): reports whether the remote provider is
+    """GET /api/chat/config reports whether the remote provider is
     configured, so the picker can hide the option on a fresh clone."""
 
     @pytest.fixture

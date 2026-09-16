@@ -25,11 +25,11 @@ Messages has its own history-retention setting (Messages → Settings → Genera
 
 **Restarting the API service (or anything routed through LifeOS.app) on macOS:** never force-restart with `launchctl kickstart` — it has wedged the service rather than cleanly restarting it. Use a clean stop-then-start instead: `./scripts/service.sh stop` then `./scripts/service.sh start` (or, for a harder reset, `./scripts/service.sh uninstall` then `./scripts/service.sh install` to fully tear down and rebootstrap the launchd job). If that bootstrap/load step fails with a bare `Input/output error`, that's a known-transient launchd/TCC hiccup — retry the identical command before assuming anything is actually misconfigured.
 
-### Self-update (issue #509)
+### Self-update
 
 The Apple Data Agent Mac runs `apple_data_agent.sh` from its own separate checkout, which nothing else ever pulls — a fix to the export pipeline on `main` would otherwise silently never reach it. Step 0 of the agent script self-updates that checkout before exporting, using the same guards as `auto-deploy.sh`: only on the `main` branch, only with a clean working tree, and only via `git pull --ff-only` (never force, never reset). If any guard trips or the pull fails, the agent logs a warning (and, on an actual pull failure, sends a Telegram alert) and **continues with the existing checkout** — a slightly stale export is better than a skipped one, as long as the staleness is visible.
 
-The before/after SHA is logged in the agent's own log, and the export's `manifest.json` records the SHA it ran from as `agent_sha`. On the Linux side, `apple_data_import.py`'s `check_manifest()` compares `agent_sha` against the host's own `main` SHA and logs a warning on mismatch — so a stuck self-update is diagnosable from the import log without SSHing to the Apple Data Agent Mac. Manifests written before this change simply lack `agent_sha`, which is treated as "nothing to compare" rather than a warning.
+The before/after SHA is logged in the agent's own log, and the export's `manifest.json` records the SHA it ran from as `agent_sha`. On the Linux side, `apple_data_import.py`'s `check_manifest()` compares `agent_sha` against the host's own `main` SHA and logs a warning on mismatch — so a stuck self-update is diagnosable from the import log without SSHing to the Apple Data Agent Mac. A manifest that predates `agent_sha` simply lacks the field, which is treated as "nothing to compare" rather than a warning.
 
 ## Monarch Money (Financial Data)
 
@@ -99,7 +99,7 @@ The uvicorn access log itself has its query string stripped before it ever reach
 `scripts/gpu-watchdog.sh` runs every 5 minutes (`lifeos-gpu-watchdog.timer`, Linux only) and watches for two independent GPU failure signals on the gfx1151 iGPU:
 
 - **VRAM saturation** — reads usage from AMDGPU sysfs and alerts above `LIFEOS_VRAM_ALERT_PCT` (default 80%). Guards against the 2026-05-28 incident where VRAM exhaustion during model load locked up the GPU.
-- **SDMA-queue exhaustion (#521)** — the iGPU has only 8 SDMA queues. Concurrent GPU embedders (e.g. the API server and a manual reindex both loading/encoding on GPU at once) can exhaust them with VRAM still healthy — VRAM% alone can't see this. Each tick scans the kernel log (`journalctl -k --since <last tick>`) for `No more SDMA queue to allocate`, the signature that preceded the 2026-07-10 host freeze, and alerts on it with its own cooldown (`LIFEOS_SDMA_ALERT_COOLDOWN_MIN`, defaults to the VRAM cooldown) so it can't spam independently of the VRAM alert.
+- **SDMA-queue exhaustion** — the iGPU has only 8 SDMA queues. Concurrent GPU embedders (e.g. the API server and a manual reindex both loading/encoding on GPU at once) can exhaust them with VRAM still healthy — VRAM% alone can't see this. Each tick scans the kernel log (`journalctl -k --since <last tick>`) for `No more SDMA queue to allocate`, the signature that preceded the 2026-07-10 host freeze, and alerts on it with its own cooldown (`LIFEOS_SDMA_ALERT_COOLDOWN_MIN`, defaults to the VRAM cooldown) so it can't spam independently of the VRAM alert.
 
 Both signals alert via Telegram and log to `logs/gpu-watchdog.log`. See `api/services/embeddings.py`'s cross-process `flock` (settings `embedding_gpu_lock_*`) for the mitigation that serializes GPU embedding across processes to prevent SDMA exhaustion in the first place.
 
@@ -181,16 +181,16 @@ Never uses `launchctl kickstart` — see the kickstart-avoidance guidance under 
 
 ---
 
-## Shared Credentials Across Tools (#658)
+## Shared Credentials Across Tools
 
 LifeOS sometimes shares a paid provider account with another tool running on the
 same box (e.g. `LIFEOS_REMOTE_LLM_API_KEY` in `config/settings.py` — a vendor-neutral
-credential for whichever OpenAI-compatible remote provider is configured, #654).
+credential for whichever OpenAI-compatible remote provider is configured).
 When another local tool authenticates to that *same* provider account, the two
 tools end up with two independent copies of one secret: two rotation targets,
 and two places that silently drift when only one gets updated.
 
-**The fix is never a config-sharing mechanism between the two codebases** —
+**This is never solved with a config-sharing mechanism between the two codebases** —
 LifeOS reading the other tool's config file (or vice versa) creates exactly the
 kind of cross-repo coupling and stale-snapshot risk this section exists to avoid
 (see the model readout below for what that failure mode looks like in practice).
@@ -215,7 +215,7 @@ tool's own config *reference* that file rather than embed the value:
 Either way, each tool keeps its own variable name — there's no requirement (or
 benefit) to renaming across tools, only to stop duplicating the value.
 
-## Model Readout (#658)
+## Model Readout
 
 `GET /health/full` includes a `models` key reporting, per chat surface, which
 model is **actually serving it right now** — `api/services/model_readout.py`.
@@ -261,4 +261,4 @@ value dressed up as confirmed-live.
 - [Troubleshooting](troubleshooting.md) — General operational troubleshooting
 - [Scripts Reference](scripts.md) — `auto-deploy.sh` / `auto-update-macos.sh` / `setup-launchd.sh` usage and flags
 - [Human Queue](human-queue.md) — Auto-filed `monarch-reauth` card on an expired/missing session
-- [Agent Worker Setup](agent-worker-setup.md#card-assignment-running-a-card-on-another-machine-851) — Remote-host card assignment over ssh, and why it can't reach Apple-data tasks (the FDA limitation this doc's section above documents)
+- [Agent Worker Setup](agent-worker-setup.md#card-assignment-running-a-card-on-another-machine) — Remote-host card assignment over ssh, and why it can't reach Apple-data tasks (the FDA limitation this doc's section above documents)

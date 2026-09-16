@@ -655,7 +655,7 @@ def _skip_linkedin_preamble(f) -> None:
     zero-record "success" on a file that is perfectly good.
 
     Scans a bounded number of lines for the header, then seeks back to its
-    start. A file that already begins with the header (previously de-preambled
+    start. A file that already begins with the header (de-preambled
     by hand) is left untouched, so this is safe on both shapes.
     """
     probe_limit = 10

@@ -1,5 +1,5 @@
 """
-Tests for scripts/create_contact_persons.py (#700).
+Tests for scripts/create_contact_persons.py.
 
 A contacts SourceEntity never creates a PersonEntity on its own, and
 link_imessage_entities.py only links handles to *existing* people. So a
@@ -138,7 +138,7 @@ class TestEmailEvidenceCreation:
     def test_email_only_contact_with_enough_messages_creates_person(
         self, source_store, person_store, resolver, imessage_db_path
     ):
-        """Motivating case: a phone-less, email-only contact (#700)."""
+        """Motivating case: a phone-less, email-only contact."""
         email = "avery.chen@example.com"
         contact = _add_contact(source_store, name="Avery Chen", email=email)
         # Handle case differs from the stored (lowercased) email to mirror
@@ -209,7 +209,7 @@ class TestIdempotency:
 
         second = _run(source_store, person_store, resolver, imessage_db_path)
         assert second["persons_created"] == 0
-        assert second["contacts_checked"] == 0  # already linked, no longer "unlinked"
+        assert second["contacts_checked"] == 0  # already linked, not counted as "unlinked"
 
         assert len(person_store.get_all()) == 1
         updated = source_store.get_by_source("contacts", contact.source_id)
@@ -221,8 +221,8 @@ class TestExistingLinkedUntouched:
         self, source_store, person_store, resolver, imessage_db_path
     ):
         phone = "+15550005555"
-        # Person + link already exist before this script ever runs (e.g.
-        # created via WhatsApp import, as in the issue's control case).
+        # Person + link already exist ahead of any script run (e.g.
+        # created via WhatsApp import).
         existing_result = resolver.resolve(name="Morgan Ito", phone=phone, create_if_missing=True)
         person = existing_result.entity
         contact = _add_contact(source_store, name="Morgan Ito", phone=phone)

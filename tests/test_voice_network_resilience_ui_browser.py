@@ -1,9 +1,9 @@
 """Browser tests for voice-turn network resilience on weak/intermittent
-connections (#801).
+connections.
 
 The operator's report: on flaky internet a voice submission "simply fails and
 I have to start over" -- re-speaking the whole message. This suite covers the
-policy `web/chat/voice.js` now implements:
+policy `web/chat/voice.js` implements:
 
 - **Initial-submission retry** (`postTurnStart()`): up to 3 automatic retries
   with jittered backoff (~1s/3s/9s) on network-class failures only (a fetch()
@@ -216,7 +216,7 @@ def _fire_turn(page: Page, **kwargs):
 
     Always supplies a real (fake-content) Blob -- FormData.append()'s 3-arg
     form requires an actual Blob, which a JSON-serialized Python value can
-    never satisfy, and #801's retry/held-recording mechanics only have
+    never satisfy, and the retry/held-recording mechanics only have
     something to exercise when the turn genuinely carries one."""
     page.evaluate(
         "(extra) => { "
@@ -435,7 +435,7 @@ class TestRetryReconciliation:
 
 
 class TestInteractionProofs:
-    """The five behaviors #801 calls out explicitly, each independent of the
+    """Five behaviors, each independent of the
     retry/failure mechanics already covered above."""
 
     def test_cancel_aborts_a_pending_retry_and_discards_the_recording(self, page: Page, chat_base_url):
@@ -521,7 +521,7 @@ class TestInteractionProofs:
         expect(page.locator("#statusText")).to_have_text("Error")
 
     def test_a_second_recording_replaces_the_held_one(self, page: Page, chat_base_url):
-        """#801: "one held blob, replaced by the next recording -- not an
+        """"One held blob, replaced by the next recording -- not an
         unbounded queue." A fresh (non-retry) submitTurn() call clears the
         prior failed turn's status row; its Retry affordance is gone even
         though the bubble/text stays as thread history."""

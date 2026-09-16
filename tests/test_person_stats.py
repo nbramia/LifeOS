@@ -189,12 +189,12 @@ class TestRefreshUpdatesLastSeen:
 
 
 class TestMergedLegacyIds:
-    """Regression: full refresh used to corrupt canonicals that had legacy
-    (pre-merge) person_ids still attached to interaction rows. The loop would
-    process the canonical first (correct counts), then process the legacy ID,
-    resolve it via get_by_id() to the *same canonical*, and overwrite with the
-    legacy ID's under-counts and older last_seen. Fix: aggregate by canonical
-    before applying."""
+    """Full refresh must not corrupt canonicals that have legacy
+    (pre-merge) person_ids still attached to interaction rows: processing
+    the canonical first (correct counts), then the legacy ID (which
+    resolves via get_by_id() to the *same canonical*), must not overwrite
+    with the legacy ID's under-counts and older last_seen. Aggregate by
+    canonical before applying."""
 
     def test_full_refresh_aggregates_legacy_into_canonical(self, tmp_path):
         canonical_id = "canonical-001"

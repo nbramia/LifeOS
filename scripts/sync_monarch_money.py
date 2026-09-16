@@ -61,12 +61,12 @@ async def sync_monarch(dry_run: bool = True, month: str | None = None) -> dict:
     if not is_monarch_configured():
         # Declare the skip so the parent records SKIPPED instead of a
         # FAILED that repeats every night on any install that never set up
-        # Monarch — same pattern as Photos/Apple Contacts (#495/#497).
+        # Monarch — same pattern as Photos/Apple Contacts.
         # A configured-but-broken session (bad password, network, expired
         # session with no fallback credentials) does NOT hit this branch —
         # is_monarch_configured() only reports "no way to authenticate at
         # all", so a real outage still reaches get_monarch_client() below
-        # and fails loud, exactly as before — issue #687.
+        # and fails loud.
         logger.warning(
             "Monarch Money not configured (no cached session and "
             "MONARCH_EMAIL/MONARCH_PASSWORD unset) — skipping"
@@ -106,7 +106,7 @@ def _failure_message(e: Exception) -> str:
     `_is_transient_failure` something to match — e.g. a bare
     `ConnectTimeout` or `ReadTimeout` already matches its patterns by class
     name alone, no new signature needed. A non-empty `str(e)` is returned
-    unchanged (#781).
+    unchanged.
 
     Deliberately does not include a response body: Monarch is a financial
     data source, an error body could carry account/personal detail, and
@@ -174,7 +174,7 @@ def main():
         # classifies against captured stdout/stderr (which the logger call
         # below writes to) — an empty str(e) here left nothing after
         # "sync failed: " for the classifier to match, silently defeating
-        # the retry (#781). Use the same enriched message on both this log
+        # the retry. Use the same enriched message on both this log
         # line and the sync_health record below.
         logger.error(f"Monarch Money sync failed: {failure_message}")
         if run_id is not None:

@@ -170,7 +170,7 @@ def _resolve_action(action: Optional[str], message_type: Optional[str]) -> str:
 
 
 def _require_known_bot(bot: Optional[str]) -> Optional[str]:
-    """Reject a bot name the registry doesn't know, else return it (#575).
+    """Reject a bot name the registry doesn't know, else return it.
 
     An orphaned name — usually the residue of a bot rename — otherwise stores
     fine and then silently delivers to the primary chat at every fire. The

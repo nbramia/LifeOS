@@ -82,7 +82,7 @@ class _FakeStderr:
 class _FakeProc:
     """Stand-in for `subprocess.Popen` with predetermined stdout + returncode.
 
-    `pid` is set so the executor's #379 pid-recording (os.getpgid(proc.pid))
+    `pid` is set so the executor's pid-recording (os.getpgid(proc.pid))
     has something to read; an `on_wait` hook lets a test simulate the operator
     flipping the session row to FAILED while `wait()` blocks (the kill-mid-run
     case).
@@ -142,10 +142,10 @@ def _build_executor(
     transcripts = TranscriptStore(transcripts_dir=transcript_dir)
 
     notify = (lambda msg: notifications.append(msg)) if notifications is not None else None
-    # #311: a fake (session_id, body) sink so a test can assert the executor
+    # A fake (session_id, body) sink so a test can assert the executor
     # mirrors each streamed [NOTIFY]/[CLARIFY]/[GOAL] into the web thread.
     mirror = (lambda sid, body: mirror_calls.append((sid, body))) if mirror_calls is not None else None
-    # #458: preferred operator sender — receives (session, body) so the worker
+    # The preferred operator sender — receives (session, body) so the worker
     # can register reply anchors. Tests capture (session_id, body).
     op_send = (
         (lambda session, body: operator_sends.append((session.session_id, body)))
@@ -180,7 +180,7 @@ def _seed_child_session(
     store: SessionStore, *, task_id: str = "child-1", claude_code_model: str | None = None,
 ):
     """A claude_code session spawned by another agent — has a parent, so it
-    reports back to that parent rather than streaming to the operator (#349)."""
+    reports back to that parent rather than streaming to the operator."""
     return store.create(
         task_id=task_id,
         routing="claude_code",
@@ -219,7 +219,7 @@ def test_init_event_captures_and_persists_cli_session_id(tmp_path: Path):
 
 
 def test_completed_outcome_and_event_carry_exit_meta(tmp_path: Path):
-    """#760: the terminal transcript event (and the ExecutorOutcome the
+    """The terminal transcript event (and the ExecutorOutcome the
     worker's earned-completion gate reads) both carry how the subprocess
     ended — returncode, timed_out, and stream_terminal_event_seen (True only
     when a `result` event was actually parsed, the real signal that
@@ -248,8 +248,8 @@ def test_returncode_zero_without_result_event_flags_exit_meta(tmp_path: Path):
     """A subprocess that exits 0 without ever emitting a `result` event (the
     field case's likely shape — hit --max-turns or died mid-turn but still
     returned 0) still lands on the returncode==0 fallback in `_run`, but
-    `stream_terminal_event_seen` is False — the diagnostic signal #760 added
-    so this no longer has to be reconstructed from prose logs."""
+    `stream_terminal_event_seen` is False — the diagnostic signal that
+    avoids reconstructing this from prose logs."""
     events = [
         {"type": "system", "subtype": "init", "session_id": "cli-sess-noterm"},
         {
@@ -322,7 +322,7 @@ def test_assistant_narrative_outside_notify_is_kept_as_final_text(tmp_path: Path
 
 
 def test_child_notify_not_streamed_and_folded_into_final_text(tmp_path: Path):
-    """A spawned child (#349) must NOT stream [NOTIFY] to the operator. Instead
+    """A spawned child must NOT stream [NOTIFY] to the operator. Instead
     the bodies are folded into final_text so the parent — which only reads
     final_text — still receives the substance the child reported."""
     events = [
@@ -364,7 +364,7 @@ def test_child_notify_not_streamed_and_folded_into_final_text(tmp_path: Path):
 
 
 def test_child_clarify_folds_into_final_text_and_does_not_block(tmp_path: Path):
-    """#356: a spawned child's [CLARIFY] must NOT message the operator and must
+    """A spawned child's [CLARIFY] must NOT message the operator and must
     NOT go BLOCKED (which would strand the yielded parent — it only resumes once
     every child is terminal). The question is folded into final_text, prefixed
     [needs clarification], so the parent reads it on resume and decides; the
@@ -409,11 +409,11 @@ def test_child_clarify_folds_into_final_text_and_does_not_block(tmp_path: Path):
 
 
 def test_conversation_mirror_invoked_for_each_streamed_body(tmp_path: Path):
-    """#311: when a conversation_mirror is wired, the executor calls it with
+    """When a conversation_mirror is wired, the executor calls it with
     (session_id, body) for each streamed [NOTIFY]/[CLARIFY]/[GOAL] so the web
     thread mirrors live progress. Only [NOTIFY] also relays to Telegram here —
     [CLARIFY] and [GOAL] deliver via the worker's single anchored
-    body + reply-instructions message at block time (#456, #458)."""
+    body + reply-instructions message at block time."""
     events = [
         {"type": "system", "subtype": "init", "session_id": "cli-1"},
         {
@@ -452,7 +452,7 @@ def test_conversation_mirror_invoked_for_each_streamed_body(tmp_path: Path):
 
 
 def test_child_session_does_not_mirror(tmp_path: Path):
-    """#311: a child session stays silent to the operator, and its [NOTIFY]
+    """A child session stays silent to the operator, and its [NOTIFY]
     bodies are folded into final_text — so they must NOT be mirrored to a web
     thread either (parity with the no-Telegram gate)."""
     events = [
@@ -478,7 +478,7 @@ def test_child_session_does_not_mirror(tmp_path: Path):
 
 
 def test_raising_conversation_mirror_does_not_abort_run(tmp_path: Path):
-    """#311 (review): a conversation_mirror that raises (e.g. a transient DB
+    """A conversation_mirror that raises (e.g. a transient DB
     lock) must NOT kill the assistant-event loop — the session still completes,
     later bodies still stream to Telegram, and the terminal result is produced.
     Mirrors the existing guard around the Telegram notification callback."""
@@ -525,7 +525,7 @@ def test_raising_conversation_mirror_does_not_abort_run(tmp_path: Path):
 
 def test_build_command_uses_session_model_tier(tmp_path: Path):
     """A child seeded with claude_code_model='haiku' runs the CLI with
-    --model haiku; the default (None) falls back to opus (#349)."""
+    --model haiku; the default (None) falls back to opus."""
     captured: dict = {}
 
     def _spawn_capture(cmd, **kwargs):
@@ -589,7 +589,7 @@ def test_operator_system_prompt_keeps_pause_and_relay_clarify_wording(tmp_path: 
 
 def test_child_system_prompt_describes_parent_clarify_routing(tmp_path: Path):
     """A spawned child's [CLARIFY] folds into its output and the turn ends
-    (#356) — its prompt must describe that honestly instead of promising an
+    — its prompt must describe that honestly instead of promising an
     operator pause-and-relay that never happens."""
     prompt = _captured_system_prompt(tmp_path, _seed_child_session)
     assert "Your session will pause and the user's" not in prompt
@@ -641,7 +641,7 @@ def test_clarify_returns_blocked_with_question(tmp_path: Path):
     assert outcome.status == STATUS_BLOCKED
     assert outcome.reason == REASON_AWAITING_CLARIFICATION
     # The question rides the outcome; the worker composes the single anchored
-    # question + reply-instructions message at block time (#458) — no separate
+    # question + reply-instructions message at block time — no separate
     # streamed Telegram message.
     assert outcome.final_text == "Which file did you mean?"
     assert notifications == []
@@ -873,7 +873,7 @@ def test_system_prompt_carries_session_id_for_delegation(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Protocol tag hardening (#402): fence-aware scan + malformed-tag tolerance
+# Protocol tag hardening: fence-aware scan + malformed-tag tolerance
 # ---------------------------------------------------------------------------
 
 
@@ -921,7 +921,7 @@ def test_scan_ignores_empty_body_tags():
 
 def test_notify_inside_code_fence_not_streamed(tmp_path: Path):
     """End-to-end: a [NOTIFY] inside a fenced block must NOT fire the operator
-    notification callback; only the real one outside the fence does (#402)."""
+    notification callback; only the real one outside the fence does."""
     events = [
         {"type": "system", "subtype": "init", "session_id": "cli-1"},
         {
@@ -990,7 +990,7 @@ def test_result_event_fenced_tag_preserved_in_final_text(tmp_path: Path):
 
 
 def test_operator_send_preferred_for_notify_bodies(tmp_path: Path):
-    """#458: when operator_send is wired, streamed [NOTIFY] bodies go through
+    """When operator_send is wired, streamed [NOTIFY] bodies go through
     it with the session (so the worker can register reply anchors) and the
     legacy notification_callback is NOT used."""
     events = [
@@ -1016,7 +1016,7 @@ def test_operator_send_preferred_for_notify_bodies(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# [GOAL] tag (#398)
+# [GOAL] tag
 # ---------------------------------------------------------------------------
 
 
@@ -1154,12 +1154,12 @@ def test_clarify_takes_precedence_over_goal_in_same_turn(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# #379 — operator kill terminates the local subprocess promptly
+# Operator kill terminates the local subprocess promptly
 # ---------------------------------------------------------------------------
 
 
 def test_spawn_records_pid_event_and_new_session(tmp_path: Path):
-    """#379: a successful spawn records a `claude_code_pid` event carrying the
+    """A successful spawn records a `claude_code_pid` event carrying the
     subprocess pid/pgid, and passes `start_new_session=True` to the spawn_fn so
     the subprocess is its own process-group leader (killable via killpg without
     touching the worker)."""
@@ -1192,7 +1192,7 @@ def test_spawn_records_pid_event_and_new_session(tmp_path: Path):
 
 
 def test_operator_kill_mid_run_exits_silently(tmp_path: Path):
-    """#379: when the operator kill flips the session row to FAILED while the
+    """When the operator kill flips the session row to FAILED while the
     subprocess runs, `proc.wait()` returns and the executor must exit silently —
     REASON_KILLED, a `claude_code_killed` event, and NEITHER a
     `claude_code_failed` nor a COMPLETED transition."""
@@ -1265,7 +1265,7 @@ def test_cancelled_clean_cli_return_cannot_publish_completion(tmp_path: Path):
 
 
 def test_clean_completion_wins_over_raced_failed_flip(tmp_path: Path):
-    """#379 cascade-race guard: the row can be flipped to FAILED mid-run by a
+    """Cascade-race guard: the row can be flipped to FAILED mid-run by a
     second legitimate writer (LocalExecutor._cascade_kill_lineage on a
     lineage-budget breach, which is routing-agnostic). If our subprocess exits 0
     at that instant — it finished its work — the COMPLETED path must win so the
@@ -1310,7 +1310,7 @@ def test_clean_completion_wins_over_raced_failed_flip(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Subprocess environment — subscription billing is enforced by omission (#578)
+# Subprocess environment — subscription billing is enforced by omission
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("var", [

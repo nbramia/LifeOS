@@ -104,7 +104,7 @@ same machine, but when `LIFEOS_API_URL` points the worker at a remote API
 own filesystem, not the API server's.
 
 A card with no `done_when` just sits open until an agent (the filer, on
-observing the fix, or `/chat`/Hermes on request) resolves it by hand.
+observing that the underlying problem is resolved, or `/chat`/Hermes on request) resolves it by hand.
 
 A check that does not pass leaves the card untouched, retried next poll,
 but logging differs: an **errored** check (endpoint unreachable, wrong

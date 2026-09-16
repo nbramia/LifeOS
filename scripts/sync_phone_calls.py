@@ -197,7 +197,7 @@ def sync_phone_calls(
 
         try:
             # Create/update SourceEntity for this phone via the shared
-            # factory (issue #228) so the ``phone_{e164}`` source_id format
+            # factory so the ``phone_{e164}`` source_id format
             # stays defined in exactly one place.
             if phone not in seen_phones:
                 source_entity = create_phone_source_entity(

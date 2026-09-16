@@ -1,5 +1,5 @@
 """
-Tests for the manage_human_queue native chat tool (#852) — the surface the
+Tests for the manage_human_queue native chat tool — the surface the
 /chat orchestrator uses when asked "what's waiting on me".
 """
 import pytest

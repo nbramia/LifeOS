@@ -1,4 +1,4 @@
-"""Tests for the server host guard (#506).
+"""Tests for the server host guard.
 
 LIFEOS_SERVER_HOSTNAME designates the one machine allowed to run the LifeOS
 API server. Unset (the default) must never block a start — a fresh

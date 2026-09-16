@@ -1,16 +1,16 @@
 """
-Tests for schedule notification-bot validation (issue #575).
+Tests for schedule notification-bot validation.
 
 A schedule's ``bot`` field names which Telegram bot delivers its notification.
-Before #575 nothing validated it, so a typo — or a name orphaned by a bot
-rename — was accepted and then silently degraded to the primary bot and the
+Without validation, a typo — or a name orphaned by a bot
+rename — would be accepted and then silently degrade to the primary bot and the
 primary chat at every fire, putting domain-specific content in the general feed
 with no signal anywhere but a log line.
 
 Three surfaces are covered here:
 - the registry-backed validation helpers in ``api.services.telegram``
 - the scheduler HTTP routes (create + update) and the MCP tool handlers
-- the fire path, which stays fail-open but now marks the misroute in the
+- the fire path, which stays fail-open but marks the misroute in the
   message it delivers
 
 Every registry in this file is synthetic and patched in; nothing asserts against

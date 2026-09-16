@@ -1,5 +1,5 @@
 """
-Tests for the Human-queue integration in scripts/run_all_syncs.py (#852):
+Tests for the Human-queue integration in scripts/run_all_syncs.py:
 filing a keyed card for a classified sync failure, resolving it on the next
 success, and filing the monarch-reauth card on an expired/missing session.
 

@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 SYNC_DIR = os.path.expanduser(settings.investments_sync_dir)
 
-# Freshness alerting (#448): the macbook pipeline refreshes on weekdays (~18:30)
+# Freshness alerting: the macbook pipeline refreshes on weekdays (~18:30)
 # and Syncthing delivers here. A weekend plus the weekday cadence can leave the
 # file ~3 days old legitimately, so warn only past this threshold — enough to
 # catch a genuinely stuck pipeline / Syncthing without false-alarming on Mondays.
@@ -92,7 +92,7 @@ def check_investments_freshness() -> Optional[str]:
     return None
 
 
-# --- Big-mover alert (#463) ----------------------------------------------
+# --- Big-mover alert -------------------------------------------------------
 
 # Default day-change threshold: a held ticker up or down more than this many
 # percent on the day is a "mover" worth a nudge.

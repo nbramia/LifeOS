@@ -1,5 +1,5 @@
 """
-Journal emotion aggregation API (#212).
+Journal emotion aggregation API.
 
 The daily journal (`<vault>/Personal/Journal/YYYY-MM-DD.md`) logs a
 `feeling:` frontmatter field per entry, which chains into deeper fields
@@ -20,8 +20,7 @@ Two irregularities in the real data drove the parsing approach:
   the tree keeps those occurrences separate because they're keyed by path,
   not by value alone.
 
-Adversarial review (post-implementation) surfaced privacy and correctness
-gaps in the first pass, all addressed here:
+Privacy and correctness considerations:
 - Frontmatter values are free text as far as the parser is concerned — the
   fixed Google Form is today's only source, but a hand-edited entry could
   put a full sentence in `feeling:` and it would otherwise become public
@@ -29,15 +28,15 @@ gaps in the first pass, all addressed here:
   (short, few words, no line breaks) instead of allowlisting today's known
   vocabulary, which would silently misclassify real data the moment the
   form's options change.
-- `entry_count` used to mean "entries with a feeling", silently presented
-  as if it meant "journal entries" — a window with mostly feeling-less
-  entries looked like a small window with complete coverage. The response
-  now reports `total_entries` and `emotion_entries` separately.
-- File access is now symlink-safe (#212 review FIX 3) and treats the
+- A single `entry_count` field would be ambiguous — a window with mostly
+  feeling-less entries could look like a small window with complete
+  coverage. The response reports `total_entries` and `emotion_entries`
+  separately to keep that distinction unambiguous.
+- File access is symlink-safe and treats the
   `YYYY-MM-DD.md` filename as the canonical date, skipping files whose
-  frontmatter `date:` disagrees (FIX 4) or whose bytes aren't valid UTF-8
-  (FIX 5), and an unrecognized `window` value is normalized before both
-  computing bounds and being echoed back (FIX 6).
+  frontmatter `date:` disagrees or whose bytes aren't valid UTF-8,
+  and an unrecognized `window` value is normalized before both
+  computing bounds and being echoed back.
 """
 from __future__ import annotations
 
@@ -193,7 +192,7 @@ def window_bounds(window: str, today: date) -> tuple[date | None, date]:
 
 # No result caching: every request below re-reads and re-parses every
 # *.md file directly in the journal directory. Fine at the real-world
-# scale here (dozens of entries as of #212); revisit with a cache or an
+# scale here (dozens of entries); revisit with a cache or an
 # index if entry volume ever reaches the thousands.
 def _iter_valid_journal_files(vault_path: Path, window: str, today: date | None = None):
     """Yield (entry_date, frontmatter_dict) for every trustworthy dated
