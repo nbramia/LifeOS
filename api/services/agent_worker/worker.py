@@ -179,9 +179,9 @@ _BLOCKED_PROMPT_RETRY_DELAY_S = 0.5
 # scan: only recently-terminal sessions are considered, and at most this
 # many are reconciled in one tick. 90 days comfortably covers a worker
 # outage on the order of the longest one observed on this host (18 days)
-# with margin; unhealable rows (task deleted from the vault) get a durable
-# resolved marker so they don't cost a rescan on every subsequent tick, which
-# is what makes a window this wide safe to hold open.
+# with margin; a row the sweep has already examined and found nothing to do
+# for is stamped with `drift_swept_at` so it doesn't cost a rescan on every
+# subsequent tick, which is what makes a window this wide safe to hold open.
 _LIFECYCLE_DRIFT_SWEEP_WINDOW_S = 90 * 24 * 60 * 60
 _LIFECYCLE_DRIFT_SWEEP_LIMIT = 50
 
@@ -2658,70 +2658,76 @@ class Worker:
         poll to do that — the vault tag is stranded at `#agent-running` /
         `#agent-blocked` forever.
 
-        `SessionStore.list_terminal_unprojected` finds sessions with that
-        signature (terminal status, no acknowledged projection for the
-        current attempt/status) and is already scoped to vault-backed
-        sessions and bounded in size — see its docstring for the cost
-        argument. It only narrows the *candidate* set: "no applied
-        projection" also matches every historical terminal session that
-        predates this projector (it never recorded one either), so the
-        actual drift signature — the task's vault tag is still non-terminal
-        (`RUNNING_TAG` / `BLOCKED_TAG`) — is checked below before anything
-        is touched. Reconciling on the candidate signature alone would
-        rewrite tasks that were already settled by another path (e.g. an
-        operator's `#accepted #agent-completed`), clobbering that decision.
+        `SessionStore.list_terminal_unswept` finds sessions the sweep hasn't
+        examined since their last state change (terminal status, and either
+        never swept or swept before their most recent `last_activity_at`)
+        and is already scoped to vault-backed sessions and bounded in size —
+        see its docstring for the cost argument. It only narrows the
+        *candidate* set: an already-settled terminal session (reconciled by
+        the live path, an operator edit, or a historical session that
+        predates this sweep entirely) is also a candidate until the sweep
+        has looked at it once, so the actual drift signature — the task's
+        vault tag is still non-terminal (`RUNNING_TAG` / `BLOCKED_TAG`) — is
+        checked below before anything is touched. Reconciling on the
+        candidate signature alone would rewrite tasks that were already
+        settled by another path (e.g. an operator's `#accepted
+        #agent-completed`), clobbering that decision.
 
-        This sweep applies the same projection a genuinely-drifted session
-        would have gotten had the terminal write gone through
-        `update_status`, via the shared projector so a session already
-        reconciled by that path (or already re-opened for a follow-up turn,
-        which flips the row back to non-terminal) is left untouched rather
-        than double-projected.
+        Every row examined here and found to need no action right now is
+        stamped via `mark_drift_swept` so it drops out of the next tick's
+        candidate query. That stamp is only a statement about the past: a
+        vault tag that's currently terminal can legitimately flip back to
+        `#agent-running`/`#agent-blocked` later — the reopen-for-followup
+        path (see `code_reopened_for_pending_messages`) does exactly that,
+        on the very same attempt, with no `begin_new_execution` in between.
+        `update_status`/`mark_cancelled` bump `last_activity_at` on every
+        write, including that reopen and any terminal write that follows
+        it, so a genuine re-drift on the same attempt always re-qualifies
+        the row for another look rather than staying masked by the earlier
+        stamp.
+
+        A genuinely-drifted row is healed via the shared projector, the same
+        one a terminal write reaching `update_status` would have used, so a
+        session already reconciled by that path (or re-opened for a
+        follow-up turn, which flips the row back to non-terminal and so
+        isn't a candidate at all) is left untouched rather than
+        double-projected.
         """
         healed = 0
         since = int(time.time()) - _LIFECYCLE_DRIFT_SWEEP_WINDOW_S
-        for session in self.session_store.list_terminal_unprojected(
+        for session in self.session_store.list_terminal_unswept(
             since=since, limit=_LIFECYCLE_DRIFT_SWEEP_LIMIT,
         ):
-            event_id = LifecycleProjector.event_id(
-                session.task_id, session.attempt_id, session.status,
-                suffix="lifecycle_drift_sweep",
-            )
             task, is_absent = self._fetch_task_or_absent(session.task_id)
             if task is None:
                 if not is_absent:
                     # The fetch was merely unavailable — a transient error,
                     # timeout, or malformed payload — not a confirmed
                     # deletion (e.g. the API restarting mid-tick after a
-                    # deploy). Recording a resolved marker here would read
-                    # this row as permanently settled and stop it ever being
-                    # rechecked, silently turning a one-tick blip into
-                    # unhealable drift. Skip without a marker so the next
-                    # tick retries.
+                    # deploy). The row was not definitively examined: skip
+                    # without stamping so the next tick retries rather than
+                    # silently turning a one-tick blip into unhealable
+                    # drift.
                     continue
                 # Task definitively deleted from the vault (404) — nothing
-                # left to reconcile. Record a resolved marker so this row
-                # stops matching the candidate query on every future tick:
-                # the fetch above is an HTTP GET per row and this state can
-                # never heal, so leaving it unmarked would cost that GET
-                # forever.
-                self._mark_drift_row_settled(event_id, session, expected_version=None)
+                # left to reconcile, and this can never change. Stamp so
+                # this row stops costing an HTTP GET on every future tick.
+                self.session_store.mark_drift_swept(session.session_id)
                 continue
             tags = self._norm_task_tags(task)
             if RUNNING_TAG not in tags and BLOCKED_TAG not in tags:
-                # Not actually drifted — the vault tag is already terminal
-                # (settled by the live-kill path, an operator edit, or a
-                # historical session that predates this sweep entirely).
-                # Record a resolved marker here too: a terminal vault tag
-                # never flips back to running/blocked on its own, so this
-                # row can never become real drift later, and leaving it
-                # unmarked would hold it in the candidate query — and thus a
-                # batch slot under `_LIFECYCLE_DRIFT_SWEEP_LIMIT` — on every
-                # future tick until it ages out of the window.
-                self._mark_drift_row_settled(
-                    event_id, session, expected_version=task.get("updated_at"),
-                )
+                # Not actually drifted — the vault tag is already terminal.
+                # Definitively examined: stamp so this row doesn't hold a
+                # batch slot under `_LIFECYCLE_DRIFT_SWEEP_LIMIT` on every
+                # future tick. A later genuine re-drift on this same session
+                # still re-qualifies it, since whatever causes that also
+                # bumps `last_activity_at` past this stamp.
+                self.session_store.mark_drift_swept(session.session_id)
                 continue
+            event_id = LifecycleProjector.event_id(
+                session.task_id, session.attempt_id, session.status,
+                suffix="lifecycle_drift_sweep",
+            )
             event = LifecycleEvent(
                 event_id=event_id,
                 task_id=session.task_id,
@@ -2732,26 +2738,19 @@ class Worker:
                 reason="lifecycle_drift_sweep",
             )
             try:
-                if self.lifecycle_projector.transition(event, task=SimpleNamespace(**task)):
-                    healed += 1
+                applied = self.lifecycle_projector.transition(event, task=SimpleNamespace(**task))
             except Exception as exc:
                 logger.warning(
                     "lifecycle drift reconciliation failed for %s: %s", session.task_id, exc,
                 )
+                continue
+            if applied:
+                healed += 1
+                self.session_store.mark_drift_swept(session.session_id)
+            # else: `expected_version` conflicted with a concurrent edit —
+            # leave unstamped so the next tick re-examines with fresh state
+            # rather than treating a raced write as "nothing to do".
         return healed
-
-    def _mark_drift_row_settled(
-        self, event_id: str, session: Session, *, expected_version: str | None,
-    ) -> None:
-        """Record an already-applied lifecycle-projection marker for a
-        drift-sweep candidate that needs no tag change, so it stops matching
-        `list_terminal_unprojected` on every future tick."""
-        self.session_store.begin_projection(
-            event_id, task_id=session.task_id, session_id=session.session_id,
-            attempt_id=session.attempt_id, expected_version=expected_version,
-            target_status=session.status, payload={},
-        )
-        self.session_store.acknowledge_projection(event_id)
 
     def _check_human_queue_done_when(self, done_when: dict) -> tuple[bool, str]:
         """Evaluate one card's `done_when`. Returns `(passed, description)`;
