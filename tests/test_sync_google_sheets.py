@@ -1,10 +1,11 @@
-"""Tests for scripts/sync_google_sheets.py's clean-skip path (issue #687).
+"""Tests for scripts/sync_google_sheets.py's clean-skip path.
 
-Before this fix, a missing config/gsheet_sync.yaml (e.g. the gsheet-journal
-Google Form -> Sheet pipeline never set up) produced a zero-count "success"
-dict with no SYNC_SKIPPED marker and no emitted SYNC_STATS -- indistinguishable
-from a real, quiet run. These tests pin that the script now surfaces the skip
-through the structured contract run_all_syncs._parse_sync_output reads.
+A missing config/gsheet_sync.yaml (e.g. the gsheet-journal
+Google Form -> Sheet pipeline never set up) must not produce a zero-count
+"success" dict with no SYNC_SKIPPED marker and no emitted SYNC_STATS --
+that would be indistinguishable from a real, quiet run. These tests pin
+that the script surfaces the skip through the structured contract
+run_all_syncs._parse_sync_output reads.
 """
 import pytest
 

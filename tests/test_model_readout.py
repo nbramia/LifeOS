@@ -1,10 +1,10 @@
-"""Tests for the per-surface live model readout (api/services/model_readout.py, #658).
+"""Tests for the per-surface live model readout (api/services/model_readout.py).
 
 The local-LLM probe hits an OpenAI-compatible `/v1/models` shape, stubbed via
 ASGITransport (no sockets) — mirroring the pattern tests/test_hermes_proxy.py
 and tests/test_agent_proxy.py already use for stubbing httpx calls to an
 external backend. Hermes chat is read from an in-memory "last observed turn"
-cache instead (#658 review: the configured Hermes URL is LifeOS's own
+cache instead (the configured Hermes URL is LifeOS's own
 adapter, not the Hermes gateway, so there is no `/v1/models` to probe there —
 and even if there were, a capability probe can't reflect a per-turn model
 override the way an actually-observed turn can) — those tests call
@@ -243,9 +243,9 @@ async def test_health_full_includes_the_model_readout(monkeypatch):
 async def test_no_credential_leaks_when_local_probe_fails(monkeypatch):
     """Belt-and-suspenders: even in the failure path, no configured secret
     ever appears in the aggregated readout. hermes_backend_token is set here
-    even though the current Hermes path never sends it anywhere (#658
-    review removed the live Hermes probe) — guards against a future
-    regression that reintroduces a network call without this check."""
+    even though the current Hermes path never sends it anywhere (there is
+    no live Hermes probe) — guards against a future regression that
+    reintroduces a network call without this check."""
     monkeypatch.setattr(mr.settings, "llm_backend", "local")
     monkeypatch.setattr(mr.settings, "local_llm_url", "http://stub-down")
     monkeypatch.setattr(mr.settings, "hermes_backend_url", "http://adapter")

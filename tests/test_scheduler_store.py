@@ -657,7 +657,7 @@ class TestCronComputation:
 
 class TestComputeNextNTriggers:
     """`compute_next_n_triggers` is the pure helper `compute_next_trigger`
-    now shares — covered directly here for the multi-trigger case the
+    shares — covered directly here for the multi-trigger case the
     single-trigger helper never exercises, plus the once/invalid cases
     `compute_next_trigger`'s own tests above already cover for count=1."""
 
@@ -728,7 +728,7 @@ class TestDueChecking:
 
 
 class TestIndexSwapAtomicity:
-    """The index must never be observable half-rebuilt (issue #524).
+    """The index must never be observable half-rebuilt.
 
     ``get`` / ``list_all`` / ``get_due_reminders`` read without the lock, so
     every write has to swap in a complete map rather than mutate the live one.
@@ -970,7 +970,7 @@ class TestFormatHelpers:
 
 
 class TestActionDispatch:
-    """#245 — _fire_entry dispatches on action, records run history, hands off agents."""
+    """_fire_entry dispatches on action, records run history, hands off agents."""
 
     @pytest.fixture
     def scheduler(self, store):

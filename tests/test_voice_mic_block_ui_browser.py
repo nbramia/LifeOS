@@ -1,9 +1,9 @@
-"""Browser test for the /chat voice mic-block diagnostics (#516).
+"""Browser test for the /chat voice mic-block diagnostics.
 
 Drives `web/chat/voice.js`'s `micBlockReason()` through the real talk button.
 Each of the four preconditions (secure context, getUserMedia, MediaRecorder, a
-supported mime type) used to collapse into one "Mic unavailable (HTTPS required)"
-message; this pins that each now reports its own cause, and that an insecure
+supported mime type) must report its own cause rather than collapsing into
+one "Mic unavailable (HTTPS required)" message, and an insecure
 context offers a tappable link to the configured HTTPS origin.
 
 Unlike the rest of the browser suite this serves `web/` itself from an ephemeral
