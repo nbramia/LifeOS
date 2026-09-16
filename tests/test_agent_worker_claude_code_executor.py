@@ -14,6 +14,7 @@ sequence of stream-json events. No real Claude CLI is invoked. Exercises:
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from typing import Iterable
 
@@ -26,6 +27,7 @@ from api.services.agent_worker.claude_code_executor import (
     REASON_BINARY_NOT_FOUND,
     REASON_KILLED,
     ClaudeCodeExecutor,
+    _RunState,
 )
 from api.services.agent_worker.session_store import (
     STATUS_BLOCKED,
@@ -714,6 +716,88 @@ def test_nonzero_exit_without_terminal_returns_failed(tmp_path: Path):
     outcome = executor.execute(session, {"description": "broken thing"})
     assert outcome.status == STATUS_FAILED
     assert "exited with code 2" in outcome.reason
+
+
+def test_result_event_then_nonzero_exit_returns_failed(tmp_path: Path):
+    """A non-zero exit is authoritative even when the `result` event was
+    parsed: the CLI process itself is reporting a bad end-of-run. This is
+    the new behavior — it must fail if the exit-code gate is loosened back
+    to `proc.returncode == 0 or state.terminal`."""
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "cli-sess-badexit"},
+        {"type": "result", "session_id": "cli-sess-badexit", "total_cost_usd": 0.01, "result": "done, I think"},
+    ]
+    executor, store, transcripts = _build_executor(
+        tmp_path, spawn_fn=_spawn_with(events, returncode=1, stderr="teardown crashed"),
+    )
+    session = _seed_session(store)
+
+    outcome = executor.execute(session, {"description": "task"})
+
+    assert outcome.status == STATUS_FAILED
+    assert "exited with code 1" in outcome.reason
+    assert store.get(session.task_id).status == STATUS_FAILED
+    kinds = [e["kind"] for e in _read_transcript(transcripts, session.session_id)]
+    assert "claude_code_failed" in kinds
+    assert "claude_code_completed" not in kinds
+
+
+def test_result_event_then_zero_exit_returns_completed(tmp_path: Path):
+    """Unchanged: a `result` event followed by a clean (zero) exit is still
+    a completed session."""
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "cli-sess-goodexit"},
+        {"type": "result", "session_id": "cli-sess-goodexit", "total_cost_usd": 0.01, "result": "All set."},
+    ]
+    executor, store, transcripts = _build_executor(
+        tmp_path, spawn_fn=_spawn_with(events, returncode=0),
+    )
+    session = _seed_session(store)
+
+    outcome = executor.execute(session, {"description": "task"})
+
+    assert outcome.status == STATUS_COMPLETED
+    assert outcome.final_text == "All set."
+    assert store.get(session.task_id).status == STATUS_COMPLETED
+    kinds = [e["kind"] for e in _read_transcript(transcripts, session.session_id)]
+    assert "claude_code_completed" in kinds
+    assert "claude_code_failed" not in kinds
+
+
+def test_no_result_event_zero_exit_still_completes_via_fallback(tmp_path: Path):
+    """Unchanged: with no `result` event ever parsed, a zero exit still
+    lands on the returncode==0 fallback — the evidence-based downgrade for
+    that shape lives in `executor_lifecycle.normalize_outcome`, not here."""
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "cli-sess-noterm2"},
+        # No `result` event — stdout just ends here.
+    ]
+    executor, store, _ = _build_executor(
+        tmp_path, spawn_fn=_spawn_with(events, returncode=0),
+    )
+    session = _seed_session(store)
+
+    outcome = executor.execute(session, {"description": "task"})
+
+    assert outcome.status == STATUS_COMPLETED
+    assert outcome.exit_meta["stream_terminal_event_seen"] is False
+
+
+def test_stream_terminal_event_seen_still_true_on_nonzero_exit(tmp_path: Path):
+    """`stream_terminal_event_seen` in exit metadata reflects only whether
+    the `result` event was parsed (`_handle_result_event` sets
+    `state.terminal`) — it does not depend on the exit code. This pins that
+    the signal survives the exit-code branch change: it would read False
+    here if something stopped setting `state.terminal` on the `result`
+    path, independent of what returncode `_exit_metadata` is given."""
+    state = _RunState(terminal=True)
+    proc = _FakeProc([], returncode=1)
+    timed_out = threading.Event()
+
+    exit_meta = ClaudeCodeExecutor._exit_metadata(proc, timed_out, state)
+
+    assert exit_meta["returncode"] == 1
+    assert exit_meta["stream_terminal_event_seen"] is True
 
 
 def test_empty_prompt_returns_failed(tmp_path: Path):
