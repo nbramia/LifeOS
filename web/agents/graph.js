@@ -415,7 +415,7 @@ export function initGraph(boardApi) {
     if (wrap) wrap.style.display = cwds.length > 0 ? '' : 'none';
   }
 
-  // Host filter (#849) — same pattern as cwd above: options derive from
+  // Host filter — same pattern as cwd above: options derive from
   // whatever hosts are present in the current snapshot (local + any
   // cross-machine cli_sessions rows), hidden entirely on a single-host
   // deployment where the filter has nothing to distinguish.
@@ -1102,7 +1102,7 @@ export function initGraph(boardApi) {
   if (filterTagEl) filterTagEl.addEventListener('input', () => setFilter('tag', filterTagEl.value));
   if (filterClearBtn) filterClearBtn.addEventListener('click', () => resetFilters());
 
-  // --- Search (issue #252) ---
+  // --- Search ---
   const searchInputEl = document.getElementById('search-input');
   const searchResultsEl = document.getElementById('search-results');
   const searchWrapEl = document.getElementById('search-wrap');

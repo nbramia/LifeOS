@@ -9362,7 +9362,7 @@
             // A running graph force simulation has its own tick timer and
             // must be stopped unconditionally here, the single choke point
             // every dashboard/person navigation passes through -- otherwise
-            // it keeps ticking against DOM it no longer owns and eventually
+            // it keeps ticking against DOM that isn't its own anymore and eventually
             // throws NaN-attribute console errors once its physics interact
             // with whatever the destination view is doing. Re-entering the
             // Graph tab starts a fresh one via renderGraph()'s own
@@ -9404,7 +9404,7 @@
                 await loadPersonDetail(personId, false);
                 // Restore the requested tab, or fall back to Overview -- a
                 // click/back-step that lands on a URL with no tab segment
-                // must not leave whatever tab was previously showing.
+                // must not leave whatever tab was already showing.
                 await switchTab(tab || 'overview', true); // true = don't update URL
             } else {
                 // Hide birthdays page and show main container
@@ -9576,7 +9576,7 @@
             const listEl = document.getElementById('peopleList');
 
             // Cancel whatever search is still in flight (if any) so its
-            // response — cached or not — can never land after this one and
+            // response — cached or not — can never arrive later and
             // overwrite it. This also covers the cache-hit path below: it
             // "wins" immediately, so nothing from a still-running earlier
             // call should be allowed to render or cache over it afterward.
@@ -9996,7 +9996,7 @@
                 // Refetch immediately (rather than waiting for the next
                 // Family visit) and drop any now-invalid id from the
                 // current selection, so a merged-away person can't linger
-                // in selectedFamilyIds after this. Only reconcile on a
+                // in selectedFamilyIds going forward. Only reconcile on a
                 // successful refetch -- a transient failure here shouldn't
                 // wipe out the existing selection.
                 await loadFamilyMembers();
@@ -12261,7 +12261,7 @@
             relationshipDashboard.style.display = 'block';
             relationshipDashboard.classList.add('visible');
 
-            // Load partner photo now that we know one is configured
+            // Load partner photo once we know one is configured
             loadRelationshipPartnerPhoto(PARTNER_PERSON_ID);
 
             // Load insights and the timeline first; tone analysis can be slow
@@ -12980,7 +12980,7 @@
             // entirely here rather than plotted at a fabricated score -- see
             // errorMarkers below, which renders a distinct "not analysed"
             // marker at their x position instead. A "stale" month (a real,
-            // previously-computed score the server couldn't refresh this
+            // already-computed score the server couldn't refresh this
             // load) is NOT skipped -- it still has real data and must be
             // served rather than discarded -- but is rendered dimmed and
             // distinct from a normal point.
@@ -16444,11 +16444,9 @@
         /**
          * Load timeline data from the API.
          *
-         * IMPORTANT: Filtering is now done server-side via the source_type and date parameters.
+         * IMPORTANT: Filtering is done server-side via the source_type and date parameters.
          * This ensures we get the correct filtered data regardless of how many total
-         * interactions exist. Previously, filtering was client-side on a limited 100-item
-         * fetch, which meant filters would show nothing if no matching items were in
-         * the initial fetch.
+         * interactions exist.
          *
          * Date filtering uses the same date range inputs whether the user clicks on
          * a heatmap date or manually enters dates. This provides a unified experience.
@@ -16807,9 +16805,8 @@
          * Filter timeline by source type.
          * Called when user clicks a filter chip (Emails, Events, Messages, etc.)
          *
-         * IMPORTANT: This now re-fetches from the API with the filter applied server-side.
-         * Previously it only filtered the client-side data, which didn't work when the
-         * desired items weren't in the initial limited fetch.
+         * IMPORTANT: This re-fetches from the API with the filter applied server-side,
+         * so it still works when the desired items weren't in the initial limited fetch.
          *
          * @param {string} source - Filter to apply (e.g., 'gmail', 'calendar', 'messages')
          */
@@ -18347,7 +18344,7 @@
 
             // Wait for simulation to stabilize a bit before fitting
             setTimeout(() => {
-                // The graph may no longer be the active view by the time this
+                // The graph may not be the active view any more by the time this
                 // fires: dashboard/person navigation doesn't reload the
                 // document, so navigating away within this 800ms window can
                 // leave graphSvg (or its container) present but hidden or
@@ -18390,8 +18387,8 @@
                 const width = container.clientWidth;
                 const height = container.clientHeight;
 
-                // A hidden container (its ancestor tab/dashboard no longer
-                // showing) reports 0 for both -- fitting to it produced a
+                // A hidden container (its ancestor tab/dashboard not
+                // currently showing) reports 0 for both -- fitting to it produced a
                 // degenerate (zero/NaN) zoom transform applied via
                 // graphZoom.transform, which then threw a stream of
                 // "NaN"-attribute console errors from d3's own zoom/label
@@ -18528,7 +18525,7 @@
         /**
          * Show person details panel when single-clicking a node.
          * This provides a quick preview without navigating away from the current graph.
-         * Double-click is used to navigate to that person's graph view.
+         * Double-click navigates to that person's graph view.
          *
          * @param {object} nodeData - D3 node data object with person info
          */
@@ -18660,7 +18657,7 @@
                 // Load the person detail first (await it fully)
                 await loadPersonDetail(personId, true);
 
-                // Update filter chip UI (now that the DOM is rendered)
+                // Update filter chip UI (once the DOM is rendered)
                 document.querySelectorAll('.timeline-filter-chip').forEach(c => c.classList.remove('active'));
                 const chip = document.querySelector(`.timeline-filter-chip[data-source="${filterType}"]`);
                 if (chip) chip.classList.add('active');
@@ -19365,7 +19362,7 @@
 
                 // Invalidate the cached person so navigating away and back
                 // this session shows the saved notes instead of whatever
-                // was cached before this edit.
+                // was cached prior to the edit.
                 invalidatePersonCache(selectedPersonId);
 
                 // Update original value and hide save button
@@ -19417,7 +19414,7 @@
         }
 
         function updatePeopleDunbarFilter() {
-            // Check if we were previously in "only outer circles" mode
+            // Check if we were already in "only outer circles" mode
             const wasOnlyOuter = peopleDunbarFilters.size > 0 &&
                 [...peopleDunbarFilters].every(c => c === '5' || c === '6+');
 

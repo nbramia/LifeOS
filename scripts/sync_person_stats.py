@@ -60,7 +60,7 @@ def main():
         logger.info(f"People updated: {stats['updated']}")
         logger.info(f"Total interactions: {stats['total_interactions']}")
 
-        # Canonical line consumed by run_all_syncs._parse_sync_output (#496).
+        # Canonical line consumed by run_all_syncs._parse_sync_output.
         # The prose above reads "People updated", which the regex fallback
         # (persons?[_\s]?updated) never matched — hence 0/0/0 every night.
         from api.services.sync_health import emit_sync_stats

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Create PersonEntity records for Apple Contacts that have iMessage evidence
-but no person yet (#700).
+but no person yet.
 
 The chicken-and-egg this closes: a contacts SourceEntity never creates a
 PersonEntity on its own (correctly -- most of the address book shouldn't
@@ -187,7 +187,7 @@ def create_contact_persons(
                     continue
 
                 if not contact.observed_name:
-                    # resolver.resolve() never creates from phone alone (#226)
+                    # resolver.resolve() never creates from phone alone
                     # and this script shouldn't invent a name-less person.
                     stats["skipped_no_name"] += 1
                     continue

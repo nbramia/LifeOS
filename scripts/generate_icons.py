@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Regenerate web/icons/*.png (and nothing else) from the committed SVG
-sources, for #731.
+sources.
 
 Rasterizes the deterministic vector marks in web/icons/icon.svg and
 web/icons/icon-maskable.svg into the PNG sizes referenced by

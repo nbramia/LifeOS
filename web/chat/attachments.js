@@ -1,4 +1,4 @@
-// Chat composer attachments (#358): drag/drop, paste, file-picker, validation,
+// Chat composer attachments: drag/drop, paste, file-picker, validation,
 // preview, and the base64 payload sent with a message. Extracted verbatim from
 // index.html's inline <script>.
 

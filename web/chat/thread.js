@@ -1,4 +1,4 @@
-// Chat thread rendering (#358): message bubbles, streaming updates, markdown,
+// Chat thread rendering: message bubbles, streaming updates, markdown,
 // source badges, and the connection-status indicator. Extracted verbatim from
 // index.html's inline <script>.
 

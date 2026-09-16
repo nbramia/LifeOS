@@ -1,4 +1,4 @@
-// Conversation sidebar (#358): list, search/filter, open, delete, new chat,
+// Conversation sidebar: list, search/filter, open, delete, new chat,
 // relative-time labels, and the mobile sidebar toggle + swipe gesture.
 // Extracted verbatim from index.html's inline <script>.
 
@@ -63,7 +63,7 @@ export function setupSwipeGestures() {
 
 export async function loadConversations() {
   try {
-    // Scope the sidebar to the selected persona (#359) and backend (#596).
+    // Scope the sidebar to the selected persona and backend.
     // Conversation detail (loadConversation / search) is fetched by id and is
     // not persona/backend-scoped. config.backend is null for lifeos (see
     // backend.js), so it's normalized to the "lifeos" tag the server stores.
@@ -188,12 +188,12 @@ function renderConversations(conversations, isPartial = false) {
 export async function loadConversation(id) {
   state.currentConversationId = id;
   closeSidebar();
-  // Drop any answer affordance/poll from the previously-open conversation; if
-  // this one has an outstanding question, polling restarts below (#412).
+  // Drop any answer affordance/poll from the conversation that was open; if
+  // this one has an outstanding question, polling restarts below.
   stopPendingQuestionPolling();
 
   try {
-    // (round 1, finding #5) encodeURIComponent — `id` can arrive from the
+    // encodeURIComponent — `id` can arrive from the
     // `?conversation=` deep link (main.js's maybeOpenDeepLinkedConversation),
     // an unencoded URL query param, same as every other conversation-id
     // fetch site (ask-stream.js, pending-question.js).
@@ -212,7 +212,7 @@ export async function loadConversation(id) {
       }
 
       // If this conversation spawned an orchestrating-persona session that is
-      // awaiting an answer, re-show the affordance and resume polling (#412).
+      // awaiting an answer, re-show the affordance and resume polling.
       if (data.pending_question) {
         startPendingQuestionPolling(id);
       }
@@ -240,8 +240,8 @@ export async function deleteConversation(id) {
 
 export function newChat() {
   state.currentConversationId = null;
-  state.currentAgentThread = null; // leave agent-thread mode (#236)
-  stopPendingQuestionPolling();   // no active conversation → no answer affordance (#412)
+  state.currentAgentThread = null; // leave agent-thread mode
+  stopPendingQuestionPolling();   // no active conversation → no answer affordance
   elements.inputField.placeholder = 'Ask a question...';
   elements.chatTitle.textContent = 'New conversation';
   elements.messagesEl.innerHTML = `

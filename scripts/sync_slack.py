@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # override=True: the .env file deterministically wins over inherited env vars.
 # A present-but-empty inherited SLACK_USER_TOKEN would otherwise shadow the
-# file value and silently disable the sync — issue #438.
+# file value and silently disable the sync.
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent / ".env", override=True)
 
@@ -112,7 +112,7 @@ def main(argv=None):
 
     # A skipped sync (e.g. SLACK_USER_TOKEN missing/empty) must exit nonzero
     # so run_all_syncs records FAILED and alerts, instead of the silent
-    # success-with-zeros that hid the July 2026 outage — issue #438.
+    # success-with-zeros that would hide an outage.
     if results.get("status") == "skipped":
         logger.error(
             f"Slack sync skipped ({results.get('reason', 'unknown')}) — "
@@ -124,7 +124,7 @@ def main(argv=None):
     # API-call time). full_sync/incremental_sync report that as status
     # "partial", so status alone can't distinguish it from a run that mostly
     # worked. Partial errors WITH real work remain success, consistent with
-    # gmail's per-message error tolerance — issue #438.
+    # gmail's per-message error tolerance.
     msgs = results.get("messages") or {}
     if results.get("errors") and not msgs.get("channels_synced") and not msgs.get("messages_indexed"):
         logger.error(

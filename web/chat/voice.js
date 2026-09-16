@@ -1,4 +1,4 @@
-// Voice mode for /chat (#361).
+// Voice mode for /chat.
 //
 // Tap-to-talk (tap start, tap stop) — same interaction model as
 // whisper-relay/static/app.js (onTalkClick), not hold-to-talk. Turn lifecycle:
@@ -64,8 +64,8 @@ let activeTurnAbort = null;
 // the AbortError branch, mid-stream-drop recovery, terminal failure, and the
 // SSE handlers in consumeTurnStream) checks this before touching module
 // state shared across turns, so a stale turn settling late can't clobber a
-// newer turn's bookkeeping (#832) — the identity check #827 introduced for
-// one branch, generalized to every exit path. `token.id`, once known, is
+// newer turn's bookkeeping — the same identity check applies uniformly to
+// every exit path. `token.id`, once known, is
 // used the other way around: to actively cancel a turn that's ALREADY been
 // superseded (submitTurn()'s own supersession below, and the `started`
 // handler's late-id case) rather than to decide what's superseded.
@@ -77,24 +77,23 @@ let playbackChain = Promise.resolve();
 // Whether a real clip is currently loading/playing, on *either* the shared
 // (iOS/Android) or per-clip (desktop) element -- set/cleared by
 // playSingleUrl() itself, tied to that specific call's own promise via
-// `.finally()`. This replaced a turn-lifecycle `isPlaying` flag that
-// tracked "is a turn nominally still running" instead of "is audio actually
-// audible right now": a turn that threw after its audio event but before
-// playback settled left that flag stuck, and defensively resetting it in
-// every exit path (see git history, #608) opened a *different* hole --
-// audio already handed to playbackChain keeps playing after the turn's
-// promise settles, so a reset tied to the turn's lifecycle goes stale in
-// exactly the window a tap most needs it (onTalkClick's stop-vs-record
-// branch, the cancel button). Tying the flag to the clip's own settlement
-// instead makes both callers correct regardless of what the enclosing
-// turn's control flow does.
+// `.finally()`. Tracking "is a turn nominally still running" instead of "is
+// audio actually audible right now" is the wrong signal: a turn that throws
+// after its audio event but before playback settles would leave such a flag
+// stuck, and defensively resetting it on every exit path opens a
+// *different* hole -- audio already handed to playbackChain keeps playing
+// after the turn's promise settles, so a reset tied to the turn's lifecycle
+// goes stale in exactly the window a tap most needs it (onTalkClick's
+// stop-vs-record branch, the cancel button). Tying the flag to the clip's
+// own settlement instead makes both callers correct regardless of what the
+// enclosing turn's control flow does.
 let clipInFlight = false;
 let thinkingEl = null;
-// The in-flight turn's user bubble (#758). Held for the life of the turn so
+// The in-flight turn's user bubble. Held for the life of the turn so
 // the authoritative `done` transcript can reconcile the one the earlier
 // `transcript` SSE event rendered, instead of appending a second bubble.
 let turnTranscriptEl = null;
-// True once a turn's `done` payload has been processed (#758). The Cancel
+// True once a turn's `done` payload has been processed. The Cancel
 // button doubles as a "stop playback" control while a completed reply's
 // audio is still queued (voiceBusy/clipInFlight stay true across
 // `await playbackChain`, see submitTurn()) -- tapping it then must stop the
@@ -104,7 +103,7 @@ let turnTranscriptEl = null;
 let turnDone = false;
 let ttsAudio = null;
 
-// --- network resilience (#801) ---
+// --- network resilience ---
 //
 // The last recorded clip, held until its turn *definitively* completes:
 // success, an explicit user cancel, or an explicit dismiss (the "✕" on a
@@ -119,14 +118,15 @@ let heldRecording = null; // { blob, mime } | null
 // tracked so a later state (a new retry attempt, success, a fresh turn) can
 // remove/replace it without hunting the DOM. Never inside `.message-content`
 // itself: `.message.user`'s own text is asserted verbatim by pre-existing
-// tests (#758's eager-transcript suite), so this lives in a sibling node.
+// tests covering the eager-transcript rendering, so this lives in a sibling
+// node.
 let turnStatusEl = null;
 
-// Every write to `clipInFlight` goes through here (#734) rather than
+// Every write to `clipInFlight` goes through here rather than
 // assigning the module variable directly, so the wake tap's AudioContext
 // (`listenAudioCtx`, set up in startListening() below) suspends/resumes in
 // lockstep with it -- see updateListenSuspension() just below, which also
-// covers the `isRecording` half of the same problem (#724). Both branches
+// covers the `isRecording` half of the same problem. Both branches
 // are no-ops when Listening isn't running (listenAudioCtx null) or the
 // context is already in the target state.
 function setClipInFlight(value) {
@@ -136,16 +136,16 @@ function setClipInFlight(value) {
 
 // Shared by setClipInFlight() above and the `isRecording` writes in
 // beginRecording()/beginWebAudioRecording()/stopRecordingAndSend() below
-// (routed through setIsRecording(), #724): suspends the wake tap's
+// (routed through setIsRecording()): suspends the wake tap's
 // AudioContext whenever a clip is playing OR a recording is in progress,
 // resumes when neither. `ScriptProcessorNode.onaudioprocess` runs on the
 // main thread regardless of whether handleListenFrame() has anything useful
-// to do with the frame -- #734 covered the playback case, but the recording
-// case had the identical shape and was still open: `listenProcessor` stayed
+// to do with the frame -- the playback and recording cases have the
+// identical shape: without this guard, `listenProcessor` would stay
 // connected and running for the entire time a recording was in progress,
-// even though canDetectWake()'s own `!isRecording` guard already made every
+// even though canDetectWake()'s own `!isRecording` guard already makes every
 // call a no-op (wake detection is meaningless while already recording), so
-// the live callback was pure main-thread overhead contending with the
+// the live callback would be pure main-thread overhead contending with the
 // recorder's/endpointer's own taps for that whole window -- exactly the
 // aggregate-cost concern the taps-inventory doc above ensureAudioContext()
 // warns about. suspend()/resume() stop and restart the whole graph's
@@ -153,7 +153,7 @@ function setClipInFlight(value) {
 // match still works the instant recording ends, with zero extra
 // getUserMedia calls.
 //
-// #740: suspend()/resume() above are NOT enough on their own -- they stop
+// suspend()/resume() above are NOT enough on their own -- they stop
 // the graph's *processing*, but the underlying MediaStreamTrack keeps
 // capturing regardless, so the same shouldSuspend condition below also
 // drives setListenTracksEnabled(), which disables/re-enables the wake
@@ -162,7 +162,7 @@ function setClipInFlight(value) {
 // is a second, independent hazard from main-thread contention.
 function updateListenSuspension() {
   const shouldSuspend = clipInFlight || isRecording;
-  // #813 -- the dock's live-mic dot mirrors exactly what this function does
+  // The dock's live-mic dot mirrors exactly what this function does
   // to the tap, so it can never claim the mic is live while the capture is
   // suspended. Computed before the `listenAudioCtx` bail-out below so the
   // "Listening isn't running at all" case turns the dot off too.
@@ -176,7 +176,7 @@ function updateListenSuspension() {
   setListenTracksEnabled(!shouldSuspend);
 }
 
-// #813 -- the dock's only signal that the mic is currently open. Driven
+// The dock's only signal that the mic is currently open. Driven
 // solely by updateListenSuspension() above and stopListening() below, both
 // of which own the real "is the wake tap holding a live capture" state, so
 // the dot can't drift from it: it is deliberately NOT tied to the Listening
@@ -189,7 +189,7 @@ function updateListenIndicator(live) {
   dot.classList.toggle('live', !!live);
 }
 
-// Every write to `isRecording` goes through here (#724), for the same
+// Every write to `isRecording` goes through here, for the same
 // reason setClipInFlight() above exists -- see updateListenSuspension().
 function setIsRecording(value) {
   isRecording = value;
@@ -270,7 +270,7 @@ function unlockTtsAudio() {
   // bound to the old clip's `resolve`, but with the resource swapped out
   // from under it, it fires against this silent one instead once *it*
   // becomes ready -- silently completing the turn without the real clip
-  // ever having played (#608).
+  // ever having played.
   if (clipInFlight) return;
   const audio = getTtsAudioElement();
   audio.volume = 1;
@@ -308,7 +308,7 @@ function resolveExplicitVoiceMode() {
   return null;
 }
 
-// An explicit "begin recording immediately" deep link (#731 -- the iPhone
+// An explicit "begin recording immediately" deep link (the iPhone
 // Action Button, via Shortcuts, opening this page). Distinct from
 // ?mode=voice on purpose: that param alone only arms wake-listening (a
 // live mic that waits for a spoken wake burst), never an actual recording
@@ -394,10 +394,10 @@ function pickMimeType() {
   return '';
 }
 
-// Which recording precondition failed, or '' when the mic is usable. These used
-// to collapse into one boolean reported as "HTTPS required", which sent users
-// chasing a TLS problem for three causes that have nothing to do with TLS
-// (#516). Order matters: an insecure context also hides getUserMedia, so it must
+// Which recording precondition failed, or '' when the mic is usable. Collapsing
+// these into one boolean reported as "HTTPS required" would send users
+// chasing a TLS problem for three causes that have nothing to do with TLS.
+// Order matters: an insecure context also hides getUserMedia, so it must
 // be checked first to be named as the real cause.
 const MIC_BLOCK_MESSAGES = {
   insecure_context: 'Mic blocked — this page is not on HTTPS',
@@ -457,16 +457,16 @@ function formatMicError(err) {
 }
 
 export function initVoice() {
-  // Loaded before the first applyVoiceMode() call below (#710): that call
+  // Loaded before the first applyVoiceMode() call below: that call
   // syncs the Listening mic hold to dockSettings.listen, so the setting has
   // to be in memory before voice mode is first applied, not after.
   loadDockSettings();
-  loadEndpointingConfig();  // #718 -- fire-and-forget; defaults apply until it resolves
+  loadEndpointingConfig();  // fire-and-forget; defaults apply until it resolves
 
   const explicit = resolveExplicitVoiceMode();
   config.voiceMode = explicit === true;  // text until the server default resolves
   applyVoiceMode();
-  maybeAutoStartRecording();  // #731 -- only ever fires alongside ?mode=voice&record=1
+  maybeAutoStartRecording();  // only ever fires alongside ?mode=voice&record=1
   if (explicit === null) {
     // No URL param / stored preference — honor the server default. Async, but
     // local + sub-frame, so any text→voice flip is imperceptible.
@@ -495,7 +495,7 @@ export function initVoice() {
     });
   }
 
-  // Text|Voice mode pill (#684) — replaces the old mic/keyboard icon toggle;
+  // Text|Voice mode pill — replaces the old mic/keyboard icon toggle;
   // mirrors backend.js's explicit-set pattern (each button picks its own
   // mode) rather than a single toggle button.
   if (elements.modeTextBtn) elements.modeTextBtn.addEventListener('click', () => setVoiceMode(false));
@@ -513,13 +513,13 @@ function applyVoiceMode() {
   document.body.classList.toggle('voice-mode', isVoiceMode());
   if (elements.modeTextBtn) elements.modeTextBtn.classList.toggle('active', !isVoiceMode());
   if (elements.modeVoiceBtn) elements.modeVoiceBtn.classList.toggle('active', isVoiceMode());
-  // Listening (#710) is only meaningful in voice mode -- leaving voice mode
+  // Listening is only meaningful in voice mode -- leaving voice mode
   // releases its mic hold entirely; entering it (with the toggle already on)
   // re-acquires it. startListening()/stopListening() are both idempotent.
   if (isVoiceMode() && isListeningEnabled()) startListening();
   else stopListening();
   // The record path's own stream releases the same way on leaving voice mode
-  // (#724, see releaseMicStream()'s own doc comment) -- unlike Listening's
+  // (see releaseMicStream()'s own doc comment) -- unlike Listening's
   // it is NOT re-acquired on entering voice mode; it stays lazily acquired
   // by the next tap or wake trigger, same as always.
   if (!isVoiceMode()) releaseMicStream();
@@ -569,7 +569,7 @@ async function acquireMicStream() {
     try {
       // Deliberately plain `{ audio: true }`, unlike WAKE_STREAM_CONSTRAINTS
       // (Listening section, below) -- see that constant's comment for the
-      // reasoning (#740).
+      // reasoning.
       return await navigator.mediaDevices.getUserMedia({ audio: true });
     } catch (err) {
       lastErr = err;
@@ -596,20 +596,19 @@ function requestMicInGesture() {
 }
 
 // The talk-button's own stream, `micStream` -- lazily acquired above by
-// requestMicInGesture() the first time it's needed -- used to never be
-// released at all: applyVoiceMode() only ever tore down Listening's
-// separate hold on leaving voice mode, never this one, so once a session
-// had recorded even once the mic stayed live for the rest of the page's
-// life regardless of mode (#724). Guarded on `!isRecording && !isStarting`
+// requestMicInGesture() the first time it's needed. Without this function,
+// it would never be released: applyVoiceMode() only tears down Listening's
+// separate hold on leaving voice mode, not this one, so once a session
+// had recorded even once the mic would stay live for the rest of the page's
+// life regardless of mode. Guarded on `!isRecording && !isStarting`
 // so this never yanks the stream out from under a recording that's already
 // in progress or in the brief async gap while one is starting -- leaving
-// voice mode mid-recording keeps today's existing (unrelated, unchanged)
-// behavior of that recording continuing to completion; this only closes the
-// gap for the common case of leaving voice mode with nothing actively
-// recording, which is what "no lingering live mic hold" is about. Unlike
-// Listening's stream, this one is never re-acquired on *entering* voice
-// mode -- it never was, before this fix either -- it stays lazy, acquired
-// only by the next actual tap or wake trigger.
+// voice mode mid-recording keeps that recording continuing to completion
+// unaffected; this only closes the gap for the common case of leaving voice
+// mode with nothing actively recording, which is what "no lingering live
+// mic hold" is about. Unlike Listening's stream, this one is never
+// re-acquired on *entering* voice mode -- it stays lazy, acquired only by
+// the next actual tap or wake trigger.
 function releaseMicStream() {
   if (isRecording || isStarting) return;
   if (micStream) {
@@ -644,10 +643,10 @@ function beginRecording(stream) {
   setIsRecording(true);
   setStatus('', 'Recording…');
   setTalkActive(true);
-  maybeStartEndpointing(stream);  // #718 -- no-op unless Auto + voice mode
+  maybeStartEndpointing(stream);  // no-op unless Auto + voice mode
 }
 
-// --- Audio taps: inventory and the main-thread-contention invariant (#734) ---
+// --- Audio taps: inventory and the main-thread-contention invariant ---
 //
 // This file runs up to three independent `ScriptProcessorNode`s, each on its
 // own `AudioContext`:
@@ -656,11 +655,11 @@ function beginRecording(stream) {
 //      releaseCapture() the instant recording stops.
 //   2. `listenProcessor` (startListening()/stopListening(), "Listening"
 //      section below) -- connected for as long as voice mode + the Listening
-//      toggle are both on, which since #710 shipping the toggle on by
-//      default means essentially the whole time voice mode is open. Its
+//      toggle are both on, which — since the toggle defaults on — means
+//      essentially the whole time voice mode is open. Its
 //      `AudioContext` is suspended (not disconnected -- see the invariant
 //      below) whenever a clip is playing or a recording is in progress
-//      (updateListenSuspension(), #734 + #724), so "connected" here is about
+//      (updateListenSuspension()), so "connected" here is about
 //      the node wiring's lifetime, not whether it's actually processing at
 //      any given moment.
 //   3. `endpointProcessor` (maybeStartEndpointing()/stopEndpointing(), "Smart
@@ -679,33 +678,34 @@ function beginRecording(stream) {
 //
 // The invariant: **a tap that isn't actively needed must be disconnected or
 // have its `AudioContext` suspended -- not merely have its output ignored.**
-// Bug #734 was exactly this mistake: `handleListenFrame()` correctly
-// suspended *detection* while a clip played (`canDetectWake()`'s
-// `clipInFlight` guard) but left `listenProcessor` connected and firing --
-// the callback kept running on the main thread for no purpose the entire
-// time a reply was audible. The fix (`setClipInFlight()` above) suspends
-// `listenAudioCtx` itself in lockstep with `clipInFlight`, so the callback
-// stops firing rather than merely discarding what it computes. Suspend, not
-// `getUserMedia`-releasing teardown: the mic stream and node wiring survive
-// untouched, so resuming never re-prompts for mic permission. #724 found the
-// identical gap for the *recording* window -- `canDetectWake()`'s
-// `!isRecording` guard already made detection a no-op the whole time a
-// recording was in progress, but `listenProcessor` itself stayed connected
-// and running regardless, same contention, different trigger.
-// `updateListenSuspension()` (by `setClipInFlight()`/`setIsRecording()`)
-// generalizes the fix to both conditions at once.
+// The easy mistake to make: `handleListenFrame()` correctly
+// suspends *detection* while a clip plays (`canDetectWake()`'s
+// `clipInFlight` guard), but that alone leaves `listenProcessor` connected
+// and firing -- the callback keeps running on the main thread for no
+// purpose the entire time a reply is audible. `setClipInFlight()` above
+// suspends `listenAudioCtx` itself in lockstep with `clipInFlight`, so the
+// callback stops firing rather than merely discarding what it computes.
+// Suspend, not `getUserMedia`-releasing teardown: the mic stream and node
+// wiring survive untouched, so resuming never re-prompts for mic
+// permission. The identical gap exists for the *recording* window --
+// `canDetectWake()`'s `!isRecording` guard already makes detection a no-op
+// the whole time a recording is in progress, but `listenProcessor` itself
+// would stay connected and running regardless, same contention, different
+// trigger. `updateListenSuspension()` (called from both
+// `setClipInFlight()` and `setIsRecording()`) covers both conditions at
+// once.
 //
-// A second, independent hazard (#740): main-thread contention is not the
+// A second, independent hazard: main-thread contention is not the
 // only way an unneeded tap degrades playback. `AudioContext.suspend()`
 // stops the graph's *processing*, but it does NOT stop the underlying
 // `MediaStreamTrack` -- the microphone capture itself stays live regardless
-// of whether anything reads it. #734's fix above was necessary but not
-// sufficient: it shipped believing `listenAudioCtx.suspend()` fully
-// deactivated the wake tap during playback, and on real hardware it did
-// not -- popping persisted, correlating exactly with the Listening toggle,
-// because the capture was never actually stopped. An open capture, on its
-// own, degrades output independently of CPU: `getUserMedia({ audio: true })`
-// (the un-narrowed constraints, before #740) enables echoCancellation --
+// of whether anything reads it. Suspending `listenAudioCtx` is necessary but
+// not sufficient: relying on it alone to fully deactivate the wake tap
+// during playback is not safe on real hardware -- popping can persist,
+// correlating exactly with the Listening toggle, because the capture itself
+// was never actually stopped. An open capture, on its
+// own, degrades output independently of CPU: default `getUserMedia({ audio: true })`
+// constraints enable echoCancellation --
 // which has to reference the current output signal to cancel it, hooking
 // the output path for as long as the capture stays open -- and a live
 // capture can also force a play-and-record audio session on some platforms,
@@ -716,7 +716,7 @@ function beginRecording(stream) {
 // `AudioContext.suspend()`, not instead of it (the suspend/resume is still
 // correct and worth keeping for its own reason -- CPU). See
 // `setListenTracksEnabled()` and `WAKE_STREAM_CONSTRAINTS` in the Listening
-// section below for the fix, and `isListenTrackEnabled()` for the browser
+// section below for the mechanism, and `isListenTrackEnabled()` for the browser
 // test seam that distinguishes "capturing" from "processing" the way
 // `isListenTapRunning()` already distinguishes "processing" from
 // "detecting".
@@ -750,7 +750,7 @@ function beginWebAudioRecording(stream) {
   setIsRecording(true);
   setStatus('', 'Recording…');
   setTalkActive(true);
-  maybeStartEndpointing(stream);  // #718 -- no-op unless Auto + voice mode
+  maybeStartEndpointing(stream);  // no-op unless Auto + voice mode
 }
 
 function releaseCapture() {
@@ -854,18 +854,18 @@ function stopRecorder() {
 async function handleSkippedEmptyRecording() {
   setTalkActive(false);
   setStatus('', 'Ready');
-  // No auto-continue here (#721). This function's only caller,
+  // No auto-continue here. This function's only caller,
   // stopRecordingAndSend(), reaches it whenever the recording is being
   // discarded rather than submitted: a manual tap-to-stop that caught too
-  // little/no audio, a #718 hard-cap/candidate finalize whose captured clip
-  // still reads as silent, or a #723 idle-timeout exit (discard) -- none
+  // little/no audio, an Auto-mode hard-cap/candidate finalize whose captured
+  // clip still reads as silent, or an idle-timeout exit (discard) -- none
   // of these is "a turn was submitted and its reply finished playing".
   // Auto-continue has to key off exactly that (submitTurn()'s own
   // maybeAutoContinue() call below, after `await playbackChain`) --
-  // re-arming here as well used to treat any of these discards as if a
+  // re-arming here as well would treat any of these discards as if a
   // reply had just played, instantly restarting recording with no way to
-  // stop without leaving Auto mode entirely (#721's original bug, for the
-  // manual-stop case specifically).
+  // stop without leaving Auto mode entirely (the failure mode this guards
+  // against, for the manual-stop case specifically).
 }
 
 async function beginRecordingFromTap() {
@@ -893,24 +893,24 @@ async function beginRecordingFromTap() {
 // no-submit/no-auto-continue branch instead of evaluating the captured
 // blob -- the same teardown a manual stop or a silent recording uses, just
 // without the isSilentBlob() check. Two callers set it, for the same reason
-// from different evidence: a spoken cancel (#722), where the user's own
+// from different evidence: a spoken cancel, where the user's own
 // words are the instruction to throw the clip away, and an idle-timeout
-// exit (#723), which already knows from endpointHasSpeech -- the same VAD
-// signal #718's candidate/hard-cap logic keys off -- that the recording
+// exit, which already knows from endpointHasSpeech -- the same VAD
+// signal the candidate/hard-cap logic keys off -- that the recording
 // captured no speech at all. Either way a discard doesn't care what's in
 // the clip, so there's nothing to decode it for, and neither can fall
 // through to submitTurn() on a blob that isSilentBlob()'s independently
 // tuned thresholds happen to judge as "not silent". Every other caller (a
-// manual tap, #718's hard cap/candidate finalize) omits it and keeps the
+// manual tap, the hard cap/candidate finalize) omits it and keeps the
 // isSilentBlob()-decided behavior exactly.
 async function stopRecordingAndSend({ discard = false } = {}) {
   if (isStarting || !isRecording) return;
   // Set (and tear down endpointing) synchronously, before the MIN_RECORD_MS
-  // await below, so a concurrent second call -- #718's hard cap, a
-  // candidate's "complete" verdict, and #723's idle timeout can each reach
+  // await below, so a concurrent second call -- the hard cap, a
+  // candidate's "complete" verdict, and the idle timeout can each reach
   // this function -- sees `!isRecording` and returns immediately instead of
   // double-stopping. Goes through setIsRecording() so the wake tap's
-  // suspension follows the recording state (#724).
+  // suspension follows the recording state.
   setIsRecording(false);
   stopEndpointing();
 
@@ -966,7 +966,7 @@ function playUrlOnElement(audio, url) {
       audio.play().catch((err) => { cleanup(); finish(reject, err); });
     };
     // Lets stopAllAudio() settle this promise with a benign rejection
-    // instead of orphaning it (#617) -- nulling onended/onerror below stops
+    // instead of orphaning it -- nulling onended/onerror below stops
     // them from ever firing on their own once this clip is interrupted.
     audio.__abortPlayback = () => {
       cleanup();
@@ -986,10 +986,10 @@ function playUrlOnElement(audio, url) {
 
 function playSingleUrl(url) {
   // Set *before* touching the element: playUrlOnElement()'s Promise executor
-  // runs synchronously (assigning `.src` immediately, before this function
-  // gets anything back), so a flag set only after that call returns would
+  // runs synchronously (assigning `.src` immediately, ahead of anything this
+  // function gets back), so a flag set only after that call returns would
   // still leave a window, right at the start of a clip's load, where
-  // unlockTtsAudio() could steal the element out from under it (#608).
+  // unlockTtsAudio() could steal the element out from under it.
   // Cleared via `.finally()` below -- tied 1:1 to this call's own promise,
   // regardless of what the enclosing turn's control flow does. Both readers
   // (unlockTtsAudio()'s guard, and onTalkClick's/the cancel button's
@@ -1009,7 +1009,7 @@ function playSingleUrl(url) {
       audio.onended = () => resolve();
       audio.onerror = () => reject(new Error('playback failed'));
       // Same abort hook as the shared-element path above, for the same
-      // reason (#617) -- a Promise only settles once, so this is a no-op
+      // reason -- a Promise only settles once, so this is a no-op
       // if onended/onerror already fired.
       audio.__abortPlayback = () => reject(new DOMException('Playback stopped', 'AbortError'));
       audio.play().catch(reject);
@@ -1037,7 +1037,7 @@ function stopAllAudio() {
     // nulled below -- otherwise that promise is orphaned (never resolves
     // or rejects), which hangs whatever awaits it: enqueueClip()'s
     // playbackChain link and, transitively, submitTurn()'s
-    // `await playbackChain` for a live turn interrupted by replay (#617).
+    // `await playbackChain` for a live turn interrupted by replay.
     // isBenignPlaybackError() already treats AbortError as expected, so
     // this doesn't surface as a playback-failed bubble.
     a.__abortPlayback?.();
@@ -1073,7 +1073,7 @@ function isBenignPlaybackError(err) {
 // Reported at most once per turn, so several clips failing in the same turn
 // (a status_audio clip and the main_audio clip, say) don't stack duplicate
 // bubbles. Reset per turn in consumeTurnStream(). A voice turn's spoken reply
-// *is* the output (#608) -- rendering the text alone with no signal that
+// *is* the output -- rendering the text alone with no signal that
 // speech failed reads as the assistant ignoring the user, so this follows the
 // same idiom as reportMicBlocked() rather than only logging to the console.
 let reportedPlaybackFailure = false;
@@ -1157,7 +1157,7 @@ async function maybeAutoContinue() {
   }
 }
 
-// --- Listening: wake-word ("Hermes") detection (#710) ---
+// --- Listening: wake-word ("Hermes") detection ---
 //
 // `listenProcessor` below is tap #2 of the audio-taps inventory documented
 // above ensureAudioContext() -- see that comment for the main-thread-
@@ -1175,8 +1175,8 @@ async function maybeAutoContinue() {
 // beginRecordingFromTap() -- the same function the talk button itself calls
 // -- so a wake trigger is indistinguishable from a tap.
 //
-// Investigated for #724 (merge the two streams into one getUserMedia hold)
-// and kept separate. Findings, so the next agent doesn't relitigate this
+// Merging the two mic streams into one getUserMedia hold was investigated
+// and rejected. Findings, so the next agent doesn't relitigate this
 // from scratch:
 //   - No hard technical incompatibility rules a shared stream out. A
 //     `MediaRecorder` and a live `MediaStreamAudioSourceNode` CAN read the
@@ -1185,20 +1185,20 @@ async function maybeAutoContinue() {
 //     the record path doesn't even use `MediaRecorder`; it uses the same
 //     `createMediaStreamSource`-based approach this section does, so that
 //     candidate conflict doesn't apply there either.
-//   - Merging streams would NOT touch the actual cost #724 was filed to
-//     reduce. The "second always-on audio graph" (battery/CPU) is a
+//   - Merging streams would NOT touch the actual cost that matters here.
+//     The "second always-on audio graph" (battery/CPU) is a
 //     `ScriptProcessorNode`/`AudioContext` count problem, not a
-//     `getUserMedia` count problem -- fixed narrowly instead, by extending
-//     the exact suspend/resume pattern #734 built (setClipInFlight()) to
-//     also cover the recording window (updateListenSuspension()/
+//     `getUserMedia` count problem -- addressed narrowly instead, by
+//     extending the exact suspend/resume pattern setClipInFlight() applies
+//     to also cover the recording window (updateListenSuspension()/
 //     setIsRecording(), same section above ensureAudioContext()). That
 //     closes the real contention with zero stream-lifetime changes.
 //   - Merging would NOT reliably reduce permission prompts either: a
 //     granted mic permission is scoped to the page's origin, not to any
 //     particular `getUserMedia` call or stream -- a second call on an
-//     already-granted origin does not re-prompt on its own. (#724's own
-//     issue text concedes this: permission persistence is an origin-level
-//     browser setting, not something this file's call count controls.)
+//     already-granted origin does not re-prompt on its own. Permission
+//     persistence is an origin-level browser setting, not something this
+//     file's call count controls.
 //   - What a merge WOULD cost: reference-counted release across three
 //     independent consumers (the recorder/`audioProcessor`, `listenProcessor`,
 //     `endpointProcessor`), each currently owned exclusively by its own
@@ -1206,9 +1206,10 @@ async function maybeAutoContinue() {
 //     means none of them may ever be the one to stop a track the others
 //     still want -- real, tractable complexity, but complexity in exchange
 //     for a benefit (one fewer live hardware capture) that's speculative
-//     beyond a single iOS Safari user report, while the codebase's own
-//     history (#734's whole existence) is evidence WebKit's iOS audio-graph
-//     behavior is fragile territory worth extra caution in, not less. Given
+//     beyond a single iOS Safari user report, while the amount of care
+//     this section's own suspend/resume machinery required is evidence
+//     WebKit's iOS audio-graph behavior is fragile territory worth extra
+//     caution in, not less. Given
 //     voice mode is reported working well on both Linux desktop and iPhone
 //     today, that trade isn't worth taking without a reproducible failure
 //     to actually fix. Revisit if one shows up.
@@ -1228,7 +1229,7 @@ const WAKE_PROCESSOR_BUFFER = 4096;   // same block size beginWebAudioRecording(
 const WAKE_WORD = 'hermes';
 const WAKE_MAX_EDIT_DISTANCE = 1;     // tolerates "Hermès"/"Hermie's"/"hermez"-ish whisper-isms
 
-// --- wake chime: a "heard you" sound on a confirmed wake match (#726) ---
+// --- wake chime: a "heard you" sound on a confirmed wake match ---
 //
 // A bundled set of short confirmation sounds lives at
 // `web/chat/wake-sounds/*`, described by `web/chat/wake-sounds/manifest.json`
@@ -1261,7 +1262,7 @@ function loadWakeChimeManifest() {
   return wakeChimeManifestPromise;
 }
 
-// Desktop path: a fresh, throwaway `<audio>` per chime, same as before #725.
+// Desktop path: a fresh, throwaway `<audio>` per chime.
 // Desktop's autoplay policy doesn't require a prior gesture-unlocked element
 // the way iOS/Android's does (this whole file's shared-element machinery
 // exists only to route around that mobile restriction), so there's nothing
@@ -1292,17 +1293,17 @@ function playWakeChimeStandalone(url) {
   });
 }
 
-// Mobile path (#725): the chime used to play via `new Audio()` -- an element
-// never unlocked by a user gesture. iOS/Android block that unconditionally,
-// and the wake path has no gesture of its own (it fires from the wake-word
-// STT callback), so the chime was always silent there. Every other
+// Mobile path: playing the chime via a fresh `new Audio()` element doesn't
+// work here -- iOS/Android block an unlocked element's autoplay
+// unconditionally, and the wake path has no user gesture of its own to
+// unlock one with (it fires from the wake-word STT callback). Every other
 // non-gesture playback on this platform (status/main TTS audio) already
 // solves this by routing through the single shared element `unlockTtsAudio()`
 // unlocked from an earlier tap -- this does the same, via the same
 // `playUrlOnElement()` helper real clips use, rather than a second
 // playback routine.
 //
-// Guarded against the #608 hazard `unlockTtsAudio()` itself guards against:
+// Guarded against the same hazard `unlockTtsAudio()` itself guards against:
 // touching `.src` while a real clip is mid-load/playback on this element
 // would abandon that clip's `oncanplaythrough` the same way. Callers only
 // ever reach this once `baseWakeGuardsOk()` (which requires `!clipInFlight`)
@@ -1348,7 +1349,7 @@ function playWakeChime() {
   }).catch(() => {});  // belt-and-suspenders -- loadWakeChimeManifest() already never throws
 }
 
-// #740 -- getUserMedia constraints for the wake stream specifically (see
+// getUserMedia constraints for the wake stream specifically (see
 // startListening() below), deliberately different from the plain
 // `{ audio: true }` acquireMicStream() (the talk-button/recording path)
 // still uses. Bare `audio: true` accepts the browser's defaults, which
@@ -1366,9 +1367,9 @@ function playWakeChime() {
 // browser defaults: AEC/NS/AGC genuinely help transcription quality of the
 // user's own speech, and unlike the wake stream, the recording stream is
 // only open for user-directed capture -- not held open, armed, through
-// playback -- so it isn't implicated by this bug (see #740: popping
-// correlates exactly with the Listening toggle, not with whether a prior
-// recording's stream is still cached).
+// playback -- so it isn't implicated by the open-capture hazard described
+// above: popping correlates exactly with the Listening toggle, not with
+// whether a prior recording's stream is still cached).
 const WAKE_STREAM_CONSTRAINTS = {
   audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
 };
@@ -1383,12 +1384,12 @@ let listenSilenceMs = 0;
 let listenInBurst = false;
 let listenChecking = false;  // an STT round-trip for an already-captured burst is in flight
 
-// #740 -- disables/re-enables the wake stream's own MediaStreamTracks,
+// Disables/re-enables the wake stream's own MediaStreamTracks,
 // called by updateListenSuspension() above in lockstep with
 // listenAudioCtx.suspend()/resume(). AudioContext.suspend() only stops
 // *processing* what the track produces; the browser keeps the underlying
-// capture itself live regardless, which is exactly the mechanism #734
-// missed -- an open capture forces a play-and-record audio session (and,
+// capture itself live regardless -- an open capture forces a play-and-record
+// audio session (and,
 // were WAKE_STREAM_CONSTRAINTS not already off, would keep an AEC pipeline
 // hooked to the output) for as long as any track feeding it stays live, not
 // just while something reads its output. Per spec, `track.enabled = false`
@@ -1402,12 +1403,12 @@ function setListenTracksEnabled(enabled) {
   for (const t of listenStream.getAudioTracks()) t.enabled = enabled;
 }
 
-// Test seam (#740): whether the wake stream's own tracks are currently
+// Test seam: whether the wake stream's own tracks are currently
 // capturing, as opposed to isListenTapRunning() below (whether the
 // AudioContext graph is processing). The two are set in lockstep by
 // updateListenSuspension() but are independent browser-level states -- this
 // lets a browser test assert the capture itself stops, not just the
-// context, closing the exact gap #734 missed.
+// context, closing the exact gap an AudioContext-only suspend would miss.
 export function isListenTrackEnabled() {
   if (!listenStream) return null;
   const tracks = listenStream.getAudioTracks();
@@ -1427,7 +1428,7 @@ function baseWakeGuardsOk() {
     && !voiceBusy && !state.isLoading && !clipInFlight;
 }
 
-// Also excludes "a wake check is already in flight" -- used to gate whether
+// Also excludes "a wake check is already in flight" -- gates whether
 // new audio frames accumulate into a burst at all, so overlapping wake
 // checks never fire. (Not used by the actual trigger below -- see there.)
 function canDetectWake() {
@@ -1445,7 +1446,7 @@ async function startListening() {
   if (micBlockReason()) return;  // same preconditions as the talk button; fail silent here
   let stream;
   try {
-    // #740 -- the wake stream is requested WITHOUT the browser's default
+    // The wake stream is requested WITHOUT the browser's default
     // audio-processing chain (echoCancellation/noiseSuppression/
     // autoGainControl all explicitly off), unlike acquireMicStream() below
     // (the talk-button/recording path), which deliberately keeps the
@@ -1484,7 +1485,7 @@ async function startListening() {
   // recording (or clip) is already in progress -- without this the freshly
   // created context would start (and stay) in the 'running' state
   // regardless of `isRecording`/`clipInFlight` until the next write to
-  // either one happened to flip it (#724).
+  // either one happened to flip it.
   updateListenSuspension();
 }
 
@@ -1513,10 +1514,10 @@ function stopListening() {
   listenSpeechMs = 0;
   listenSilenceMs = 0;
   listenChecking = false;
-  updateListenIndicator(false);  // #813 -- no mic held, so no live dot
+  updateListenIndicator(false);  // no mic held, so no live dot
 }
 
-// Test seam (#734): whether the wake tap's own AudioContext is actually
+// Test seam: whether the wake tap's own AudioContext is actually
 // running right now, as opposed to merely "detection would accept a frame
 // if one arrived" (canDetectWake() above, which stays false for several
 // other reasons -- recording, a turn in flight -- that have nothing to do
@@ -1660,10 +1661,10 @@ export async function checkForWakeWord(samples, sampleRate) {
 // the race by the time this wake match's STT round-trip resolves,
 // isRecording/isStarting are already true and this quietly no-ops.
 //
-// A wake-confirmation chime (#726) plays here, before recording starts --
+// A wake-confirmation chime plays here, before recording starts --
 // never after, so it's never captured as part of the user's turn. While it
 // plays, `listenChecking` is still true (checkForWakeWord() below only
-// clears it in its `finally`, which runs after this whole async function
+// clears it in its `finally`, once this whole async function
 // settles), so handleListenFrame() keeps dropping frames the entire time --
 // the chime can't be mistaken for speech or re-trigger detection. Guards are
 // re-checked below because playback is async: recording, a manual talk-tap,
@@ -1677,7 +1678,7 @@ async function triggerWakeRecording() {
   return true;
 }
 
-// --- Smart turn endpointing: pause + semantic completeness (#718) ---
+// --- Smart turn endpointing: pause + semantic completeness ---
 //
 // `endpointProcessor` below is tap #3 of the audio-taps inventory documented
 // above ensureAudioContext() -- see that comment for the main-thread-
@@ -1696,7 +1697,7 @@ async function triggerWakeRecording() {
 // recording-so-far is a *candidate* endpoint, not a final decision --
 // POSTed to the same bare-STT route (`/api/voice/transcribe`) Listening's
 // wake check already uses (no conversation/turn artifacts either way), then
-// checked for a spoken cancel (isCancelUtterance() below, #722) BEFORE the
+// checked for a spoken cancel (isCancelUtterance() below) BEFORE the
 // completeness decision. Cancel -> discard through stopRecordingAndSend's
 // `discard: true` branch, no submit. Otherwise run through
 // isTranscriptComplete() below. Complete -> finalize through the SAME path a
@@ -1706,7 +1707,7 @@ async function triggerWakeRecording() {
 // regardless of any candidate verdict, so an ambiguous or unreachable check
 // can never hang the mic open forever.
 //
-// Idle timeout (#723): a THIRD, disjoint budget for the opposite situation --
+// Idle timeout: a THIRD, disjoint budget for the opposite situation --
 // no speech at ALL yet this recording, so SILENCE_MS/HARD_CAP_MS above (both
 // scoped to trailing silence *after* speech) have nothing to measure. Without
 // this, a recording nobody ever spoke into (walked away, wake-triggered by
@@ -1719,17 +1720,19 @@ async function triggerWakeRecording() {
 // discard param below), never a parallel teardown. Crucially this must
 // never re-arm auto-continue (that re-arm is exactly what would reopen the
 // mic in a loop) -- see stopRecordingAndSend()'s doc comment: the discard
-// branch it shares with a manual empty-recording stop has had no
-// maybeAutoContinue() call since #721, so this path inherits that for free.
+// branch it shares with a manual empty-recording stop never makes a
+// maybeAutoContinue() call, so this path inherits that for free.
 //
-// Precedence vs. #718 is a straight handoff, not a race: endpointIdleMs (idle
+// Precedence vs. the hard-cap/candidate-finalize endpointing above is a
+// straight handoff, not a race: endpointIdleMs (idle
 // timeout's own counter) only accrues while `!endpointHasSpeech`, and
-// endpointSilenceMs (#718's) only starts once `endpointHasSpeech` is true --
+// endpointSilenceMs (that endpointing's own) only starts once `endpointHasSpeech` is true --
 // see handleEndpointFrame() below. The very first speech frame flips
 // endpointHasSpeech permanently true for the rest of THIS recording (nothing
 // resets it back to false except a brand-new recording's
 // resetEndpointState()), so the two counters can never both be live at once.
-// Speech seen this recording -> #718 owns the ending, always. No speech at
+// Speech seen this recording -> the hard-cap/candidate-finalize endpointing
+// owns the ending, always. No speech at
 // all -> idle timeout owns it, always.
 //
 // Guards are re-checked after every await, the same pattern
@@ -1782,7 +1785,7 @@ export function isTranscriptComplete(transcript) {
 }
 
 // Trailing phrases that read as the user abandoning the turn mid-recording
-// (#722) -- checked the same way ENDPOINT_TRAILING_FILLER_WORDS above is:
+// -- checked the same way ENDPOINT_TRAILING_FILLER_WORDS above is:
 // against the NORMALIZED end of the transcript, never a substring/includes()
 // match anywhere in it. That distinction is the entire point of this
 // feature -- "cancel my 3pm with Dana" is a real request that must still be
@@ -1911,7 +1914,7 @@ function stopEndpointing() {
   resetEndpointState();
 }
 
-// Test seam (#734): whether the endpointing tap is currently wired up, so a
+// Test seam: whether the endpointing tap is currently wired up, so a
 // browser test can assert it's torn down after every stop path (manual stop,
 // hard-cap finalize, spoken-cancel discard) rather than inferring it
 // indirectly.
@@ -1946,7 +1949,7 @@ function handleEndpointFrame(e) {
     return;
   }
   if (!endpointHasSpeech) {
-    // No speech at all yet this recording (#723) -- a disjoint silence
+    // No speech at all yet this recording -- a disjoint silence
     // budget from endpointSilenceMs below, which only starts once speech has
     // been seen. See the "Idle timeout" doc comment above this section for
     // why the two can never both be counting.
@@ -1993,7 +1996,7 @@ export function finalizeEndpointing() {
 // entirely into handleSkippedEmptyRecording(), the existing no-submit path a
 // silent/empty recording already uses; that function's own doc comment is
 // why a spoken cancel, like a manual stop, never re-arms auto-continue
-// (#721) -- auto-continue only fires from submitTurn()'s own
+// -- auto-continue only fires from submitTurn()'s own
 // maybeAutoContinue() call after a reply actually plays, which a discarded
 // recording never reaches. Called by checkEndpointCandidate() below on a
 // cancel-utterance verdict; not exported -- unlike the hard cap,
@@ -2008,12 +2011,12 @@ function discardEndpointing() {
   });
 }
 
-// Idle-timeout finalize (#723) -- stops and DISCARDS, never submits. Also
+// Idle-timeout finalize -- stops and DISCARDS, never submits. Also
 // through stopRecordingAndSend(), but with its `discard` param set:
 // this is the SAME handleSkippedEmptyRecording() teardown a manual stop on
 // an empty/silent recording already uses (see stopRecordingAndSend()'s doc
-// comment), not a parallel discard implementation -- and that path has had
-// no auto-continue re-arm since #721, so this inherits that for free. Same
+// comment), not a parallel discard implementation -- and that path never
+// re-arms auto-continue, so this inherits that for free. Same
 // `!isRecording` guard/no-op-if-already-stopped reasoning as
 // finalizeEndpointing() above. Exported for the same headless-test reason:
 // it's the exact function real continuous no-speech silence crossing
@@ -2035,7 +2038,7 @@ export function finalizeIdleTimeout() {
 // crosses SILENCE_MS; nothing here is a parallel/fake implementation of that
 // logic. Returns the completeness verdict (or null when the check never
 // reached one -- suspended, superseded, or the relay call failed), or the
-// string 'cancelled' on a spoken-cancel verdict (#722), so tests can assert
+// string 'cancelled' on a spoken-cancel verdict, so tests can assert
 // on any of the three outcomes directly.
 //
 // `token` pins this check to the recording it started transcribing for
@@ -2058,7 +2061,7 @@ export async function checkEndpointCandidate(samples, sampleRate) {
     // Recording ended (or Auto/voice mode changed, or a NEW recording has
     // since started) while we awaited -- a stale verdict must never act.
     if (!endpointingActive() || token !== endpointRecordingToken) return null;
-    // Checked BEFORE the completeness decision (#722) -- a cancel verdict
+    // Checked BEFORE the completeness decision -- a cancel verdict
     // preempts it entirely, the same way it rides the same candidate-pause
     // transcript rather than opening a second detection path/timer/STT call.
     if (isCancelUtterance(transcript)) {
@@ -2090,7 +2093,7 @@ function clearThinking() {
 
 // --- the user's own words in the thread ---
 
-// Renders the spoken turn's transcript as a user bubble (#758), matching what
+// Renders the spoken turn's transcript as a user bubble, matching what
 // the text path does at send time (askStream() in ask-stream.js). Called as
 // soon as the transcript is known -- from the `transcript` SSE event, which the
 // relay emits the moment STT lands and long before the reply finishes -- rather
@@ -2122,7 +2125,7 @@ function clearUserTranscript() {
   }
 }
 
-// --- network-resilience UI: retrying/failed status row (#801) ---
+// --- network-resilience UI: retrying/failed status row ---
 //
 // A small row appended right after the turn's bubble (or, if none exists
 // yet -- an audio-only turn whose initial submission never even reached STT
@@ -2166,7 +2169,7 @@ function showRetryingStatus(attempt, max) {
 }
 
 // Definitive failure: the recording is held (heldRecording, set by the
-// caller) and this offers the only two things #801 promises -- resubmit the
+// caller) and this offers the only two things the retry mechanism promises -- resubmit the
 // same audio, or explicitly throw it away. No third "do nothing" outcome
 // silently loses it: the row simply stays until one of those two is tapped,
 // or the next recording replaces it (submitTurn()'s own teardown, see
@@ -2198,11 +2201,11 @@ function showFailedStatus(onRetry, onDismiss) {
 // the *initial* submission (never even reached the gateway) or a mid-stream
 // drop before `transcript` ever arrived leaves it null: STT never ran, so
 // there is no transcript to show. This still must not lose the recording
-// (#801's whole point), so a placeholder user bubble is created purely as an
+// (the retry mechanism's whole point), so a placeholder user bubble is created purely as an
 // anchor for the failed-state row and its Retry affordance -- never shown by
 // a successful turn (renderUserTranscript() already no-ops on empty text, so
 // this can't collide with the "no bubble on a transcript-less success" case,
-// #758/test_turn_without_a_transcript_renders_no_user_bubble).
+// see test_turn_without_a_transcript_renders_no_user_bubble).
 function ensureTurnBubble() {
   if (turnTranscriptEl) return turnTranscriptEl;
   turnTranscriptEl = addMessage('🎤 Voice message', 'user');
@@ -2243,7 +2246,7 @@ function postTurnCancel(turnId) {
 }
 
 async function consumeTurnStream(response, ownTurn) {
-  // Found on review (#832/F1): the reset below is reachable even when this
+  // The reset below is reachable even when this
   // turn has ALREADY been superseded -- a fetch() promise can resolve with a
   // Response even after its signal fires (the abort races the "headers
   // already arrived" resolution), so postTurnStart() returning doesn't
@@ -2262,12 +2265,12 @@ async function consumeTurnStream(response, ownTurn) {
     // A turn's events arrive progressively over the life of this stream --
     // long enough for a newer turn to have started in the meantime (the user
     // cancelled and immediately re-recorded). `isOwnTurn` gates every branch
-    // below that would otherwise touch module state a newer turn now owns
-    // (#832); `doneData` is this call's own local, so it's always safe to
+    // below that would otherwise touch module state a newer turn currently owns;
+    // `doneData` is this call's own local, so it's always safe to
     // set regardless.
     if (event.type === 'started') {
-      // Recorded on `ownTurn` itself unconditionally (#832/F2), even when
-      // this turn no longer owns anything -- submitTurn()'s own supersession
+      // Recorded on `ownTurn` itself unconditionally, even when
+      // this turn doesn't own anything -- submitTurn()'s own supersession
       // logic can only abort+cancel a turn whose id it already knows, and a
       // turn superseded before its `started` frame arrived has no id to give
       // it yet. Filling this in lets a turn cancel itself the moment its own
@@ -2277,8 +2280,7 @@ async function consumeTurnStream(response, ownTurn) {
         activeTurnId = event.turn_id;
         showCancel(true);
       } else {
-        // Defense-in-depth, not the common case (found on independent
-        // review, #832/N1): a real fetch() errors its body stream the
+        // Defense-in-depth, not the common case: a real fetch() errors its body stream the
         // instant its own AbortController fires, and reading it resumes
         // into one synchronous reader.read()-resolves -> parseSseChunk ->
         // handleEvent block -- so a turn superseded BEFORE its `started`
@@ -2286,8 +2288,9 @@ async function consumeTurnStream(response, ownTurn) {
         // browser; the connection is simply gone before the id exists to
         // act on. This exists for the narrower, still-real race where the
         // frame was already in flight over the wire a moment before the
-        // abort (the same class of race #832/F1's postTurnStart()-resolves-
-        // after-abort comment describes) -- close enough behind the abort
+        // abort (the same class of race the reset comment above,
+        // postTurnStart()-resolves-after-abort, describes) -- close enough
+        // behind the abort
         // that this handler still runs once more before the stream
         // actually tears down. Either way, finish the job the abort alone
         // couldn't: tell the server to stop, so the turn doesn't run to
@@ -2301,12 +2304,12 @@ async function consumeTurnStream(response, ownTurn) {
     if (event.type === 'cancelled') {
       // This frame means the turn was cancelled server-side -- possibly by
       // this tab's own Cancel button (cancelActiveTurn(), which already
-      // cleared the bubble), but a turn's lifetime is server-owned (#611) and
+      // cleared the bubble), but a turn's lifetime is server-owned and
       // can just as easily be cancelled from elsewhere (another tab/device
       // on the same conversation). Clear here too so an externally-cancelled
       // turn leaves no trace either -- idempotent if cancelActiveTurn()
       // already ran. Gated the same as every other branch here: a newer
-      // turn's own bubble must survive a stale cancel arriving late (#832).
+      // turn's own bubble must survive a stale cancel arriving late.
       if (isOwnTurn(ownTurn)) clearUserTranscript();
       throw new DOMException('Turn cancelled', 'AbortError');
     }
@@ -2314,7 +2317,7 @@ async function consumeTurnStream(response, ownTurn) {
       // A definitive, server-reported failure -- whisper-relay's TurnPipeline
       // (turns.py) always runs `registry.end(turn_id)` in its `finally`
       // before yielding this, so the turn has already ended server-side.
-      // Tagged so submitTurn()'s catch (#801) treats this as a normal failed
+      // Tagged so submitTurn()'s catch treats this as a normal failed
       // state, never a "mid-stream drop" needing the poll-for-completion
       // dance below -- there's nothing ambiguous left to resolve, and a
       // resubmit can never double-execute against a turn that's confirmed
@@ -2325,7 +2328,7 @@ async function consumeTurnStream(response, ownTurn) {
     }
     if (event.type === 'status_audio') {
       if (event.message && isOwnTurn(ownTurn)) setStatus('loading', event.message);  // spoken status text
-      // Gated (#832/F1): ungated, a stale turn's own clip queues onto the
+      // Gated: ungated, a stale turn's own clip queues onto the
       // shared playbackChain a newer turn's `await playbackChain` then waits
       // on -- the newer turn's status text stays right, but the user hears
       // the stale turn's audio play out anyway.
@@ -2355,7 +2358,7 @@ async function consumeTurnStream(response, ownTurn) {
   return doneData;
 }
 
-// --- submission retry-with-backoff + mid-stream-drop recovery (#801) ---
+// --- submission retry-with-backoff + mid-stream-drop recovery ---
 //
 // Scope: the retry ladder below covers ONLY the *initial* submission -- the
 // POST that starts a turn, before any SSE bytes have come back. Once that
@@ -2378,7 +2381,7 @@ async function consumeTurnStream(response, ownTurn) {
 //     guarantee a raw fetch rejection does.
 // Never retryable:
 //   - Any 4xx -- the request was rejected outright and won't get better
-//     (per the issue: "a rejected request won't get better").
+//     on a retry.
 //   - Any OTHER 5xx (500, 503, 504, ...). Deliberate, not an oversight: none
 //     of them is proven to mean "never ran" the way this proxy's 502 is --
 //     `voice_turn_stream` (whisper-relay's route) always answers 200 and
@@ -2388,8 +2391,8 @@ async function consumeTurnStream(response, ownTurn) {
 //     -free, and retrying blind against an unproven guarantee is exactly
 //     the double-execution risk this feature exists to avoid elsewhere.
 // An AbortError from the user's OWN cancel (activeTurnAbort) is handled by
-// the caller before this classification is ever consulted.
-// Test seam (#801): whether a recording is currently held for retry, without
+// the caller ahead of this classification, which is never consulted for it.
+// Test seam: whether a recording is currently held for retry, without
 // exposing the blob itself -- lets a browser test assert directly that a
 // recording survived a failed submission, or was discarded on
 // cancel/dismiss/success, the same pattern isEndpointTapActive()/
@@ -2413,7 +2416,7 @@ function jitteredDelay(baseMs) {
 // Resolves after a jittered backoff, or rejects with the same AbortError
 // shape cancelActiveTurn() already produces if `signal` fires first while
 // waiting -- a spoken/tapped cancel during a pending retry behaves exactly
-// like a cancel during the fetch itself (#801 interaction proof).
+// like a cancel during the fetch itself.
 function waitForRetry(baseMs, signal) {
   return new Promise((resolve, reject) => {
     if (signal.aborted) { reject(new DOMException('Turn cancelled', 'AbortError')); return; }
@@ -2455,7 +2458,7 @@ async function backoffBeforeRetry(attempt, signal) {
   await waitForRetry(SUBMIT_RETRY_DELAYS_MS[attempt], signal); // throws AbortError on cancel
 }
 
-// #801 mid-stream drop: the initial POST succeeded and consumeTurnStream()
+// Mid-stream drop: the initial POST succeeded and consumeTurnStream()
 // was reading real SSE frames when the connection died (a network error
 // mid-read, or the stream ending with no `done`/`error`/`cancelled` ever
 // seen -- see submitTurn()'s "Turn ended without a response" throw). Unlike
@@ -2472,8 +2475,8 @@ async function backoffBeforeRetry(attempt, signal) {
 // `_serve_clip()`) -- 404s until `turns.py` writes the final TTS clip, which
 // only happens after the LLM reply is in hand, immediately before `done`.
 // So a 200 there is proof the turn actually completed, even though nothing
-// exposes the transcript/response text to redisplay -- a real gap, noted as
-// a follow-up in the PR report.
+// exposes the transcript/response text to redisplay -- a real gap in what's
+// currently exposed.
 //
 // Chosen semantics: poll that endpoint briefly (HEAD, no body download).
 // Found -> the turn completed; there is nothing left to retry, so the
@@ -2502,12 +2505,13 @@ function sleepAbortable(ms, signal) {
   });
 }
 
-// `signal` (#832/F5): this poll used to run its own ~3s budget deaf to
+// `signal`: without it, this poll would run its own ~3s budget deaf to
 // cancellation -- neither a Cancel tap nor a newer turn superseding this one
-// (submitTurn()'s own abort() on supersession) stopped it, because its sleep
-// was a bare setTimeout and its HEAD fetch carried no signal at all. Both are
-// wired to the turn's own AbortController now, so aborting it (from either
-// source) ends the poll immediately instead of after its full budget.
+// (submitTurn()'s own abort() on supersession) would stop it, because its
+// sleep would be a bare setTimeout and its HEAD fetch would carry no signal
+// at all. Both are wired to the turn's own AbortController, so aborting it
+// (from either source) ends the poll immediately instead of after its full
+// budget.
 async function pollForCompletedAudio(turnId, signal) {
   for (let i = 0; i < MIDSTREAM_POLL_ATTEMPTS; i += 1) {
     if (i > 0) {
@@ -2554,13 +2558,11 @@ function handleTerminalFailure(message) {
 }
 
 // `ownTurn` is checked after the poll's await -- a newer turn may have
-// started while it ran (#832, generalizing the identity check #827
-// introduced for one branch). No entry-time check: this function's only
-// caller already checks isOwnTurn() with no await before calling it (found
-// on independent review, #832/N2 -- a prior version of this comment claimed
-// an entry-time race that the code couldn't actually produce), so an
-// identical check here would never fire. The poll itself also carries
-// `ownTurn`'s own signal (#832/F5), so a supersession's abort() ends it
+// started while it ran, and the same turn-ownership check applies uniformly
+// regardless of which branch triggers it. No entry-time check: this
+// function's only caller already checks isOwnTurn() with no await before
+// calling it, so an identical check here would never fire. The poll itself
+// also carries `ownTurn`'s own signal, so a supersession's abort() ends it
 // immediately rather than after its full ~3s budget.
 async function handleMidStreamDrop(err, ownTurn) {
   const turnId = activeTurnId;
@@ -2579,7 +2581,7 @@ async function handleMidStreamDrop(err, ownTurn) {
 
 // Exported so the headless test harness can drive a turn without a real mic
 // (getUserMedia/MediaRecorder don't run headless). `retryBubble` is internal
-// (#801) -- set only by the failed-state Retry button's own click handler
+// -- set only by the failed-state Retry button's own click handler
 // above, never by a real caller, so a retried turn reconciles into the SAME
 // bubble instead of submitTurn() resetting to null and letting
 // renderUserTranscript() create a second one.
@@ -2594,8 +2596,8 @@ export async function submitTurn({ blob, mime, transcript, retryBubble } = {}) {
     turnTranscriptEl = retryBubble;
   } else {
     // A fresh (non-retry) turn supersedes whatever the last held
-    // recording/failed status was -- #801's "one held blob, replaced by the
-    // next recording, not an unbounded queue". Any earlier failed bubble the
+    // recording/failed status was -- one held blob, replaced by the
+    // next recording, not an unbounded queue. Any earlier failed bubble the
     // user never tapped Retry/dismiss on stays in the thread as history; it
     // just loses the now-stale affordance along with removeVoiceTurnStatus()
     // above, since its blob is about to be overwritten below.
@@ -2603,12 +2605,12 @@ export async function submitTurn({ blob, mime, transcript, retryBubble } = {}) {
   }
   turnDone = false;
   // A caller-supplied transcript needs no STT round trip, so it can go in the
-  // thread immediately (#758); an audio turn's bubble lands on the relay's
+  // thread immediately; an audio turn's bubble lands on the relay's
   // `transcript` SSE event instead.
   renderUserTranscript(transcript);
   showThinking();
 
-  // #832/F2: this turn supersedes whatever was still active -- abort its
+  // This turn supersedes whatever was still active -- abort its
   // connection and, if its id is already known, tell the relay to stop
   // running it too (best-effort; if the id isn't known yet, the `started`
   // handler above finishes this job the moment that turn learns its own id).
@@ -2622,7 +2624,7 @@ export async function submitTurn({ blob, mime, transcript, retryBubble } = {}) {
 
   activeTurnId = null;
   activeTurnAbort = new AbortController();
-  // Captured so the checks below (#827, generalized by #832) can tell "this
+  // Captured so the turn-ownership checks below can tell "this
   // turn's own controller is still current" from "a newer turn already
   // replaced it" -- distinct from activeTurnAbort itself, which a later
   // submitTurn() call reassigns. `id` starts null and is filled in by
@@ -2631,12 +2633,12 @@ export async function submitTurn({ blob, mime, transcript, retryBubble } = {}) {
   // survives being superseded (see the supersession comment above).
   const ownTurn = { abort: activeTurnAbort, id: null };
 
-  // #801 -- hold the recording until the turn *definitively* completes (see
+  // Hold the recording until the turn *definitively* completes (see
   // `heldRecording`'s own comment). Set here, unconditionally, so a fresh
   // recording AND a manual retry (which passes the same blob back in) both
   // keep exactly one slot current.
   if (blob) heldRecording = { blob, mime };
-  // #832/F9: identifies THIS turn's own held-recording object (or null if it
+  // Identifies THIS turn's own held-recording object (or null if it
   // never set one), distinct from `heldRecording` itself, which a later
   // submitTurn() call can reassign to a different object. Used below to
   // clear it on a stale-success early return WITHOUT clobbering a newer
@@ -2648,9 +2650,9 @@ export async function submitTurn({ blob, mime, transcript, retryBubble } = {}) {
   if (transcript) form.append('transcript', transcript);
   if (state.currentConversationId) form.append('conversation_id', state.currentConversationId);
   form.append('backend', mode);
-  // Persona rides along on lifeos and hermes alike now (#593), mirroring the
-  // `backend !== 'agent'` gate askStream() uses for text turns — this used to
-  // gate on 'lifeos' only, which left a spoken Hermes turn with no persona
+  // Persona rides along on lifeos and hermes alike, mirroring the
+  // `backend !== 'agent'` gate askStream() uses for text turns — gating on
+  // 'lifeos' only would leave a spoken Hermes turn with no persona
   // and no spoken-style rules once it reached the Hermes proxy. The agent
   // backend keeps its current field-dropping behavior (it has no persona
   // pass-through at all, on either surface).
@@ -2660,7 +2662,7 @@ export async function submitTurn({ blob, mime, transcript, retryBubble } = {}) {
   // Per-turn model pick — forwarded as `model_override`, mirroring how text
   // turns send it on /api/ask/stream (web/chat/ask-stream.js). Omitted for
   // 'auto' so the default turn stays byte-identical; only the lifeos backend
-  // honors model picks — deliberately NOT extended to hermes (#593): model
+  // honors model picks — deliberately NOT extended to hermes: model
   // selection on that backend belongs to the harness, not to LifeOS.
   // whisper-relay relays the field to /api/ask/stream (whisper-relay#24) —
   // until that ships the gateway drops it, degrading gracefully to the
@@ -2669,7 +2671,7 @@ export async function submitTurn({ blob, mime, transcript, retryBubble } = {}) {
     form.append('model_override', config.model);
   }
 
-  // #801 -- once the initial POST answers `ok` and the SSE stream starts
+  // Once the initial POST answers `ok` and the SSE stream starts
   // being read, a failure switches from "retry the submission" to "mid-
   // stream drop" semantics (see handleMidStreamDrop()'s own comment for
   // why they differ).
@@ -2678,7 +2680,7 @@ export async function submitTurn({ blob, mime, transcript, retryBubble } = {}) {
     const res = await postTurnStart(form, ownTurn.abort.signal);
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
-      // Guarded like every other settling touch below (#832): a newer turn
+      // Guarded like every other settling touch below: a newer turn
       // may already own the thinking placeholder by the time this awaited
       // response comes back.
       if (isOwnTurn(ownTurn)) clearThinking();
@@ -2693,10 +2695,10 @@ export async function submitTurn({ blob, mime, transcript, retryBubble } = {}) {
     }
     if (!isOwnTurn(ownTurn)) {
       // A newer turn already owns everything below -- this stale turn has
-      // nothing left to reconcile into shared state (#832). The stream was
+      // nothing left to reconcile into shared state. The stream was
       // still fully drained by consumeTurnStream() above either way. This
       // turn DID complete successfully server-side, though, so it has
-      // nothing left to retry -- clear heldRecording (#832/F9), but only if
+      // nothing left to retry -- clear heldRecording, but only if
       // it's still THIS turn's own object: a newer turn that has since
       // submitted its own recording already overwrote it, and that one must
       // survive to be retried if the newer turn later fails.
@@ -2708,26 +2710,24 @@ export async function submitTurn({ blob, mime, transcript, retryBubble } = {}) {
       state.currentConversationId = data.conversation_id;
       setStoredConversationId(data.conversation_id);  // per-backend persistence
       loadConversations();
-      // Orchestrating-persona voice turn (#412): the relay's `done` payload
+      // Orchestrating-persona voice turn: the relay's `done` payload
       // doesn't surface the `claude_code` routing the text path keys off, so
       // gate on the selected persona instead — only an orchestrating bot (e.g.
       // doctor) spawns a session that can ask. Poll the linked conversation so
       // a `[CLARIFY]`/`[GOAL]` can be answered here without Telegram.
-      // Also gated on the lifeos backend specifically (#593): the spawn is
+      // Also gated on the lifeos backend specifically: the spawn is
       // LifeOS-native. An orchestrating persona_id sent to the Hermes proxy
-      // used to be rejected there with a 400 (hermes_proxy.py), so a
-      // Hermes-backend turn never had a session to poll for; since #642
-      // Hermes drives that persona itself (lifeos_agent_spawn) instead of
-      // 400ing, but that's still not a LifeOS-linked session this client can
-      // poll, so the gate stays lifeos-only (personaOrchestrates() is false
-      // for hermes now too, #642 — see persona.js).
+      // is handled by Hermes driving that persona itself
+      // (lifeos_agent_spawn), but that's still not a LifeOS-linked session
+      // this client can poll, so the gate stays lifeos-only
+      // (personaOrchestrates() is false for hermes too — see persona.js).
       if (mode === 'lifeos' && personaOrchestrates()) {
         startPendingQuestionPolling(data.conversation_id);
       }
     }
     clearThinking();
     turnDone = true;
-    heldRecording = null; // #801 -- the turn reached the server and completed; nothing to retry
+    heldRecording = null; // the turn reached the server and completed; nothing to retry
     // `done` is authoritative — reconciles the bubble the `transcript` event
     // already rendered, or renders it if that event never arrived.
     renderUserTranscript(data.transcript);
@@ -2743,7 +2743,7 @@ export async function submitTurn({ blob, mime, transcript, retryBubble } = {}) {
     // comment) is exactly what settles `playbackChain` early, and that same
     // tap already reset activeTurnAbort/voiceBusy/status itself. Checked
     // again here, after the await, for the same reason as everywhere else in
-    // this function (#832): don't redo that reset onto whatever turn is
+    // this function: don't redo that reset onto whatever turn is
     // current by the time this resumes.
     if (!isOwnTurn(ownTurn)) return;
     showCancel(false);
@@ -2752,11 +2752,11 @@ export async function submitTurn({ blob, mime, transcript, retryBubble } = {}) {
   } catch (err) {
     if (err?.name === 'AbortError') {
       // A local Cancel-button tap runs cancelActiveTurn() synchronously
-      // before this ever settles -- it already reset thinking/cancel/status
+      // ahead of this ever settling -- it already reset thinking/cancel/status
       // and nulled activeTurnAbort, so redoing that here would risk
       // clobbering a next turn that started in the meantime. A turn
       // cancelled server-side (the 'cancelled' SSE branch above, reachable
-      // with no local cancelActiveTurn() call -- see #827) never goes
+      // with no local cancelActiveTurn() call) never goes
       // through that reset, and activeTurnAbort is still THIS turn's own
       // controller in that case -- checked by identity, not mere presence,
       // so a stale turn settling after a newer one has already started
@@ -2768,10 +2768,10 @@ export async function submitTurn({ blob, mime, transcript, retryBubble } = {}) {
       }
       return;
     }
-    if (!isOwnTurn(ownTurn)) return; // superseded -- nothing left to report (#832)
+    if (!isOwnTurn(ownTurn)) return; // superseded -- nothing left to report
     clearThinking();
     showCancel(false);
-    // #801 -- a mid-stream drop (the SSE stream died after a genuine `ok`
+    // A mid-stream drop (the SSE stream died after a genuine `ok`
     // response, and this wasn't a definitive server-reported error) gets the
     // poll-then-explicit-retry-only treatment; every other failure (the
     // initial submission never got a usable response at all, or the server
@@ -2788,7 +2788,7 @@ export async function submitTurn({ blob, mime, transcript, retryBubble } = {}) {
     // newer turn has taken over, so in practice this only ever runs while
     // still current -- but it's the very last thing this turn does, and the
     // one reset every prior version of this code applied unconditionally
-    // (#832), so it gets the same identity check as everywhere else rather
+    // so it gets the same identity check as everywhere else rather
     // than relying on that invariant holding forever.
     if (isOwnTurn(ownTurn)) {
       activeTurnId = null;
@@ -2803,7 +2803,7 @@ function showCancel(on) {
   if (elements.voiceCancelBtn) elements.voiceCancelBtn.classList.toggle('visible', on);
 }
 
-// Exported so the headless test harness can drive it directly (#758) --
+// Exported so the headless test harness can drive it directly --
 // same reason submitTurn() is exported, and needed to test the "stop
 // playback after done" case without faking real audio element timing.
 export function cancelActiveTurn() {
@@ -2813,13 +2813,13 @@ export function cancelActiveTurn() {
   stopAllAudio();
   clearThinking();
   // A cancelled turn is never persisted, so it leaves no trace in the thread —
-  // drop the user bubble along with the thinking placeholder (#758). But this
+  // drop the user bubble along with the thinking placeholder. But this
   // button is also the "stop playback" control once a turn has already
   // reached `done` (voiceBusy/clipInFlight stay true while audio plays out,
   // see submitTurn()'s `await playbackChain`) -- that bubble is the
   // authoritative, already-persisted transcript, so leave it alone then.
   if (!turnDone) clearUserTranscript();
-  // #801 -- an explicit cancel is one of the three discard triggers
+  // An explicit cancel is one of the three discard triggers
   // (success, cancel, explicit dismiss) for the held recording, and clears
   // any retrying/failed status row along with it. Already null/absent by
   // the time a turn has reached `done` (cleared on success; stop-playback

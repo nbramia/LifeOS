@@ -102,7 +102,7 @@ def link_imessage_entities(dry_run: bool = True) -> dict:
         # presence of a linked message instead (the previous behaviour) meant a
         # handle whose messages were partially linked — one linked row was
         # enough — was skipped forever, so its remaining rows could never be
-        # backfilled (#497). The UPDATE below is already scoped to unlinked
+        # backfilled. The UPDATE below is already scoped to unlinked
         # rows, so re-visiting a partially-linked handle is safe.
         cursor = conn.execute("""
             SELECT 1 FROM messages
@@ -155,7 +155,7 @@ def link_imessage_entities(dry_run: bool = True) -> dict:
 
     # Canonical line consumed by run_all_syncs._parse_sync_output. "Newly
     # linked" / "Messages updated" match none of the fallback regexes, so a
-    # night that linked thousands of rows still reported 0/0/0 (#497).
+    # night that linked thousands of rows still reported 0/0/0.
     from api.services.sync_health import emit_sync_stats
     emit_sync_stats({
         "processed": int(stats.get("handles_checked", 0) or 0),

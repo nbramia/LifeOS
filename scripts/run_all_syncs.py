@@ -23,7 +23,7 @@ Options:
 # override=True: the .env file deterministically wins over inherited env vars.
 # A present-but-empty inherited var (e.g. SLACK_USER_TOKEN="") would otherwise
 # shadow the file value here AND in config.settings (which merges os.environ
-# over dotenv_values), silently disabling credential syncs — issue #438.
+# over dotenv_values), silently disabling credential syncs.
 from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent / ".env", override=True)
@@ -326,12 +326,12 @@ _active_source: str | None = None
 _llm_stopped_for_sync: bool = False
 _llm_was_running_before_sync: bool = False
 
-# In-progress signal for scripts/auto-deploy.sh's sync_in_progress() (#793).
-# Auto-deploy used to match `run_all_syncs.py` in any process's command line
-# to decide whether a sync was running — including an unrelated process that
-# merely mentioned the script's name/path as an argument, which deferred
-# deploys for no reason. A first fix (a pid-in-a-file marker, checked with
-# `kill -0`) traded that for three new problems found on review: checking the
+# In-progress signal for scripts/auto-deploy.sh's sync_in_progress().
+# Matching `run_all_syncs.py` in any process's command line to decide
+# whether a sync is running is unreliable — it also matches an unrelated
+# process that merely mentions the script's name/path as an argument, which
+# would defer deploys for no reason. A pid-in-a-file marker (checked with
+# `kill -0`) has three problems of its own: checking the
 # marker once and then restarting later is TOCTOU (a sync can start in the
 # gap); a marker's pid can be reused by an unrelated process after the sync
 # that wrote it dies, reading as "still alive" forever; and one global marker
@@ -408,7 +408,7 @@ def _acquire_sync_lock() -> None:
         SYNC_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
         _sync_lock_file = open(SYNC_LOCK_PATH, "w")
     except OSError as e:
-        # Found on review: this used to be a buried `logger.warning` — given
+        # A buried `logger.warning` would not be enough here — given
         # the consequence (auto-deploy can't see this sync and may restart a
         # service on top of it, the exact OOM host-freeze this mechanism
         # exists to prevent), it goes through the same Telegram path a real
@@ -553,7 +553,7 @@ def log_sync_summary_to_markdown(result: dict, trigger: str = "unknown"):
             src_details = ", ".join(f"{s}: {c}" for s, c in interactions_by_src.items() if c > 0)
             lines.append(f"- Interactions: {interactions_created}" + (f" ({src_details})" if src_details else ""))
 
-    # Repeated-identical-yield sources (#646) — excluded from "New Records"
+    # Repeated-identical-yield sources — excluded from "New Records"
     # above because a constant non-zero count across consecutive runs is
     # evidence of re-importing unchanged upstream data, not real new
     # records. Called out here so the run isn't just silently under-counted.
@@ -570,7 +570,7 @@ def log_sync_summary_to_markdown(result: dict, trigger: str = "unknown"):
             else:
                 lines.append(f"- {src}")
 
-    # Apple Data Agent SHA drift (#646) — a silently-broken self-update on
+    # Apple Data Agent SHA drift — a silently-broken self-update on
     # the (installer-configurable) export agent, surfaced here instead of a
     # log line no batched report reads.
     apple_agent_sha_drift = result.get("apple_agent_sha_drift")
@@ -587,7 +587,7 @@ def log_sync_summary_to_markdown(result: dict, trigger: str = "unknown"):
 
 
 # ---------------------------------------------------------------------------
-# Human queue integration (#852) — files/resolves operator-only-failure
+# Human queue integration — files/resolves operator-only-failure
 # cards through the local HTTP API, never the in-process TaskManager (this
 # script runs as a separate process from the API server — the same rule the
 # maintenance-mode toggle above follows). Every entry point below is wrapped
@@ -662,16 +662,16 @@ def file_human_queue_cards_for_sync(result: dict) -> None:
     """File a keyed Human-queue card for each source this run's summary
     classifies as a real failure (`result['failed_sources']` — a source
     that's disabled/unconfigured, or skipped because a dependency failed,
-    never enters that list), and resolve any previously-filed `sync:<source>`
-    card for a source that succeeded this run (#852).
+    never enters that list), and resolve any already-filed `sync:<source>`
+    card for a source that succeeded this run.
 
     Hooked from the summary path (called once after the full run, alongside
     `send_sync_summary_telegram`) rather than instrumented into
     `sync_health.record_sync_complete`/`record_sync_error` at each of
     `run_sync`'s many internal call sites (retries, duration-collapse,
     yield-collapse, ...) — a single, easily-testable seam, and
-    `failed_sources` is already exactly the classification this issue asks
-    for (the same list the Telegram/markdown summaries report). Never raises
+    `failed_sources` is already exactly the right classification
+    (the same list the Telegram/markdown summaries report). Never raises
     into the sync run.
     """
     logger = logging.getLogger(__name__)
@@ -710,7 +710,7 @@ def file_human_queue_cards_for_sync(result: dict) -> None:
 def file_human_queue_card_for_monarch(mstatus: dict) -> None:
     """File the `monarch-reauth` card when the Monarch session is expired or
     missing, with a `done_when` endpoint check the worker's poll tick
-    resolves automatically once re-auth succeeds (#852). A no-op for any
+    resolves automatically once re-auth succeeds. A no-op for any
     other status. Never raises."""
     logger = logging.getLogger(__name__)
     try:
@@ -772,7 +772,7 @@ def send_sync_summary_telegram(result: dict, trigger: str = "unknown"):
         for src in result.get("failed_sources", []):
             lines.append(f"  • {src}")
 
-    # Suspiciously fast completions (possible silent no-ops — issue #438)
+    # Suspiciously fast completions (possible silent no-ops)
     if collapsed_sources:
         lines.append("")
         lines.append(f"*Suspiciously fast ({len(collapsed_sources)}):*")
@@ -827,7 +827,7 @@ def send_sync_summary_telegram(result: dict, trigger: str = "unknown"):
             else:
                 lines.append(f"🔧 *Data Issues:* {total_issues} found, {total_fixed} auto-fixed")
 
-    # Investments-snapshot freshness (#448) — surface the stale WARNING here so
+    # Investments-snapshot freshness — surface the stale WARNING here so
     # it reaches the operator (the bare log line does not feed any batched report).
     investments_stale = result.get("investments_stale")
     if investments_stale:
@@ -835,7 +835,7 @@ def send_sync_summary_telegram(result: dict, trigger: str = "unknown"):
         lines.append("⚠️ *Investments snapshot stale:*")
         lines.append(f"  {investments_stale}")
 
-    # Apple Data Agent SHA drift (#646) — surface here so a silently-broken
+    # Apple Data Agent SHA drift — surface here so a silently-broken
     # export agent's self-update reaches the operator (the bare log line
     # does not feed any batched report).
     apple_agent_sha_drift = result.get("apple_agent_sha_drift")
@@ -844,7 +844,7 @@ def send_sync_summary_telegram(result: dict, trigger: str = "unknown"):
         lines.append("⚠️ *Apple Data Agent SHA drift:*")
         lines.append(f"  {apple_agent_sha_drift}")
 
-    # Repeated-identical-yield sources (#646) — a constant non-zero count
+    # Repeated-identical-yield sources — a constant non-zero count
     # across consecutive runs is evidence of re-importing unchanged upstream
     # data, not real new records. Called out explicitly since these counts
     # are excluded from "New People"/"New Interactions" above.
@@ -976,7 +976,7 @@ SYNC_ORDER = [
     "link_slack",               # Link Slack users to people by email
     "imessage",                 # Create interactions from iMessage data (links its own unlinked messages internally)
     "link_imessage",            # Retroactive: backfill phone-based links against latest CRM data (runs after imessage — see depends_on)
-    "create_contact_persons",   # Create people for contacts with iMessage evidence but no person yet (#700)
+    "create_contact_persons",   # Create people for contacts with iMessage evidence but no person yet
     "link_source_entities",     # Retroactive linking for all unlinked entities
     "photos",                   # Sync Photos face data to people
 
@@ -1105,9 +1105,9 @@ def get_disabled_work_sources() -> set[str]:
     Work integrations are disabled by default for safety - work data will only be
     synced if explicitly enabled via environment variables. Personal Google has
     no such toggle, but is gated the same way once its credentials are absent —
-    absence used to reach sync_gmail_calendar_interactions.py unguarded and
-    raise FileNotFoundError, recorded as SyncStatus.FAILED every night on any
-    install that never set up personal Gmail/Calendar — issue #687.
+    without the gate, absence would reach sync_gmail_calendar_interactions.py
+    unguarded and raise FileNotFoundError, recorded as SyncStatus.FAILED every
+    night on any install that never set up personal Gmail/Calendar.
     """
     disabled = set()
 
@@ -1138,7 +1138,7 @@ def get_disabled_work_sources() -> set[str]:
     return disabled
 
 
-# Duration-collapse detection (issue #438): a source that historically takes
+# Duration-collapse detection: a source that typically takes
 # minutes completing in a fraction of a second is the signature of a silent
 # no-op (e.g. credentials missing from the child env). Exit-code hardening in
 # the sync scripts catches the known skip paths; this catches unknown ones.
@@ -1171,7 +1171,7 @@ def _detect_duration_collapse(source: str, elapsed_seconds: float) -> dict | Non
     return None
 
 
-# Yield-collapse detection (issue #494): duration collapse only catches sources
+# Yield-collapse detection: duration collapse only catches sources
 # that *used* to be slow. A source that always finishes instantly and always
 # produces nothing is invisible to it — `entity_cleanup` silently stopped
 # producing records in Feb 2026 and nobody noticed for months. Yield measures
@@ -1248,7 +1248,7 @@ def _detect_never_yielded(source: str, stats: dict) -> dict | None:
     }
 
 
-# Repeated-yield detection (issue #646): a dead export agent that leaves the
+# Repeated-yield detection: a dead export agent that leaves the
 # same stale upstream file in place every night is invisible to yield
 # collapse (yield collapse only fires on *zero* output) — the re-import
 # re-processes byte-identical data and reports an identical non-zero count,
@@ -1283,9 +1283,9 @@ def _detect_repeated_yield(source: str, stats: dict) -> dict | None:
 
 
 # A chronic never-yielded source (link_slack, repoint_stale_ids, google_sheets,
-# etc.) is a fixed, known-benign condition every night — issue #494's
-# acceptance criterion was "report once, not nightly", not "warn every night
-# forever". Re-warn periodically so a genuinely-fixed source's silence isn't
+# etc.) is a fixed, known-benign condition every night — the goal is to
+# report once, not nightly, not to warn every night
+# forever. Re-warn periodically so a genuinely-fixed source's silence isn't
 # permanent, but damp the common case.
 NEVER_YIELDED_REWARN_DAYS = 7
 
@@ -1318,7 +1318,7 @@ def _recently_warned_never_yielded(source: str, within_days: int = NEVER_YIELDED
 
 
 # =============================================================================
-# Transient-failure retry (issue #541)
+# Transient-failure retry
 # =============================================================================
 #
 # Mechanism chosen: a retry loop inside this orchestrator, around each
@@ -1342,7 +1342,7 @@ def _recently_warned_never_yielded(source: str, within_days: int = NEVER_YIELDED
 # run_sync is ever called, so a dependency-skipped source is never retried as
 # though it had failed), and lets one attempt campaign share a single
 # sync_runs row — so the retry doesn't skew the duration/yield history that
-# other detectors (#438, #494) rely on by counting one logical run twice.
+# other detectors rely on by counting one logical run twice.
 #
 # Idempotence: a retry re-runs a source's script from scratch, so a script
 # that fails partway through (after writing some data) and then retries must
@@ -1388,8 +1388,8 @@ RETRY_BACKOFF_SECONDS = [30, 120]  # wait before attempt 2, then before attempt 
 # Conservative allowlist: only failures that plausibly clear on their own get
 # retried. Matched against the captured output (stdout+stderr, or whatever
 # partial output was flushed before a timeout kill) — not against a specific
-# library's error *wording*, since issue #540 (landing separately) is
-# changing what Gmail's current "expired/revoked" message actually means.
+# library's error *wording*, since what Gmail's current "expired/revoked"
+# message actually means is subject to change independently.
 # These patterns key on the underlying signature instead: the DNS-resolution
 # errno/exception names, generic connection-level failures, and rate-limit
 # responses, which are stable across that kind of wording churn. Anything
@@ -1405,7 +1405,7 @@ _TRANSIENT_ERROR_PATTERNS = [
     r"nodename nor servname provided",
     r"NameResolutionError",
     r"gaierror",
-    # Requires the quote urllib3 always emits right after this phrase
+    # Requires the quote urllib3 always emits immediately following this phrase
     # ("Failed to resolve 'host.name' (...)") — bare "Failed to resolve"
     # would also match this codebase's *entity*-resolution vocabulary
     # (e.g. "Failed to resolve duplicate entity for source_id=..."), which
@@ -1657,7 +1657,7 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
             # failed-attempt time + backoff on top of the real execution
             # time — inflating get_typical_duration_seconds's baseline and
             # making _detect_duration_collapse progressively less sensitive
-            # every time a retry fires (issue #541 adversarial review).
+            # every time a retry fires.
             attempt_started_monotonic = time.monotonic()
             outcome = _execute_sync_once(source, script_path, args, full_path)
             attempt_elapsed_seconds = time.monotonic() - attempt_started_monotonic
@@ -1691,7 +1691,7 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
                 # green" summary.
                 skipped_reason = stats.pop("skipped_reason", None)
 
-                # Yield-based no-op detection (issue #494). Only meaningful when
+                # Yield-based no-op detection. Only meaningful when
                 # the source actually ran; a skipped source is expected to
                 # produce nothing.
                 if not skipped_reason:
@@ -1709,7 +1709,7 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
                     never_yielded = _detect_never_yielded(source, stats)
                     if never_yielded:
                         stats["never_yielded"] = never_yielded
-                        # Damped (#494 follow-up): only warn when the condition
+                        # Damped: only warn when the condition
                         # is newly true, or periodically — not every night for
                         # the same chronic sources.
                         if not _recently_warned_never_yielded(source):
@@ -1797,8 +1797,9 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
 
             stats = outcome["stats"]
             # Even on a terminal failure, an earlier attempt may have done
-            # real (idempotent) work before this one failed — don't let the
-            # last attempt's numbers erase that from the record.
+            # real (idempotent) work ahead of the attempt that ultimately
+            # failed — don't let the last attempt's numbers erase that from
+            # the record.
             stats.update(campaign_stats)
             record_sync_complete(
                 run_id,
@@ -1830,8 +1831,8 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
 
     except Exception as e:
         # `_execute_sync_once` already catches everything the subprocess
-        # attempt itself can raise (adversarial review finding #1: that
-        # helper's own try/except covers TimeoutExpired and Exception). This
+        # attempt itself can raise — that
+        # helper's own try/except covers TimeoutExpired and Exception. This
         # guards the orchestration *around* it instead — duration/yield
         # detection, and the record_sync_error/record_sync_complete calls —
         # since a locked sync_health.db (this host runs many agents against
@@ -1904,7 +1905,7 @@ def _parse_sync_output(output: str) -> dict:
     # A script that cannot run because it isn't configured emits
     # ``SYNC_SKIPPED:<reason>``. It still exits 0 — nothing is broken — but
     # recording it as a healthy success inflates the nightly "N/N green"
-    # summary and hides dead sources (issue #494).
+    # summary and hides dead sources.
     skipped_match = re.search(r"SYNC_SKIPPED:\s*([^\n]+)", output)
     if skipped_match:
         stats["skipped_reason"] = skipped_match.group(1).strip()
@@ -2023,7 +2024,7 @@ def backup_databases():
     """Snapshot interactions.db and crm.db before sync operations.
 
     Pruning is deliberately deferred to ``prune_backups_after_success``. A
-    snapshot taken now is only known to be a *usable* rollback point once the
+    snapshot only becomes a *usable* rollback point once the
     run it protects has finished cleanly, so nothing older is discarded until
     then — a string of failing nights must not rotate away the last good copy.
 
@@ -2134,7 +2135,7 @@ def run_all_syncs(
         except Exception as e:
             logger.warning(f"Failed to reap orphan sync_runs: {e}")
 
-        # Monarch session expiry check (issue #199 §3 acceptance criterion).
+        # Monarch session expiry check.
         # Surfaces re-auth need in the nightly log *before* the monthly
         # sync hits a 401/525. Cheap — just stats the pickle's mtime.
         try:
@@ -2143,7 +2144,7 @@ def run_all_syncs(
             if mstatus["status"] in ("expiring_soon", "expired", "missing"):
                 logger.warning(f"Monarch session: {mstatus['message']}")
             # File a Human-queue card for expired/missing (not expiring_soon
-            # — that's an early warning, not yet operator-actionable) (#852).
+            # — that's an early warning, not yet operator-actionable).
             file_human_queue_card_for_monarch(mstatus)
         except Exception as e:
             logger.warning(f"Monarch session-status check failed: {e}")
@@ -2199,7 +2200,7 @@ def run_all_syncs(
                 continue
 
             # Skip sources disabled by work integration settings (or, for
-            # personal Google, missing OAuth credentials — issue #687)
+            # personal Google, missing OAuth credentials)
             if source in disabled_sources:
                 if source in PERSONAL_GOOGLE_SOURCES:
                     logger.info(f"Skipping {source}: personal Google account not configured")
@@ -2316,7 +2317,7 @@ def run_all_syncs(
     logger.info("SYNC RUN COMPLETE")
     logger.info(f"Total sources: {len(sources)}")
     # Skipped sources aren't successes — counting them green is what let an
-    # unconfigured source sit in the "all healthy" total for months (#494).
+    # unconfigured source sit in the "all healthy" total for months.
     logger.info(f"Succeeded: {len(sources) - len(failed) - len(skipped_sources)}")
     logger.info(f"Failed: {len(failed)}")
     if skipped_sources:
@@ -2354,7 +2355,7 @@ def run_all_syncs(
     logger.info(f"Overall health: {health_msg}")
 
     # Silent-regression check: warn if a source keeps creating interactions
-    # but stopped persisting source_entities (issue #199 §2). Run after the
+    # but stopped persisting source_entities. Run after the
     # sync so the data we look at is post-tonight, not pre-tonight.
     try:
         drift = detect_silent_source_entity_drift()
@@ -2366,7 +2367,7 @@ def run_all_syncs(
     except Exception as e:
         logger.warning(f"Source-entity drift detector failed: {e}")
 
-    # Investments-snapshot freshness (#448): the Schwab pipeline delivers
+    # Investments-snapshot freshness: the Schwab pipeline delivers
     # summary.json via Syncthing (weekday ~18:30 refresh); warn if it has gone
     # stale. Non-fatal and skipped silently when absent. Surfaced in the nightly
     # Telegram summary (via result["investments_stale"]) so it reaches the operator.
@@ -2379,8 +2380,8 @@ def run_all_syncs(
     except Exception as e:
         logger.warning(f"Investments freshness check failed: {e}")
 
-    # Apple Data Agent SHA-drift warning (issue #646): the Mac Mini export
-    # agent's self-update (#509) can silently stop working, leaving it
+    # Apple Data Agent SHA-drift warning: the Mac Mini export
+    # agent's self-update can silently stop working, leaving it
     # running stale code indefinitely with no per-run signal — apple_import's
     # own CRITICAL log line never reaches this summary (it's a subprocess;
     # only its SYNC_STATS line is parsed). Checked directly against
@@ -2411,7 +2412,7 @@ def run_all_syncs(
     for source, stats in results.items():
         if stats.get("skipped") or stats.get("dry_run"):
             continue
-        # Issue #646: a source flagged repeated_yield reported the exact same
+        # A source flagged repeated_yield reported the exact same
         # non-zero count it reported on the last several runs — the
         # signature of re-importing an unchanged upstream file, not real new
         # records. Excluded here so the "New Records" summary doesn't repeat
@@ -2458,7 +2459,7 @@ def run_all_syncs(
         "apple_agent_sha_drift": apple_agent_sha_drift,
     }
 
-    # Exit maintenance mode now that sync is complete
+    # Exit maintenance mode once sync completes
     if not dry_run:
         try:
             import urllib.request
@@ -2478,7 +2479,7 @@ def run_all_syncs(
     if not dry_run:
         send_sync_summary_telegram(result, trigger=trigger)
 
-    # File/resolve Human-queue cards for sources needing operator action (#852).
+    # File/resolve Human-queue cards for sources needing operator action.
     if not dry_run:
         file_human_queue_cards_for_sync(result)
 
@@ -2534,7 +2535,7 @@ def main():
     if not args.execute and not args.dry_run:
         logger.info("Note: Running in dry-run mode. Use --execute to actually run syncs.")
 
-    # Shared lock for auto-deploy.sh's sync_in_progress() (#793) — acquired
+    # Shared lock for auto-deploy.sh's sync_in_progress() — acquired
     # before the run starts, released automatically by the kernel whenever
     # this process exits (normal return, the SIGTERM handler above, or a
     # hard kill), so there's no cleanup call needed here. Held for the whole

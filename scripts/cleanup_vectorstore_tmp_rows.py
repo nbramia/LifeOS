@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-One-off cleanup for #828: remove stray rows written by a test run that
+One-off cleanup: remove stray rows written by a test run that
 indexed a synthetic tmp vault into the live ChromaDB collection instead of
 an isolated one.
 
@@ -150,8 +150,7 @@ def main():
         print("\nDry run only — pass --apply to delete these rows.")
         return
 
-    # --apply: print the full record of what's being removed (issue's
-    # acceptance criteria calls for "a record of what was removed"), not
+    # --apply: print the full record of what's being removed, not
     # just a truncated preview.
     deleted = 0
     for i in range(0, len(stray), args.delete_batch_size):

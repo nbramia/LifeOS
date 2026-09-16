@@ -62,7 +62,7 @@ def run_relationship_discovery(dry_run: bool = True, days_back: int = 3650) -> d
     logger.info(f"  Total: {results.get('total', 0)} relationships updated")
 
     # Canonical line consumed by run_all_syncs._parse_sync_output. Without it
-    # this phase reported 0/0/0 nightly despite ~40 minutes of real work (#496).
+    # this phase reported 0/0/0 nightly despite ~40 minutes of real work.
     from api.services.sync_health import emit_sync_stats
     emit_sync_stats({"people_updated": int(results.get("total", 0) or 0)})
 
