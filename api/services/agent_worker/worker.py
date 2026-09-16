@@ -2682,6 +2682,17 @@ class Worker:
         double-projected: its tag is already terminal, so it was never a
         candidate in the first place.
 
+        A BLOCKED target is outside that "non-terminal is legitimately
+        live" scope: if the projector's own CAS write for a BLOCKED
+        transition (`_handle_cli_interrupted`'s resumable-park write, for
+        instance) loses a concurrent-edit race, the session row still lands
+        BLOCKED but the vault tag keeps whatever it held before. Because
+        BLOCKED is non-terminal, this sweep treats that session as
+        legitimately live and never revisits it. The stale tag self-corrects
+        only if a later status transition fires the projector again for that
+        same session — a session parked BLOCKED and never resumed or killed
+        keeps the stale tag indefinitely.
+
         Cost per tick: exactly two HTTP calls (one per tag), regardless of
         how many sessions or tasks exist. A failure listing one tag is
         logged and skipped — that tag simply contributes no candidates this
@@ -3112,10 +3123,10 @@ class Worker:
         round-trips through ``_resume_as_followup``, which for
         claude_code/codex routing just re-enqueues the reply and flips the
         session to CLAIMED so the next dispatch drains it through
-        ``resume()`` on the persisted CLI session id. The vault tag is left
-        at ``#agent-running`` (mirrors the CLARIFY/GOAL/PLAN block path,
-        which also doesn't swap it) — only the session row moves to BLOCKED
-        so ``/agents`` reflects it.
+        ``resume()`` on the persisted CLI session id. The session row moves
+        to BLOCKED through ``session_store.update_status``, which fires the
+        status projector and swaps the vault tag to ``#agent-blocked`` so
+        ``/agents`` reflects it.
 
         Fallback (no CLI session id persisted — ``init`` never fired, so
         there is nothing to resume against, or Telegram delivery failed and
