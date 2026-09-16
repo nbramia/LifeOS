@@ -1,4 +1,4 @@
-"""Tests for scripts/auto-update-macos.sh (#777) — the macOS analog of
+"""Tests for scripts/auto-update-macos.sh — the macOS analog of
 scripts/auto-deploy.sh's opt-in redeploy timer.
 
 Follows tests/test_deploy_drift.py's established pattern: `source` the real
@@ -6,7 +6,7 @@ script (its operational body is wrapped in `main()` and guarded so sourcing
 only defines functions — never fetches, pulls, or touches a real launch
 agent), then drive its decision helpers directly. `launchctl` and `curl` are
 never real here — they're shadowed by bash functions defined after sourcing,
-the same technique used to isolate `service_active_since_epoch` from a real
+the same technique that isolates `service_active_since_epoch` from a real
 systemd in test_deploy_drift.py, just via a function override instead of a
 PATH-stubbed binary (there's no columnar `launchctl list` format worth
 emulating for these tests since every call site is a single named command).
@@ -62,8 +62,8 @@ def _run_sourced(repo: Path, call: str, env_extra: dict | None = None) -> subpro
     real machine's actual lock file means pointing $HOME at a directory
     under the synthetic repo instead.
 
-    HOME is set AFTER layering in env_extra, not before (found on review,
-    #833) — a caller building env_extra from `dict(os.environ)` (e.g. to
+    HOME is set AFTER layering in env_extra, not before — a caller
+    building env_extra from `dict(os.environ)` (e.g. to
     tweak just PATH) carries the real $HOME along with it, and applying
     env_extra second would silently defeat this function's whole isolation
     guarantee, sending sync_in_progress_lock_acquire against the real
@@ -85,27 +85,27 @@ def _wait_until_lock_held(lock_path: Path, timeout: float = 30.0) -> None:
     lock_path — i.e. until a background holder has actually acquired, not
     just been spawned.
 
-    This is #833's actual root cause (found on review, by finally
-    reproducing it under the full unit suite rather than this file alone --
-    a single-file run can't reproduce it at all, since --dist loadscope puts
-    one file's tests on one worker with no intra-file concurrency; the flake
-    needs genuine system-wide contention from the OTHER 16 workers' worth of
-    tests). Two contributing problems, both fixed here:
+    Reproducing this reliably needs the full unit suite, not just this
+    file alone -- a single-file run can't reproduce it at all, since
+    --dist loadscope puts one file's tests on one worker with no
+    intra-file concurrency; the flake needs genuine system-wide
+    contention from the OTHER 16 workers' worth of tests. Two things
+    matter here:
 
-    1. The probe used to shell out to the external `flock`(1) CLI on every
-       poll iteration -- a fresh fork+exec per attempt, compounding exactly
-       the process-spawn contention this is trying to survive. It now calls
-       `fcntl.flock()` directly (LOCK_EX | LOCK_NB, released immediately),
-       matching what the real `flock` CLI does under the hood but without
-       spawning a process to do it.
-    2. A short (formerly 5s, then 30s -- still not enough under sustained
-       reproduction load) timeout assumed the HOLDER's own bash-spawns-
-       python3-spawns-flock startup chain gets scheduled promptly; under
-       heavy parallel load that alone can take longer, raising TimeoutError
-       here even though the holder genuinely would have acquired the lock
-       given more time -- not a hung/broken holder, just a slow one.
-       `_start_shared_lock_holder`'s own `seconds` safety cap was bumped for
-       a related but distinct reason (see its docstring)."""
+    1. The probe calls `fcntl.flock()` directly (LOCK_EX | LOCK_NB,
+       released immediately) on every poll iteration, matching what the
+       real `flock` CLI does under the hood but without spawning a
+       process to do it -- shelling out to the external `flock`(1) CLI
+       per poll would add a fresh fork+exec per attempt, compounding
+       exactly the process-spawn contention this is trying to survive.
+    2. The timeout has to tolerate the HOLDER's own bash-spawns-
+       python3-spawns-flock startup chain getting scheduled late; under
+       heavy parallel load that chain alone can take a while, and too
+       short a timeout raises TimeoutError even though the holder
+       genuinely would have acquired the lock given more time -- not a
+       hung/broken holder, just a slow one. `_start_shared_lock_holder`'s
+       own `seconds` safety cap is bumped for a related but distinct
+       reason (see its docstring)."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
@@ -127,19 +127,19 @@ def _start_shared_lock_holder(lock_path: Path, seconds: float = 60.0) -> subproc
     would return) keeps the fd open, so killing that parent alone does not
     release the lock. This one-liner IS the process holding the lock.
 
-    `seconds` is a safety cap, not the intended hold duration (found on
-    review, #833/F6) — every caller already calls `holder.terminate()` in
-    its own `finally`, which kills this process (and so releases the flock)
-    essentially instantly regardless of how much of `seconds` remains: no
-    signal handler is installed, so SIGTERM's default disposition (die
-    immediately) applies even mid-`time.sleep()`. The bug was treating
-    `seconds` as short (5, formerly) and load-bearing: under heavy parallel
-    load (many xdist workers, or other agents' test runs sharing this box),
-    the wall-clock time between spawning this holder and the calling test's
-    own assertion actually getting scheduled could exceed that short window,
-    so the holder released the lock on its own, naturally, before the test
-    ever checked it. A generous default removes that race without changing
-    how any test actually ends the hold."""
+    `seconds` is a safety cap, not the intended hold duration -- every
+    caller already calls `holder.terminate()` in its own `finally`, which
+    kills this process (and so releases the flock) essentially instantly
+    regardless of how much of `seconds` remains: no signal handler is
+    installed, so SIGTERM's default disposition (die immediately) applies
+    even mid-`time.sleep()`. A short, load-bearing `seconds` is dangerous:
+    under heavy parallel load (many xdist workers, or other agents' test
+    runs sharing this box), the wall-clock time between spawning this
+    holder and the calling test's own assertion actually getting scheduled
+    can exceed a short window, so the holder would release the lock on its
+    own, naturally, before the test ever checked it. A generous default
+    removes that race without changing how any test actually ends the
+    hold."""
     return subprocess.Popen([
         sys.executable, "-c",
         f"import fcntl, time\n"
@@ -475,7 +475,7 @@ def test_mark_env_mtime_applied_logs_error_and_leaves_no_marker_on_write_failure
 # ---------------------------------------------------------------------------
 # wait_for_pid_gone — never start the next process before the old one is
 # actually gone (poll the pid captured before unload, not `launchctl list`
-# re-queried after — the bind-race #777 fixes).
+# re-queried after — this avoids the bind race).
 # ---------------------------------------------------------------------------
 @pytest.mark.unit
 def test_wait_for_pid_gone_returns_immediately_for_empty_pid(tmp_path: Path):
@@ -537,7 +537,7 @@ def test_start_with_retry_succeeds_on_first_attempt(tmp_path: Path):
 @pytest.mark.unit
 def test_start_with_retry_retries_once_then_succeeds(tmp_path: Path):
     """A bare error on the first `load` is transient — the retry must
-    actually happen (#777 acceptance criterion)."""
+    actually happen."""
     if not AUTO_UPDATE_MACOS.exists():
         pytest.skip("scripts/auto-update-macos.sh not present")
     repo = _make_repo_for_macos(tmp_path)
@@ -795,7 +795,7 @@ def _run_main_macos(
 ) -> subprocess.CompletedProcess:
     """Run main() with api_active_since_epoch() overridden to a fixed,
     test-controlled value — the ground-truth replacement for the old
-    self-tracked restart marker means tests can no longer fake "the service
+    self-tracked restart marker means tests cannot fake "the service
     started at time X" by writing a marker file's mtime; overriding the
     function directly is the direct analog of test_deploy_drift.py's
     stubbed systemctl reporting a unit's ActiveEnterTimestamp. launchctl and
@@ -812,8 +812,8 @@ def _run_main_macos(
     fake_home.mkdir(exist_ok=True)
     env = dict(os.environ)
     env.update(env_extra or {})
-    # Set AFTER env_extra, not before (#833/F7, matching _run_sourced()'s own
-    # fix and comment above) -- so env_extra can never defeat this function's
+    # Set AFTER env_extra, not before (matching _run_sourced()'s own
+    # comment above) -- so env_extra can never defeat this function's
     # isolation, the same way it silently could here otherwise.
     env["HOME"] = str(fake_home)
     return subprocess.run(
@@ -905,8 +905,8 @@ def test_main_skips_when_api_service_not_running(tmp_path: Path):
 @pytest.mark.unit
 def test_main_lock_is_released_when_api_service_not_running(tmp_path: Path):
     """Regression guard for the trap-based release: this exact early exit
-    (service not running) previously had NO release call at all before the
-    lock was acquired — found and fixed on review. The lock must be free
+    (service not running) must trigger a release call once the lock has
+    been acquired, not just on later exit paths. The lock must be free
     immediately afterward."""
     if not AUTO_UPDATE_MACOS.exists():
         pytest.skip("scripts/auto-update-macos.sh not present")
@@ -950,13 +950,13 @@ def test_main_no_restart_when_service_started_after_code_and_env(tmp_path: Path)
 
 @pytest.mark.unit
 def test_main_does_not_scan_the_vault_on_a_no_op_tick(tmp_path: Path):
-    """Found on re-review: health_check_timeout() (which recursively walks
-    the whole vault via `find`) used to be computed unconditionally near
-    the top of main(), on every tick — including this one, where nothing
-    is stale and no restart happens. On a real host that keeps a
-    possibly-sleeping external disk spinning every cron tick for no
-    reason. It must only run once STALE is known true, right before the
-    first restart attempt."""
+    """health_check_timeout() (which recursively walks
+    the whole vault via `find`) must not be computed unconditionally near
+    the top of main() on every tick — including a no-op tick, where
+    nothing is stale and no restart happens. On a real host that would
+    keep a possibly-sleeping external disk spinning every cron tick for
+    no reason. It must only run once STALE is known true, right before
+    the first restart attempt."""
     if not AUTO_UPDATE_MACOS.exists():
         pytest.skip("scripts/auto-update-macos.sh not present")
     repo, _origin, code_epoch = _make_policy_repo_macos(tmp_path)
@@ -975,10 +975,10 @@ def test_main_does_not_scan_the_vault_on_a_no_op_tick(tmp_path: Path):
 
 @pytest.mark.unit
 def test_main_restarts_on_first_run_when_code_pulled_is_newer_than_running_service(tmp_path: Path):
-    """The exact bug found on review: a pull happening in THIS invocation
+    """A pull happening in THIS invocation
     must not be silently treated as 'already applied' just because it's the
     first time the script has ever run — the running process's real start
-    time (well before this pull) proves it's still stale."""
+    time, well ahead of that pull, proves it's still stale."""
     if not AUTO_UPDATE_MACOS.exists():
         pytest.skip("scripts/auto-update-macos.sh not present")
     repo, _origin, code_epoch = _make_policy_repo_macos(tmp_path)
@@ -991,8 +991,9 @@ def test_main_restarts_on_first_run_when_code_pulled_is_newer_than_running_servi
 
 @pytest.mark.unit
 def test_main_restarts_when_only_env_file_changed(tmp_path: Path):
-    """#792's signal applies here too: a .env edit after the service's real
-    start time must trigger a restart even with no new commit on main."""
+    """The same signal applies here too: a .env edit after the service's
+    real start time must trigger a restart even with no new commit on
+    main."""
     if not AUTO_UPDATE_MACOS.exists():
         pytest.skip("scripts/auto-update-macos.sh not present")
     repo, _origin, code_epoch = _make_policy_repo_macos(tmp_path)
@@ -1030,7 +1031,7 @@ def test_main_no_restart_on_second_run_after_env_restart_even_with_future_mtime(
 
     # Second tick: still the same (still-future) ENV_MTIME, active_since
     # unchanged (as if the restart hadn't actually moved the real clock) —
-    # must NOT restart again now that it's recorded as applied.
+    # must NOT restart again once it's recorded as applied.
     second = _run_main_macos(repo, active_since=active_since)
     assert second.returncode == 0, (second.stdout, second.stderr)
     log_after = (repo / "logs" / "auto-update-macos.log").read_text()

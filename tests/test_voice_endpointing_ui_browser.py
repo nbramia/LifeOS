@@ -1,10 +1,10 @@
-"""Browser tests for smart turn endpointing in auto-mode voice recording (#718)
-and the idle timeout for a recording with no speech at all (#723).
+"""Browser tests for smart turn endpointing in auto-mode voice recording
+and the idle timeout for a recording with no speech at all.
 
-While the **Auto** dock toggle is on, `web/chat/voice.js` now decides *when a
+While the **Auto** dock toggle is on, `web/chat/voice.js` decides *when a
 recording ends* on its own, layered on top of Auto-continue's existing
 "reopen the mic after a reply" behavior. Pipeline: an energy VAD on the live
-recording stream (the same technique `handleListenFrame()` uses for #710 wake
+recording stream (the same technique `handleListenFrame()` uses for wake
 detection) detects trailing silence following speech; once it crosses
 `LIFEOS_VOICE_ENDPOINT_SILENCE_MS`, the recording-so-far is transcribed via
 the same bare-STT route (`POST /api/voice/transcribe`) Listening's wake check
@@ -15,13 +15,13 @@ Incomplete keeps recording. `LIFEOS_VOICE_ENDPOINT_HARD_CAP_MS` of continuous
 silence finalizes regardless, so an ambiguous/unreachable check can never
 hang the mic open.
 
-`LIFEOS_VOICE_IDLE_TIMEOUT_MS` (#723, `TestIdleTimeout`/`TestIdleTimeoutThenWake`
+`LIFEOS_VOICE_IDLE_TIMEOUT_MS` (`TestIdleTimeout`/`TestIdleTimeoutThenWake`
 below) governs the opposite, disjoint situation: no speech detected AT ALL
 yet this recording, so the trailing-silence timers above have nothing to
 measure. That much silence with nothing spoken stops the recording and
 DISCARDS it -- no turn submitted -- through `finalizeIdleTimeout()`, which
 shares `stopRecordingAndSend()`'s manual-stop discard path
-(`handleSkippedEmptyRecording()`, unaffected by #721) rather than a parallel
+(`handleSkippedEmptyRecording()`) rather than a parallel
 teardown. The discriminator between the two feature areas is whether speech
 has been seen yet this recording (`endpointHasSpeech` in voice.js) -- a
 straight handoff at the first speech frame, never a race, since
@@ -320,7 +320,7 @@ class TestAutoModeGating:
 
     def test_no_second_getusermedia_call(self, page: Page, chat_base_url):
         """Endpointing taps the SAME recording stream -- it must never
-        acquire its own mic. Listening (#710, on by default) holds its own
+        acquire its own mic. Listening (on by default) holds its own
         separate stream unrelated to this, so it's seeded off here to
         isolate endpointing's own mic usage specifically."""
         _open_voice_chat_listening_off(page, chat_base_url)
@@ -495,12 +495,12 @@ class TestBargeInSuspension:
 
 
 class TestEndpointTapTeardown:
-    """The endpointing ScriptProcessorNode (#734's tap #3 -- see the
+    """The endpointing ScriptProcessorNode (tap #3 -- see the
     audio-taps inventory above ensureAudioContext() in voice.js) must be
     connected only while a recording it governs is actually in progress, and
     disconnected on every path that ends that recording -- a live callback
-    left behind after the recording ends is exactly the class of bug #734
-    fixed for the wake tap. `isEndpointTapActive()` checks the tap directly
+    left behind after the recording ends is the same class of bug as an
+    undisconnected wake tap. `isEndpointTapActive()` checks the tap directly
     (`!!endpointProcessor`) rather than inferring teardown indirectly."""
 
     def test_active_while_recording(self, page: Page, chat_base_url):
@@ -528,7 +528,7 @@ class TestEndpointTapTeardown:
         _start_recording(page)
         assert page.evaluate("window.lifeChatVoice.isEndpointTapActive()") is True
 class TestIdleTimeout:
-    """Idle timeout (#723): a recording that captures no speech at all is
+    """Idle timeout: a recording that captures no speech at all is
     stopped and DISCARDED -- never submitted -- after
     LIFEOS_VOICE_IDLE_TIMEOUT_MS of silence, distinct from the
     trailing-silence-after-speech timers TestHardCapFinalize above exercises.
@@ -561,7 +561,7 @@ class TestIdleTimeout:
         (`WAKE_PROCESSOR_BUFFER`), one `onaudioprocess` callback is roughly
         85-95ms at a typical 44.1/48kHz context sample rate, so a handful of
         real callbacks cross 300ms well within the wait below. (This is the
-        exact mechanism #723's harness bug rode on elsewhere in this suite
+        exact mechanism this suite's own harness relies on elsewhere
         -- see the `/api/chat/config` stub's doc comment above -- just
         deliberately triggered here instead of suppressed.)"""
         _open_voice_chat_short_idle_timeout(page, chat_base_url, 300)
@@ -590,7 +590,7 @@ class TestIdleTimeout:
         assert page.evaluate("window.__turnStreamCalls") == 0
 
         # No auto-continue re-arm: recording never restarts on its own, even
-        # though Auto is still on (#721's fix applies here too, since the
+        # though Auto is still on (the same guard applies here too, since the
         # idle path shares handleSkippedEmptyRecording()'s discard teardown).
         page.wait_for_timeout(250)
         assert page.evaluate("window.__recorderStartCalls") == 1
@@ -612,7 +612,7 @@ class TestIdleTimeout:
 
     def test_hard_cap_after_speech_submits_and_idle_timeout_never_fires(
             self, page: Page, chat_base_url):
-        """A recording WITH speech ends through #718's hard cap (the exact
+        """A recording WITH speech ends through the hard cap (the exact
         function real continuous silence *after* speech calls), never
         through the idle-discard path -- and once it has, a late idle-timeout
         call finds nothing left to act on. This is the observable half of
@@ -674,14 +674,14 @@ class TestIdleTimeout:
         all (maybeStartEndpointing() no-ops -- see TestAutoModeGating above).
         stopRecordingAndSend()'s new `discard` param defaults to false,
         so the pre-existing manual-stop discard-without-submit-or-rearm
-        behavior (#721) for a genuinely silent recording -- reached via
+        behavior for a genuinely silent recording -- reached via
         isSilentBlob(), not discard -- must be completely unaffected."""
         _open_voice_chat(page, chat_base_url)
         page.locator("#voiceAuto").uncheck()
         _start_recording(page)
 
         # Manual stop -- the fake stream is silent, so this is the same
-        # empty/silent-recording path #721 already covers.
+        # empty/silent-recording path this suite already covers.
         page.locator("#voiceTalkBtn").click(force=True)
 
         page.wait_for_function("window.__recorderStopCalls === 1")

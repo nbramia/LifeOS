@@ -322,7 +322,7 @@ class TestDependencySkip:
 
 
 class TestRepeatedYieldExcludedFromNewRecords:
-    """Issue #646 acceptance criterion: the nightly summary must distinguish
+    """The nightly summary must distinguish
     'N new records' from 'N records re-written from an unchanged upstream
     file' — a stale-input run must not report new interactions."""
 
@@ -760,7 +760,7 @@ class TestDurationCollapse:
     """Tests for silent no-op detection via duration collapse."""
 
     def test_detects_collapse(self):
-        """A source that historically takes minutes finishing in <2s is flagged."""
+        """A source that typically takes minutes finishing in <2s is flagged."""
         from scripts.run_all_syncs import _detect_duration_collapse
 
         with patch("scripts.run_all_syncs.get_typical_duration_seconds", return_value=450.0):
@@ -895,7 +895,7 @@ class TestDurationCollapse:
 
 def test_sync_summary_surfaces_investments_stale():
     """A stale investments snapshot must reach the user via the nightly Telegram
-    summary — a bare logger.warning feeds no batched report (#448)."""
+    summary — a bare logger.warning feeds no batched report."""
     from scripts.run_all_syncs import send_sync_summary_telegram
     result = {
         "succeeded": 3, "sources_run": 3, "failed": 0, "failed_sources": [],
@@ -929,8 +929,8 @@ def test_sync_summary_omits_investments_when_fresh():
 
 def test_sync_summary_surfaces_apple_agent_sha_drift():
     """A silently-broken Mac Mini self-update must reach the nightly
-    Telegram summary — a bare logger.warning feeds no batched report (#646,
-    same lesson as #448's investments_stale)."""
+    Telegram summary — a bare logger.warning feeds no batched report, the
+    same lesson as investments_stale."""
     from scripts.run_all_syncs import send_sync_summary_telegram
     result = {
         "succeeded": 3, "sources_run": 3, "failed": 0, "failed_sources": [],
@@ -963,7 +963,7 @@ def test_sync_summary_omits_sha_drift_when_absent():
 
 def test_sync_summary_surfaces_repeated_yield_sources():
     """A source stuck reporting the same non-zero count must be called out
-    in the nightly summary and flip the status away from a clean ✅ (#646)."""
+    in the nightly summary and flip the status away from a clean ✅."""
     from scripts.run_all_syncs import send_sync_summary_telegram
     result = {
         "succeeded": 3, "sources_run": 3, "failed": 0, "failed_sources": [],
@@ -999,7 +999,7 @@ def test_sync_summary_omits_repeated_yield_section_when_clean():
 
 
 def test_markdown_summary_surfaces_repeated_yield_and_sha_drift():
-    """Same distinction (#646) must land in the markdown log, not just
+    """The same distinction must land in the markdown log, not just
     Telegram — sync_errors.md is the other half of "the nightly summary"."""
     from scripts.run_all_syncs import log_sync_summary_to_markdown
     result = {
@@ -1042,10 +1042,11 @@ def test_markdown_summary_omits_sections_when_clean():
 
 
 class TestYieldCollapse:
-    """Yield-based no-op detection (#494).
+    """Yield-based no-op detection.
 
-    Duration collapse only catches sources that used to be slow. These cover
-    the blind spot: sources that produce nothing while looking normal.
+    Duration collapse only catches sources that are typically slow. These
+    cover the blind spot: sources that produce nothing while looking
+    normal.
     """
 
     def test_detects_yield_collapse(self):
@@ -1093,7 +1094,7 @@ class TestYieldCollapse:
 
 
 class TestRepeatedYield:
-    """Repeated-identical-yield detection (#646).
+    """Repeated-identical-yield detection.
 
     Distinct from yield collapse (which only fires on zero output): a source
     re-importing the same unchanged upstream file reports the same non-zero
@@ -1134,7 +1135,7 @@ class TestRepeatedYield:
 
 
 class TestNeverYielded:
-    """Dead/misconfigured source detection (#494)."""
+    """Dead/misconfigured source detection."""
 
     def test_flags_source_that_never_produced(self):
         from scripts.run_all_syncs import _detect_never_yielded
@@ -1148,7 +1149,7 @@ class TestNeverYielded:
 
     def test_long_running_phase_exempt(self):
         """relationship_discovery runs ~40min without reporting stats — it is
-        doing real work (#496), not a dead source, and must not be flagged."""
+        doing real work, not a dead source, and must not be flagged."""
         from scripts.run_all_syncs import _detect_never_yielded
 
         history = {"runs": 151, "best_yield": 0, "avg_duration_seconds": 2203.0}
@@ -1179,8 +1180,8 @@ class TestNeverYielded:
 
 
 class TestNeverYieldedDamping:
-    """Never-yielded warning must fire once, not nightly (#494 follow-up):
-    a chronic source (link_slack, repoint_stale_ids, google_sheets) should
+    """Never-yielded warning must fire once, not nightly: a chronic source
+    (link_slack, repoint_stale_ids, google_sheets) should
     only re-warn every ``NEVER_YIELDED_REWARN_DAYS`` days, not every run."""
 
     def test_no_prior_warning_not_recently_warned(self):
@@ -1282,7 +1283,7 @@ class TestNeverYieldedDamping:
 
 
 class TestSkippedMarker:
-    """SYNC_SKIPPED marker parsing (#494/#495): an unconfigured source must not
+    """SYNC_SKIPPED marker parsing: an unconfigured source must not
     be recorded as a healthy success."""
 
     def test_parses_skip_reason(self):
@@ -1299,7 +1300,7 @@ class TestSkippedMarker:
 
 class TestBackupRetentionGating:
     """
-    Retention must not run when the sync failed (#562).
+    Retention must not run when the sync failed.
 
     Snapshots are taken before the sync; whether they are a usable rollback
     point is only known once the run finishes. Pruning on a failed night could
@@ -1357,8 +1358,8 @@ class TestBackupRetentionGating:
 
 
 class TestPersonalGoogleGating:
-    """Direct tests of get_disabled_work_sources()'s personal-Google gating
-    (issue #687). Personal has no explicit on/off toggle like work/work2 --
+    """Direct tests of get_disabled_work_sources()'s personal-Google gating.
+    Personal has no explicit on/off toggle like work/work2 --
     "configured" means its OAuth credentials file exists. These call the
     real function (unlike the higher-level run_all_syncs() tests above,
     which patch it away entirely) so the settings-driven logic itself is
@@ -1469,7 +1470,7 @@ def _external_exclusive_probe_succeeds(lock_path) -> bool:
 
 
 class TestSyncLock:
-    """Coverage for the #793 shared advisory lock. scripts/auto-deploy.sh's
+    """Coverage for the shared advisory lock. scripts/auto-deploy.sh's
     sync_in_progress_lock_acquire() takes a matching EXCLUSIVE, non-blocking
     lock on the same file to decide whether a sync is running.
 
@@ -1693,7 +1694,7 @@ class TestSyncLock:
             holder.wait(timeout=5)
 
     def test_acquire_sync_lock_notifies_telegram_on_open_failure(self, tmp_path):
-        """Found on review: this used to be a buried `logger.warning` —
+        """A lock-open failure here must not be a buried `logger.warning` —
         given the consequence (auto-deploy can't see this sync and may
         restart a service on top of it), a real failure must reach the
         same Telegram path a sync failure does, not just the log file."""
