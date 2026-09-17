@@ -1,11 +1,11 @@
-"""Browser tests for the `?record=1` Action Button deep-link param (#731).
+"""Browser tests for the `?record=1` Action Button deep-link param.
 
 An iPhone Action Button routes through Shortcuts, which can only open a URL
 -- so `/chat` accepts `?record=1` (alongside `?mode=voice`) to begin an
 actual recording on page load, the same code path a manual tap on the talk
 button uses, rather than only arming Listening's wake-word mic hold as
-`?mode=voice` alone does. `resolveExplicitVoiceMode()`/`?mode=voice` were
-covered before this by tests/test_voice_mic_block_ui_browser.py and friends;
+`?mode=voice` alone does. `resolveExplicitVoiceMode()`/`?mode=voice` are
+already covered by tests/test_voice_mic_block_ui_browser.py and friends;
 this file is about the new `maybeAutoStartRecording()` in `web/chat/voice.js`
 specifically:
 

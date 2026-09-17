@@ -1,4 +1,4 @@
-"""Unit tests for api/services/chat_turns.py (#611) — the turn registry
+"""Unit tests for api/services/chat_turns.py — the turn registry
 primitives directly, below the HTTP layer already covered by
 tests/test_chat_turn_survives_disconnect.py and tests/test_chat_turn_cancel.py.
 
@@ -132,5 +132,5 @@ class TestChatTurnEmit:
 
         got = await turn._queue.get()
         assert got == "frame-1"
-        await second_emit  # now unblocks
+        await second_emit  # unblocked
         second_emit.result()

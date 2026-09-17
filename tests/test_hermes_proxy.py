@@ -1,4 +1,4 @@
-"""Tests for the Hermes text-backend proxy (api/routes/hermes_proxy.py, #587).
+"""Tests for the Hermes text-backend proxy (api/routes/hermes_proxy.py).
 
 Mirrors tests/test_agent_proxy.py: both backends are mounted from the same
 `make_backend_router()` factory in api/routes/_proxy.py, so the same behaviors
@@ -96,7 +96,7 @@ async def test_status_not_configured(monkeypatch):
 
 
 async def test_status_configured_and_reachable(monkeypatch):
-    """#688: unchanged shape for the case that matters most — a fully
+    """The shape for the case that matters most — a fully
     configured, up Hermes still reports available."""
     def _stub_client():
         return httpx.AsyncClient(
@@ -114,7 +114,7 @@ async def test_status_configured_and_reachable(monkeypatch):
 
 
 async def test_status_configured_but_unreachable(monkeypatch):
-    """#688: the actual bug — a configured Hermes whose process is down must
+    """The important case — a configured Hermes whose process is down must
     not report available (that's what sent every chat turn to fail at send
     time instead of falling back to lifeos), and must be distinguishable
     from "not configured" via the configured/reachable fields."""
@@ -279,7 +279,7 @@ async def test_502_when_backend_unreachable(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# `lifeos_context` envelope (#590) — persona resolution, defaulting, voice
+# `lifeos_context` envelope — persona resolution, defaulting, voice
 # gating, and rejection paths. Mirrors the registry-fixture pattern in
 # tests/test_persona_api.py.
 # ---------------------------------------------------------------------------
@@ -297,7 +297,7 @@ async def test_envelope_defaults_to_primary_persona(proxy_client):
     assert resp.status_code == 200
     ctx = json.loads(_received["body"])["lifeos_context"]
     # Pin the exact key sets, not just presence. `turn` is a sibling of
-    # `persona` added by #591 — see the `turn` sub-object tests below for its
+    # `persona` — see the `turn` sub-object tests below for its
     # own shape and its relationship to persona.
     assert set(ctx.keys()) == {"schema_version", "modality", "persona", "turn"}
     assert set(ctx["persona"].keys()) == {
@@ -508,14 +508,12 @@ async def test_unknown_persona_400_and_not_forwarded(proxy_client):
 
 
 async def test_orchestrating_persona_no_longer_rejected(proxy_client, tmp_path, monkeypatch):
-    # #642: this used to be a 400 (test_orchestrating_persona_400_and_not_
-    # forwarded) — Hermes had no way to drive a background Claude Code
-    # session, so an orchestrating persona reaching this route was treated as
-    # a routing bug. #640 gave Hermes that capability, so the persona now
-    # reaches Hermes like any other: forwarded, 200, with `orchestrates: true`
-    # in the envelope (see test_orchestrates_field_is_derived_not_hardcoded
-    # and test_orchestrates_true_uses_hermes_surface_preamble for the rest of
-    # what changed alongside this).
+    # An orchestrating persona reaching this route is forwarded like any
+    # other: 200, with `orchestrates: true` in the envelope, because Hermes
+    # can drive a background Claude Code session (see
+    # test_orchestrates_field_is_derived_not_hardcoded and
+    # test_orchestrates_true_uses_hermes_surface_preamble for the rest of
+    # this behavior).
     persona_file = tmp_path / "doctor.md"
     persona_file.write_text("DOCTOR PERSONA BODY")
     reg = _registry(tmp_path, [
@@ -535,9 +533,9 @@ async def test_orchestrating_persona_no_longer_rejected(proxy_client, tmp_path, 
 
 
 async def test_orchestrates_true_uses_hermes_surface_preamble(proxy_client, tmp_path, monkeypatch):
-    # #642: the envelope resolves persona_id with surface="hermes" so an
+    # The envelope resolves persona_id with surface="hermes" so an
     # orchestrating persona with a Hermes-specific variant (e.g.
-    # config/personas/doctor.hermes.md, #641) gets that body instead of the
+    # config/personas/doctor.hermes.md) gets that body instead of the
     # plain one — which claims shell/filesystem access Hermes doesn't have.
     # A sibling `<stem>.hermes<suffix>` file next to persona_file (the naming
     # rule _surface_variant_body uses) proves the surface parameter is
@@ -560,10 +558,9 @@ async def test_orchestrates_true_uses_hermes_surface_preamble(proxy_client, tmp_
 
 
 async def test_orchestrates_field_is_derived_not_hardcoded(proxy_client, monkeypatch):
-    # Guards against a regression to a literal `"orchestrates": False` (or,
-    # since #642 removed the guard that used to make every real call False in
-    # practice, a literal `True`) in the envelope. A spy that always returns
-    # True proves the field reflects a real call to
+    # Guards against a regression to a literal `"orchestrates": False` or a
+    # literal `True` in the envelope. A spy that always returns True proves
+    # the field reflects a real call to
     # settings.persona_orchestrates(), not a hardcoded literal.
     calls = {"n": 0}
 
@@ -594,7 +591,7 @@ async def test_malformed_json_400_and_not_forwarded(proxy_client):
 
 async def test_oversized_attachment_400_and_not_forwarded(proxy_client):
     # The same per-file size caps the native chat request model enforces
-    # apply here (Constraints in #590) — 6MB of raw data exceeds the 5MB
+    # apply here — 6MB of raw data exceeds the 5MB
     # image/png cap (see tests/test_attachments.py for the same pattern).
     large_data = base64.b64encode(b"x" * (6 * 1024 * 1024)).decode()
     payload = {
@@ -625,7 +622,7 @@ async def test_non_envelope_fields_forwarded_unchanged(proxy_client):
 
 
 # ---------------------------------------------------------------------------
-# `lifeos_context.turn` (#591) — a sibling of `persona`, sharing its shape
+# `lifeos_context.turn` — a sibling of `persona`, sharing its shape
 # and literal keys with GET /api/chat/turn-context so one parser handles
 # either source.
 # ---------------------------------------------------------------------------
@@ -635,8 +632,8 @@ async def test_turn_shape_and_literal_keys(proxy_client):
     assert resp.status_code == 200
     ctx = json.loads(_received["body"])["lifeos_context"]
     turn = ctx["turn"]
-    # Literal keys pinned by the cross-repo schema comment on #590, exactly —
-    # not a subset check. `caller_session_id` (#640) is the one key added
+    # Literal keys pinned by the cross-repo schema comment, exactly —
+    # not a subset check. `caller_session_id` is the one key added
     # here rather than by build_turn_context() itself — see hermes_proxy.py.
     assert set(turn.keys()) == {
         "current_datetime", "current_datetime_iso", "timezone",
@@ -656,8 +653,8 @@ async def test_turn_shape_and_literal_keys(proxy_client):
     assert isinstance(turn["tags_instruction"], str) and turn["tags_instruction"]
     assert isinstance(turn["caller_session_id"], str) and turn["caller_session_id"]
     # `turn` and `persona` are siblings under `lifeos_context`, never merged
-    # into one object — each key set is disjoint from the other's. This is
-    # the separation #640's caller_session_id must respect too: it lands in
+    # into one object — each key set is disjoint from the other's.
+    # `caller_session_id` must respect that separation too: it lands in
     # `turn` (per-turn, never prompt-cached), not `persona` (stable across a
     # conversation, prompt-cacheable — a per-turn value there would bust
     # that cache every request).
@@ -699,7 +696,7 @@ async def test_turn_matches_endpoint_for_same_persona(proxy_client, monkeypatch)
     assert hermes_resp.status_code == 200
     envelope_turn = json.loads(_received["body"])["lifeos_context"]["turn"]
 
-    # `caller_session_id` (#640) is the one deliberate difference: it's an
+    # `caller_session_id` is the one deliberate difference: it's an
     # agent-worker session identity Hermes needs and the plain turn-context
     # endpoint has no reason to hand out (it creates nothing). Every other
     # field must still come from the identical build_turn_context() call.
@@ -711,7 +708,7 @@ async def test_turn_matches_endpoint_for_same_persona(proxy_client, monkeypatch)
 
 
 # ---------------------------------------------------------------------------
-# `caller_session_id` lifecycle (#640) — a real agent-worker session backs
+# `caller_session_id` lifecycle — a real agent-worker session backs
 # the id handed to Hermes, so `lifeos_agent_*` calls (which all require a
 # resolvable `caller_session_id`, see inter_agent.py) work from a Hermes
 # turn instead of failing with `no_caller`.
@@ -720,7 +717,7 @@ async def test_turn_matches_endpoint_for_same_persona(proxy_client, monkeypatch)
 @pytest.fixture
 def agent_session_store(tmp_path, monkeypatch):
     """A real SessionStore on a throwaway db, wired in place of the class
-    `hermes_proxy._resolve_caller_session_id` locally imports (#640) — same
+    `hermes_proxy._resolve_caller_session_id` locally imports — same
     isolation pattern as `hermes_store`/`usage_store` above, applied to the
     class itself (rather than a module-level singleton) because
     `_resolve_caller_session_id` constructs a fresh `SessionStore()` per
@@ -781,8 +778,8 @@ async def test_caller_session_id_differs_across_conversations(proxy_client, agen
 
 async def test_spawn_succeeds_from_a_hermes_turns_caller_session_id(proxy_client, agent_session_store, tmp_path):
     """Acceptance criterion: a Hermes turn's caller_session_id can spawn —
-    the exact call that returned `no_caller` before #640, since Hermes had
-    no session at all."""
+    lifeos_agent_spawn requires a resolvable caller session, and a Hermes
+    turn provides one."""
     from api.services.agent_worker import inter_agent
     from api.services.agent_worker.transcript_store import TranscriptStore
 
@@ -806,14 +803,12 @@ async def test_spawn_succeeds_from_a_hermes_turns_caller_session_id(proxy_client
 
 
 # ---------------------------------------------------------------------------
-# Caller-session bot ownership (#684 adversarial review) — a Hermes turn's
+# Caller-session bot ownership — a Hermes turn's
 # caller_session_id, and every lifeos_agent_spawn descendant of it, must
 # carry the SAME bot ownership a native-spawned session gets, so the
 # worker's status/blocked notices for that lineage route to the right
 # Telegram bot and that bot's threaded-reply resume (scoped to its own
-# `bot`) can find them. Before this, a Hermes-rooted session's `bot` was
-# always None regardless of persona_id, so every descendant silently fell
-# back to the PRIMARY bot's channel.
+# `bot`) can find them.
 # ---------------------------------------------------------------------------
 
 async def test_caller_session_bot_matches_persona_id(proxy_client, agent_session_store, tmp_path, monkeypatch):
@@ -851,8 +846,8 @@ async def test_caller_session_bot_is_none_for_primary(proxy_client, agent_sessio
 
 async def test_spawned_child_inherits_bot_from_hermes_caller(proxy_client, agent_session_store, tmp_path, monkeypatch):
     """The Codex-flagged regression: a doctor-persona Hermes turn's
-    caller_session_id, used to `lifeos_agent_spawn` a worker, must produce a
-    child session tagged `bot="doctor"` — not `None` (which would route the
+    caller_session_id, when spawning a worker via `lifeos_agent_spawn`,
+    must produce a child session tagged `bot="doctor"` — not `None` (which would route the
     worker's own status/blocked notices to the primary bot's channel and
     make the doctor listener's threaded-reply resume, scoped to `bot=
     "doctor"`, unable to find them)."""
@@ -903,7 +898,7 @@ async def test_spawned_child_inherits_bot_from_hermes_caller(proxy_client, agent
 
 
 async def test_spawn_model_claude_blocked_from_a_hermes_root(proxy_client, agent_session_store, tmp_path):
-    """The spend guard (#640, extending #578/ADR-018): a Hermes-rooted
+    """The spend guard, per ADR-018: a Hermes-rooted
     session is not API-billed, so it may not open the model="claude" side
     door any more than a claude_code/codex root can."""
     from api.services.agent_worker import inter_agent
@@ -972,9 +967,9 @@ async def test_worker_spawned_on_one_turn_resolves_via_check_on_a_later_turn(
 
 
 # ---------------------------------------------------------------------------
-# Session-to-date cost (#610, extended with `session_cost_is_lower_bound`
-# by #613) — `lifeos_context.turn` carries the verbatim sum of this
-# conversation's already-recorded usage, never `persona` (which must stay
+# Session-to-date cost — `lifeos_context.turn` carries the verbatim sum,
+# including `session_cost_is_lower_bound`, of this conversation's
+# already-recorded usage, never `persona` (which must stay
 # cacheable/turn-invariant), scoped by the request's own `conversation_id`
 # and excluding the in-flight turn.
 # ---------------------------------------------------------------------------
@@ -983,7 +978,7 @@ async def test_session_cost_lands_in_turn_never_in_persona(proxy_client):
     """The cache-busting regression this issue exists to prevent: a
     cumulative, every-turn-changing figure in `persona` would invalidate a
     consumer's prompt cache on every single turn. `session_cost_is_lower_
-    bound` (#613) is exactly as turn-variant as the other session fields --
+    bound` is exactly as turn-variant as the other session fields --
     it's derived from the same per-conversation sum -- so it must land in
     `turn` alongside them, never in `persona`."""
     resp = await proxy_client.post("/api/hermes/ask/stream", json={"question": "hi"})
@@ -1002,7 +997,7 @@ async def test_session_cost_sums_prior_turns_and_excludes_the_in_flight_one(prox
     """Seeded usage for this request's own `conversation_id` must be summed
     into the envelope -- and, since the stub backend below emits no `usage`
     event of its own, nothing from *this* turn is added on top, proving the
-    figure reflects only turns already completed before this one started."""
+    figure reflects only turns completed prior to this one."""
     from api.services.usage_store import get_usage_store
 
     store = get_usage_store()  # per-test isolated singleton (conftest)
@@ -1076,11 +1071,10 @@ async def test_session_cost_zero_cost_turn_still_reports_a_truthful_sum(proxy_cl
 
 
 async def test_session_cost_unpriced_turn_marks_the_envelope_as_a_lower_bound(proxy_client):
-    """#613: a conversation containing a turn recorded `unpriced=True` (its
+    """A conversation containing a turn recorded `unpriced=True` (its
     provider reported no cost) must surface `session_cost_is_lower_bound
     =True` in the envelope -- the real per-conversation distinction this
-    field exists to carry to a consumer, replacing the unconditional-floor
-    wording #610 originally shipped with."""
+    field exists to carry to a consumer."""
     from api.services.usage_store import get_usage_store
 
     store = get_usage_store()
@@ -1104,7 +1098,7 @@ async def test_session_cost_unpriced_turn_marks_the_envelope_as_a_lower_bound(pr
 
 
 # ---------------------------------------------------------------------------
-# Turn persistence (#592) — the proxy is a read-only tee on its own relay:
+# Turn persistence — the proxy is a read-only tee on its own relay:
 # the browser gets byte-identical output, and a parallel copy is reassembled
 # from the SSE frames and written to the conversation store. `_HermesTurnPersister`
 # is exercised both directly (frame reassembly, partial-stream, dedup) and
@@ -1125,7 +1119,7 @@ def hermes_store(tmp_path, monkeypatch):
 @pytest.fixture
 def usage_store(tmp_path, monkeypatch):
     """A real UsageStore on a throwaway db, wired in place of the singleton
-    `get_usage_store()` hermes_proxy imports (#595) — same pattern as
+    `get_usage_store()` hermes_proxy imports — same pattern as
     `hermes_store` above."""
     store = UsageStore(db_path=str(tmp_path / "usage.db"))
     monkeypatch.setattr(hp, "get_usage_store", lambda: store)
@@ -1233,7 +1227,7 @@ async def test_persists_with_the_selected_persona(persist_proxy_client, hermes_s
 
 
 async def test_voice_turn_persists_like_a_typed_turn(persist_proxy_client, hermes_store):
-    """#593: a spoken Hermes turn (persona_id + modality=voice, the shape a
+    """A spoken Hermes turn (persona_id + modality=voice, the shape a
     gateway routing voice through this proxy is expected to send) persists
     exactly like a typed one -- modality only affects the upstream envelope
     (test_envelope_voice_modality_populates_voice_rules above), never the
@@ -1309,8 +1303,8 @@ async def test_truncated_stream_still_persists_partial_content(monkeypatch, herm
     assert resp.status_code == 200
     assert resp.content == b"".join(_TRUNCATED_SSE_CHUNKS)
 
-    # #611: no `done` event ever arrived (the stub's stream just ends), so
-    # this is now flagged as a genuine truncation -- the marker and
+    # No `done` event ever arrived (the stub's stream just ends), so
+    # this is flagged as a genuine truncation -- the marker and
     # `routing.truncated` mean the browser can never mistake this cut-off
     # reply for a whole one, the same guarantee the native path gives a
     # cancelled/errored turn.
@@ -1326,16 +1320,16 @@ stub_hermes_crlf = FastAPI()
 
 # CRLF frame separators (`\r\n\r\n`) rather than bare LF — SSE permits both
 # (WHATWG spec), and an intermediary is free to rewrite line endings even
-# though the Hermes adapter itself emits LF today (#592 review: without
-# handling this, `_FRAME_SEP` never matched and nothing was persisted —
-# silent total data loss, not an error).
+# though the Hermes adapter itself emits LF today. Without handling this,
+# `_FRAME_SEP` would never match and nothing would be persisted — silent
+# total data loss, not an error.
 _CRLF_SSE_CHUNKS = [
     b'data: {"type": "conversation_id", "conversation_id": "crlf-1"}\r\n\r\n',
     b'data: {"type": "content", "content": "crlf reply"}\r\n\r\n',
-    # A `done` event (#611: its absence is now the truncation signal — see
+    # A `done` event (its absence is the truncation signal — see
     # test_truncated_stream_still_persists_partial_content below) so this
     # CRLF-framing test isn't mistaken for a genuinely truncated turn; this
-    # fixture predates #611 and was never about completion signaling.
+    # fixture was never about completion signaling.
     b'data: {"type": "done"}\r\n\r\n',
 ]
 
@@ -1379,21 +1373,19 @@ async def test_crlf_framed_stream_still_persists(monkeypatch, hermes_store):
 
 
 async def test_client_disconnect_still_persists_the_last_chunk(monkeypatch, hermes_store):
-    """MAJOR (#592 review), STRENGTHENED by #611: `_proxy.py`'s relay loop
-    used to call `observer.observe(chunk)` *after* `yield chunk`. Closing
-    the response generator while it's suspended at that yield — exactly
-    what an early client disconnect does — raised `GeneratorExit` right
-    there, which skipped any code written after the yield in that same
-    loop iteration, so the chunk already handed off was silently never
-    observed. Fixed for #592 by observing before yielding.
+    """`_proxy.py`'s relay loop calls `observer.observe(chunk)` *before*
+    `yield chunk`. Closing the response generator while it's suspended at
+    that yield — exactly what an early client disconnect does — raises
+    `GeneratorExit` right there, which skips any code written after the
+    yield in that same loop iteration; observing first means the chunk
+    already handed off is never silently unobserved.
 
-    #611 goes further: the upstream drain is no longer the response
-    generator's own loop at all. It's a registry-owned background pump
-    that keeps draining upstream regardless of what the browser does, so a
-    disconnect doesn't just fail to lose the LAST delivered chunk — it no
-    longer stops the turn early at all. The invariant this test now pins is
-    stronger: a disconnect never loses ANY observed chunk, including ones
-    that hadn't reached the browser yet when it disconnected. That's why
+    The upstream drain is not the response generator's own loop: it's a
+    registry-owned background pump that keeps draining upstream regardless
+    of what the browser does, so a disconnect doesn't stop the turn early
+    at all. The invariant this test pins is that a disconnect never loses
+    ANY observed chunk, including ones that hadn't reached the browser yet
+    when it disconnected. That's why
     the persisted content below is the FULL relayed text ("first
     chunknever requested"), not just "first chunk".
 
@@ -1414,7 +1406,7 @@ async def test_client_disconnect_still_persists_the_last_chunk(monkeypatch, herm
         b'data: {"type": "conversation_id", "conversation_id": "disco-1"}\n\n'
         b'data: {"type": "content", "content": "first chunk"}\n\n',
         b'data: {"type": "content", "content": "never requested"}\n\n',
-        # A `done` event (#611: its absence is now the "this turn was cut
+        # A `done` event (its absence is the "this turn was cut
         # off" signal used by test_truncated_stream_still_persists_partial_content
         # below) — the detached pump drains this fully regardless of what
         # the reader below ever pulls, so this is what makes the persisted
@@ -1480,9 +1472,9 @@ async def test_client_disconnect_still_persists_the_last_chunk(monkeypatch, herm
 
     # Simulate the client vanishing right here: close the generator without
     # ever pulling the second chunk. This is exactly the "suspended at the
-    # yield" moment the finding describes. Unlike before #611, this detaches
-    # the pump rather than stopping it -- await its turn's task to let it
-    # actually finish draining upstream before asserting on what's persisted.
+    # yield" moment the finding describes. This detaches the pump rather
+    # than stopping it -- await its turn's task to let it actually finish
+    # draining upstream before asserting on what's persisted.
     await gen.aclose()
 
     from api.services.chat_turns import get_turn_registry
@@ -1563,7 +1555,7 @@ def _manual_request(body: dict):
 async def test_disconnect_then_completion_persists_full_reply_and_a_usage_row(
     monkeypatch, hermes_store, usage_store,
 ):
-    """#611: a Hermes turn that survives a disconnect (as above) also gets
+    """A Hermes turn that survives a disconnect (as above) also gets
     its `usage` event captured once the pump finishes draining -- the
     money side of "the turn runs to completion" holds too, not just the
     text."""
@@ -1613,18 +1605,12 @@ async def test_disconnect_then_completion_persists_full_reply_and_a_usage_row(
 async def test_voice_modality_disconnect_detaches_the_pump_like_a_text_turn(
     monkeypatch, hermes_store,
 ):
-    """#616: this test used to be named
-    `test_voice_modality_disconnect_cancels_the_pump_rather_than_detaching`
-    and asserted the OPPOSITE of what it asserts now -- that a
-    voice-modality Hermes turn was cancelled by a disconnect rather than
-    surviving it, because whisper-relay had no way to say "stop" other than
-    abandoning the stream. Now that whisper-relay calls `POST
-    /api/chat/cancel` with its `client_turn_id` on a real cancel gesture
-    (whisper-relay#37), a disconnect alone no longer means "stop": a
-    voice-modality turn relayed through Hermes detaches and keeps draining
-    upstream to completion, exactly like the text turn in
-    `test_client_disconnect_still_persists_the_last_chunk` above. This
-    inversion is deliberate, not a weakening -- see #616."""
+    """A disconnect alone does not mean "stop" for a voice-modality Hermes
+    turn, because whisper-relay calls `POST /api/chat/cancel` with its
+    `client_turn_id` on an explicit cancel gesture instead of abandoning
+    the stream: a voice-modality turn relayed through Hermes detaches and
+    keeps draining upstream to completion, exactly like the text turn in
+    `test_client_disconnect_still_persists_the_last_chunk` above."""
     monkeypatch.setattr(hp.settings, "hermes_backend_url", "http://hermes")
     monkeypatch.setattr(hp.settings, "hermes_backend_token", "")
 
@@ -1669,11 +1655,11 @@ async def test_voice_modality_disconnect_detaches_the_pump_like_a_text_turn(
 async def test_client_turn_id_cancel_halts_a_voice_barge_in_before_the_pumps_first_frame(
     monkeypatch, hermes_store,
 ):
-    """#616 acceptance criterion, extended to the Hermes pump: a barge-in
-    landing before the turn's first SSE frame -- before any conversation_id
-    exists to cancel by -- must still halt generation via `client_turn_id`,
-    the same first-turn barge-in gap #611 review closed for the native
-    path (tests/test_chat_turn_cancel.py's `TestClientTurnIdCancel`)."""
+    """A barge-in landing before the turn's first SSE frame -- before any
+    conversation_id exists to cancel by -- must still halt generation via
+    `client_turn_id`, closing the same first-turn barge-in gap for the
+    Hermes pump as for the native path
+    (tests/test_chat_turn_cancel.py's `TestClientTurnIdCancel`)."""
     monkeypatch.setattr(hp.settings, "hermes_backend_url", "http://hermes")
     monkeypatch.setattr(hp.settings, "hermes_backend_token", "")
 
@@ -1707,8 +1693,8 @@ async def test_client_turn_id_cancel_halts_a_voice_barge_in_before_the_pumps_fir
 
 
 # ---------------------------------------------------------------------------
-# Usage capture (#595) — the same read-only tee that persists a Hermes turn
-# (#592, above) also captures its `usage` event, if any, and writes a usage
+# Usage capture — the same read-only tee that persists a Hermes turn
+# (above) also captures its `usage` event, if any, and writes a usage
 # row on `finalize()`. The relay's byte-identity guarantee applies equally
 # here: capturing usage is observation, never a rewrite of what the browser
 # receives.
@@ -1717,7 +1703,7 @@ async def test_client_turn_id_cancel_halts_a_voice_barge_in_before_the_pumps_fir
 stub_hermes_usage = FastAPI()
 
 # cost_usd (0.00087) is deliberately *not* what the live pricing table
-# (agent_worker/pricing.py's cost_for, #656) would compute for this
+# (agent_worker/pricing.py's cost_for) would compute for this
 # unrecognized model -- its conservative Opus-rate fallback for these same
 # token counts: (120/1e6)*15.0 + (340/1e6)*75.0 = 0.0273. Recording the
 # wrong, upstream-reported number rather than that recomputed one is
@@ -1776,7 +1762,7 @@ async def test_usage_event_writes_a_row_with_verbatim_cost(usage_proxy_client, u
     # comment above.
     assert cost_usd == pytest.approx(0.00087)
     assert conversation_id == "usage-conv-1"
-    # A real reported cost (#613) — not the "couldn't price this" case.
+    # A real reported cost — not the "couldn't price this" case.
     assert unpriced == 0
 
 
@@ -1854,7 +1840,7 @@ async def test_usage_event_without_cost_records_zero(monkeypatch, hermes_store, 
     assert stats["total_input_tokens"] == 10
     assert stats["total_output_tokens"] == 5
     assert stats["total_cost"] == 0.0
-    # #613: the row is flagged `unpriced` -- the zero above is "unknown",
+    # The row is flagged `unpriced` -- the zero above is "unknown",
     # not a real reported cost of zero.
     with sqlite3.connect(usage_store.db_path) as conn:
         (unpriced,) = conn.execute("SELECT unpriced FROM usage").fetchone()
@@ -1902,7 +1888,7 @@ async def test_malformed_usage_event_is_ignored_and_does_not_interrupt_the_relay
     assert resp.status_code == 200
     assert resp.content == b"".join(_MALFORMED_USAGE_SSE_CHUNKS)
 
-    # No usage row -- the malformed event was dropped, not recorded.
+    # No usage row -- the malformed event is dropped, not recorded.
     assert usage_store.get_usage_stats()["request_count"] == 0
     # The turn itself still completed and persisted normally.
     messages = hermes_store.get_messages("usage-conv-3")
@@ -1920,7 +1906,7 @@ async def test_no_usage_event_writes_no_row_and_turn_completes_normally(
     assert resp.status_code == 200
     assert resp.content == b"".join(_PERSIST_SSE_CHUNKS)
     assert usage_store.get_usage_stats()["request_count"] == 0
-    # Conversation persistence (#592) is unaffected by usage capture.
+    # Conversation persistence is unaffected by usage capture.
     assert hermes_store.get_conversation("hermes-conv-1") is not None
 
 
@@ -2001,10 +1987,10 @@ class TestHermesTurnPersisterDirect:
         persister.observe(b'ersation_id": "split-1"}\n\n')
         persister.observe(b'data: {"type": "content", "content": "he')
         persister.observe(b'llo"}\n\n')
-        # A `done` event (#611: its absence is now the "this turn was cut
+        # A `done` event (its absence is the "this turn was cut
         # off" signal — see test_truncated_stream_still_persists_partial_content
         # below) so this frame-reassembly test isn't mistaken for a
-        # genuinely truncated turn; this fixture predates #611.
+        # genuinely truncated turn.
         persister.observe(b'data: {"type": "done"}\n\n')
         persister.finalize()
 
@@ -2015,13 +2001,12 @@ class TestHermesTurnPersisterDirect:
         ]
 
     def test_observe_never_calls_the_store(self, monkeypatch):
-        """BLOCKER (#592 review): `observe()` used to call
-        `store.create_conversation()`/`add_message()` synchronously as soon
-        as a `conversation_id` event was parsed, so a locked db
-        (`ConversationStore._connect()`'s 10s busy timeout) could stall
-        delivery of this stream's own next chunk. `observe()` must do only
-        in-memory parsing; every store call belongs in `finalize()`, once,
-        after the relay has already handed off every byte of the turn.
+        """`observe()` must do only in-memory parsing; every store call
+        belongs in `finalize()`, once, after the relay has already handed
+        off every byte of the turn. A synchronous store call as soon as a
+        `conversation_id` event is parsed risks a locked db
+        (`ConversationStore._connect()`'s 10s busy timeout) stalling
+        delivery of this stream's own next chunk.
         """
         calls = []
 
@@ -2041,7 +2026,7 @@ class TestHermesTurnPersisterDirect:
         # Still mid-stream: nothing written to the store yet.
         assert calls == []
 
-        # A `done` event (#611) so this test isn't mistaken for a genuinely
+        # A `done` event so this test isn't mistaken for a genuinely
         # truncated turn — see test_truncated_stream_still_persists_partial_content.
         persister.observe(b'data: {"type": "done"}\n\n')
         persister.finalize()
@@ -2066,7 +2051,7 @@ class TestHermesTurnPersisterDirect:
         persister = hp._HermesTurnPersister(question="second turn q", persona_id="primary")
         persister.observe(b'data: {"type": "conversation_id", "conversation_id": "existing-1"}\n\n')
         persister.observe(b'data: {"type": "content", "content": "second turn a"}\n\n')
-        # A `done` event (#611) so this test isn't mistaken for a genuinely
+        # A `done` event so this test isn't mistaken for a genuinely
         # truncated turn — see test_truncated_stream_still_persists_partial_content.
         persister.observe(b'data: {"type": "done"}\n\n')
         persister.finalize()
@@ -2079,13 +2064,12 @@ class TestHermesTurnPersisterDirect:
         ]
 
     def test_overlong_conversation_id_is_dropped_not_truncated(self, hermes_store, caplog):
-        """MAJOR (#592 review): an overlong id used to be silently
-        truncated (`conv_id[:_MAX_CONVERSATION_ID_LEN]`) before the store
-        write. The browser keeps the verbatim upstream id and would later
-        request it in full via `GET /api/conversations/{id}` — a row
-        created under the truncated id could never be found on reload.
-        Now it's logged and dropped instead of creating that mismatched
-        row.
+        """An overlong conversation id must not be silently truncated
+        (`conv_id[:_MAX_CONVERSATION_ID_LEN]`) before the store write: the
+        browser keeps the verbatim upstream id and would later request it
+        in full via `GET /api/conversations/{id}` — a row created under a
+        truncated id could never be found on reload. It's logged and
+        dropped instead of creating that mismatched row.
         """
         overlong = "x" * (hp._MAX_CONVERSATION_ID_LEN + 50)
         persister = hp._HermesTurnPersister(question="q", persona_id="primary")
@@ -2106,7 +2090,7 @@ class TestHermesTurnPersisterDirect:
 
     def test_observe_never_calls_the_usage_store(self, monkeypatch, hermes_store):
         """Same structural guarantee as `test_observe_never_calls_the_store`
-        above (#592 review), extended to usage capture (#595): `observe()`
+        above, extended to usage capture: `observe()`
         must only reassemble frames and buffer the parsed usage fields in
         memory. Every usage-store call belongs in `finalize()`."""
         calls = []
@@ -2207,7 +2191,7 @@ class TestHermesTurnPersisterDirect:
 
     def test_usage_recorded_even_without_a_conversation_id(self, hermes_store, usage_store):
         """Conversation persistence and usage persistence are independent
-        (#595) -- a usage event with no preceding `conversation_id` still
+        -- a usage event with no preceding `conversation_id` still
         gets recorded, with a null conversation id, rather than being
         dropped because there's nothing to attach a conversation row to."""
         persister = hp._HermesTurnPersister(question="q", persona_id="primary")
@@ -2246,7 +2230,7 @@ class TestMakePersister:
 
 
 # ---------------------------------------------------------------------------
-# `POST /api/hermes/resolve-persona` (#644) — persona selection for Hermes's
+# `POST /api/hermes/resolve-persona` — persona selection for Hermes's
 # own Telegram front door, which never passes through the proxy above. Grammar
 # tests exercise `_parse_persona_tag()` directly; endpoint tests exercise auth,
 # the untagged/tagged/unrecognized-tag response contract, voice gating, and
@@ -2335,7 +2319,7 @@ def _auth(token="secret-token"):
 
 async def test_resolve_persona_untagged_is_unchanged(resolve_client):
     # "Given no persona selected, then behavior shall be unchanged from
-    # today" (#644 AC) — text passes through byte-identical and there is no
+    # today" — text passes through byte-identical and there is no
     # envelope for Hermes to apply.
     resp = await resolve_client.post(
         "/api/hermes/resolve-persona", json={"text": "what's on my calendar today"},
@@ -2379,8 +2363,7 @@ async def test_resolve_persona_tagged_resolves_and_strips_prefix(resolve_client,
     assert body["persona_id"] == "fitness"
     assert body["text"] == "what's my workout today"
     ctx = body["lifeos_context"]
-    # Same preamble /chat (via resolve_persona) would use for this persona —
-    # the #644 AC in a nutshell.
+    # Same preamble /chat (via resolve_persona) would use for this persona.
     assert ctx["persona"]["id"] == "fitness"
     assert ctx["persona"]["label"] == "Fitness Coach"
     assert ctx["persona"]["preamble"] == "FITNESS PERSONA BODY"
@@ -2485,7 +2468,7 @@ async def test_resolve_persona_malformed_json_400(resolve_client):
 
 
 # ---------------------------------------------------------------------------
-# Reply-thread persona inheritance (#644 follow-up) — the ordered rule:
+# Reply-thread persona inheritance — the ordered rule:
 # explicit @tag > inherited from reply-to > nothing. `resolve_client`,
 # `_registry`, and `_auth` above are reused unchanged.
 # ---------------------------------------------------------------------------
@@ -2701,14 +2684,13 @@ async def test_register_persona_message_requires_auth(resolve_client):
 
 
 # ---------------------------------------------------------------------------
-# Journal capture gate on the proxy relay path (#685). Before this, a
-# journal-persona turn sent through `/api/hermes/ask/stream` — which `/chat`
-# reaches by default whenever Hermes is available — was relayed to Hermes and
-# never captured at all: #674's exact signature (a reply that reads like a
-# successful capture and no file) resurrected on a surface nobody had
-# checked. Mirrors tests/test_journal_capture.py's coverage of the native
-# path: assertions land on the actual file on disk, not on a mock having
-# been called — the gap that let #674 ship broken in the first place.
+# Journal capture gate on the proxy relay path. A journal-persona turn sent
+# through `/api/hermes/ask/stream` — which `/chat` reaches by default
+# whenever Hermes is available — must capture the fragment before being
+# relayed to Hermes; a reply that reads like a successful capture but wrote
+# no file is a failure mode this surface must not allow. Mirrors
+# tests/test_journal_capture.py's coverage of the native path: assertions
+# land on the actual file on disk, not on a mock having been called.
 # ---------------------------------------------------------------------------
 
 # Obviously synthetic fragment — nothing here resembles a real note.
@@ -2748,7 +2730,7 @@ def journal_persona_registered(tmp_path, monkeypatch) -> str:
     `persona_id="journal"` resolves on this proxy's envelope path too.
     Returns the resolved raw preamble — the shape `chat_via_api()` and the
     ring ingest actually send (`persona=...`, no `persona_id`), needed by
-    the raw-preamble capture test below (#685 finding 1)."""
+    the raw-preamble capture test below."""
     reg = _registry(tmp_path, [
         {"name": "journal", "token_env": "TG_JOURNAL_TEST", "persona_file": "config/personas/journal.md"},
     ])
@@ -2871,22 +2853,21 @@ async def test_non_journal_persona_proxy_behavior_unchanged(proxy_client, journa
 
 
 # ---------------------------------------------------------------------------
-# Adversarial-review follow-up (#685, finding 1): the journal-capture gate's
-# effective-persona resolution must match ask_stream()'s native semantics —
-# reverse-mapping a raw `persona` preamble (the exact shape chat_via_api()
-# and the ring ingest send, api/routes/journal_ingest.py:172), and rejecting
-# the same malformed persona_id/persona shapes with the same 400 — not
-# approximate them as `persona_id or "primary"` alone.
+# The journal-capture gate's effective-persona resolution must match
+# ask_stream()'s native semantics — reverse-mapping a raw `persona`
+# preamble (the exact shape chat_via_api() and the ring ingest send,
+# api/routes/journal_ingest.py:172), and rejecting the same malformed
+# persona_id/persona shapes with the same 400 — not approximating them as
+# `persona_id or "primary"` alone.
 # ---------------------------------------------------------------------------
 
 async def test_raw_persona_preamble_journal_turn_still_captures(
     proxy_client, journal_vault, journal_persona_registered,
 ):
     """The shape chat_via_api()/the ring ingest actually send: a raw
-    `persona` preamble, no `persona_id` at all. #684 is what's expected to
-    point those callers at this proxy — if the prelude only ever looked at
-    `persona_id`, this turn would silently stop being captured the moment
-    that happens, #674's bug a third time."""
+    `persona` preamble, no `persona_id` at all. If the prelude only ever
+    looked at `persona_id`, this turn would silently stop being captured
+    for callers that send only a raw `persona` preamble."""
     journal_preamble = journal_persona_registered
     resp = await proxy_client.post(
         "/api/hermes/ask/stream",
@@ -2932,12 +2913,11 @@ async def test_tokenless_raw_persona_preamble_reverse_maps_in_envelope(
 
 
 # ---------------------------------------------------------------------------
-# #691: _build_envelope() used to resolve `parsed.persona_id or "primary"` —
-# ignoring a raw `persona` preamble entirely — while the #685 capture prelude
-# above already reverse-mapped it via resolve_effective_persona_id(). One
-# request, two different answers to "who is this persona": captured under
-# the reverse-mapped bot, but the envelope built (and forwarded to Hermes)
-# for "primary". Pin that both now agree.
+# `_build_envelope()`'s persona resolution and the capture prelude's
+# persona resolution (via `resolve_effective_persona_id()`) must agree: a
+# raw `persona` preamble reverse-maps to the same persona in both places,
+# not `parsed.persona_id or "primary"` in the envelope while the capture
+# prelude resolves the real one.
 # ---------------------------------------------------------------------------
 
 async def test_raw_persona_envelope_matches_capture_persona(
@@ -2979,9 +2959,9 @@ async def test_persona_and_persona_id_conflict_gets_native_400_on_proxy(proxy_cl
 
 
 # ---------------------------------------------------------------------------
-# Adversarial-review follow-up (#685, finding 2): once capture has already
-# succeeded, its proof must reach the caller regardless of what Hermes then
-# does — chat_via_api() (api/services/telegram.py) and the ring ingest
+# Once capture has already succeeded, its proof must reach the caller
+# regardless of what Hermes then does — chat_via_api()
+# (api/services/telegram.py) and the ring ingest
 # (api/routes/journal_ingest.py) both treat a non-200 response as "nothing
 # happened" and never look at its body for a `journal_capture` event.
 # ---------------------------------------------------------------------------
@@ -3064,13 +3044,13 @@ async def test_journal_capture_proof_survives_hermes_non_200(
 def journal_ingest_via_proxy(tmp_path, monkeypatch, journal_vault, journal_persona_registered):
     """`POST /api/journal/ingest` wired to a `chat_via_api`-shaped bridge that
     posts through the Hermes PROXY instead of native `/api/ask/stream` — the
-    wiring #684 is expected to give `chat_via_api()` itself once it points
-    the journal bot at Hermes. Exercises the REAL, unmocked ring-ingest
-    dedupe logic (api/routes/journal_ingest.py) on top of the guaranteed-
-    prelude-delivery fix (#685 finding 2): a capture that succeeds while
-    Hermes then fails must still get the delivery's idempotency key burned,
-    or a genuine retry re-invokes `capture_fragment()` a second time for the
-    same delivery — the double-append the adversarial review flagged.
+    same wiring `chat_via_api()` itself uses once it points the journal bot
+    at Hermes. Exercises the REAL, unmocked ring-ingest dedupe logic
+    (api/routes/journal_ingest.py) on top of the guaranteed-prelude-delivery
+    behavior: a capture that succeeds while Hermes then fails must still get
+    the delivery's idempotency key burned, or a genuine retry re-invokes
+    `capture_fragment()` a second time for the same delivery — a
+    double-append.
 
     Hermes is unreachable for every call in this fixture — the point being
     proven is that capture (and the ring ingest's success/dedupe
@@ -3188,7 +3168,7 @@ def test_capture_proof_survives_hermes_failure_and_retry_does_not_double_append(
 
 
 # ---------------------------------------------------------------------------
-# Adversarial-review follow-up (#685, finding 3): `/resolve-persona` resolves
+# `/resolve-persona` resolves
 # a persona WITHOUT running a turn, so there is no ask/stream turn here for
 # the journal-capture gate to hook — `journal` must be refused visibly
 # instead of silently resolving into a phantom "Logged." reply with nothing

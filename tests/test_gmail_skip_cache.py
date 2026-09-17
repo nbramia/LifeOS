@@ -3,7 +3,7 @@ Tests for the Gmail skip cache.
 
 The cache exists because marketing mail is discarded without producing an
 interaction row, so the sync's "already seen" set could never remember it and
-re-fetched ~13k messages every night (#552).
+re-fetched ~13k messages every night.
 """
 import pytest
 import sqlite3

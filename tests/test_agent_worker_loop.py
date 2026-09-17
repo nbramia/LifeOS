@@ -53,7 +53,7 @@ from api.services.agent_worker.worker import (
 
 @pytest.fixture(autouse=True)
 def _redirect_agent_output(tmp_path, monkeypatch):
-    """Every completed task now writes a note to the vault's Agent Output
+    """Every completed task writes a note to the vault's Agent Output
     folder. Redirect the vault to a throwaway tmp dir so these worker tests
     write there instead of the repo's ./vault default."""
     from config.settings import settings as _settings
@@ -410,7 +410,7 @@ def test_routing_ask_lands_in_blocked_with_model_question(tmp_path: Path):
 
 @pytest.mark.unit
 def test_ssh_failure_reason_reaches_agent_failed_notice(tmp_path: Path):
-    """Round 1, finding #4, dispatch-level half: `_handle_outcome` (the
+    """The dispatch-level wiring: `_handle_outcome` (the
     wiring `outcome.reason` goes through on the way to the #agent-failed
     Telegram notice) must surface the ssh failure text verbatim — the
     executor-level tests only prove `outcome.reason` itself is correct,
@@ -438,7 +438,7 @@ def test_ssh_failure_reason_reaches_agent_failed_notice(tmp_path: Path):
 @pytest.mark.unit
 def test_insane_task_lands_in_failed(tmp_path: Path):
     """A deterministically destructive title (matched by the code, not the
-    model's prose) still fails closed — #747 must not weaken this guard."""
+    model's prose) still fails closed regardless of routing configuration."""
     api = FakeApi(tasks=[
         {"id": "t1", "description": "rm -rf /", "status": "todo", "tags": ["local"]},
     ])
@@ -490,7 +490,7 @@ def test_preflight_parse_error_with_explicit_tag_does_not_reach_mark_failed(tmp_
 
 @pytest.mark.unit
 def test_mundane_sane_false_task_lands_in_blocked_not_cancelled(tmp_path: Path):
-    """#747: a preflight sanity rejection of an ordinary, non-destructive
+    """A preflight sanity rejection of an ordinary, non-destructive
     title must park the task (blocked, still actionable) rather than
     cancel it — the model's own 'not executable' opinion is not fatal."""
     api = FakeApi(tasks=[
@@ -518,9 +518,9 @@ def test_mundane_sane_false_task_lands_in_blocked_not_cancelled(tmp_path: Path):
 
 @pytest.mark.unit
 def test_sane_false_and_ambiguous_blocked_messages_are_distinguishable(tmp_path: Path):
-    """#747 + #748 interaction: a parked sanity objection and a genuine
-    ambiguity must produce distinguishable operator-facing text, not one
-    generic 'blocked' string."""
+    """A parked sanity objection and a genuine ambiguity must produce
+    distinguishable operator-facing text, not one generic 'blocked'
+    string."""
     api = FakeApi(tasks=[
         {"id": "t1", "description": "reply to John", "status": "todo", "tags": ["local"]},
     ])
@@ -543,7 +543,7 @@ def test_sane_false_and_ambiguous_blocked_messages_are_distinguishable(tmp_path:
 
 @pytest.mark.unit
 def test_routing_flavored_ambiguity_does_not_block(tmp_path: Path):
-    """#748: a method-of-execution question smuggled into `ambiguity` must
+    """A method-of-execution question smuggled into `ambiguity` must
     not block the task — routing decides."""
     api = FakeApi(tasks=[
         {"id": "t1", "description": "Turn the record button white when idle",
@@ -570,10 +570,10 @@ def test_routing_flavored_ambiguity_does_not_block(tmp_path: Path):
 
 @pytest.mark.unit
 def test_default_route_demotes_ambiguity_and_runs(tmp_path: Path, monkeypatch):
-    """#751: with a default route configured, a genuine ambiguity no longer
-    blocks — it's demoted to advisory and the task runs on the default
-    route instead. Contrast with `test_ambiguous_title_lands_in_blocked`,
-    which covers the no-default-route case and must keep blocking."""
+    """With a default route configured, a genuine ambiguity is demoted to
+    advisory and the task runs on the default route instead, rather than
+    blocking. Contrast with `test_ambiguous_title_lands_in_blocked`, which
+    covers the no-default-route case and must keep blocking."""
     from config.settings import settings as _settings
     monkeypatch.setattr(_settings, "agent_default_route", "local")
     api = FakeApi(tasks=[
@@ -597,9 +597,10 @@ def test_default_route_demotes_ambiguity_and_runs(tmp_path: Path, monkeypatch):
 
 @pytest.mark.unit
 def test_default_route_does_not_rescue_fatal_sanity(tmp_path: Path, monkeypatch):
-    """#751 must not weaken #747's fail-closed guard: a deterministically
-    destructive title still fails the task even with a default route
-    configured — sanity is decided before routing is even consulted."""
+    """A deterministically destructive title still fails the task even with
+    a default route configured — sanity is decided before routing is even
+    consulted, and a default route must not weaken that fail-closed
+    guard."""
     from config.settings import settings as _settings
     monkeypatch.setattr(_settings, "agent_default_route", "local")
     api = FakeApi(tasks=[
@@ -617,17 +618,15 @@ def test_default_route_does_not_rescue_fatal_sanity(tmp_path: Path, monkeypatch)
 
 @pytest.mark.unit
 def test_default_route_demotes_nonfatal_sanity_and_runs(tmp_path: Path, monkeypatch):
-    """#803 supersedes the pre-#803 expectation of this test (formerly
-    `test_default_route_does_not_rescue_nonfatal_sanity`, which asserted the
-    opposite): a non-fatal sane=false — the classifier's own 'not
-    executable' opinion on a mundane title, never a `sane_fatal` one — is
-    now demoted to advisory when a default route is configured, the same
-    way #751 already demotes `ambiguity`. Building features is half the
-    point of this pipeline, and a park still cost the operator a
-    confirmation round-trip for a legitimate feature request — see #803.
-    #747's fail-closed guard for genuinely fatal verdicts is untouched;
-    that's covered separately by `test_default_route_does_not_rescue_fatal_sanity`
-    below, which still parks/fails."""
+    """A non-fatal sane=false — the classifier's own 'not executable'
+    opinion on a mundane title, never a `sane_fatal` one — is demoted to
+    advisory when a default route is configured, the same way `ambiguity`
+    is already demoted. Building features is half the point of this
+    pipeline, and parking still costs the operator a confirmation
+    round-trip for a legitimate feature request. The fail-closed guard for
+    genuinely fatal verdicts is untouched; that's covered separately by
+    `test_default_route_does_not_rescue_fatal_sanity` below, which still
+    parks/fails."""
     from config.settings import settings as _settings
     monkeypatch.setattr(_settings, "agent_default_route", "local")
     api = FakeApi(tasks=[
@@ -654,16 +653,16 @@ def test_default_route_demotes_nonfatal_sanity_and_runs(tmp_path: Path, monkeypa
     assert preflight_events
     assert preflight_events[0]["payload"]["demoted_sanity"] == sane_reason
     assert preflight_events[0]["payload"]["sane"] is True
-    # `test_default_route_does_not_rescue_fatal_sanity` (above, pre-existing
-    # and left unmodified by #803) already covers the sane_fatal case with a
-    # default route configured — proving fail-closed behavior is unaffected.
+    # `test_default_route_does_not_rescue_fatal_sanity` (above) already
+    # covers the sane_fatal case with a default route configured — proving
+    # fail-closed behavior is unaffected.
 
 
 @pytest.mark.unit
 def test_default_route_demotes_second_field_verdict_sanity_and_runs(tmp_path: Path, monkeypatch):
-    """#803: the same classifier opinion has fired twice in the field — this
-    covers the second real title (#774, a macOS setup-script parity task)
-    with a default route configured, alongside the #747 title covered by
+    """The same classifier opinion has fired twice in the field — this
+    covers a second real title (a macOS setup-script parity task) with a
+    default route configured, alongside the title covered by
     `test_default_route_demotes_nonfatal_sanity_and_runs` above."""
     from config.settings import settings as _settings
     monkeypatch.setattr(_settings, "agent_default_route", "local")
@@ -689,9 +688,9 @@ def test_default_route_demotes_second_field_verdict_sanity_and_runs(tmp_path: Pa
 
 @pytest.mark.unit
 def test_no_default_route_nonfatal_sanity_still_parks(tmp_path: Path, monkeypatch):
-    """#3 acceptance: with no default route configured (explicit empty,
-    since a host `.env` can leak the setting in), #747's park behavior for
-    a non-fatal sanity objection is unchanged."""
+    """With no default route configured (explicit empty,
+    since a host `.env` can leak the setting in), park behavior for
+    a non-fatal sanity objection is unaffected."""
     from config.settings import settings as _settings
     monkeypatch.setattr(_settings, "agent_default_route", "")
     api = FakeApi(tasks=[
@@ -742,7 +741,7 @@ def test_claude_routing_without_managed_credentials_blocks(tmp_path: Path, monke
     monkeypatch.setattr(_settings, "agent_environment_id", "", raising=False)
     api = FakeApi(tasks=[
         # `#cloud-sonnet` is the operator asking for the API route explicitly;
-        # without it an inferred cloud route would park at `ask` instead (#584).
+        # without it an inferred cloud route would park at `ask` instead.
         {"id": "t1", "description": "summarize", "status": "todo",
          "tags": ["cloud-sonnet"]},
     ])
@@ -761,7 +760,7 @@ def test_claude_routing_without_managed_credentials_blocks(tmp_path: Path, monke
 
 @pytest.mark.unit
 def test_cloud_tag_routes_to_remote_provider_when_configured(tmp_path: Path, monkeypatch):
-    """(#809) `#cloud` — the configured remote OpenAI-compatible provider —
+    """`#cloud` — the configured remote OpenAI-compatible provider —
     dispatches through the remote-forced executor, never Managed Agents."""
     from config.settings import settings as _settings
     monkeypatch.setattr(_settings, "remote_llm_base_url", "https://api.fireworks.ai/inference", raising=False)
@@ -790,9 +789,9 @@ def test_cloud_tag_routes_to_remote_provider_when_configured(tmp_path: Path, mon
 
 @pytest.mark.unit
 def test_cloud_tag_parks_when_remote_provider_unconfigured(tmp_path: Path, monkeypatch):
-    """(#809) `#cloud` with no remote provider configured must park at
+    """`#cloud` with no remote provider configured must park at
     #agent-blocked with a clear message — never silently fall back to the
-    Anthropic API (the old `#cloud` meaning) or to local Gemma."""
+    Anthropic API or to local Gemma."""
     from config.settings import settings as _settings
     monkeypatch.setattr(_settings, "remote_llm_base_url", "", raising=False)
     monkeypatch.setattr(_settings, "remote_llm_model", "", raising=False)
@@ -1085,8 +1084,7 @@ def test_format_token_buckets_includes_cache_creation_and_read_when_nonzero():
 @pytest.mark.unit
 def test_completion_summary_renders_four_bucket_breakdown(tmp_path: Path):
     """When a managed session populated all four token buckets, the operator-
-    facing Telegram message must surface them — that's the visible signal
-    that #137 actually landed."""
+    facing Telegram message must surface them."""
     api = FakeApi(tasks=[
         {"id": "t1", "description": "draft email", "status": "todo",
          "tags": ["cloud-sonnet"]},
@@ -1121,7 +1119,7 @@ def test_completion_summary_renders_four_bucket_breakdown(tmp_path: Path):
 def test_completion_summary_flags_escalation_to_child_engine(tmp_path: Path):
     """When a session delegated work to a claude_code child, the single
     completion message names the engine + tier so the operator knows the task
-    was escalated and where it ran (#349)."""
+    was escalated and where it ran."""
     api = FakeApi(tasks=[])
     executor = _StubExecutor(outcome=ExecutorOutcome(
         status=STATUS_COMPLETED, final_text="Here are today's matches: A vs B at noon.",
@@ -1207,10 +1205,10 @@ def test_completion_summary_omits_footer_when_no_init_failures(tmp_path: Path):
 
 @pytest.mark.unit
 def test_resume_message_carries_failed_child_reason(tmp_path: Path):
-    """A parent resuming after failed/budget children sees WHY each one died
-    (#433): the resume turn appends a `reason:` line under the status header,
+    """A parent resuming after failed/budget children sees WHY each one died:
+    the resume turn appends a `reason:` line under the status header,
     read from the child's `child_*_internal` transcript event. A failed child
-    with no such event (pre-#433 CLI transcripts) gets no reason line."""
+    with no such event gets no reason line."""
     api = FakeApi(tasks=[
         {"id": "p1", "description": "orchestrate the thing",
          "status": "in_progress", "tags": [RUNNING_TAG, "local"]},
@@ -1264,7 +1262,7 @@ def test_resume_message_carries_failed_child_reason(tmp_path: Path):
 
 @pytest.mark.unit
 def test_resume_message_latest_failure_event_wins(tmp_path: Path):
-    """A child that hit budget, was reopened (#428), then failed shows the
+    """A child that hit budget, was reopened, then failed shows the
     NEWER failed reason in the parent's resume turn — _child_failure_reason
     is latest-event-wins across both child_*_internal kinds."""
     api = FakeApi(tasks=[
@@ -1307,7 +1305,7 @@ def test_resume_message_latest_failure_event_wins(tmp_path: Path):
 @pytest.mark.unit
 def test_completed_child_leftover_failure_event_no_reason_line(tmp_path: Path):
     """A COMPLETED child carrying a leftover child_*_internal event (e.g. from
-    a failed run before a #428 reopen) contributes NO reason line — the status
+    a failed run before a reopen) contributes NO reason line — the status
     gate in _build_resume_message keeps reason lines failed/budget-only."""
     api = FakeApi(tasks=[
         {"id": "p1", "description": "orchestrate the thing",
@@ -1409,7 +1407,7 @@ def test_cloud_yield_resume_creates_fresh_managed_session_with_children_output(t
     # Both child session_ids show up in the [status] header lines.
     assert c1.session_id in msg
     assert c2.session_id in msg
-    # Parent session row now points at the new remote id.
+    # Parent session row points at the new remote id.
     refreshed = w.session_store.get("p1")
     assert refreshed.managed_agent_session_id == "sesn_new_remote_id"
     # Status flipped to RUNNING; yield_waiting_for cleared.
@@ -1468,7 +1466,7 @@ def test_recovery_inlines_short_text_tool_result(tmp_path: Path):
     """Sanity check the other branch: when the last tool result IS short
     and text-shaped (e.g. lifeos_gmail_draft returned a few-hundred-char
     summary), inline it — that's the genuine "show what the agent did"
-    case from PR #130."""
+    case."""
     from api.services.agent_worker.transcript_store import TranscriptStore as _TS
     api = FakeApi(tasks=[
         {"id": "t1", "description": "draft", "status": "todo",
@@ -1513,7 +1511,7 @@ class _FakeManagedExecutor:
 
 @pytest.mark.unit
 def test_resume_pending_kills_orphan_remote_session(tmp_path: Path):
-    """#198: rolling back a session with a live remote Managed Agents session
+    """Rolling back a session with a live remote Managed Agents session
     must kill the remote session — otherwise it keeps running on Anthropic's
     infrastructure, making MCP tool calls with side effects long after the
     operator was told the task was rolled back."""
@@ -1546,7 +1544,7 @@ def test_resume_pending_kills_orphan_remote_session(tmp_path: Path):
 
 @pytest.mark.unit
 def test_resume_pending_rollback_survives_kill_failure(tmp_path: Path):
-    """#198: a kill failure (remote 404, network error) must not block the
+    """A kill failure (remote 404, network error) must not block the
     local rollback — the session still finalizes FAILED."""
     from api.services.agent_worker.session_store import STATUS_FAILED, STATUS_RUNNING
 
@@ -1574,8 +1572,8 @@ def test_resume_pending_rollback_survives_kill_failure(tmp_path: Path):
 def test_resume_pending_does_not_telegram_for_spawned_children(tmp_path: Path):
     """Live bug: after a worker restart, the startup-recovery path saw a
     spawned child stuck in RUNNING, rolled it back, and pinged the
-    operator with the parent-internal child id. Per PR #132 invariant,
-    children's terminal state should never reach Telegram."""
+    operator with the parent-internal child id. Children's terminal state
+    should never reach Telegram."""
     from api.services.agent_worker.session_store import STATUS_RUNNING
     api = FakeApi(tasks=[
         {"id": "root_task", "description": "root", "status": "in_progress",
@@ -1805,12 +1803,11 @@ def test_empty_final_text_surfaces_last_tool_result_from_transcript(tmp_path: Pa
 
 @pytest.mark.unit
 def test_empty_final_text_without_side_effect_marks_failed(tmp_path: Path):
-    """Live bug repro: an agent runs a bunch of read-only searches, finds
-    nothing useful, and idles without a final reply. Previously this got
-    marked #agent-completed and the operator never noticed the silent
-    failure. The empty-final-text guard now routes it through the failure
-    path so the operator gets a Telegram alert and the task carries
-    #agent-failed."""
+    """An agent that runs a bunch of read-only searches, finds nothing
+    useful, and idles without a final reply must not be marked
+    #agent-completed, silently hiding the failure from the operator. The
+    empty-final-text guard routes it through the failure path so the
+    operator gets a Telegram alert and the task carries #agent-failed."""
     api = FakeApi(tasks=[
         {"id": "t1", "description": "research thing", "status": "todo",
          "tags": ["local"]},
@@ -2143,10 +2140,10 @@ def test_completion_label_says_local_for_local_routing(tmp_path: Path):
 
 @pytest.mark.unit
 def test_completion_label_reports_remote_fallback_model_when_served_by_set(tmp_path: Path):
-    """(#699) When the local route actually ran on the flag-gated remote
+    """When the local route actually ran on the flag-gated remote
     fallback, the completion message must name the model that actually
-    served the session, not just the static "local" route label — #658's
-    report-observed-not-configured principle applied to this new path."""
+    served the session, not just the static "local" route label — the
+    report-observed-not-configured principle applied to this path."""
     api = FakeApi(tasks=[
         {"id": "t1", "description": "task", "status": "todo", "tags": ["local"]},
     ])
@@ -2222,7 +2219,7 @@ def test_completion_spills_to_vault_when_over_cap(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(_settings, "vault_path", vault, raising=False)
 
     # Tag is "local" — not "cloud" — so the deterministic tag precedence
-    # (#139 §2) routes this task to the local executor. The test exercises
+    # routes this task to the local executor. The test exercises
     # the over-cap spillover via _StubExecutor on the local path.
     api = FakeApi(tasks=[
         {"id": "t1", "description": "Big report on Julia",
@@ -2451,16 +2448,17 @@ def test_worker_pauses_at_daily_cap(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# #753 — top-level #agent CLI-routed tasks dispatch off the tick thread
+# Top-level #agent CLI-routed tasks dispatch off the tick thread
 #
-# Before this fix, `_dispatch()`'s ROUTE_CLAUDE_CODE/ROUTE_CODEX branch called
-# `_dispatch_claude_code_session`/`_dispatch_codex_session` inline, so the
-# whole CLI subprocess ran synchronously inside tick()'s claim loop — up to
-# the session's 14,400s budget wall. Nothing else in tick() (new claims,
-# sleeping-session wakes, managed polling, clarification processing/timeouts)
-# ran while that subprocess was in flight. The fix reuses `_submit_cli_dispatch`
-# — the same pool + `_cli_inflight` machinery spawned CLI children already use
-# (#299, test_agent_worker_async_cli_dispatch.py) — for the top-level path too.
+# `_dispatch()`'s ROUTE_CLAUDE_CODE/ROUTE_CODEX branch reuses
+# `_submit_cli_dispatch` rather than calling
+# `_dispatch_claude_code_session`/`_dispatch_codex_session` inline — the
+# same pool + `_cli_inflight` machinery spawned CLI children already use
+# (test_agent_worker_async_cli_dispatch.py) — for the top-level path too.
+# Running the CLI subprocess inline inside tick()'s claim loop would block
+# everything else in tick() (new claims, sleeping-session wakes, managed
+# polling, clarification processing/timeouts) for up to the session's
+# 14,400s budget wall.
 # ---------------------------------------------------------------------------
 
 class _CapturingPool:
@@ -2486,8 +2484,8 @@ class _CapturingPool:
 @pytest.mark.unit
 def test_top_level_cli_task_dispatched_off_tick_not_inline(tmp_path: Path):
     """A top-level #agent task routed to claude_code must be handed to the
-    CLI pool, not executed inline in tick() — the fix's core claim, proven
-    by a pool that records submissions without running them. Once the
+    CLI pool, not executed inline in tick() — proven by a pool that records
+    submissions without running them. Once the
     submitted work is run (as the real pool thread would), the full
     outcome-handling path (vault tag swap, task completion, Telegram) still
     fires — it's the same `_dispatch_claude_code_session` used by spawned
@@ -2497,7 +2495,7 @@ def test_top_level_cli_task_dispatched_off_tick_not_inline(tmp_path: Path):
     class _Executor:
         def execute(self, session, task):
             calls.append((session.task_id, task.get("description")))
-            # notifications_sent=1 earns the completion (#760) — this test is
+            # notifications_sent=1 earns the completion — this test is
             # about off-tick dispatch, not the earned-completion gate itself.
             return ExecutorOutcome(status=STATUS_COMPLETED, final_text="all done", notifications_sent=1)
 
@@ -2651,7 +2649,7 @@ def test_persisted_execution_snapshot_is_reused_after_worker_restart(tmp_path: P
 
 @pytest.mark.unit
 def test_second_cli_task_claimed_and_runs_while_first_blocks(tmp_path: Path):
-    """Live bug repro (#753): two #agent tasks routed to claude_code — the
+    """Two #agent tasks routed to claude_code — the
     second must be claimed and start running while the first is still mid
     execute(), instead of sitting unclaimed for the first task's entire run.
     Uses a real ThreadPoolExecutor (not a synchronous stub) since this is
@@ -2661,7 +2659,7 @@ def test_second_cli_task_claimed_and_runs_while_first_blocks(tmp_path: Path):
 
     class _Executor:
         def execute(self, session, task):
-            # notifications_sent=1 earns the completion (#760) — this test is
+            # notifications_sent=1 earns the completion — this test is
             # about pool concurrency, not the earned-completion gate itself.
             if task.get("description") == "slow task":
                 start_evt.set()
@@ -2705,7 +2703,7 @@ def test_second_cli_task_claimed_and_runs_while_first_blocks(tmp_path: Path):
 
 @pytest.mark.unit
 def test_clarification_processing_continues_while_cli_task_blocks(tmp_path: Path):
-    """(#753) A blocked CLI subprocess must not starve clarification
+    """A blocked CLI subprocess must not starve clarification
     processing for an unrelated, already-blocked local session — the tick
     thread has to stay free to keep servicing the rest of the worker's
     responsibilities while the CLI task runs on the pool."""
@@ -2758,8 +2756,8 @@ def test_clarification_processing_continues_while_cli_task_blocks(tmp_path: Path
 
 @pytest.mark.unit
 def test_cli_inflight_guard_covers_top_level_dispatch(tmp_path: Path):
-    """(#753) Top-level CLI dispatch shares `_cli_inflight` with the spawned
-    path (#299) — a session submitted to the pool but not yet flipped
+    """Top-level CLI dispatch shares `_cli_inflight` with the spawned
+    path — a session submitted to the pool but not yet flipped
     CLAIMED→RUNNING must not be submitted a second time, mirroring
     test_inflight_guard_prevents_double_dispatch_across_ticks for spawned
     children."""

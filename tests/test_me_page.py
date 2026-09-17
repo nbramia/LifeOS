@@ -11,7 +11,7 @@ from api.routes.crm import MY_PERSON_ID
 
 # Marked per-class below rather than at module level: every class here is
 # mock-based (unit) except test_my_person_id_is_valid_uuid, which needs a
-# real configured settings.my_person_id (#682) and is marked individually.
+# real configured settings.my_person_id and is marked individually.
 
 
 @pytest.mark.unit

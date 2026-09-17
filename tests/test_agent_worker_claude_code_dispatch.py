@@ -126,7 +126,7 @@ def _recording_worker(tmp_path: Path, claude_code_executor):
 
 def _capturing_worker(tmp_path: Path, claude_code_executor):
     """Worker whose Telegram senders record every message, so a test can assert
-    the exact operator-facing message count (#349)."""
+    the exact operator-facing message count."""
     store = SessionStore(db_path=tmp_path / "sessions.db")
     transcripts = TranscriptStore(transcripts_dir=tmp_path / "transcripts")
     sent: list[str] = []
@@ -151,7 +151,7 @@ def _capturing_worker(tmp_path: Path, claude_code_executor):
 
 def test_spawned_child_completion_does_not_telegram_operator(tmp_path: Path):
     """A spawned claude_code child (has a parent) must NOT send its completion
-    text to the operator — the parent relays it in one message (#349)."""
+    text to the operator — the parent relays it in one message."""
     stub = _StubClaudeCodeExecutor(
         outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="Match 1: A vs B at noon.")
     )
@@ -184,8 +184,8 @@ def test_operator_claude_session_still_telegrams_on_completion(tmp_path: Path):
 
 def test_child_final_text_reads_claude_code_completed_event(tmp_path: Path):
     """The parent pulls a claude_code child's final_text from the
-    claude_code_completed transcript event — the child's only path out now that
-    it stays silent to the operator (#349)."""
+    claude_code_completed transcript event, since it stays silent to the
+    operator."""
     stub = _StubClaudeCodeExecutor(
         outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="")
     )
@@ -203,8 +203,7 @@ def test_child_final_text_reads_claude_code_completed_event(tmp_path: Path):
 
 def test_child_final_text_reads_codex_completed_event(tmp_path: Path):
     """The parent pulls a codex child's final_text from the codex_completed
-    transcript event — the child's only path out now that the codex completion
-    send is child-gated too (#429, parity with #349)."""
+    transcript event, since the codex completion send is child-gated too."""
     worker, store, transcripts, _ = _capturing_worker(tmp_path, claude_code_executor=None)
     parent = store.create(task_id="parent-1", routing="local")
     child = store.create(
@@ -218,7 +217,7 @@ def test_child_final_text_reads_codex_completed_event(tmp_path: Path):
 
 
 def test_child_final_text_legacy_codex_event_without_key_does_not_clobber(tmp_path: Path):
-    """A legacy `codex_completed` event that predates #429 (final_chars only,
+    """A legacy `codex_completed` event (final_chars only,
     no `final_text` key) must not wipe a real value from an earlier event —
     the key-presence guard is per-event, not per-kind."""
     worker, store, transcripts, _ = _capturing_worker(tmp_path, claude_code_executor=None)
@@ -238,7 +237,7 @@ def test_child_final_text_legacy_codex_event_without_key_does_not_clobber(tmp_pa
 
 def test_resume_delivers_all_pending_messages(tmp_path: Path):
     """A resume dispatch must carry EVERY drained pending message, in order —
-    not just pending[0]. Reopen-on-send (#428) makes multi-enqueue likely
+    not just pending[0]. Reopen-on-send makes multi-enqueue likely
     (e.g. a parent sends twice before the dispatch tick claims the reopened
     child), and each send already returned delivered=true."""
     stub = _StubClaudeCodeExecutor(
@@ -265,7 +264,7 @@ def test_resume_delivers_all_pending_messages(tmp_path: Path):
 
 
 def test_child_final_text_latest_completed_event_wins_even_when_empty(tmp_path: Path):
-    """The LATEST completed event's final_text wins even when empty (#428):
+    """The LATEST completed event's final_text wins even when empty:
     a reopened child whose second run completes with no final text must not
     re-deliver the first run's '[needs clarification] …' question to the
     parent — that would invite a re-answer loop."""
@@ -285,7 +284,7 @@ def test_child_final_text_latest_completed_event_wins_even_when_empty(tmp_path: 
 
 
 def test_child_final_text_legacy_event_without_key_does_not_clobber(tmp_path: Path):
-    """A legacy completed event that never carried a `final_text` key (pre-#349
+    """A legacy completed event that never carried a `final_text` key (some
     payloads recorded final_chars only) must not wipe a real value from an
     earlier event."""
     worker, store, transcripts, _ = _capturing_worker(tmp_path, claude_code_executor=None)
@@ -309,7 +308,7 @@ def test_vault_claude_task_marked_complete_on_finish(tmp_path: Path):
     PUT .../complete and a #agent-running → #agent-completed swap. Regression
     for CLI tasks stranded at ``[/]`` / ``#agent-running`` forever (the CLI
     dispatch path bypasses ``_handle_outcome``)."""
-    # notifications_sent=1 earns the completion (#760) — this test is about
+    # notifications_sent=1 earns the completion — this test is about
     # vault reconciliation, not the earned-completion gate itself.
     stub = _StubClaudeCodeExecutor(
         outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="done.", notifications_sent=1)
@@ -365,7 +364,7 @@ def test_dispatch_calls_claude_code_executor(tmp_path: Path):
 
 def test_already_launched_subprocess_does_not_reexecute_prompt(tmp_path: Path):
     """A re-dispatch of a session that ALREADY launched a subprocess must NOT
-    re-run the original prompt (#400).
+    re-run the original prompt.
 
     Simulates the spawn-before-init window: a routing='claude_code' session whose
     subprocess actually launched once (a `claude_code_spawn` transcript event with
@@ -407,7 +406,7 @@ def test_already_launched_subprocess_does_not_reexecute_prompt(tmp_path: Path):
 
 def test_binary_not_found_does_not_loop_or_misdiagnose(tmp_path: Path):
     """A missing `claude` binary must end the session FAILED without re-dispatch
-    looping, and must NOT trip the already-launched guard (#400).
+    looping, and must NOT trip the already-launched guard.
 
     The executor writes `claude_code_spawn` *before* the spawn call, then on a
     missing binary writes `claude_code_binary_not_found` and returns FAILED — no
@@ -450,7 +449,7 @@ def test_binary_not_found_does_not_loop_or_misdiagnose(tmp_path: Path):
 
 def test_fresh_spawn_with_no_prior_spawn_event_still_executes(tmp_path: Path):
     """Guardrail: the crash-before-init check must not break the normal first
-    dispatch. With no prior `claude_code_spawn` event, execute() still runs (#400)."""
+    dispatch. With no prior `claude_code_spawn` event, execute() still runs."""
     stub = _StubClaudeCodeExecutor(
         outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="done.")
     )
@@ -463,13 +462,13 @@ def test_fresh_spawn_with_no_prior_spawn_event_still_executes(tmp_path: Path):
 
 
 # =============================================================================
-# Web-thread result mirroring (#311)
+# Web-thread result mirroring
 # =============================================================================
 
 
 def _mirroring_worker(tmp_path: Path, claude_code_executor):
     """Worker with an isolated ConversationStore so a test can assert the
-    spawned session's output is mirrored into the linked conversation (#311)."""
+    spawned session's output is mirrored into the linked conversation."""
     store = SessionStore(db_path=tmp_path / "sessions.db")
     conv_store = ConversationStore(db_path=str(tmp_path / "conversations.db"))
     transcripts = TranscriptStore(transcripts_dir=tmp_path / "transcripts")
@@ -594,13 +593,13 @@ def test_child_completion_does_not_mirror(tmp_path: Path):
 
 
 # =============================================================================
-# #431 — child failure/budget notices stay silent to the operator
+# Child failure/budget notices stay silent to the operator
 # =============================================================================
 
 
 def test_child_failure_sends_no_operator_notice(tmp_path: Path):
     """A spawned child (parent set) that FAILS must not send the operator a
-    "⚠️ … failed" Telegram notice (#431) — the parent's resume turn already
+    "⚠️ … failed" Telegram notice — the parent's resume turn already
     carries the child's [failed] status header. FAILED is still persisted."""
     stub = _StubClaudeCodeExecutor(
         outcome=ExecutorOutcome(status=STATUS_FAILED, reason="boom")
@@ -618,7 +617,7 @@ def test_child_failure_sends_no_operator_notice(tmp_path: Path):
 
     assert not any("failed" in s.lower() for s in sent)
     assert store.get("child-fail").status == STATUS_FAILED
-    # #433: the reason is persisted for the parent's resume turn.
+    # The reason is persisted for the parent's resume turn.
     events = worker.transcript_store.read(child.session_id)
     reasons = [e["payload"]["reason"] for e in events if e["kind"] == "child_failed_internal"]
     assert reasons == ["boom"]
@@ -626,7 +625,7 @@ def test_child_failure_sends_no_operator_notice(tmp_path: Path):
 
 def test_child_budget_exceeded_sends_no_operator_notice(tmp_path: Path):
     """A spawned child that exceeds budget must not send the operator a
-    "⚠️ … budget" notice (#431); the terminal status is still persisted."""
+    "⚠️ … budget" notice; the terminal status is still persisted."""
     from api.services.agent_worker.session_store import STATUS_BUDGET_EXCEEDED
 
     stub = _StubClaudeCodeExecutor(
@@ -645,7 +644,7 @@ def test_child_budget_exceeded_sends_no_operator_notice(tmp_path: Path):
 
     assert not any("budget" in s.lower() for s in sent)
     assert store.get("child-budget").status == STATUS_BUDGET_EXCEEDED
-    # #433: the reason is persisted for the parent's resume turn.
+    # The reason is persisted for the parent's resume turn.
     events = worker.transcript_store.read(child.session_id)
     reasons = [e["payload"]["reason"]
                for e in events if e["kind"] == "child_budget_exceeded_internal"]
@@ -656,7 +655,7 @@ def test_child_executor_crash_records_failure_reason(tmp_path: Path):
     """An executor crash (execute() raising) bypasses the dispatch tail via
     the except-handler's early return — the crash handler must still record
     the child's failure reason so the parent's resume turn carries a
-    `reason:` line (#433 review round 1).
+    `reason:` line.
 
     It also appends a `claude_code_dispatch_crashed` transcript event naming
     the phase and the error before the terminal status is written."""
@@ -722,7 +721,7 @@ def test_resume_crash_records_dispatch_crashed_event(tmp_path: Path):
 
 def test_child_failure_does_not_mirror(tmp_path: Path):
     """A child's failure notice must not mirror into a linked conversation
-    either (#431) — pins the restructure that moved the child protection from
+    either — pins the restructure that moved the child protection from
     the inner mirror gate to the outer notice gate. Parity with
     test_codex_child_failure_does_not_mirror."""
     stub = _StubClaudeCodeExecutor(
@@ -743,7 +742,7 @@ def test_child_failure_does_not_mirror(tmp_path: Path):
 
 
 # =============================================================================
-# #379 — operator-killed session emits no post-kill notice
+# Operator-killed session emits no post-kill notice
 # =============================================================================
 
 
@@ -771,7 +770,7 @@ def test_operator_killed_failed_outcome_sends_no_telegram_notice(tmp_path: Path)
 
 def test_operator_killed_failed_outcome_does_not_mirror_to_web(tmp_path: Path):
     """Parity for the web/voice thread: a REASON_KILLED FAILED outcome must NOT
-    mirror a failure notice into the linked conversation (#379 + #311)."""
+    mirror a failure notice into the linked conversation."""
     from api.services.agent_worker.claude_code_executor import REASON_KILLED
 
     stub = _StubClaudeCodeExecutor(
@@ -789,7 +788,7 @@ def test_operator_killed_failed_outcome_does_not_mirror_to_web(tmp_path: Path):
 
 
 # =============================================================================
-# #760 — earned completion / interrupted CLI sessions
+# Earned completion / interrupted CLI sessions
 # =============================================================================
 
 # Verbatim field fixture: session sess_099c0b8ca254486f ended mid-turn with
@@ -799,7 +798,7 @@ FIELD_FRAGMENT = "Now update the cancel test to drop the no-longer-needed releas
 
 
 def test_field_fixture_lands_blocked_not_completed(tmp_path: Path):
-    """Regression for #760: a CLI subprocess exiting with no earned
+    """A CLI subprocess exiting with no earned
     completion signal must NOT be marked #agent-completed — it parks BLOCKED
     (resumable) instead."""
     stub = _StubClaudeCodeExecutor(
@@ -846,7 +845,7 @@ def test_interrupted_message_preserves_final_text_and_exit_meta(tmp_path: Path):
 
 
 def test_interrupted_message_names_discoverable_wip_branch(tmp_path: Path):
-    """Best-effort WIP-branch discovery (#760): a `git switch -c <branch>`
+    """Best-effort WIP-branch discovery: a `git switch -c <branch>`
     tool_use recorded earlier in this session's transcript is surfaced in
     the interrupted message. Never runs git — pure transcript scan."""
     stub = _StubClaudeCodeExecutor(
@@ -903,7 +902,7 @@ def test_interrupted_session_reply_resumes_via_followup(tmp_path: Path):
 
 
 def test_interrupted_without_cli_session_id_fails_with_preserved_context(tmp_path: Path):
-    """Documented fallback (#760): no claude_code_session_id was ever
+    """Documented fallback: no claude_code_session_id was ever
     persisted (init never fired), so there is nothing to resume against —
     fail with the interrupted context preserved in the message rather than
     leave an unresumable BLOCKED row stranded forever."""
@@ -972,7 +971,7 @@ def test_notify_sent_still_completes_even_with_fragment_text(tmp_path: Path):
 def test_child_session_bypasses_interrupted_gate(tmp_path: Path):
     """A spawned child (has a parent) is exempt from the earned-completion
     gate — its raw outcome (fragment included) is consumed by the parent via
-    _child_final_text, which already handles this (#349)."""
+    _child_final_text, which already handles this."""
     stub = _StubClaudeCodeExecutor(
         outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=FIELD_FRAGMENT)
     )

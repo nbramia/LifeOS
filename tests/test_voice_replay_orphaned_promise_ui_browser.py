@@ -1,8 +1,7 @@
-"""Browser tests for #617: stopAllAudio() orphaning an in-flight playback
+"""Browser tests for stopAllAudio() orphaning an in-flight playback
 promise when replay interrupts a live turn.
 
-Found while fixing #608, deliberately left out of that PR to keep it
-surgical (see the issue for the full reachability analysis). Reproduction:
+Reproduction:
 
 `stopAllAudio()` (`web/chat/voice.js`) stops every element in `activeAudios`
 by nulling `onended`/`onerror` and pausing -- it never *fires* those
@@ -29,7 +28,7 @@ This reproduces on both the shared-audio-element path (iOS/Android,
 `playUrlOnElement()`) and the desktop one-`Audio`-per-clip path
 (`playSingleUrl()`'s own executor) -- `stopAllAudio()` iterates
 `activeAudios` the same way regardless of platform, so neither is
-special-cased in the fix.
+special-cased.
 
 Unlike most of the browser suite this serves `web/` itself from an ephemeral
 port and drives `submitTurn()` directly (exported from voice.js for exactly

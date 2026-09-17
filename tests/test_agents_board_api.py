@@ -1,4 +1,4 @@
-"""API tests for the /agents Kanban board (#850).
+"""API tests for the /agents Kanban board.
 
 Covers GET /api/agents/board, PUT .../board/cards/{id}/lane,
 POST .../board/cards/{id}/accept and /undo-accept, GET /api/agents/pending-questions,
@@ -94,7 +94,7 @@ class TestGetBoard:
         assert body["api_host"] == "board-api-host"
 
     def test_get_board_never_served_from_stream_cache(self, client, stores):
-        """Round-2 finding 6(a): GET /board must always build fresh — it
+        """GET /board must always build fresh — it
         must never read the TTL'd cache the stream's own tick uses.
         Poisons the cache with a snapshot missing the task and proves GET
         ignores it rather than serving pre-write data (reproduces the
@@ -281,8 +281,8 @@ class TestGetBoard:
         assert assigned[0]["session"] is None
 
     def test_card_carries_its_linked_session(self, client, stores):
-        """Round-1 finding 13: `_task_card`'s session join was untested —
-        every prior fixture card had `session: None`."""
+        """`_task_card`'s session join, exercised with a card whose
+        `session` is not `None`."""
         task_manager, _sched, session_store, _transcript = stores
         task = task_manager.create("Draft the memo", tags=["codex"])
         session = session_store.create(task_id=task.id, status="running", routing="claude")
@@ -292,7 +292,7 @@ class TestGetBoard:
         assert card["session"]["session_id"] == session.session_id
 
     def test_card_session_picks_most_recently_active_of_several(self, client, stores, monkeypatch):
-        """Round-1 finding 13: with two sessions on the same task, the card
+        """With two sessions on the same task, the card
         must carry the one with the latest `last_activity_at`, not just
         whichever the store happened to return first. `sessions` PRIMARY
         KEYs on `task_id` (at most one LifeOS-worker session per task at a
@@ -392,7 +392,7 @@ class TestGetBoard:
         assert endpoint_card["endpoint_config"] == {"method": "GET", "endpoint": "/api/health", "params": {"x": 1}}
 
     def test_scheduled_cron_entry_carries_last_run_after_it_fires(self, client, stores):
-        """Round-1 finding 16: a recurring entry that has already fired once
+        """A recurring entry that has already fired once
         but is still enabled with a future next trigger stays in Scheduled —
         its `last_run` must still be populated from the prior fire."""
         _tm, scheduler_store, *_ = stores
@@ -757,15 +757,13 @@ class TestReviewActions:
 
 class TestBoardStream:
     async def test_stream_emits_a_second_frame_after_a_task_mutation(self, stores):
-        """Round-1 finding 12(a): the SSE path itself (GET
-        /api/agents/board/stream) was never opened by any test — only
-        _build_board() was called directly. Drive the real generator
-        directly rather than through TestClient — its `_TestClientTransport`
-        fully drains an ASGI call before returning a response, and this
-        generator never completes on its own — and prove a task mutation
-        produces a second, different frame on the path the page actually
-        uses ("The board updates within three seconds of an external vault
-        edit without a page reload.")."""
+        """Drives the real SSE generator (GET /api/agents/board/stream)
+        directly rather than through TestClient — its
+        `_TestClientTransport` fully drains an ASGI call before returning a
+        response, and this generator never completes on its own — and
+        proves a task mutation produces a second, different frame on the
+        path the page actually uses ("The board updates within three
+        seconds of an external vault edit without a page reload.")."""
         task_manager, *_ = stores
         task = task_manager.create("Ping the vendor")
 
@@ -786,7 +784,7 @@ class TestBoardStream:
             # too.
             assert first_board["api_host"] == agents_route.api_host_name()
 
-            # Round-2 finding 10: without a mutation, ticks must not emit —
+            # Without a mutation, ticks must not emit —
             # the signature-diff suppression, not "any frame that shows up".
             # Use asyncio.wait (not wait_for) so a timeout leaves the pending
             # __anext__() task running rather than cancelling it — cancelling
@@ -812,8 +810,8 @@ class TestBoardStream:
             # If anything between asyncio.wait and `await next_task` raises,
             # next_task is still pending — closing the generator while its
             # own __anext__() is still outstanding raises "aclose(): asynchronous
-            # generator is already running" and masks the real error
-            # (#850 round-3 finding 4). Cancel it first so aclose() sees a
+            # generator is already running" and masks the real error.
+            # Cancel it first so aclose() sees a
             # generator that isn't mid-iteration.
             if next_task is not None and not next_task.done():
                 next_task.cancel()
@@ -930,9 +928,10 @@ class TestMoveBoardCard:
         assert r.status_code == 400
 
     def test_human_queue_card_dropped_into_done_lands_in_done(self, client, stores):
-        """Round-1 finding 1: a #human + blocked card dropped into Done must
-        actually leave Human queue — the stale `human` tag used to keep it
-        there even after `status` was written to `done`."""
+        """A #human + blocked card dropped into Done must
+        actually leave Human queue: the `human` tag must be stripped along
+        with the status write, since the lane is otherwise derived from the
+        tag and would keep it there even after `status` becomes `done`."""
         task_manager, *_ = stores
         task = task_manager.create("Escalated to the operator", tags=["human"], status="blocked")
         r = client.put(f"/api/agents/board/cards/{task.id}/lane", json={"lane": "done"})
@@ -953,10 +952,10 @@ class TestMoveBoardCard:
     def test_worker_owned_card_cannot_be_dropped_on_in_progress_or_done(
         self, client, stores, worker_tag, target_lane,
     ):
-        """Round-2 finding 1: a worker-owned card (agent-running or
+        """A worker-owned card (agent-running or
         agent-blocked) must 409 for In progress and Done, with NO write at
-        all — round-1's tag-strip silently detached these from a live
-        worker task instead."""
+        all — a tag-strip there would silently detach it from a live
+        worker task."""
         task_manager, *_ = stores
         task = task_manager.create("Being worked by the agent", tags=["agent", worker_tag])
         inbox = task_manager.tasks_dir / "Inbox.md"
@@ -977,7 +976,7 @@ class TestMoveBoardCard:
     def test_review_card_cannot_be_moved_to_in_progress_or_human_queue(
         self, client, stores, target_lane,
     ):
-        """Round-2 finding 2(a): a pending review (agent-completed, not yet
+        """A pending review (agent-completed, not yet
         accepted) must 409 rather than silently writing status/tags while
         the card stays in Review — only Done still doubles as accept."""
         task_manager, *_ = stores
@@ -995,7 +994,7 @@ class TestMoveBoardCard:
 
     def test_review_card_dropped_on_done_still_accepts(self, client, stores):
         """Done keeps acting as the accept path for a Review card — only
-        In progress and Human queue were narrowed to 409 (round-2 finding 2a)."""
+        In progress and Human queue 409 instead."""
         task_manager, *_ = stores
         task = task_manager.create("Reviewed by the operator", tags=["me", "agent-completed"], status="done")
         r = client.put(f"/api/agents/board/cards/{task.id}/lane", json={"lane": "done"})
@@ -1721,8 +1720,8 @@ class TestAcceptBoardCard:
         assert r.status_code == 404
 
     def test_accept_on_non_review_card_is_409(self, client, stores):
-        """Round-1 finding 6: /accept had no Review-lane guard — it would
-        happily mark any todo card done."""
+        """/accept must be rejected for a card outside the Review lane, not
+        mark an arbitrary todo card done."""
         task_manager, *_ = stores
         task = task_manager.create("A plain todo, never touched by the worker")
         r = client.post(f"/api/agents/board/cards/{task.id}/accept")
@@ -1798,7 +1797,7 @@ class TestAcceptBoardCard:
 @pytest.mark.unit
 class TestPendingQuestions:
     def test_answer_invalidates_the_stream_cache(self, client, stores):
-        """Round-2 finding 6(c): answering a question must invalidate
+        """Answering a question must invalidate
         `_board_cache` like a lane-move/accept write does, so the stream's
         next tick doesn't keep serving a pre-answer board for the rest of
         the TTL."""
@@ -1836,7 +1835,7 @@ class TestPendingQuestions:
         r2 = client.post(f"/api/agents/pending-questions/{qid}/answer", json={"answer": "staging"})
         assert r2.status_code == 200
 
-        # The row now looks exactly like it would after a Telegram reply via
+        # The row looks exactly like it would after a Telegram reply via
         # deposit_answer: answer + answered_at set, nothing else touched.
         with session_store._connect() as conn:
             row = dict(conn.execute(
@@ -1891,7 +1890,7 @@ class TestPendingQuestions:
         assert r.status_code == 404
 
     def test_answer_bare_empty_string_is_400_via_min_length(self, client, stores):
-        """Round-1 finding 10: `answer` now has a min_length, so a bare empty
+        """`answer` has a min_length, so a bare empty
         string is rejected by Pydantic validation (whitespace still 400s via
         the handler's own strip check — see test_answer_empty_string_is_400
         above). This app's `RequestValidationError` handler (api/main.py)
@@ -1907,7 +1906,7 @@ class TestPendingQuestions:
         assert r.status_code == 400
 
     def test_status_anchor_row_excluded_from_pending_questions(self, client, stores):
-        """Round-1 finding 14: `status_anchor` rows are routing plumbing (see
+        """`status_anchor` rows are routing plumbing (see
         `add_reply_anchors`), never a real question."""
         _tm, _sched, session_store, _transcript = stores
         session = session_store.create(task_id="t1", status=STATUS_BLOCKED)
@@ -1918,7 +1917,7 @@ class TestPendingQuestions:
         assert r.json()["questions"] == []
 
     def test_answering_already_answered_question_is_404(self, client, stores):
-        """Round-1 finding 14: the second answer attempt on the same
+        """The second answer attempt on the same
         question must 404, not silently overwrite the first answer."""
         _tm, _sched, session_store, _transcript = stores
         session = session_store.create(task_id="t1", status=STATUS_BLOCKED)
@@ -1936,7 +1935,7 @@ class TestPendingQuestions:
         assert row["answer"] == "first"
 
     def test_followup_row_excluded_from_pending_questions(self, client, stores):
-        """Round-1 finding 7: `kind='followup'` rows are completion notices,
+        """`kind='followup'` rows are completion notices,
         not real questions — they must not render a fake pending-question
         badge on a Review card."""
         task_manager, _sched, session_store, _transcript = stores
@@ -1959,7 +1958,7 @@ class TestPendingQuestions:
 
 
 # ---------------------------------------------------------------------------
-# Hermes label fix + Codex stream dispatch (#850)
+# Hermes label + Codex stream dispatch
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
@@ -2000,9 +1999,9 @@ class TestHermesLabelAndCodexStream:
         assert sessions[s.session_id]["model_label"] == "Hermes"
 
     def test_codex_stream_dispatches_to_codex_ingest_not_lifeos_store(self, client, stores, monkeypatch):
-        """Before #850, /sessions/{id}/stream only special-cased `cc:` — a
-        `cx:` id fell through to the LifeOS transcript store's path-traversal
-        guard and 400'd. It must now dispatch to the Codex ingest path."""
+        """/sessions/{id}/stream must dispatch a `cx:` id to the Codex
+        ingest path — not fall through to the LifeOS transcript store's
+        path-traversal guard, which 400s on it."""
         called = {}
 
         async def fake_stream_codex(session_id, backfill):
@@ -2029,14 +2028,13 @@ class TestHermesLabelAndCodexStream:
         assert r.status_code == 404
 
     async def test_stream_codex_session_actually_reads_a_rollout_file(self, stores, monkeypatch, tmp_path):
-        """Round-1 finding 17: `_stream_codex_session` itself was never
-        executed — the dispatch test above monkeypatches the whole generator
-        away. Point `settings.codex_sessions_dir` at a synthetic rollout and
-        drive the real generator directly (not through TestClient — its
-        `_TestClientTransport` fully drains an ASGI call before returning a
-        response, and this generator only ends on a 300s idle timeout, so a
-        real HTTP round trip through it can't complete inside a unit test);
-        it should backfill the file's events unchanged."""
+        """Points `settings.codex_sessions_dir` at a synthetic rollout and
+        drives the real `_stream_codex_session` generator directly (not
+        through TestClient — its `_TestClientTransport` fully drains an ASGI
+        call before returning a response, and this generator only ends on a
+        300s idle timeout, so a real HTTP round trip through it can't
+        complete inside a unit test); it should backfill the file's events
+        unchanged."""
         from tests.test_codex_ingest import _write_rollout, _session_meta, _agent_event_msg
         from config.settings import settings
 

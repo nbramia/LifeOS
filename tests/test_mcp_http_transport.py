@@ -136,7 +136,7 @@ def test_tools_call_dispatches_to_handler(client: TestClient, bearer_token: str)
 
 @pytest.mark.unit
 def test_tools_call_sets_is_error_on_tool_failure(client: TestClient, bearer_token: str, monkeypatch):
-    """#603 review (MAJOR): a tool-level failure must surface as MCP
+    """A tool-level failure must surface as MCP
     `isError: true`, not just as prose inside a structurally-successful
     JSON-RPC result — the same "error" key convention the agent worker's
     ToolRegistry already uses (api/services/agent_worker/tools.py) to decide

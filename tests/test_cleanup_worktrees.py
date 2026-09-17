@@ -1,4 +1,4 @@
-"""Idempotency / stale-collision tests for scripts/cleanup-worktrees.sh (#400).
+"""Idempotency / stale-collision tests for scripts/cleanup-worktrees.sh.
 
 The doctor lifecycle creates an integration worktree off origin/main up front
 and removes it at end-of-goal. A crashed run leaves the worktree directory and
@@ -74,7 +74,7 @@ def test_stale_worktree_preflight_clears_collision(tmp_path: Path):
     assert result.returncode == 0, result.stderr
     assert not wt.exists()
 
-    # The add the doctor would run next now succeeds.
+    # The add the doctor would run next succeeds.
     re_add = _git(repo, "worktree", "add", "-b", branch, str(wt), "main")
     assert re_add.returncode == 0, re_add.stderr
 
@@ -93,7 +93,7 @@ def test_cleanup_is_idempotent_when_already_clean(tmp_path: Path):
 
 
 def test_stale_dir_without_git_tracking_is_removed(tmp_path: Path):
-    """A leftover directory git no longer tracks (e.g. metadata pruned but the
+    """A leftover directory git does not track (e.g. metadata pruned but the
     dir survived) is still cleared so the path is free for a fresh add."""
     repo = _init_repo(tmp_path)
     wt = repo / ".worktrees" / "orphan"

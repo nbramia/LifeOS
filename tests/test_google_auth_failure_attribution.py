@@ -1,5 +1,5 @@
 """
-Tests for Google credential-refresh failure attribution (#540).
+Tests for Google credential-refresh failure attribution.
 
 Regression context: a DNS failure reaching oauth2.googleapis.com during a
 routine token refresh was caught by a bare `except Exception`, logged as
@@ -10,7 +10,7 @@ top-line error on a sync job that fails most nights, so it's the first thing
 an operator reads, and it pointed at the wrong fix (and would have cost an
 interactive browser session on a headless box for nothing).
 
-These tests pin the fix: a transport/DNS failure during refresh must be
+These tests pin the requirement: a transport/DNS failure during refresh must be
 reported as a connectivity problem (token untested, no re-auth suggested); a
 genuine rejection by the identity provider must still say re-auth is needed
 and name the script; an unrecognised failure must say the refresh failed

@@ -34,7 +34,7 @@ class TestAdminEndpoints:
         # own try/except that falls back to document_count=0 (admin.py:46-53)
         # -- these tests only care about the response shape/status, not a
         # real count, so mock VectorStore rather than reaching the live
-        # store (#828).
+        # store.
         with patch('api.routes.admin.VectorStore'):
             response = client.get("/api/admin/status")
         assert response.status_code == 200
@@ -50,7 +50,7 @@ class TestAdminEndpoints:
         assert "vault_path" in data
 
     def test_status_ignores_stale_running_reindex_job(self, client):
-        """#768: a `reindex_vault` job stuck "running" because the process
+        """A `reindex_vault` job stuck "running" because the process
         that was executing it restarted mid-job (e.g. an unrelated
         auto-deploy) must not be reported as `status: "reindexing"` — its
         started_at predates this process's own start."""

@@ -1,4 +1,4 @@
-"""Browser test for Hermes-proxied usage capture reaching the browser (#595).
+"""Browser test for Hermes-proxied usage capture reaching the browser.
 
 Confirms the acceptance criterion that a relayed `usage` SSE event -- the
 same event shape the native `/api/ask/stream` path emits -- increases the
@@ -99,8 +99,8 @@ def test_hermes_usage_event_updates_session_cost_via_unmodified_client(page: Pag
     page.locator("#inputField").fill("what's 2+2?")
     page.locator("#inputField").press("Enter")
 
-    # ask-stream.js's `data.type === 'usage'` branch is untouched by #595 --
-    # this is the same handler the native path already exercises, now fed by
+    # ask-stream.js's `data.type === 'usage'` branch is unmodified --
+    # this is the same handler the native path already exercises, fed by
     # the Hermes proxy's relayed event instead.
     page.wait_for_function("() => document.getElementById('sessionCost').textContent !== '$0.00'")
     assert page.locator("#sessionCost").text_content() == "$0.001"

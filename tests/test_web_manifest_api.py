@@ -1,5 +1,4 @@
-"""Tests that the web app manifest and its icons are served correctly (#727,
-extended by #731 for the designed icon set + maskable variant).
+"""Tests that the web app manifest and its icons are served correctly.
 
 A Home Screen shortcut on iOS only opens standalone when the manifest is
 reachable at the URL the HTML pages actually link, with a content type
@@ -87,7 +86,7 @@ class TestIconServing:
         # Android adaptive icons crop to a circle/squircle/rounded-square mask
         # of the launcher's choosing -- without a "maskable" entry, Android
         # instead applies that mask to the plain "any" icon, which has no
-        # padding for it and gets clipped (#731).
+        # padding for it and gets clipped.
         manifest = client.get("/manifest.webmanifest").json()
         maskable = [icon for icon in manifest["icons"] if icon.get("purpose") == "maskable"]
         assert maskable, "manifest must declare at least one purpose=maskable icon"
@@ -101,7 +100,7 @@ class TestIconServing:
         # transparency of its own -- any alpha channel (even a
         # near-invisible anti-aliased edge left over from SVG rasterization)
         # would show through as a border artifact rather than being masked
-        # cleanly (#731).
+        # cleanly.
         response = client.get("/static/icons/apple-touch-icon.png")
         img = Image.open(io.BytesIO(response.content))
         if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):

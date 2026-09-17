@@ -1,4 +1,4 @@
-"""Browser tests for the three-way LifeOS|Agent|Hermes backend selector (#587).
+"""Browser tests for the three-way LifeOS|Agent|Hermes backend selector.
 
 Drives `web/chat/backend.js` through the real toolbar buttons: conditional
 default resolution (hermes if configured, else lifeos — including when the
@@ -99,16 +99,16 @@ def _open_chat(page: Page, base_url, *, agent_available=False, hermes_available=
     *failure*, distinct from the generic `{}` stub any other test falls
     through to (which is a 200 with no `personas` key: a successful response
     that happens to carry zero personas, not a failure to discover any).
-    `persona.js` treats those two differently (#607) — only the latter is
+    `persona.js` treats those two differently — only the latter is
     ever persisted as confirmation that a stored persona id is gone.
 
-    `conversations` (#592) maps a conversation id to the body `GET
+    `conversations` maps a conversation id to the body `GET
     /api/conversations/{id}` returns for it (the shape `loadConversation()`
     expects: `{"title": ..., "messages": [{"role": ..., "content": ...}]}`)
     — needed to assert what a backend switch renders for a stored id, instead
     of falling through to the generic `{}` stub.
 
-    `conversation_list` (#607) stubs the body of the sidebar's `GET
+    `conversation_list` stubs the body of the sidebar's `GET
     /api/conversations` *list* call (no id in the path) with
     `{"conversations": conversation_list}` — needed to assert what actually
     renders in the sidebar on first load, e.g. a Hermes-tagged thread, rather
@@ -139,7 +139,7 @@ def _open_chat(page: Page, base_url, *, agent_available=False, hermes_available=
             if hermes_status_fails:
                 route.fulfill(status=500, content_type="application/json", body="{}")
             elif hermes_down:
-                # Configured but unreachable (#688) — distinct from both
+                # Configured but unreachable — distinct from both
                 # "available" and "not configured" via the real server's
                 # three-field shape.
                 route.fulfill(status=200, content_type="application/json",
@@ -209,7 +209,7 @@ class TestDefaultBackendResolution:
 
 
 class TestHermesConfiguredButUnreachable:
-    """#688: a Hermes that's configured but down must default `/chat` to
+    """A Hermes that's configured but down must default `/chat` to
     lifeos (no failed turns at send time) while staying visible — not
     collapsed into the same "hidden" treatment as never-configured."""
 
@@ -287,12 +287,12 @@ class TestBackendModeUi:
 
 
 class TestPersonaPickerAcrossBackends:
-    """AC (#590): 'The persona picker's contents shall not change based on
+    """'The persona picker's contents shall not change based on
     the selected backend' — every persona, orchestrating or not, stays
     selectable on Hermes. An orchestrating persona's turn reaches the Hermes
     proxy like any other (api/routes/hermes_proxy.py; see
-    test_orchestrating_persona_no_longer_rejected in tests/test_hermes_proxy.py,
-    #642) rather than the client hiding it from the picker."""
+    test_orchestrating_persona_no_longer_rejected in tests/test_hermes_proxy.py)
+    rather than the client hiding it from the picker."""
 
     _PERSONAS = [
         {"id": "primary", "label": "Primary", "capabilities": ["handoff", "agent"], "orchestrates": False},
@@ -321,15 +321,12 @@ class TestPersonaPickerAcrossBackends:
 
 
 class TestOrchestratingPersonaOnHermes:
-    """Through #641, an orchestrating persona (e.g. doctor) always ran on
-    LifeOS, even with Hermes selected — the spawn path had no Hermes
-    equivalent, so the composer diverted its turn to `/api/ask/stream`
-    instead of the Hermes proxy. #642 gave Hermes its own way to drive that
-    persona (lifeos_agent_spawn, #640) and removed the divert: an
-    orchestrating persona's Hermes turn now posts to the Hermes proxy like
-    any other persona's. A non-orchestrating persona was already unaffected
-    by the old divert, and the agent backend (no persona pass-through at
-    all) is unaffected by any of this."""
+    """An orchestrating persona (e.g. doctor)'s Hermes turn posts to the
+    Hermes proxy like any other persona's, because Hermes can drive
+    lifeos_agent_spawn itself rather than needing the composer to divert
+    its turn to `/api/ask/stream`. A non-orchestrating persona is
+    unaffected, and the agent backend (no persona pass-through at all) is
+    unaffected by any of this."""
 
     _PERSONAS = [
         {"id": "primary", "label": "Primary", "capabilities": ["handoff", "agent"], "orchestrates": False},
@@ -338,11 +335,9 @@ class TestOrchestratingPersonaOnHermes:
     ]
 
     def test_orchestrating_persona_on_hermes_posts_to_hermes_proxy(self, page: Page, chat_base_url):
-        # #642: was test_orchestrating_persona_on_hermes_diverts_to_lifeos_
-        # endpoint, asserting the opposite — a POST to /api/ask/stream tagged
-        # body["backend"] == "hermes". Now there is no divert at all: doctor
-        # on Hermes reaches the Hermes proxy exactly like a non-orchestrating
-        # persona (test_non_orchestrating_persona_on_hermes_still_posts_to_
+        # There is no divert: doctor on Hermes reaches the Hermes proxy
+        # exactly like a non-orchestrating persona
+        # (test_non_orchestrating_persona_on_hermes_still_posts_to_
         # proxy, below), and carries no `backend` tag — nothing to divert
         # means nothing to tag either.
         _open_chat(page, chat_base_url, hermes_available=True, personas=self._PERSONAS)
@@ -384,12 +379,9 @@ class TestOrchestratingPersonaOnHermes:
         assert "backend" not in body
 
     def test_handoff_but_not_orchestrating_persona_on_hermes_still_posts_to_proxy(self, page: Page, chat_base_url):
-        # #643 regression guard, weakened by #642: this used to guard against
-        # a capabilities-based inference wrongly diverting a persona carrying
-        # `handoff` (like primary/doctor) but `orchestrates: false`. #642
-        # removed the divert mechanism entirely, so there's no longer a
-        # diversion decision here to get wrong either way — this now just
-        # pins the same "reaches the proxy untagged" outcome as
+        # There is no divert mechanism, so there's no diversion decision
+        # here to get wrong — this pins the same "reaches the proxy
+        # untagged" outcome as
         # test_non_orchestrating_persona_on_hermes_still_posts_to_proxy for a
         # persona with handoff-like capabilities specifically. Kept rather
         # than deleted in case a diversion-style mechanism is ever reintroduced.
@@ -453,13 +445,10 @@ class TestOrchestratingPersonaOnHermes:
     def test_orchestrates_truth_table_across_backends(self, page: Page, chat_base_url):
         """personaOrchestrates()/personaSupportsHandoff(): neither is ever
         true on Hermes or Agent — only the LifeOS backend actually starts a
-        session this client tracks. Through #641, orchestration (not
-        handoff) was also true on Hermes because an orchestrating persona's
-        turn was diverted back to LifeOS; #642 removed that divert, so
-        Hermes now matches Agent here even though the persona itself still
-        orchestrates server-side (Hermes just drives it itself, via
-        lifeos_agent_spawn, rather than this client tracking a LifeOS-linked
-        session for it)."""
+        session this client tracks. Hermes matches Agent here even though
+        the persona itself still orchestrates server-side (Hermes just
+        drives it itself, via lifeos_agent_spawn, rather than this client
+        tracking a LifeOS-linked session for it)."""
         _open_chat(
             page, chat_base_url, agent_available=True, hermes_available=True,
             personas=self._PERSONAS,
@@ -476,7 +465,7 @@ class TestOrchestratingPersonaOnHermes:
         assert truth() == [True, True]  # lifeos: doctor orchestrates AND has handoff
 
         page.locator("#backendHermes").click()
-        assert truth() == [False, False]  # hermes (#642): Hermes drives it itself now, not this client
+        assert truth() == [False, False]  # hermes: Hermes drives it itself, not this client
 
         page.locator("#backendAgent").click()
         assert truth() == [False, False]  # agent: neither — no persona pass-through at all
@@ -485,11 +474,8 @@ class TestOrchestratingPersonaOnHermes:
         assert truth() == [True, True]  # back to lifeos, unchanged
 
     def test_orchestrates_badge_visible_on_lifeos_only(self, page: Page, chat_base_url):
-        # #642: was test_orchestrates_badge_visible_on_lifeos_and_hermes_not_
-        # agent, which asserted the badge stayed visible on Hermes too
-        # ("still runs on LifeOS, regardless of backend") — no longer true,
-        # since a Hermes-selected orchestrating persona no longer runs on
-        # LifeOS at all.
+        # A Hermes-selected orchestrating persona does not run on LifeOS at
+        # all, so the badge must not stay visible on Hermes.
         _open_chat(
             page, chat_base_url, agent_available=True, hermes_available=True,
             personas=self._PERSONAS, session_items={"lifeos:chat:backend_mode": "lifeos"},
@@ -501,7 +487,7 @@ class TestOrchestratingPersonaOnHermes:
         expect(badge).to_be_visible()  # lifeos: this turn really does run on LifeOS
 
         page.locator("#backendHermes").click()
-        expect(badge).to_be_hidden()  # hermes (#642): Hermes drives it itself now, not LifeOS
+        expect(badge).to_be_hidden()  # hermes: Hermes drives it itself, not LifeOS
 
         page.locator("#backendAgent").click()
         expect(badge).to_be_hidden()  # agent has no persona pass-through at all
@@ -553,7 +539,7 @@ class TestPerBackendConversationIsolation:
 
 
 class TestHermesThreadRendering:
-    """#592: a Hermes turn is now persisted server-side like a lifeos one, so
+    """A Hermes turn is persisted server-side like a lifeos one, so
     switching to Hermes with a stored conversation id must render that
     conversation's messages — not the blank view the Agent backend (whose
     history genuinely lives elsewhere) still gets."""
@@ -606,11 +592,11 @@ class TestHermesThreadRendering:
 
 
 class TestLifeosRequestBodyContract:
-    """Pins the last acceptance criterion: 'a turn sent on the lifeos backend
-    shall produce a request body byte-identical to the one produced before
-    this change'. #587 must not silently add a `backend` or `model_override`
-    field to the common case — a fresh session, default persona, default
-    model, no prior conversation."""
+    """Pins the acceptance criterion that a turn sent on the lifeos backend
+    produces the same request body as a single-backend implementation
+    would: no `backend` or `model_override` field silently added to the
+    common case — a fresh session, default persona, default model, no
+    prior conversation."""
 
     def test_lifeos_turn_posts_byte_identical_body(self, page: Page, chat_base_url):
         # hermes_available=False so default resolution lands on lifeos.
@@ -631,7 +617,7 @@ class TestLifeosRequestBodyContract:
 
 
 class TestSidebarBackendFilter:
-    """#596 follow-up: the sidebar's `GET /api/conversations` request must
+    """The sidebar's `GET /api/conversations` request must
     carry the selected backend, and must carry the *resolved* one — not
     whatever config.backend happened to be before initBackend()'s async
     default-resolution finished. Regression guard for the gap where
@@ -689,18 +675,17 @@ class TestSidebarBackendFilter:
 
 
 class TestSidebarInitialLoadRace:
-    """#607: the initial sidebar load must wait for backend resolution rather
-    than racing it. Before the fix, `persona.js`'s `loadPersonas()` fired an
-    unresolved-backend listing (`backend=lifeos`) in parallel with
-    `initBackend()`'s corrected one; both requests were in flight
-    simultaneously with no guarantee on the order their *responses* landed,
-    so whichever settled last silently won the final write to
-    `state.allConversations`. Request order alone (asserted by
-    `TestSidebarBackendFilter` above) can't catch that — requests are always
-    sent in the same order; only responses could arrive out of order. The fix
-    removes the early listing entirely, so these tests pin "exactly one
-    request, already carrying the resolved backend" rather than re-deriving
-    the race.
+    """The initial sidebar load must wait for backend resolution rather
+    than racing it: firing an unresolved-backend listing
+    (`backend=lifeos`) in parallel with `initBackend()`'s corrected one
+    would put both requests in flight simultaneously with no guarantee on
+    the order their *responses* land, so whichever settles last would
+    silently win the final write to `state.allConversations`. Request
+    order alone (asserted by `TestSidebarBackendFilter` above) can't catch
+    that — requests are always sent in the same order; only responses
+    could arrive out of order. These tests pin "exactly one request,
+    already carrying the resolved backend" rather than re-deriving the
+    race.
     """
 
     @staticmethod
@@ -719,7 +704,8 @@ class TestSidebarInitialLoadRace:
         # Hermes unconfigured: the resolved default (lifeos) is the same value
         # a pre-resolution guess would already use — exactly the "resolves to
         # the default" case the AC calls out. A "list early, then refresh"
-        # implementation sends two identical requests here; the fix sends one.
+        # implementation would send two identical requests here; this sends
+        # exactly one.
         backends = self._list_request_backends(page, chat_base_url, hermes_available=False)
         assert backends == ["lifeos"]
 
@@ -747,7 +733,7 @@ class TestSidebarInitialLoadRace:
         expect(page.locator(".conversation-title")).to_contain_text("Hermes boot thread")
 
     def test_reload_produces_the_same_sidebar_as_the_fresh_load(self, page: Page, chat_base_url):
-        # Stand-in for the issue's two entry paths (opening /chat directly vs.
+        # Stand-in for two entry paths (opening /chat directly vs.
         # navigating to CRM and back): both re-run the identical boot sequence,
         # so a reload must resolve to the same backend and render the same list.
         thread = {
@@ -767,9 +753,9 @@ class TestSidebarInitialLoadRace:
 
 
 class TestSidebarPersonaValidationRace:
-    """#607 follow-up: moving the sidebar's single listing into initBackend()
-    fixed the backend race, but `config.personaId` isn't fully resolved just
-    because `loadPersonas()` has started. `persona.js` restores the stored id
+    """The sidebar's single listing lives in initBackend(), but
+    `config.personaId` isn't fully resolved just because `loadPersonas()`
+    has started. `persona.js` restores the stored id
     synchronously, but only *validates* it — falling back to `primary` if the
     fetched persona list doesn't contain it — after its own `/api/personas`
     await. `loadPersonas()` runs unawaited alongside `initBackend()`, so if the
@@ -854,12 +840,12 @@ class TestSidebarPersonaValidationRace:
 
 
 class TestSidebarListsDespitePersonaFailure:
-    """#607 follow-up: `backend.js` now awaits `loadPersonas()`'s promise
-    before its single listing, which opens a new zero-listing path if that
-    promise ever rejects — `await personasReady` with no catch would throw
-    and skip `loadConversations()` entirely, leaving the sidebar permanently
-    empty for the whole session (worse than the original bug, which was only
-    intermittently wrong). `persona.js` is designed to never reject (every
+    """`backend.js` awaits `loadPersonas()`'s promise before its single
+    listing, which opens a zero-listing path if that promise ever rejects
+    — `await personasReady` with no catch would throw and skip
+    `loadConversations()` entirely, leaving the sidebar permanently empty
+    for the whole session (worse than an intermittently wrong sidebar).
+    `persona.js` is designed to never reject (every
     risky call is internally try/caught), but the listing must not depend on
     that guarantee holding forever — so `backend.js` swallows a rejection
     with `.catch(() => {})` before proceeding. `__LIFEOS_TEST_FORCE_PERSONAS_REJECT__`
@@ -880,7 +866,7 @@ class TestSidebarListsDespitePersonaFailure:
 
 
 class TestPersonaIdPersistenceOnDiscoveryFailure:
-    """#607 follow-up: the in-memory fallback to `primary` when a stored
+    """The in-memory fallback to `primary` when a stored
     persona id can't be confirmed (discovery failed, or succeeded without it)
     is correct for the current boot — every caller needs an answer now. But
     *persisting* that fallback is a separate decision: a transient

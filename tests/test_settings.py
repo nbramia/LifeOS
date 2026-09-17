@@ -17,10 +17,10 @@ def test_local_llm_autostart_defaults_false():
     """
     Local LLM autostart should default to False.
 
-    Asserts the FIELD default, not a live instance. ``Settings()`` reads the
-    local .env, so this used to assert whatever the developer's machine had
-    configured — it failed on any host that sets LIFEOS_LOCAL_LLM_AUTOSTART and
-    passed everywhere else, which is the opposite of what it claims to check.
+    Asserts the FIELD default, not a live instance: ``Settings()`` reads
+    the local .env, so asserting a live instance would fail on any host
+    that sets LIFEOS_LOCAL_LLM_AUTOSTART and pass everywhere else, which is
+    the opposite of what this test claims to check.
     """
     from config.settings import Settings
 
@@ -63,7 +63,7 @@ def test_local_llm_model_from_env(monkeypatch):
 
 def test_routing_llm_url_falls_back_to_local_llm_url_when_unset(monkeypatch):
     """Routing target URL defaults to the global local LLM URL when unset, so
-    a fresh clone with no override behaves exactly as today (#566 PR 2)."""
+    a fresh clone with no override behaves exactly as today."""
     monkeypatch.delenv("LIFEOS_LOCAL_ROUTING_LLM_URL", raising=False)
     monkeypatch.setenv("LIFEOS_LOCAL_LLM_URL", "http://localhost:8080")
     from config.settings import Settings
@@ -80,7 +80,7 @@ def test_routing_llm_url_override(monkeypatch):
 
 
 def test_router_enable_thinking_defaults_false():
-    """query_router's thinking control (#566) defaults False.
+    """query_router's thinking control defaults False.
 
     12 labelled cases through the real QueryRouter._llm_route: thinking ON
     24.65s mean vs OFF 3.00s (8.2x), IDENTICAL correctness 11/12 both ways —
@@ -92,7 +92,7 @@ def test_router_enable_thinking_defaults_false():
 
 
 def test_local_agent_enable_thinking_defaults_false():
-    """The orchestrator's local-model thinking control (#567) defaults False.
+    """The orchestrator's local-model thinking control defaults False.
 
     Measured on the real orchestrator (Gemma 4 26B-A4B, 6 multi-step
     questions): thinking ON 233.0s mean / 1032 char answers vs OFF 72.6s /
@@ -104,7 +104,7 @@ def test_local_agent_enable_thinking_defaults_false():
 
 
 def test_specialist_model_default_is_current_alias():
-    """#470 regression pin: the specialist-call model must be a model ALIAS,
+    """The specialist-call model must be a model ALIAS,
     never a dated snapshot. The previous pin (claude-sonnet-4-20250514)
     retired and returned 404 on every relationship-insights / fact-extraction /
     tone-analysis call — silently, since callers swallow per-item errors.
@@ -126,7 +126,7 @@ def test_specialist_model_default_is_current_alias():
 
 
 def test_orchestrator_model_default_is_alias_not_snapshot():
-    """Same rule for the orchestrator default (#470 guard, defense in depth)."""
+    """Same rule for the orchestrator default (defense in depth)."""
     import re
 
     from config.settings import Settings
@@ -136,10 +136,9 @@ def test_orchestrator_model_default_is_alias_not_snapshot():
 
 
 def test_monarch_vault_dir_default_matches_hardcoded_path():
-    """LIFEOS_MONARCH_VAULT_DIR must default to exactly the path that was
-    previously hardcoded (Personal/Finance/Monarch) -- issue #687's
-    behavior-neutrality constraint requires an install that never sets this
-    var to write to the same place it always has.
+    """LIFEOS_MONARCH_VAULT_DIR must default to exactly the path
+    (Personal/Finance/Monarch) an install that never sets this var writes
+    to, keeping default behavior neutral.
 
     Asserts the FIELD default, not a live instance, so a host-level override
     can't turn this into a false failure.
@@ -151,7 +150,7 @@ def test_monarch_vault_dir_default_matches_hardcoded_path():
 
 def test_monarch_vault_dir_from_env(monkeypatch):
     """LIFEOS_MONARCH_VAULT_DIR should be configurable via env var, same
-    convention as LIFEOS_AGENT_OUTPUT_DIR (issue #687)."""
+    convention as LIFEOS_AGENT_OUTPUT_DIR."""
     monkeypatch.setenv("LIFEOS_MONARCH_VAULT_DIR", "Personal/Money/Monarch")
     from config.settings import Settings
 
@@ -160,11 +159,10 @@ def test_monarch_vault_dir_from_env(monkeypatch):
 
 
 def test_investments_sync_dir_default_matches_hardcoded_path():
-    """LIFEOS_INVESTMENTS_SYNC_DIR must default to exactly the path that was
-    previously hardcoded (~/Code/Sync/investments) in both api/routes/
-    investments.py and the search_finances 'investments' chat tool (#767) —
-    an install that never sets this var must see the same directory it
-    always has.
+    """LIFEOS_INVESTMENTS_SYNC_DIR must default to exactly the path
+    (~/Code/Sync/investments) both api/routes/investments.py and the
+    search_finances 'investments' chat tool resolve to — an install that
+    never sets this var must see the same directory both use.
 
     Asserts the FIELD default, not a live instance, so a host-level override
     can't turn this into a false failure.
@@ -176,7 +174,7 @@ def test_investments_sync_dir_default_matches_hardcoded_path():
 
 def test_investments_sync_dir_from_env(monkeypatch):
     """LIFEOS_INVESTMENTS_SYNC_DIR should be configurable via env var, same
-    convention as LIFEOS_MONARCH_VAULT_DIR (#767)."""
+    convention as LIFEOS_MONARCH_VAULT_DIR."""
     monkeypatch.setenv("LIFEOS_INVESTMENTS_SYNC_DIR", "/tmp/some/other/investments")
     from config.settings import Settings
 
@@ -194,13 +192,14 @@ def test_investments_sync_dir_from_env(monkeypatch):
     ],
 )
 def test_agent_hosts_validator_receives_raw_string(monkeypatch, raw_value, expected):
-    """Round 1, finding #8: `LIFEOS_AGENT_HOSTS` is a plain `dict[str, str]`
-    field, so pydantic-settings' own complex-field JSON pre-decode used to
-    run BEFORE `_parse_agent_hosts` (a `mode="before"` validator) — an
-    empty string or malformed JSON raised `SettingsError` straight out of
-    `Settings()`, before the validator's empty/invalid branches (which
-    promise `{}`, not a crash) ever ran. `NoDecode` on the field makes the
-    validator receive the raw env string in every case, including empty.
+    """`LIFEOS_AGENT_HOSTS` is a plain `dict[str, str]` field, so without
+    `NoDecode` on the field, pydantic-settings' own complex-field JSON
+    pre-decode would run BEFORE `_parse_agent_hosts` (a `mode="before"`
+    validator) — an empty string or malformed JSON would raise
+    `SettingsError` straight out of `Settings()`, before the validator's
+    empty/invalid branches (which promise `{}`, not a crash) ever run.
+    `NoDecode` on the field makes the validator receive the raw env string
+    in every case, including empty.
 
     `_env_file=None` so a real `.env`'s own `LIFEOS_AGENT_HOSTS` (if any)
     can't leak into this test."""

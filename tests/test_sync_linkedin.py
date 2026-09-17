@@ -1,14 +1,13 @@
-"""Tests for scripts/sync_linkedin.py's clean-skip path (issue #780).
+"""Tests for scripts/sync_linkedin.py's clean-skip path.
 
-Before this fix, a missing data/LinkedInConnections.csv already returned a
-{"status": "skipped", "reason": "csv_not_found"} dict internally, but this
-script runs as a subprocess (run_all_syncs.py's SYNC_SOURCES entry), so only
-what lands on stdout/stderr is ever parsed downstream — the returned dict
-was discarded, and the SYNC_SKIPPED marker _parse_sync_output actually looks
-for was never printed. The result: an absent CSV recorded as a normal,
-zero-stat "success", indistinguishable from a healthy but quiet source.
-These tests pin that the marker is now printed, and that a present CSV's
-behavior is unchanged.
+This script runs as a subprocess (run_all_syncs.py's SYNC_SOURCES entry),
+so only what lands on stdout/stderr is ever parsed downstream — a returned
+{"status": "skipped", "reason": "csv_not_found"} dict for a missing
+data/LinkedInConnections.csv is not enough by itself: the SYNC_SKIPPED
+marker _parse_sync_output actually looks for must also be printed, or an
+absent CSV records as a normal, zero-stat "success", indistinguishable
+from a healthy but quiet source. These tests pin that the marker is
+printed, and that a present CSV's behavior is unaffected.
 """
 import pytest
 
@@ -42,8 +41,8 @@ class TestSyncLinkedinSkip:
 
     def test_present_csv_configured_run_is_unaffected(self, tmp_path, monkeypatch, capsys):
         """Regression guard: a present, valid CSV must produce byte-identical
-        stats and behavior to before this fix — no SYNC_SKIPPED marker, same
-        result shape."""
+        stats and behavior when the CSV is present — no SYNC_SKIPPED marker,
+        same result shape."""
         from scripts.sync_linkedin import sync_linkedin
 
         csv_path = tmp_path / "Connections.csv"

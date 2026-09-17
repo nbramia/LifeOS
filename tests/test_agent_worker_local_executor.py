@@ -104,12 +104,12 @@ def _make_executor(session_store, transcript_dir, llm):
 def test_executor_reseeds_with_original_task_when_resuming_after_blocked_clarification(
     tmp_path: Path, fake_session,
 ):
-    """Repro of the live bug: preflight blocks for ambiguity → executor
-    never runs → worker resumes by appending only the user's answer →
-    executor saw a 1-message history that wasn't the task ("Web Searches")
-    and acted on it as if it were the task. After the fix, executor
-    detects the missing system role, clears, re-seeds with system +
-    original task, and re-appends the answer in the right order."""
+    """When preflight blocks for ambiguity and the worker resumes by
+    appending only the user's answer (no seeded task, no system role),
+    the executor must not act on that 1-message history ("Web Searches")
+    as if it were the task. It detects the missing system role, clears,
+    re-seeds with system + original task, and re-appends the answer in
+    the right order."""
     store, session = fake_session
     sid = session.session_id
 
@@ -166,12 +166,12 @@ def test_executor_completes_when_model_returns_text_only(tmp_path: Path, fake_se
 
 @pytest.mark.unit
 def test_executor_truncates_oversize_tool_results_in_context(tmp_path: Path, fake_session):
-    """Live bug repro: an unbounded `grep -r` returned 32k chars of noise
-    and was appended verbatim to conversation history, which then pushed
-    the next LLM call past Gemma's 32k context window — llama-server
-    dropped the connection mid-request. The fix caps any single tool
-    result the model sees at MAX_TOOL_RESULT_CHARS; the full output
-    still lives in the transcript for operator audit."""
+    """An unbounded `grep -r` can return 32k chars of noise; appended
+    verbatim to conversation history, that would push the next LLM call
+    past Gemma's 32k context window and make llama-server drop the
+    connection mid-request. Any single tool result the model sees is
+    capped at MAX_TOOL_RESULT_CHARS; the full output still lives in the
+    transcript for operator audit."""
     from api.services.agent_worker.local_executor import MAX_TOOL_RESULT_CHARS
     from api.services.agent_worker.tools import ToolResult
 
@@ -209,7 +209,7 @@ def test_executor_truncates_oversize_tool_results_in_context(tmp_path: Path, fak
         f"tool result still {len(tool_content)} chars — truncation missed"
     )
     assert "truncated" in tool_content.lower()
-    # Original size is referenced so the agent knows what was dropped.
+    # Original size is referenced so the agent knows how much was cut.
     assert str(len(big)) in tool_content
 
 
@@ -378,7 +378,7 @@ def test_executor_records_local_spend_is_zero_dollars(tmp_path: Path, fake_sessi
 @pytest.mark.unit
 def test_executor_records_known_model_priced_and_not_unpriced(tmp_path: Path, fake_session):
     """A recognized model prices real dollars and leaves `unpriced` False —
-    the record path must not regress known-model behavior (#669)."""
+    the record path must not regress known-model behavior."""
     store, session = fake_session
     llm = _ScriptedLLM([
         _FakeResponse(text="done.", usage=_FakeUsage(1000, 500)),
@@ -398,7 +398,7 @@ def test_executor_records_known_model_priced_and_not_unpriced(tmp_path: Path, fa
 
 @pytest.mark.unit
 def test_executor_records_unknown_model_as_unpriced_not_fallback_rate(tmp_path: Path, fake_session):
-    """This is a **record** path (#669): an unrecognized model must not be
+    """This is a **record** path: an unrecognized model must not be
     silently billed at cost_for's conservative fallback (priciest) rate —
     it must record $0.00 and flag the session `unpriced` instead."""
     store, session = fake_session
@@ -422,13 +422,14 @@ def test_executor_records_unknown_model_as_unpriced_not_fallback_rate(tmp_path: 
 
 
 # ---------------------------------------------------------------------------
-# #699 — remote fallback executor construction, spend, and served_by
+# Remote fallback executor construction, spend, and served_by
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
 def test_default_llm_client_flag_off_stays_local_without_probing(monkeypatch):
-    """Pins behavior-neutrality: flag off is byte-identical to pre-#699,
-    including making zero network calls to check anything — the remote
+    """Pins behavior-neutrality: flag off is byte-identical to the
+    flag-unaware path, including making zero network calls to check
+    anything — the remote
     branch is never even entered."""
     from config.settings import settings
     from api.services.llm_client import LocalLLMClient
@@ -518,7 +519,7 @@ def test_default_llm_client_flag_on_remote_configured_local_down_selects_remote(
     assert is_remote is True
     assert model_name == "accounts/fireworks/models/deepseek-v4-flash-0731"
     assert isinstance(client, LocalLLMClient)
-    # #706: LocalLLMClient strips one trailing /v1 segment so the wire
+    # LocalLLMClient strips one trailing /v1 segment so the wire
     # path is always {base}/v1/chat/completions, never .../v1/v1/....
     assert client.base_url == "https://remote.example"
     assert client.model == "accounts/fireworks/models/deepseek-v4-flash-0731"
@@ -528,7 +529,7 @@ def test_default_llm_client_flag_on_remote_configured_local_down_selects_remote(
 
 @pytest.mark.unit
 def test_remote_only_llm_client_never_probes_local_or_checks_the_flag(monkeypatch):
-    """(#809) `_remote_only_llm_client` — the `#cloud` tag's executor — is a
+    """`_remote_only_llm_client` — the `#cloud` tag's executor — is a
     first-class route, not a contingency: unlike `_default_llm_client`, it
     never checks local llama-server reachability and is not gated on
     `settings.agent_remote_executor` at all. The operator tagging a task
@@ -581,7 +582,7 @@ def test_executor_construction_flag_off_builds_bare_local_client(tmp_path: Path,
 
 @pytest.mark.unit
 def test_executor_records_remote_spend_priced_with_configured_rates(tmp_path: Path, fake_session, monkeypatch):
-    """Mirrors agent_loop.py's force_remote _track_usage branch (#654):
+    """Mirrors agent_loop.py's force_remote _track_usage branch:
     when remote rates are configured, a remote-served session prices real
     dollars from them, not from pricing.PRICING (the remote model id isn't
     in that table at all)."""
@@ -611,7 +612,7 @@ def test_executor_records_remote_spend_priced_with_configured_rates(tmp_path: Pa
 @pytest.mark.unit
 def test_executor_records_remote_spend_unpriced_without_configured_rates(tmp_path: Path, fake_session, monkeypatch):
     """No configured rate ⇒ real unpriced spend, never fallback-priced —
-    same #669 convention as the unknown-model case, applied to the remote
+    same convention as the unknown-model case, applied to the remote
     branch."""
     from config.settings import settings
     monkeypatch.setattr(settings, "remote_llm_input_price_per_mtok", None, raising=False)
@@ -746,7 +747,7 @@ def test_pricing_table_opus_uses_correct_rates():
 def test_pricing_table_opus_5_uses_verified_rate():
     """Claude Opus 5's rate is $5/$25 per Mtok — verified against
     https://platform.claude.com/docs/en/about-claude/pricing (2026-08-23),
-    same tier price as Opus 4.5/4.6/4.7/4.8 (#655)."""
+    same tier price as Opus 4.5/4.6/4.7/4.8."""
     cost = cost_for("claude-opus-5", 1000, 1000)
     assert cost == pytest.approx(0.005 + 0.025)
 
@@ -755,7 +756,7 @@ def test_pricing_table_opus_5_uses_verified_rate():
 def test_pricing_unknown_model_falls_through_to_priciest_rate():
     """Conservative: unknown model = highest plausible price (so budgets stay
     enforced rather than silently suppressed by a typo). Fable 5 / Mythos 5
-    are the priciest tier as of #655 (Opus was, before they were added)."""
+    are the priciest tier."""
     unknown = cost_for("typoed-model", 1000, 1000)
     priciest = cost_for("claude-fable-5", 1000, 1000)
     assert unknown == pytest.approx(priciest)
@@ -764,13 +765,13 @@ def test_pricing_unknown_model_falls_through_to_priciest_rate():
 @pytest.mark.unit
 def test_pricing_fallback_does_not_hardcode_a_specific_model_id():
     """The unknown-model fallback must track whichever tier is priciest,
-    not a specific superseded id (#655) — so it can't itself go stale the
+    not a specific hardcoded id — so it can't itself go stale the
     next time a new top-tier model ships.
 
-    #669 narrowed the set it maxes over to models Anthropic still serves
-    (see RETIRED_MODELS); the original guard — computed, never a hardcoded
-    id — is unchanged, and a newly-added top tier is still picked up
-    automatically, which is what this test exists to protect.
+    The set it maxes over is narrowed to models Anthropic still serves
+    (see RETIRED_MODELS); the guard itself — computed, never a hardcoded
+    id — picks up a newly-added top tier automatically, which is what
+    this test exists to protect.
     """
     from api.services.agent_worker.pricing import (
         PRICING, RETIRED_MODELS, fallback_rates,
@@ -797,7 +798,7 @@ def test_pricing_fallback_does_not_hardcode_a_specific_model_id():
 def test_pricing_historical_dated_snapshot_ids_still_resolve():
     """Real usage rows record the exact dated snapshot id the API echoed
     back (e.g. Claude Code sessions), not the bare tier alias — these must
-    keep pricing correctly (#656)."""
+    keep pricing correctly."""
     assert cost_for("claude-sonnet-4-5-20250929", 1000, 1000) == pytest.approx(
         cost_for("claude-sonnet-4-5", 1000, 1000)
     )
@@ -813,7 +814,7 @@ def test_is_known_model_true_for_dated_snapshot_of_a_priced_tier():
 
 @pytest.mark.unit
 def test_is_known_model_false_for_unrecognized_id():
-    """An unrecognized model records as unpriced (#661) rather than being
+    """An unrecognized model records as unpriced rather than being
     silently priced at the (expensive) Opus fallback rate."""
     assert is_known_model("typoed-model") is False
 
@@ -867,9 +868,10 @@ def test_pricing_cache_buckets_default_to_zero():
     ("claude-haiku-3-5", 0.8e-6, 4.0e-6),
 ])
 def test_retired_model_pricing_added_by_669(model, input_rate, output_rate):
-    """Before #669, these retired-but-still-served ids had no PRICING entry
-    and silently fell through to fallback_rates() (the $10/$50 tier) —
-    which *understated* the Opus pair's real $15/$75 rate."""
+    """These retired-but-still-served ids must have a PRICING entry —
+    without one they would silently fall through to fallback_rates() (the
+    $10/$50 tier), which *understates* the Opus pair's real $15/$75
+    rate."""
     assert is_known_model(model) is True
     # 1M input + 1M output tokens, so the dollar total is the per-Mtok pair.
     assert cost_for(model, 1_000_000, 1_000_000) == pytest.approx(
@@ -882,7 +884,7 @@ def test_retired_models_do_not_raise_the_unknown_model_ceiling():
     """Retired ids are priced for historical rows but must never win
     fallback_rates(). Opus 4/4.1 are $15/$75 — pricier than any tier
     Anthropic still serves — so including them would silently inflate every
-    unknown-model *estimate* by 50% (found while implementing #669)."""
+    unknown-model *estimate* by 50%."""
     from api.services.agent_worker.pricing import (
         PRICING, RETIRED_MODELS, fallback_rates,
     )
@@ -901,7 +903,7 @@ def test_retired_models_do_not_raise_the_unknown_model_ceiling():
 
 
 # ---------------------------------------------------------------------------
-# System-prompt structure (issue #119 — Anthropic 4.6/4.7 best practices)
+# System-prompt structure (Anthropic 4.6/4.7 best practices)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
@@ -919,7 +921,7 @@ def test_system_prompt_uses_xml_section_tags():
 
 @pytest.mark.unit
 def test_system_prompt_requires_final_text_turn_after_tool_use():
-    """Issue #117 / #119: explicit requirement that the agent produces a
+    """Explicit requirement that the agent produces a
     text summary turn after any tool use. Catches the 'idled without
     agent.message' regression at the prompt level."""
     prompt = _system_prompt(

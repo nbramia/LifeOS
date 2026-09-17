@@ -1,4 +1,4 @@
-"""Tests for the Claude Code resume + focus endpoints (issues #160 + wezterm).
+"""Tests for the Claude Code resume + focus endpoints.
 
 `resume` spawns a wezterm tab via `wezterm cli spawn` and captures the
 pane id from stdout. `focus` calls `wezterm cli activate-pane` to revisit
@@ -608,7 +608,7 @@ def test_resume_injects_wezterm_pane_env_when_launcher_is_wezterm(
     _, sid = synthetic_session
     r = client.post(f"/api/agents/sessions/cc:{sid}/resume", json={})
     assert r.status_code == 200, r.text
-    # The Popen env now carries WEZTERM_PANE pointing at the default-workspace pane.
+    # The Popen env carries WEZTERM_PANE pointing at the default-workspace pane.
     assert captured["env"].get("WEZTERM_PANE") == "7"
 
 
@@ -671,7 +671,7 @@ def test_focus_calls_activate_pane_when_mapping_exists(
 ):
     from config.settings import settings
     monkeypatch.setattr(settings, "cc_resume_enabled", True)
-    # Pin a wezterm boot id so the post-#257 invalidation check accepts
+    # Pin a wezterm boot id so the invalidation check accepts
     # this cached mapping rather than discarding it as stale.
     wezterm_store.upsert("cc:session-x", pane_id=17, cwd="/tmp/proj", wezterm_pid=99001)
     monkeypatch.setattr("api.routes.agents._live_wezterm_pids", lambda xdg: {99001})
@@ -716,7 +716,7 @@ def test_focus_returns_410_and_clears_mapping_when_activate_fails(
     from config.settings import settings
     monkeypatch.setattr(settings, "cc_resume_enabled", True)
     # Mark the cached mapping as belonging to the current wezterm boot so
-    # the #257 invalidation doesn't short-circuit before activate-pane runs.
+    # the invalidation doesn't short-circuit before activate-pane runs.
     wezterm_store.upsert("cc:session-x", pane_id=17, cwd="/tmp/proj", wezterm_pid=99001)
     monkeypatch.setattr("api.routes.agents._live_wezterm_pids", lambda xdg: {99001})
 

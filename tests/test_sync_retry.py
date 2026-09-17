@@ -1,5 +1,5 @@
 """
-Tests for transient-failure retry in the nightly sync orchestrator (issue #541).
+Tests for transient-failure retry in the nightly sync orchestrator.
 
 Regression context: the nightly sync fires once at 03:30 with no retry. On a
 WiFi-only host, a momentary DNS blip (measured baseline: ~2-in-3 nightly
@@ -12,8 +12,7 @@ success, recorded as a success that needed a retry; a non-transient failure
 is never retried; an always-failing source terminates within the retry
 bound rather than looping forever; a first-time success records no retry;
 a dependency-skipped source never enters the retry path at all; and the
-sync_health schema migration preserves rows written before this feature
-existed.
+sync_health schema migration preserves rows written under an older schema.
 """
 import sqlite3
 import subprocess
@@ -116,9 +115,9 @@ def _run_sync_with_patches(subprocess_side_effect):
 
 class TestTransientFailureClassifier:
     """_is_transient_failure must key on connectivity/rate-limit signatures,
-    not on any single library's error wording — issue #540 (landing
-    separately) is about to change Gmail's current "expired/revoked" text,
-    so the classifier must not depend on that phrase."""
+    not on any single library's error wording — Gmail's "expired/revoked"
+    text is subject to change independently, so the classifier must not
+    depend on that phrase."""
 
     @pytest.mark.parametrize(
         "error_text",
@@ -142,7 +141,7 @@ class TestTransientFailureClassifier:
     @pytest.mark.parametrize(
         "error_text",
         [
-            "Token has expired or been revoked",  # the #540 misattribution — not a connectivity signature
+            "Token has expired or been revoked",  # a misattribution risk — not a connectivity signature
             "PermissionError: [Errno 13] Permission denied: '/data/crm.db'",
             "KeyError: 'GMAIL_CLIENT_ID' not found in config",
             "google.auth.exceptions.RefreshError: invalid_grant: Token has been expired or revoked",
@@ -163,8 +162,7 @@ class TestTransientFailureClassifier:
         [
             # A bare "429" with no status-code context — could be a line
             # number, byte count, or message id in an unrelated traceback,
-            # not a rate-limit response (issue #541 adversarial review
-            # finding #2).
+            # not a rate-limit response.
             "IndexError: list index out of range at line 429",
             "AssertionError: expected 429 rows, got 12",
             "ValueError: message id 429 already processed",
@@ -190,8 +188,7 @@ class TestTransientFailureClassifier:
         """'RateLimiter' is a common HTTP-client helper class name. A bug in
         that class (e.g. an AttributeError) is not a rate-limit response and
         must not be misread as one just because the class name contains
-        'rate' + 'limit' as a substring (issue #541 adversarial review,
-        found while auditing pattern shapes similar to the bare-429 issue)."""
+        'rate' + 'limit' as a substring."""
         assert _is_transient_failure(
             "AttributeError: 'RateLimiter' object has no attribute 'wait'"
         ) is False
@@ -205,16 +202,14 @@ class TestTransientFailureClassifier:
         """This codebase's own domain vocabulary uses "resolve" for
         merging/linking person entities. A bug there ("Failed to resolve
         duplicate entity...") is not a DNS failure and must not match just
-        because both contain the words "Failed to resolve" (issue #541
-        adversarial review, found while auditing pattern shapes similar to
-        the bare-429 issue)."""
+        because both contain the words "Failed to resolve"."""
         assert _is_transient_failure(
             "RuntimeError: Failed to resolve duplicate entity for source_id=abc123"
         ) is False
 
     def test_real_dns_failed_to_resolve_still_transient(self):
-        """The tightened pattern must still catch urllib3's actual wording,
-        which always quotes the hostname immediately after this phrase."""
+        """The pattern must still catch urllib3's actual wording, which
+        always quotes the hostname immediately after "Failed to resolve"."""
         assert _is_transient_failure(
             "NameResolutionError: Failed to resolve 'gmail.googleapis.com' "
             "([Errno -3] Temporary failure in name resolution)"
@@ -318,14 +313,12 @@ class TestRetryLoop:
         attempt that produced the final outcome — not the failed attempt's
         time plus the backoff sleep between attempts.
 
-        Regression: duration_seconds used to be derived from the row's
-        started_at (set once, at the first attempt), so a retried run
-        recorded failed-attempt-time + backoff on top of the successful
-        attempt's real execution time. That value feeds
-        get_typical_duration_seconds, which _detect_duration_collapse
+        Deriving duration_seconds from the row's started_at (set once, at
+        the first attempt) would record failed-attempt-time + backoff on
+        top of the successful attempt's real execution time. That value
+        feeds get_typical_duration_seconds, which _detect_duration_collapse
         compares against to catch silent no-op syncs — inflating it on
-        every retry would make that detector progressively less sensitive
-        (issue #541 adversarial review finding #1).
+        every retry would make that detector progressively less sensitive.
         """
         dns_failure = _completed(1, stderr="Temporary failure in name resolution")
         ok = _completed(0)
@@ -377,16 +370,14 @@ class TestOrchestrationExceptionSafety:
     """A health-DB write failure (e.g. sync_health.db locked — this host runs
     several agents against it concurrently) must not escape run_sync.
 
-    Regression: the retry refactor briefly dropped the outer
-    ``except Exception`` that pre-#541 `run_sync` had around its single
-    subprocess call. `_execute_sync_once` catches everything the subprocess
-    attempt itself can raise, but the orchestration around it (detection
-    calls, record_sync_error/record_sync_complete) ran unguarded — if any of
-    those raised, the exception would escape run_sync entirely, and since
-    run_all_syncs has no exception guard of its own around each run_sync
-    call, one source's DB hiccup would have aborted the whole nightly
-    pipeline instead of just failing that source (adversarial review
-    finding #1).
+    `_execute_sync_once` catches everything the subprocess attempt itself
+    can raise, but the orchestration around it (detection calls,
+    record_sync_error/record_sync_complete) needs its own outer
+    ``except Exception`` too — if any of those raised unguarded, the
+    exception would escape run_sync entirely, and since run_all_syncs has
+    no exception guard of its own around each run_sync call, one source's
+    DB hiccup would abort the whole nightly pipeline instead of just
+    failing that source.
     """
 
     def test_health_db_write_exception_produces_terminal_failure_not_propagation(self):
@@ -449,14 +440,14 @@ class TestCampaignStatsNotLostOnRetry:
     """A retried run must not under-report or zero out real work an earlier
     attempt already did.
 
-    Regression: if attempt 1 does real work and then fails partway with a
+    If attempt 1 does real work and then fails partway with a
     transient error, the idempotent retry (attempt 2) legitimately reports
     near-zero new counters for rows attempt 1 already wrote (the sources are
     idempotent — see the comment above MAX_SYNC_RETRIES). Recording only the
     final attempt's numbers would under-report, or even zero out, a run that
     actually did work — and `_detect_yield_collapse`/the consecutive-zero-
     run streak read exactly these fields, so a successful-after-retry run
-    could trip a false zero-yield alert (adversarial review finding #2).
+    could trip a false zero-yield alert.
     """
 
     def test_success_after_retry_preserves_earlier_attempts_yield(self):
@@ -575,7 +566,7 @@ class TestDependencySkipNotRetried:
 
 
 class TestSyncRunsSchemaMigration:
-    """A pre-#541 sync_health.db (no attempt_count column) must migrate in
+    """An older sync_health.db (no attempt_count column) must migrate in
     place: existing rows stay intact, and the new column becomes usable for
     both old and new rows."""
 
@@ -584,9 +575,8 @@ class TestSyncRunsSchemaMigration:
 
         db_path = tmp_path / "sync_health.db"
 
-        # Build the pre-#541 schema by hand and seed it with a real
-        # historical row, mirroring the six-week baseline the issue cites,
-        # before the current module ever touches the file.
+        # Build the older schema by hand and seed it with a real
+        # historical row, before the current module ever touches the file.
         conn = sqlite3.connect(str(db_path))
         conn.executescript(
             """

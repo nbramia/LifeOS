@@ -1,13 +1,14 @@
 """
 Tests for the get_message_history orchestrator tool's adaptive windowing.
 
-Regression context: the tool used to clamp silently to the last 30 days when the
-caller passed no dates. A message ~7 weeks old was therefore unreachable, and
-because the failure text ("No messages found.") never named the window searched
-— while person_info reported interaction counts over 90 days — the orchestrator
-concluded the backend had a sync or permissions fault instead of widening.
+The tool must not silently clamp to the last 30 days when the caller
+passes no dates: a message ~7 weeks old would be unreachable, and because
+a failure text ("No messages found.") that never names the window searched
+would read alongside person_info's interaction counts over 90 days as if
+the backend had a sync or permissions fault, rather than a search that
+simply needs to widen.
 
-These tests pin the fix: widen 90d -> 1y -> all history, report the window,
+These tests pin: widen 90d -> 1y -> all history, report the window,
 honor explicit dates, and cap the payload without misattributing messages.
 """
 from datetime import datetime, timedelta, timezone
@@ -171,7 +172,7 @@ class TestHonestEmpty:
 
 
 class TestAmbiguousResolution:
-    """resolve_entity_id_confidence's second element (#346): when
+    """resolve_entity_id_confidence's second element: when
     entity_resolver reports `fuzzy_ambiguous` (two-plus candidates scored close
     enough together that the top pick isn't reliably right), the tool must
     refuse the query outright rather than returning what may be the wrong

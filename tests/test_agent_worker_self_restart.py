@@ -1,4 +1,4 @@
-"""Self-restart primitive coverage (#401).
+"""Self-restart primitive coverage.
 
 Two layers:
 
@@ -160,7 +160,7 @@ def test_corrupt_marker_fails_closed(tmp_path: Path):
 def test_resume_pending_self_restart_finalizes_quietly(tmp_path: Path):
     """A session named in the marker is finalized COMPLETED with NO rollback
     notice — the doctor's own session, killed by the end-of-goal worker bounce,
-    must not surface as a spurious failed/rolled-back task (#401 acceptance)."""
+    must not surface as a spurious failed/rolled-back task."""
     api = _FakeApi(tasks=[
         {"id": "doctor_task", "description": "doctor run", "status": "in_progress",
          "tags": [RUNNING_TAG, "cloud-sonnet"]},
@@ -186,7 +186,7 @@ def test_resume_pending_self_restart_finalizes_quietly(tmp_path: Path):
     assert AGENT_TAG not in api.tasks["doctor_task"]["tags"]
     # Vault checkbox advanced to done ([x]) too — not left stuck at in_progress
     # ([/]). The quiet-finalize path must call _complete_task like every other
-    # COMPLETED path (#401 review).
+    # COMPLETED path.
     assert api.tasks["doctor_task"]["status"] == "done"
     # Transcript records the deliberate restart, not a resume_failed.
     kinds = [e["kind"] for e in w.transcript_store.read(session.session_id)]
@@ -220,7 +220,7 @@ def test_resume_pending_marker_by_task_id(tmp_path: Path):
 @pytest.mark.unit
 def test_resume_pending_without_marker_still_rolls_back(tmp_path: Path):
     """Regression guard: a crash with no marker must still FAIL + notify, so
-    the self-restart path can't silently swallow real crashes (#401)."""
+    the self-restart path can't silently swallow real crashes."""
     api = _FakeApi(tasks=[
         {"id": "crashed_task", "description": "c", "status": "in_progress",
          "tags": [RUNNING_TAG, "cloud-sonnet"]},
@@ -297,7 +297,7 @@ def _isolated_server_script(tmp_path: Path) -> Path:
 @pytest.mark.unit
 def test_restart_worker_detached_sends_notice_before_restart(tmp_path: Path):
     """The final notice must be flushed BEFORE the restart is triggered, so the
-    doctor's "Shipped" [NOTIFY] beats the worker's SIGTERM (#401 acceptance)."""
+    doctor's "Shipped" [NOTIFY] beats the worker's SIGTERM."""
     if not SERVER_SH.exists():
         pytest.skip("server.sh not present")
     bindir = tmp_path / "bin"
@@ -500,7 +500,7 @@ def test_server_sh_known_subcommands_still_parse(tmp_path: Path):
 
 @pytest.mark.unit
 def test_verify_deployed_checks_worktree_and_head(tmp_path: Path):
-    """verify-deployed (#419) exits 0 only when the checkout is a real work tree
+    """verify-deployed exits 0 only when the checkout is a real work tree
     whose HEAD matches the expected sha (or origin/main); else exits 1. This is
     the doctor's guard against reporting "Shipped" after a silently-failed pull
     (e.g. a bare/misconfigured checkout)."""

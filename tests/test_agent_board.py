@@ -1,5 +1,5 @@
 """Unit tests for api/services/agent_board.py — pure lane derivation and
-lane-move planning (#850). One test per row of the lane table in the issue,
+lane-move planning. One test per row of the lane table,
 plus the scheduler-entry bucketing rule.
 """
 from datetime import datetime, timedelta, timezone
@@ -33,7 +33,7 @@ class TestDeriveAssignee:
         assert agent_board.derive_assignee([]) is None
 
     def test_multiple_assignee_tags_precedence_is_ASSIGNEE_TAGS_order(self):
-        # Round-1 finding 15: precedence follows ASSIGNEE_TAGS order
+        # Precedence follows ASSIGNEE_TAGS order
         # ("me" first), not the order the tags happen to appear in the list.
         assert agent_board.derive_assignee(["codex", "me"]) == "me"
 
@@ -50,7 +50,7 @@ class TestNormalizeTags:
 
 
 # ---------------------------------------------------------------------------
-# derive_lane — one test per row of the issue's lane table
+# derive_lane — one test per row of the lane table
 # ---------------------------------------------------------------------------
 
 class TestDeriveLaneTable:
@@ -281,7 +281,7 @@ class TestPlanLaneMove:
         assert plan.status == "in_progress"
 
     def test_in_progress_multiple_assignee_tags_uses_precedence(self):
-        # Round-1 finding 15: with both "me" and "codex" tags present,
+        # With both "me" and "codex" tags present,
         # derive_assignee resolves "me" (ASSIGNEE_TAGS precedence) — since
         # "me" isn't in AGENT_ASSIGNEES, the move succeeds instead of 409ing.
         plan = agent_board.plan_lane_move("todo", ["me", "codex"], "in_progress", None)
@@ -347,7 +347,7 @@ class TestPlanLaneMove:
 #     re-route them
 #   * the card is a pending review (agent-completed, not yet accepted) and
 #     the target is In progress or Human queue — Done still doubles as the
-#     accept path (round-2 finding 2a)
+#     accept path
 # Assigned/unassigned are tags-only by design (an assignee change must not
 # pull a card out of Human queue — the lane table says Human queue beats
 # Assigned), so for those two targets this only checks the assignee-tag
@@ -452,7 +452,7 @@ class TestPlanLaneMoveLandsInTargetLane:
         assert "human" not in plan.tags
 
     def test_done_rejects_worker_owned_agent_blocked_and_agent_running(self):
-        # Round-2 finding 1: the worker owns a card carrying agent-running or
+        # The worker owns a card carrying agent-running or
         # agent-blocked — dropping it on Done must 409 and write nothing,
         # not silently strip the tag out from under a live worker task.
         plan = agent_board.plan_lane_move(
@@ -483,7 +483,7 @@ class TestPlanLaneMoveLandsInTargetLane:
         assert "human" not in plan.tags
 
     def test_in_progress_rejects_worker_owned_agent_blocked(self):
-        # Round-2 finding 1: agent-blocked means the worker owns this card
+        # Agent-blocked means the worker owns this card
         # (it's waiting on an answer) — 409, not a silent strip.
         plan = agent_board.plan_lane_move("todo", ["agent-blocked"], "in_progress", None)
         assert plan.error == (

@@ -1,4 +1,4 @@
-"""Tests for `api/services/agent_worker/remote_spawn.py` (#851): host
+"""Tests for `api/services/agent_worker/remote_spawn.py`: host
 resolution, ssh argv construction, and the injectable remote kill runner."""
 from __future__ import annotations
 
@@ -160,7 +160,7 @@ def test_env_names_matching_prefixes_respects_keep(monkeypatch):
 
 
 def test_env_names_matching_prefixes_unsets_canonical_names_on_clean_local_env(monkeypatch):
-    """Round 1, finding #2: a worker whose OWN process env has none of the
+    """A worker whose OWN process env has none of the
     provider-credential vars set (subscription/OAuth install — the common
     case) must still unset them remotely, since a registered host's own
     non-interactive shell may export one. `env_names_matching_prefixes`

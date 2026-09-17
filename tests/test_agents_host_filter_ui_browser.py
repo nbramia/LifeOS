@@ -1,4 +1,4 @@
-"""Browser test for the /agents host filter + side panel fields (#849).
+"""Browser test for the /agents host filter + side panel fields.
 
 Serves `web/` itself on an ephemeral port and stubs every `/api/` call, the
 same server-free pattern as `tests/test_voice_mic_block_ui_browser.py` —
@@ -12,11 +12,11 @@ why this carries no `requires_server` marker and runs at pre-push
 to the real network like it does for every other browser test against this
 page family.
 
-#850 made the Kanban board the default /agents view and moved this graph
-(unchanged) behind a Graph tab, lazily initialized on first open — so every
-scenario here clicks into the Graph tab before touching graph-specific
-elements like `#filter-host` or `.node`, which now live in initially-hidden
-markup and aren't wired up until `initGraph()` runs.
+The Kanban board is the default /agents view; this graph lives behind a
+Graph tab, lazily initialized on first open — so every scenario here clicks
+into the Graph tab before touching graph-specific elements like
+`#filter-host` or `.node`, which live in initially-hidden markup and
+aren't wired up until `initGraph()` runs.
 
 `TestRecentChipAndRouteFilterAndNodeLabels` covers the "recent" chip
 (completed + ended), the route filter's `hermes`/`ask` options, and that no
@@ -45,7 +45,7 @@ WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
 class _AgentsHandler(http.server.SimpleHTTPRequestHandler):
     """Serves agents.html the way api/main.py does: `/agents` is agents.html
-    and the web/agents/*.js modules (#850) hang off `/static/`."""
+    and the web/agents/*.js modules hang off `/static/`."""
 
     def translate_path(self, path):
         path = path.split("?", 1)[0].split("#", 1)[0]
@@ -116,8 +116,7 @@ SNAPSHOT = {
         },
         # A cli_sessions row whose SessionEnd event already fired — must be
         # treated as terminal (hidden by default, shown with "include
-        # finished" on) rather than staying in the live view forever (#849
-        # round-1 finding: 'ended' was missing from the frontend TERMINAL set).
+        # finished" on) rather than staying in the live view forever.
         {
             "session_id": "cc:host-filter-ended",
             "task_id": "t3",
@@ -157,7 +156,7 @@ def _open_agents(page: Page, base_url):
 
     page.route("**/api/**", handler)
     page.goto(f"{base_url}/agents")
-    # #850: the board is the default tab; the graph (and its filters) live
+    # The board is the default tab; the graph (and its filters) live
     # behind the Graph tab and only initialize once it's opened.
     page.click('[data-tab="graph"]')
     # The host select ships with only its `all` option; the per-host options
@@ -182,7 +181,7 @@ class TestHostFilter:
         _open_agents(page, agents_base_url)
         # Both sessions are recent enough to be visible under the default
         # 30-minute recency filter only if last_activity_at is "now" — the
-        # fixture's timestamps are fixed epoch seconds in the past, so
+        # fixture's timestamps are fixed epoch seconds well before now, so
         # widen recency to "all time" first.
         page.select_option("#filter-recency", "all")
         page.select_option("#filter-host", "laptop-a")
@@ -193,9 +192,9 @@ class TestHostFilter:
 class TestEndedStatus:
     # The fixture has 3 sessions total: two 'running' and one 'ended'
     # (cc:host-filter-ended). 'ended' must be treated as terminal — hidden
-    # by default and only shown once "include finished" is checked (#849
-    # round-1 finding: 'ended' was missing from the frontend TERMINAL set,
-    # so a closed CLI session stayed in the live view indefinitely).
+    # by default and only shown once "include finished" is checked —
+    # otherwise a closed CLI session would stay in the live view
+    # indefinitely.
     def test_ended_session_hidden_by_default(self, page: Page, agents_base_url):
         _open_agents(page, agents_base_url)
         page.select_option("#filter-recency", "all")

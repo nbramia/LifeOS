@@ -212,11 +212,11 @@ async def test_in_process_tool_send_is_gated_by_shared_ledger_for_http_created_d
     """A draft created via the HTTP route must also be refused by the
     in-process send_email_draft tool in a brand new turn.
 
-    Before the fix, send_email_draft called GmailService.send_draft()
-    directly with no ledger check at all — only the in-memory per-turn set
-    stood in the way, and a fresh turn's set is empty. This is exactly the
-    cross-caller bypass #588 was filed about, just relocated to the
-    in-process tool instead of the HTTP route.
+    send_email_draft must not call GmailService.send_draft() directly with
+    no ledger check — relying only on the in-memory per-turn set would
+    leave a fresh turn's set empty, reopening the cross-caller bypass this
+    ledger closes, just relocated to the in-process tool instead of the
+    HTTP route.
     """
     from unittest.mock import MagicMock
 
@@ -241,9 +241,9 @@ async def test_in_process_tool_create_records_to_shared_ledger_for_http_send_gat
     """A draft created via the in-process create_email_draft tool must be
     visible to the HTTP /api/gmail/send route's gate.
 
-    Before the fix, create_email_draft never wrote to the shared ledger, so
-    the HTTP route saw an unrelated hand-composed draft and sent it freely —
-    the other half of the same cross-caller bypass (#588).
+    create_email_draft must write to the shared ledger — otherwise the
+    HTTP route would see an unrelated hand-composed draft and send it
+    freely, the other half of the same cross-caller bypass.
     """
     from unittest.mock import MagicMock
 
@@ -280,7 +280,7 @@ def test_prune_never_evicts_turn_tagged_row_by_age(tmp_path):
     """Turn-tagged entries must survive prune() regardless of age.
 
     The same-turn-id guarantee promises a refusal "regardless of elapsed
-    time" (#588's acceptance criteria). A naive time-based prune would delete
+    time". A naive time-based prune would delete
     a turn-tagged row once it aged past the cooldown window, silently
     reopening the exact bypass this row exists to close: draft A created
     with turn id t1, pruned away 300s later, then a send of A with turn id
@@ -317,7 +317,7 @@ def test_prune_caps_turn_tagged_rows_by_count_oldest_first(tmp_path):
 
     now = datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc)
     for i in range(5):
-        # turn-tagged-0 is the oldest (created furthest in the past),
+        # turn-tagged-0 is the oldest (created longest ago),
         # turn-tagged-4 the newest.
         ledger.record_created(
             account="personal",
@@ -346,7 +346,7 @@ def test_ledger_fails_closed_when_db_file_lost_but_marker_survives(
     EXISTS whenever the file is absent — including when the file was
     deleted out from under an existing deployment. Without a way to tell
     that apart from a genuine first run, a lost ledger looks identical to
-    an empty one and every previously-tracked draft becomes "unknown" (and
+    an empty one and every draft the ledger has no record of becomes "unknown" (and
     unknown drafts always send). The marker file survives the .db file
     going missing, so its presence is the signal that data was lost.
     """
@@ -408,8 +408,8 @@ def test_fresh_install_with_no_prior_marker_is_not_restricted(tmp_path):
 def test_grace_period_expires_after_cooldown_window():
     """The fail-closed window after detected data loss is bounded: any draft
     that could have been silently lost was created before the ledger was
-    recreated, so once one full cooldown window elapses, it would no longer
-    be blocked even if it had been tracked perfectly."""
+    recreated, so once one full cooldown window elapses, it stops being
+    blocked even if it had been tracked perfectly."""
     ledger = GmailDraftLedger.__new__(GmailDraftLedger)
     ledger.freshly_initialized_at = datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc)
 

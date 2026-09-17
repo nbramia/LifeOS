@@ -1,10 +1,10 @@
 """Tests for the active-reclaim logic in scripts/gpu-watchdog.sh.
 
-The watchdog historically only *alerted* on VRAM saturation. After issue #199
-recurred (2026-07-09: a network wedge left GPU work hung at 97% VRAM and nothing
-reclaimed it, forcing a manual reboot), it gained an active safety valve: on
-sustained saturation it stops the local LLM service to release VRAM + GPU
-queues, then restarts it once VRAM drains.
+Beyond alerting on VRAM saturation, the watchdog has an active safety
+valve: on sustained saturation it stops the local LLM service to release
+VRAM + GPU queues, then restarts it once VRAM drains — a network wedge
+that leaves GPU work hung near 100% VRAM would otherwise require a manual
+reboot.
 
 These tests drive the script through fake sysfs VRAM values and fake
 systemctl/sudo/curl binaries, asserting the stop/start decisions without a GPU.

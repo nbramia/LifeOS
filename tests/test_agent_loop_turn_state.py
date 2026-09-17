@@ -1,4 +1,4 @@
-"""#615: `run_agent_loop` yields a `turn_state` event -- carrying a live,
+"""`run_agent_loop` yields a `turn_state` event -- carrying a live,
 mutable reference to its `AgentResult` -- as the very first event, before
 any round runs. `api/routes/chat.py` stashes this reference so a cancelled
 turn's cancel/deadline handler can read accrued usage without waiting for

@@ -1,14 +1,15 @@
-"""#611: a chat turn's lifetime is owned by the server, not the SSE
+"""A chat turn's lifetime is owned by the server, not the SSE
 connection that happened to be watching it when it started.
 
-Today (before #611), `generate()` in `api/routes/chat.py` has no `finally`
-block and the assistant row is written once at the very end — so closing
-the SSE reader mid-turn (a browser tab closing, an app backgrounding) kills
+If `generate()` in `api/routes/chat.py` had no `finally` block and the
+assistant row were written once at the very end, closing the SSE reader
+mid-turn (a browser tab closing, an app backgrounding) would kill
 generation within milliseconds via the `CancelledError`/`GeneratorExit`
-Starlette delivers at the suspended `yield`, and nothing is ever persisted,
-not even the partial text. `test_native_turn_completes_and_persists_after_client_disconnect`
-below drives that exact sequence and must fail until the turn registry
-(`api/services/chat_turns.py`) decouples the turn's task from its reader.
+Starlette delivers at the suspended `yield`, and nothing would ever be
+persisted, not even the partial text. The turn registry
+(`api/services/chat_turns.py`) decouples the turn's task from its reader so
+`test_native_turn_completes_and_persists_after_client_disconnect` below
+passes.
 """
 import asyncio
 import json
@@ -117,18 +118,14 @@ async def test_native_turn_completes_and_persists_after_client_disconnect(
 
 
 async def test_voice_modality_disconnect_detaches_and_survives_like_text(store, monkeypatch):
-    """#616: this test used to be named
-    `test_voice_modality_disconnect_cancels_rather_than_detaches` and
-    asserted the OPPOSITE of what it asserts now — that a voice-modality
-    turn's disconnect cancelled the task immediately rather than detaching
-    it, because whisper-relay had no way to say "stop" other than
-    abandoning the stream. Now that whisper-relay calls `POST
-    /api/chat/cancel` with its `client_turn_id` on a real cancel gesture
-    (whisper-relay#37), a disconnect alone — a hangup or network drop with
-    no explicit cancel — no longer means "stop": a voice turn detaches and
-    keeps running to completion server-side, exactly like the text turn in
+    """A disconnect alone — a hangup or network drop with no explicit
+    cancel — does not mean "stop" for a voice-modality turn, because
+    whisper-relay calls `POST /api/chat/cancel` with its `client_turn_id`
+    on an explicit cancel gesture instead of abandoning the stream: a
+    voice turn detaches and keeps running to completion server-side,
+    exactly like the text turn in
     `test_native_turn_completes_and_persists_after_client_disconnect`
-    above. This inversion is deliberate, not a weakening — see #616."""
+    above."""
     import api.services.agent_loop as agent_loop_mod
 
     resume = asyncio.Event()

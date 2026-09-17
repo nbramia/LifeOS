@@ -1,7 +1,7 @@
 """Tests for the paid remote OpenAI-compatible provider on the native chat
-path (#654) -- the "Remote" model picker option.
+path -- the "Remote" model picker option.
 
-`_track_usage`'s cost computation (reworked by #661 into a general
+`_track_usage`'s cost computation (a general
 `pricing.is_known_model`/`cost_for` mechanism -- see
 tests/test_agent_loop_cost_recording.py) carries one deliberate exception
 for this provider: its rates come from `settings.remote_llm_{input,output}_
@@ -10,14 +10,14 @@ option is an operator-flippable model id (Fireworks today, any other
 OpenAI-compatible endpoint tomorrow) -- a static dict keyed by literal model
 id would need a code change on every flip, defeating the "provider as
 config" design. `force_remote` gates that exception so every other model
-(Anthropic, local) goes through #661's mechanism unchanged. An unconfigured
-rate marks the turn `unpriced` (#613's usage_store column) instead of
-guessing another model's price -- the same hazard `cost_tracker.
+(Anthropic, local) goes through the general mechanism unchanged. An
+unconfigured rate marks the turn `unpriced` (the usage_store column)
+instead of guessing another model's price -- the same hazard `cost_tracker.
 calculate_cost`'s old Sonnet fall-through created, and `pricing.cost_for`'s
 Opus-rate fallback would recreate here if this exception didn't exist (see
 `is_known_model`'s docstring). The model id itself comes from
-`LocalLLMClient.model` (constructor-configured, #654) via `resolved_model`
-in `run_agent_loop` -- the same attribution mechanism #661 built for every
+`LocalLLMClient.model` (constructor-configured) via `resolved_model`
+in `run_agent_loop` -- the same attribution mechanism built for every
 other backend -- so even a turn cancelled before any round completes
 reports the right model.
 
@@ -41,7 +41,7 @@ _REMOTE_MODEL_ID = "accounts/fireworks/models/x"
 class _OneRoundClient:
     """A single tool-round-free turn: text, then "done" with usage.
 
-    Exposes `.model` the way the real LocalLLMClient's property does (#654) --
+    Exposes `.model` the way the real LocalLLMClient's property does --
     `resolved_model = getattr(client, "model", "local")` in run_agent_loop
     reads it to attribute the turn."""
 
@@ -57,8 +57,8 @@ class _OneRoundClient:
 
 
 class _TwoRoundClient:
-    """Round 1: a tool call. Round 2 (after the tool result is fed back):
-    text + done. Exercises cost accumulation across rounds."""
+    """First pass: a tool call. Second pass (after the tool result is fed
+    back): text + done. Exercises cost accumulation across rounds."""
 
     def __init__(self, usage_round_1, usage_round_2, model=_REMOTE_MODEL_ID):
         self._usages = [usage_round_1, usage_round_2]
@@ -77,7 +77,7 @@ class _TwoRoundClient:
                     "function": {"name": "search_vault", "arguments": "{}"},
                 }],
             }
-            finish_reason = "tool_calls"  # keeps the loop going into round 2
+            finish_reason = "tool_calls"  # keeps the loop going into the next pass
         else:
             yield {"type": "text", "content": "final answer"}
             finish_reason = "end_turn"
@@ -169,8 +169,8 @@ async def test_remote_turn_accumulates_cost_across_rounds(monkeypatch):
 async def test_remote_turn_with_no_configured_rate_is_unpriced(monkeypatch):
     """A provider configured to run (URL/model/key) but with no configured
     rate must not be silently priced at 0.0 (which reads as "genuinely
-    free") -- it's marked unpriced instead, same #613 convention Hermes
-    turns already use, and the same one #661 gave every other model."""
+    free") -- it's marked unpriced instead, the same convention Hermes
+    turns and every other model use."""
     from api.services import agent_loop
 
     _configure_remote(monkeypatch, input_price=None, output_price=None)
@@ -189,7 +189,7 @@ async def test_remote_turn_with_no_configured_rate_is_unpriced(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_remote_model_id_set_even_if_cancelled_before_any_round(monkeypatch):
-    """The model id comes from the client (LocalLLMClient.model, #654) at
+    """The model id comes from the client (LocalLLMClient.model) at
     construction, not discovered mid-round -- so it's already correct on
     the live `turn_state` result a cancel handler would read, before any
     round ever completes."""

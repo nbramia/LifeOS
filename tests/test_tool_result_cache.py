@@ -1,4 +1,4 @@
-"""Tests for the per-session tool result cache (#139 §4)."""
+"""Tests for the per-session tool result cache."""
 from __future__ import annotations
 
 import pytest

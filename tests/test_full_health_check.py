@@ -1,5 +1,5 @@
-"""Unit tests for the health-honesty fixes in `GET /health` and `GET /health/full`
-(api/main.py, #697): `api_key_configured` must reflect the Anthropic API key
+"""Unit tests for `GET /health` and `GET /health/full`
+(api/main.py): `api_key_configured` must reflect the Anthropic API key
 rather than the local-LLM URL (which has a non-empty default regardless of
 configuration), and the `local_llm` / `gmail_search` rows in `/health/full`
 must not report "ok" for a service that is neither running nor in use.
@@ -21,7 +21,7 @@ pytestmark = pytest.mark.unit
 
 @pytest.fixture(autouse=True)
 def _stub_vault_root_sanity_vectorstore(monkeypatch):
-    """`full_health_check()`'s vault-root sanity check (#762) reaches the
+    """`full_health_check()`'s vault-root sanity check reaches the
     real `get_vector_store()` singleton whenever the vault_search probe
     reports "ok" -- which, on a host that happens to have a live LifeOS API
     + ChromaDB running (as the maintainer's does), it does. That's a
@@ -29,7 +29,7 @@ def _stub_vault_root_sanity_vectorstore(monkeypatch):
     which `_check_vault_root_sanity`'s own `except Exception` already
     treats as a benign hiccup -- the same fail-closed behavior this file's
     module docstring already relies on for the OTHER live probes
-    `full_health_check()` makes (#828).
+    `full_health_check()` makes.
     """
     monkeypatch.setattr(
         "api.services.vectorstore.get_vector_store",
@@ -43,7 +43,7 @@ def test_health_api_key_configured_true_with_key():
 
     mock_settings = MagicMock()
     mock_settings.anthropic_api_key = "sk-ant-fake-value"
-    mock_settings.local_llm_url = ""  # must no longer influence this field
+    mock_settings.local_llm_url = ""  # must not influence this field
 
     client = TestClient(app)
     with patch("config.settings.settings", mock_settings):
@@ -59,7 +59,7 @@ def test_health_api_key_configured_false_without_key():
     mock_settings = MagicMock()
     mock_settings.anthropic_api_key = ""
     # A non-empty local_llm_url (the actual default) must not make this
-    # field true — that was exactly the #697 bug.
+    # field true.
     mock_settings.local_llm_url = "http://localhost:8080"
 
     client = TestClient(app)
@@ -127,7 +127,7 @@ async def test_full_health_gmail_search_reports_not_configured_shape(monkeypatch
     """No Google credentials on disk: gmail_search must report the same
     not-configured ("error") shape as calendar/drive, not "ok, 0 emails" —
     GmailService.search() swallows the underlying FileNotFoundError and
-    returns an empty list, which used to mask this at the endpoint level."""
+    returns an empty list, which the endpoint must not mask."""
     import api.main as main
     from api.services import google_auth
 

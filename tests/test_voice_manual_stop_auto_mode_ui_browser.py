@@ -1,16 +1,16 @@
-"""Browser tests for a manual talk-button stop in Auto mode (#721).
+"""Browser tests for a manual talk-button stop in Auto mode.
 
-Bug: in Auto mode, tapping the live record button to stop recording
-immediately restarted it. `stopRecordingAndSend()` in `web/chat/voice.js`
+In Auto mode, tapping the live record button to stop recording must not
+immediately restart it. `stopRecordingAndSend()` in `web/chat/voice.js`
 routes an empty/silent recording (the only outcome a real tap-to-stop
 produces against these tests' silent fake mic stream -- see below) through
-`handleSkippedEmptyRecording()`, which used to call `maybeAutoContinue()`
-itself, treating "the user tapped stop" the same as "a turn was submitted and
-its reply finished playing". That's the only caller of
+`handleSkippedEmptyRecording()`, which must not call `maybeAutoContinue()`
+itself -- that would treat "the user tapped stop" the same as "a turn was
+submitted and its reply finished playing". That's the only caller of
 `stopRecordingAndSend()` (onTalkClick's stop branch), so every empty/silent
 recording it produces is, by construction, a manual stop -- there is no
-other way to reach it. The fix drops that call: auto-continue's only re-arm
-trigger is now `submitTurn()`'s own `maybeAutoContinue()` call after
+other way to reach it. Auto-continue's only re-arm trigger is
+`submitTurn()`'s own `maybeAutoContinue()` call after
 `await playbackChain` (i.e. once a turn was actually submitted and its reply
 finished playing), which this suite also exercises to confirm a later cycle
 still re-arms normally after a manual stop.
@@ -258,8 +258,8 @@ class TestManualStopDoesNotRestart:
         )
 
     def test_manual_stop_does_not_submit_a_turn(self, page: Page, chat_base_url):
-        """Existing discard semantics for an empty/silent recording are
-        unchanged by this fix -- a manual stop with nothing captured must
+        """Existing discard semantics for an empty/silent recording hold
+        regardless -- a manual stop with nothing captured must
         not hit /api/voice/turn/stream."""
         _open_voice_chat(page, chat_base_url, auto=True)
 
@@ -335,7 +335,7 @@ class TestCycleAfterManualStopStillReArms:
 
 class TestAutoOffPathUnchanged:
     """With Auto off, neither a manual stop nor a completed turn should ever
-    restart recording -- unaffected by this fix either way."""
+    restart recording, in either case."""
 
     def test_manual_stop_with_auto_off_does_not_restart(self, page: Page, chat_base_url):
         _open_voice_chat(page, chat_base_url, auto=False)

@@ -1,4 +1,4 @@
-"""Tests for `api/services/agent_worker/assignment.py` (#851): the
+"""Tests for `api/services/agent_worker/assignment.py`: the
 task-fields extractor and the per-engine effort mapping."""
 from __future__ import annotations
 

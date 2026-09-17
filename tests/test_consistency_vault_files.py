@@ -1,7 +1,7 @@
 """
-Vault interactions whose file no longer exists.
+Vault interactions whose backing file is gone.
 
-Moving a note in Obsidian strands its interactions at the old path, and the next
+Moving a note in Obsidian strands its interactions at the path it moved from, and the next
 reindex creates new ones at the new path. A blanket delete would be wrong: on
 the corpus that prompted this, 56 of 78 dangling rows were *moved* notes, not
 deleted ones, and 4 of those had no replacement rows at all — deleting them

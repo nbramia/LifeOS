@@ -238,10 +238,10 @@ def _simulate_new_process(queue):
     """Bump process_start_time to the far future, so a job already claimed
     on `queue` (started_at set at __init__ time, necessarily earlier) reads
     as belonging to a since-restarted previous process rather than this
-    one — the real-world ordering reconciliation depends on (#768 Codex
-    review: reconciliation is now scoped to started_at < process_start_time,
-    so simulating "stale" requires the timestamps in this relative order,
-    not just reusing the same queue object to claim-then-reconcile)."""
+    one — the real-world ordering reconciliation depends on. Reconciliation
+    is scoped to started_at < process_start_time, so simulating "stale"
+    requires the timestamps in this relative order, not just reusing the
+    same queue object to claim-then-reconcile."""
     queue.process_start_time = "9999-01-01T00:00:00+00:00"
 
 
@@ -249,7 +249,7 @@ class TestOrphanReconciliation:
     """A job left RUNNING by a process that restarted mid-job is never
     revisited by anything else in this module — cleanup_old_jobs() only
     touches COMPLETED/FAILED/CANCELLED rows. start_worker() must reconcile
-    it before the (new) worker thread starts (#768)."""
+    it before the (new) worker thread starts."""
 
     def test_start_worker_reconciles_stale_running_job(self, queue):
         job_id = queue.enqueue("a")
@@ -266,11 +266,11 @@ class TestOrphanReconciliation:
         assert job.completed_at is not None
 
     def test_reconciliation_does_not_touch_a_job_from_this_same_process(self, queue):
-        """A RUNNING row whose started_at is AFTER this process's own start
+        """A RUNNING row whose started_at postdates this process's own start
         cannot have been stranded by a restart of this process — reconciling
         it unconditionally (rather than scoping to process_start_time) would
         risk killing a job a still-alive process is genuinely executing
-        against the same database (Codex review of #768)."""
+        against the same database."""
         job_id = queue.enqueue("a")
         queue._claim_next()
         # No _simulate_new_process() call: process_start_time (set at
@@ -336,7 +336,7 @@ class TestOrphanReconciliation:
         """A RUNNING row with no started_at can't be a real live claim —
         _claim_next always sets it in the same atomic UPDATE — so it must
         still be reconciled even though it fails the started_at < process_
-        start_time comparison outright (#768 Codex review)."""
+        start_time comparison outright."""
         job_id = queue.enqueue("a")
         queue._claim_next()
         with queue._conn() as conn:
@@ -353,7 +353,7 @@ class TestOrphanReconciliation:
 class TestStaleRunningJobHelper:
     """is_stale_running_job() — the signal admin/jobs routes use to flag
     staleness before start_worker()'s reconciliation has had a chance to
-    run, or against a queue that never called start_worker() at all (#768)."""
+    run, or against a queue that never called start_worker() at all."""
 
     def test_true_when_started_before_process_start(self, queue):
         job_id = queue.enqueue("a")

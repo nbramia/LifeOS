@@ -1,5 +1,5 @@
 """
-Tests for the fitness Google Sheet mirror (issue #321).
+Tests for the fitness Google Sheet mirror.
 
 Verifies the off-by-default guardrail, full-tab build from the store, the
 content-hash short-circuit, dedup-by-rebuild, and graceful failure (no raise).

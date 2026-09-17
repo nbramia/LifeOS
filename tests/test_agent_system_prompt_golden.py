@@ -1,9 +1,10 @@
-"""Golden-output test for the #591 build_system_prompt extraction.
+"""Golden-output test for the build_system_prompt extraction.
 
-#591 extracted the per-turn context assembly (date/time, the relative-time
-instruction, existing task tags) out of `build_system_prompt` into the
-standalone `build_turn_context`, so the same computation can also back a
-read-only endpoint and the Hermes envelope. The acceptance criterion is that
+The per-turn context assembly (date/time, the relative-time
+instruction, existing task tags) lives in the standalone
+`build_turn_context`, separate from `build_system_prompt`, so the same
+computation can also back a read-only endpoint and the Hermes envelope.
+The acceptance criterion is that
 the native system prompt is byte-identical before and after that extraction,
 for a turn with a persona, a turn without one, a voice turn, and a turn with
 existing task tags.
@@ -18,7 +19,7 @@ not just the clock:** `agent_system_prompt._STATIC_PROMPT` interpolates
 `settings.user_name` and the configured Google accounts exactly ONCE, at
 first import of the module — it is deliberately cached for the life of the
 process (see the comment at its definition). A full pytest run imports many
-files before this one; if any earlier-imported file triggers `api.main`'s
+files ahead of this one; if any earlier-imported file triggers `api.main`'s
 import (its `load_dotenv()` walks upward and can load a real, machine-
 specific `.env` when cwd is nested under the real checkout, as a worktree
 is), `settings.user_name` is real by the time `agent_system_prompt` is first
@@ -53,7 +54,7 @@ from tests.fixtures import agent_system_prompt_golden_591 as golden
 
 pytestmark = pytest.mark.unit
 
-# Same frozen instant used to capture the baseline.
+# The same frozen instant the golden baseline was captured with.
 _FIXED_NOW = datetime(2026, 8, 19, 9, 14, 22, tzinfo=ZoneInfo("America/New_York"))
 
 

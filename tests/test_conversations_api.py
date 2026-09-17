@@ -136,7 +136,7 @@ class TestListConversations:
 
 @pytest.mark.unit
 class TestListConversationsBackendParam:
-    """The optional `backend` query filter (#596)."""
+    """The optional `backend` query filter."""
 
     def test_omitted_backend_leaves_filter_unset(self, client, mock_store):
         # Preserves today's behavior exactly: no backend filter applied.
@@ -519,7 +519,7 @@ class TestConversationEdgeCases:
 
 
 # =============================================================================
-# POST /api/conversations/{id}/answer Tests (#403 web/voice parity)
+# POST /api/conversations/{id}/answer Tests (web/voice parity)
 # =============================================================================
 
 @pytest.mark.unit
@@ -560,7 +560,7 @@ class TestAnswerInConversation:
         mock_store.add_message.assert_called_once()
 
     def test_answer_reaches_session_from_a_hermes_tagged_conversation(self, client, mock_store):
-        """#596: a LifeOS-spawned session whose conversation happens to be
+        """A LifeOS-spawned session whose conversation happens to be
         tagged "hermes" (test_persona_api.py's
         test_doctor_spawn_diverted_from_hermes_tags_conversation_hermes) links
         exactly as one tagged "lifeos" — this endpoint doesn't branch on
@@ -679,7 +679,7 @@ class TestPendingQuestionSurfacing:
 @pytest.mark.unit
 class TestAgentSessionActive:
     """GET /api/conversations/{id} reports whether the spawned session is still
-    running (#311) so the client's result-streaming poll can terminate."""
+    running so the client's result-streaming poll can terminate."""
 
     def _linked_conversation(self):
         now = datetime.now()

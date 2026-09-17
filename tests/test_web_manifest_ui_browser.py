@@ -1,12 +1,11 @@
-"""Browser tests for the web app manifest + standalone metadata (#727).
+"""Browser tests for the web app manifest + standalone metadata.
 
-`web/home.html` (`/`) lacked `apple-mobile-web-app-capable`, so a Home
-Screen shortcut added from the root URL opened in the user's default
-browser instead of its own standalone container. The fix adds that meta
-(matching `web/index.html` and `web/crm.html`, which already had it) plus a
-real web app manifest linked from all three served pages, since Apple
-documents the legacy meta alone as deprecated in favor of the manifest's
-`display` member.
+`web/home.html` (`/`) must declare `apple-mobile-web-app-capable` (matching
+`web/index.html` and `web/crm.html`) — without it, a Home Screen shortcut
+added from the root URL would open in the user's default browser instead
+of its own standalone container. A real web app manifest is also linked
+from all three served pages, since Apple documents the legacy meta alone
+as deprecated in favor of the manifest's `display` member.
 
 Like tests/test_mode_pill_ui_browser.py, this serves `web/` itself from an
 ephemeral port rather than pointing at a running API — the assertions are
@@ -79,8 +78,8 @@ def _open(page: Page, base_url, path):
 @pytest.mark.parametrize("path", ["/", "/chat", "/crm"])
 class TestStandaloneMetaAndManifestLink:
     """Every served entry point must declare the same standalone capability
-    and link the same manifest — that's the whole point of #727: all three
-    pages should behave identically on a Home Screen shortcut."""
+    and link the same manifest — all three pages must behave identically
+    on a Home Screen shortcut."""
 
     def test_apple_mobile_web_app_capable(self, page: Page, site_base_url, path):
         _open(page, site_base_url, path)
@@ -105,7 +104,7 @@ class TestStandaloneMetaAndManifestLink:
 
 class TestManifestContent:
     """The manifest itself must parse and point at a real, standalone-ready
-    route — not the /static prefix (#727's central trap)."""
+    route — not the /static prefix."""
 
     def test_manifest_parses_as_standalone(self, page: Page, site_base_url):
         _open(page, site_base_url, "/chat")

@@ -575,7 +575,7 @@ class TestSlackResponseModels:
 
 
 # =============================================================================
-# GET /api/slack/my-messages Tests (issue #441)
+# GET /api/slack/my-messages Tests
 # =============================================================================
 
 @pytest.mark.unit

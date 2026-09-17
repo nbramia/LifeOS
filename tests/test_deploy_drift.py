@@ -1,4 +1,4 @@
-"""Deploy-drift coverage (#631).
+"""Deploy-drift coverage.
 
 `scripts/auto-deploy.sh` is the sole production-restart mechanism: it
 detects a stale-but-active service by comparing tracked source/`.env` mtimes
@@ -67,7 +67,7 @@ def _run_sourced(repo: Path, call: str, env_extra: dict | None = None) -> subpro
     because it needs two checkouts to share one $HOME instead of each
     getting its own).
 
-    HOME is set AFTER layering in env_extra, not before (#833/F7) — a caller
+    HOME is set AFTER layering in env_extra, not before — a caller
     building env_extra from `dict(os.environ)` (e.g. to tweak PATH) carries
     the real $HOME along with it, and applying env_extra second would
     silently defeat this function's whole isolation guarantee. No caller
@@ -163,7 +163,7 @@ def test_newest_code_mtime_reflects_real_api_edit(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# #792 — .env's mtime is a second, independent drift signal
+# .env's mtime is a second, independent drift signal
 # ---------------------------------------------------------------------------
 @pytest.mark.unit
 def test_env_file_mtime_reflects_env_edit(tmp_path: Path):
@@ -250,7 +250,7 @@ def _venv_with_python(tmp_path: Path) -> Path:
 @pytest.mark.unit
 def test_worker_busy_true_when_non_terminal_session_exists(tmp_path: Path):
     """Authoritative source of truth: the session store. A claimed or
-    running row means busy (yielded does not — see #636)."""
+    running row means busy (yielded does not)."""
     if not AUTO_DEPLOY.exists():
         pytest.skip("scripts/auto-deploy.sh not present")
     workdir = tmp_path / "work"
@@ -345,22 +345,18 @@ def _wait_until_lock_held(lock_path: Path, timeout: float = 30.0) -> None:
     lock_path — i.e. until a background holder has actually acquired, not
     just been spawned.
 
-    #833's actual root cause (found on review), reproduced here too since
-    this file's own lock-holder tests use the identical pattern. Two
-    contributing problems, both fixed here (see
-    tests/test_auto_update_macos.py's copy of this same function for the
-    full writeup, including the reproduction numbers):
+    Uses `fcntl.flock()` directly rather than shelling out to the external
+    `flock`(1) CLI on every poll iteration, which would be a fresh
+    fork+exec per attempt, compounding exactly the process-spawn
+    contention this is trying to survive.
 
-    1. The probe used to shell out to the external `flock`(1) CLI on every
-       poll iteration -- a fresh fork+exec per attempt, compounding exactly
-       the process-spawn contention this is trying to survive. It now calls
-       `fcntl.flock()` directly instead.
-    2. A short (formerly 5s, then 30s) timeout assumed the HOLDER's own
-       bash-spawns-python3-spawns-flock startup chain gets scheduled
-       promptly, which doesn't hold under the genuine system-wide
-       contention a full `-m unit` run creates -- a single-file run can't
-       reproduce this at all, since --dist loadscope puts each file on one
-       worker with no intra-file concurrency."""
+    A generous timeout is needed: the HOLDER's own
+    bash-spawns-python3-spawns-flock startup chain does not always get
+    scheduled promptly under the genuine system-wide contention a full
+    `-m unit` run creates -- a single-file run can't reproduce this at
+    all, since --dist loadscope puts each file on one worker with no
+    intra-file concurrency. See tests/test_auto_update_macos.py's copy of
+    this same function for the full writeup."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
@@ -385,15 +381,14 @@ def _start_shared_lock_holder(lock_path: Path, seconds: float = 60.0) -> subproc
     pid releases it immediately — mirroring what
     run_all_syncs.py's _acquire_sync_lock() actually does.
 
-    `seconds` is a safety cap, not the intended hold duration (found on
-    review, #833/F6, applied here too for the same reason) — every caller
+    `seconds` is a safety cap, not the intended hold duration — every caller
     already calls `holder.terminate()`/`.kill()` in its own `finally`, which
     ends this process (and so releases the flock) essentially instantly
     regardless of how much of `seconds` remains. A short fixed value here
-    used to race the CALLING TEST's own scheduling under heavy parallel
+    would race the CALLING TEST's own scheduling under heavy parallel
     load: if the wall-clock time between spawning this holder and the test's
-    assertion actually running exceeded it, the holder had already released
-    the lock naturally, before the test ever checked it."""
+    assertion actually running exceeds it, the holder would already have
+    released the lock naturally, before the test ever checked it."""
     return subprocess.Popen([
         sys.executable, "-c",
         f"import fcntl, time\n"
@@ -404,12 +399,12 @@ def _start_shared_lock_holder(lock_path: Path, seconds: float = 60.0) -> subproc
 
 
 # ---------------------------------------------------------------------------
-# #793 — sync_in_progress_lock_acquire/_release: a shared/exclusive flock on
-# data/sync.lock, replacing an earlier pid-in-a-file marker design that
-# review found to be TOCTOU (checked once, then restarted later), vulnerable
-# to pid reuse (a dead sync's marker misread as a live, unrelated process),
-# and unable to represent two overlapping manual syncs (one global marker,
-# overwritten and cleared by whichever sync writes/exits last). A kernel-held
+# sync_in_progress_lock_acquire/_release: a shared/exclusive flock on
+# data/sync.lock. A pid-in-a-file marker design would be TOCTOU (checked
+# once, then restarted later), vulnerable to pid reuse (a dead sync's
+# marker misread as a live, unrelated process), and unable to represent
+# two overlapping manual syncs (one global marker, overwritten and
+# cleared by whichever sync writes/exits last). A kernel-held
 # flock has none of those: any number of processes can each hold the shared
 # side independently, the kernel releases it the instant a holder exits for
 # ANY reason (including SIGKILL) with no cleanup code involved, and
@@ -549,13 +544,13 @@ def test_two_overlapping_syncs_are_both_recognized_as_in_progress(tmp_path: Path
 
 @pytest.mark.unit
 def test_lock_is_visible_across_two_different_checkouts_sharing_home(tmp_path: Path):
-    """Finding 2 (review): the lock must be host-wide, not keyed to
+    """The lock must be host-wide, not keyed to
     $PROJECT_DIR/data — this repo is routinely worked in multiple git
     worktrees, each with its own checkout-local data/ directory, so a lock
     keyed to PROJECT_DIR is invisible across checkouts. A sync launched
     from checkout B must still defer a deploy running from checkout A.
     Two independent synthetic checkouts share $HOME (so the fixed
-    $HOME/.lifeos/sync.lock path — not configurable, per Finding NEW-2 —
+    $HOME/.lifeos/sync.lock path — not configurable —
     resolves identically for both) but each has its own PROJECT_DIR,
     proving cross-checkout visibility without touching the real machine's
     actual lock file (HOME points at an isolated sandbox for the duration
@@ -619,10 +614,10 @@ def test_lock_release_allows_a_subsequent_acquire(tmp_path: Path):
 
 @pytest.mark.unit
 def test_lock_acquire_logs_distinct_error_when_flock_itself_fails(tmp_path: Path):
-    """Found on review: every flock failure used to look identical to 'sync
-    in progress'. A genuine tool/environment failure (here simulated by a
+    """A genuine tool/environment failure (here simulated by a
     broken `flock`) must still defer — the safe default — but log something
-    an operator can actually diagnose, not the generic sync-busy message."""
+    an operator can actually diagnose, distinct from the generic sync-busy
+    message."""
     if not AUTO_DEPLOY.exists():
         pytest.skip("scripts/auto-deploy.sh not present")
     repo = _make_repo_for_drift(tmp_path)
@@ -767,7 +762,7 @@ def _make_policy_repo(tmp_path: Path) -> tuple[Path, Path, int]:
     files under `state/` (so a stubbed restart can move a unit's recorded
     start time forward, the way a real restart would). Returns
     (repo, state_dir, code_epoch) where code_epoch is the fixed mtime given
-    to the one tracked api/ file, an hour in the past.
+    to the one tracked api/ file, one hour earlier than now.
     """
     origin = tmp_path / "origin.git"
     subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
@@ -857,7 +852,7 @@ def _run_main(repo: Path, state: Path, venv: Path, env_extra: dict | None = None
     env["PYTHONPATH"] = str(REPO_ROOT)
     # Isolated by default — see _run_sourced()'s comment on why this is a
     # $HOME override, not a sync-lock-specific one, and on why it's set
-    # AFTER env_extra rather than before (#833/F7).
+    # AFTER env_extra rather than before.
     fake_home = repo / "home"
     fake_home.mkdir(exist_ok=True)
     env.update(env_extra or {})
@@ -871,8 +866,8 @@ def _run_main(repo: Path, state: Path, venv: Path, env_extra: dict | None = None
 @pytest.mark.unit
 def test_main_restarts_stale_services_and_defers_busy_worker(tmp_path: Path):
     """One tick, three active-but-stale services: api and mcp-http restart;
-    the worker — mid-session — defers instead (#631 acceptance: never
-    silently stay stale, never kill an in-flight #agent session)."""
+    the worker — mid-session — defers instead: never
+    silently stay stale, never kill an in-flight #agent session."""
     if not AUTO_DEPLOY.exists():
         pytest.skip("scripts/auto-deploy.sh not present")
     repo, state, code_epoch = _make_policy_repo(tmp_path)
@@ -927,7 +922,7 @@ def test_main_no_thrash_on_repeat_run_with_no_new_commits(tmp_path: Path):
 
 @pytest.mark.unit
 def test_main_restarts_when_only_env_file_changed(tmp_path: Path):
-    """#792: editing .env (config, not tracked source) must still be
+    """Editing .env (config, not tracked source) must still be
     treated as drift — a service started after the last code change but
     before a later .env edit must still restart."""
     if not AUTO_DEPLOY.exists():
@@ -954,7 +949,7 @@ def test_main_restarts_when_only_env_file_changed(tmp_path: Path):
 def test_main_does_not_restart_again_after_a_manual_restart_already_picked_up_env(
     tmp_path: Path,
 ):
-    """Finding 1 (review): a marker-only check is wrong once a marker
+    """A marker-only check is wrong once a marker
     exists. Scenario reproduced end-to-end: tick 1 restarts lifeos-api for
     code drift, recording an env-mtime-applied marker for whatever .env
     said at that moment. The operator then edits .env AND manually runs
@@ -1018,15 +1013,14 @@ def test_main_no_restart_when_neither_code_nor_env_changed_since_start(tmp_path:
 
 @pytest.mark.unit
 def test_main_proceeds_when_only_untracked_files_are_present(tmp_path: Path):
-    """#634: an untracked path must not block the deploy.
+    """An untracked path must not block the deploy.
 
-    `.worktrees/` is the conventional location for worktree-based development
-    here — `.git/hooks/post-commit` already expects worktrees to exist — and it
-    is untracked. While the guard counted untracked paths, its mere presence
-    made `git status --porcelain` non-empty, so auto-deploy skipped every tick
-    silently: 62 consecutive skips on the real host, during which #631's drift
-    check never executed at all. The service stayed stale and the only evidence
-    was a log line nobody reads.
+    `.worktrees/` is the conventional location for worktree-based
+    development here — `.git/hooks/post-commit` already expects worktrees
+    to exist — and it is untracked. If the guard counted untracked paths,
+    its mere presence would make `git status --porcelain` non-empty, so
+    auto-deploy would skip every tick silently, leaving the service stale
+    with only a log line nobody reads as evidence.
     """
     if not AUTO_DEPLOY.exists():
         pytest.skip("scripts/auto-deploy.sh not present")
@@ -1053,7 +1047,8 @@ def test_main_proceeds_when_only_untracked_files_are_present(tmp_path: Path):
 
 @pytest.mark.unit
 def test_main_still_skips_when_a_tracked_file_is_modified(tmp_path: Path):
-    """The guard's actual purpose survives #634's narrowing: uncommitted edits
+    """The guard still serves its purpose after narrowing to ignore
+    untracked files: uncommitted edits
     to tracked code still stop the deploy. Loosening to
     `--untracked-files=no` must not become "never skip"."""
     if not AUTO_DEPLOY.exists():
@@ -1129,7 +1124,7 @@ def _worker_busy_rc(tmp_path: Path, statuses: list[str]) -> str:
 
 @pytest.mark.unit
 def test_worker_busy_excludes_yielded_sessions(tmp_path: Path):
-    """#636: a yielded session must NOT block a restart.
+    """A yielded session must NOT block a restart.
 
     The worker's own recovery path skips yielded sessions ("Sleeping sessions
     are healthy — main loop will wake them"), so a restart does not harm them.

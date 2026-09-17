@@ -1,6 +1,6 @@
 """
 Tests for the Scheduler API routes (/api/scheduler) and the agent-tools
-manage_schedules wrapper — the renamed surface from #246.
+manage_schedules wrapper.
 
 CRUD is tested in-process via TestClient with a mocked store; the agent-tools
 path is tested against a real store on a temp vault.
@@ -91,7 +91,7 @@ class TestSchedulerAPI:
         assert resp.status_code == 400
 
     def test_create_failure_is_never_success_shaped(self, mock_store):
-        """#609: a store write failure must be a non-2xx, never a 200 with
+        """A store write failure must be a non-2xx, never a 200 with
         the created schedule's own shape."""
         from fastapi.testclient import TestClient
         from api.main import app

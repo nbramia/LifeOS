@@ -1,10 +1,11 @@
-"""Tests for scripts/sync_monarch_money.py's clean-skip path (issue #687).
+"""Tests for scripts/sync_monarch_money.py's clean-skip path.
 
-Before this fix, an unconfigured Monarch install (no cached session, no
-MONARCH_EMAIL/MONARCH_PASSWORD) raised inside MonarchClient._get_client(),
-propagated through sync_monarch() to main()'s broad `except Exception`, and
-recorded SyncStatus.FAILED every night forever on any install without
-Monarch. These tests pin both directions: an unconfigured install skips
+An unconfigured Monarch install (no cached session, no
+MONARCH_EMAIL/MONARCH_PASSWORD) must not raise inside
+MonarchClient._get_client(), propagate through sync_monarch() to main()'s
+broad `except Exception`, and record SyncStatus.FAILED every night forever
+on any install without Monarch. These tests pin both directions: an
+unconfigured install skips
 cleanly (SYNC_SKIPPED marker + SyncStatus.SKIPPED, run succeeds), and a
 configured-but-genuinely-broken install still fails loud, so absence of
 config and presence of real errors are never conflated.
@@ -67,7 +68,7 @@ class TestSyncMonarchFunctionSkip:
 class TestMainRecordsSkipStatus:
     """Exercises main() end-to-end -- the sync_health status it records is
     the structured contract the orchestrator (and /health) actually reads,
-    not the log text (#646's lesson)."""
+    not the log text."""
 
     def _patch_sync_health(self, monkeypatch, recorded):
         monkeypatch.setattr(
@@ -121,7 +122,7 @@ class TestMainRecordsSkipStatus:
         assert recorded["status"] == SyncStatus.FAILED
 
     def test_empty_exception_message_falls_back_to_class_name(self, monkeypatch):
-        """A bare exception with no message (issue #781) must still record
+        """A bare exception with no message must still record
         something an operator — and run_all_syncs.py's transient-failure
         classifier, which reads this same subprocess's stderr — can act
         on, rather than an empty string that matches nothing."""
@@ -150,12 +151,12 @@ class TestMainRecordsSkipStatus:
         assert "ConnectionError" in error_message
 
     def test_normal_exception_message_unchanged(self, monkeypatch, caplog):
-        """An exception with a real message must be recorded exactly as
-        before this change — no class-name prefix added when it isn't
-        needed (#781's acceptance criteria: behavior-preserving). Also
-        pins the emitted log text, since that's what run_all_syncs.py's
-        transient-failure classifier actually reads (this script runs as
-        a subprocess and the classifier inspects captured stderr)."""
+        """An exception with a real message must be recorded verbatim —
+        no class-name prefix added when it isn't needed (behavior-
+        preserving). Also pins the emitted log text, since that's what
+        run_all_syncs.py's transient-failure classifier actually reads
+        (this script runs as a subprocess and the classifier inspects
+        captured stderr)."""
         import logging
         from api.services.sync_health import SyncStatus
         from scripts.sync_monarch_money import main
@@ -184,7 +185,7 @@ class TestMainRecordsSkipStatus:
 
 
 class TestFailureMessageEnrichment:
-    """Unit tests for _failure_message()'s fallback construction (#781)."""
+    """Unit tests for _failure_message()'s fallback construction."""
 
     def test_empty_message_uses_class_name(self):
         from scripts.sync_monarch_money import _failure_message

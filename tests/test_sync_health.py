@@ -247,10 +247,10 @@ class TestSyncHealthSummary:
         """Test summary when some sources have issues."""
         with patch('api.services.sync_health.SYNC_HEALTH_DB_PATH', temp_db):
             # One fresh success — use vault_reindex (never conditionally
-            # disabled, unlike gmail_personal since #687: a dev checkout
-            # with no config/credentials-personal.json now correctly
-            # reports that source as disabled, so it can no longer stand
-            # in for "a source that's always healthy" here).
+            # disabled, unlike gmail_personal: a dev checkout with no
+            # config/credentials-personal.json reports that source as
+            # disabled, so it can't stand in for "a source that's always
+            # healthy" here).
             run_id = record_sync_start("vault_reindex")
             record_sync_complete(run_id, SyncStatus.SUCCESS)
 
@@ -284,7 +284,7 @@ class TestSyncHealthSummary:
         """When some tracked sources are disabled, the healthy message must
         break the total down (active vs disabled) so it doesn't read as
         contradicting a nightly 'Total sources: N' line that only counts the
-        sources actually run (issue #494 follow-up)."""
+        sources actually run."""
         summary = {
             "all_healthy": True,
             "total_sources": 28,
@@ -357,8 +357,8 @@ class TestSyncSourceConfiguration:
 
 
 class TestPersonalGoogleDisabledCheck:
-    """Direct tests of _is_source_disabled()'s personal-Google handling
-    (issue #687). Without this, an unconfigured install would show
+    """Direct tests of _is_source_disabled()'s personal-Google handling.
+    Without this, an unconfigured install would show
     gmail_personal/calendar_personal as permanently "never run" in the
     health summary instead of quietly excluded, since run_all_syncs
     pre-skips the source and never writes a sync_runs row for it.
@@ -466,9 +466,9 @@ class TestOrphanReaper:
         with patch('api.services.sync_health.SYNC_HEALTH_DB_PATH', temp_db):
             conn = get_sync_health_db()
             # 10h ago — should be reaped at default 8h cutoff. vault_reindex
-            # (not gmail_personal) since #687: a dev checkout with no
-            # config/credentials-personal.json now correctly reports that
-            # source as disabled, and get_sync_health() deliberately doesn't
+            # (not gmail_personal): a dev checkout with no
+            # config/credentials-personal.json reports that source as
+            # disabled, and get_sync_health() deliberately doesn't
             # surface last_status for a disabled source.
             old = (datetime.now(timezone.utc) - timedelta(hours=10)).isoformat()
             conn.execute(
@@ -505,7 +505,7 @@ class TestOrphanReaper:
 
 
 class TestSourceEntityDriftDetector:
-    """Tests for the silent-regression detector from issue #199 §2."""
+    """Tests for the silent-regression detector."""
 
     def _seed(self, tmp_path, interactions: list, source_entities: list):
         """Seed minimal interactions.db / crm.db with given rows."""
@@ -743,7 +743,7 @@ class TestTypicalDuration:
 
 
 class TestRepeatedYieldStreak:
-    """Tests for get_repeated_yield_streak (issue #646).
+    """Tests for get_repeated_yield_streak.
 
     A dead export agent that leaves a stale upstream file in place makes a
     re-import report the same non-zero count night after night — invisible
