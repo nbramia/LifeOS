@@ -20,8 +20,11 @@ Exits non-zero if the score falls below PASS_THRESHOLD (see below).
 """
 import asyncio
 import sys
+from pathlib import Path
 
-from api.services.pebble_capture import PebbleJournalClassifier, validate_plan
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from api.services.pebble_capture import PebbleJournalClassifier, validate_plan  # noqa: E402
 
 # Chosen so an occasional miss on a genuinely ambiguous case doesn't fail a
 # healthy model, while still catching a model that has lost the log-only

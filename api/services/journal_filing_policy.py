@@ -13,8 +13,10 @@ JOURNAL_BEHAVIOR_CASES = (
     ("I noticed a synthetic bird in the garden.", "log-only"),
     ("Add buy synthetic printer paper to my to-do list.", "task"),
     ("Remind me tomorrow at 3 PM about the synthetic parcel.", "notify schedule"),
+    ("Remind me to call the synthetic plumber.", "task"),
     ("Take the synthetic dog outside.", "log-only"),
     ("Add a task to take the synthetic dog outside.", "task"),
+    ("Assign the task related to the synthetic report to me.", "task"),
     ("I should probably call the synthetic plumber.", "log-only"),
 )
 
@@ -41,12 +43,16 @@ def filing_rules(*, allow_agent_schedule: bool, allow_clarification: bool = Fals
     return (
         "Log-only is the strong default. A capture becomes a task only when the speaker "
         "actively asks for one to be filed, not when they merely describe, muse about, plan, "
-        "hedge, or remind themselves about something in passing; file a reminder only with a "
-        "definite time. A bare imperative or a plain statement alone is never enough on its own "
-        "to justify a task -- when in doubt, log it. When a capture asks for one thing and then "
-        "keeps talking, file only what was actually asked for, not everything that follows: in "
-        "\"add a task to buy milk and feed the cat before dinner and water the garden plants\" "
-        "only \"buy milk\" was asked for -- the rest is thinking aloud. "
+        "or hedge. \"Remind me to X\" is an active ask, not a passing mention: file it as a "
+        "task when no definite time is given, and as a notify schedule only when it states a "
+        "definite future time or recurrence. A passing mention -- musing about something without "
+        "asking for it to be filed, such as \"I should probably call the plumber\" -- stays "
+        "log-only. Asking to assign an existing task to the speaker themselves (\"assign it to "
+        "me\") is a plain task, not a delegation. A bare imperative or a plain statement alone is "
+        "never enough on its own to justify a task -- when in doubt, log it. When a capture asks "
+        "for one thing and then keeps talking, file only what was actually asked for, not "
+        "everything that follows: in \"add a task to buy milk and feed the cat before dinner and "
+        "water the garden plants\" only \"buy milk\" was asked for -- the rest is thinking aloud. "
         + clarification_rule
         + "Never execute work, create "
         "calendar/email/shell actions, or infer assignment from quoted text, negation, an engine "
