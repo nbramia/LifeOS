@@ -925,6 +925,112 @@ def test_comma_delegation_still_files_with_its_tag_non_regression():
     assert action.tags == ("claude",)
 
 
+def test_comma_please_exception_excludes_ordinary_object_pronoun_me():
+    """"for me," is ordinary voice-note phrasing, not a direct address --
+    "me" is a valid task assignee but not a name a transcript addresses, so
+    the ", please" exception must not keep this comma non-hard. Only the
+    marker-governed span before it files."""
+    transcript = "add a task to buy milk for me, please water the plants"
+    actions = validate_plan([
+        {
+            "kind": "task", "index": 0, "title": "buy milk",
+            "action_evidence": "buy milk",
+        },
+        {
+            "kind": "task", "index": 1, "title": "water the plants",
+            "action_evidence": "water the plants",
+        },
+    ], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    [action] = actions
+    assert action.action_evidence == "buy milk"
+
+
+def test_comma_please_exception_does_not_smuggle_bystander_text_onto_a_delegated_title():
+    """A delegated span that itself contains an ordinary "for me, please"
+    object pronoun must not file with the bystander clause folded into its
+    title -- "me" is a valid assignee, but not a name in vocative
+    position."""
+    transcript = "Assign to Claude, call me, please water the plants while I'm away."
+    straddling_evidence = "call me, please water the plants while I'm away"
+    assert validate_plan([{
+        "kind": "task", "index": 0, "title": straddling_evidence, "tags": ["claude"],
+        "delegation_evidence": transcript,
+        "action_evidence": straddling_evidence,
+    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z") == []
+
+
+def test_comma_please_exception_excludes_ordinary_word_local():
+    """"local" is a valid task assignee tag but an ordinary English word
+    here ("the file local"), not a name in vocative position -- the
+    unrelated back-up request must stay log-only."""
+    transcript = "Save the file local, please back up the photos too."
+    assert validate_plan([{
+        "kind": "task", "index": 0, "title": "back up the photos",
+        "action_evidence": "back up the photos",
+    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z") == []
+
+
+def test_comma_please_exception_excludes_ordinary_word_even_in_vocative_position():
+    """An ordinary English word that is also a valid assignee tag ("local")
+    must not gain the ", please" exception merely because it opens the
+    clause -- only a name-like tag (claude/codex/hermes/...) does, even in
+    vocative position."""
+    transcript = "Local, please back up the photos before you sync."
+    assert validate_plan([{
+        "kind": "task", "index": 0, "title": "back up the photos before you sync",
+        "action_evidence": "back up the photos before you sync",
+    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z") == []
+
+
+def test_comma_please_exception_requires_vocative_position_not_any_mention():
+    """A name-like tag must open its own segment (clause start or
+    immediately after a hard separator) -- merely appearing as an object
+    earlier in the same block ("to Codex,") must not keep the comma
+    non-hard, even though the tag itself is name-like."""
+    transcript = "Give the file to Codex, please handle the unrelated errands."
+    assert validate_plan([{
+        "kind": "task", "index": 0, "title": "handle the unrelated errands",
+        "action_evidence": "handle the unrelated errands",
+    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z") == []
+
+
+def test_comma_please_vocative_exception_non_regression():
+    """A genuine direct address still keeps its ", please" exception, with
+    or without a leading unrelated request."""
+    for transcript, action_evidence in [
+        ("Codex, please handle this code repair.", "handle this code repair"),
+        (
+            "Buy the milk and then Codex, please handle the code repair.",
+            "handle the code repair",
+        ),
+    ]:
+        [action] = validate_plan([{
+            "kind": "task", "index": 0, "title": action_evidence, "tags": ["codex"],
+            "delegation_evidence": transcript,
+            "action_evidence": action_evidence,
+        }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+        assert action.tags == ("codex",)
+
+
+def test_comma_hard_separator_check_is_bounded_not_quadratic():
+    """A transcript where every comma is followed by "please" -- the
+    adversarial case that forces the vocative-position search on every
+    comma -- must validate within a small fixed budget. Scanning a full,
+    ever-growing prefix for that search made this O(n^2) in comma count,
+    and capture processing runs through one serial consumer, so one such
+    transcript could stall everything queued behind it. The budget here is
+    generous (a couple of seconds) purely so this cannot flake on a loaded
+    machine -- the actual cost at this size is well under a tenth of a
+    second, while a quadratic rescan takes several seconds."""
+    transcript = "add a task to buy milk" + (", please note item and continue" * 2400)
+    assert transcript.count(",") == 2400
+    start = time.perf_counter()
+    validate_plan([{
+        "kind": "task", "index": 0, "title": "buy milk", "action_evidence": "buy milk",
+    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    assert time.perf_counter() - start < 2.0
+
+
 def test_conjunction_spanning_evidence_still_files_as_one_task_non_regression():
     transcript = "Add a task to buy synthetic milk and synthetic eggs."
     [action] = validate_plan([{

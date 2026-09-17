@@ -73,19 +73,44 @@ _PLAIN_TASK_FILING_RE = re.compile(
 #
 # Hard separators end a request outright: an evidence span may never cross
 # one, so they also bound the containment check in `_explicit_task_request`.
-# A comma is hard unless the token immediately before it is a valid task
-# assignee and "please" immediately follows -- that is the same direct-
-# address shape the marker patterns themselves already span ("Codex, please
-# handle this"; see `_explicit_tags`), so splitting there would sever a name
-# from its verb. Any other comma ("...on my list, please call the plumber")
-# is an ordinary clause boundary and must split.
+# A comma is hard unless it directly addresses a name-like assignee and
+# "please" immediately follows -- that is the same direct-address shape the
+# marker patterns themselves already span ("Codex, please handle this"; see
+# `_explicit_tags`), so splitting there would sever a name from its verb.
+# Any other comma ("...on my list, please call the plumber") is an ordinary
+# clause boundary and must split.
 _TASK_REQUEST_HARD_SEPARATOR_RE = re.compile(
     r"\b(?:and\s+then|then|also|plus|as\s+well\s+as)\b|,", re.I
 )
-_ASSIGNEE_ALTERNATION_RE = "|".join(
-    sorted((re.escape(tag) for tag in _VALID_TASK_ASSIGNEES), key=len, reverse=True)
+# The ", please" exception must fire only for a genuine direct address and
+# never for an ordinary object pronoun ("...for me, please ..."), so two
+# constraints gate it:
+#   - name-like tag only: `_VALID_TASK_ASSIGNEES` minus the ordinary English
+#     words "me"/"local"/"cloud", which are valid assignees but not names a
+#     transcript would ever address.
+#   - vocative position: the tag must open its own segment (clause start or
+#     immediately after a hard-separator token), which is what distinguishes
+#     an address ("Codex, please...") from a trailing object pronoun
+#     ("...for me, please...").
+# Both checks run over a small bounded window around the comma instead of a
+# full clause slice, so the per-comma cost is O(1) rather than O(n) -- a full
+# prefix rescan for every comma made block-splitting O(n^2) in comma count.
+_TASK_REQUEST_NAME_LIKE_ASSIGNEES = frozenset(
+    tag for tag in _VALID_TASK_ASSIGNEES if tag not in {"me", "local", "cloud"}
 )
-_COMMA_ASSIGNEE_BEFORE_RE = re.compile(rf"\b(?:{_ASSIGNEE_ALTERNATION_RE})\s*$", re.I)
+_NAME_LIKE_ASSIGNEE_ALTERNATION_RE = "|".join(
+    sorted(
+        (re.escape(tag) for tag in _TASK_REQUEST_NAME_LIKE_ASSIGNEES),
+        key=len,
+        reverse=True,
+    )
+)
+_COMMA_SEPARATOR_WINDOW = 40  # longest name-like tag plus a boundary token
+_COMMA_VOCATIVE_ASSIGNEE_BEFORE_RE = re.compile(
+    rf"(?:^|[.!?;\n,]|\band\s+then\b|\bthen\b|\balso\b|\bplus\b|\bas\s+well\s+as\b)"
+    rf"\s*#?(?:{_NAME_LIKE_ASSIGNEE_ALTERNATION_RE})\s*$",
+    re.I,
+)
 _COMMA_PLEASE_AFTER_RE = re.compile(r"^\s*please\b", re.I)
 # A bare "and" is soft: an evidence span may cross it (it is not a request
 # boundary on its own), but a marker still only governs the sub-segment its
@@ -112,22 +137,23 @@ def _task_request_has_marker(segment: str) -> bool:
 
 
 def _comma_is_hard_separator(clause: str, comma_index: int) -> bool:
-    before = clause[:comma_index]
-    after = clause[comma_index + 1:]
-    if not _COMMA_ASSIGNEE_BEFORE_RE.search(before):
+    after = clause[comma_index + 1:comma_index + 1 + _COMMA_SEPARATOR_WINDOW]
+    if not _COMMA_PLEASE_AFTER_RE.match(after):
         return True
-    return not _COMMA_PLEASE_AFTER_RE.match(after)
+    before = clause[max(0, comma_index - _COMMA_SEPARATOR_WINDOW):comma_index]
+    return not _COMMA_VOCATIVE_ASSIGNEE_BEFORE_RE.search(before)
 
 
 def _task_request_hard_blocks(clause: str) -> list[tuple[int, int]]:
     """Split one positive clause into hard blocks an evidence span may not cross.
 
     A coordinating conjunction other than bare "and" always starts a new
-    block; a comma starts one unless it directly addresses a valid assignee
-    ("Codex, please ..."). An infinitive complement immediately after a
-    boundary is merged back into the block before it only when that block
-    already carries a filing/delegation marker of its own -- otherwise it
-    would pull an unrelated leading request under a later marker.
+    block; a comma starts one unless it directly addresses a name-like
+    assignee in vocative position ("Codex, please ..."). An infinitive
+    complement immediately after a boundary is merged back into the block
+    before it only when that block already carries a filing/delegation
+    marker of its own -- otherwise it would pull an unrelated leading
+    request under a later marker.
     """
     raw: list[tuple[int, int]] = []
     last = 0
