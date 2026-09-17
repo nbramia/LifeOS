@@ -175,7 +175,7 @@ Option (a) is the default. Options (b) and (c) require explicit justification.
 
 - LifeOS handles deeply personal data: emails, messages, photos, finances, therapy notes.
 - Never log, expose, or transmit personal data beyond what the system requires.
-- All data stays local. LLM inference runs locally — no data leaves the machine.
+- LLM inference runs locally by default and on a keyless install; a remote or cloud provider is used only when the operator explicitly configures one (`LIFEOS_REMOTE_LLM_*`, `LIFEOS_LLM_BACKEND`, or an Anthropic key) — see [ADR-024](docs/adr/024-remote-llm-backend.md) and, for Pebble specifically, [guides/pebble-capture.md](docs/guides/pebble-capture.md). Sending data off-box is always an explicit operator choice, never a silent default.
 - Use obviously synthetic data in all documentation and test fixtures.
 - Security-sensitive implementation details belong in code, not docs.
 - When in doubt about whether something is a privacy concern, treat it as one.
