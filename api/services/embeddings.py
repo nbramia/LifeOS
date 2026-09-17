@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # GPU error keywords — shared between load-time and encode-time fallback
 _GPU_ERROR_KEYWORDS = ("hip", "cuda", "out of memory", "invalid device", "gpu hang")
 
-# Outcomes of _acquire_gpu_lock(). See its docstring (#521).
+# Outcomes of _acquire_gpu_lock(). See its docstring.
 _LOCK_ACQUIRED = "acquired"
 _LOCK_DISABLED = "disabled"
 _LOCK_ERROR = "error"
@@ -204,14 +204,14 @@ class EmbeddingService:
     @contextmanager
     def _acquire_gpu_lock(self):
         """Cross-process lock serializing GPU embedding across all LifeOS
-        processes (API server, agent worker, nightly sync, ad-hoc scripts) (#521).
+        processes (API server, agent worker, nightly sync, ad-hoc scripts).
 
         This host's iGPU has only 8 SDMA queues. If several processes each try
         to grab GPU compute queues at the same time (e.g. the API server and a
         manual reindex both embedding on GPU), the kernel logs "No more SDMA
         queue to allocate" and the amdgpu driver has, on this host, wedged into
-        an unrecoverable freeze requiring a hard reboot — the incident #483's
-        per-call batch-size cap only partially addressed (that cap bounds the
+        an unrecoverable freeze requiring a hard reboot — a per-call batch-size
+        cap elsewhere only partially addresses this (that cap bounds the
         size of one call; it does nothing about multiple concurrent callers).
 
         Implementation: ``fcntl.flock`` on a well-known file
@@ -224,8 +224,8 @@ class EmbeddingService:
           - It needs no extra infrastructure: no server, no port, no schema —
             just a file, which fits a single-host coordination problem.
           - It works across independent processes (unlike ``threading.Lock``,
-            which only serializes within one process — the exact gap #521
-            reported: ``self._load_lock`` already does the in-process case).
+            which only serializes within one process, not across processes:
+            ``self._load_lock`` already handles the in-process case).
 
         Bounded wait: gives up after
         ``settings.embedding_gpu_lock_timeout_seconds`` and yields
@@ -239,8 +239,8 @@ class EmbeddingService:
         purpose — an error means the *locking mechanism* is unavailable, not
         that another process holds the GPU, so the caller proceeds on GPU
         unserialized rather than needlessly forcing CPU. Serializing GPU access
-        is a safety improvement; failing (or forcibly downgrading) an embed
-        because a lock file couldn't be opened would be strictly worse.
+        reduces the risk of a driver freeze; failing (or forcibly downgrading)
+        an embed because a lock file couldn't be opened would be strictly worse.
         """
         if not settings.embedding_gpu_lock_enabled or not settings.embedding_gpu_lock_path:
             yield _LOCK_DISABLED
@@ -315,7 +315,7 @@ class EmbeddingService:
 
     def _encode_with_fallback(self, data, **kwargs):
         """Encode with GPU→CPU fallback on RuntimeError, serialized against
-        other processes' GPU embedding via a cross-process lock (#521).
+        other processes' GPU embedding via a cross-process lock.
 
         If the model was loaded on GPU and encode() raises a GPU error,
         the model is reloaded on CPU and the encode is retried.
@@ -323,7 +323,7 @@ class EmbeddingService:
         # Bound the batch so a large document's chunks are encoded in small
         # groups instead of one giant allocation. An unbounded batch of a
         # multi-MB note's chunks spiked ~10GB of VRAM in a single call, which
-        # exhausted the gfx1151 iGPU's SDMA queues and froze the host (#483).
+        # exhausted the gfx1151 iGPU's SDMA queues and froze the host.
         # This is semantically neutral: batching changes only peak memory, not
         # the resulting vectors. Callers may still override batch_size.
         kwargs.setdefault("batch_size", settings.embedding_batch_size)

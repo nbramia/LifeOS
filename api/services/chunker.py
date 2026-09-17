@@ -301,8 +301,8 @@ def generate_chunk_context(
     Generate contextual prefix for a chunk.
 
     Adds 1-2 sentences describing what document this chunk is from,
-    which significantly improves retrieval accuracy by helping the
-    embedding model understand context.
+    which gives the embedding model more context to work with when
+    understanding the chunk.
 
     Args:
         file_path: Path to the source file

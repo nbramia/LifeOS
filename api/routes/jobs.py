@@ -30,7 +30,7 @@ class JobResponse(BaseModel):
     max_attempts: int
     priority: int
     error: Optional[str] = None
-    # Additive (#768): true when this job is reported "running" but its
+    # True when this job is reported "running" but its
     # started_at predates this process's own start — it was stranded by a
     # previous process (e.g. an unrelated auto-deploy restart mid-job) and
     # is not actually progressing. Surfaced here so a caller polling a

@@ -153,7 +153,7 @@ class GmailDraftLedger:
         ledger's memory of it was lost. Bounded to `window_seconds` (the same
         cooldown window used for sends): any draft that could have been
         silently lost was created before the ledger was recreated, so once one
-        full cooldown window has elapsed, it would no longer be blocked even
+        full cooldown window has elapsed, it would stop being blocked even
         if it had been tracked perfectly.
         """
         if self.freshly_initialized_at is None:
@@ -219,7 +219,7 @@ class GmailDraftLedger:
         window has passed they can never block anything again.
 
         Turn-tagged entries back a *different* guarantee: "a send carrying the
-        same turn id as creation is refused regardless of elapsed time" (#588).
+        same turn id as creation is refused regardless of elapsed time."
         A time-based cutoff would delete exactly the rows that promise applies
         to once they age past the cooldown, silently reopening the same-turn
         bypass the gate exists to close. So turn-tagged rows are exempt from

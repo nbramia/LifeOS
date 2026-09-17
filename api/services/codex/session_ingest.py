@@ -827,7 +827,7 @@ def build_snapshot(
                 edges=list(edges),
             )
     # Per-row copies on the cache-write path too: the returned rows are
-    # distinct objects from the ones the cache entry now owns, so a caller
+    # distinct objects from the ones the cache entry owns, so a caller
     # mutating a returned row can never corrupt a warm cache.
     return [dict(row) for row in sessions], list(edges)
 

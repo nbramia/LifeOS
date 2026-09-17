@@ -284,9 +284,9 @@ def _build_preflight_preview(request: CreateTaskRequest) -> PreflightPreviewResp
     # can't know preset size; this is a floor, not a calibrated estimate.
     half_tokens = max(0, pre.budget.max_tokens // 2)
     if pre.routing == ROUTE_REMOTE:
-        # (#809) `#cloud` — priced from the remote provider's own configured
+        # `#cloud` — priced from the remote provider's own configured
         # rate, not the Anthropic table `cost_for` looks up. Unset rates
-        # mean "unknown, not free" (#669's convention) — the estimate floors
+        # mean "unknown, not free" — the estimate floors
         # at 0 rather than guessing, same as an unrecognized model would.
         input_price = settings.remote_llm_input_price_per_mtok
         output_price = settings.remote_llm_output_price_per_mtok
@@ -369,7 +369,7 @@ async def list_tasks(
     - status: Filter by status (todo, done, in_progress, cancelled, deferred, blocked, urgent)
     - context: Filter by context/category
     - tag: Filter by tag (with or without '#')
-    - due_before: Filter tasks due before this date (YYYY-MM-DD)
+    - due_before: Filter tasks due on or before the given date (YYYY-MM-DD)
     - query: Fuzzy text search on description
     """
     manager = get_task_manager()
@@ -417,7 +417,7 @@ async def list_conflicts():
 
 
 # ---------------------------------------------------------------------------
-# Human queue (#852) — fire-and-forget cards any agent can file/resolve for
+# Human queue — fire-and-forget cards any agent can file/resolve for
 # the operator. Business logic (dedupe, done_when validation, card shape)
 # lives in api/services/human_queue.py, shared with the native chat tool and
 # the briefing line. Registered before /{task_id} — see the module comment

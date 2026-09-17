@@ -415,7 +415,7 @@ class ServiceHealthRegistry:
         else:
             overall = "healthy"
 
-        # Monarch session age (issue #199 §3) — surface re-auth need before
+        # Monarch session age — surface re-auth need before
         # the monthly sync 401s. Cheap (just file mtime), no network.
         monarch_session = None
         try:

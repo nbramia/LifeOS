@@ -248,7 +248,7 @@ class CalendarService:
         Args:
             query: Keyword to search in title/description
             attendee: Filter by attendee name/email
-            days_back: How many days in the past to search
+            days_back: How many days back to search
             days_forward: How many days in the future to search
             calendar_id: Calendar ID to query
 
@@ -295,12 +295,11 @@ class CalendarService:
             time_max: End time
             max_results: Maximum results, across all pages. `None` means no
                 cap — keep following `nextPageToken` until Google reports no
-                more pages, rather than the single-call behavior that used to
-                silently truncate any range with more matches than one page
-                (a 10-year backfill over a dense calendar returned only the
-                *oldest* ~2,500 events and left the newest window empty, with
-                no error). A window that fits on one page still costs exactly
-                one API call, as before.
+                more pages. A range with more matches than one page but no
+                cap would otherwise silently truncate to the *oldest* ~2,500
+                events and leave the newest window empty, with no error (as
+                on a 10-year backfill over a dense calendar). A window that
+                fits on one page still costs exactly one API call.
             calendar_id: Calendar to query
             query: Optional search query
 

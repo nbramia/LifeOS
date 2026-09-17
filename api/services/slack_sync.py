@@ -35,7 +35,7 @@ DEFAULT_DM_HISTORY_DAYS = None  # Full history for DMs
 DEFAULT_CHANNEL_HISTORY_DAYS = 90  # 90 days for channels
 # Incremental thread-reply rescan window: how far back to re-check parents
 # for new replies. A reply to a parent older than this is missed by the
-# nightly sync (trade-off documented in issue #440).
+# nightly sync.
 THREAD_RESCAN_DAYS = 7
 # Inter-thread pacing for conversations.replies (Slack Tier 3 is ~50 req/min).
 # A backfill (no reply cursor) walks every thread in a channel, so it paces
@@ -195,7 +195,7 @@ class SlackSync:
             # Enumerate only channels the authed user is a member of
             # (users.conversations): messages can only exist where the user is
             # a member, it avoids not_in_channel on history calls, and it cuts
-            # API volume vs listing the whole workspace — issue #439.
+            # API volume vs listing the whole workspace.
             channels = self.client.list_channels(self._workspace_id, member_only=True)
             logger.info(f"Found {len(channels)} member channels")
 
@@ -285,10 +285,10 @@ class SlackSync:
             "errors": [],
         }
 
-        # Captured before the main history fetch: replies posted after this
-        # instant are deferred to the next run, so indexing them can't advance
+        # Captured ahead of the main history fetch: replies posted following
+        # this instant are deferred to the next run, so indexing them can't advance
         # the channel cursor past a top-level message posted mid-run that the
-        # main fetch never saw (issue #445 review).
+        # main fetch never saw.
         sync_start = datetime.now(timezone.utc)
 
         # Determine oldest timestamp for fetch
@@ -325,7 +325,7 @@ class SlackSync:
 
         # Fetch + index thread replies. Runs even when the main fetch is
         # empty: a reply posted today to an old parent doesn't surface the
-        # parent in a cursor-windowed conversations.history call — issue #440.
+        # parent in a cursor-windowed conversations.history call.
         replies_indexed, reply_errors = self._sync_thread_replies(
             channel=channel,
             messages=messages,
@@ -364,7 +364,7 @@ class SlackSync:
         sync_start: datetime,
     ) -> tuple[int, list[str]]:
         """
-        Fetch and index thread replies for a channel (issue #440).
+        Fetch and index thread replies for a channel.
 
         Thread parents come from two sources:
         1. The main history fetch — any message with ``reply_count > 0``.
@@ -693,7 +693,7 @@ class SlackSync:
         """
         Perform an incremental sync of new Slack data.
 
-        Step 1: Refresh the workspace user list to SourceEntity (issue #224).
+        Step 1: Refresh the workspace user list to SourceEntity.
             Without this, users added between the last manual ``full_sync``
             and tonight stay invisible to entity resolution — messages flow
             into ``interactions`` for retro-matched senders while
@@ -701,7 +701,7 @@ class SlackSync:
             growing. ``users.list`` is cheap (~1s for thousands of users)
             and ``add_or_update`` is idempotent.
         Step 2: Sync new messages — DMs (only for users linked to CRM people)
-            plus public/private channels the user is a member of (#439).
+            plus public/private channels the user is a member of.
 
         Args:
             create_interactions: If True, create CRM Interaction records
@@ -734,7 +734,7 @@ class SlackSync:
         try:
             results["messages"] = self.sync_messages(
                 full=False,
-                dm_only=False,  # DMs + member channels — issue #439
+                dm_only=False,  # DMs + member channels
                 create_interactions=create_interactions,
                 linked_only=True,
             )

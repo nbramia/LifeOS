@@ -110,7 +110,7 @@ class SchedulerWatcher:
             self._observer = None
 
     def is_alive(self) -> bool:
-        """Liveness for health reporting (#766) — mirrors
+        """Liveness for health reporting — mirrors
         SchedulerScheduler.is_alive()'s shape. `Observer` is itself a
         `threading.Thread` subclass, so this is the same "does the thread
         that's supposed to be running still exist and hasn't died" check,

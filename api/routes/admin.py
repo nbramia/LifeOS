@@ -55,16 +55,15 @@ async def get_status() -> IndexStatus:
 
     # Check if a reindex job is currently running. A "running" row left by a
     # process that has since restarted (e.g. an unrelated auto-deploy mid-job)
-    # is stale, not actually in progress — exclude it (#768).
+    # is stale, not actually in progress — exclude it.
     #
     # limit=1 is safe even with a stale row present: this queue runs one job
     # at a time on a single worker thread (JobQueue._worker_loop), and
     # start_worker() reconciles any pre-existing RUNNING row before that
     # thread starts, so there is never more than one RUNNING row queue-wide
     # at a time in the single-process-per-database model this queue assumes
-    # (Codex review of #768 raised the two-rows case; it requires a second
-    # process concurrently claiming jobs against the same jobs.db, which
-    # this architecture doesn't support).
+    # (the two-rows case would require a second process concurrently claiming
+    # jobs against the same jobs.db, which this architecture doesn't support).
     queue = get_job_queue()
     running_jobs = queue.list_jobs(status="running", job_type="reindex_vault", limit=1)
     reindex_in_progress = any(
@@ -221,7 +220,7 @@ async def trigger_calendar_sync(days_past: int = 30, days_future: int = 30) -> C
     Fetches events from the specified date range and indexes them into ChromaDB.
 
     Args:
-        days_past: Number of days in the past to fetch (default: 30)
+        days_past: Number of days before today to fetch (default: 30)
         days_future: Number of days in the future to fetch (default: 30)
     """
     try:
@@ -240,11 +239,11 @@ async def trigger_calendar_sync(days_past: int = 30, days_future: int = 30) -> C
         logger.error(f"Calendar sync failed: {e}")
         # A plain JSONResponse, not a CalendarSyncResponse, so the extra
         # top-level "error" key survives instead of being filtered out by
-        # response_model validation. #609 made this legible (top-level
-        # "error" key); #614 decided a total failure must also be non-2xx,
-        # since a consumer that only checks HTTP status (`raise_for_status()`)
-        # should get correct behavior without knowing about the body
-        # convention. 500 because this is an unhandled exception, not a
+        # response_model validation, keeping it legible. A total failure is
+        # also non-2xx, since a consumer that only checks HTTP status
+        # (`raise_for_status()`) should get correct behavior without knowing
+        # about the body convention. 500 because this is an unhandled
+        # exception, not a
         # classified upstream/dependency failure. The "error" key stays as
         # additive defense — `mcp_server.py: dispatch()` and the agent
         # worker's ToolRegistry already flag any tool result as an error

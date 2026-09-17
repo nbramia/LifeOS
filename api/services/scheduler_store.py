@@ -7,7 +7,7 @@ A *schedule* binds a trigger (one-off ``at`` or recurring ``cron``) to an
 - ``notify``   — send a static message via Telegram (legacy ``static``)
 - ``prompt``   — run a prompt through the full LifeOS chat pipeline and send the result
 - ``endpoint`` — call a LifeOS API endpoint and send the formatted result
-- ``agent``    — hand work off to the agent worker (behaviour lands in #245)
+- ``agent``    — hand work off to the agent worker
 
 Source of truth: ``LifeOS/Scheduler/Inbox.md`` in the vault. Schedules are
 checkbox lines with stable ``<!-- id:xxxx -->`` IDs and Dataview-style
@@ -444,7 +444,7 @@ class SchedulerStore:
     notification is silently skipped) or raise "dictionary changed size during
     iteration" mid-scan.
 
-    For backward compatibility a ``file_path=`` argument (the old JSON path)
+    For compatibility, a ``file_path=`` argument (a JSON index path)
     is accepted: it becomes the index path and its parent directory becomes an
     isolated vault root, so existing callers and tests keep working.
     """
@@ -778,7 +778,7 @@ class SchedulerStore:
     def _merge_prior(entry: ScheduleEntry, prior: Optional[ScheduleEntry]):
         """Carry cached fields forward by ID when markdown doesn't supply them.
 
-        ``message_content`` now lives in the markdown body, so markdown wins when
+        ``message_content`` lives in the markdown body, so markdown wins when
         a body is present; the cache fallback only fills entries written before
         bodies existed (lazy migration). ``endpoint_config`` is similar: a vault
         line carrying endpoint fields wins outright (including over a params
@@ -898,7 +898,7 @@ class SchedulerStore:
 
 
 def _misroute_notice(bot: str) -> str:
-    """Banner for a schedule whose configured bot can't be resolved (#575).
+    """Banner for a schedule whose configured bot can't be resolved.
 
     Delivery stays fail-open — an orphaned bot name (typically the residue of a
     bot rename) must never cost a notification, so the send still goes out from

@@ -13,7 +13,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -291,7 +291,7 @@ class ApplePhotosReader:
         Useful for incremental sync.
 
         Args:
-            since: Only return faces from photos after this timestamp
+            since: Only return faces from photos captured after the given timestamp
             limit: Maximum faces to return
 
         Yields:

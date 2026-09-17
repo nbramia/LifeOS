@@ -1,8 +1,8 @@
-"""Kanban board view-model helpers for `/agents` (#850).
+"""Kanban board view-model helpers for `/agents`.
 
 Pure functions only — no I/O, no vault or scheduler access — so lane
 derivation and lane-move planning can be unit-tested exhaustively against the
-lane table in issue #850 without a TaskManager or SchedulerStore fixture.
+lane table without a TaskManager or SchedulerStore fixture.
 `api/routes/agents.py` wires these against the real stores and stays thin:
 it reads a task/schedule entry, calls into this module for the *decision*,
 then performs the write. See docs/specs/technical/agent-viz.md.
@@ -30,8 +30,8 @@ MACHINE_WAIT_TAGS = frozenset({"agent-wait-provider", "agent-wait-dependency"})
 # A `#human` card is filed for the operator directly (not by the worker).
 HUMAN_TAG = "human"
 
-# The accepted marker for Review -> Done (#850) — a tag, not a new status
-# symbol, per the issue's constraints.
+# The accepted marker for Review -> Done — a tag, not a new status
+# symbol.
 ACCEPTED_TAG = "accepted"
 
 # Tags whose ownership/lifecycle is outside the board's free-text Tags field.
@@ -647,6 +647,6 @@ def is_schedule_active(enabled: bool, next_trigger_at: Optional[str]) -> bool:
     is disabled and when a one-off fires (see `update()` / trigger recording
     in `scheduler_store.py`), so `enabled and next_trigger_at is not None` is
     sufficient — it covers "fired one-off" and "disabled recurring" the same
-    way, matching the issue's rule that both show in Done.
+    way, so both show in Done.
     """
     return bool(enabled) and next_trigger_at is not None

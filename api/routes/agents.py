@@ -2,7 +2,7 @@
 
 Powers the `/agents` UI: a live graph of in-flight and recently-completed
 agent worker sessions, plus per-session transcript tailing. See
-`docs/specs/technical/agent-worker.md` and issue #133.
+`docs/specs/technical/agent-worker.md`.
 """
 from __future__ import annotations
 
@@ -45,7 +45,7 @@ router = APIRouter(prefix="/api/agents", tags=["agents"])
 _session_store: SessionStore | None = None
 _transcript_store: TranscriptStore | None = None
 
-# (#851) Injectable remote-kill runner, forwarded to `teardown_session` for a
+# Injectable remote-kill runner, forwarded to `teardown_session` for a
 # session whose `host` names a machine other than this API host. None (the
 # default) uses `remote_spawn.kill_remote_process_group`'s real `subprocess.run`
 # over ssh; tests monkeypatch this to a fake that records the argv.
@@ -97,9 +97,9 @@ def _get_transcript_store() -> TranscriptStore:
 
 
 def api_host_name() -> str:
-    """Short hostname of the machine running this API process (#849).
+    """Short hostname of the machine running this API process.
 
-    Used to label every snapshot row with `host` — worker sessions and
+    Labels every snapshot row with `host` — worker sessions and
     local-transcript CLI sessions always ran here, so they get this value
     directly; remote `cli_sessions` rows carry whatever host their own
     hook posted. Strips any domain suffix the same way the hook script
@@ -327,7 +327,7 @@ def _codex_snapshot() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
 
 def _apply_cli_session_to_dict(sd: dict[str, Any], cli: CliSession) -> None:
     """Merge an event-driven `cli_sessions` row onto a transcript-derived
-    snapshot dict for the same session (#849). Event status wins over the
+    snapshot dict for the same session. Event status wins over the
     transcript scan's file-age guess; token/cost fields stay
     transcript-derived — the hook posts no usage data.
     """
@@ -345,7 +345,7 @@ def _apply_cli_session_to_dict(sd: dict[str, Any], cli: CliSession) -> None:
 
 def _cli_session_to_dict(cli: CliSession) -> dict[str, Any]:
     """Synthetic snapshot row for a `cli_sessions` row with no matching
-    local transcript — a session running on a different machine (#849).
+    local transcript — a session running on a different machine.
     No token or dollar detail (the hook posts none); `status_inferred` is
     always False because the status here is event-driven by definition.
     """
@@ -531,7 +531,7 @@ def _build_snapshot() -> dict[str, Any]:
         if s.parent_session_id
     ]
 
-    # Cross-machine CLI sessions (#849): registered via the hook script's
+    # Cross-machine CLI sessions: registered via the hook script's
     # POST /api/agents/cli-sessions/events, keyed the same way
     # transcript-derived rows are (cc:<uuid> / cx:<uuid>). Ids that also
     # have a local transcript merge below (event status wins, tokens stay
@@ -750,7 +750,7 @@ def _model_label_for_routing(routing: str | None, hermes_model: str | None = Non
         # model running at all — it must never render a Claude tier guess.
         return "Waiting on you"
     if routing == "remote":
-        # (#809) `#cloud` — the configured remote OpenAI-compatible provider,
+        # `#cloud` — the configured remote OpenAI-compatible provider,
         # not an Anthropic model, so it must not fall into the Claude-model-
         # name guessing below.
         try:
@@ -760,7 +760,7 @@ def _model_label_for_routing(routing: str | None, hermes_model: str | None = Non
             return "Remote"
     from api.services.agent_worker.hermes_session import HERMES_ROUTING
     if routing == HERMES_ROUTING:
-        # (#850) Hermes sessions used to fall through to the Claude-model-name
+        # Hermes sessions must not fall through to the Claude-model-name
         # guess below and get mislabeled "Claude" — Hermes runs its own
         # DeepSeek-backed engine, not an Anthropic model.
         # The per-turn model comes from `Session.hermes_model`, written
@@ -989,7 +989,7 @@ async def stream_snapshots() -> StreamingResponse:
 
 
 # ---------------------------------------------------------------------------
-# Kanban board (#850) — vault-task-backed view of /agents. Lane derivation
+# Kanban board — vault-task-backed view of /agents. Lane derivation
 # lives in api/services/agent_board.py; this section only reads the task,
 # scheduler, and session stores, calls into that pure module for the
 # decision, and performs the write. See docs/specs/technical/agent-viz.md.
@@ -1181,7 +1181,7 @@ def _build_board() -> dict[str, Any]:
 
 
 # Module-level (built_at, board) cache used ONLY by the stream's own tick —
-# NOT by GET /board (round-2 finding 6). `_build_board` reads every task,
+# NOT by GET /board. `_build_board` reads every task,
 # every schedule entry, and up to 200 session transcript files — cheap once,
 # but every open board tab's stream connection rebuilding independently on
 # every tick would multiply that cost by the number of open tabs. Sharing
@@ -1220,7 +1220,7 @@ async def get_board() -> dict[str, Any]:
     Always built fresh, never served from `_board_cache` — an explicit GET
     is a direct client request (e.g. the drawer's own `await putTask();
     await fetchBoard()` after a save) and must reflect the write that just
-    happened, not a cache built before it (round-2 finding 6).
+    happened, not a stale cached board.
     """
     return await run_in_threadpool(_build_board)
 
@@ -2070,7 +2070,7 @@ async def answer_pending_question(question_id: int, body: PendingQuestionAnswerR
 
 
 # ---------------------------------------------------------------------------
-# Agent threads for web /chat (#236, Phase 3 of #233)
+# Agent threads for web /chat
 # ---------------------------------------------------------------------------
 
 
@@ -2316,7 +2316,7 @@ async def reply_to_thread(session_id: str, body: ReplyRequest) -> dict[str, Any]
 
 @router.post("/spawn")
 async def spawn_agent(body: SpawnRequest) -> dict[str, Any]:
-    """Spawn an operator agent on demand (#235's create_operator_session)."""
+    """Spawn an operator agent on demand via create_operator_session."""
     prompt = (body.prompt or "").strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
@@ -2437,7 +2437,7 @@ async def _kill_session_subtree(target: Session, reason: str) -> tuple[list[str]
         from api.services.agent_worker.inter_agent import teardown_session as _teardown
 
         def _run_teardown() -> tuple[list[str], list[dict[str, str]]]:
-            # #379: the per-CLI-child subprocess reap inside teardown_session does
+            # The per-CLI-child subprocess reap inside teardown_session does
             # a blocking SIGTERM→grace(up to ~2s)→SIGKILL. Run the whole subtree
             # teardown off the event loop (mirror spawn_agent's asyncio.to_thread)
             # so a multi-node kill can't stall all HTTP for N×grace seconds.
@@ -2543,7 +2543,7 @@ class CCPaneBindRequest(BaseModel):
 class CliSessionEventRequest(BaseModel):
     """Body for POST /api/agents/cli-sessions/events — posted by
     `scripts/lifeos-agent-hook.sh` from any machine, on Claude Code /
-    Codex SessionStart, UserPromptSubmit, Stop, and SessionEnd (#849).
+    Codex SessionStart, UserPromptSubmit, Stop, and SessionEnd.
 
     Unlike /cc-pane-bind and /cx-pane-bind, this endpoint is reachable over
     the tailnet (bearer-token gated, not localhost-only) — it's what lets a
@@ -2564,7 +2564,7 @@ class CliSessionEventRequest(BaseModel):
 
 
 def _check_agent_hook_auth(request: Request) -> None:
-    """Bearer-token gate for POST /api/agents/cli-sessions/events (#849).
+    """Bearer-token gate for POST /api/agents/cli-sessions/events.
 
     Mirrors `api/routes/hermes_proxy.py`'s `_check_hermes_inbound_auth`:
     disabled (503) until an operator sets `LIFEOS_AGENT_HOOK_TOKEN`, since
@@ -2591,7 +2591,7 @@ def _check_agent_hook_auth(request: Request) -> None:
 
 @router.post("/cli-sessions/events")
 async def cli_session_event(request: Request, body: CliSessionEventRequest) -> dict[str, Any]:
-    """Register one Claude Code / Codex CLI lifecycle event (#849).
+    """Register one Claude Code / Codex CLI lifecycle event.
 
     Posted by `scripts/lifeos-agent-hook.sh` on SessionStart,
     UserPromptSubmit, Stop, and SessionEnd, from any machine. Applies the
@@ -2650,14 +2650,14 @@ async def cli_session_event(request: Request, body: CliSessionEventRequest) -> d
         except Exception as exc:  # noqa: BLE001 — pane mapping is a nice-to-have, never fail the event
             logger.warning("cc_wezterm_store upsert failed for %s: %s", cli.session_id, exc)
 
-    # (#851) A `session_start` naming a task links this CLI session to its
+    # A `session_start` naming a task links this CLI session to its
     # board card and moves the card to In progress — the interactive
     # terminal `POST /board/cards/{id}/open` (api/routes/agent_assignment.py)
-    # spawns sets `LIFEOS_TASK_ID`, the hook script already forwards it as
-    # `task_id` on every event (scripts/lifeos-agent-hook.sh), so this is
-    # the one piece #849 didn't need: turning a task_id-bearing session_start
-    # into a lane move. Best-effort — a task lookup/update failure must
-    # never break the registration event itself.
+    # spawns sets `LIFEOS_TASK_ID`, and the hook script already forwards it
+    # as `task_id` on every event (scripts/lifeos-agent-hook.sh), so this
+    # handler turns a task_id-bearing session_start into a lane move.
+    # Best-effort — a task lookup/update failure must never break the
+    # registration event itself.
     if body.event == "session_start" and body.task_id:
         try:
             from api.services.task_manager import get_task_manager
@@ -2792,8 +2792,8 @@ def _live_wezterm_pids(xdg_runtime_dir: str | None) -> set[int]:
     """Return the set of PIDs of all currently-live wezterm-gui processes.
 
     Used by /focus to validate a cached `session_id → pane_id` mapping: pane
-    ids reset on wezterm restart, so if the pid that wrote the mapping is
-    no longer in the live set, the cache entry is stale.
+    ids reset on wezterm restart, so if the pid that wrote the mapping isn't
+    in the live set, the cache entry is stale.
     """
     return {pid for _mtime, _path, pid in _enumerate_live_wezterm_sockets(xdg_runtime_dir)}
 
@@ -2984,12 +2984,12 @@ def _resume_env() -> dict[str, str]:
 
 
 def _check_session_host_or_409(session_id: str) -> str | None:
-    """Resolve /focus and /resume's target host for `session_id` (#849, #851).
+    """Resolve /focus and /resume's target host for `session_id`.
 
     Returns `None` when the session ran on THIS API host (or has no
-    `cli_sessions` row at all — never registered via the hook, or
-    registered before this feature existed — which falls through
-    unchanged to the existing local-only resolution: cache / FD-probe).
+    `cli_sessions` row at all — never registered via the hook — which
+    falls through unchanged to the existing local-only resolution:
+    cache / FD-probe).
     Returns the ssh target string when the session's host is a DIFFERENT,
     but registered (`settings.agent_hosts`), machine — the caller then
     runs the launcher over ssh instead of spawning it locally. Raises
@@ -3139,7 +3139,7 @@ async def _resume_codex_session(
 
     Reuses the same env / wezterm pane injection / clipboard / dock
     machinery; only the lookup, settings, and inner command differ.
-    `remote_ssh_target` (#851): the ssh target to run the launcher on when
+    `remote_ssh_target`: the ssh target to run the launcher on when
     the session's host isn't this API host, resolved by the caller via
     `_check_session_host_or_409`.
     """
@@ -3166,7 +3166,7 @@ async def _resume_codex_session(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     if remote_ssh_target:
-        # (#851) See the identical branch in resume_claude_code_session —
+        # See the identical branch in resume_claude_code_session —
         # a remote session's rollout file isn't under this API's local
         # `codex_sessions_dir`; its cwd comes from the `cli_sessions` row.
         cli = _get_session_store().get_cli_session(session_id)
@@ -3308,7 +3308,7 @@ async def _resume_codex_session(
     pane_id: int | None = None
     stdout_bytes = b""
     stderr_bytes = b""
-    # (round 1, finding #7) An ssh round trip routinely exceeds the local
+    # An ssh round trip routinely exceeds the local
     # 1.5s budget — use the connect-timeout-derived value on the remote
     # branch so a remote launcher doesn't spuriously degrade to
     # `pane_id: None` before the real ssh response even arrives.
@@ -3341,7 +3341,7 @@ async def _resume_codex_session(
         except ValueError:
             pane_id = None
 
-    # (round 1, finding #10) `wezterm_pid` comes from THIS host's own
+    # `wezterm_pid` comes from THIS host's own
     # `_current_wezterm_pid` — on a remote resume the pane and its wezterm
     # process live on `remote_ssh_target`, not here, so upserting would
     # record a host-mismatched pid/pane into the LOCAL store.
@@ -3407,7 +3407,7 @@ async def _resume_claude_code_launcher(
     remote_ssh_target: str | None = None,
 ) -> dict[str, Any]:
     """The `cc:`-prefixed half of `resume_claude_code_session`, factored out
-    (#851) so `/focus`'s remote fallback (no cross-host pane registry — see
+    so `/focus`'s remote fallback (no cross-host pane registry — see
     that function) can reuse it exactly like it already reuses
     `_resume_codex_session` for `cx:` sessions."""
     import shlex
@@ -3436,11 +3436,11 @@ async def _resume_claude_code_launcher(
         bare = bare.split(":agent:", 1)[0]
 
     if remote_ssh_target:
-        # (#851) A remote session's transcript lives on the REMOTE host, not
+        # A remote session's transcript lives on the REMOTE host, not
         # under this API's local `claude_code_projects_dir` — the local
         # `discover_sessions` scan below would always 404 it. Its cwd comes
         # from the `cli_sessions` row instead (populated by the remote
-        # host's own hook script over HTTP, host-agnostic by design — #849).
+        # host's own hook script over HTTP, host-agnostic by design).
         cli = _get_session_store().get_cli_session(session_id)
         if cli is not None and cli.cwd:
             from types import SimpleNamespace
@@ -3533,7 +3533,7 @@ async def _resume_claude_code_launcher(
     popen_argv = argv
     popen_cwd = target.decoded_cwd
     if remote_ssh_target:
-        # (#851) The rendered argv already carries `--cwd <remote path>` (or
+        # The rendered argv already carries `--cwd <remote path>` (or
         # equivalent) baked in by the template above — that path is on the
         # REMOTE filesystem, so the LOCAL ssh client must not `cwd=` into
         # it (it likely doesn't exist locally at all).
@@ -3586,7 +3586,7 @@ async def _resume_claude_code_launcher(
     # is a backup for operator-overridden non-wezterm launchers AND
     # for the case where the wezterm tab opened off-screen and the
     # operator just wants to run the command somewhere visible. For a
-    # remote target (#851), wrap it as a runnable ssh command instead of a
+    # remote target, wrap it as a runnable ssh command instead of a
     # bare `cd && ...` — the local clipboard's contents must be paste-able
     # into a LOCAL terminal to be useful.
     clipboard_text = ""
@@ -3609,7 +3609,7 @@ async def _resume_claude_code_launcher(
     #   (b) The launcher BECOMES the terminal (rare; not the default) —
     #       communicate() times out, no pane id available, return spawned=True.
     # A 1.5s timeout is plenty for (a) and short enough that the API stays
-    # snappy for (b) — LOCALLY. (round 1, finding #7) An ssh round trip
+    # snappy for (b) — LOCALLY. An ssh round trip
     # routinely exceeds 1.5s, so the remote branch uses the connect-
     # timeout-derived value instead, leaving the local value untouched.
     pane_id: int | None = None
@@ -3650,7 +3650,7 @@ async def _resume_claude_code_launcher(
         except ValueError:
             pane_id = None
 
-    # (round 1, finding #10) See the codex sibling above — a remote resume's
+    # See the codex sibling above — a remote resume's
     # pane and wezterm process live on `remote_ssh_target`, not here.
     if pane_id is not None and not remote_ssh_target:
         try:
@@ -4072,7 +4072,7 @@ async def focus_claude_code_session(
             raise HTTPException(status_code=400, detail="cc resume disabled — set LIFEOS_CC_RESUME_ENABLED=true")
 
     if remote_ssh_target:
-        # (#851) There is no cross-host pane registry: the local
+        # There is no cross-host pane registry: the local
         # `cc_wezterm_store` mapping is only ever written for a session
         # that ran ON this API host (`cli_session_event`'s upsert guard),
         # and the FD-probe fallback below reads a local transcript file a
@@ -4130,7 +4130,7 @@ async def focus_claude_code_session(
     # Invalidate the cache across wezterm restarts. Pane ids reset when
     # wezterm-gui restarts, so a cached pane_id from a dead wezterm could
     # silently activate an unrelated session's pane in the new wezterm.
-    # `wezterm_pid=0` covers pre-#257 rows that have no boot id recorded.
+    # `wezterm_pid=0` covers rows that have no boot id recorded.
     if mapping is not None:
         live_pids = _live_wezterm_pids(env.get("XDG_RUNTIME_DIR"))
         if mapping.wezterm_pid == 0 or mapping.wezterm_pid not in live_pids:
@@ -4231,9 +4231,7 @@ async def _stream_codex_session(session_id: str, backfill: int):
     """Per-session SSE generator for Codex (cx:-prefixed) sessions.
 
     Mirrors `_stream_claude_code_session` — Codex has no DB status either, so
-    it uses the same idle-close-after-5-minutes heuristic. (#850: previously
-    `/sessions/{id}/stream` only dispatched `cc:` here, so opening a Codex
-    session's panel fell through to the LifeOS transcript store and 400'd.)
+    it uses the same idle-close-after-5-minutes heuristic.
     """
     yield ": ok\n\n"
     try:
@@ -4281,7 +4279,7 @@ async def stream_session_transcript(
 
     Closes cleanly when the session reaches a terminal status.
     Dispatches by `cc:` prefix to the Claude Code ingest path, `cx:` to the
-    Codex ingest path (#850).
+    Codex ingest path.
     """
     if session_id.startswith("cc:"):
         if not _claude_code_enabled():

@@ -1,4 +1,4 @@
-"""Human queue: fire-and-forget cards any agent can file for the operator (#852).
+"""Human queue: fire-and-forget cards any agent can file for the operator.
 
 A human-queue card is a task (`api/services/task_manager.py`) with tag
 `human` and status `blocked` ("open"). This module is the single place that
@@ -30,7 +30,7 @@ TAG = "human"
 STATUS_OPEN = "blocked"
 
 # `done_when` types. Deliberately excludes a `shell` type — a remote-
-# execution surface reachable by any agent (see the issue's Out of Scope).
+# execution surface reachable by any agent is out of scope.
 _ENDPOINT_TYPE = "endpoint"
 _FILE_EXISTS_TYPE = "file_exists"
 

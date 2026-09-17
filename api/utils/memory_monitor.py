@@ -73,7 +73,7 @@ class MemoryMonitor:
             warning_threshold: Log warnings above this % (default 80)
             critical_threshold: Signal stop above this % (default 90)
             growth_rate_threshold: Warn if memory grows this much between checks (default 5)
-            consecutive_warnings_to_stop: Stop after this many consecutive warnings (default 3)
+            consecutive_warnings_to_stop: Stop once this many consecutive warnings occur (default 3)
             log_interval: Log status every N checks (default 10)
         """
         self.warning_threshold = warning_threshold

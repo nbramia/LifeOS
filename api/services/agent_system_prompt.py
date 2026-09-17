@@ -139,7 +139,7 @@ _STATIC_PROMPT = _STATIC_PROMPT_TEMPLATE.format(
 
 
 # The relative-time-resolution instruction, verbatim in both the native prompt
-# and the exported turn context (#591) — the pinned cross-repo schema on #590
+# and the exported turn context — the pinned cross-repo schema
 # quotes this exact string as `turn.time_resolution_instruction`.
 TIME_RESOLUTION_INSTRUCTION = (
     "When the user asks for something time-relative ('recent', 'lately', "
@@ -152,7 +152,7 @@ TIME_RESOLUTION_INSTRUCTION = (
 )
 
 # The existing-tags instruction, verbatim in both the native prompt and the
-# exported turn context (#591), as `turn.tags_instruction`.
+# exported turn context, as `turn.tags_instruction`.
 TAGS_INSTRUCTION = (
     "When the user asks to tag a task, prefer an existing tag if it clearly "
     "matches the user's intent semantically — including casing and hyphenation. "
@@ -165,7 +165,7 @@ TAGS_INSTRUCTION = (
 
 def _get_existing_tags() -> list[dict]:
     """Existing task tags with usage counts, shared by the native prompt, the
-    turn-context endpoint, and the Hermes envelope (#591).
+    turn-context endpoint, and the Hermes envelope.
 
     Returns [] if there are no tags or the task manager isn't reachable, so a
     caller can render an empty list as a normal degraded case rather than an
@@ -195,17 +195,16 @@ def _existing_tags_block() -> str | None:
 def build_turn_context(persona_id: str | None = None, conversation_id: str | None = None) -> dict:
     """Build the per-turn context shared by the turn-context endpoint, the
     Hermes upstream envelope, and (via its constituent pieces) the native
-    system prompt (#591).
+    system prompt.
 
     Read-only: makes no writes. Degrades gracefully — an unreachable task
     manager yields an empty ``existing_tags`` list rather than raising.
 
     Returns a JSON-serializable dict with the literal keys pinned by the
-    `lifeos_context` cross-repo contract (#590): ``current_datetime``,
+    `lifeos_context` cross-repo contract: ``current_datetime``,
     ``current_datetime_iso``, ``timezone``, ``time_resolution_instruction``,
     ``personal_context``, ``existing_tags``, ``tags_instruction``, plus the
-    session-cost fields added by #610 (and #613's ``session_cost_is_lower_
-    bound``) below.
+    session-cost fields (and ``session_cost_is_lower_bound``) below.
 
     ``conversation_id`` scopes the session-cost fields to one conversation's
     prior turns (``UsageStore.get_conversation_usage`` — never recomputed,
@@ -223,15 +222,15 @@ def build_turn_context(persona_id: str | None = None, conversation_id: str | Non
         "personal_context": settings.personal_context(persona_id or ""),
         "existing_tags": _get_existing_tags(),
         "tags_instruction": TAGS_INSTRUCTION,
-        # Session-to-date cost (#610): the verbatim sum of every turn
+        # Session-to-date cost: the verbatim sum of every turn
         # already recorded for this conversation, EXCLUDING the turn
         # currently being built (its own usage isn't recorded until its
-        # stream finishes, after this context was already handed out).
+        # stream finishes, once this context has already been handed out).
         "session_cost_usd": session_usage["cost_usd"],
         "session_turn_count": session_usage["turn_count"],
         "session_input_tokens": session_usage["input_tokens"],
         "session_output_tokens": session_usage["output_tokens"],
-        # #613: True when any summed turn was recorded `unpriced` (its
+        # True when any summed turn was recorded `unpriced` (its
         # provider reported no cost, rather than a real zero) — read this
         # before treating `session_cost_usd` as exact. Still no substitute
         # for a floor when the sum spans a row written before the

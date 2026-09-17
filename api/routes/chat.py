@@ -243,8 +243,8 @@ async def list_personas():
     Returns the primary persona plus each configured specialized bot. Adding a
     registry entry + its token env var surfaces a new persona after restart with
     no code change. Only the primary and orchestrating bots advertise
-    handoff/agent capabilities. ``orchestrates`` (#643) is the server's own
-    `settings.persona_orchestrates()` verdict, so clients no longer have to
+    handoff/agent capabilities. ``orchestrates`` is the server's own
+    `settings.persona_orchestrates()` verdict, sparing clients from having to
     infer it from `capabilities` alone (which look identical for `primary` and
     an orchestrating bot like `doctor`).
     """
@@ -265,24 +265,24 @@ async def chat_config():
     default input mode when there's no ?mode= param or stored preference.
 
     `secure_url` is the HTTPS origin (TAILNET_HTTPS_URL) the web client offers as
-    a one-tap escape when the mic is blocked by an insecure context (#516).
+    a one-tap escape when the mic is blocked by an insecure context.
     Trailing slash stripped so clients can append a path directly; "" when unset,
     in which case the client just reports the insecure context without a link.
 
-    `remote_model_available`/`remote_model_label` (#654) tell the model
+    `remote_model_available`/`remote_model_label` tell the model
     picker whether to show its "Remote" option — a paid OpenAI-compatible
     provider (e.g. Fireworks) that only exists as an explicit per-turn pick,
     never auto-escalated to. Unconfigured (no base URL/model/key) means
     `remote_model_available` is False and `remote_model_label` is "" — the
     picker hides the option and every existing path is unaffected.
 
-    `voice_endpoint_silence_ms`/`voice_endpoint_hard_cap_ms` (#718) drive
+    `voice_endpoint_silence_ms`/`voice_endpoint_hard_cap_ms` drive
     smart turn endpointing's VAD timing in auto-mode voice recording — see
     `web/chat/voice.js`. `voice_endpoint_semantic` is reserved for a future
     optional completeness classifier and is currently unwired on the client
     (see `config/settings.py`'s `voice_endpoint_semantic` docstring).
 
-    `voice_idle_timeout_ms` (#723) is a disjoint timing knob for the opposite
+    `voice_idle_timeout_ms` is a disjoint timing knob for the opposite
     situation those two govern: no speech at all yet in the recording. After
     this much silence with nothing spoken, the client stops and discards the
     recording rather than leaving the mic open indefinitely.
@@ -306,7 +306,7 @@ class TagCount(BaseModel):
 
 
 class TurnContextResponse(BaseModel):
-    """Response for the per-turn context endpoint (#591, extended by #610, #613)."""
+    """Response for the per-turn context endpoint."""
     current_datetime: str
     current_datetime_iso: str
     timezone: str
@@ -325,13 +325,13 @@ class TurnContextResponse(BaseModel):
 async def turn_context(persona_id: str = "primary", modality: str = "text", conversation_id: Optional[str] = None):
     """Read-only per-turn context: current date/time, timezone, the
     relative-time-resolution instruction, the persona-scoped personal-context
-    block, existing task tags with usage counts, and (#610) session-to-date
+    block, existing task tags with usage counts, and session-to-date
     cost/token totals for `conversation_id`.
 
     This is the same computation `build_system_prompt` folds into the native
     system prompt, exported as structured JSON (no Anthropic content-block
     dependency) so any MCP client or the Hermes backend can pull it at the
-    start of a turn without a LifeOS-specific integration (#591). It never
+    start of a turn without a LifeOS-specific integration. It never
     creates, mutates, or persists anything.
 
     `modality` is accepted for shape symmetry with `/api/ask/stream` but
@@ -431,18 +431,14 @@ class AskStreamRequest(BaseModel):
     # prompt; None/"text" is a normal typed turn. Set by the voice gateway
     # (whisper-relay) on spoken turns; omitted for text.
     modality: Optional[str] = None
-    # Text backend the client had selected, used SOLELY to tag a newly created
-    # conversation for sidebar filtering (#596). Through #641 the web client
-    # sent this when diverting an orchestrating persona's turn here from a
-    # Hermes-selected composer, because this handler was where its spawn path
-    # lived and Hermes had no equivalent; #642 gave Hermes its own way to
-    # drive that persona and removed the divert, so the web client no longer
-    # sends this field on any turn. Kept as a generic, supported field on
-    # this request for any other caller. Never used to route, resolve a
-    # persona, or pick a model; omitted (the default) reproduces today's
+    # Text backend the client selected, used solely to tag a newly created
+    # conversation for sidebar filtering. No client currently sends this
+    # field on any turn; it remains a generic, supported field on this
+    # request for any other caller. Plays no part in routing, resolving a
+    # persona, or picking a model; omitted (the default) reproduces standard
     # tagging ("lifeos") exactly.
     backend: Optional[str] = None
-    # Opaque, client-generated turn key (#611 review). `conversation_id`
+    # Opaque, client-generated turn key. `conversation_id`
     # alone can't cancel a turn before its first SSE frame ever arrives —
     # the request that started it carries `conversation_id: None` for a
     # brand-new conversation, and the real id only shows up in the
@@ -502,9 +498,9 @@ class AskStreamRequest(BaseModel):
 async def _handle_agent_slash(stripped: str, conversation_id, store):
     """Stream the SSE response for a `/agent [local|claude] <task>` chat command.
 
-    Operator agent spawn from web chat (#235), calling the same
+    Operator agent spawn from web chat, calling the same
     `create_operator_session` entry point as the Telegram `/agent` command.
-    Web has no inline reply mechanism yet (added in Phase 3 / #236), so an
+    Web has no inline reply mechanism yet, so an
     ambiguous auto-route asks the user to re-run with an explicit model.
     """
     rest = stripped[len("/agent"):].strip()
@@ -563,8 +559,8 @@ async def _handle_agent_slash(stripped: str, conversation_id, store):
 def resolve_effective_persona_id(persona_id: Optional[str], persona: Optional[str]) -> Optional[str]:
     """The exact persona-shape validation and effective-id derivation
     `ask_stream()` performs for its `_effective_pid` — shared with the
-    Hermes proxy's journal-capture gate (`api/routes/hermes_proxy.py`,
-    #685 adversarial-review follow-up) so a raw-`persona` preamble turn
+    Hermes proxy's journal-capture gate (`api/routes/hermes_proxy.py`)
+    so a raw-`persona` preamble turn
     (`chat_via_api()`'s and the ring ingest's shape, not just a
     `persona_id`-selected one) resolves identically on both surfaces —
     approximating it as `persona_id or "primary"` alone, as the proxy's
@@ -600,13 +596,13 @@ def resolve_effective_persona_id(persona_id: Optional[str], persona: Optional[st
 
 
 def journal_capture_gate(persona_id: Optional[str], text: str) -> Optional[CaptureResult]:
-    """#674's deterministic journal capture, as a single gate shared by every
+    """Deterministic journal capture, as a single gate shared by every
     surface that can drive a journal-persona turn — the native path below and
-    the Hermes proxy relay (`api/routes/hermes_proxy.py`, #685) — so a third
-    surface can't recreate the gap this closes: the journal persona used to be
-    told to call `lifeos_vault_write` itself, a tool that doesn't exist in
-    either agentic loop, so every fragment was silently lost while the reply
-    still read like a successful capture.
+    the Hermes proxy relay (`api/routes/hermes_proxy.py`) — so a third
+    surface can't recreate the gap this closes: the journal persona is never
+    told to call `lifeos_vault_write` itself, since that tool doesn't exist in
+    either agentic loop, which would otherwise silently lose every fragment
+    while the reply still read like a successful capture.
 
     No-op (returns `None`) for any persona other than `journal`. Must be
     called BEFORE the caller's SSE stream opens / before the turn is handed
@@ -771,14 +767,14 @@ async def ask_stream(request: AskStreamRequest):
     # above has already validated persona_id/persona's shape, so
     # resolve_effective_persona_id() below can't actually raise here — it's
     # reused rather than re-inlined so the Hermes proxy's journal-capture gate
-    # (#685) shares the exact same derivation instead of approximating it.
+    # shares the exact same derivation instead of approximating it.
     _effective_pid = resolve_effective_persona_id(request.persona_id, request.persona)
     # Shared with Pebble's bounded classifier. Native Journal remains a
     # notify-only surface even when Pebble permits attested delegation.
     persona_preamble = _with_journal_filing_policy(_effective_pid, persona_preamble)
     personal_context = settings.personal_context(_effective_pid or "")
 
-    # #674 (shared with the Hermes proxy via `journal_capture_gate`, #685):
+    # Shared with the Hermes proxy via `journal_capture_gate`:
     # deterministic journal capture, done here in code, not left to the
     # model. Done BEFORE the SSE stream opens (like the persona resolution
     # above) — see the helper's docstring for why. Covers every journal
@@ -787,18 +783,17 @@ async def ask_stream(request: AskStreamRequest):
     # through `persona_id`.
     journal_capture = journal_capture_gate(_effective_pid, request.question)
 
-    # #611: the turn's lifetime is owned by the server from here on, not by
+    # The turn's lifetime is owned by the server from here on, not by
     # this SSE connection — every modality survives the client leaving
-    # (#616 lifted the voice-only exception; see ChatTurn.reader() in
-    # chat_turns.py). `modality` is still recorded on the turn for parity
+    # (see ChatTurn.reader() in chat_turns.py). `modality` is still recorded on the turn for parity
     # with the request and for other voice-specific behavior elsewhere
     # (e.g. spoken-style system-prompt rules, below).
     _modality = (request.modality or "").strip().lower() or "text"
-    # Supersede (#611): a new turn on a conversation OR client_turn_id that
+    # Supersede: a new turn on a conversation OR client_turn_id that
     # already has one in flight cancels the old one first — asking again is
     # itself a stop gesture, and it prevents a stale reply landing after a
     # newer question. Checking client_turn_id too closes the same gap the
-    # explicit cancel endpoint closes (#611 review): a reused/duplicate key
+    # explicit cancel endpoint closes: a reused/duplicate key
     # supersedes rather than silently colliding with an unrelated turn.
     if request.conversation_id:
         get_turn_registry().cancel_conversation(request.conversation_id)
@@ -812,7 +807,7 @@ async def ask_stream(request: AskStreamRequest):
 
     async def _content(text: str) -> None:
         """Emit a `content` SSE frame AND accumulate it into `partial_text`
-        (#611) — the running "what has the user actually seen so far" used
+        — the running "what has the user actually seen so far", used
         to persist an honest partial if this turn is interrupted. Reset to
         "" on `self_correction`, mirroring `ask-stream.js`'s `fullContent`:
         `agent_result.full_text` only gains a round's text at round end, so
@@ -822,7 +817,7 @@ async def ask_stream(request: AskStreamRequest):
         await turn.emit(f"data: {json.dumps({'type': 'content', 'content': text})}\n\n")
 
     partial_text = ""
-    # #615: live reference to the agent loop's own AgentResult, stashed from
+    # Live reference to the agent loop's own AgentResult, stashed from
     # the `turn_state` event so a cancel/deadline handler can read accrued
     # usage without waiting for the terminal `result` event, which a
     # cancelled turn never reaches. Stays None for a fake loop that doesn't
@@ -849,19 +844,18 @@ async def ask_stream(request: AskStreamRequest):
                 # Create new conversation, tagged with the selected persona so
                 # persona-scoped listing (e.g. the voice sidebar) can filter it,
                 # and with the selected backend (default "lifeos") — the
-                # `backend` field's only purpose (#596; no longer set by the
-                # first-party client since #642 removed its one use case, the
-                # Hermes-orchestrating-persona divert, but still a generic,
-                # supported field on this request for any other caller).
+                # `backend` field's only purpose. No first-party client sets
+                # it; it remains a generic, supported field on this request
+                # for any other caller.
                 conv = store.create_conversation(
                     persona_id=new_conversation_persona_id,
                     backend=request.backend or "lifeos",
                 )
                 conversation_id = conv.id
-                # #611: bind the turn to its conversation id now that one
-                # exists, so it becomes cancellable/supersedable by that id.
-                # (An id supplied in the request was already bound at
-                # creation, in ask_stream(), before this task started.)
+                # Bind the turn to its newly created conversation id
+                # so it becomes cancellable/supersedable by that id.
+                # (An id supplied in the request is already bound at
+                # creation, in ask_stream(), ahead of this task's creation.)
                 get_turn_registry().bind(turn, conversation_id)
                 # Generate title from question
                 title = generate_title(request.question)
@@ -874,7 +868,7 @@ async def ask_stream(request: AskStreamRequest):
             # Send conversation ID to client
             await turn.emit(f"data: {json.dumps({'type': 'conversation_id', 'conversation_id': conversation_id})}\n\n")
 
-            # #674: tell the caller the fragment is on disk. This is the only
+            # Tell the caller the fragment is on disk. This is the only
             # thing that makes "logged" an honest status downstream — the ring
             # ingest endpoint requires this event before it reports success or
             # burns the delivery's idempotency key, rather than inferring
@@ -893,8 +887,8 @@ async def ask_stream(request: AskStreamRequest):
             # Save user message
             store.add_message(conversation_id, "user", request.question)
 
-            # `/agent [local|claude] <task>` — spawn an operator agent on demand
-            # (#235). Equivalent affordance to Telegram's /agent command, calling
+            # `/agent [local|claude] <task>` — spawn an operator agent on demand.
+            # Equivalent affordance to Telegram's /agent command, calling
             # the same create_operator_session entry point.
             _stripped = request.question.strip()
             if _stripped.lower() == "/agent" or _stripped.lower().startswith("/agent "):
@@ -907,11 +901,11 @@ async def ask_stream(request: AskStreamRequest):
             # (resolved further down), this isn't an LLM turn at all — it routes
             # the whole message to a background Claude Code worker session, the
             # same handoff the orchestrator emits for an inferred "use claude
-            # code" directive (#305b). An explicit per-turn choice, so it precedes
+            # code" directive. An explicit per-turn choice, so it precedes
             # numeric selection, classification, and the agentic loop, and works
             # regardless of the chat LLM backend (the handoff spawns a CLI worker,
             # not an LLM turn). The frontend treats an explicit pick as its own
-            # handoff opt-in, bypassing the persona capability gate (#359).
+            # handoff opt-in, bypassing the persona capability gate.
             canonical_cli = (
                 canonical_spec.executor
                 if canonical_spec is not None and canonical_spec.executor in {"claude_code", "codex"}
@@ -959,7 +953,7 @@ async def ask_stream(request: AskStreamRequest):
                     # [CLARIFY]/[GOAL] can be answered from this web/voice thread
                     # (no Telegram needed) via POST /api/conversations/{id}/answer
                     # → the session-keyed deposit → the worker's existing resume
-                    # path (#403). Best-effort: a link failure only loses the
+                    # path. Best-effort: a link failure only loses the
                     # web round-trip, not the session (Telegram parity still works).
                     try:
                         store.set_agent_session_id(conversation_id, _sid)
@@ -1032,7 +1026,7 @@ async def ask_stream(request: AskStreamRequest):
                                     # Persisted in full above — clear the accumulator so a
                                     # cancellation on the way out (e.g. during the emit/return
                                     # below) can't re-persist it as if it were only a partial
-                                    # (#611: would otherwise double-write this message).
+                                    # (would otherwise double-write this message).
                                     partial_text = ""
                                     await turn.emit(f"data: {json.dumps({'type': 'done'})}\n\n")
                                     return
@@ -1057,7 +1051,7 @@ async def ask_stream(request: AskStreamRequest):
                     await turn.emit(f"data: {json.dumps({'type': 'done'})}\n\n")
                     return
 
-            # Explicit engine handoff (#305 part b): the user named a CLI engine
+            # Explicit engine handoff: the user named a CLI engine
             # ("use codex", "use claude code"). Hand the task off to that worker
             # session rather than answering inline — the surface (Telegram) spawns
             # it and reports back. Explicit intent, so it precedes classification
@@ -1082,7 +1076,7 @@ async def ask_stream(request: AskStreamRequest):
                 return
 
             # Intent classification for special dispatch cases only.
-            # Compose, task, and reminder intents now flow through the agentic
+            # Compose, task, and reminder intents flow through the agentic
             # loop which has dedicated tools (create_email_draft, manage_tasks,
             # manage_reminders). Only "code" and "ambiguous" need early return.
             action_intent = None
@@ -1111,10 +1105,9 @@ async def ask_stream(request: AskStreamRequest):
                 await turn.emit(f"data: {json.dumps({'type': 'done'})}\n\n")
                 return
 
-            # --- REMOVED: legacy compose/task/reminder handlers ---
-            # These intents now flow through the agentic loop below, which has
-            # create_email_draft, manage_tasks, and manage_reminders tools.
-            # Keeping this comment as a breadcrumb for future readers.
+            # Compose, task, and reminder intents flow through the agentic loop
+            # below, which has create_email_draft, manage_tasks, and
+            # manage_reminders tools.
 
             # =============================================================
             # Agentic synthesis path: Claude decides what to fetch
@@ -1144,19 +1137,19 @@ async def ask_stream(request: AskStreamRequest):
             # The agent loop uses the orchestrator model configured by
             # LIFEOS_ANTHROPIC_MODEL (or the local backend if LIFEOS_LLM_BACKEND=local).
             # The perf-trace field is still named `model_tier` because the column
-            # in perf_traces.db is `model_tier` — but the value is now a model id
+            # in perf_traces.db is `model_tier` — but the value is a model id
             # (e.g. "claude-haiku-4-5"), not a tier label ("haiku"/"sonnet"/"opus").
             orchestrator_model = getattr(settings, "anthropic_model", "claude-haiku-4-5")
             # Escalation: pick a stronger model for this turn either because the
-            # user explicitly asked ("escalate to opus", #305) or because the
-            # prior turn refused and this message pushes back (#303). Anthropic
+            # user explicitly asked ("escalate to opus") or because the
+            # prior turn refused and this message pushes back. Anthropic
             # backend only — the local backend can't honor a per-turn model.
             escalated = False
             force_local = False
             force_remote = False
             # Per-turn model picker: an explicit pick wins over auto-escalation.
             # "gemma"/"local" → run this turn on the local backend; "remote"
-            # (#654) → the configured paid OpenAI-compatible provider, an
+            # → the configured paid OpenAI-compatible provider, an
             # explicit pick only — never reachable from auto-escalation (see
             # NON_API_RUNGS in agent_loop.py); a tier word or model id → pin
             # this turn to that cloud model. "auto"/unset falls through to the
@@ -1188,7 +1181,7 @@ async def ask_stream(request: AskStreamRequest):
                 orchestrator_model, escalated = resolve_orchestrator_model(
                     conversation_history, request.question, orchestrator_model, escalation_model
                 )
-            # A `local` rung (#584): the ladder can climb to the on-box model
+            # A `local` rung: the ladder can climb to the on-box model
             # instead of an API one. Handled here rather than below because it
             # IS an LLM turn — just on the other backend — so it must set
             # force_local before the loop builds its client, and must not fall
@@ -1198,7 +1191,7 @@ async def ask_stream(request: AskStreamRequest):
                 force_local = True
                 logger.info("escalation ladder → local (Gemma) turn")
 
-            # Top of the escalation ladder (#305c): when repeated refusals exhaust
+            # Top of the escalation ladder: when repeated refusals exhaust
             # the model rungs, resolve returns an engine name — hand off to that
             # worker session instead of running the loop on a non-model.
             if escalated and orchestrator_model in ("codex", "claude_code"):
@@ -1260,7 +1253,7 @@ async def ask_stream(request: AskStreamRequest):
                 user_message=request.question,
             ):
                 if event["type"] == "turn_state":
-                    # #615: live, mutable AgentResult -- see the comment by
+                    # Live, mutable AgentResult -- see the comment by
                     # `live_result`'s declaration above.
                     live_result = event["result"]
                 elif event["type"] == "text":
@@ -1268,7 +1261,7 @@ async def ask_stream(request: AskStreamRequest):
                 elif event["type"] == "status":
                     await turn.emit(f"data: {json.dumps({'type': 'status', 'message': event['message']})}\n\n")
                 elif event["type"] == "self_correction":
-                    # #611: what was streamed so far is superseded by the
+                    # What was streamed so far is superseded by the
                     # self-corrected retry that follows — mirrors
                     # ask-stream.js's `fullContent = ''` reset, and matters
                     # here because `agent_result.full_text` only gains a
@@ -1287,7 +1280,7 @@ async def ask_stream(request: AskStreamRequest):
 
             # Record usage
             if agent_result.total_input_tokens > 0:
-                # getattr tolerates an agent_result predating #654 (e.g. a
+                # getattr tolerates an agent_result (e.g. a
                 # test double) that has no unpriced field at all.
                 _unpriced = getattr(agent_result, "unpriced", False)
                 usage_store = get_usage_store()
@@ -1299,8 +1292,8 @@ async def ask_stream(request: AskStreamRequest):
                     conversation_id=conversation_id,
                     unpriced=_unpriced,
                 )
-                usage_recorded = True  # #615: the cancel/deadline handler must not double-write this
-                # #654: an unpriced turn (a remote pick with no configured
+                usage_recorded = True  # the cancel/deadline handler must not double-write this
+                # An unpriced turn (a remote pick with no configured
                 # rate) sends no cost_usd at all rather than a confident free
                 # 0 -- the same three-state contract Hermes turns already use
                 # (docs/specs/technical/client-surfaces.md's "Usage and cost
@@ -1365,7 +1358,7 @@ async def ask_stream(request: AskStreamRequest):
             )
             # Clear the streamed accumulator after persistence so a
             # cancellation on the way out below can't re-persist it as a
-            # truncated duplicate of the message just written (#611).
+            # truncated duplicate of the message just written.
             partial_text = ""
             print(f"Saved assistant response ({len(_assistant_text)} chars, {len(agent_result.tool_calls_log)} tool calls)")
 
@@ -1383,10 +1376,9 @@ async def ask_stream(request: AskStreamRequest):
             await turn.emit(f"data: {json.dumps({'type': 'done'})}\n\n")
 
         except asyncio.CancelledError:
-            # #611: the client disconnected (survivable turn, now cancelled
+            # The client disconnected (survivable turn, cancelled
             # by an explicit /cancel, a supersede, the detached-lifetime
-            # deadline, or a shutdown drain) — every modality alike since
-            # #616 lifted the voice-only immediate-cancel gate. Persist
+            # deadline, or a shutdown drain) — every modality alike. Persist
             # whatever the user had already seen rather than losing it
             # outright — marked so it's never mistaken for a finished reply.
             if conversation_id and partial_text:
@@ -1394,7 +1386,7 @@ async def ask_stream(request: AskStreamRequest):
                     conversation_id, "assistant", partial_text + TRUNCATION_MARKER,
                     routing=truncation_routing(turn.cancel_reason or "cancelled"),
                 )
-            # #615: the tokens for a cancelled turn were already spent (and
+            # The tokens for a cancelled turn were already spent (and
             # billed) even though the loop never reached its terminal
             # `result` event -- read them from the live reference stashed
             # from `turn_state` instead. `usage_recorded` guards against a
@@ -1402,14 +1394,13 @@ async def ask_stream(request: AskStreamRequest):
             # (e.g. during `finish_trace`/`turn.emit` on the way out) from
             # double-recording it.
             #
-            # #629 narrowed, but did not close, the gap #615 left open: both
-            # LocalLLMClient.astream and AnthropicLLMClient.astream only
+            # Both LocalLLMClient.astream and AnthropicLLMClient.astream only
             # yield *confirmed* usage in the "done" event that closes out a
             # full round's stream, and agent_loop._track_usage() folds that
             # into total_input_tokens/total_output_tokens only once "done"
-            # arrives. A cancellation landing mid-round used to report zero
-            # for that round no matter what. Now, on the Anthropic backend,
-            # agent_loop also tracks provisional_input_tokens /
+            # arrives. A cancellation landing mid-round would otherwise report
+            # zero for that round no matter what was actually spent. On the
+            # Anthropic backend, agent_loop also tracks provisional_input_tokens /
             # provisional_output_tokens -- the in-flight round's cumulative
             # usage-so-far, from the "usage_update" events Anthropic's wire
             # protocol carries via `message_start`/`message_delta` (see
@@ -1419,8 +1410,7 @@ async def ask_stream(request: AskStreamRequest):
             # protocol has no equivalent mid-stream signal, so
             # provisional_input_tokens/provisional_output_tokens stay 0
             # there always, and a mid-round cancellation on that backend is
-            # unchanged from before #629: still a known, narrower surviving
-            # gap, not a claim that nothing was spent.
+            # a known, narrower surviving gap, not a claim that nothing was spent.
             #
             # `total_input_tokens + provisional_input_tokens > 0` is NOT
             # "nothing was spent" -- it's "neither the confirmed nor the
@@ -1428,8 +1418,8 @@ async def ask_stream(request: AskStreamRequest):
             # guard exists because writing a zero-token row would
             # affirmatively assert "this cost nothing," which is worse than
             # writing nothing at all. `getattr(..., 0)` tolerates a
-            # `live_result` that predates #629 (e.g. a test double) and
-            # therefore has no provisional_* fields at all.
+            # `live_result` (e.g. a test double) that has no provisional_*
+            # fields at all.
             #
             # This also covers a cancelled turn before any round completed
             # (neither accumulator ever moved) and a fake test loop that
@@ -1446,8 +1436,8 @@ async def ask_stream(request: AskStreamRequest):
                         output_tokens=cancelled_output_tokens,
                         cost_usd=live_result.total_cost_usd,
                         conversation_id=conversation_id,
-                        # getattr tolerates a live_result predating #654/#661
-                        # (or a test double) that has no unpriced field at all.
+                        # getattr tolerates a live_result (or a test double)
+                        # that has no unpriced field at all.
                         unpriced=getattr(live_result, "unpriced", False),
                     )
                     usage_recorded = True
@@ -1456,8 +1446,8 @@ async def ask_stream(request: AskStreamRequest):
         except Exception:
             finish_trace()  # Clean up trace on error
             if conversation_id and partial_text:
-                # #611: a genuine mid-stream error (e.g. the agent loop
-                # itself raised) used to leave NOTHING persisted even though
+                # A genuine mid-stream error (e.g. the agent loop
+                # itself raised) would otherwise leave NOTHING persisted even though
                 # partial_text had already reached the browser -- an
                 # invisible truncation with no signal anything went wrong.
                 # Persist it, marked, same as an explicit cancellation.
@@ -1480,11 +1470,11 @@ async def ask_stream(request: AskStreamRequest):
             get_turn_registry().pop(turn)
             await turn.close()
 
-    # #611: start the turn as a background task NOW -- it owns its own
+    # Start the turn as a background task NOW -- it owns its own
     # lifetime from here on -- and hand StreamingResponse a reader over its
     # queue rather than the turn's own generator. A connected client's frame
     # sequence is unaffected (emit() backpressures exactly like a bare
-    # `yield` did), but closing this reader (a disconnect) no longer stops
+    # `yield` would), and closing this reader (a disconnect) does not stop
     # the task underneath it.
     turn.task = asyncio.create_task(_run_turn())
     return StreamingResponse(
@@ -1498,7 +1488,7 @@ async def ask_stream(request: AskStreamRequest):
 
 
 class ChatCancelRequest(BaseModel):
-    """Cancel a chat turn by its client-supplied key (#611 review)."""
+    """Cancel a chat turn by its client-supplied key."""
     client_turn_id: str
 
     @field_validator("client_turn_id")
@@ -1517,7 +1507,7 @@ class ChatCancelRequest(BaseModel):
 async def chat_cancel(request: ChatCancelRequest):
     """Cancel a chat turn (native or Hermes-relayed) by `client_turn_id` —
     the key the client mints and sends on `POST /api/ask/stream`, BEFORE it
-    has a `conversation_id` to cancel by (#611 review). This closes the
+    has a `conversation_id` to cancel by. This closes the
     "first-turn barge-in" gap `POST /api/conversations/{id}/cancel` alone
     can't: a request that hasn't reached its first SSE frame yet has no
     conversation id, but the client already has the key it generated.
@@ -1536,7 +1526,7 @@ async def chat_cancel(request: ChatCancelRequest):
 
 
 class HandoffRequest(BaseModel):
-    """Web-chat → CLI-engine handoff (#305b/c)."""
+    """Web-chat → CLI-engine handoff."""
     engine: str  # "codex" | "claude_code"
     task: str
     conversation_id: Optional[str] = None
@@ -1630,9 +1620,9 @@ async def chat_handoff(request: HandoffRequest):
         )
         working_dir = canonical.working_dir or working_dir
     # Also route the worker's completion notification to the operator's Telegram.
-    # As of #311 the spawned session's progress + result are mirrored back into
+    # The spawned session's progress + result are mirrored back into
     # this web/voice thread too (the conversation is linked to the session
-    # below), so Telegram is now an additional delivery channel, not the only
+    # below); Telegram is an additional delivery channel, not the only
     # one. None if Telegram isn't set.
     chat_id = getattr(settings, "telegram_chat_id", "") or None
 
@@ -1671,7 +1661,7 @@ async def chat_handoff(request: HandoffRequest):
             )
         except Exception:
             logger.warning("failed to record handoff acknowledgment", exc_info=True)
-        # #311: link the conversation to the spawned session so the worker can
+        # Link the conversation to the spawned session so the worker can
         # mirror the session's progress + terminal result back into this thread
         # (in addition to Telegram). Best-effort — a link failure only loses the
         # web round-trip, not the Telegram delivery. Mirrors the orchestrating-

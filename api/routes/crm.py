@@ -1253,7 +1253,7 @@ def get_person_contact_sources(person_id: str):
     - This email address is linked to Person A
     - This phone number is linked to Person A
 
-    Not: "Message #12345 is linked to Person A"
+    Not: "Message 12345 is linked to Person A"
     """
     from pathlib import Path
 
@@ -1580,7 +1580,7 @@ def split_person(request: PersonSplitRequest):
         to_person.sources = [row[0] for row in cursor]
 
         # Update phone_numbers and emails based on remaining source entities
-        # Get phones/emails that were moved
+        # Collect the phones/emails to move to to_person
         moved_phones = {se.get('observed_phone') for se in source_entity_details if se.get('observed_phone')}
         moved_emails = {se.get('observed_email', '').lower() for se in source_entity_details if se.get('observed_email')}
 
@@ -1594,7 +1594,7 @@ def split_person(request: PersonSplitRequest):
             if email and not to_person.has_email(email):
                 to_person.emails.append(email)
 
-        # Remove phones from from_person that no longer have source entities
+        # Remove phones from from_person that have no remaining source entities
         cursor = conn.execute("""
             SELECT DISTINCT observed_phone FROM source_entities
             WHERE canonical_person_id = ? AND observed_phone IS NOT NULL
@@ -1604,7 +1604,7 @@ def split_person(request: PersonSplitRequest):
         if from_person.phone_primary and from_person.phone_primary not in remaining_phones:
             from_person.phone_primary = from_person.phone_numbers[0] if from_person.phone_numbers else None
 
-        # Remove emails from from_person that no longer have source entities
+        # Remove emails from from_person that have no remaining source entities
         cursor = conn.execute("""
             SELECT DISTINCT LOWER(observed_email) FROM source_entities
             WHERE canonical_person_id = ? AND observed_email IS NOT NULL
@@ -2667,7 +2667,7 @@ def get_network_graph(
     center_edges: dict[str, Relationship] = {}
 
     # Cached and cheap. Canonical-id-keyed, so it serves both as the
-    # strength lookup used to rank first-degree candidates by the real
+    # strength lookup for ranking first-degree candidates by the real
     # rendered edge weight, and as the final node-building/edge-weight
     # lookup with no separate batch-by-id call needed.
     all_people_dict = {p.id: p for p in person_store.get_all()}
@@ -2912,7 +2912,7 @@ def get_network_graph(
 
     if center_on:
         # Every edge touching the center is unconditionally included -
-        # these are exactly the relationship rows used to select each
+        # these are exactly the relationship rows that selected each
         # first-degree node, so this edge is never missing even for a
         # legacy/merged neighbor id - UNLESS the center itself didn't
         # survive the category/min_strength filter above, in which case
@@ -4600,7 +4600,7 @@ def get_family_communication_gaps(
             all_gap_sizes.append(gap_days)
 
             if gap_days >= min_gap_days:
-                # Calculate average gap before this point
+                # Calculate the average gap leading up to this point
                 gaps_before = all_gap_sizes[:-1] if len(all_gap_sizes) > 1 else []
                 avg_before = sum(gaps_before) / len(gaps_before) if gaps_before else None
 
@@ -5624,7 +5624,7 @@ _tone_analysis_locks_meta_lock = threading.Lock()
 
 
 def _get_tone_analysis_lock(person_id: str) -> threading.Lock:
-    """Get or create the per-person lock used to serialize tone analysis."""
+    """Get or create the per-person lock that serializes tone analysis."""
     with _tone_analysis_locks_meta_lock:
         lock = _tone_analysis_locks.get(person_id)
         if lock is None:

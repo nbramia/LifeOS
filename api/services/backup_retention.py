@@ -15,7 +15,7 @@ At the defaults (5 / 35 / 365 day boundaries), steady state is roughly:
 
 The helper is intentionally parameterised by ``db_basename`` so other
 stores (``crm.db``, ``sync_health.db``, …) can reuse the same retention
-policy without copy-pasting the bucket math. Issue #227.
+policy without copy-pasting the bucket math.
 
 Filename convention
 -------------------
@@ -90,8 +90,8 @@ def parse_backup_timestamp(name: str, db_basename: str) -> Optional[datetime]:
 
 @dataclass(frozen=True)
 class RetentionPolicy:
-    """Tier boundaries (in days) for ``prune``. All defaults match what
-    ``interaction_store.create_backup`` shipped with in PR #225."""
+    """Tier boundaries (in days) for ``prune``. All defaults match
+    ``interaction_store.create_backup``'s own retention defaults."""
 
     daily_keep: int = 5
     weekly_horizon_days: int = 35

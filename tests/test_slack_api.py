@@ -5,7 +5,6 @@ Tests Slack integration endpoints for search, conversations, and sync.
 """
 import pytest
 from unittest.mock import MagicMock, patch
-from datetime import datetime
 from fastapi.testclient import TestClient
 
 from api.main import app
