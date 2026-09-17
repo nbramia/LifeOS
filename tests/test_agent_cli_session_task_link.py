@@ -1,6 +1,6 @@
-"""Tests for #851's task_id linkage on CLI session registration: a
+"""Tests for task_id linkage on CLI session registration: a
 `session_start` event naming a `task_id` (forwarded by
-`scripts/lifeos-agent-hook.sh` from `$LIFEOS_TASK_ID` — see #849) moves that
+`scripts/lifeos-agent-hook.sh` from `$LIFEOS_TASK_ID`) moves that
 task from `todo` to `in_progress`. Board `POST /board/cards/{id}/open`
 (`api/routes/agent_assignment.py`) sets `LIFEOS_TASK_ID` when it spawns the
 interactive CLI, so this is what turns "opened" into "In progress" on the

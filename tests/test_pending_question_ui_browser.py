@@ -1,4 +1,4 @@
-"""Browser test for the web /chat answer affordance (#412).
+"""Browser test for the web /chat answer affordance.
 
 Drives the orchestrating-persona answer UI — the inline card that renders when a
 conversation's spawned session is awaiting a `[CLARIFY]`/`[GOAL]` — with the
@@ -9,7 +9,7 @@ deterministically, without a real doctor session or worker.
 Verifies the FRONTEND: that a conversation whose `GET` returns a
 `pending_question` renders the answer card, that Send POSTs to `/answer`, and
 that a successful answer clears the affordance. The server-side deposit/resume
-(#403) is covered separately; this never spawns a real session. Requires the
+is covered separately; this never spawns a real session. Requires the
 server serving the chat page on the owned candidate instance.
 """
 import json
@@ -72,10 +72,10 @@ def _install_conversation_mocks(page: Page, state: dict):
                 "updated_at": "2026-06-25T10:01:00",
                 # `state["messages"]` is mutable so a test can simulate a
                 # late-arriving message (the worker mirroring the spawned
-                # session's result, #311) landing in a later poll.
+                # session's result) landing in a later poll.
                 "messages": list(state["messages"]),
                 "pending_question": None,
-                # #311: whether the spawned session is still running. The client
+                # Whether the spawned session is still running. The client
                 # stops polling once this is False AND no question is pending.
                 # Defaults to active so a test that never sets it keeps the
                 # historical "poll runs" behavior.
@@ -182,7 +182,7 @@ class TestPendingQuestionUI:
         expect(page.locator("#pendingQuestionCard")).to_have_count(0)
 
     def test_late_mirrored_message_renders_once(self, page: Page):
-        """#311: a message that appears in a LATER poll (the worker mirroring the
+        """A message that appears in a LATER poll (the worker mirroring the
         spawned session's result into the thread) is rendered into #messages and
         is NOT duplicated on subsequent polls.
 
@@ -213,7 +213,7 @@ class TestPendingQuestionUI:
         expect(result).to_have_count(1)
 
     def test_poll_stops_when_session_terminal_and_no_question(self, page: Page):
-        """#311: once the spawned session reaches a terminal status AND no
+        """Once the spawned session reaches a terminal status AND no
         question is pending, the client stops the 4s poll instead of running
         forever. The stop needs TWO consecutive terminal polls (race guard), so
         this allows a couple of cycles before asserting the detail-GET count
@@ -222,14 +222,14 @@ class TestPendingQuestionUI:
         # A question is pending, so the poll is running and the card is shown.
         expect(page.locator("#pendingQuestionCard")).to_be_visible(timeout=8000)
 
-        # The session finishes: the question resolves and the server now reports
+        # The session finishes: the question resolves and the server subsequently reports
         # the linked session as terminal (not active).
         self.state["awaiting"] = False
         self.state["agent_session_active"] = False
 
         # The card clears on the first terminal poll; the loop stops on the
         # second. Wait past two full intervals so the stop has definitely fired,
-        # then snapshot the GET count and confirm it no longer grows.
+        # then snapshot the GET count and confirm it stays flat.
         expect(page.locator("#pendingQuestionCard")).to_have_count(0, timeout=8000)
         page.wait_for_timeout(POLL_INTERVAL_MS_PLUS * 2)
         settled = self.state.get("detail_get_count", 0)
@@ -241,7 +241,7 @@ class TestPendingQuestionUI:
         )
 
     def test_terminal_poll_before_result_is_stored_still_renders_result(self, page: Page):
-        """#311 (race guard): the executor flips the session row terminal BEFORE
+        """Race guard: the executor flips the session row terminal BEFORE
         the dispatch handler writes the result mirror, so a poll can see
         agent_session_active=false with the result not yet in the GET. A single
         terminal poll must NOT stop — the next poll, once the mirrored result has

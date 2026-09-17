@@ -1,5 +1,5 @@
 """
-Tests for multi-bot Telegram support (issue #316).
+Tests for multi-bot Telegram support.
 
 Covers the registry loader (settings.telegram_bots), per-bot listener wiring,
 token routing via the active-bot ContextVar, and persona forwarding through the
@@ -53,7 +53,7 @@ class TestRegistryLoader:
         assert (bot.name, bot.token, bot.chat_id, bot.persona) == (
             "fitness", "fit-token-123", "555", "FIT PERSONA"
         )
-        # #684: every registry entry defaults to the Hermes backend.
+        # Every registry entry defaults to the Hermes backend.
         assert bot.backend == "hermes"
 
     def test_backend_defaults_to_hermes(self, tmp_path, monkeypatch):
@@ -209,7 +209,7 @@ class TestHandleUpdate:
 
     @pytest.mark.asyncio
     async def test_specialized_bot_forwards_persona_id_via_hermes(self, monkeypatch):
-        """#684: a specialized bot resolves its persona server-side via
+        """A specialized bot resolves its persona server-side via
         `persona_id` (not the raw preamble text) and targets the Hermes
         backend by default, once Hermes is configured."""
         monkeypatch.setattr("api.services.telegram.settings.hermes_backend_url", "http://hermes")
@@ -290,7 +290,7 @@ class TestHandleUpdate:
 
     @pytest.mark.asyncio
     async def test_primary_bot_prepends_reply_quote_when_hooks_miss(self):
-        """Issue #435: a reply to an ordinary primary-bot message (not a
+        """A reply to an ordinary primary-bot message (not a
         claude-code/agent-worker thread) carries the quoted text into chat."""
         listener = self._listener("primary", "999")
         update = {"message": {
@@ -482,7 +482,7 @@ class TestChatViaApiPersona:
 
 
 # ---------------------------------------------------------------------------
-# chat_via_api's backend selection (#684): persona_id, target URL, and the
+# chat_via_api's backend selection: persona_id, target URL, and the
 # HermesUnavailable signal a hermes-backend caller retries on.
 # ---------------------------------------------------------------------------
 
@@ -554,7 +554,7 @@ class TestChatViaApiBackendSelection:
     @pytest.mark.asyncio
     @patch("api.services.telegram.settings")
     async def test_hermes_503_raises_hermes_unavailable(self, mock_settings):
-        """#684: an unconfigured Hermes backend (the router's 503, raised
+        """An unconfigured Hermes backend (the router's 503, raised
         before any side effect — e.g. journal capture — can have happened)
         is a HermesUnavailable, not a generic RuntimeError, so a caller can
         catch it and retry on backend="lifeos"."""
@@ -598,7 +598,7 @@ class TestChatViaApiBackendSelection:
     @pytest.mark.asyncio
     @patch("api.services.telegram.settings")
     async def test_lifeos_backend_non_200_is_a_plain_runtime_error(self, mock_settings):
-        """A non-200 on the native path is unaffected by #684 — still the
+        """A non-200 on the native path is unaffected by the Hermes backend switch — still the
         original plain RuntimeError, never HermesUnavailable."""
         from api.services.telegram import HermesUnavailable, chat_via_api
         mock_settings.port = 8000
@@ -611,7 +611,7 @@ class TestChatViaApiBackendSelection:
 
 
 # ---------------------------------------------------------------------------
-# Listener-level Hermes fallback + one-time disclosure (#684)
+# Listener-level Hermes fallback + one-time disclosure
 # ---------------------------------------------------------------------------
 
 class TestHermesFallback:
@@ -696,7 +696,7 @@ class TestHermesFallback:
 
     @pytest.mark.asyncio
     async def test_bot_configured_lifeos_backend_never_tries_hermes(self, monkeypatch):
-        """A registry entry pinned to backend="lifeos" (#684) never attempts
+        """A registry entry pinned to backend="lifeos" never attempts
         Hermes at all — no fallback, no disclosure, just the native call."""
         monkeypatch.setattr("api.services.telegram.settings.hermes_backend_url", "http://hermes")
         listener = self._listener()
@@ -712,7 +712,7 @@ class TestHermesFallback:
 
     @pytest.mark.asyncio
     async def test_primary_bot_never_touches_hermes_backend(self, monkeypatch):
-        """The primary bot is untouched by #684 regardless of Hermes state —
+        """The primary bot is untouched by the Hermes backend switch regardless of Hermes state —
         it always calls the raw-persona native path."""
         monkeypatch.setattr("api.services.telegram.settings.hermes_backend_url", "http://hermes")
         listener = self._listener(name="primary", persona="PRIMARY PERSONA")

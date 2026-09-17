@@ -1,4 +1,4 @@
-"""Unit tests for completion_signal.has_positive_completion_signal (#760).
+"""Unit tests for completion_signal.has_positive_completion_signal.
 
 Deterministic gate that decides whether a claude_code/codex session's
 nominal STATUS_COMPLETED outcome is an EARNED completion or an interrupted
@@ -21,7 +21,7 @@ FIELD_FRAGMENT = "Now update the cancel test to drop the no-longer-needed releas
 
 def test_field_fixture_is_not_earned():
     """The exact field-observed fragment must NOT earn completion — this is
-    the regression case #760 exists to fix."""
+    a case this check exists to catch."""
     assert has_positive_completion_signal(FIELD_FRAGMENT, notifications_sent=0) is False
 
 
@@ -44,8 +44,8 @@ def test_issue_url_in_final_text_earns_completion():
 
 
 def test_pr_mention_with_hash_number_earns_completion():
-    """A bare #123 only counts alongside merge/PR-ish phrasing (conservative
-    per #760 — a URL is the strong signal)."""
+    """A bare hash+number only counts alongside merge/PR-ish phrasing
+    (conservative — a URL is the strong signal)."""
     assert has_positive_completion_signal(
         "Opened PR #123 for the cancel-test fix.", notifications_sent=0,
     ) is True

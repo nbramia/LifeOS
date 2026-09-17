@@ -39,7 +39,7 @@ from api.routes.crm import router as crm_router
 pytestmark = pytest.mark.unit
 
 SLEEP_SECONDS = 1.5
-# The issue's own acceptance bound. Measured non-flaky even under deliberate
+# The acceptance bound. Measured non-flaky even under deliberate
 # full-CPU saturation (idle: low-single-digit ms; 32 busy-loops on a 32-core
 # box: still under 10ms) — a 100x margin under contention, so 100ms asserts
 # the criterion instead of just approximating it.

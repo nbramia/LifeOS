@@ -1,6 +1,6 @@
 """
 Tests for the Monarch transactions endpoint's optional ascending/descending
-sort order (#779).
+sort order.
 
 The underlying monarchmoney client always fetches with offset=0 and a fixed
 server-side ordering with no direction control, so naively sorting a

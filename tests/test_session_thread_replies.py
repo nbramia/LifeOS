@@ -1,4 +1,4 @@
-"""Threaded replies to ANY session message route back into the session (#458).
+"""Threaded replies to ANY session message route back into the session.
 
 Covers the three layers of the status-anchor feature:
   * session_store — the per-session ``kind='status_anchor'`` row that
@@ -177,7 +177,7 @@ class TestCompletedWithPendingReopens:
                         session.session_id, "operator", "(operator note) also check X",
                     )
                 self.store.update_status(session.task_id, STATUS_COMPLETED)
-                # notifications_sent=1 earns the completion (#760) — these
+                # notifications_sent=1 earns the completion — these
                 # tests are about the reopen-for-pending-messages tail, not
                 # the earned-completion gate itself.
                 return ExecutorOutcome(
@@ -233,7 +233,7 @@ class TestCompletedWithPendingReopens:
 class TestBlockedClarifyPromptMerged:
     def test_clarify_prompt_carries_question_and_footer(self, tmp_path):
         """The clarification question and its reply instructions arrive as ONE
-        anchored message (#458), same treatment [GOAL] got in #456."""
+        anchored message, same treatment [GOAL] gets."""
         from dataclasses import dataclass
         from api.services.agent_worker.claude_code_executor import (
             REASON_AWAITING_CLARIFICATION,
@@ -372,18 +372,17 @@ class TestStatusAnchorReplies:
         assert any(t.endswith(REPLYABLE_FOOTER) for t in sent)
 
 
-# #684 retired `_handle_orchestration_message` (the direct-CC entry doctor
-# used for a FRESH message, including its "On it" ack + reply-anchor
-# registration) in favor of routing fresh messages through the same chat
-# pipeline every other bot uses. The worker-side anchor machinery this test
-# exercised (`send_message_capture_ids` + `add_reply_anchors`) is unaffected
-# and still fully covered elsewhere in this file (e.g.
+# Fresh messages route through the same chat pipeline every other bot
+# uses, rather than through a direct-CC entry doctor path with its own
+# "On it" ack + reply-anchor registration. The worker-side anchor
+# machinery this test exercises (`send_message_capture_ids` +
+# `add_reply_anchors`) is fully covered elsewhere in this file (e.g.
 # TestReplyAnchorStore, TestFooterAndAnchors) — it's exercised there via a
 # session the worker itself sends status/completion messages for, which is
-# how a Hermes- or native-fallback-spawned doctor session still gets
-# anchored replies once the WORKER (not this retired ack) sends its first
+# how a Hermes- or native-fallback-spawned doctor session gets
+# anchored replies once the WORKER sends its first
 # operator-facing message. `test_blocked_session_note_rides_the_goal_answer`
-# below is the closest surviving end-to-end case: a spawned doctor session's
+# below is the closest end-to-end case: a spawned doctor session's
 # anchored status message resolves a threaded reply back into it.
 
 

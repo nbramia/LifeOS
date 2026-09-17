@@ -1,5 +1,5 @@
 """Tests for the vault-root sanity check added to `vault_search` in
-`GET /health/full` (#762): the existing request/response probe only
+`GET /health/full`: the existing request/response probe only
 confirms search returns *something* — it can't tell a moved/deleted vault
 whose index still holds entries from the old location, because search keeps
 "working" against stale content. These tests cover the pure comparison
@@ -57,7 +57,7 @@ class TestSampleFilePaths:
     def test_dedupes_chunks_from_the_same_file(self):
         """Each file is indexed as several chunks sharing one file_path — a
         raw limit-sized fetch could otherwise return the same file 5 times
-        over instead of sampling 5 distinct files (Codex review finding)."""
+        over instead of sampling 5 distinct files."""
         metadatas = (
             [{"file_path": "/vault/a.md"}] * 3
             + [{"file_path": "/vault/b.md"}] * 3
@@ -80,7 +80,7 @@ class TestSampleFilePaths:
     def test_calendar_only_rows_yield_an_empty_sample(self):
         """On a real vault, calendar-event rows (indexed under a relative
         pseudo-path like "calendar/<event-id>") dominate the front of
-        insertion order. Before #762 follow-up, a fetch limited to the first
+        insertion order. A fetch limited to the first
         few rows could return nothing but these, and every one would be
         flagged as "outside the vault root" — a false degraded. They must be
         excluded from the sample entirely, not just tolerated."""
@@ -237,7 +237,7 @@ class TestCheckVaultRootSanity:
         """A sample with zero vault documents (e.g. the collection is
         currently all calendar/Slack content) must not be treated as
         evidence of a moved vault — absence of vault chunks in a bounded
-        sample isn't proof the vault moved (#762 follow-up)."""
+        sample isn't proof the vault moved."""
         import api.main as main
         from api.services import vectorstore as vs
 
@@ -259,8 +259,7 @@ class TestCheckVaultRootSanity:
         some matches and some mismatches (e.g. debris from a test run that
         indexed documents straight into this collection, or a stray path
         from an old sync) isn't that failure and must not degrade — but the
-        partial mismatch is still surfaced as a counts-only note (#762
-        second follow-up)."""
+        partial mismatch is still surfaced as a counts-only note."""
         import api.main as main
         from api.services import vectorstore as vs
 

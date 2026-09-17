@@ -1,4 +1,4 @@
-"""#629: a cancellation landing mid-round (after the client has surfaced a
+"""A cancellation landing mid-round (after the client has surfaced a
 "usage_update" event but before that round's "done" event) must not report
 zero usage for the whole round, and a round that completes normally must
 still fold its usage into AgentResult exactly once -- the "usage_update"
@@ -47,7 +47,7 @@ async def test_mid_round_cancellation_credits_provisional_tokens_without_folding
     """A cancellation that lands after "usage_update" but before "done"
     must leave the tokens visible on the live AgentResult via
     provisional_input_tokens/provisional_output_tokens -- exactly what a
-    cancel/deadline handler reads (#615, #629) -- without having advanced
+    cancel/deadline handler reads -- without having advanced
     total_input_tokens/total_output_tokens, since the round never closed
     out."""
     from api.services import agent_loop
@@ -95,8 +95,8 @@ async def test_mid_round_cancellation_credits_provisional_tokens_without_folding
 
 @pytest.mark.asyncio
 async def test_usage_update_does_not_double_count_when_round_completes_normally():
-    """Regression guard for the double-count risk #629 explicitly warns
-    about: once the round's "done" event arrives, total_input_tokens/
+    """Regression guard against double-counting: once the round's "done"
+    event arrives, total_input_tokens/
     total_output_tokens must reflect exactly that event's usage -- not the
     "usage_update" snapshot plus the "done" usage added on top -- and the
     provisional fields must be cleared so a later reader doesn't add them

@@ -1,4 +1,4 @@
-"""API tests for the read-only agent activity visualization (issue #133).
+"""API tests for the read-only agent activity visualization.
 
 Covers /api/agents/snapshot, /api/agents/sessions/{sid}/events, and the
 per-session SSE transcript tail. Uses temp-dir-backed stores via monkeypatch
@@ -662,7 +662,7 @@ def test_stream_reports_lane_and_pending_question(stores):
 
 
 # ---------------------------------------------------------------------------
-# Summary search (issue #252) — GET /api/agents/search + the cache-only
+# Summary search — GET /api/agents/search + the cache-only
 # search_cached_summaries helper. Seeds the disk cache directly so no LLM runs.
 # ---------------------------------------------------------------------------
 

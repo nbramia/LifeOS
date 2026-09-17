@@ -1,4 +1,4 @@
-"""Tests for the agent text-backend proxy (api/routes/agent_proxy.py, #361).
+"""Tests for the agent text-backend proxy (api/routes/agent_proxy.py).
 
 Routes the proxy's httpx client through an in-process stub agent backend via
 ASGITransport (no sockets), so they're fast and deterministic.
@@ -112,7 +112,7 @@ async def test_503_when_not_configured(monkeypatch):
 
 
 async def test_malformed_json_is_forwarded_unmodified(proxy_client):
-    # Unlike the Hermes route (#590), the Agent route has no transform_body —
+    # Unlike the Hermes route, the Agent route has no transform_body —
     # it stays a pure byte relay and never parses the body as JSON, so even a
     # malformed body is forwarded as-is rather than rejected.
     resp = await proxy_client.post(
@@ -141,6 +141,6 @@ async def test_502_when_backend_unreachable(monkeypatch):
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://p") as c:
         resp = await c.post("/api/agent/ask/stream", json={"question": "hi"})
     assert resp.status_code == 502
-    # Pins the exact pre-#587 detail string — the generalized proxy (_proxy.py)
+    # Pins the exact detail string — the generalized proxy (_proxy.py)
     # must render this identically for backend_label="agent".
     assert resp.json()["detail"] == "agent backend unreachable: refused"

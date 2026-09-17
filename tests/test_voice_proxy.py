@@ -1,5 +1,5 @@
-"""Tests for the voice-gateway reverse proxy (api/routes/voice.py, #361), and
-its persistence tee (#711, `_VoiceTurnPersister`).
+"""Tests for the voice-gateway reverse proxy (api/routes/voice.py), and
+its persistence tee (`_VoiceTurnPersister`).
 
 The proxy forwards /api/voice/* to the whisper-relay voice gateway. These tests
 route the proxy's httpx client through an in-process stub gateway via
@@ -94,7 +94,7 @@ async def test_turn_stream_forwards_multipart_and_sse(proxy_client):
 
 
 async def test_turn_stream_forwards_hermes_backend_value_unchanged(proxy_client):
-    """#593: backend selection is a field on the turn, not a route -- the
+    """Backend selection is a field on the turn, not a route -- the
     catch-all here has no branch on its value, so a hermes-selected turn
     reaches the gateway through the exact same handler as a lifeos one
     (proven by the same route succeeding for a different backend string,
@@ -120,7 +120,7 @@ async def test_audio_clip_forwards_bytes_and_headers(proxy_client):
 
 
 async def test_transcribe_forwards_through_the_generic_proxy(proxy_client):
-    """No LifeOS-side route for this exists (#710) -- the catch-all `{path:path}`
+    """No LifeOS-side route for this exists yet -- the catch-all `{path:path}`
     handler already forwards any gateway path, including one whisper-relay
     doesn't implement yet. Proven here against a stub that does, pinning that
     the day the real route ships, LifeOS needs no code change to use it."""
@@ -188,7 +188,7 @@ async def test_rejects_parent_traversal_path():
 
 
 # ---------------------------------------------------------------------------
-# Persistence tee (#711) — `_VoiceTurnPersister`
+# Persistence tee — `_VoiceTurnPersister`
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
@@ -396,7 +396,7 @@ async def test_agent_backend_turn_does_not_persist(persist_proxy_client, voice_s
 @pytest.mark.parametrize("scenario", ["error", "cancelled"])
 async def test_failed_or_cancelled_turn_persists_nothing(persist_proxy_client, voice_store, scenario):
     """A turn that never reaches a `done` event — including a future bare-
-    transcribe/wake-check call (#710) that errors or is cancelled before a
+    transcribe/wake-check call that errors or is cancelled before a
     real answer — creates no conversation at all, even for the hermes
     backend that would otherwise persist."""
     data = {

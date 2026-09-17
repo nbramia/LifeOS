@@ -1,8 +1,8 @@
 """
-Tests for the manage_workouts orchestrator tool (issue #320).
+Tests for the manage_workouts orchestrator tool.
 
 The fitness bot logs/queries via this tool on the native orchestrator path;
-`POST /api/fitness/workouts` (#603) calls this same dispatcher for the MCP
+`POST /api/fitness/workouts` calls this same dispatcher for the MCP
 surface. Verifies the dispatcher, the log/update/history/summary/metric/
 profile actions, and the compact session summary the bot echoes back.
 """
@@ -39,10 +39,10 @@ class TestDispatch:
         assert out.startswith("Error")
 
     def test_update_with_empty_sets_preserves_existing_sets(self, temp_store):
-        """#603 review (BLOCKER): 'update' with sets=[] must not delete the
-        session's existing sets. Previously this returned 200/"Updated —
-        (no sets)" and the stored session's sets became [] — a silent data
-        loss reported as a success."""
+        """'update' with sets=[] must not delete the
+        session's existing sets — treating an empty sets list as "no sets
+        provided" and silently wiping the stored session would be a
+        silent data loss reported as a success."""
         _tool_manage_workouts({"action": "log", "sets": [{"exercise": "bench", "reps": 8, "weight": 135}]})
         session_id = temp_store.get_latest_session().id
         out = _tool_manage_workouts({"action": "update", "sets": []})
@@ -225,7 +225,7 @@ class TestDurationThroughTool:
 
 
 class TestSetValidation:
-    """#603 review (MAJOR): the write path accepted garbage — an empty
+    """The write path must reject garbage — an empty
     exercise, no measure at all, negative numbers, an out-of-range RPE, an
     unparseable date. Every case here must be rejected before it reaches the
     store, for both 'log' and 'update'."""

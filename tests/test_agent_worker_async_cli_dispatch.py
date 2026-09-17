@@ -1,4 +1,4 @@
-"""Spawned CLI children (claude_code/codex) dispatch off the tick (#299).
+"""Spawned CLI children (claude_code/codex) dispatch off the tick.
 
 A long-running CLI subprocess must not block the worker's poll loop from
 claiming new tasks or dispatching siblings. These tests use a capturing pool

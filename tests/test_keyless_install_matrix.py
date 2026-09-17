@@ -1,18 +1,18 @@
-"""Keyless-install regression matrix (#788).
+"""Keyless-install regression matrix.
 
 Running with no model-provider key, no reachable local model server, and no
-#699 remote provider configured is a documented, supported way to run this
-system -- but every failure that shape has produced (#697, #704, #706, #716,
-#787) was found live by a real person, fixed one at a time, with nothing
-standing guard against the next one in the same shape. This module is that
-guard: a reusable fully-keyless fixture, plus one regression assertion per
-affected path, so a future path hit by the same "no key, no local model"
-gap can be added here instead of discovered live again.
+remote provider configured is a documented, supported way to run this
+system -- and each failure shape below has broken it, in each case found
+live by a real person and fixed one at a time. This module stands guard
+against recurrence in the same shape: a reusable fully-keyless fixture,
+plus one regression assertion per affected path, so a future path hit by
+the same "no key, no local model" gap can be added here instead of
+discovered live again.
 
-Fixture design avoids two hazards named in #689/#755:
+Fixture design avoids two hazards:
 
-- Never reloads `config.settings` (which splits the singleton -- #689).
-  Every module under test did `from config.settings import settings` at
+- Never reloads `config.settings` (which would split the singleton).
+  Every module under test does `from config.settings import settings` at
   its own import time, binding its own name to the *same* underlying
   `Settings()` object (`config/settings.py`'s module-level `settings =
   Settings()`, instantiated exactly once). Swapping in a whole new
@@ -21,35 +21,31 @@ Fixture design avoids two hazards named in #689/#755:
   `config.settings.settings` fresh -- not to a module's already-bound
   name. Patching *attributes* on the shared object instead is visible
   from every module's binding without needing a fresh import anywhere.
-- Never reads an ambient environment variable / real `.env` (#755) --
-  every setting this matrix cares about is pinned explicitly via
+- Never reads an ambient environment variable / real `.env` -- every
+  setting this matrix cares about is pinned explicitly via
   `monkeypatch.setattr`, never left to whatever the process environment
   happens to contain.
 
 No test here requires network access, a real credential, a GPU, a running
 server, or writes to a real database.
 
-Status per motivating bug, as of this write (landed = already true on
-`origin/feat/oss-portability-audit`, confirmed by reading the code, not
-by GitHub issue state -- an issue closes on merge to `main`, and these
-land on the integration branch first):
+Each affected path below carries a real, currently-passing assertion:
 
-- #697 (health honesty)              -- landed  -> real assertion
-- #704 (preflight doesn't raise)     -- landed  -> real assertion
-- #706 (LocalLLMClient /v1 doubling) -- landed  -> real assertion
-- #716 (titling doesn't raise)       -- N/A     -> real assertion (see below)
-- #787 (chat omits raw exception)    -- landed  -> real assertion (promoted from
-                                                    an xfail(strict=True) placeholder)
+- Health honesty              -> real assertion
+- Preflight doesn't raise     -> real assertion
+- LocalLLMClient /v1 doubling -> real assertion
+- Titling doesn't raise       -> real assertion (see below)
+- Chat omits raw exception    -> real assertion
 
-#716's own acceptance criteria is broader than what's tested here (a
-shared local-or-remote fallback resolver, tracked by #773, so titling can
-actually *succeed* on a remote-only or Anthropic-only install instead of
-only ever trying the local server) -- that part is still open and out of
-this matrix's scope. What #788 itself asks for regarding titling is
-narrower: that a keyless install's titling failure doesn't raise and
-leaves the placeholder title in place. That guarantee already holds today
-(the broad `except Exception` in `_maybe_retitle`), so it's written below
-as a real, currently-passing assertion rather than a placeholder.
+Titling's own acceptance criteria is broader than what's tested here (a
+shared local-or-remote fallback resolver so titling can actually *succeed*
+on a remote-only or Anthropic-only install instead of only ever trying the
+local server) -- that part is out of this matrix's scope. What this
+matrix asks for regarding titling is narrower: that a keyless install's
+titling failure doesn't raise and leaves the placeholder title in place.
+That guarantee holds today (the broad `except Exception` in
+`_maybe_retitle`), so it's written below as a real, currently-passing
+assertion rather than a placeholder.
 """
 from __future__ import annotations
 
@@ -66,7 +62,7 @@ def keyless_settings(monkeypatch):
 
     No Anthropic key, no reachable local model server (the *setting* that
     would point at one is pinned to a bogus URL; reachability itself is
-    mocked per-test rather than dialed for real), no #699 remote provider,
+    mocked per-test rather than dialed for real), no remote provider,
     no Telegram. Returns the shared object so a test can read from it if
     needed.
     """
@@ -88,7 +84,7 @@ def keyless_settings(monkeypatch):
         # raising=True (default): a typo'd/renamed field must fail loudly,
         # not silently no-op while the singleton keeps whatever value it
         # picked up at import time (possibly from a real ambient .env/
-        # environment variable -- exactly the #755 hazard this fixture
+        # environment variable -- exactly the hazard this fixture
         # exists to avoid).
         monkeypatch.setattr(settings, name, value)
 
@@ -104,7 +100,7 @@ def keyless_settings(monkeypatch):
 
 
 class TestHealthReportsHonestly:
-    """#697 (landed) -- `api_key_configured` reflects whether an Anthropic
+    """`api_key_configured` reflects whether an Anthropic
     key is actually set, not merely whether `local_llm_url` (which has a
     non-empty default regardless of backend) happens to be a non-empty
     string."""
@@ -143,9 +139,9 @@ class TestPreflightDegradesInsteadOfRaising:
 
 
 class TestRemoteClientDoesNotDoubleV1:
-    """#706 (landed) -- an OpenAI-compatible remote base URL that already
+    """An OpenAI-compatible remote base URL that already
     ends in `/v1` (the documented convention for these providers, e.g. the
-    #699 remote-executor path on a keyless install) must not be doubled
+    remote-executor path on a keyless install) must not be doubled
     into `.../v1/v1/chat/completions` once call sites append their own
     `/v1/chat/completions` suffix."""
 
@@ -190,11 +186,11 @@ class _FakeTitlerStore:
 
 
 class TestTitlingDoesNotRaiseWhenNoModelIsUsable:
-    """#716's narrow slice that #788 actually asks for: on a keyless
+    """On a keyless
     install where the titler's local-only call fails, the existing
     placeholder title is left in place without raising -- not "titling
-    succeeds via some fallback" (that's #773's shared resolver, still
-    open, out of scope here)."""
+    succeeds via some fallback" (a shared local-or-remote fallback
+    resolver that would let titling succeed is out of scope here)."""
 
     @pytest.mark.asyncio
     async def test_maybe_retitle_swallows_unreachable_model_error(self, keyless_settings, monkeypatch):
@@ -228,14 +224,12 @@ class TestTitlingDoesNotRaiseWhenNoModelIsUsable:
 
 
 class TestChatErrorMessageOmitsRawException:
-    """#787 (landed) -- when a chat turn's model call exhausts its retries,
-    `agent_loop.py`'s round-loop fatal branch used to interpolate the raw
+    """When a chat turn's model call exhausts its retries,
+    `agent_loop.py`'s round-loop fatal branch must not interpolate the raw
     exception straight into the user-facing text
     (`f"Sorry, I encountered an error: {e}"`). On a keyless install that
-    read like an SDK's own internal message, not a plain "this isn't set
-    up yet" signal. #787 replaced it with fixed, generic text; this is now
-    a normal always-on regression test rather than the xfail(strict=True)
-    placeholder it started as.
+    would read like an SDK's own internal message, not a plain "this isn't
+    set up yet" signal -- fixed, generic text must be shown instead.
     """
 
     @pytest.mark.asyncio

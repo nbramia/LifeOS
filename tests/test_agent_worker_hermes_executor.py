@@ -1,4 +1,4 @@
-"""Tests for HermesExecutor (#851, AC4): a board-assigned #hermes task opens
+"""Tests for HermesExecutor: a board-assigned #hermes task opens
 a Hermes conversation via the configured backend, the turn's final text
 lands on the outcome (worker.py hands it to the Agent Output note the same
 way every other executor's final_text does), the session records

@@ -1,9 +1,9 @@
-"""Browser tests for the "Listening" wake-word dock toggle (#710).
+"""Browser tests for the "Listening" wake-word dock toggle.
 
 Covers the fourth dock checkbox end to end at the JS layer: it renders
 unchecked by default, persists like its siblings (mute/2x/auto), holds and
 releases its own mic stream (never the one the talk button reuses across
-taps), surfaces that hold as a live-mic dot on its own label (#813), and its
+taps), surfaces that hold as a live-mic dot on its own label, and its
 post-capture pipeline -- STT round-trip, wake-word fuzzy match, and entering
 recording -- is reachable and correctly gated even though headless Chromium
 can't produce a real spoken "Hermes" for the VAD's energy analysis to
@@ -250,7 +250,7 @@ def _is_recording(page: Page):
 
 
 def _dot_is_live(page: Page):
-    """#813 -- the live-mic dot's own class, used where the dock as a whole
+    """The live-mic dot's own class, used where the dock as a whole
     is hidden (text mode) and `to_be_visible()` would pass for the wrong
     reason."""
     return page.evaluate(
@@ -293,7 +293,7 @@ class TestListeningMicLifecycle:
     """Only meaningful in voice mode; releases the mic entirely on
     toggle-off or on leaving voice mode.
 
-    #740 note: the constraints assertions below check `__lastGumConstraints`
+    The constraints assertions below check `__lastGumConstraints`
     -- the object actually passed to `navigator.mediaDevices.getUserMedia()`
     -- rather than reading the resulting track's `getConstraints()`/
     `getSettings()`. Verified empirically (real Chromium, not a guess): a
@@ -311,7 +311,7 @@ class TestListeningMicLifecycle:
     def test_entering_voice_mode_requests_mic_with_the_default_on(
             self, page: Page, chat_base_url):
         """Listening is on by default, so the mic hold is acquired by entering
-        voice mode itself — no dock click required. #740: the wake stream is
+        voice mode itself — no dock click required. The wake stream is
         requested with echoCancellation/noiseSuppression/autoGainControl all
         explicitly off — unlike the plain `{ audio: true }` the recording
         path still uses (see WAKE_STREAM_CONSTRAINTS in voice.js)."""
@@ -381,12 +381,13 @@ class TestListeningMicLifecycle:
 
     def test_leaving_voice_mode_releases_the_talk_buttons_mic_too(
             self, page: Page, chat_base_url):
-        """#724: `micStream` -- the talk button's own stream, acquired lazily
-        by requestMicInGesture() the first time it's needed -- used to never
-        be released at all: applyVoiceMode() only ever tore down Listening's
-        separate hold on leaving voice mode, so once a session had recorded
-        even once the mic stayed live regardless of mode for the rest of the
-        page's life. Verified with Listening off throughout so the only live
+        """`micStream` -- the talk button's own stream, acquired lazily
+        by requestMicInGesture() the first time it's needed -- must be
+        released when leaving voice mode: applyVoiceMode() must not only
+        tear down Listening's separate hold, or once a session had
+        recorded even once the mic would stay live regardless of mode for
+        the rest of the page's life. Verified with Listening off
+        throughout so the only live
         stream in play is the record path's own -- isolates this from
         TestListeningMicLifecycle's other tests, which are all about
         Listening's stream instead."""
@@ -524,11 +525,11 @@ class TestListeningSuspension:
 
     def test_wake_tap_graph_itself_suspends_during_playback_and_resumes_after(
             self, page: Page, chat_base_url):
-        """#734: the wake tap's callback must actually stop firing while a
-        clip plays, not merely have its output ignored (the old bug --
-        canDetectWake() already returned False here, but the still-connected
-        ScriptProcessorNode kept its onaudioprocess callback running on the
-        main thread, contending with playback). isListenTapRunning() checks
+        """The wake tap's callback must actually stop firing while a
+        clip plays, not merely have its output ignored: canDetectWake()
+        returning False alone is not enough if the still-connected
+        ScriptProcessorNode keeps its onaudioprocess callback running on
+        the main thread, contending with playback. isListenTapRunning() checks
         the graph's own AudioContext.state directly, and __gumCalls/
         __stopCalls confirm the suspend/resume cycle never touches the mic
         permission -- no second getUserMedia, no track stop."""
@@ -563,13 +564,13 @@ class TestListeningSuspension:
 
     def test_wake_track_itself_disables_during_playback_and_reenables_after(
             self, page: Page, chat_base_url):
-        """#740: #734 believed listenAudioCtx.suspend() (above) fully
-        deactivated the wake tap during playback, but suspend() only stops
+        """listenAudioCtx.suspend() (above) alone is not enough to fully
+        deactivate the wake tap during playback: suspend() only stops
         the graph's *processing* -- the underlying MediaStreamTrack keeps
-        capturing regardless, which is the actual mechanism behind the
-        popping that persisted after #734 shipped (confirmed on real
-        hardware: it correlates exactly with the Listening toggle).
-        isListenTrackEnabled() checks the wake stream's own track.enabled
+        capturing regardless, which is the actual mechanism behind mic
+        popping that correlates exactly with the Listening toggle on real
+        hardware. isListenTrackEnabled() checks the wake stream's own
+        track.enabled
         state directly -- independent of, and in addition to, the context
         suspend/resume this suite already covers -- and __gumCalls/
         __stopCalls confirm disabling the track never touches the mic
@@ -604,11 +605,12 @@ class TestListeningSuspension:
 
     def test_wake_tap_graph_suspends_during_recording_and_resumes_after(
             self, page: Page, chat_base_url):
-        """#724: the same main-thread-contention bug #734 fixed for TTS
-        playback also applied to the recording window -- canDetectWake()'s
-        own `!isRecording` guard already made detection a no-op the entire
-        time a recording was in progress, but `listenProcessor` itself
-        stayed connected and running regardless, contending with the
+        """The same main-thread-contention risk that applies to TTS
+        playback also applies to the recording window -- canDetectWake()'s
+        own `!isRecording` guard already makes detection a no-op the
+        entire time a recording is in progress, but `listenProcessor`
+        itself must not stay connected and running regardless, contending
+        with the
         recorder's/endpointer's own taps for nothing. Same isListenTapRunning()
         seam as the playback-suspension test above, this time driven by a
         real recording started the same way a talk-button tap would."""
@@ -624,7 +626,7 @@ class TestListeningSuspension:
         )
 
         page.wait_for_function("() => window.lifeChatVoice.isListenTapRunning() === false")
-        # The record path's own (separate, #724-documented) stream acquisition
+        # The record path's own (separate) stream acquisition
         # -- Listening's own hold is untouched, no re-prompt, no track stop.
         assert page.evaluate("window.__gumCalls") == 2
         assert page.evaluate("window.__stopCalls") == 0
@@ -676,7 +678,7 @@ class TestListeningSuspension:
 
 
 class TestListeningLiveIndicator:
-    """#813: the dock's live-mic dot. It tracks the *capture*, not the
+    """The dock's live-mic dot. It tracks the *capture*, not the
     checkbox -- on only while the wake tap actually holds an unsuspended
     mic, off whenever the tap is suspended (playback/recording) or
     Listening is released. The distinction is the whole point: the checkbox
@@ -713,7 +715,7 @@ class TestListeningLiveIndicator:
         expect(page.locator("#voiceListenDot")).to_be_visible()
 
     def test_dot_is_not_live_when_listening_starts_off(self, page: Page, chat_base_url):
-        """A visitor who opted out previously (persisted unchecked) enters
+        """A visitor who already opted out (persisted unchecked) enters
         voice mode with no mic held at all -- no dot, ever, until they opt
         back in."""
         _open_voice_chat(page, chat_base_url)
@@ -727,7 +729,7 @@ class TestListeningLiveIndicator:
 
     def test_dot_disappears_during_tts_playback_and_returns_after(
             self, page: Page, chat_base_url):
-        """The tap is suspended for the whole clip (#734/#740) -- the mic
+        """The tap is suspended for the whole clip -- the mic
         is genuinely not listening, so the dot must not say it is. The
         checkbox stays checked throughout, which is exactly why the dot is
         driven by updateListenSuspension() instead."""
@@ -754,7 +756,7 @@ class TestListeningLiveIndicator:
 
     def test_dot_disappears_while_recording_and_returns_after(
             self, page: Page, chat_base_url):
-        """Same for the recording window (#724): the wake tap is suspended
+        """Same for the recording window: the wake tap is suspended
         while the talk button holds its own stream, so the Listening dot is
         off -- the recording button's own pulse is the live signal then."""
         _open_voice_chat(page, chat_base_url)

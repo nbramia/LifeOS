@@ -20,7 +20,7 @@ pytestmark = pytest.mark.slow
 
 
 class _StubHybridSearch:
-    """Deterministic stand-in for HybridSearch (#828): these tests are
+    """Deterministic stand-in for HybridSearch: these tests are
     about /api/search's request/response contract (result shape, filter
     pass-through, top_k truncation) -- none of them need the live
     ChromaDB collection's actual content, and depending on it coupled

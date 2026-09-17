@@ -1,4 +1,4 @@
-"""Browser test for the web /chat agent-threads UI (#236, Phase 3 + thread view).
+"""Browser test for the web /chat agent-threads UI (thread view).
 
 Drives the Agents panel, the "run as agent" composer affordance, and the
 click-to-open thread view with the `/api/agents/*` endpoints mocked via
@@ -154,7 +154,7 @@ class TestAgentThreadsUI:
     def test_reply_from_thread_view_continues_thread(self, page: Page):
         page.locator("#agentsThreadsList .agent-thread").first.click()
         expect(page.locator(".agent-thread-banner")).to_be_visible(timeout=8000)
-        # The main composer now continues the thread.
+        # The main composer continues the thread.
         page.locator("#inputField").fill("also CC the property manager")
         page.locator("#sendBtn").click()
         page.wait_for_timeout(500)
@@ -163,7 +163,7 @@ class TestAgentThreadsUI:
 
     def test_small_thread_renders_without_load_earlier(self, page: Page):
         # The 2-turn fixture is below the cap, so no "load earlier" control
-        # appears and both turns render — small threads stay unchanged (#270).
+        # appears and both turns render — small threads stay unchanged.
         page.locator("#agentsThreadsList .agent-thread").first.click()
         expect(page.locator(".agent-thread-banner")).to_be_visible(timeout=8000)
         expect(page.locator(".thread-load-earlier")).to_have_count(0)
@@ -192,7 +192,7 @@ def _large_conversation(n_turns: int):
 
 
 class TestLargeThreadRendering:
-    """#270 — a thread with a very large transcript must render bounded, not
+    """A thread with a very large transcript must render bounded, not
     freeze the renderer, while keeping full history reachable."""
 
     N_TURNS = 90  # well above THREAD_INITIAL_TURNS (30)

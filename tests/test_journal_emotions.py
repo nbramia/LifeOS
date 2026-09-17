@@ -1,5 +1,5 @@
 """
-Tests for the journal emotion-wheel aggregation API (#212).
+Tests for the journal emotion-wheel aggregation API.
 
 All fixtures use invented dates, names, and emotion values — never the real
 journal, which is deeply personal data. Covers the real-data irregularities

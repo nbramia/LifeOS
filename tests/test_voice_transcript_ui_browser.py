@@ -1,10 +1,11 @@
-"""Browser tests for eager user-transcript rendering on spoken turns (#758).
+"""Browser tests for eager user-transcript rendering on spoken turns.
 
-A spoken turn used to put the user's words in the thread only after the whole
-SSE stream finished (the terminal `done` payload), so the thread sat empty
-while the assistant thought. `web/chat/voice.js` now renders the user bubble on
-the relay's `transcript` event -- emitted the moment STT lands -- matching what
-the text path does at send time (askStream()).
+The user's words must appear in the thread as soon as STT lands, not
+only after the whole SSE stream finishes (the terminal `done` payload)
+-- otherwise the thread sits empty while the assistant thinks.
+`web/chat/voice.js` renders the user bubble on the relay's `transcript`
+event -- emitted the moment STT lands -- matching what the text path
+does at send time (askStream()).
 
 Drives `submitTurn()` directly, the seam voice.js exports so a headless harness
 can run a turn without a real mic. The fetch mock returns a genuinely
@@ -272,7 +273,7 @@ class TestEagerTranscriptRendering:
 
     def test_server_cancelled_frame_removes_the_bubble_without_local_cancel(
             self, page: Page, chat_base_url):
-        """A turn's lifetime is server-owned (#611) -- it can be cancelled from
+        """A turn's lifetime is server-owned -- it can be cancelled from
         elsewhere (another tab/device on the same conversation), not only via
         this tab's own Cancel button. The eagerly-rendered bubble must not
         survive that path either, even though this tab's activeTurnAbort was

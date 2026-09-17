@@ -262,7 +262,7 @@ class TestReminderPipelineE2E:
             message_type="static",
             message_content="Hi",
         )
-        # Once-type reminder in the past has next_trigger_at=None
+        # A once-type reminder whose trigger time has passed has next_trigger_at=None
         due = scheduler.store.get_due_reminders()
         assert r.id not in [d.id for d in due]
 
@@ -619,7 +619,7 @@ class TestChatViaApiWithLogParsing:
 
     @pytest.mark.asyncio
     async def test_handles_self_correction_event(self):
-        """Self-correction events should clear previously accumulated text."""
+        """Self-correction events should clear already-accumulated text."""
         sse_events = [
             'data: {"type": "content", "content": "I cannot access..."}',
             'data: {"type": "self_correction"}',
@@ -793,7 +793,7 @@ class TestAgentReminderMessageType:
 
 
 class TestEndpointReminderFixed:
-    """Verify: endpoint reminders have httpx imported (previously missing)."""
+    """Verify: endpoint reminders have httpx imported."""
 
     def test_httpx_imported_in_reminder_store(self):
         """reminder_store.py must import httpx for _call_endpoint."""
@@ -809,7 +809,7 @@ class TestEndpointReminderFixed:
 
     @pytest.mark.asyncio
     async def test_call_endpoint_no_longer_crashes(self):
-        """_call_endpoint should not raise NameError now that httpx is imported."""
+        """_call_endpoint should not raise NameError, since httpx is imported."""
         from api.services.reminder_store import ReminderStore, ReminderScheduler
 
         import tempfile
@@ -1143,7 +1143,7 @@ class TestMemoryRelevanceFiltering:
 
 
 # ---------------------------------------------------------------------------
-# P) Suppression & Sentinel Improvements (Batch 5 — Gaps #13, #15)
+# P) Suppression & Sentinel Enhancements (Batch 5)
 # ---------------------------------------------------------------------------
 
 class TestFuzzySuppressionBatch5:
@@ -1189,7 +1189,7 @@ class TestFuzzySuppressionBatch5:
         assert "NOTHING_TO_REPORT" in MORNING_BRIEFING_PROMPT
 
     def test_morning_briefing_surfaces_human_queue(self):
-        """#852: the morning briefing must surface open Human-queue cards
+        """The morning briefing must surface open Human-queue cards
         by naming the list tool the orchestrator calls to check them."""
         from scripts.seed_proactive_reminders import MORNING_BRIEFING_PROMPT
         # Checks the section HEADING specifically, not just the phrase
@@ -1242,11 +1242,11 @@ class TestChatViaApiStatusCheck:
 
 
 # ---------------------------------------------------------------------------
-# R) Dashboard Improvements (Batch 8)
+# R) Dashboard Enhancements (Batch 8)
 # ---------------------------------------------------------------------------
 
 class TestDashboardImprovements:
-    """Test dashboard formatting improvements."""
+    """Test dashboard formatting updates."""
 
     def test_format_cron_human_interval_pattern(self):
         """Should handle */15 8-18 * * 1-5 pattern."""

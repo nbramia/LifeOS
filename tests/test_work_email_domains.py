@@ -1,5 +1,5 @@
 """
-Tests for Settings.work_email_domains (#764).
+Tests for Settings.work_email_domains.
 
 Work email domains were hard-capped at two (LIFEOS_WORK_DOMAIN,
 LIFEOS_WORK_DOMAIN_2). LIFEOS_WORK_DOMAINS_EXTRA adds an arbitrary number

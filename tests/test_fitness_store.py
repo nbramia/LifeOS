@@ -1,5 +1,5 @@
 """
-Tests for the fitness workout store (issue #320).
+Tests for the fitness workout store.
 
 Covers session logging with set-count expansion, exercise normalization,
 date defaulting, corrections (update latest / by id), health metrics

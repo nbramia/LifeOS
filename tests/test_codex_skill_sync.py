@@ -169,9 +169,9 @@ def test_every_portable_skill_has_a_source_in_the_repo():
 
 def test_native_codex_skill_path_removed():
     """The native-skill install path (NATIVE_CODEX_SKILLS +
-    install_native_codex_skills) was retired along with the six lifecycle
-    directories it copied from `.agents/skills/` — Codex now gets the
-    lifecycle from the `benjamcalvin/bootstraps` marketplace instead (#491).
+    install_native_codex_skills) must not exist -- Codex gets its
+    lifecycle from the `benjamcalvin/bootstraps` marketplace instead, not
+    from directories copied out of `.agents/skills/`.
     Guard against either resurfacing without a source in the repo.
     """
     assert not hasattr(codex_skill_sync, "NATIVE_CODEX_SKILLS")

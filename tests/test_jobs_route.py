@@ -1,4 +1,4 @@
-"""Tests for the /api/jobs/* endpoints' additive `stale` field (#768).
+"""Tests for the /api/jobs/* endpoints' additive `stale` field.
 
 A job stuck "running" because its owning process restarted mid-job is
 reconciled to failed/orphaned at the next worker startup (see
@@ -41,7 +41,7 @@ def test_get_job_stale_when_started_before_process_start(client):
     c, queue = client
     job_id = queue.enqueue("a")
     queue._claim_next()
-    # Simulate a process restart: process_start_time now postdates started_at.
+    # Simulate a process restart: process_start_time is set to postdate started_at.
     queue.process_start_time = "9999-01-01T00:00:00+00:00"
     r = c.get(f"/api/jobs/{job_id}")
     assert r.status_code == 200, r.text

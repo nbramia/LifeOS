@@ -1,4 +1,4 @@
-"""Tests for Telegram bot token log redaction (#519).
+"""Tests for Telegram bot token log redaction.
 
 The Telegram Bot API embeds the bot token in the request URL
 (`api.telegram.org/bot<digits>:<secret>/<method>`), and httpx's request

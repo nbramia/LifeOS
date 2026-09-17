@@ -2,8 +2,9 @@
 The Gmail sync must not re-fetch mail it already judged to be marketing.
 
 Discarded messages produce no interaction row, so the sync's existing_base_ids
-set could never remember them: ~13k messages were re-fetched every night for
-their whole 30-day life, costing ~42 min per run (#552).
+set can never remember them: without a separate skip cache, ~13k messages
+would be re-fetched every night for their whole 30-day life, costing
+~42 min per run.
 """
 from pathlib import Path
 from unittest.mock import MagicMock, patch

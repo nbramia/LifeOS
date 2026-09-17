@@ -147,7 +147,7 @@ def test_spawn_cli_child_for_capability_fallback(ctx, store, parent, model):
 @pytest.mark.parametrize("tier", ["haiku", "sonnet", "opus"])
 def test_spawn_claude_code_tier_persisted(ctx, store, tier):
     """A claude_code child's `tier` arg lands on the session as
-    claude_code_model so the executor runs the CLI with that --model (#349)."""
+    claude_code_model so the executor runs the CLI with that --model."""
     result = dispatch(ctx, "lifeos_agent_spawn", {
         "prompt": "look up today's matches", "model": "claude_code", "tier": tier,
     })
@@ -1054,7 +1054,7 @@ def test_dispatch_handles_handler_exception(store, transcript, parent, monkeypat
 
 
 # ---------------------------------------------------------------------------
-# #379 — teardown_session reaps the local CLI subprocess
+# teardown_session reaps the local CLI subprocess
 # ---------------------------------------------------------------------------
 
 
@@ -1066,7 +1066,7 @@ class _SignalRecorder:
     large value keeps it alive through the whole grace window so the SIGKILL
     fallback fires; a small value simulates a clean exit under SIGTERM.
 
-    `group_gone_after` controls the #379 SIGKILL sweep: once the leader pid has
+    `group_gone_after` controls the SIGKILL sweep: once the leader pid has
     been reported gone (its liveness probe raised), `killpg` raises
     ProcessLookupError to model a fully-exited group (no lingering children). If
     left None, killpg always succeeds — modelling a group child that outlived the
@@ -1158,7 +1158,7 @@ def test_teardown_local_subprocess_clean_exit_no_sigkill(
     target = _seed_claude_code_with_pid(store, transcript, parent, pid=7, pgid=7)
     # alive_for=1: the up-front liveness check passes, then the first in-grace
     # probe reports the leader gone → clean exit under SIGTERM. With
-    # group_gone_when_leader_gone the #379 sweep's killpg(SIGKILL) raises
+    # group_gone_when_leader_gone the SIGKILL sweep's killpg(SIGKILL) raises
     # ProcessLookupError (no lingering children), so no SIGKILL is recorded.
     rec = _SignalRecorder(alive_for=1, group_gone_when_leader_gone=True)
     monkeypatch.setattr(inter_agent.os, "kill", rec.kill)
@@ -1184,9 +1184,10 @@ def test_teardown_local_subprocess_clean_exit_no_sigkill(
 def test_teardown_sigkill_sweep_reaps_lingering_group_child(
     store, transcript, parent, monkeypatch
 ):
-    """#379: if the leader exits under SIGTERM but a group child lingers, the
-    SIGKILL sweep still fires on the pgid so the survivor is reaped. (The old
-    grace loop `break`'d on the leader exiting and skipped the SIGKILL.)"""
+    """If the leader exits under SIGTERM but a group child lingers, the
+    SIGKILL sweep must still fire on the pgid so the survivor is reaped:
+    breaking out of the grace loop as soon as the leader exits would skip
+    the SIGKILL entirely."""
     import signal as _signal
 
     target = _seed_claude_code_with_pid(store, transcript, parent, pid=55, pgid=55)
@@ -1284,7 +1285,7 @@ def test_teardown_managed_session_skips_local_kill_but_does_managed(
 
 
 # ---------------------------------------------------------------------------
-# spawn — a subscription-billed lineage cannot spawn an API-billed child (#578)
+# spawn — a subscription-billed lineage cannot spawn an API-billed child
 # ---------------------------------------------------------------------------
 
 def _cli_root(store: SessionStore, routing: str = "claude_code"):
@@ -1324,7 +1325,7 @@ def test_spawn_managed_child_rejected_from_cli_root(store, transcript, routing):
 
 @pytest.mark.unit
 def test_spawn_managed_child_rejected_from_hermes_root(store, transcript):
-    """Hermes (#640) is not a CLI routing — it never runs as a local
+    """Hermes is not a CLI routing — it never runs as a local
     subprocess this worker manages — but it's billed exactly like one for
     this purpose: an external, non-API-billed harness must not be able to
     open the model="claude" side door either. See
@@ -1367,7 +1368,7 @@ def test_hermes_routing_is_a_canonical_spawn_destination():
 @pytest.mark.unit
 def test_spawn_managed_child_rejected_through_local_intermediary(store, transcript):
     """The check reads the ROOT's routing, so an intermediate child on another
-    engine can't be used to launder the API-billed spawn."""
+    engine can't launder the API-billed spawn that way."""
     root = _cli_root(store)
     middle = store.create(
         task_id="middle_task",

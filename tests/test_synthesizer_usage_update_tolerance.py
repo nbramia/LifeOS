@@ -1,4 +1,4 @@
-"""#629 audit: Synthesizer.stream_response is one of astream()'s consumers
+"""Synthesizer.stream_response is one of astream()'s consumers
 (the other two call sites are in api/services/agent_loop.py, covered by
 tests/test_agent_loop_incremental_usage.py). Adding the "usage_update" event
 type to the astream() contract must not break a consumer that doesn't know
@@ -71,9 +71,10 @@ class _FakeClientDone:
 
 @pytest.mark.asyncio
 async def test_usage_event_model_label_matches_summarizer_model_default(monkeypatch):
-    """#775: the usage event's "model" label was a hardcoded "local" literal
-    -- now it reads settings.summarizer_model, same as the summarizer's
-    outbound payload, for consistency. Default is unchanged."""
+    """The usage event's "model" label reads
+    settings.summarizer_model, same as the summarizer's outbound payload,
+    for consistency -- never a hardcoded "local" literal. Default is
+    unchanged."""
     from config.settings import settings
     monkeypatch.setattr(settings, "summarizer_model", "local", raising=False)
 
@@ -87,7 +88,7 @@ async def test_usage_event_model_label_matches_summarizer_model_default(monkeypa
 
 @pytest.mark.asyncio
 async def test_usage_event_model_label_reflects_configured_override(monkeypatch):
-    """#775: an operator running Ollama (LIFEOS_SUMMARIZER_MODEL set) sees
+    """An operator running Ollama (LIFEOS_SUMMARIZER_MODEL set) sees
     that model name in the usage label instead of the misleading "local"."""
     from config.settings import settings
     monkeypatch.setattr(settings, "summarizer_model", "qwen2.5:3b-instruct", raising=False)
