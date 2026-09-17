@@ -44,6 +44,26 @@ _ROUTING_TAGS = frozenset((*_VALID_TASK_ASSIGNEES, *AGENT_PICKUP_TAGS))
 _VALID_KINDS = {"task", "schedule", "human"}
 _EFFECT_LEASE_SECONDS = 60
 _INLINE_AUTHORITY_RE = re.compile(r"\[\s*\w+\s*::|#[\w-]+")
+# Positive-clause markers that prove a transcript is explicitly asking for a
+# task to be filed, not merely stating or imagining one. Covers plain filing
+# phrasing ("add a task", "put ... on my list", "remind me to", "task:") and
+# the same delegation-request shapes already recognized for tag authority
+# (assign/delegate/route ... to, ask/have/let <executor>, "<executor>, please
+# ...") so a genuinely delegated task never needs a second, different marker.
+_TASK_REQUEST_MARKER_RE = re.compile(
+    r"\badd\s+(?:a\s+|an\s+)?(?:task|to-?do)\b"
+    r"|\b(?:make|create)\s+(?:a\s+)?task\b"
+    r"|\btask\s*:"
+    r"|\b(?:to|on)\s+(?:my|the)\s+(?:to-?do\s+)?list\b"
+    r"|\bremind\s+me\s+to\b"
+    r"|\b(?:assign|delegate|route)\b[\s\S]{0,100}\bto\b"
+    r"|\bask\s+#?[\w-]+\s+to\b"
+    r"|\bhave\s+#?[\w-]+\s+(?:to\s+)?[\w-]+\b"
+    r"|\blet\s+#?[\w-]+\s+[\w-]+\b"
+    r"|\b#?[\w-]+\s*(?:,\s*(?:please\s+)?|please\s+)"
+    r"(?!i\b|we\b|they\b|he\b|she\b)[\w-]+\s+(?:this|it|that|the\b|[\w-]+)",
+    re.I,
+)
 
 
 class PebbleCaptureError(ValueError):
@@ -587,6 +607,26 @@ def _explicit_action_evidence(transcript: str, evidence: str, action_evidence: s
     )
 
 
+def _explicit_task_request(transcript: str, action_evidence: str) -> bool:
+    """Prove every task -- delegated or not -- was explicitly asked for.
+
+    Log-only is the strong default: a bare imperative or an observation must
+    never become a task.  This binds ``action_evidence`` to a positive clause
+    that also carries an explicit filing/delegation marker, reusing the same
+    evidence-binding proof (`_explicit_action_evidence`) delegation already
+    requires -- the clause itself stands in for the caller-supplied
+    ``evidence`` argument, so a marker and its action must share one clause.
+    """
+    if not action_evidence:
+        return False
+    for clause in _positive_clauses(transcript):
+        if _TASK_REQUEST_MARKER_RE.search(clause) and _explicit_action_evidence(
+            transcript, clause, action_evidence
+        ):
+            return True
+    return False
+
+
 def _explicit_task_delegation(
     transcript: str, executor: str, evidence: str, action_evidence: str
 ) -> bool:
@@ -725,6 +765,11 @@ def validate_plan(raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at
                     date.fromisoformat(due)
                 except (TypeError, ValueError) as exc:
                     raise PebbleCaptureError("task due date is invalid") from exc
+            if not _explicit_task_request(transcript, action_evidence):
+                # Log-only is the strong default. An unproven task is omitted,
+                # never raised: the capture must still log and complete, and
+                # under-filing is the safe failure direction here.
+                continue
             if any(tag in _VALID_TASK_ASSIGNEES for tag in normalized_tags):
                 title = _safe_markdown_text(
                     action_evidence, field="action_evidence", limit=500
@@ -873,8 +918,27 @@ def _validated_classifier_actions(
     if not isinstance(actions, list):
         raise PebbleCaptureError("local classifier returned no action list")
     validated = validate_plan(actions, transcript=final_text, recorded_at=recorded_at)
-    for raw_action, action in zip(actions, validated):
-        if not isinstance(raw_action, dict) or action.kind != "task":
+    # ``validate_plan`` can omit an over-eager task outright, so an earlier
+    # index can be entirely absent from ``validated``: a raw action's
+    # position in ``actions`` is not reliably aligned with its validated
+    # counterpart's position in ``validated``.  Pair by the model-assigned
+    # ``index`` instead of by list position.
+    validated_by_index = {action.index: action for action in validated}
+    for raw_action in actions:
+        if not isinstance(raw_action, dict) or raw_action.get("kind") != "task":
+            continue
+        action = validated_by_index.get(raw_action.get("index"))
+        if action is None:
+            # Dropped for lacking a proven, explicit filing request. A task
+            # proposed with no action_evidence at all is a structural
+            # contract miss -- give the model one corrective round rather
+            # than silently losing a well-formed capture.  A task whose
+            # action_evidence was present but not bound to an explicit
+            # request stays dropped: under-filing is the safe direction, and
+            # the model already tried and failed to prove it, so a retry
+            # would not be a format fix.
+            if not (raw_action.get("action_evidence") or "").strip():
+                raise PebbleCaptureError("classifier proposed a task without action_evidence")
             continue
         claimed_assignees = {
             value.lstrip("#").lower()

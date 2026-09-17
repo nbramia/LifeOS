@@ -17,6 +17,7 @@ from api.services.pebble_capture import (
     LocalOnlyJournalClassifier,
     PebbleCaptureConsumer,
     PebbleCaptureError,
+    _validated_classifier_actions,
     parse_framed_blocks,
     ready_result,
     validate_plan,
@@ -46,7 +47,7 @@ def _run_consumer_process(root, start, results):
             CaptureLedger(base / "ledger.sqlite"),
             TaskManager(vault_path=base / "vault", index_path=base / "tasks.json"),
             SchedulerStore(vault_path=base / "vault", index_path=base / "schedules.json"),
-            _Classifier([{"kind": "task", "index": 0, "title": "Synthetic process task"}]),
+            _Classifier([{"kind": "task", "index": 0, "title": "Synthetic process task", **_TASK_EVIDENCE}]),
             apply=True,
         )
         start.wait()
@@ -78,8 +79,15 @@ def _payload(revision=1):
         "reconciliation": {"status": "ready"},
         "whisper_raw": "Synthetic review", "whisper_polished": None,
         "comparison": "equivalent", "models": {"backend": "synthetic", "model": "synthetic"},
-        "final_text": "Remind me about synthetic review tomorrow at 09:00.",
+        "final_text": "Add a task to handle the synthetic review.",
     }
+
+
+# Explicit filing marker + action_evidence pair for plain (non-delegated)
+# tasks built against the default ``_payload()`` transcript above. These
+# ledger/idempotency/claim-recovery tests only need *a* task to exist; the
+# specific evidence text is incidental to what they verify.
+_TASK_EVIDENCE = {"action_evidence": "handle the synthetic review"}
 
 
 def _frame(payload):
@@ -159,7 +167,10 @@ async def test_pending_raw_revision_leaves_no_receipt_then_ready_revision_is_acc
     ready = json.loads((fixture_dir / "pebble-result-ready-after-pending-v1.json").read_text())
     assert parse_framed_blocks(_frame(pending)) == [pending]
     assert parse_framed_blocks(_frame(ready)) == [ready]
-    classifier = _Classifier([{"kind": "task", "index": 0, "title": "Buy synthetic printer paper"}])
+    classifier = _Classifier([{
+        "kind": "task", "index": 0, "title": "Buy synthetic printer paper",
+        "action_evidence": "buy synthetic printer paper",
+    }])
     consumer = PebbleCaptureConsumer(ledger, tasks, schedules, classifier, apply=True)
 
     with pytest.raises(PebbleCaptureError, match="only ready"):
@@ -232,7 +243,7 @@ def test_watcher_recovers_valid_frame_after_unrelated_torn_utf8_tail(tmp_path):
 @pytest.mark.asyncio
 async def test_ready_capture_creates_one_task_after_post_commit_crash(stores, monkeypatch):
     ledger, tasks, schedules = stores
-    classifier = _Classifier([{"kind": "task", "index": 0, "title": "Synthetic review"}])
+    classifier = _Classifier([{"kind": "task", "index": 0, "title": "Synthetic review", **_TASK_EVIDENCE}])
     consumer = PebbleCaptureConsumer(ledger, tasks, schedules, classifier, apply=True)
     original = ledger.record_effect
     calls = 0
@@ -261,7 +272,7 @@ async def test_ready_capture_creates_one_task_after_post_commit_crash(stores, mo
 @pytest.mark.asyncio
 async def test_changed_final_revision_is_held_not_replayed(stores):
     ledger, tasks, schedules = stores
-    classifier = _Classifier([{"kind": "task", "index": 0, "title": "Synthetic review"}])
+    classifier = _Classifier([{"kind": "task", "index": 0, "title": "Synthetic review", **_TASK_EVIDENCE}])
     consumer = PebbleCaptureConsumer(ledger, tasks, schedules, classifier, apply=True)
     assert await consumer.process(_payload()) == "complete"
     assert await consumer.process(_payload(2)) == "revision_changed"
@@ -273,7 +284,7 @@ async def test_changed_final_revision_is_held_not_replayed(stores):
 @pytest.mark.asyncio
 async def test_dry_run_never_writes_canonical_stores(stores):
     ledger, tasks, schedules = stores
-    classifier = _Classifier([{"kind": "task", "index": 0, "title": "Synthetic review"}])
+    classifier = _Classifier([{"kind": "task", "index": 0, "title": "Synthetic review", **_TASK_EVIDENCE}])
     consumer = PebbleCaptureConsumer(ledger, tasks, schedules, classifier, apply=False)
     assert await consumer.process(_payload()) == "dry_run"
     assert tasks.list_tasks() == []
@@ -283,7 +294,7 @@ async def test_dry_run_never_writes_canonical_stores(stores):
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("actions", "task_count", "schedule_count"), [
     ([], 0, 0),
-    ([{"kind": "task", "index": 0, "title": "Buy synthetic printer paper"}], 1, 0),
+    ([{"kind": "task", "index": 0, "title": "Buy synthetic printer paper", **_TASK_EVIDENCE}], 1, 0),
     ([{
         "kind": "schedule", "index": 0, "title": "Synthetic parcel",
         "schedule_type": "once", "schedule_value": "2030-01-02T15:00:00Z",
@@ -410,34 +421,44 @@ def test_naive_unambiguous_wall_time_uses_declared_zone():
 
 
 @pytest.mark.parametrize(
-    ("transcript", "tag", "retained"),
+    ("transcript", "tag", "filed", "retained"),
     [
-        ("Assign code repair to Codex.", "codex", True),
-        ("Codex, please handle this code repair.", "codex", True),
-        ("Ask Codex to review the login bug.", "codex", True),
-        ("Have Codex fix the login bug.", "codex", True),
-        ("Let Codex investigate the login bug.", "codex", True),
-        ("Let cloud-sonnet take code repair.", "cloud-sonnet", True),
-        ("Please delegate code repair to cloud-sonnet tomorrow.", "cloud-sonnet", True),
-        ("Do not assign code repair to Codex.", "codex", False),
-        ("Never let Codex handle code repair.", "codex", False),
-        ("Tag code repair as #codex.", "codex", False),
-        ("Just noting #cloud-sonnet.", "cloud-sonnet", False),
-        ("Assign code repair to the agent.", "agent", False),
-        ("Remind me to ask Codex to handle code repair.", "codex", False),
-        ("I heard Sam assign code repair to Codex.", "codex", False),
-        ("My notes say assign code repair to Codex.", "codex", False),
-        ("Sam said assign code repair to Codex.", "codex", False),
-        ("I remember Codex, please repair this code.", "codex", False),
-        ('We discussed the phrase "assign this to #codex".', "codex", False),
-        ("I mentioned #cloud-sonnet while taking notes.", "cloud-sonnet", False),
-        ("Assign code repair to mystery-engine.", "mystery-engine", False),
+        ("Assign code repair to Codex.", "codex", True, True),
+        ("Codex, please handle this code repair.", "codex", True, True),
+        ("Ask Codex to review the login bug.", "codex", True, True),
+        ("Have Codex fix the login bug.", "codex", True, True),
+        ("Let Codex investigate the login bug.", "codex", True, True),
+        ("Let cloud-sonnet take code repair.", "cloud-sonnet", True, True),
+        ("Please delegate code repair to cloud-sonnet tomorrow.", "cloud-sonnet", True, True),
+        # Negated/conditional: no positive clause survives at all, so log-only
+        # -- not even an unassigned fallback task.
+        ("Do not assign code repair to Codex.", "codex", False, False),
+        ("Never let Codex handle code repair.", "codex", False, False),
+        # No explicit filing/delegation marker at all: a bare tagging
+        # instruction or a musing is log-only under the new presumption.
+        ("Tag code repair as #codex.", "codex", False, False),
+        ("Just noting #cloud-sonnet.", "cloud-sonnet", False, False),
+        # An explicit "assign ... to" request still files the task even when
+        # the named executor itself is invalid; only the tag is stripped.
+        ("Assign code repair to the agent.", "agent", True, False),
+        # "Remind me to ..." is itself an explicit filing marker (untimed
+        # reminder -> task), even though the mentioned delegation is not
+        # authoritative and its tag is stripped.
+        ("Remind me to ask Codex to handle code repair.", "codex", True, False),
+        # Reported/quoted speech: the whole clause is excluded, so log-only.
+        ("I heard Sam assign code repair to Codex.", "codex", False, False),
+        ("My notes say assign code repair to Codex.", "codex", False, False),
+        ("Sam said assign code repair to Codex.", "codex", False, False),
+        ("I remember Codex, please repair this code.", "codex", False, False),
+        ('We discussed the phrase "assign this to #codex".', "codex", False, False),
+        ("I mentioned #cloud-sonnet while taking notes.", "cloud-sonnet", False, False),
+        ("Assign code repair to mystery-engine.", "mystery-engine", True, False),
     ],
 )
-def test_task_execution_tags_require_positive_valid_delegation(transcript, tag, retained):
+def test_task_execution_tags_require_positive_valid_delegation(transcript, tag, filed, retained):
     title = "Login bug" if "login bug" in transcript else "Code repair"
     action_evidence = "login bug" if "login bug" in transcript else "code repair"
-    [action] = validate_plan(
+    result = validate_plan(
         [{
             "kind": "task", "index": 0, "title": title, "tags": [tag],
             "delegation_evidence": transcript,
@@ -446,7 +467,99 @@ def test_task_execution_tags_require_positive_valid_delegation(transcript, tag, 
         transcript=transcript,
         recorded_at="2030-01-01T10:00:00Z",
     )
+    if not filed:
+        # Log-only is the strong default: an unproven task -- delegated or
+        # not -- is omitted entirely, never merely stripped of its tag.
+        assert result == []
+        return
+    [action] = result
     assert (tag in action.tags) is retained
+
+
+@pytest.mark.parametrize(
+    ("transcript", "action_evidence", "filed"),
+    [
+        # Explicit filing phrases -> task.
+        ("Add a task to take the synthetic dog outside.", "take the synthetic dog outside", True),
+        ("Assign the task related to the synthetic report to me.", "the synthetic report", True),
+        ("Remind me to call the synthetic plumber.", "call the synthetic plumber", True),
+        # A bare imperative or plain statement alone -> log-only.
+        ("Take the synthetic dog outside.", "take the synthetic dog outside", False),
+        ("Test take out the synthetic trash.", "take out the synthetic trash", False),
+        ("I should probably call the synthetic plumber.", "call the synthetic plumber", False),
+        ("The blue synthetic mug is on the table.", "the blue synthetic mug", False),
+    ],
+)
+def test_plain_task_requires_an_explicit_filing_request(transcript, action_evidence, filed):
+    result = validate_plan(
+        [{"kind": "task", "index": 0, "title": "Synthetic title", "action_evidence": action_evidence}],
+        transcript=transcript,
+        recorded_at="2030-01-01T10:00:00Z",
+    )
+    assert (len(result) == 1) is filed
+
+
+@pytest.mark.asyncio
+async def test_log_only_capture_still_completes_with_zero_task_actions(stores):
+    """A dropped over-eager task must be omitted, never raised: the capture
+    still logs and completes normally (it never leaves the ledger pending)."""
+    ledger, tasks, schedules = stores
+    payload = {**_payload(), "final_text": "Take the synthetic dog outside."}
+    classifier = _Classifier([{
+        "kind": "task", "index": 0, "title": "Take the synthetic dog outside",
+        "action_evidence": "take the synthetic dog outside",
+    }])
+    consumer = PebbleCaptureConsumer(ledger, tasks, schedules, classifier, apply=True)
+    assert await consumer.process(payload) == "complete"
+    assert tasks.list_tasks() == []
+
+
+def test_operator_delegated_task_capture_keeps_working():
+    """A regression guard for the operator's real phrasing: an explicit
+    filing request that also carries a valid delegation must keep both its
+    tag and its evidence-derived title."""
+    transcript = (
+        "Add a task assigned to #claude, to review the synthetic report and "
+        "send me a summary."
+    )
+    [action] = validate_plan([{
+        "kind": "task", "index": 0, "title": "Review the synthetic report", "tags": ["claude"],
+        "delegation_evidence": transcript,
+        "action_evidence": "review the synthetic report and send me a summary",
+    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    assert action.tags == ("claude",)
+    assert action.title == "review the synthetic report and send me a summary"
+
+
+def test_validated_classifier_actions_pairs_by_index_not_position():
+    """A dropped earlier action must not shift a later, valid one out of
+    alignment: pairing must use ``PlannedAction.index``, not list position.
+
+    Under the old ``zip(actions, validated)`` pairing this raised
+    "classifier proposed unauthorized task delegation" -- the dropped
+    action's claimed tag was checked against the *next* action's validated
+    tags purely because it landed at the same list position.
+    """
+    transcript = "Take the synthetic dog outside. Ask Codex to review the synthetic report."
+    response = json.dumps({"actions": [
+        # index 0: a bare imperative in its own clause claiming an unproven
+        # "claude" tag -- dropped entirely by the new authority gate (its
+        # action_evidence is present but not bound to any filing marker).
+        {
+            "kind": "task", "index": 0, "title": "Take the synthetic dog outside",
+            "tags": ["claude"], "action_evidence": "take the synthetic dog outside",
+        },
+        # index 1: a genuinely delegated, explicitly requested task.
+        {
+            "kind": "task", "index": 1, "title": "Review the synthetic report",
+            "tags": ["codex"], "delegation_evidence": "Ask Codex to review the synthetic report.",
+            "action_evidence": "review the synthetic report",
+        },
+    ]})
+    actions = _validated_classifier_actions(response, transcript, "2030-01-01T10:00:00Z")
+    [kept] = validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    assert kept.index == 1
+    assert kept.tags == ("codex",)
 
 
 @pytest.mark.parametrize(
@@ -481,12 +594,14 @@ def test_task_execution_tags_require_positive_valid_delegation(transcript, tag, 
 def test_contextual_reported_speech_cannot_delegate_a_task(
     transcript, delegation_evidence
 ):
-    [action] = validate_plan([{
+    # Reported/quoted speech excludes the whole clause from positive-clause
+    # scanning, so no explicit filing marker survives either -- the task is
+    # log-only, not merely stripped of its tag.
+    assert validate_plan([{
         "kind": "task", "index": 0, "title": "Code repair", "tags": ["codex"],
         "delegation_evidence": delegation_evidence,
         "action_evidence": "code repair",
-    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
-    assert action.tags == ()
+    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z") == []
 
 
 @pytest.mark.parametrize(
@@ -506,8 +621,11 @@ def test_contextual_prefix_does_not_block_a_direct_task_delegation(transcript):
 
 def test_explicit_non_execution_label_is_retained_but_mentions_are_not():
     [action] = validate_plan(
-        [{"kind": "task", "index": 0, "title": "Synthetic task", "tags": ["errand", "ideas"]}],
-        transcript="Tag this as #errand; I merely mentioned #ideas.",
+        [{
+            "kind": "task", "index": 0, "title": "Synthetic task", "tags": ["errand", "ideas"],
+            "action_evidence": "tag this",
+        }],
+        transcript="Add a task to tag this as #errand; I merely mentioned #ideas.",
         recorded_at="2030-01-01T10:00:00Z",
     )
     assert action.tags == ("errand",)
@@ -558,10 +676,14 @@ async def test_mentioned_executor_cannot_gain_pickup_authority_after_markdown_re
     from api.routes.tasks import _has_agent_pickup_tag
 
     ledger, tasks, schedules = stores
+    # The task itself is filed for an unrelated, explicit reason (the first
+    # clause); the mentioned #codex in the second clause must still not gain
+    # pickup authority.
+    transcript = "Add a task to write up the synthetic note; I mentioned #codex while taking it."
     payload = {
         **_payload(),
         "capture_id": "capture-mentioned-executor",
-        "final_text": "I mentioned #codex while taking a synthetic note.",
+        "final_text": transcript,
     }
     consumer = PebbleCaptureConsumer(
         ledger,
@@ -569,7 +691,8 @@ async def test_mentioned_executor_cannot_gain_pickup_authority_after_markdown_re
         schedules,
         _Classifier([{
             "kind": "task", "index": 0, "title": "Synthetic ordinary task", "tags": ["codex"],
-            "delegation_evidence": "I mentioned #codex while taking a synthetic note.",
+            "action_evidence": "write up the synthetic note",
+            "delegation_evidence": transcript,
         }]),
         apply=True,
     )
@@ -616,12 +739,13 @@ def test_task_delegation_accepts_paraphrase_but_files_source_scoped_action():
 
 def test_whole_capture_cannot_be_reused_as_delegation_evidence_for_another_action():
     transcript = "Buy milk. Assign code repair to Codex."
-    [action] = validate_plan([{
+    # "Buy milk" is a bare imperative in its own clause -- no explicit filing
+    # marker there -- so the task is log-only, not merely stripped of its tag.
+    assert validate_plan([{
         "kind": "task", "index": 0, "title": "Buy milk", "tags": ["codex"],
         "delegation_evidence": transcript,
         "action_evidence": "Buy milk",
-    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
-    assert action.tags == ()
+    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z") == []
 
 
 @pytest.mark.parametrize("transcript", [
@@ -631,11 +755,13 @@ def test_whole_capture_cannot_be_reused_as_delegation_evidence_for_another_actio
     "Assign code repair to Codex, not as a real delegation.",
 ])
 def test_conditional_hypothetical_or_post_negated_task_text_never_delegates(transcript):
-    [action] = validate_plan([{
+    # Conditional/hypothetical/post-negated wording excludes the whole clause
+    # from positive-clause scanning, so no explicit filing marker survives
+    # either -- log-only, not merely stripped of its tag.
+    assert validate_plan([{
         "kind": "task", "index": 0, "title": "Code repair", "tags": ["codex"],
         "delegation_evidence": transcript,
-    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
-    assert action.tags == ()
+    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z") == []
 
 
 @pytest.mark.asyncio
@@ -905,7 +1031,7 @@ def test_ready_result_rejects_status_or_schema_contradictions():
 @pytest.mark.asyncio
 async def test_same_revision_conflict_is_held_without_reclassification(stores):
     ledger, tasks, schedules = stores
-    classifier = _Classifier([{"kind": "task", "index": 0, "title": "Synthetic review"}])
+    classifier = _Classifier([{"kind": "task", "index": 0, "title": "Synthetic review", **_TASK_EVIDENCE}])
     consumer = PebbleCaptureConsumer(ledger, tasks, schedules, classifier, apply=False)
     assert await consumer.process(_payload()) == "dry_run"
     changed = _payload()
@@ -926,7 +1052,7 @@ async def test_local_model_outage_leaves_capture_pending_for_retry(stores):
             self.calls += 1
             if self.calls == 1:
                 raise RuntimeError("synthetic local model outage")
-            return [{"kind": "task", "index": 0, "title": "Synthetic recovered task"}]
+            return [{"kind": "task", "index": 0, "title": "Synthetic recovered task", **_TASK_EVIDENCE}]
 
     classifier = FlakyClassifier()
     consumer = PebbleCaptureConsumer(ledger, tasks, schedules, classifier, apply=True)
@@ -1127,7 +1253,7 @@ async def test_concurrent_plan_loser_applies_the_persisted_winner(stores):
             if arrived == 2:
                 release.set()
             await release.wait()
-            return [{"kind": "task", "index": 0, "title": self.title}]
+            return [{"kind": "task", "index": 0, "title": self.title, **_TASK_EVIDENCE}]
 
     first = PebbleCaptureConsumer(ledger, tasks, schedules, RacingClassifier("Synthetic A"), apply=True)
     second = PebbleCaptureConsumer(ledger, tasks, schedules, RacingClassifier("Synthetic B"), apply=True)
@@ -1220,7 +1346,7 @@ async def test_post_commit_task_deletion_is_held_not_recreated(stores, monkeypat
     ledger, tasks, schedules = stores
     consumer = PebbleCaptureConsumer(
         ledger, tasks, schedules,
-        _Classifier([{"kind": "task", "index": 0, "title": "Synthetic review"}]),
+        _Classifier([{"kind": "task", "index": 0, "title": "Synthetic review", **_TASK_EVIDENCE}]),
         apply=True,
     )
     original = ledger.record_effect
@@ -1275,7 +1401,7 @@ async def test_completed_receipt_never_recreates_user_edit_or_deletion(stores):
     ledger, tasks, schedules = stores
     consumer = PebbleCaptureConsumer(
         ledger, tasks, schedules,
-        _Classifier([{"kind": "task", "index": 0, "title": "Synthetic original"}]),
+        _Classifier([{"kind": "task", "index": 0, "title": "Synthetic original", **_TASK_EVIDENCE}]),
         apply=True,
     )
     assert await consumer.process(_payload()) == "complete"
@@ -1311,8 +1437,8 @@ async def test_completed_schedule_receipt_preserves_user_edit_and_deletion(store
 async def test_multi_action_partial_completion_resumes_only_unfinished_action(stores, monkeypatch):
     ledger, tasks, schedules = stores
     classifier = _Classifier([
-        {"kind": "task", "index": 0, "title": "Synthetic first"},
-        {"kind": "task", "index": 1, "title": "Synthetic second"},
+        {"kind": "task", "index": 0, "title": "Synthetic first", **_TASK_EVIDENCE},
+        {"kind": "task", "index": 1, "title": "Synthetic second", **_TASK_EVIDENCE},
     ])
     consumer = PebbleCaptureConsumer(ledger, tasks, schedules, classifier, apply=True)
     original = tasks.create_or_find_by_operation

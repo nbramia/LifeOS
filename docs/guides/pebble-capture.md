@@ -1,7 +1,7 @@
 # Pebble Capture Filing
 
 **Status:** Complete
-**Last Updated:** 2026-09-10
+**Last Updated:** 2026-09-17
 **Audience:** Operators
 
 Pebble owns `LifeOS/Log/Pebble`, where each recording day is two files:
@@ -37,7 +37,15 @@ raw revision creates no receipt, so a later ready reconciliation can proceed.
 
 ## Filing Rules
 
-- Clear to-dos create canonical `LifeOS/Tasks/Inbox.md` entries.
+- Log-only is the strong default. A task -- delegated or not -- is filed only
+  when the transcript carries an explicit filing request ("add a task",
+  "add a to-do", "put it on my list", "remind me to ...", "make/create a
+  task", "assign ... to ...", or "task: ...") in the same positive clause as
+  its `action_evidence`, an exact unquoted span of the transcript. A bare
+  imperative ("Take the dog outside.") or a plain statement is not enough,
+  and this holds for every task the local classifier proposes, not only
+  delegated ones; an unproven task is silently omitted, so the capture still
+  logs and completes normally.
 - Ordinary timed reminders create `notify` entries in `LifeOS/Scheduler/Inbox.md`.
 - An `agent` schedule requires explicit quoted scheduled-execution evidence and
   a valid, visible non-empty `#executor`; blank, invented, and unknown
@@ -51,9 +59,15 @@ raw revision creates no receipt, so a later ready reconciliation can proceed.
 - A structurally incomplete local classification gets one bounded local repair
   attempt. The replacement must supply exact source evidence and pass the same
   deterministic authority checks; application code never fills missing
-  delegation fields. A proposed task whose execution tag fails those checks is
-  corrected or omitted rather than filed as an unassigned task, and a second
-  invalid response leaves the capture pending.
+  delegation fields. A task proposed with no `action_evidence` field at all is
+  treated as a structural contract miss and triggers that same one-shot
+  repair; a task whose `action_evidence` was supplied but is not bound to an
+  explicit filing request in a positive clause is instead silently omitted,
+  since under-filing is the safe direction and a retry would not fix a
+  content judgment. A proposed task whose execution tag fails the delegation
+  checks is corrected (the tag dropped, the task otherwise still filed if its
+  own filing request stands) rather than granted pickup authority it never
+  proved, and a second invalid response leaves the capture pending.
 - Classifier-proposed titles and messages cannot inject task/schedule Markdown
   fields, routing tags, comments, or line separators. The captured text stays
   quoted producer evidence and never becomes parser metadata.
@@ -86,6 +100,7 @@ before apply is held and creates no dead Scheduler entry.
 | Startup/periodic/debounced recovery | `PebbleCaptureWatcher`; bounded queue, coalesced scan, atomic move-in, shutdown drain, health, and read-only watcher cases |
 | Local-only bounded classification and dry run | `LocalOnlyJournalClassifier`; dry-run consumer case |
 | Journal/Pebble capability difference | shared note/task/reminder cases in `journal_filing_policy.py`, native clarification regression, and Pebble effect matrix |
+| Every task requires an explicit, bound filing request | `test_plain_task_requires_an_explicit_filing_request` calibration table; index-based classifier/validated-action pairing regression; a dropped task still completes the capture |
 | Relative time, timezone, elapsed trigger safety | `validate_plan`; local-time, DST gap/overlap, offset mismatch, and saved-plan elapsed cases |
 | Explicit assignment and schedule action gate | source-scoped evidence validation; positive paraphrase, negated, quoted, reported, conditional, mentioned, unknown, and Markdown-rebuild pickup cases |
 | Crash, restart, duplicate event, and revision conflict recovery | ledger consumer crash/replay and ambiguous-deletion cases; thread and process operation-key tests |

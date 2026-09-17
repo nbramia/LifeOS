@@ -8,7 +8,7 @@
   "source": {"id": "synthetic-ring", "client": "ring", "trigger": "button"},
   "status": "pending",
   "availability": {"audio": true, "pebble_text": true},
-  "pebble_text": "Buy synthetic printer paper.",
+  "pebble_text": "Add a task to buy synthetic printer paper.",
   "audio": {
     "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     "reference": "/private/synthetic-pending.m4a",
@@ -19,7 +19,7 @@
     "raw_stt": "durable",
     "interpretation": "pending_reconciliation"
   },
-  "whisper_raw": "Buy synthetic printer paper.",
+  "whisper_raw": "Add a task to buy synthetic printer paper.",
   "whisper_polished": null,
   "final_text": null,
   "comparison": "pending_reconciliation",
