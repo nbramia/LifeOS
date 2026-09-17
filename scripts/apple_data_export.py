@@ -17,7 +17,7 @@ Exported to: data/apple-imports/
 
 Uses the same directory name (data/apple-imports/) apple_data_import.py
 reads from, so a single-machine deployment (export and import on the same
-host) works with no rsync step and no manual symlink (#785). The
+host) works with no rsync step and no manual symlink. The
 two-machine flow rsyncs this directory across hosts unchanged — see
 scripts/apple_data_agent.sh.
 """
@@ -114,8 +114,8 @@ def _parse_abcdp_contact(plist_data: dict, identifier: str) -> dict | None:
 def _read_abcdp_contacts(addressbook_dir: Path) -> list[dict]:
     """Read contacts from legacy per-person .abcdp plist files, if any exist.
 
-    On current macOS this glob matches nothing (contacts moved to the
-    AddressBook-v22.abcddb SQLite databases — see issue #514) but older
+    On current macOS this glob matches nothing (contacts live in the
+    AddressBook-v22.abcddb SQLite databases instead) but older
     macOS versions still write one .abcdp file per contact under
     Sources/*/Metadata/, so this path is kept as a fallback.
     """
@@ -344,7 +344,7 @@ def export_contacts(dry_run: bool = False) -> dict:
     """Export Apple Contacts by reading AddressBook's local files directly.
 
     Contacts currently live in AddressBook-v22.abcddb SQLite databases (the
-    root DB plus one per account source under Sources/*/) — see issue #514.
+    root DB plus one per account source under Sources/*/).
     Older macOS instead wrote one .abcdp plist per contact under
     Sources/*/Metadata/, which is kept as a fallback for that case.
 
@@ -710,7 +710,7 @@ _WACLI_AUTH_FAILURE_MARKERS = (
 def _diagnose_wacli_failure(output: str) -> dict:
     """Classify a failed `wacli sync` from its combined stdout/stderr.
 
-    Issue #677: WhatsApp sync was dead for 3+ months because a silent
+    WhatsApp sync can go dead for months because a silent
     Homebrew tap rename (steipete/tap -> openclaw/tap) froze wacli at 0.5.0
     while WhatsApp's protocol moved on, producing "Client outdated (405)".
     `wacli doctor` kept reporting AUTHENTICATED true throughout — the
@@ -730,7 +730,7 @@ def _diagnose_wacli_failure(output: str) -> dict:
     records the failure (health_message/markdown_message/classify_message,
     the nightly summary status, any alert) from that exit code. The
     CRITICAL log check_manifest() also emits IS captured into the sync log
-    file, so a human reading it does see the diagnosis (#646) — it just
+    file, so a human reading it does see the diagnosis — it just
     doesn't drive record_failure or anything downstream of it. Only the
     exit code does.
     """
@@ -762,7 +762,7 @@ def _diagnose_wacli_failure(output: str) -> dict:
 def _get_wacli_version() -> str | None:
     """Best-effort `wacli --version` lookup for the export manifest.
 
-    Recorded on every export (issue #677) so a frozen client is visible
+    Recorded on every export so a frozen client is visible
     from the Linux side without shelling into the Mac — a version that
     hasn't moved in months is the frozen-client signal even before a sync
     actually fails outright. Mirrors _get_agent_sha's best-effort shape:
@@ -815,13 +815,13 @@ def _newest_message_timestamp(messages: list[dict]) -> str | None:
 def export_whatsapp(dry_run: bool = False) -> dict:
     """Export WhatsApp data via wacli for import on Linux.
 
-    Routes through the wacli CLI (openclaw/tap, formerly steipete/tap) which
+    Routes through the wacli CLI (openclaw/tap) which
     is macOS-only and reads the WhatsApp Desktop app's local SQLite
     database. The Mac Mini is the canonical source — Linux can't run wacli,
     so this export bridges them via a JSON file the Linux importer can
     consume.
 
-    Periodic "is wacli current?" check (issue #677 AC): deliberately NOT
+    Periodic "is wacli current?" check: deliberately NOT
     implemented as a separate network call to GitHub/Homebrew. `brew
     outdated` already claims to do this and is exactly what silently broke
     (a tap rename made it go quiet); a second freshness poll would rot the
@@ -838,7 +838,7 @@ def export_whatsapp(dry_run: bool = False) -> dict:
     # Step 1: Have wacli refresh its local database from WhatsApp Desktop.
     # A non-zero exit (or a timeout) must not be treated as "continue with
     # whatever's on disk and call it ok" — that is exactly how a 405 Client
-    # outdated failure exported as status "ok" for 3+ months (issue #677).
+    # outdated failure exported as status "ok" for 3+ months.
     sync_diagnosis: dict | None = None
     try:
         result = subprocess.run(
@@ -984,7 +984,7 @@ def export_whatsapp(dry_run: bool = False) -> dict:
 def _finalize_result(result: dict) -> dict:
     """Guard against a source reporting "ok" with no actual output.
 
-    Observed for `contacts` (issue #505): when no .abcdp files were found,
+    Observed for `contacts`: when no .abcdp files were found,
     export_contacts returned {"status": "ok", "count": 0, "path": ""} —
     indistinguishable from a healthy empty result. A source that claims "ok"
     but produced neither a count nor an output path didn't actually export
@@ -1005,7 +1005,7 @@ def _finalize_result(result: dict) -> dict:
 def _get_agent_sha() -> str | None:
     """Return the git HEAD SHA of this checkout, or None if it can't be determined.
 
-    Recorded in the manifest so the Linux side (issue #509) can tell which
+    Recorded in the manifest so the Linux side can tell which
     revision of the export pipeline produced a given export without SSHing to
     the Mac Mini — e.g. to notice the agent's self-update silently stopped
     working. Best-effort: a shallow clone, missing git binary, or non-repo
@@ -1059,8 +1059,8 @@ def main():
         sources = {args.source: sources[args.source]}
 
     # Computed once so every source touched by this invocation — and the
-    # top-level manifest fields — agree exactly (issue #820, acceptance
-    # criterion: a full export's per-source and top-level timestamps match).
+    # top-level manifest fields — agree exactly (a full export's per-source
+    # and top-level timestamps must match).
     exported_at = datetime.now(timezone.utc).isoformat()
     agent_sha = _get_agent_sha()
 
@@ -1073,11 +1073,11 @@ def main():
             logger.error(f"Failed to export {name}: {e}")
             results[name] = {"status": "error", "error": str(e)}
 
-    # Issue #820: freshness belongs to each source, not just the top of the
+    # Freshness belongs to each source, not just the top of the
     # file. A partial (--source) run's merge below preserves entries for
     # sources it didn't touch — those keep whatever exported_at/agent_sha
     # they were stamped with on their own last run, instead of silently
-    # inheriting this run's timestamp the way the top-level field used to.
+    # inheriting this run's timestamp.
     for source_result in results.values():
         if isinstance(source_result, dict):
             source_result["exported_at"] = exported_at
@@ -1087,13 +1087,13 @@ def main():
     # existing manifest rather than replacing it wholesale — otherwise the
     # documented single-source troubleshooting flow (e.g. re-running just
     # WhatsApp after a fix) silently discards every other source's
-    # last-known status (#786). A full run (no --source) always produces a
-    # full replacement, same as before this change.
+    # last-known status. A full run (no --source) always produces a
+    # full replacement.
     #
     # If the existing manifest can't be read, or has no usable results dict,
     # we do NOT fall back to overwriting it with just this run's result —
-    # that would reproduce the exact data-loss bug this fix exists to
-    # prevent, just triggered by corruption instead of an ordinary
+    # that would reproduce the exact data-loss failure mode described above,
+    # just triggered by corruption instead of an ordinary
     # single-source run. Leave the file untouched and fail loud instead.
     manifest_results = results
     manifest_path = EXPORT_DIR / "manifest.json"
@@ -1105,15 +1105,16 @@ def main():
             existing_results = existing_manifest.get("results")
             if isinstance(existing_results, dict):
                 manifest_results = {**existing_results, **results}
-                # Issue #820: a preserved entry from before per-source
-                # timestamps existed has no exported_at of its own — this is
-                # the last point where the old top-level value (describing
-                # when that entry actually last ran) is still recoverable,
-                # since this same write is about to replace the top-level
-                # field with this run's timestamp. Without backfilling here,
-                # the very next partial run after upgrading would silently
-                # reproduce the original bug for every source this run
-                # didn't touch, just one generation later.
+                # A preserved entry with no exported_at of its own (e.g. one
+                # written before per-source timestamps existed) needs one
+                # backfilled — this is the last point where the top-level
+                # value (describing when that entry actually last ran) is
+                # still recoverable, since this same write is about to
+                # replace the top-level field with this run's timestamp.
+                # Without backfilling here, the very next partial run would
+                # silently reproduce the data-loss failure mode described
+                # above for every source this run didn't touch, just one
+                # generation later.
                 old_exported_at = existing_manifest.get("exported_at")
                 old_agent_sha = existing_manifest.get("agent_sha")
                 for name, entry in manifest_results.items():

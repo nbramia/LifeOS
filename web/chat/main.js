@@ -1,4 +1,4 @@
-// Chat module entry point (#358). Wires the extracted modules together and
+// Chat module entry point. Wires the extracted modules together and
 // bridges them to the classic index.html shell script:
 //
 //   - `window.lifeChat` exposes the shared state and `initChat` so the shell can
@@ -30,7 +30,7 @@ import { initModel, onModelChange } from './model.js';
 
 // Boot the chat surface. The shell passes in the explicit DOM element map (so
 // the modules never getElementById), the API endpoints, and integration hooks
-// (onAgentThreadReply — the #236 reply path still lives in the shell).
+// (onAgentThreadReply — the agent-thread reply path still lives in the shell).
 export function initChat({ elements: els, endpoints: eps, hooks: hks } = {}) {
   Object.assign(elements, els || {});
   Object.assign(endpoints, eps || {});
@@ -62,17 +62,17 @@ export function initChat({ elements: els, endpoints: eps, hooks: hks } = {}) {
   // says it's gone) once loadPersonas()'s own promise settles. It deliberately
   // does NOT list the conversation sidebar itself — config.backend isn't
   // resolved yet at this point either, and initBackend() below issues the
-  // sidebar's single initial load once BOTH are (#607) — awaiting this promise
+  // sidebar's single initial load once BOTH are resolved — awaiting this promise
   // (personasReady) is what makes it wait on persona validation too, not just
   // the synchronous id restore.
   const personasReady = loadPersonas();
-  // LifeOS|Agent|Hermes selector + restore per-backend conversation (#361,
-  // #587). The promise is stashed on the bridge (below) so tests can await
+  // LifeOS|Agent|Hermes selector + restore per-backend conversation.
+  // The promise is stashed on the bridge (below) so tests can await
   // "default resolution actually happened" instead of polling UI state that
   // can look identical before and after (e.g. the lifeos default matches
   // index.html's initial markup).
   window.lifeChat.backendReady = initBackend(personasReady);
-  // (#851) A deep link naming a conversation — e.g. the board's "open" on
+  // A deep link naming a conversation — e.g. the board's "open" on
   // a Hermes card, `/chat?conversation=<id>` — opens that thread once the
   // backend restore above has settled, so it wins over whatever
   // per-backend conversation initBackend() itself restored from
@@ -85,12 +85,12 @@ export function initChat({ elements: els, endpoints: eps, hooks: hks } = {}) {
   // touches the SSE contract those params gate.
   window.lifeChat.backendReady.then(() => { maybeOpenDeepLinkedConversation(); });
   initModel();  // restore the per-turn model picker (Auto/Sonnet/Opus/Gemma)
-  initVoice();  // restore Voice|Text mode + wire the hold-to-talk dock (#361)
+  initVoice();  // restore Voice|Text mode + wire the hold-to-talk dock
   setStatus('', 'Ready');
   inputField.focus();
 }
 
-// (#851) `?conversation=<id>` deep link — see initChat()'s call site above
+// `?conversation=<id>` deep link — see initChat()'s call site above
 // for why this runs after backendReady rather than synchronously.
 function maybeOpenDeepLinkedConversation() {
   let id = null;
@@ -105,7 +105,7 @@ function maybeOpenDeepLinkedConversation() {
 
 // --- Bridge for the classic shell script + inline handlers ---
 // personaOrchestrates/personaSupportsHandoff are exposed read-only for tests
-// (a browser-test truth table across backends, #596) — nothing in the app
+// (a browser-test truth table across backends) — nothing in the app
 // itself needs them off this bridge; ask-stream.js/voice.js import them
 // directly as module functions.
 window.lifeChat = { state, config, initChat, personaOrchestrates, personaSupportsHandoff };

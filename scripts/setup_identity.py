@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Guided first-run identity setup: owner, partner, family, work domains (#763).
+Guided first-run identity setup: owner, partner, family, work domains.
 
-Turns finding your own PersonEntity ID (previously: curl the people-search
-endpoint by hand, then hand-edit config/family_members.json and
+Turns finding your own PersonEntity ID (the manual alternative: curl the
+people-search endpoint by hand, then hand-edit config/family_members.json and
 config/relationship_overrides.json) into a short interactive conversation.
 Run this once, after the first vault sync/index completes, so there are
 indexed people to search and pick yourself and your family from.
@@ -144,8 +144,8 @@ def _skeleton_from_example(example_path: Path) -> dict:
 
 def _existing_partner_person_id(config_path: Path) -> str:
     """Read the current partner_person_id out of relationship_overrides.json,
-    if it exists, purely so main() can warn about drift -- never used to
-    decide what to write."""
+    if it exists, purely so main() can warn about drift -- it never
+    decides what to write."""
     if not config_path.exists():
         return ""
     try:

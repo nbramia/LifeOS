@@ -400,7 +400,7 @@
         }
 
         /* Answer affordance for an orchestrating-persona session awaiting a
-           [CLARIFY]/[GOAL] (#412). Appended inside #messages, styled like an
+           [CLARIFY]/[GOAL]. Appended inside #messages, styled like an
            assistant bubble but accented so it reads as an action, not a reply. */
         .pending-question {
             align-self: flex-start;
@@ -538,12 +538,12 @@
         .routing-source.attachment { border-color: #9c27b0; color: #9c27b0; }
         .routing-source.people { border-color: #00bcd4; color: #00bcd4; }
 
-        /* "Runs on LifeOS" toolbar badge (#596): shown whenever the selected
+        /* "Runs on LifeOS" toolbar badge: shown whenever the selected
            persona orchestrates on the LifeOS backend specifically (spawns a
-           background Claude Code session). Since #642, Hermes drives an
-           orchestrating persona itself (lifeos_agent_spawn) instead of having
-           its turn diverted to LifeOS, so the badge no longer shows there —
-           only on lifeos. Agent has no persona pass-through at all. */
+           background Claude Code session). Hermes drives an
+           orchestrating persona itself (lifeos_agent_spawn) rather than having
+           its turn diverted to LifeOS, so the badge only shows
+           on lifeos. Agent has no persona pass-through at all. */
         .orchestrates-badge:not([hidden]) {
             display: inline-flex;
             align-items: center;
@@ -688,8 +688,8 @@
             color: white;
         }
 
-        /* Persona picker (#359). Restyled to match the backend/mode pill
-           selectors below (#684) — same height, font, background, and colors
+        /* Persona picker. Restyled to match the backend/mode pill
+           selectors below — same height, font, background, and colors
            — via grouped selectors that share the pill rules rather than
            duplicating their values, even though the picker itself is a
            single <select> with no separate container element. */
@@ -721,21 +721,21 @@
             border-color: var(--accent);
         }
 
-        /* LifeOS|Agent|Hermes text-backend selector (#361, three-way in #587);
+        /* LifeOS|Agent|Hermes text-backend selector (a three-way toggle);
            shown only when at least one of Agent/Hermes is configured
            server-side (body.agent-available / body.hermes-configured). Each
            non-lifeos option additionally hides itself unless ITS backend is
            configured, so a machine with only one configured still gets a
            clean two-way toggle rather than a dead third button.
 
-           Hermes visibility gates on -configured, not -available (#688):
+           Hermes visibility gates on -configured, not -available:
            a configured-but-unreachable Hermes must stay visible (marked
            unavailable via body.hermes-down below), not vanish
            indistinguishably from "never configured". Agent has no such
            split yet, so it still gates on -available.
 
            .mode-toggle-group shares this same pill shape for the Text|Voice
-           input-mode selector (#684) — unlike the backend toggle it has no
+           input-mode selector — unlike the backend toggle it has no
            availability gating, so it sets its own `display` instead of
            joining the conditional rule below. */
         .backend-toggle,
@@ -785,7 +785,7 @@
             display: inline-block;
         }
 
-        /* Configured but unreachable (#688): visible, not silently hidden,
+        /* Configured but unreachable: visible, not silently hidden,
            but visually marked as down and not clickable (backend.js's click
            handler also refuses the switch — this is belt-and-suspenders). */
         body.hermes-down #backendHermes {
@@ -804,7 +804,7 @@
         }
 
         /* Hermes mode keeps the persona picker visible but hides the per-turn
-           model picker — model selection there is the harness's concern (#587). */
+           model picker — model selection there is the harness's concern. */
         body.hermes-mode #modelPicker {
             display: none;
         }
@@ -1087,12 +1087,12 @@
 
         /* Wrapper around the run-as-agent controls (routing select + spawn).
            Transparent on desktop so they sit inline in the composer row; on
-           mobile it becomes its own row above the input (#361). */
+           mobile it becomes its own row above the input. */
         .composer-tools {
             display: contents;
         }
 
-        /* Top-of-chat selector toolbar (#361 UI) */
+        /* Top-of-chat selector toolbar */
         .chat-toolbar {
             display: flex;
             align-items: center;
@@ -1110,7 +1110,7 @@
            relays to /api/ask/stream (whisper-relay#24) — so it stays visible in
            voice mode. It is still hidden on the Agent backend via
            `body.agent-mode .persona-picker` (that backend ignores model picks)
-           and on Hermes via `body.hermes-mode #modelPicker` (#587) — Hermes
+           and on Hermes via `body.hermes-mode #modelPicker` — Hermes
            keeps the persona picker visible but owns its own model selection. */
 
         .voice-dock {
@@ -1155,7 +1155,7 @@
             cursor: pointer;
         }
 
-        /* Live-mic indicator on the Listening label (#813). Hidden unless
+        /* Live-mic indicator on the Listening label. Hidden unless
            voice.js adds `.live`, which it does only while the wake tap is
            actually holding an unsuspended capture — so the dot disappears
            during playback/recording and whenever Listening is off, rather
@@ -1183,7 +1183,7 @@
             border-color: var(--accent);
         }
 
-        /* Circular camera-shutter talk button (#361 UI) */
+        /* Circular camera-shutter talk button */
         .voice-talk-btn.shutter {
             width: 76px;
             height: 76px;
@@ -1248,7 +1248,7 @@
             justify-content: center;
         }
 
-        /* Network-resilience status row for a voice turn (#801) -- a subtle
+        /* Network-resilience status row for a voice turn -- a subtle
            "retrying" note, or a definitive "failed" state with Retry/dismiss.
            A sibling of `.message.user`/`.message.assistant`, appended right
            after the turn's bubble, deliberately NOT nested inside one (see
@@ -1367,7 +1367,7 @@
             transform: none;
         }
 
-        /* Stop button (#611): swapped in for send-btn while a turn is in
+        /* Stop button: swapped in for send-btn while a turn is in
            flight. Shares send-btn's box so the composer layout doesn't
            shift; a distinct color signals it's a different action. */
         .stop-btn {
@@ -1650,7 +1650,7 @@
                 bottom: 0;
                 z-index: 100;
                 transform: translateX(-100%);
-                /* Fixed positioning escapes body's padding-top (#727 follow-up):
+                /* Fixed positioning escapes body's padding-top:
                    without its own insets, the drawer (and the + new-thread button
                    in .sidebar-header) renders under the status bar / Dynamic
                    Island and is unreachable to touch. safe-left covers the
@@ -1697,7 +1697,7 @@
                 padding: 0 0.75rem;
             }
 
-            /* Compact topbar (#361): icon-only nav + remember, snug action row
+            /* Compact topbar: icon-only nav + remember, snug action row
                so the persona picker, title, and actions fit a phone width. */
             .header-nav .nav-label,
             .remember-btn .btn-label {
@@ -2898,7 +2898,7 @@
             opacity: 0.5;
         }
 
-        /* Agent threads panel (#236) */
+        /* Agent threads panel */
         .agents-panel { border-top: 1px solid var(--border, #2a2a2a); margin-top: auto; }
         .agents-panel-header {
             display: flex; align-items: center; justify-content: space-between;
@@ -2923,7 +2923,7 @@
         .agent-badge.completed { background: #1e4620; color: #7ad17f; }
         .agent-badge.failed, .agent-badge.budget_exceeded { background: #4a1e1e; color: #ff9d9d; }
         .agent-badge.blocked, .agent-badge.yielded { background: #4a3a1e; color: #ffd27f; }
-        /* Agent thread view in the main chat body (#236) */
+        /* Agent thread view in the main chat body */
         .agent-thread-banner { font-size: 0.85rem; padding: 0.6rem 0.8rem; margin-bottom: 0.8rem; border-radius: 8px; background: rgba(45,95,163,0.15); border: 1px solid rgba(45,95,163,0.4); }
         .agent-thread-exit { margin-left: 0.5rem; font-size: 0.74rem; padding: 0.15rem 0.5rem; border-radius: 6px; border: none; cursor: pointer; background: #2d5fa3; color: #fff; }
         .agent-thread-empty { opacity: 0.6; font-size: 0.85rem; padding: 0.5rem 0.2rem; }
@@ -2953,7 +2953,7 @@
         <div class="conversations-list" id="conversationsList">
             <div class="empty-conversations">No conversations yet</div>
         </div>
-        <!-- Agent threads (#236): in-flight + completed agent sessions, replyable -->
+        <!-- Agent threads: in-flight + completed agent sessions, replyable -->
         <div class="agents-panel" id="agentsPanel">
             <div class="agents-panel-header">
                 <span>Agent threads</span>
@@ -2992,7 +2992,7 @@
             </div>
         </header>
 
-        <!-- Top-of-chat selector toolbar (#361 UI): persona + routing + backend + mode -->
+        <!-- Top-of-chat selector toolbar: persona + routing + backend + mode -->
         <div class="chat-toolbar">
             <select class="persona-picker" id="personaPicker" onchange="onPersonaChange()" title="Choose persona" aria-label="Persona"></select>
             <span class="orchestrates-badge" id="orchestratesBadge" hidden title="This persona runs on LifeOS as a background Claude Code session">⚙️ Runs on LifeOS</span>
@@ -3009,7 +3009,7 @@
                 <button class="backend-option" id="backendAgent" type="button" title="Agent backend">Agent</button>
                 <button class="backend-option" id="backendHermes" type="button" title="Hermes backend">Hermes</button>
             </div>
-            <!-- Text|Voice input-mode selector (#684): replaces the old mic/keyboard
+            <!-- Text|Voice input-mode selector: replaces the old mic/keyboard
                  icon toggle with a pill matching .backend-toggle above. -->
             <div class="mode-toggle-group" role="group" aria-label="Input mode">
                 <button class="mode-toggle-option active" id="modeTextBtn" type="button" title="Text input">Text</button>
@@ -3051,12 +3051,12 @@
                     ></textarea>
                 </div>
                 <button class="send-btn" id="sendBtn" onclick="sendMessage()" title="Send message">➤</button>
-                <!-- Stop (#611): shown in place of Send while a turn is in flight.
+                <!-- Stop: shown in place of Send while a turn is in flight.
                      Cancels the turn server-side rather than just walking away from
                      the stream -- the turn otherwise keeps running to completion. -->
                 <button class="stop-btn" id="stopBtn" onclick="stopTurn()" title="Stop">⏹</button>
             </div>
-            <!-- Voice dock (#361): tap-to-talk + dock toggles; shown in voice mode -->
+            <!-- Voice dock: tap-to-talk + dock toggles; shown in voice mode -->
             <div class="voice-dock" id="voiceDock">
                 <div class="voice-dock-row">
                     <button class="voice-talk-btn shutter" id="voiceTalkBtn" title="Tap to talk" aria-label="Tap to talk"><span class="shutter-core"></span></button>
@@ -3286,7 +3286,7 @@
         document.addEventListener('DOMContentLoaded', () => {
             chatState = window.lifeChat.state;
             // Boot the extracted chat modules, passing the DOM elements, API
-            // endpoints, and the agent-thread reply hook (#236) this shell owns.
+            // endpoints, and the agent-thread reply hook this shell owns.
             window.lifeChat.initChat({
                 elements: {
                     messagesEl, inputField, chatTitle,
@@ -3338,7 +3338,7 @@
             setInterval(loadAgentThreads, 5000);
         });
 
-        // --- Agent threads panel (#236) ---
+        // --- Agent threads panel ---
         async function loadAgentThreads() {
             const list = document.getElementById('agentsThreadsList');
             if (!list) return;
@@ -3358,7 +3358,7 @@
             const tip = escapeHtml((modelLabel || (r === 'claude' ? 'Cloud' : 'Local')).toString());
             if (r === 'claude') return '<span class="agent-route cloud" title="' + tip + '">☁ cloud</span>';
             if (r === 'local') return '<span class="agent-route local" title="' + tip + '">🖥 local</span>';
-            // (#809) `#cloud` tasks route here, not to Anthropic — the
+            // `#cloud` tasks route here, not to Anthropic — the
             // configured remote OpenAI-compatible provider (e.g. DeepSeek via
             // Fireworks). Distinct badge so it isn't confused with the
             // Anthropic-API "cloud" badge above.

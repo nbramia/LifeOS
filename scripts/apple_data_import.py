@@ -50,7 +50,7 @@ STALENESS_CRITICAL_HOURS = 168  # 7 days
 def _get_local_main_sha() -> str | None:
     """Return this host's current `main` SHA, or None if it can't be determined.
 
-    Used only to flag a stale Mac Mini agent (issue #509) — best-effort and
+    Used only to flag a stale Mac Mini agent — best-effort and
     non-fatal, since a detached HEAD, missing git binary, or any other
     lookup failure here must never affect the import itself.
     """
@@ -81,7 +81,7 @@ def check_manifest() -> dict | None:
     Mini export marked with status == "error". The caller (main) uses the
     returned manifest to decide exit status.
 
-    Issue #646: a CRITICAL log line alone never drives alerting. It does
+    A CRITICAL log line alone never drives alerting. It does
     land in the sync log file — a human reading it directly sees it fine —
     but this script runs as a subprocess under run_all_syncs.py, and only
     that subprocess's exit code (plus the ``SYNC_STATS:{json}`` line for
@@ -143,11 +143,7 @@ def check_manifest() -> dict | None:
     # subprocess exit code does, and logging by itself never touches it.
     # main() below is what actually makes this count, by folding any
     # manifest-reported error into this run's results dict so the existing
-    # status=="error" -> sys.exit(1) path picks it up. (Issue #646:
-    # believing the CRITICAL log level *was* "the existing alerting path"
-    # — this comment used to say exactly that — is what let a stale export
-    # look healthy for ten days, even though the CRITICAL was right there
-    # in the log the whole time.)
+    # status=="error" -> sys.exit(1) path picks it up.
     results = manifest.get("results") or {}
     if isinstance(results, dict):
         for source_name, source_result in results.items():
@@ -160,16 +156,15 @@ def check_manifest() -> dict | None:
                     f"Check wacli/tooling on {agent_label}."
                 )
 
-    # Issue #820: a partial (--source) export run preserves other sources'
-    # manifest entries (#786) rather than clobbering them, but the top-level
+    # A partial (--source) export run preserves other sources'
+    # manifest entries rather than clobbering them, but the top-level
     # exported_at above describes only the run that just happened — checking
     # staleness from it alone means a fresh run of one source silently masks
-    # a week-old preserved entry for another. Sources exported by the fixed
-    # apple_data_export.py now carry their own exported_at; judge each one's
+    # a week-old preserved entry for another. apple_data_export.py stamps
+    # each source with its own exported_at; judge each one's
     # staleness from that value instead. A source with no per-source
-    # exported_at is a legacy manifest (pre-#820, or an entry from before
-    # this field existed) — leave it to the top-level check above, which
-    # already covers that case exactly as it did before this change.
+    # exported_at is a legacy manifest entry — leave it to the top-level
+    # check above, which already covers that case.
     stale_sources: dict[str, str] = {}
     if isinstance(results, dict):
         for source_name, source_result in results.items():
@@ -199,8 +194,8 @@ def check_manifest() -> dict | None:
     if stale_sources:
         manifest["_stale_sources"] = stale_sources
 
-    # Flag a Mac Mini agent whose self-update (issue #509) has fallen behind.
-    # `agent_sha` is absent on manifests written before this change — that's
+    # Flag a Mac Mini agent whose self-update has fallen behind.
+    # `agent_sha` is absent on some manifests — that's
     # expected and not a problem, so only compare when it's actually present.
     agent_sha = manifest.get("agent_sha")
     if agent_sha:
@@ -234,8 +229,8 @@ def import_contacts(dry_run: bool = False, manifest: dict | None = None) -> dict
     """Import contacts from JSON export.
 
     Manifest-aware like import_whatsapp: if the Mac-side export marked
-    contacts as errored (e.g. the zero-count/empty-path pattern from
-    issue #505), propagate that as a failure here too instead of quietly
+    contacts as errored (e.g. the zero-count/empty-path pattern),
+    propagate that as a failure here too instead of quietly
     returning "skipped" — a manifest error must not look like a healthy
     no-op.
     """
@@ -399,15 +394,15 @@ def import_phone_calls(dry_run: bool = False) -> dict:
       source_entity to that person (unless a manual link already exists)
       and create the Interaction record for the call.
     - If the number doesn't resolve to any Person, the source_entity is
-      stored **unlinked** (``canonical_person_id IS NULL``). This is
-      issue #226's policy: phone alone never creates a Person — auto-
+      stored **unlinked** (``canonical_person_id IS NULL``). Phone alone
+      never creates a Person — auto-
       creating one per spam call would pollute the People graph — but we
       keep the forensic observation so ``scripts/link_source_entities.py``
       can retro-link it later when the matching Contact / email arrives.
       No Interaction is created (interactions require ``person_id``).
 
     The source_entity update happens BEFORE the "interaction already
-    exists?" check so that re-imports still close the issue #199 §2 drift
+    exists?" check so that re-imports still close the drift
     gap when a Person row was created out-of-band between runs.
 
     Manual SourceEntity→Person links (``link_status='manual'``) are never
@@ -498,7 +493,7 @@ def import_phone_calls(dry_run: bool = False) -> dict:
             continue
 
         # Resolve to an existing PersonEntity by phone — phone alone never
-        # CREATES a Person (issue #226). May return None.
+        # CREATES a Person. May return None.
         result = resolver.resolve(phone=phone, create_if_missing=False)
         person = result.entity if result else None
 
@@ -514,7 +509,7 @@ def import_phone_calls(dry_run: bool = False) -> dict:
             seen_phones.add(phone)
             this_phone_max_ts = phone_max_ts.get(phone, timestamp or now)
             # Use the shared factory so the ``phone_{e164}`` source_id format
-            # stays defined in exactly one place (see issue #228 — silent
+            # stays defined in exactly one place (silent
             # duplicates were the failure mode if it drifts).
             template = create_phone_source_entity(
                 phone=phone,
@@ -602,7 +597,7 @@ def import_photos_faces(dry_run: bool = False) -> dict:
     """Import Photos face recognition data from Mac Mini export.
 
     Matches Photos people to PersonEntity records using contact UUIDs
-    (via previously imported contacts), then creates SourceEntity and
+    (via already-imported contacts), then creates SourceEntity and
     Interaction records — the same records that sync_photos.py would
     create if the Photos library were available locally.
     """
@@ -852,7 +847,7 @@ def import_whatsapp(dry_run: bool = False, manifest: dict | None = None) -> dict
 
 
 # ---------------------------------------------------------------------------
-# Apple Health (#323) — written into the self-data fitness store, NOT the
+# Apple Health — written into the self-data fitness store, NOT the
 # person-centric SourceEntity model (see ADR-013). Source is an iOS Shortcut
 # that emits health.json into a synced path (see docs/guides/apple-health.md).
 # ---------------------------------------------------------------------------
@@ -862,7 +857,7 @@ def import_health(dry_run: bool = False) -> dict:
 
     Reads the file at LIFEOS_HEALTH_EXPORT_PATH and delegates to the shared
     ingest core (api.services.health_import.ingest_health) — the same core the
-    POST /api/fitness/health/ingest endpoint uses (#333). Absent file → skipped
+    POST /api/fitness/health/ingest endpoint uses. Absent file → skipped
     (a fresh clone / no-iPhone setup is unaffected).
     """
     from config.settings import settings
@@ -897,8 +892,7 @@ def main():
 
     if not IMPORT_DIR.exists():
         # No Apple Data Agent has ever exported anything to this host — not
-        # broken, just never set up (issue #698, the Apple-shaped sibling of
-        # #687's clean-skip pattern). A configured install's import directory
+        # broken, just never set up. A configured install's import directory
         # exists (even mid-outage, even stale), so this branch never fires
         # for it — check_manifest()'s staleness/per-source-error paths below
         # are untouched and still fail loud for a real outage.
@@ -957,7 +951,7 @@ def main():
     #     this is a no-op for them. imessage/phone/photos/health are NOT
     #     manifest-aware: if last export's file is still on disk, the local
     #     import happily reprocesses it and reports "ok", silently masking
-    #     a Mac-side export failure (issue #646 — the same "logged but not
+    #     a Mac-side export failure (the same "logged but not
     #     structured" gap as staleness, just for this specific walk in
     #     check_manifest() above instead of the staleness guard). Override
     #     status back to "error" here rather than teaching every import_*
@@ -982,7 +976,7 @@ def main():
             else:
                 results[name] = {"status": "error", "reason": reason}
 
-    # Issue #820: a source whose OWN recorded exported_at is critically
+    # A source whose OWN recorded exported_at is critically
     # stale fails the run for that source specifically, independent of the
     # top-level manifest_staleness check below (which only sees the shared
     # timestamp and would miss this on a manifest freshened by an unrelated
@@ -1002,7 +996,7 @@ def main():
             else:
                 results[name] = {"status": "error", "reason": message}
 
-    # Issue #646: staleness past STALENESS_CRITICAL_HOURS must fail the run,
+    # Staleness past STALENESS_CRITICAL_HOURS must fail the run,
     # not just log a CRITICAL that doesn't drive record_failure/alerting —
     # only the exit code does. A synthetic "manifest_staleness" entry reuses
     # the exact per-source error path below (results[...]["status"] ==

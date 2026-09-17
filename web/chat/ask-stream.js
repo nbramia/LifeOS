@@ -1,7 +1,7 @@
-// Chat SSE client (#358): streams an answer from /api/ask/stream and the
+// Chat SSE client: streams an answer from /api/ask/stream and the
 // orchestrator's engine-handoff to /api/chat/handoff. Extracted verbatim from
 // index.html's inline <script>, with the transport split into askStream() so
-// follow-on surfaces (#359 persona, #361 Voice|Text) can reuse it.
+// follow-on surfaces (persona picker, Voice|Text) can reuse it.
 
 import { state, config, elements, endpoints, hooks } from './session.js';
 import { addMessage, updateMessage, setStatus, buildSourcesHtml } from './thread.js';
@@ -33,19 +33,16 @@ export async function askStream({ question, conversationId, attachments, persona
 
   // Both proxied backends are reached via their own endpoint (bearer added
   // server-side). Hermes resolves persona_id server-side into the
-  // `lifeos_context` envelope (#590), so it gets persona_id exactly like
+  // `lifeos_context` envelope, so it gets persona_id exactly like
   // lifeos does; the Agent backend still has no persona pass-through.
   // model_override stays lifeos-only — a persona's `model` frontmatter field
   // is a no-op on the other backends.
   const proxiedAskEndpoint = { agent: endpoints.agentAsk, hermes: endpoints.hermesAsk };
-  // Orchestrating personas (e.g. doctor) used to always run on LifeOS, even
-  // with Hermes selected, diverting their turn to /api/ask/stream because the
-  // spawn path (background Claude Code session + thread linking) was
-  // LifeOS-native with no Hermes equivalent (#596). #642 removed that divert:
-  // Hermes now drives its own background worker for these personas
-  // (lifeos_agent_spawn, #640), carrying a Hermes-specific preamble the proxy
+  // Orchestrating personas (e.g. doctor) run entirely on their selected
+  // backend: Hermes drives its own background worker for these personas
+  // (lifeos_agent_spawn), carrying a Hermes-specific preamble the proxy
   // attaches server-side (surface="hermes", hermes_proxy.py) — so a Hermes
-  // turn is no longer special-cased here at all, orchestrating or not.
+  // turn is never special-cased here, orchestrating or not.
   const isLifeos = !proxiedAskEndpoint[backend];
   if (backend !== 'agent' && personaId != null) body.persona_id = personaId;
   // Per-turn model picker (lifeos backend only). 'auto' is the default — omit
@@ -85,11 +82,11 @@ export async function askStream({ question, conversationId, attachments, persona
   }
 }
 
-// Stop the turn in flight for the current conversation (#611). A turn now
+// Stop the turn in flight for the current conversation. A turn
 // keeps running server-side after the browser gives up on the stream, so an
 // explicit cancel is the only way to actually stop it — closing the tab or
-// navigating away no longer does. Best-effort: on failure there's nothing
-// useful to show the user; the turn just keeps running, same as before #611.
+// navigating away does not. Best-effort: on failure there's nothing
+// useful to show the user; the turn just keeps running.
 export async function stopTurn() {
   const conversationId = state.currentConversationId;
   if (!conversationId) return;
@@ -107,7 +104,7 @@ export async function sendMessage() {
   if (!question || state.isLoading) return;
 
   // In agent-thread mode the composer continues that thread instead
-  // of starting a normal chat query (#236).
+  // of starting a normal chat query.
   if (state.currentAgentThread) {
     await hooks.onAgentThreadReply(question);
     return;
@@ -116,7 +113,7 @@ export async function sendMessage() {
   state.isLoading = true;
   setStatus('loading', 'Thinking...');
   elements.sendBtn.disabled = true;
-  // Swap Send for Stop (#611) — hidden again once this turn settles, in the
+  // Swap Send for Stop — hidden again once this turn settles, in the
   // same place sendBtn is re-enabled below.
   elements.sendBtn.style.display = 'none';
   elements.stopBtn.classList.add('visible');
@@ -182,7 +179,7 @@ export async function sendMessage() {
           state.currentConversationId = data.conversation_id;
           setStoredConversationId(data.conversation_id);  // per-backend persistence
         } else if (data.type === 'usage') {
-          // #602: a backend that can't price a turn sends no `cost_usd`
+          // A backend that can't price a turn sends no `cost_usd`
           // rather than inventing a zero. `data.cost_usd || 0` treated an
           // absent cost the same as a real one, silently turning "unknown"
           // into a confident (wrong) claim of "free". An explicit
@@ -202,9 +199,9 @@ export async function sendMessage() {
             ? state.sessionCostUnpriced + ' turn(s) this session had no reported cost -- total is a lower bound.'
             : '';
         } else if (data.type === 'claude_intent') {
-          // Engine handoff (#305b/c): the orchestrator delegated to a CLI
+          // Engine handoff: the orchestrator delegated to a CLI
           // worker. Gate it on the selected persona's advertised capabilities
-          // (#359) — only personas with the `handoff` capability may trigger
+          // — only personas with the `handoff` capability may trigger
           // it; for others, ignore the intent (no handoff UI). An explicit
           // `claude_code` model pick is itself the handoff opt-in, so it
           // bypasses the persona gate; inferred intents still require a
@@ -234,7 +231,7 @@ export async function sendMessage() {
                 ? d.message
                 : '⚠️ Handoff to ' + label + ' failed.';
               updateMessage(msgId, fullContent);
-              // #311: the handoff linked the spawned session to the conversation
+              // The handoff linked the spawned session to the conversation
               // it targeted server-side, so poll THAT conversation for the
               // session's streamed progress + terminal result and render them
               // into the thread (parity with the orchestrating-persona path
@@ -296,7 +293,7 @@ export async function sendMessage() {
 
           loadConversations();
 
-          // Orchestrating-persona spawn (#403/#412): this turn started a
+          // Orchestrating-persona spawn: this turn started a
           // background Claude Code session (routed to `claude_code`, the
           // doctor spawn path) and the conversation is now linked to it. Begin
           // polling for a `[CLARIFY]`/`[GOAL]` so it can be answered here

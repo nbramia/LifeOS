@@ -36,7 +36,7 @@ def main():
     logger.info(f"Failed: {result['failed']}")
     logger.info(f"Total: {result['total']}")
 
-    # Canonical line consumed by run_all_syncs._parse_sync_output (#496).
+    # Canonical line consumed by run_all_syncs._parse_sync_output.
     from api.services.sync_health import emit_sync_stats
     emit_sync_stats({
         "people_updated": int(result.get("updated", 0) or 0),

@@ -2,7 +2,7 @@
 """
 One-shot migration: ``~/.lifeos/reminders.json`` → the Scheduler store.
 
-The reminder store used JSON as the source of truth. The Scheduler (issue #244)
+The reminder store used JSON as the source of truth. The Scheduler
 uses ``LifeOS/Scheduler/Inbox.md`` as the source of truth with a rebuildable
 index cache. This script reads the legacy JSON and writes each entry as a
 schedule line, mapping the old message types to actions:

@@ -1,19 +1,15 @@
 // web/agents/assignment.js
 //
-// Card-assignment pickers (#851): engine, model, effort, and host — for a
-// board card's drawer. Isolated module rather than a patch to
-// web/agents/board.js because the Kanban board UI (#850) hadn't merged
-// when this landed (see this PR's description) — hooking it in is a
-// one-line `import { renderAssignmentPickers } from './assignment.js'`
-// plus one call inside board.js's `renderDrawer()` once it does. Matches
-// that branch's card/drawer shapes exactly (verified against its
-// `git show feat/kanban-board:web/agents/board.js`):
+// Card-assignment pickers: engine, model, effort, and host — for a
+// board card's drawer. Isolated module, imported by board.js's
+// `renderDrawer()` via `renderAssignmentPickers`. Matches
+// board.js's card/drawer shapes exactly:
 //   - card: {id, title, notes, tags, assignee, fields, session, ...}
-//     `fields` is the task's `[key:: value]` inline-field map (#853);
+//     `fields` is the task's `[key:: value]` inline-field map;
 //     `session` (when a session exists) carries `host`/`model`/`effort`
 //     — "what actually ran", read-only, distinct from the assignment.
 //   - `PUT /api/tasks/{id}` with `{fields: {...}}` patches inline fields;
-//     a field value of `null` clears it (#853's fields API contract).
+//     a field value of `null` clears it.
 //   - `GET /api/agents/models` returns
 //     `{engines: {claude: [...], codex: [...], local: [...], hermes: [...]},
 //     refreshed_at, stale}`, each entry `{id, label, pricing}` — the

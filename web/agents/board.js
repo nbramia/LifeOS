@@ -1,6 +1,6 @@
 // web/agents/board.js
 //
-// The Kanban board (#850) — the primary /agents view. Backed by the vault
+// The Kanban board — the primary /agents view. Backed by the vault
 // task store via GET/PUT /api/agents/board*, with a card drawer that reuses
 // the shared SessionPanel (./panel.js) for the linked session's transcript,
 // exactly like the Graph tab's side panel does. The drawer's own action
@@ -69,15 +69,15 @@ const LIFECYCLE_TAGS = new Set([
   'agent-reassigned',
 ]);
 
-// Card fields the drawer renders as editable inputs — used to decide
-// whether an SSE tick needs to rebuild the drawer at all (#850 finding 2).
+// Card fields the drawer renders as editable inputs — read to decide
+// whether an SSE tick needs to rebuild the drawer at all.
 const DRAWER_EDITABLE_FIELDS = [
   'title', 'notes', 'tags', 'assignee', 'lane',
   // The model/effort/host pickers write here. Without it a frame whose only
   // change is a picker value is read as "nothing changed", so a drawer
   // showing a stale picker has no later frame that can converge it.
   'fields',
-  // Scheduled-card fields, editable in the drawer since #850 finding 4.
+  // Scheduled-card fields, editable in the drawer.
   'name', 'message_content', 'enabled',
   // Full schedule editing — trigger type, timing, timezone, action,
   // executor, and delivery bot — all through PUT /api/scheduler/{id}.
@@ -374,7 +374,7 @@ export function initBoard() {
   // the open card changed. Rebuilding the drawer via innerHTML every time
   // drops unsaved edits mid-keystroke, re-opens the linked session's
   // transcript EventSource, and re-fires GET /sessions/{id}/summary (an LLM
-  // call) on every tick (#850 finding 2). So: refresh the linked session in
+  // call) on every tick. So: refresh the linked session in
   // place via panel.updateMeta when its id hasn't changed, and only rebuild
   // the editable field block when a field actually changed and the operator
   // isn't mid-edit in the drawer.
@@ -403,7 +403,7 @@ export function initBoard() {
     // which action buttons the drawer shows (Answer, Kill). Without this,
     // answering from the drawer or a session reaching a terminal state
     // leaves a stale button behind: a second "Answer" click 404s, and
-    // "Kill" survives a session that already exited (#850 round-2 finding 3).
+    // "Kill" survives a session that already exited.
     const prevPendingId = (prev && prev.pending_question && prev.pending_question.id) ?? null;
     const freshPendingId = (fresh.pending_question && fresh.pending_question.id) ?? null;
     const prevSessionStatus = (prev && prev.session && prev.session.status) ?? null;
@@ -420,7 +420,7 @@ export function initBoard() {
       // otherwise a frame skipped because the drawer had focus is treated
       // as "no change" forever, and a later change gets silently dropped
       // too because it's diffed against this stale snapshot instead of the
-      // last card the drawer actually shows (#850 round-2 finding 4).
+      // last card the drawer actually shows.
       openCardSnapshot = fresh;
     }
   }
@@ -558,8 +558,7 @@ export function initBoard() {
     }
 
     // Only cancelled task cards are behind this filter — the Done lane
-    // itself (finished tasks, retired/fired schedules) always stays visible
-    // (#850 finding 3).
+    // itself (finished tasks, retired/fired schedules) always stays visible.
     if (!includeDoneEl?.checked && card.kind === 'task' && card.status === 'cancelled') return false;
 
     return true;
@@ -927,7 +926,7 @@ export function initBoard() {
       ${card.last_run ? `<div class="board-card-lastrun">${escapeHtml(card.last_run.outcome || '')} · ${escapeHtml(card.last_run.snippet || '')}</div>` : ''}
     `;
     // Scheduled cards open the drawer (name/message/enabled are editable
-    // there — #850 finding 4) but never drag between lanes: their lane is
+    // there) but never drag between lanes: their lane is
     // derived from the scheduler entry's own enabled/next-fire state, not
     // settable by dropping a card.
     div.addEventListener('click', () => openDrawer(card.id));
@@ -1397,7 +1396,7 @@ export function initBoard() {
         // tags-only assigned/unassigned moves (e.g. a Human-queue card
         // assigned to someone stays in Human queue) — surface that instead
         // of leaving the operator to notice the card "snapped back" on its
-        // own (#850 round-2 finding 2b).
+        // own.
         if (data && data.lane && data.lane !== targetLane) {
           showToast(`Card landed in ${laneLabel(data.lane)}, not ${laneLabel(targetLane)}.`, false);
         }
@@ -1420,7 +1419,7 @@ export function initBoard() {
         render();
         // Re-throw so a caller mid-edit (e.g. the drawer's assignee select)
         // can revert its own unsaved UI state instead of leaving a value
-        // that was never actually persisted (#850 finding 9).
+        // that was never actually persisted.
         throw err;
       });
   }
@@ -2428,7 +2427,7 @@ export function initBoard() {
     // suggestion/chip-remove button and THAT element then moving out.
     picker.addEventListener('focusout', (event) => {
       // Focus is still somewhere inside the picker — the operator is
-      // mid-navigation (an option or a chip's remove button now has
+      // mid-navigation (an option or a chip's remove button currently has
       // focus), not abandoning the field. Wait for the move that actually
       // clears the container.
       if (picker.contains(event.relatedTarget)) return;
@@ -3392,8 +3391,7 @@ export function initBoard() {
 
   // A change that arrived while the drawer had focus is deferred by
   // updateOpenDrawer's `!focused` check — flush it as soon as the operator
-  // leaves the field, using the latest board already applied by applyBoard
-  // (#850 round-2 finding 4).
+  // leaves the field, using the latest board already applied by applyBoard.
   if (drawerEl) {
     drawerEl.addEventListener('focusout', (e) => {
       // focusout fires before focus lands on the next element, so a move
@@ -3589,7 +3587,7 @@ export function initBoard() {
   // drawer's tag picker — `putBoardTags` sends only the editable tag set,
   // and the server preserves every protected tag already on the card
   // (update_board_card_tags's `update_tags_preserving`). ADD only, matching
-  // the issue's scope — no bulk untagging.
+  // by design — no bulk untagging.
   async function bulkTagOne(card, tag) {
     const current = editableTagsForCard(card);
     if (current.includes(tag)) return;  // already has it — counts as success

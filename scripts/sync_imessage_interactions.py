@@ -53,7 +53,7 @@ def sync_imessage_interactions(dry_run: bool = True, limit: int = None) -> dict:
     # no Full Disk Access granted yet — this step is a routine no-op, not an
     # error: on Linux, messages instead arrive via apple_data_import.py's
     # rsync'd imessage.db, and steps 2/3 below process those regardless
-    # (issue #698, the imessage-shaped sibling of #687's clean-skip pattern).
+    # (the imessage-shaped sibling of the Gmail/Calendar clean-skip pattern).
     #
     # Only these two specific "not configured for this host" signatures are
     # treated as a silent skip. Anything else is left to propagate, so a

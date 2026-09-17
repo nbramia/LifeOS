@@ -8,14 +8,14 @@ fast. A fresh install therefore starts with an empty interaction history
 that the nightly job never fills in on its own — someone has to notice the
 gap and know to run a deeper pass by hand. On a real second-user install,
 this went unnoticed long enough that months of history simply never
-arrived (#778).
+arrived.
 
 This script runs the same sources, in the same phase order, as the nightly
 pipeline's SYNC_ORDER (Phases 1-4: collection, entity processing,
 relationship building, indexing) — but any source whose nightly invocation
 narrows its own lookback window is instead run at that script's full-history
 default. It is a thin driver: the actual sync logic, idempotence, and
-unconfigured-source clean-skip behavior (#687) all live in the underlying
+unconfigured-source clean-skip behavior all live in the underlying
 per-source scripts, reused unmodified — this script only decides which
 sources to run, in what order, with what arguments, and prints a coverage
 report when it's done.
@@ -25,9 +25,9 @@ Deliberately excluded, even though present in the nightly SYNC_ORDER:
     "full history" concept to backfill.
   - Phase 5 (google_docs, google_sheets, monarch_money), Phase 6
     (entity_cleanup), Phase 7 (consistency_verify): content sync, cleanup,
-    and verification, not interaction-history depth. #778's acceptance
-    criteria name exactly four phases to mirror — collection, entity
-    processing, relationship building, indexing — so this stops at the end
+    and verification, not interaction-history depth. This backfill mirrors
+    exactly four phases — collection, entity
+    processing, relationship building, indexing — so it stops at the end
     of Phase 4.
   - phone: not part of the nightly SYNC_ORDER at all (it's macOS-FDA-only,
     invoked separately by scripts/run_fda_syncs.py's own cron path, always
@@ -141,7 +141,7 @@ def run_backfill_source(source: str, dry_run: bool = False) -> dict:
     skipped_reason = stats.pop("skipped_reason", None)
 
     # Mirror run_all_syncs.py's own precedence exactly: exit code decides
-    # success/failure first; a clean skip (#687) is only recognized within
+    # success/failure first; a clean skip is only recognized within
     # an already-successful (exit 0) run.
     if result.returncode != 0:
         error_msg = result.stderr or result.stdout or "Unknown error"

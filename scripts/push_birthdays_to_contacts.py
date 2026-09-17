@@ -34,7 +34,7 @@ def get_apple_contacts_with_email():
     except ImportError:
         logger.error("pyobjc-framework-Contacts not available")
         # Declare the skip so the parent records SKIPPED instead of a green
-        # zero-record "success" — macOS-only source on a Linux host (#497).
+        # zero-record "success" — macOS-only source on a Linux host.
         print(
             "SYNC_SKIPPED: Apple Contacts unavailable "
             "(pyobjc-framework-Contacts is macOS-only)",

@@ -34,7 +34,7 @@ def run_photos_sync(dry_run: bool = True, since: datetime = None) -> dict:
         # Declare the skip so the parent records SKIPPED rather than a green
         # "success" with zero records. Reading Photos.sqlite requires a macOS
         # .photoslibrary bundle, so on Linux this is always the path taken —
-        # and it silently inflated the nightly healthy count for months (#495).
+        # and it would silently inflate the nightly healthy count.
         # Face data still reaches the vault via the Apple Data Agent, imported
         # under `apple_import`, so nothing is actually lost here.
         print(

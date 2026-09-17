@@ -2,7 +2,7 @@
 //
 // Lets a chat turn run on a chosen model: 'auto' (the default Haiku orchestrator
 // with escalation), 'sonnet' / 'opus' (pin this turn to that cloud model),
-// 'gemma' (run this turn on the local llama-server), or 'remote' (#654 — a
+// 'gemma' (run this turn on the local llama-server), or 'remote' (a
 // configured paid OpenAI-compatible provider, e.g. Fireworks; an explicit pick
 // only, never reachable via auto-escalation). 'claude_code' is special: it
 // isn't an inline model but a handoff — the turn is routed to a background
@@ -37,12 +37,11 @@ export function onModelChange() {
   }
 }
 
-// (#654) Show/hide the "Remote" option based on GET /api/chat/config, which
+// Show/hide the "Remote" option based on GET /api/chat/config, which
 // reports whether the server has a remote provider configured at all (base
 // URL + model + key). Unconfigured is the default for a fresh clone — the
-// option stays hidden and the picker looks exactly like it did before this
-// option existed. A network failure degrades the same way (hidden), never
-// showing an option that can't actually run.
+// option simply stays hidden. A network failure degrades the same way
+// (hidden), never showing an option that can't actually run.
 async function applyRemoteAvailability() {
   const picker = elements.modelPicker;
   const option = picker && picker.querySelector('option[value="remote"]');

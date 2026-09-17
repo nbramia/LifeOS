@@ -1,10 +1,10 @@
 // LifeOS | Agent | Hermes text-backend selector + per-backend conversation
-// persistence (#361, PR-D; three-way selector added in #587).
+// persistence.
 //
 // The composer can target three text backends: `lifeos` (the orchestrator, with
 // personas + handoff), `agent` (the OpenClaw voice-adapter, no personas), and
 // `hermes` (an agent harness, personas resolved server-side into a
-// `lifeos_context` envelope — #590) — the latter two proxied with a
+// `lifeos_context` envelope) — the latter two proxied with a
 // server-side bearer at /api/agent/ask/stream and /api/hermes/ask/stream
 // respectively. Neither proxied backend has handoff wired through. The
 // selection persists in sessionStorage, and
@@ -14,7 +14,7 @@
 //
 // With no stored preference, the default is conditional: hermes if it's
 // configured server-side, else lifeos — so a machine with no Hermes URL set
-// behaves exactly as it did before this file existed. initBackend() resolves
+// defaults cleanly to lifeos. initBackend() resolves
 // that default (an async availability check) before the composer accepts a
 // turn, via the same state.isLoading gate sendMessage() already respects.
 
@@ -25,14 +25,14 @@ import { updateOrchestratesBadge } from './persona.js';
 const BACKEND_MODE_KEY = 'lifeos:chat:backend_mode';
 const BACKEND_MODES = ['lifeos', 'agent', 'hermes'];
 // Same-origin status checks; bounded so a wedged server can't hang the
-// composer open indefinitely (falls back to lifeos on timeout, per #587).
+// composer open indefinitely (falls back to lifeos on timeout).
 // `window.__LIFEOS_TEST_STATUS_TIMEOUT_MS__` is a testability hook only — set
 // via page.add_init_script() so a browser test can exercise the timeout path
 // in milliseconds instead of waiting out the real 5s.
 const STATUS_TIMEOUT_MS =
   (typeof window !== 'undefined' && window.__LIFEOS_TEST_STATUS_TIMEOUT_MS__) || 5000;
 
-// The mode actually in effect. Starts at the pre-#587 safe default (lifeos)
+// The mode actually in effect. Starts at the safe default (lifeos)
 // and is resolved by initBackend() before the composer accepts a turn.
 let currentMode = 'lifeos';
 
@@ -74,14 +74,14 @@ export function setStoredConversationId(id) {
 function applyBackendUi() {
   const mode = getBackendMode();
   // CSS hides the persona+model pickers in agent mode (no personas there) and
-  // just the model picker in hermes mode (personas stay visible; #587).
+  // just the model picker in hermes mode (personas stay visible).
   document.body.classList.toggle('agent-mode', mode === 'agent');
   document.body.classList.toggle('hermes-mode', mode === 'hermes');
   if (elements.backendLifeos) elements.backendLifeos.classList.toggle('active', mode === 'lifeos');
   if (elements.backendAgent) elements.backendAgent.classList.toggle('active', mode === 'agent');
   if (elements.backendHermes) elements.backendHermes.classList.toggle('active', mode === 'hermes');
   // personaOrchestrates() depends on the backend (excludes agent), so the
-  // "runs on LifeOS" badge (#596) must be re-evaluated on every backend switch,
+  // "runs on LifeOS" badge must be re-evaluated on every backend switch,
   // not just on persona change.
   updateOrchestratesBadge();
 }
@@ -92,7 +92,7 @@ function setBackendMode(mode) {
   if (next === currentMode) return;
   currentMode = next;
   // config.backend drives ask/stream routing + voice turns; null = lifeos
-  // default (omitted from the request body, byte-identical to pre-#361).
+  // default (omitted from the request body).
   config.backend = next === 'lifeos' ? null : next;
   try { window.sessionStorage.setItem(BACKEND_MODE_KEY, next); } catch (e) { /* blocked */ }
   applyBackendUi();
@@ -100,7 +100,7 @@ function setBackendMode(mode) {
 }
 
 // Switch the view to the selected backend's stored conversation. LifeOS and
-// Hermes threads are both stored server-side (#592) and render the same way;
+// Hermes threads are both stored server-side and render the same way;
 // the Agent backend's history genuinely lives elsewhere, so it keeps a fresh
 // view and just retains the id for turn continuity.
 function restoreBackendConversation() {
@@ -116,15 +116,14 @@ function restoreBackendConversation() {
 // GET a backend's /status endpoint and report configured/reachable/available.
 // Bounded by STATUS_TIMEOUT_MS and never throws — any failure (network error,
 // non-2xx, timeout) reports everything false, which is exactly the "fall
-// back to lifeos" behavior #587 requires.
+// back to lifeos" behavior this UI requires.
 //
-// `configured`/`reachable` (#688) let the UI distinguish "not set up" (fully
+// `configured`/`reachable` let the UI distinguish "not set up" (fully
 // hidden, unchanged) from "set up but down" (visible, but not selectable —
 // see applyBackendUi()). A backend whose /status doesn't send those fields
 // (the Agent backend, as of this writing — it doesn't opt into the
-// reachability probe server-side) falls back to `available` for both, so it
-// behaves exactly as before this field split existed: configured and
-// reachable are the same single check.
+// reachability probe server-side) falls back to `available` for both, so
+// configured and reachable collapse to the same single check for it.
 async function checkAvailable(url) {
   if (!url) return { available: false, configured: false, reachable: false };
   const controller = new AbortController();
@@ -157,7 +156,7 @@ export async function initBackend(personasReady) {
   document.body.classList.toggle('agent-available', agentStatus.available);
   document.body.classList.toggle('hermes-available', hermesStatus.available);
   // Drives visibility (unlike -available, stays true while merely down —
-  // #688: a configured-but-unreachable Hermes must stay visible, marked
+  // A configured-but-unreachable Hermes must stay visible, marked
   // unavailable, not vanish indistinguishably from "never configured").
   document.body.classList.toggle('hermes-configured', hermesStatus.configured);
   // The one state that's visible but not selectable: configured, not reachable.
@@ -170,10 +169,10 @@ export async function initBackend(personasReady) {
   }
 
   // Stored preference wins; otherwise default to hermes if available, else
-  // lifeos. A stored preference for a backend that's no longer configured
+  // lifeos. A stored preference for a backend that isn't configured anymore
   // (e.g. disabled since the last visit) must not strand the UI on a hidden
   // option, so it's re-validated against availability too. "Available" here
-  // already means configured AND reachable (#688) — a down Hermes falls back
+  // already means configured AND reachable — a down Hermes falls back
   // to lifeos exactly like an unconfigured one, never failing a turn at send
   // time.
   let mode = getStoredBackendMode();
@@ -191,7 +190,7 @@ export async function initBackend(personasReady) {
   if (elements.backendAgent) elements.backendAgent.addEventListener('click', () => setBackendMode('agent'));
   if (elements.backendHermes) {
     elements.backendHermes.addEventListener('click', () => {
-      // A visible-but-down Hermes (#688) is not clickable — selecting it
+      // A visible-but-down Hermes is not clickable — selecting it
       // would just fail every turn at send time instead of the visible,
       // once-per-load degradation this state already represents.
       if (document.body.classList.contains('hermes-down')) return;
@@ -200,7 +199,7 @@ export async function initBackend(personasReady) {
   }
   applyBackendUi();
 
-  // The sidebar's single initial load (#607) — gated on BOTH resolutions, not
+  // The sidebar's single initial load — gated on BOTH resolutions, not
   // just this one. config.backend is resolved as of the assignment above, but
   // config.personaId is only *provisionally* set at this point (main.js's
   // synchronous restore, before loadPersonas() validates it against

@@ -142,7 +142,7 @@
     padding: 0.25rem 0.5rem;
     font-size: 0.8rem;
   }
-  /* Search box + live results dropdown (issue #252). The wrapper is the
+  /* Search box + live results dropdown. The wrapper is the
      positioning context for the absolutely-placed results list. */
   .search-wrap { position: relative; }
   .search-wrap input {
@@ -1041,7 +1041,7 @@
     .chips { display: none; }
   }
   /* -------------------------------------------------------------------
-     Board tab (#850) — Kanban board that reuses the styles above for
+     Board tab — Kanban board that reuses the styles above for
      chips, panel-*, modal-*, and toast markup (the drawer's session
      panel section renders the same `.panel-header` / `.events` / etc.
      structure SessionPanel builds for the Graph tab).
@@ -1904,7 +1904,7 @@
   </div>
 </header>
 
-<!-- Board tab (#850) — the primary /agents view. -->
+<!-- Board tab — the primary /agents view. -->
 <div class="tab-view" id="board-view">
   <div class="board-filters" id="board-filters">
     <button type="button" class="board-filter-toggle" id="board-filter-toggle" aria-expanded="false" aria-controls="board-filter-controls">
@@ -2002,7 +2002,7 @@
   <aside class="board-drawer" id="board-drawer"></aside>
 </div>
 
-<!-- Graph tab (#850) — the pre-#850 /agents page, unchanged, as a secondary tab. -->
+<!-- Graph tab — the original /agents page, kept as a secondary tab. -->
 <div class="tab-view" id="graph-view" hidden>
   <div class="filters">
     <div class="search-wrap" id="search-wrap">

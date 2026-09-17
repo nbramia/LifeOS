@@ -3,7 +3,7 @@
 Purge calendar interactions belonging to mass meetings.
 
 Sitting in the same 90-person standing call is no evidence that two people know
-each other, so `sync_gmail_calendar_interactions.py` no longer creates rows for
+each other, so `sync_gmail_calendar_interactions.py` does not create rows for
 events above `InteractionConfig.MASS_MEETING_ATTENDEE_LIMIT`. This removes the
 rows that were written before that guard existed.
 
