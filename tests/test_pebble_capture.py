@@ -845,6 +845,76 @@ def test_unrelated_delegation_marker_does_not_govern_a_later_bystander_span():
     }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z") == []
 
 
+def test_evidence_span_straddling_a_hard_separator_is_not_governed():
+    """An ``action_evidence`` span may start inside a marker-bearing segment
+    but must not be governed if it extends past a hard separator ("and
+    then") into an unrelated request -- otherwise the un-requested tail
+    lands on a delegated task's title, i.e. on an agent's queue."""
+    transcript = (
+        "Assign to Claude water the plants and then call the neighbor about "
+        "the noise complaint."
+    )
+    straddling_evidence = (
+        "water the plants and then call the neighbor about the noise complaint"
+    )
+    assert validate_plan([{
+        "kind": "task", "index": 0, "title": straddling_evidence, "tags": ["claude"],
+        "delegation_evidence": transcript,
+        "action_evidence": straddling_evidence,
+    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z") == []
+
+
+def test_backward_continuation_merge_does_not_pull_an_unrelated_leading_span():
+    """An infinitive complement after a comma ("..., to remind me to water
+    the plants.") merges back into a block only when that block already
+    carries its own marker -- an unrelated leading request must not be
+    governed by a marker that was never about it."""
+    transcript = (
+        "Call the neighbor about the noise complaint, to remind me to water "
+        "the plants."
+    )
+    actions = validate_plan([
+        {
+            "kind": "task", "index": 0,
+            "title": "Call the neighbor about the noise complaint",
+            "action_evidence": "Call the neighbor about the noise complaint",
+        },
+        {
+            "kind": "task", "index": 1, "title": "water the plants",
+            "action_evidence": "water the plants",
+        },
+    ], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    [action] = actions
+    assert action.action_evidence == "water the plants"
+
+
+def test_comma_please_boundary_excludes_a_non_assignee_leading_span():
+    """A comma followed by "please" is only kept as part of the same request
+    when the token immediately before it is a valid task assignee -- not for
+    any leading span, however marker-bearing."""
+    transcript = "Put milk on my list, please call the plumber about the leak."
+    assert validate_plan([{
+        "kind": "task", "index": 0, "title": "call the plumber about the leak",
+        "action_evidence": "call the plumber about the leak",
+    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z") == []
+
+
+def test_comma_please_boundary_does_not_merge_a_second_unrelated_request():
+    transcript = "add a task to buy milk, please water the plants"
+    actions = validate_plan([
+        {
+            "kind": "task", "index": 0, "title": "buy milk",
+            "action_evidence": "buy milk",
+        },
+        {
+            "kind": "task", "index": 1, "title": "water the plants",
+            "action_evidence": "water the plants",
+        },
+    ], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    [action] = actions
+    assert action.action_evidence == "buy milk"
+
+
 def test_comma_delegation_still_files_with_its_tag_non_regression():
     transcript = "Add a task assigned to #claude, to review the synthetic report."
     [action] = validate_plan([{

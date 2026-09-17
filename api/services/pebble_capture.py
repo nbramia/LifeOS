@@ -66,48 +66,100 @@ _PLAIN_TASK_FILING_RE = re.compile(
     re.I,
 )
 
-# A comma or coordinating conjunction starts a new candidate request within
-# one positive clause: unpunctuated voice transcripts routinely chain
-# several unrelated requests together, so a marker must govern the specific
-# segment its evidence span starts in, not merely co-occur somewhere else in
-# the same clause. A comma directly followed by "please" is not a request
-# boundary: it is the same direct-address shape the marker patterns
-# themselves already span ("Codex, please handle this"; see
-# `_explicit_tags`), so splitting there would sever a name from its verb.
-_TASK_REQUEST_SEGMENT_RE = re.compile(
-    r"\b(?:and\s+then|and|then|also|plus|as\s+well\s+as)\b|,(?!\s*please\b)", re.I
+# Separators within a positive clause come in two tiers, because a single
+# level cannot both keep a bare "and" list together ("buy milk and eggs" is
+# one request) and stop an evidence span from straddling into an unrelated
+# request ("water the plants and then call the neighbor..." is two).
+#
+# Hard separators end a request outright: an evidence span may never cross
+# one, so they also bound the containment check in `_explicit_task_request`.
+# A comma is hard unless the token immediately before it is a valid task
+# assignee and "please" immediately follows -- that is the same direct-
+# address shape the marker patterns themselves already span ("Codex, please
+# handle this"; see `_explicit_tags`), so splitting there would sever a name
+# from its verb. Any other comma ("...on my list, please call the plumber")
+# is an ordinary clause boundary and must split.
+_TASK_REQUEST_HARD_SEPARATOR_RE = re.compile(
+    r"\b(?:and\s+then|then|also|plus|as\s+well\s+as)\b|,", re.I
 )
+_ASSIGNEE_ALTERNATION_RE = "|".join(
+    sorted((re.escape(tag) for tag in _VALID_TASK_ASSIGNEES), key=len, reverse=True)
+)
+_COMMA_ASSIGNEE_BEFORE_RE = re.compile(rf"\b(?:{_ASSIGNEE_ALTERNATION_RE})\s*$", re.I)
+_COMMA_PLEASE_AFTER_RE = re.compile(r"^\s*please\b", re.I)
+# A bare "and" is soft: an evidence span may cross it (it is not a request
+# boundary on its own), but a marker still only governs the sub-segment its
+# span starts in -- so "buy milk and feed the cat" is ungoverned by a marker
+# that appears only in a soft segment other than the one the span starts in.
+_TASK_REQUEST_SOFT_SEPARATOR_RE = re.compile(r"\band\b", re.I)
 # An infinitive complement ("to review...", "so that...", "in order to...")
 # continues the request that precedes it rather than starting a new one, so
-# it is merged back into the segment before it.
+# it is merged back into the hard block before it -- but only when that
+# block already carries a marker of its own; otherwise an unrelated leading
+# block ("Call the neighbor..., to remind me to water the plants.") would be
+# pulled under a marker that was never about it.
 _TASK_REQUEST_CONTINUATION_RE = re.compile(
     r"^\s*(?:to|so\s+that|in\s+order\s+to)\s+\w", re.I
 )
 
 
-def _task_request_segments(clause: str) -> list[tuple[int, int]]:
-    """Split one positive clause into candidate-request spans.
+def _task_request_has_marker(segment: str) -> bool:
+    return bool(
+        _PLAIN_TASK_FILING_RE.search(segment)
+        or _explicit_tags(segment)
+        or _scheduled_executors(segment)
+    )
 
-    Coordinating conjunctions and commas start a new segment; an infinitive
-    complement immediately after one is merged back into the segment before
-    it because it continues the same request instead of starting a new one
-    (e.g. "assigned to #claude, to review the report" is one request, not
-    two).
+
+def _comma_is_hard_separator(clause: str, comma_index: int) -> bool:
+    before = clause[:comma_index]
+    after = clause[comma_index + 1:]
+    if not _COMMA_ASSIGNEE_BEFORE_RE.search(before):
+        return True
+    return not _COMMA_PLEASE_AFTER_RE.match(after)
+
+
+def _task_request_hard_blocks(clause: str) -> list[tuple[int, int]]:
+    """Split one positive clause into hard blocks an evidence span may not cross.
+
+    A coordinating conjunction other than bare "and" always starts a new
+    block; a comma starts one unless it directly addresses a valid assignee
+    ("Codex, please ..."). An infinitive complement immediately after a
+    boundary is merged back into the block before it only when that block
+    already carries a filing/delegation marker of its own -- otherwise it
+    would pull an unrelated leading request under a later marker.
     """
     raw: list[tuple[int, int]] = []
     last = 0
-    for match in _TASK_REQUEST_SEGMENT_RE.finditer(clause):
+    for match in _TASK_REQUEST_HARD_SEPARATOR_RE.finditer(clause):
+        if match.group(0) == "," and not _comma_is_hard_separator(clause, match.start()):
+            continue
         raw.append((last, match.start()))
         last = match.end()
     raw.append((last, len(clause)))
     raw = [(start, end) for start, end in raw if clause[start:end].strip()]
     merged: list[tuple[int, int]] = []
     for start, end in raw:
-        if merged and _TASK_REQUEST_CONTINUATION_RE.match(clause[start:end]):
+        if (
+            merged
+            and _TASK_REQUEST_CONTINUATION_RE.match(clause[start:end])
+            and _task_request_has_marker(clause[merged[-1][0]:merged[-1][1]])
+        ):
             merged[-1] = (merged[-1][0], end)
         else:
             merged.append((start, end))
     return merged
+
+
+def _task_request_soft_segments(clause: str, block_start: int, block_end: int) -> list[tuple[int, int]]:
+    """Split one hard block into marker-governance segments on bare "and"."""
+    result: list[tuple[int, int]] = []
+    last = block_start
+    for match in _TASK_REQUEST_SOFT_SEPARATOR_RE.finditer(clause, block_start, block_end):
+        result.append((last, match.start()))
+        last = match.end()
+    result.append((last, block_end))
+    return [(start, end) for start, end in result if clause[start:end].strip()]
 
 
 class PebbleCaptureError(ValueError):
@@ -668,9 +720,19 @@ def _explicit_task_request(transcript: str, action_evidence: str) -> bool:
     A shared clause is not enough on its own: unpunctuated voice transcripts
     routinely chain several unrelated requests into one clause ("and"/"then"/
     comma-joined), so the marker must also *govern* this specific evidence
-    span -- the span must *start* inside a segment of the clause
-    (`_task_request_segments`) that itself carries a marker, not merely
-    appear somewhere else in the same clause.
+    span, and the span must not itself straddle into an unrelated request.
+    Governance and containment are checked at two granularities because they
+    protect against different failures:
+
+    - Containment: the whole evidence span must lie inside one hard block
+      (`_task_request_hard_blocks`) -- otherwise a span that starts under a
+      marker could still run past a "then"/comma boundary and carry
+      unrequested text onto a filed task's title (e.g. a delegated task).
+    - Governance: the span must additionally *start* inside a soft segment
+      of that block (`_task_request_soft_segments`, split on bare "and")
+      that itself carries a marker, not merely appear somewhere else in the
+      block -- this is what keeps "buy milk and feed the cat" from filing
+      "feed the cat" off a marker that only covers "buy milk".
     """
     if not action_evidence:
         return False
@@ -679,19 +741,16 @@ def _explicit_task_request(transcript: str, action_evidence: str) -> bool:
         if not _explicit_action_evidence(transcript, clause, action_evidence):
             continue
         clause_key = clause.casefold()
-        for seg_start, seg_end in _task_request_segments(clause):
-            segment = clause[seg_start:seg_end]
-            if not (
-                _PLAIN_TASK_FILING_RE.search(segment)
-                or _explicit_tags(segment)
-                or _scheduled_executors(segment)
-            ):
-                continue
-            start = 0
-            while (offset := clause_key.find(action_key, start)) >= 0:
-                if seg_start <= offset < seg_end:
-                    return True
-                start = offset + 1
+        for block_start, block_end in _task_request_hard_blocks(clause):
+            for seg_start, seg_end in _task_request_soft_segments(clause, block_start, block_end):
+                segment = clause[seg_start:seg_end]
+                if not _task_request_has_marker(segment):
+                    continue
+                start = seg_start
+                while (offset := clause_key.find(action_key, start)) >= 0:
+                    if seg_start <= offset < seg_end and offset + len(action_key) <= block_end:
+                        return True
+                    start = offset + 1
     return False
 
 
