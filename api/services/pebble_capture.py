@@ -1,8 +1,8 @@
 """Bounded, local-only filing for finalized Pebble capture results.
 
 The archive is producer-owned quoted data.  This module never edits it and
-never feeds its text into a general tool loop: a local structured classifier
-may select a small plan, and this applicator can only file Inbox tasks,
+never feeds its text into a general tool loop: a structured classifier may
+select a small plan, and this applicator can only file Inbox tasks,
 Scheduler Inbox entries, or a deduplicated human-queue card.  SQLite is a
 receipt ledger, not a second content store; Markdown remains authoritative for
 the objects it creates.
@@ -532,7 +532,11 @@ def _explicit_tags(text: str) -> set[str]:
             r"\b(?:assign|delegate|route)\s+[^.!?;\n]{0,100}?\bto\s+#?([\w-]+)\b",
             r"\bask\s+#?([\w-]+)\s+to\s+(?!whether\b)[\w-]+\s+(?:this|it|that|the\b|[\w-]+)",
             r"^\s*(?:please\s+)?have\s+#?([\w-]+)\s+(?:to\s+)?[\w-]+\s+(?:this|it|that|the\b|[\w-]+)",
-            r"^\s*(?:please\s+)?let\s+#?([\w-]+)\s+[\w-]+\s+(?:this|it|that|the\b|[\w-]+)",
+            # "let me <verb>" ("let me know", "let me check", ...) is
+            # idiomatic, not a self-delegation, even though "me" is itself a
+            # valid assignee tag: exclude it rather than let it read as a
+            # filing request.
+            r"^\s*(?:please\s+)?let\s+(?!me\b)#?([\w-]+)\s+[\w-]+\s+(?:this|it|that|the\b|[\w-]+)",
             r"\b#?([\w-]+)\s*(?:,\s*(?:please\s+)?|please\s+)(?!i\b|we\b|they\b|he\b|she\b)[\w-]+\s+(?:this|it|that|the\b|[\w-]+)",
         )
         if re.search(r"\bremind\s+me\b", clause, re.I):
@@ -611,7 +615,9 @@ def _scheduled_executors(text: str) -> set[str]:
         r"\b(?:run|execute)\b[\s\S]{0,80}\b(?:with|using)\s+#?([\w-]+)\b",
         r"\bask\s+#?([\w-]+)\s+to\s+(?!whether\b)[\w-]+\s+(?:this|it|that|the\b|[\w-]+)",
         r"^\s*(?:please\s+)?have\s+#?([\w-]+)\s+(?:to\s+)?[\w-]+\s+(?:this|it|that|the\b|[\w-]+)",
-        r"^\s*(?:please\s+)?let\s+#?([\w-]+)\s+[\w-]+\s+(?:this|it|that|the\b|[\w-]+)",
+        # See the matching exclusion in `_explicit_tags`: "let me <verb>" is
+        # idiomatic, not a delegation request.
+        r"^\s*(?:please\s+)?let\s+(?!me\b)#?([\w-]+)\s+[\w-]+\s+(?:this|it|that|the\b|[\w-]+)",
         r"\b#?([\w-]+)\s*(?:,\s*(?:please\s+)?|please\s+)(?!i\b|we\b|they\b|he\b|she\b)[\w-]+\s+(?:this|it|that|the\b|[\w-]+)",
         r"\b(?:assign|delegate|route)\s+(?:this|it|that|the\s+task)?\s*to\s+#?([\w-]+)\b",
     )
@@ -673,6 +679,13 @@ def validate_plan(raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at
     seen_indexes: set[int] = set()
     used_delegations: set[str] = set()
     used_action_evidence: set[str] = set()
+    # Read only by the agent-schedule authority gate below. A plain,
+    # non-delegated task's evidence consumption must not feed it -- that
+    # gate raises on collision, and an independently-valid agent schedule
+    # must never be aborted by an unrelated plain task that merely happened
+    # to cite the same span first. Only a delegated task (one that actually
+    # carries a proven assignee tag) or a filed schedule writes here.
+    used_scheduled_delegation_evidence: set[str] = set()
     for raw_action in raw:
         if not isinstance(raw_action, dict):
             raise PebbleCaptureError("classifier action must be an object")
@@ -692,6 +705,11 @@ def validate_plan(raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at
         if not isinstance(evidence, str) or not isinstance(action_evidence, str):
             raise PebbleCaptureError("task delegation evidence is invalid")
         tags: list[str] = []
+        # A span already spent by an earlier action -- for delegation or for
+        # plain filing -- cannot also back this one: one governed span may
+        # justify at most one filed action, not several.
+        action_key = action_evidence.casefold()
+        reused_action_evidence = kind == "task" and bool(action_evidence) and action_key in used_action_evidence
         # Tags are task metadata. A model may redundantly copy an agent
         # schedule's executor into ``tags``; ignore it here so only the
         # schedule-specific authority check below consumes its evidence.
@@ -702,15 +720,13 @@ def validate_plan(raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at
                 tag = raw_tag.lstrip("#").lower()
                 if tag in _VALID_TASK_ASSIGNEES:
                     evidence_key = evidence.casefold()
-                    action_key = action_evidence.casefold()
-                    if (evidence_key not in used_delegations
-                            and action_key not in used_action_evidence
+                    if (not reused_action_evidence
+                            and evidence_key not in used_delegations
                             and _explicit_task_delegation(
                                 transcript, tag, evidence, action_evidence
                             )):
                         tags.append(tag)
                         used_delegations.add(evidence_key)
-                        used_action_evidence.add(action_key)
                 elif tag not in _ROUTING_TAGS and tag in allowed_tags:
                     tags.append(tag)
         normalized_tags = tuple(dict.fromkeys(tags))
@@ -725,10 +741,22 @@ def validate_plan(raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at
                     date.fromisoformat(due)
                 except (TypeError, ValueError) as exc:
                     raise PebbleCaptureError("task due date is invalid") from exc
-            if any(tag in _VALID_TASK_ASSIGNEES for tag in normalized_tags):
+            if reused_action_evidence:
+                # A span already spent by an earlier action cannot also back
+                # this one: dropped, never raised -- the capture must still
+                # log and complete. Whether a plain task is filed at all is
+                # the classifier's judgment call under the filing policy
+                # prompt, not something application code re-decides here.
+                continue
+            if action_evidence:
+                used_action_evidence.add(action_key)
+            is_delegated_task = any(tag in _VALID_TASK_ASSIGNEES for tag in normalized_tags)
+            if is_delegated_task:
                 title = _safe_markdown_text(
                     action_evidence, field="action_evidence", limit=500
                 )
+                if action_evidence:
+                    used_scheduled_delegation_evidence.add(action_key)
             action = replace(action, title=title, due_date=due)
         elif kind == "schedule":
             schedule_type = raw_action.get("schedule_type")
@@ -766,13 +794,14 @@ def validate_plan(raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at
                 action_key = action_evidence.casefold()
                 if (executor not in _VALID_EXECUTORS
                         or evidence_key in used_delegations
-                        or action_key in used_action_evidence
+                        or action_key in used_scheduled_delegation_evidence
                         or not _explicit_scheduled_delegation(
                             transcript, executor, evidence, action_evidence
                         )):
                     raise PebbleCaptureError("agent schedule lacks explicit valid delegation")
                 used_delegations.add(evidence_key)
                 used_action_evidence.add(action_key)
+                used_scheduled_delegation_evidence.add(action_key)
                 title = _safe_markdown_text(
                     action_evidence, field="action_evidence", limit=500
                 )
@@ -806,8 +835,32 @@ def validate_plan(raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at
     return result
 
 
-class LocalOnlyJournalClassifier:
-    """Tool-free classifier pinned to the local llama server; it never retries remotely."""
+def _pebble_llm_client() -> LocalLLMClient:
+    """Return the configured remote provider, or the local llama-server.
+
+    The remote provider (`settings.remote_llm_configured`) is used, unprobed,
+    whenever it's configured -- same construction the `#agent` preflight
+    classifier and the `remote` LLM backend already use. A keyless install
+    with no remote provider configured falls back to the local llama-server,
+    which must be a loopback URL.
+    """
+    if settings.remote_llm_configured:
+        return LocalLLMClient(
+            base_url=settings.remote_llm_base_url,
+            model=settings.remote_llm_model,
+            api_key=settings.remote_llm_api_key,
+            timeout=settings.remote_llm_timeout,
+        )
+    return LocalLLMClient(
+        base_url=_loopback_llm_url(settings.local_llm_url),
+        timeout=30,
+        trust_env=False,
+    )
+
+
+class PebbleJournalClassifier:
+    """Tool-free classifier for Pebble captures: the configured remote
+    provider when available, else the local llama-server."""
 
     async def classify(self, final_text: str, recorded_at: str) -> list[dict[str, Any]]:
         prompt = classifier_prompt(
@@ -816,11 +869,7 @@ class LocalOnlyJournalClassifier:
             local_timezone=settings.timezone,
             allow_agent_schedule=True,
         )
-        client = LocalLLMClient(
-            base_url=_loopback_llm_url(settings.local_llm_url),
-            timeout=30,
-            trust_env=False,
-        )
+        client = _pebble_llm_client()
         request: dict[str, Any] = {
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": 1200,
@@ -857,7 +906,7 @@ class LocalOnlyJournalClassifier:
             try:
                 return _validated_classifier_actions(response.text, final_text, recorded_at)
             except ValueError as exc:
-                raise PebbleCaptureError("local classifier returned no valid action plan") from exc
+                raise PebbleCaptureError("classifier returned no valid action plan") from exc
 
 
 def _validated_classifier_actions(
@@ -865,16 +914,28 @@ def _validated_classifier_actions(
 ) -> list[dict[str, Any]]:
     """Parse one model candidate and prove it passes the authority gate."""
     if not isinstance(response_text, str):
-        raise PebbleCaptureError("local classifier returned no action list")
+        raise PebbleCaptureError("classifier returned no action list")
     parsed = extract_json(response_text)
     if not isinstance(parsed, dict):
-        raise PebbleCaptureError("local classifier returned no action list")
+        raise PebbleCaptureError("classifier returned no action list")
     actions = parsed.get("actions")
     if not isinstance(actions, list):
-        raise PebbleCaptureError("local classifier returned no action list")
+        raise PebbleCaptureError("classifier returned no action list")
     validated = validate_plan(actions, transcript=final_text, recorded_at=recorded_at)
-    for raw_action, action in zip(actions, validated):
-        if not isinstance(raw_action, dict) or action.kind != "task":
+    # ``validate_plan`` can drop a task whose action_evidence duplicates an
+    # earlier action's, so a raw action's position in ``actions`` is not
+    # reliably aligned with its validated counterpart's position in
+    # ``validated``.  Pair by the model-assigned ``index`` instead of by
+    # list position.
+    validated_by_index = {action.index: action for action in validated}
+    for raw_action in actions:
+        if not isinstance(raw_action, dict) or raw_action.get("kind") != "task":
+            continue
+        action = validated_by_index.get(raw_action.get("index"))
+        if action is None:
+            # Dropped for reusing an action_evidence span an earlier action
+            # already spent: one governed span backs at most one filed
+            # action.
             continue
         claimed_assignees = {
             value.lstrip("#").lower()
@@ -896,12 +957,12 @@ class PebbleCaptureConsumer:
 
     def __init__(
         self, ledger: CaptureLedger, task_manager: TaskManager, scheduler_store: SchedulerStore,
-        classifier: Optional[LocalOnlyJournalClassifier] = None, *, apply: bool = False,
+        classifier: Optional[PebbleJournalClassifier] = None, *, apply: bool = False,
     ):
         self.ledger = ledger
         self.task_manager = task_manager
         self.scheduler_store = scheduler_store
-        self.classifier = classifier or LocalOnlyJournalClassifier()
+        self.classifier = classifier or PebbleJournalClassifier()
         self.apply = apply
 
     def _find_effect_object(
