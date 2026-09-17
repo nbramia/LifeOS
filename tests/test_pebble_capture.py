@@ -14,9 +14,9 @@ import pytest
 from api.services.pebble_capture import (
     CaptureIdentity,
     CaptureLedger,
-    LocalOnlyJournalClassifier,
     PebbleCaptureConsumer,
     PebbleCaptureError,
+    PebbleJournalClassifier,
     _validated_classifier_actions,
     parse_framed_blocks,
     ready_result,
@@ -26,8 +26,19 @@ from api.services.journal_filing_policy import classifier_prompt, filing_rules
 from api.services.scheduler_store import SchedulerStore
 from api.services.task_manager import TaskManager
 from api.services.pebble_capture_watcher import PebbleCaptureWatcher
+from config.settings import settings
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_remote_llm(monkeypatch):
+    """Deny this host's real .env remote provider so classifier tests are
+    deterministic regardless of what's configured outside the test; a test
+    that specifically exercises the remote branch configures it itself."""
+    monkeypatch.setattr(settings, "remote_llm_base_url", "", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_model", "", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_api_key", "", raising=False)
 
 
 class _Classifier:
@@ -83,10 +94,10 @@ def _payload(revision=1):
     }
 
 
-# Explicit filing marker + action_evidence pair for plain (non-delegated)
-# tasks built against the default ``_payload()`` transcript above. These
-# ledger/idempotency/claim-recovery tests only need *a* task to exist; the
-# specific evidence text is incidental to what they verify.
+# action_evidence for a plain (non-delegated) task built against the default
+# ``_payload()`` transcript above. These ledger/idempotency/claim-recovery
+# tests only need *a* task to exist; the specific evidence text is
+# incidental to what they verify.
 _TASK_EVIDENCE = {"action_evidence": "handle the synthetic review"}
 
 
@@ -421,44 +432,44 @@ def test_naive_unambiguous_wall_time_uses_declared_zone():
 
 
 @pytest.mark.parametrize(
-    ("transcript", "tag", "filed", "retained"),
+    ("transcript", "tag", "retained"),
     [
-        ("Assign code repair to Codex.", "codex", True, True),
-        ("Codex, please handle this code repair.", "codex", True, True),
-        ("Ask Codex to review the login bug.", "codex", True, True),
-        ("Have Codex fix the login bug.", "codex", True, True),
-        ("Let Codex investigate the login bug.", "codex", True, True),
-        ("Let cloud-sonnet take code repair.", "cloud-sonnet", True, True),
-        ("Please delegate code repair to cloud-sonnet tomorrow.", "cloud-sonnet", True, True),
-        # Negated/conditional: no positive clause survives at all, so log-only
-        # -- not even an unassigned fallback task.
-        ("Do not assign code repair to Codex.", "codex", False, False),
-        ("Never let Codex handle code repair.", "codex", False, False),
-        # No explicit filing/delegation marker at all: a bare tagging
-        # instruction or a musing is log-only under the new presumption.
-        ("Tag code repair as #codex.", "codex", False, False),
-        ("Just noting #cloud-sonnet.", "cloud-sonnet", False, False),
-        # An explicit "assign ... to" request still files the task even when
-        # the named executor itself is invalid; only the tag is stripped.
-        ("Assign code repair to the agent.", "agent", True, False),
-        # "Remind me to ..." is itself an explicit filing marker (untimed
-        # reminder -> task), even though the mentioned delegation is not
-        # authoritative and its tag is stripped.
-        ("Remind me to ask Codex to handle code repair.", "codex", True, False),
-        # Reported/quoted speech: the whole clause is excluded, so log-only.
-        ("I heard Sam assign code repair to Codex.", "codex", False, False),
-        ("My notes say assign code repair to Codex.", "codex", False, False),
-        ("Sam said assign code repair to Codex.", "codex", False, False),
-        ("I remember Codex, please repair this code.", "codex", False, False),
-        ('We discussed the phrase "assign this to #codex".', "codex", False, False),
-        ("I mentioned #cloud-sonnet while taking notes.", "cloud-sonnet", False, False),
-        ("Assign code repair to mystery-engine.", "mystery-engine", True, False),
+        ("Assign code repair to Codex.", "codex", True),
+        ("Codex, please handle this code repair.", "codex", True),
+        ("Ask Codex to review the login bug.", "codex", True),
+        ("Have Codex fix the login bug.", "codex", True),
+        ("Let Codex investigate the login bug.", "codex", True),
+        ("Let cloud-sonnet take code repair.", "cloud-sonnet", True),
+        ("Please delegate code repair to cloud-sonnet tomorrow.", "cloud-sonnet", True),
+        # Negated/conditional: no positive clause survives at all, so the
+        # tag is stripped -- but the plain task itself still files.
+        ("Do not assign code repair to Codex.", "codex", False),
+        ("Never let Codex handle code repair.", "codex", False),
+        # No explicit delegation marker at all: a bare tagging instruction
+        # or a musing never proves delegation.
+        ("Tag code repair as #codex.", "codex", False),
+        ("Just noting #cloud-sonnet.", "cloud-sonnet", False),
+        # An explicit "assign ... to" request still strips the tag when the
+        # named executor itself is invalid.
+        ("Assign code repair to the agent.", "agent", False),
+        ("Remind me to ask Codex to handle code repair.", "codex", False),
+        # Reported/quoted speech: the whole clause is excluded, so no
+        # delegation is proven.
+        ("I heard Sam assign code repair to Codex.", "codex", False),
+        ("My notes say assign code repair to Codex.", "codex", False),
+        ("Sam said assign code repair to Codex.", "codex", False),
+        ("I remember Codex, please repair this code.", "codex", False),
+        ('We discussed the phrase "assign this to #codex".', "codex", False),
+        ("I mentioned #cloud-sonnet while taking notes.", "cloud-sonnet", False),
+        ("Assign code repair to mystery-engine.", "mystery-engine", False),
     ],
 )
-def test_task_execution_tags_require_positive_valid_delegation(transcript, tag, filed, retained):
+def test_task_execution_tags_require_positive_valid_delegation(transcript, tag, retained):
+    """Every task is filed; an execution tag is retained only from a proven
+    positive delegation, otherwise it's stripped, not fabricated."""
     title = "Login bug" if "login bug" in transcript else "Code repair"
     action_evidence = "login bug" if "login bug" in transcript else "code repair"
-    result = validate_plan(
+    [action] = validate_plan(
         [{
             "kind": "task", "index": 0, "title": title, "tags": [tag],
             "delegation_evidence": transcript,
@@ -467,83 +478,16 @@ def test_task_execution_tags_require_positive_valid_delegation(transcript, tag, 
         transcript=transcript,
         recorded_at="2030-01-01T10:00:00Z",
     )
-    if not filed:
-        # Log-only is the strong default: an unproven task -- delegated or
-        # not -- is omitted entirely, never merely stripped of its tag.
-        assert result == []
-        return
-    [action] = result
     assert (tag in action.tags) is retained
-
-
-@pytest.mark.parametrize(
-    ("transcript", "action_evidence", "filed"),
-    [
-        # Explicit filing phrases -> task.
-        ("Add a task to take the synthetic dog outside.", "take the synthetic dog outside", True),
-        ("Assign the task related to the synthetic report to me.", "the synthetic report", True),
-        ("Remind me to call the synthetic plumber.", "call the synthetic plumber", True),
-        ("Add buy synthetic printer paper to my to-do list.", "buy synthetic printer paper", True),
-        ("Put the synthetic oil change on my list.", "the synthetic oil change", True),
-        ("Ask #codex to review the synthetic login bug.", "review the synthetic login bug", True),
-        (
-            "Add a task assigned to #claude, to review the synthetic report.",
-            "review the synthetic report",
-            True,
-        ),
-        (
-            "Have #codex review the synthetic report tomorrow at 9 AM.",
-            "review the synthetic report",
-            True,
-        ),
-        # A bare imperative or plain statement alone -> log-only.
-        ("Take the synthetic dog outside.", "take the synthetic dog outside", False),
-        ("Test take out the synthetic trash.", "take out the synthetic trash", False),
-        ("I should probably call the synthetic plumber.", "call the synthetic plumber", False),
-        ("The blue synthetic mug is on the table.", "the blue synthetic mug", False),
-        # A comma-bearing observational sentence must not be mistaken for a
-        # "<name>, please <verb>" delegation.
-        (
-            "The blue synthetic mug is on the table, right next to the lamp.",
-            "the blue synthetic mug is on the table",
-            False,
-        ),
-        # A bare "have <noun> <noun>" statement is not a delegation request.
-        (
-            "I have a synthetic doctor's appointment tomorrow and the car needs an oil change.",
-            "a synthetic doctor's appointment tomorrow",
-            False,
-        ),
-        ("I have to pick up synthetic groceries at some point.", "pick up synthetic groceries", False),
-        # "Let me know" is idiomatic, not a self-delegation to "me".
-        ("Let me know how the synthetic report turned out.", "the synthetic report turned out", False),
-        # ask/have/let/"<name>, please" aimed at a non-executor name never
-        # resolves to a valid assignee, so none of these are filing markers.
-        ("Ask Dan to walk the synthetic dog.", "walk the synthetic dog", False),
-        ("Have Dan walk the synthetic dog.", "walk the synthetic dog", False),
-        ("Let the synthetic dog out.", "the synthetic dog out", False),
-        ("Dan, please walk the synthetic dog.", "walk the synthetic dog", False),
-    ],
-)
-def test_plain_task_requires_an_explicit_filing_request(transcript, action_evidence, filed):
-    result = validate_plan(
-        [{"kind": "task", "index": 0, "title": "Synthetic title", "action_evidence": action_evidence}],
-        transcript=transcript,
-        recorded_at="2030-01-01T10:00:00Z",
-    )
-    assert (len(result) == 1) is filed
 
 
 @pytest.mark.asyncio
 async def test_log_only_capture_still_completes_with_zero_task_actions(stores):
-    """A dropped over-eager task must be omitted, never raised: the capture
-    still logs and completes normally (it never leaves the ledger pending)."""
+    """A capture the classifier judges log-only (no proposed actions at
+    all) must still log and complete normally, never left pending."""
     ledger, tasks, schedules = stores
     payload = {**_payload(), "final_text": "Take the synthetic dog outside."}
-    classifier = _Classifier([{
-        "kind": "task", "index": 0, "title": "Take the synthetic dog outside",
-        "action_evidence": "take the synthetic dog outside",
-    }])
+    classifier = _Classifier([])
     consumer = PebbleCaptureConsumer(ledger, tasks, schedules, classifier, apply=True)
     assert await consumer.process(payload) == "complete"
     assert tasks.list_tasks() == []
@@ -567,49 +511,34 @@ def test_operator_delegated_task_capture_keeps_working():
 
 
 def test_validated_classifier_actions_pairs_by_index_not_position():
-    """A dropped earlier action must not shift a later, valid one out of
-    alignment: pairing must use ``PlannedAction.index``, not list position.
-
-    Under the old ``zip(actions, validated)`` pairing this raised
-    "classifier proposed unauthorized task delegation" -- the dropped
-    action's claimed tag was checked against the *next* action's validated
-    tags purely because it landed at the same list position.
+    """A dropped earlier-index action must not shift a later, kept one out
+    of alignment: pairing must use ``PlannedAction.index``, not list
+    position -- proven here by listing the kept action FIRST (position 0,
+    index 1) and the dropped one SECOND (position 1, index 0), so a
+    position-based pairing would check the wrong action's claimed tags.
     """
-    transcript = "Take the synthetic dog outside. Ask Codex to review the synthetic report."
+    transcript = "Ask Codex to review the synthetic report."
     response = json.dumps({"actions": [
-        # index 0: a bare imperative in its own clause claiming an unproven
-        # "claude" tag -- dropped entirely by the new authority gate (its
-        # action_evidence is present but not bound to any filing marker).
-        {
-            "kind": "task", "index": 0, "title": "Take the synthetic dog outside",
-            "tags": ["claude"], "action_evidence": "take the synthetic dog outside",
-        },
-        # index 1: a genuinely delegated, explicitly requested task.
+        # Listed first (position 0) but index=1: a genuinely delegated,
+        # explicitly requested task. It claims the shared evidence span
+        # first, so it survives.
         {
             "kind": "task", "index": 1, "title": "Review the synthetic report",
             "tags": ["codex"], "delegation_evidence": "Ask Codex to review the synthetic report.",
             "action_evidence": "review the synthetic report",
+        },
+        # Listed second (position 1) but index=0: reuses the identical
+        # evidence span and claims an unauthorized "claude" tag -- dropped
+        # for reusing evidence already spent, not for the unauthorized tag.
+        {
+            "kind": "task", "index": 0, "title": "Duplicate mention",
+            "tags": ["claude"], "action_evidence": "review the synthetic report",
         },
     ]})
     actions = _validated_classifier_actions(response, transcript, "2030-01-01T10:00:00Z")
     [kept] = validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
     assert kept.index == 1
     assert kept.tags == ("codex",)
-
-
-def test_validated_classifier_actions_raises_for_task_missing_action_evidence():
-    """A task proposed with no ``action_evidence`` at all is a structural
-    contract miss, not an unproven-but-well-formed candidate: it must raise
-    so the classifier gets one corrective repair round, rather than being
-    silently dropped like a task whose evidence just failed the authority
-    gate."""
-    response = json.dumps({"actions": [
-        {"kind": "task", "index": 0, "title": "Synthetic review"},
-    ]})
-    with pytest.raises(PebbleCaptureError, match="without action_evidence"):
-        _validated_classifier_actions(
-            response, "Add a task to review the synthetic report.", "2030-01-01T10:00:00Z"
-        )
 
 
 @pytest.mark.parametrize(
@@ -645,13 +574,14 @@ def test_contextual_reported_speech_cannot_delegate_a_task(
     transcript, delegation_evidence
 ):
     # Reported/quoted speech excludes the whole clause from positive-clause
-    # scanning, so no explicit filing marker survives either -- the task is
-    # log-only, not merely stripped of its tag.
-    assert validate_plan([{
+    # scanning, so no delegation tag survives -- the plain task still files,
+    # untagged.
+    [action] = validate_plan([{
         "kind": "task", "index": 0, "title": "Code repair", "tags": ["codex"],
         "delegation_evidence": delegation_evidence,
         "action_evidence": "code repair",
-    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z") == []
+    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    assert action.tags == ()
 
 
 @pytest.mark.parametrize(
@@ -755,166 +685,6 @@ async def test_mentioned_executor_cannot_gain_pickup_authority_after_markdown_re
     assert not _has_agent_pickup_tag(task.tags)
 
 
-def test_marker_governs_only_the_nearby_span_in_an_unpunctuated_run_on():
-    """A run-on, unpunctuated transcript is one whole clause, so a single
-    filing marker must not back every candidate span in it -- only the span
-    it actually governs."""
-    transcript = (
-        "remind me to call the synthetic plumber and then also we should probably repaint the "
-        "whole synthetic garage this weekend and honestly I have been meaning to redo the "
-        "synthetic budget spreadsheet since forever and finally book the synthetic dentist "
-        "appointment"
-    )
-    spans = [
-        "call the synthetic plumber",
-        "repaint the whole synthetic garage this weekend",
-        "redo the synthetic budget spreadsheet",
-        "book the synthetic dentist appointment",
-    ]
-    actions = validate_plan(
-        [
-            {"kind": "task", "index": index, "title": span, "action_evidence": span}
-            for index, span in enumerate(spans)
-        ],
-        transcript=transcript,
-        recorded_at="2030-01-01T10:00:00Z",
-    )
-    [action] = actions
-    assert action.action_evidence == "call the synthetic plumber"
-
-
-def test_marker_governs_only_its_own_short_bystander_span_within_the_window():
-    """The old ±30-char governance window bounded distance, not specificity:
-    two short spans close together in an "and"-chained clause must not both
-    file just because they sit near the marker -- only the span whose own
-    segment carries the marker may. Both spans stay short and close to the
-    marker on purpose: a long bystander span (as in
-    ``test_marker_governs_only_the_nearby_span_in_an_unpunctuated_run_on``)
-    would fall outside even the old fixed-radius window and so could not
-    catch this."""
-    transcript = "add a task to buy milk and feed the cat before dinner"
-    actions = validate_plan(
-        [
-            {
-                "kind": "task", "index": 0, "title": "buy milk",
-                "action_evidence": "buy milk",
-            },
-            {
-                "kind": "task", "index": 1, "title": "feed the cat before dinner",
-                "action_evidence": "feed the cat before dinner",
-            },
-        ],
-        transcript=transcript,
-        recorded_at="2030-01-01T10:00:00Z",
-    )
-    [action] = actions
-    assert action.action_evidence == "buy milk"
-
-
-def test_comma_chained_spoken_list_files_only_the_marker_governed_span():
-    transcript = "remind me to check the mail, buy milk, walk the dog"
-    actions = validate_plan(
-        [
-            {
-                "kind": "task", "index": 0, "title": "check the mail",
-                "action_evidence": "check the mail",
-            },
-            {
-                "kind": "task", "index": 1, "title": "buy milk",
-                "action_evidence": "buy milk",
-            },
-            {
-                "kind": "task", "index": 2, "title": "walk the dog",
-                "action_evidence": "walk the dog",
-            },
-        ],
-        transcript=transcript,
-        recorded_at="2030-01-01T10:00:00Z",
-    )
-    [action] = actions
-    assert action.action_evidence == "check the mail"
-
-
-def test_unrelated_delegation_marker_does_not_govern_a_later_bystander_span():
-    """"assign it to Codex" governs the pronoun "it", not an unrelated span
-    that merely follows it in the same clause."""
-    transcript = "assign it to Codex then call the pharmacy for a refill"
-    assert validate_plan([{
-        "kind": "task", "index": 0, "title": "call the pharmacy for a refill",
-        "action_evidence": "call the pharmacy for a refill",
-    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z") == []
-
-
-def test_evidence_span_straddling_a_hard_separator_is_not_governed():
-    """An ``action_evidence`` span may start inside a marker-bearing segment
-    but must not be governed if it extends past a hard separator ("and
-    then") into an unrelated request -- otherwise the un-requested tail
-    lands on a delegated task's title, i.e. on an agent's queue."""
-    transcript = (
-        "Assign to Claude water the plants and then call the neighbor about "
-        "the noise complaint."
-    )
-    straddling_evidence = (
-        "water the plants and then call the neighbor about the noise complaint"
-    )
-    assert validate_plan([{
-        "kind": "task", "index": 0, "title": straddling_evidence, "tags": ["claude"],
-        "delegation_evidence": transcript,
-        "action_evidence": straddling_evidence,
-    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z") == []
-
-
-def test_backward_continuation_merge_does_not_pull_an_unrelated_leading_span():
-    """An infinitive complement after a comma ("..., to remind me to water
-    the plants.") merges back into a block only when that block already
-    carries its own marker -- an unrelated leading request must not be
-    governed by a marker that was never about it."""
-    transcript = (
-        "Call the neighbor about the noise complaint, to remind me to water "
-        "the plants."
-    )
-    actions = validate_plan([
-        {
-            "kind": "task", "index": 0,
-            "title": "Call the neighbor about the noise complaint",
-            "action_evidence": "Call the neighbor about the noise complaint",
-        },
-        {
-            "kind": "task", "index": 1, "title": "water the plants",
-            "action_evidence": "water the plants",
-        },
-    ], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
-    [action] = actions
-    assert action.action_evidence == "water the plants"
-
-
-def test_comma_please_boundary_excludes_a_non_assignee_leading_span():
-    """A comma followed by "please" is only kept as part of the same request
-    when the token immediately before it is a valid task assignee -- not for
-    any leading span, however marker-bearing."""
-    transcript = "Put milk on my list, please call the plumber about the leak."
-    assert validate_plan([{
-        "kind": "task", "index": 0, "title": "call the plumber about the leak",
-        "action_evidence": "call the plumber about the leak",
-    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z") == []
-
-
-def test_comma_please_boundary_does_not_merge_a_second_unrelated_request():
-    transcript = "add a task to buy milk, please water the plants"
-    actions = validate_plan([
-        {
-            "kind": "task", "index": 0, "title": "buy milk",
-            "action_evidence": "buy milk",
-        },
-        {
-            "kind": "task", "index": 1, "title": "water the plants",
-            "action_evidence": "water the plants",
-        },
-    ], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
-    [action] = actions
-    assert action.action_evidence == "buy milk"
-
-
 def test_comma_delegation_still_files_with_its_tag_non_regression():
     transcript = "Add a task assigned to #claude, to review the synthetic report."
     [action] = validate_plan([{
@@ -923,75 +693,6 @@ def test_comma_delegation_still_files_with_its_tag_non_regression():
         "action_evidence": "review the synthetic report",
     }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
     assert action.tags == ("claude",)
-
-
-def test_comma_please_exception_excludes_ordinary_object_pronoun_me():
-    """"for me," is ordinary voice-note phrasing, not a direct address --
-    "me" is a valid task assignee but not a name a transcript addresses, so
-    the ", please" exception must not keep this comma non-hard. Only the
-    marker-governed span before it files."""
-    transcript = "add a task to buy milk for me, please water the plants"
-    actions = validate_plan([
-        {
-            "kind": "task", "index": 0, "title": "buy milk",
-            "action_evidence": "buy milk",
-        },
-        {
-            "kind": "task", "index": 1, "title": "water the plants",
-            "action_evidence": "water the plants",
-        },
-    ], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
-    [action] = actions
-    assert action.action_evidence == "buy milk"
-
-
-def test_comma_please_exception_does_not_smuggle_bystander_text_onto_a_delegated_title():
-    """A delegated span that itself contains an ordinary "for me, please"
-    object pronoun must not file with the bystander clause folded into its
-    title -- "me" is a valid assignee, but not a name in vocative
-    position."""
-    transcript = "Assign to Claude, call me, please water the plants while I'm away."
-    straddling_evidence = "call me, please water the plants while I'm away"
-    assert validate_plan([{
-        "kind": "task", "index": 0, "title": straddling_evidence, "tags": ["claude"],
-        "delegation_evidence": transcript,
-        "action_evidence": straddling_evidence,
-    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z") == []
-
-
-def test_comma_please_exception_excludes_ordinary_word_local():
-    """"local" is a valid task assignee tag but an ordinary English word
-    here ("the file local"), not a name in vocative position -- the
-    unrelated back-up request must stay log-only."""
-    transcript = "Save the file local, please back up the photos too."
-    assert validate_plan([{
-        "kind": "task", "index": 0, "title": "back up the photos",
-        "action_evidence": "back up the photos",
-    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z") == []
-
-
-def test_comma_please_exception_excludes_ordinary_word_even_in_vocative_position():
-    """An ordinary English word that is also a valid assignee tag ("local")
-    must not gain the ", please" exception merely because it opens the
-    clause -- only a name-like tag (claude/codex/hermes/...) does, even in
-    vocative position."""
-    transcript = "Local, please back up the photos before you sync."
-    assert validate_plan([{
-        "kind": "task", "index": 0, "title": "back up the photos before you sync",
-        "action_evidence": "back up the photos before you sync",
-    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z") == []
-
-
-def test_comma_please_exception_requires_vocative_position_not_any_mention():
-    """A name-like tag must open its own segment (clause start or
-    immediately after a hard separator) -- merely appearing as an object
-    earlier in the same block ("to Codex,") must not keep the comma
-    non-hard, even though the tag itself is name-like."""
-    transcript = "Give the file to Codex, please handle the unrelated errands."
-    assert validate_plan([{
-        "kind": "task", "index": 0, "title": "handle the unrelated errands",
-        "action_evidence": "handle the unrelated errands",
-    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z") == []
 
 
 def test_comma_please_vocative_exception_non_regression():
@@ -1010,34 +711,6 @@ def test_comma_please_vocative_exception_non_regression():
             "action_evidence": action_evidence,
         }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
         assert action.tags == ("codex",)
-
-
-def test_comma_hard_separator_check_is_bounded_not_quadratic():
-    """A transcript where every comma is followed by "please" -- the
-    adversarial case that forces the vocative-position search on every
-    comma -- must validate within a small fixed budget. Scanning a full,
-    ever-growing prefix for that search made this O(n^2) in comma count,
-    and capture processing runs through one serial consumer, so one such
-    transcript could stall everything queued behind it. The budget here is
-    generous (a couple of seconds) purely so this cannot flake on a loaded
-    machine -- the actual cost at this size is well under a tenth of a
-    second, while a quadratic rescan takes several seconds."""
-    transcript = "add a task to buy milk" + (", please note item and continue" * 2400)
-    assert transcript.count(",") == 2400
-    start = time.perf_counter()
-    validate_plan([{
-        "kind": "task", "index": 0, "title": "buy milk", "action_evidence": "buy milk",
-    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
-    assert time.perf_counter() - start < 2.0
-
-
-def test_conjunction_spanning_evidence_still_files_as_one_task_non_regression():
-    transcript = "Add a task to buy synthetic milk and synthetic eggs."
-    [action] = validate_plan([{
-        "kind": "task", "index": 0, "title": "buy synthetic milk and synthetic eggs",
-        "action_evidence": "buy synthetic milk and synthetic eggs",
-    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
-    assert action.action_evidence == "buy synthetic milk and synthetic eggs"
 
 
 def test_task_delegation_is_scoped_to_the_named_action_not_the_whole_capture():
@@ -1076,14 +749,16 @@ def test_task_delegation_accepts_paraphrase_but_files_source_scoped_action():
 
 
 def test_whole_capture_cannot_be_reused_as_delegation_evidence_for_another_action():
+    """The whole capture is not a single positive clause, so it can never
+    prove one action's delegation -- the execution tag is stripped, though
+    the plain task itself still files."""
     transcript = "Buy milk. Assign code repair to Codex."
-    # "Buy milk" is a bare imperative in its own clause -- no explicit filing
-    # marker there -- so the task is log-only, not merely stripped of its tag.
-    assert validate_plan([{
+    [action] = validate_plan([{
         "kind": "task", "index": 0, "title": "Buy milk", "tags": ["codex"],
         "delegation_evidence": transcript,
         "action_evidence": "Buy milk",
-    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z") == []
+    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    assert action.tags == ()
 
 
 @pytest.mark.parametrize("transcript", [
@@ -1094,12 +769,14 @@ def test_whole_capture_cannot_be_reused_as_delegation_evidence_for_another_actio
 ])
 def test_conditional_hypothetical_or_post_negated_task_text_never_delegates(transcript):
     # Conditional/hypothetical/post-negated wording excludes the whole clause
-    # from positive-clause scanning, so no explicit filing marker survives
-    # either -- log-only, not merely stripped of its tag.
-    assert validate_plan([{
+    # from positive-clause scanning, so no delegation tag survives -- the
+    # plain task still files, untagged.
+    [action] = validate_plan([{
         "kind": "task", "index": 0, "title": "Code repair", "tags": ["codex"],
         "delegation_evidence": transcript,
-    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z") == []
+        "action_evidence": "code repair",
+    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    assert action.tags == ()
 
 
 @pytest.mark.asyncio
@@ -1469,13 +1146,36 @@ async def test_classifier_uses_only_configured_local_client(monkeypatch):
             return SimpleNamespace(text='{"actions":[]}')
 
     monkeypatch.setattr("api.services.pebble_capture.LocalLLMClient", FakeLocalClient)
-    classifier = LocalOnlyJournalClassifier()
+    classifier = PebbleJournalClassifier()
     assert await classifier.classify("Synthetic note", "2030-01-01T10:00:00Z") == []
     assert calls[0][0]
     assert calls[0][1] == 30
     assert calls[0][2] is False
     assert calls[1]["temperature"] == 0
     assert calls[1]["enable_thinking"] is False
+
+
+@pytest.mark.asyncio
+async def test_classifier_prefers_the_configured_remote_provider(monkeypatch):
+    monkeypatch.setattr(settings, "remote_llm_base_url", "https://example.com/v1", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_model", "synthetic-remote-model", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_api_key", "synthetic-key", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_timeout", 42, raising=False)
+    constructed = []
+
+    class FakeRemoteClient:
+        def __init__(self, *, base_url, model, api_key, timeout):
+            constructed.append((base_url, model, api_key, timeout))
+
+        async def acreate(self, **kwargs):
+            return SimpleNamespace(text='{"actions":[]}')
+
+    monkeypatch.setattr("api.services.pebble_capture.LocalLLMClient", FakeRemoteClient)
+    classifier = PebbleJournalClassifier()
+    assert await classifier.classify("Synthetic note", "2030-01-01T10:00:00Z") == []
+    assert constructed == [
+        ("https://example.com/v1", "synthetic-remote-model", "synthetic-key", 42)
+    ]
 
 
 @pytest.mark.asyncio
@@ -1512,7 +1212,7 @@ async def test_classifier_repairs_missing_delegation_evidence_before_apply(
     monkeypatch.setattr("api.services.pebble_capture.LocalLLMClient", FakeLocalClient)
     ledger, tasks, schedules = stores
     consumer = PebbleCaptureConsumer(
-        ledger, tasks, schedules, LocalOnlyJournalClassifier(), apply=True
+        ledger, tasks, schedules, PebbleJournalClassifier(), apply=True
     )
     payload = {**_payload(), "capture_id": "repaired-schedule", "final_text": transcript}
     assert await consumer.process(payload) == "complete"
@@ -1524,44 +1224,6 @@ async def test_classifier_repairs_missing_delegation_evidence_before_apply(
     assert "previous candidate failed" in calls[1]["messages"][-1]["content"].lower()
     assert all("tools" not in call for call in calls)
     assert all(call["enable_thinking"] is False for call in calls)
-
-
-@pytest.mark.asyncio
-async def test_classifier_repairs_task_missing_action_evidence_before_apply(
-    stores, monkeypatch
-):
-    """A raw task proposed with no ``action_evidence`` at all raises out of
-    ``_validated_classifier_actions``, driving the same one-shot repair round
-    as any other structurally incomplete candidate -- not a silent drop."""
-    transcript = "Add a task to review the synthetic report."
-    incomplete = {"kind": "task", "index": 0, "title": "Review report"}
-    repaired = {**incomplete, "action_evidence": "review the synthetic report"}
-    responses = iter((
-        SimpleNamespace(text=json.dumps({"actions": [incomplete]})),
-        SimpleNamespace(text=json.dumps({"actions": [repaired]})),
-    ))
-    calls = []
-
-    class FakeLocalClient:
-        def __init__(self, *, base_url, timeout, trust_env):
-            assert base_url and timeout == 30 and trust_env is False
-
-        async def acreate(self, **kwargs):
-            calls.append(kwargs)
-            return next(responses)
-
-    monkeypatch.setattr("api.services.pebble_capture.LocalLLMClient", FakeLocalClient)
-    ledger, tasks, schedules = stores
-    consumer = PebbleCaptureConsumer(
-        ledger, tasks, schedules, LocalOnlyJournalClassifier(), apply=True
-    )
-    payload = {**_payload(), "capture_id": "repaired-task-evidence", "final_text": transcript}
-    assert await consumer.process(payload) == "complete"
-    [task] = tasks.list_tasks()
-    assert task.description == "Review report"
-    assert len(calls) == 2
-    assert len(calls[1]["messages"]) == 3
-    assert "previous candidate failed" in calls[1]["messages"][-1]["content"].lower()
 
 
 @pytest.mark.asyncio
@@ -1585,7 +1247,7 @@ async def test_classifier_repairs_malformed_conditional_to_an_inert_plan(
     ledger, tasks, schedules = stores
     payload = {**_payload(), "capture_id": "conditional-malformed", "final_text": transcript}
     assert await PebbleCaptureConsumer(
-        ledger, tasks, schedules, LocalOnlyJournalClassifier(), apply=True
+        ledger, tasks, schedules, PebbleJournalClassifier(), apply=True
     ).process(payload) == "complete"
     assert tasks.list_tasks() == [] and schedules.list_all() == []
 
@@ -1623,7 +1285,7 @@ async def test_classifier_repairs_reported_delegation_to_an_inert_plan(
     ledger, tasks, schedules = stores
     payload = {**_payload(), "capture_id": "reported-repair", "final_text": transcript}
     assert await PebbleCaptureConsumer(
-        ledger, tasks, schedules, LocalOnlyJournalClassifier(), apply=True
+        ledger, tasks, schedules, PebbleJournalClassifier(), apply=True
     ).process(payload) == "complete"
     assert tasks.list_tasks() == [] and schedules.list_all() == []
 
@@ -1641,7 +1303,7 @@ async def test_classifier_second_invalid_candidate_remains_pending(stores, monke
     ledger, tasks, schedules = stores
     with pytest.raises(PebbleCaptureError, match="no valid action plan"):
         await PebbleCaptureConsumer(
-            ledger, tasks, schedules, LocalOnlyJournalClassifier(), apply=True
+            ledger, tasks, schedules, PebbleJournalClassifier(), apply=True
         ).process(_payload())
     assert tasks.list_tasks() == [] and schedules.list_all() == []
 
@@ -1662,7 +1324,7 @@ async def test_classifier_rejects_non_loopback_urls_before_client_creation(monke
     monkeypatch.setattr("api.services.pebble_capture.LocalLLMClient", UnexpectedClient)
     monkeypatch.setattr("api.services.pebble_capture.settings.local_llm_url", remote_url)
     with pytest.raises(PebbleCaptureError, match="loopback"):
-        await LocalOnlyJournalClassifier().classify("Synthetic note", "2030-01-01T10:00:00Z")
+        await PebbleJournalClassifier().classify("Synthetic note", "2030-01-01T10:00:00Z")
     assert created == []
 
 

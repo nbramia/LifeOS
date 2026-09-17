@@ -1,8 +1,8 @@
 """Bounded, local-only filing for finalized Pebble capture results.
 
 The archive is producer-owned quoted data.  This module never edits it and
-never feeds its text into a general tool loop: a local structured classifier
-may select a small plan, and this applicator can only file Inbox tasks,
+never feeds its text into a general tool loop: a structured classifier may
+select a small plan, and this applicator can only file Inbox tasks,
 Scheduler Inbox entries, or a deduplicated human-queue card.  SQLite is a
 receipt ledger, not a second content store; Markdown remains authoritative for
 the objects it creates.
@@ -44,148 +44,6 @@ _ROUTING_TAGS = frozenset((*_VALID_TASK_ASSIGNEES, *AGENT_PICKUP_TAGS))
 _VALID_KINDS = {"task", "schedule", "human"}
 _EFFECT_LEASE_SECONDS = 60
 _INLINE_AUTHORITY_RE = re.compile(r"\[\s*\w+\s*::|#[\w-]+")
-# Positive-clause markers that prove a transcript is explicitly asking for a
-# task to be filed, not merely stating or imagining one. Covers only plain
-# filing phrasing ("add a task", "put ... on my list", "remind me to",
-# "task:", "assign/delegate/route ... to"). A delegation-shaped request
-# (ask/have/let <executor>, "<executor>, please ...") is proven instead by
-# calling the same executor-constrained helpers tag authority already goes
-# through (`_explicit_tags`, `_scheduled_executors`) rather than
-# re-expressing those shapes as bare, unconstrained alternatives here: an
-# unconstrained copy matches ordinary prose ("I have a doctor's
-# appointment...", "Let me know how...") because it drops the valid-assignee
-# and clause-start anchoring those helpers already enforce.
-_PLAIN_TASK_FILING_RE = re.compile(
-    r"\badd\s+(?:a\s+|an\s+)?(?:task|to-?do)\b"
-    r"|\b(?:make|create)\s+(?:a\s+)?task\b"
-    r"|\btask\s*:"
-    r"|\bput\s+[\s\S]{0,60}\bon\s+(?:my|the)\s+(?:to-?do\s+)?list\b"
-    r"|\badd\s+[\s\S]{0,60}\bto\s+(?:my|the)\s+(?:to-?do\s+)?list\b"
-    r"|\bremind\s+me\s+to\b"
-    r"|\b(?:assign|delegate|route)\s+[\s\S]{0,100}\bto\b",
-    re.I,
-)
-
-# Separators within a positive clause come in two tiers, because a single
-# level cannot both keep a bare "and" list together ("buy milk and eggs" is
-# one request) and stop an evidence span from straddling into an unrelated
-# request ("water the plants and then call the neighbor..." is two).
-#
-# Hard separators end a request outright: an evidence span may never cross
-# one, so they also bound the containment check in `_explicit_task_request`.
-# A comma is hard unless it directly addresses a name-like assignee and
-# "please" immediately follows -- that is the same direct-address shape the
-# marker patterns themselves already span ("Codex, please handle this"; see
-# `_explicit_tags`), so splitting there would sever a name from its verb.
-# Any other comma ("...on my list, please call the plumber") is an ordinary
-# clause boundary and must split.
-_TASK_REQUEST_HARD_SEPARATOR_RE = re.compile(
-    r"\b(?:and\s+then|then|also|plus|as\s+well\s+as)\b|,", re.I
-)
-# The ", please" exception must fire only for a genuine direct address and
-# never for an ordinary object pronoun ("...for me, please ..."), so two
-# constraints gate it:
-#   - name-like tag only: `_VALID_TASK_ASSIGNEES` minus the ordinary English
-#     words "me"/"local"/"cloud", which are valid assignees but not names a
-#     transcript would ever address.
-#   - vocative position: the tag must open its own segment (clause start or
-#     immediately after a hard-separator token), which is what distinguishes
-#     an address ("Codex, please...") from a trailing object pronoun
-#     ("...for me, please...").
-# Both checks run over a small bounded window around the comma instead of a
-# full clause slice, so the per-comma cost is O(1) rather than O(n) -- a full
-# prefix rescan for every comma made block-splitting O(n^2) in comma count.
-_TASK_REQUEST_NAME_LIKE_ASSIGNEES = frozenset(
-    tag for tag in _VALID_TASK_ASSIGNEES if tag not in {"me", "local", "cloud"}
-)
-_NAME_LIKE_ASSIGNEE_ALTERNATION_RE = "|".join(
-    sorted(
-        (re.escape(tag) for tag in _TASK_REQUEST_NAME_LIKE_ASSIGNEES),
-        key=len,
-        reverse=True,
-    )
-)
-_COMMA_SEPARATOR_WINDOW = 40  # longest name-like tag plus a boundary token
-_COMMA_VOCATIVE_ASSIGNEE_BEFORE_RE = re.compile(
-    rf"(?:^|[.!?;\n,]|\band\s+then\b|\bthen\b|\balso\b|\bplus\b|\bas\s+well\s+as\b)"
-    rf"\s*#?(?:{_NAME_LIKE_ASSIGNEE_ALTERNATION_RE})\s*$",
-    re.I,
-)
-_COMMA_PLEASE_AFTER_RE = re.compile(r"^\s*please\b", re.I)
-# A bare "and" is soft: an evidence span may cross it (it is not a request
-# boundary on its own), but a marker still only governs the sub-segment its
-# span starts in -- so "buy milk and feed the cat" is ungoverned by a marker
-# that appears only in a soft segment other than the one the span starts in.
-_TASK_REQUEST_SOFT_SEPARATOR_RE = re.compile(r"\band\b", re.I)
-# An infinitive complement ("to review...", "so that...", "in order to...")
-# continues the request that precedes it rather than starting a new one, so
-# it is merged back into the hard block before it -- but only when that
-# block already carries a marker of its own; otherwise an unrelated leading
-# block ("Call the neighbor..., to remind me to water the plants.") would be
-# pulled under a marker that was never about it.
-_TASK_REQUEST_CONTINUATION_RE = re.compile(
-    r"^\s*(?:to|so\s+that|in\s+order\s+to)\s+\w", re.I
-)
-
-
-def _task_request_has_marker(segment: str) -> bool:
-    return bool(
-        _PLAIN_TASK_FILING_RE.search(segment)
-        or _explicit_tags(segment)
-        or _scheduled_executors(segment)
-    )
-
-
-def _comma_is_hard_separator(clause: str, comma_index: int) -> bool:
-    after = clause[comma_index + 1:comma_index + 1 + _COMMA_SEPARATOR_WINDOW]
-    if not _COMMA_PLEASE_AFTER_RE.match(after):
-        return True
-    before = clause[max(0, comma_index - _COMMA_SEPARATOR_WINDOW):comma_index]
-    return not _COMMA_VOCATIVE_ASSIGNEE_BEFORE_RE.search(before)
-
-
-def _task_request_hard_blocks(clause: str) -> list[tuple[int, int]]:
-    """Split one positive clause into hard blocks an evidence span may not cross.
-
-    A coordinating conjunction other than bare "and" always starts a new
-    block; a comma starts one unless it directly addresses a name-like
-    assignee in vocative position ("Codex, please ..."). An infinitive
-    complement immediately after a boundary is merged back into the block
-    before it only when that block already carries a filing/delegation
-    marker of its own -- otherwise it would pull an unrelated leading
-    request under a later marker.
-    """
-    raw: list[tuple[int, int]] = []
-    last = 0
-    for match in _TASK_REQUEST_HARD_SEPARATOR_RE.finditer(clause):
-        if match.group(0) == "," and not _comma_is_hard_separator(clause, match.start()):
-            continue
-        raw.append((last, match.start()))
-        last = match.end()
-    raw.append((last, len(clause)))
-    raw = [(start, end) for start, end in raw if clause[start:end].strip()]
-    merged: list[tuple[int, int]] = []
-    for start, end in raw:
-        if (
-            merged
-            and _TASK_REQUEST_CONTINUATION_RE.match(clause[start:end])
-            and _task_request_has_marker(clause[merged[-1][0]:merged[-1][1]])
-        ):
-            merged[-1] = (merged[-1][0], end)
-        else:
-            merged.append((start, end))
-    return merged
-
-
-def _task_request_soft_segments(clause: str, block_start: int, block_end: int) -> list[tuple[int, int]]:
-    """Split one hard block into marker-governance segments on bare "and"."""
-    result: list[tuple[int, int]] = []
-    last = block_start
-    for match in _TASK_REQUEST_SOFT_SEPARATOR_RE.finditer(clause, block_start, block_end):
-        result.append((last, match.start()))
-        last = match.end()
-    result.append((last, block_end))
-    return [(start, end) for start, end in result if clause[start:end].strip()]
 
 
 class PebbleCaptureError(ValueError):
@@ -733,53 +591,6 @@ def _explicit_action_evidence(transcript: str, evidence: str, action_evidence: s
     )
 
 
-def _explicit_task_request(transcript: str, action_evidence: str) -> bool:
-    """Prove every task -- delegated or not -- was explicitly asked for.
-
-    Log-only is the strong default: a bare imperative or an observation must
-    never become a task.  This binds ``action_evidence`` to a positive clause
-    that also carries an explicit filing/delegation marker, reusing the same
-    evidence-binding proof (`_explicit_action_evidence`) delegation already
-    requires -- the clause itself stands in for the caller-supplied
-    ``evidence`` argument, so a marker and its action must share one clause.
-
-    A shared clause is not enough on its own: unpunctuated voice transcripts
-    routinely chain several unrelated requests into one clause ("and"/"then"/
-    comma-joined), so the marker must also *govern* this specific evidence
-    span, and the span must not itself straddle into an unrelated request.
-    Governance and containment are checked at two granularities because they
-    protect against different failures:
-
-    - Containment: the whole evidence span must lie inside one hard block
-      (`_task_request_hard_blocks`) -- otherwise a span that starts under a
-      marker could still run past a "then"/comma boundary and carry
-      unrequested text onto a filed task's title (e.g. a delegated task).
-    - Governance: the span must additionally *start* inside a soft segment
-      of that block (`_task_request_soft_segments`, split on bare "and")
-      that itself carries a marker, not merely appear somewhere else in the
-      block -- this is what keeps "buy milk and feed the cat" from filing
-      "feed the cat" off a marker that only covers "buy milk".
-    """
-    if not action_evidence:
-        return False
-    action_key = action_evidence.casefold()
-    for clause in _positive_clauses(transcript):
-        if not _explicit_action_evidence(transcript, clause, action_evidence):
-            continue
-        clause_key = clause.casefold()
-        for block_start, block_end in _task_request_hard_blocks(clause):
-            for seg_start, seg_end in _task_request_soft_segments(clause, block_start, block_end):
-                segment = clause[seg_start:seg_end]
-                if not _task_request_has_marker(segment):
-                    continue
-                start = seg_start
-                while (offset := clause_key.find(action_key, start)) >= 0:
-                    if seg_start <= offset < seg_end and offset + len(action_key) <= block_end:
-                        return True
-                    start = offset + 1
-    return False
-
-
 def _explicit_task_delegation(
     transcript: str, executor: str, evidence: str, action_evidence: str
 ) -> bool:
@@ -930,11 +741,12 @@ def validate_plan(raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at
                     date.fromisoformat(due)
                 except (TypeError, ValueError) as exc:
                     raise PebbleCaptureError("task due date is invalid") from exc
-            if not _explicit_task_request(transcript, action_evidence) or reused_action_evidence:
-                # Log-only is the strong default. An unproven task -- or one
-                # whose only proof is a span an earlier action already spent
-                # -- is omitted, never raised: the capture must still log and
-                # complete, and under-filing is the safe failure direction.
+            if reused_action_evidence:
+                # A span already spent by an earlier action cannot also back
+                # this one: dropped, never raised -- the capture must still
+                # log and complete. Whether a plain task is filed at all is
+                # the classifier's judgment call under the filing policy
+                # prompt, not something application code re-decides here.
                 continue
             if action_evidence:
                 used_action_evidence.add(action_key)
@@ -1023,8 +835,32 @@ def validate_plan(raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at
     return result
 
 
-class LocalOnlyJournalClassifier:
-    """Tool-free classifier pinned to the local llama server; it never retries remotely."""
+def _pebble_llm_client() -> LocalLLMClient:
+    """Return the configured remote provider, or the local llama-server.
+
+    The remote provider (`settings.remote_llm_configured`) is used, unprobed,
+    whenever it's configured -- same construction the `#agent` preflight
+    classifier and the `remote` LLM backend already use. A keyless install
+    with no remote provider configured falls back to the local llama-server,
+    which must be a loopback URL.
+    """
+    if settings.remote_llm_configured:
+        return LocalLLMClient(
+            base_url=settings.remote_llm_base_url,
+            model=settings.remote_llm_model,
+            api_key=settings.remote_llm_api_key,
+            timeout=settings.remote_llm_timeout,
+        )
+    return LocalLLMClient(
+        base_url=_loopback_llm_url(settings.local_llm_url),
+        timeout=30,
+        trust_env=False,
+    )
+
+
+class PebbleJournalClassifier:
+    """Tool-free classifier for Pebble captures: the configured remote
+    provider when available, else the local llama-server."""
 
     async def classify(self, final_text: str, recorded_at: str) -> list[dict[str, Any]]:
         prompt = classifier_prompt(
@@ -1033,11 +869,7 @@ class LocalOnlyJournalClassifier:
             local_timezone=settings.timezone,
             allow_agent_schedule=True,
         )
-        client = LocalLLMClient(
-            base_url=_loopback_llm_url(settings.local_llm_url),
-            timeout=30,
-            trust_env=False,
-        )
+        client = _pebble_llm_client()
         request: dict[str, Any] = {
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": 1200,
@@ -1074,7 +906,7 @@ class LocalOnlyJournalClassifier:
             try:
                 return _validated_classifier_actions(response.text, final_text, recorded_at)
             except ValueError as exc:
-                raise PebbleCaptureError("local classifier returned no valid action plan") from exc
+                raise PebbleCaptureError("classifier returned no valid action plan") from exc
 
 
 def _validated_classifier_actions(
@@ -1082,35 +914,28 @@ def _validated_classifier_actions(
 ) -> list[dict[str, Any]]:
     """Parse one model candidate and prove it passes the authority gate."""
     if not isinstance(response_text, str):
-        raise PebbleCaptureError("local classifier returned no action list")
+        raise PebbleCaptureError("classifier returned no action list")
     parsed = extract_json(response_text)
     if not isinstance(parsed, dict):
-        raise PebbleCaptureError("local classifier returned no action list")
+        raise PebbleCaptureError("classifier returned no action list")
     actions = parsed.get("actions")
     if not isinstance(actions, list):
-        raise PebbleCaptureError("local classifier returned no action list")
+        raise PebbleCaptureError("classifier returned no action list")
     validated = validate_plan(actions, transcript=final_text, recorded_at=recorded_at)
-    # ``validate_plan`` can omit an over-eager task outright, so an earlier
-    # index can be entirely absent from ``validated``: a raw action's
-    # position in ``actions`` is not reliably aligned with its validated
-    # counterpart's position in ``validated``.  Pair by the model-assigned
-    # ``index`` instead of by list position.
+    # ``validate_plan`` can drop a task whose action_evidence duplicates an
+    # earlier action's, so a raw action's position in ``actions`` is not
+    # reliably aligned with its validated counterpart's position in
+    # ``validated``.  Pair by the model-assigned ``index`` instead of by
+    # list position.
     validated_by_index = {action.index: action for action in validated}
     for raw_action in actions:
         if not isinstance(raw_action, dict) or raw_action.get("kind") != "task":
             continue
         action = validated_by_index.get(raw_action.get("index"))
         if action is None:
-            # Dropped for lacking a proven, explicit filing request. A task
-            # proposed with no action_evidence at all is a structural
-            # contract miss -- give the model one corrective round rather
-            # than silently losing a well-formed capture.  A task whose
-            # action_evidence was present but not bound to an explicit
-            # request stays dropped: under-filing is the safe direction, and
-            # the model already tried and failed to prove it, so a retry
-            # would not be a format fix.
-            if not (raw_action.get("action_evidence") or "").strip():
-                raise PebbleCaptureError("classifier proposed a task without action_evidence")
+            # Dropped for reusing an action_evidence span an earlier action
+            # already spent: one governed span backs at most one filed
+            # action.
             continue
         claimed_assignees = {
             value.lstrip("#").lower()
@@ -1132,12 +957,12 @@ class PebbleCaptureConsumer:
 
     def __init__(
         self, ledger: CaptureLedger, task_manager: TaskManager, scheduler_store: SchedulerStore,
-        classifier: Optional[LocalOnlyJournalClassifier] = None, *, apply: bool = False,
+        classifier: Optional[PebbleJournalClassifier] = None, *, apply: bool = False,
     ):
         self.ledger = ledger
         self.task_manager = task_manager
         self.scheduler_store = scheduler_store
-        self.classifier = classifier or LocalOnlyJournalClassifier()
+        self.classifier = classifier or PebbleJournalClassifier()
         self.apply = apply
 
     def _find_effect_object(
