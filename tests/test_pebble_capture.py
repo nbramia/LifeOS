@@ -483,11 +483,46 @@ def test_task_execution_tags_require_positive_valid_delegation(transcript, tag, 
         ("Add a task to take the synthetic dog outside.", "take the synthetic dog outside", True),
         ("Assign the task related to the synthetic report to me.", "the synthetic report", True),
         ("Remind me to call the synthetic plumber.", "call the synthetic plumber", True),
+        ("Add buy synthetic printer paper to my to-do list.", "buy synthetic printer paper", True),
+        ("Put the synthetic oil change on my list.", "the synthetic oil change", True),
+        ("Ask #codex to review the synthetic login bug.", "review the synthetic login bug", True),
+        (
+            "Add a task assigned to #claude, to review the synthetic report.",
+            "review the synthetic report",
+            True,
+        ),
+        (
+            "Have #codex review the synthetic report tomorrow at 9 AM.",
+            "review the synthetic report",
+            True,
+        ),
         # A bare imperative or plain statement alone -> log-only.
         ("Take the synthetic dog outside.", "take the synthetic dog outside", False),
         ("Test take out the synthetic trash.", "take out the synthetic trash", False),
         ("I should probably call the synthetic plumber.", "call the synthetic plumber", False),
         ("The blue synthetic mug is on the table.", "the blue synthetic mug", False),
+        # A comma-bearing observational sentence must not be mistaken for a
+        # "<name>, please <verb>" delegation.
+        (
+            "The blue synthetic mug is on the table, right next to the lamp.",
+            "the blue synthetic mug is on the table",
+            False,
+        ),
+        # A bare "have <noun> <noun>" statement is not a delegation request.
+        (
+            "I have a synthetic doctor's appointment tomorrow and the car needs an oil change.",
+            "a synthetic doctor's appointment tomorrow",
+            False,
+        ),
+        ("I have to pick up synthetic groceries at some point.", "pick up synthetic groceries", False),
+        # "Let me know" is idiomatic, not a self-delegation to "me".
+        ("Let me know how the synthetic report turned out.", "the synthetic report turned out", False),
+        # ask/have/let/"<name>, please" aimed at a non-executor name never
+        # resolves to a valid assignee, so none of these are filing markers.
+        ("Ask Dan to walk the synthetic dog.", "walk the synthetic dog", False),
+        ("Have Dan walk the synthetic dog.", "walk the synthetic dog", False),
+        ("Let the synthetic dog out.", "the synthetic dog out", False),
+        ("Dan, please walk the synthetic dog.", "walk the synthetic dog", False),
     ],
 )
 def test_plain_task_requires_an_explicit_filing_request(transcript, action_evidence, filed):
@@ -560,6 +595,21 @@ def test_validated_classifier_actions_pairs_by_index_not_position():
     [kept] = validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
     assert kept.index == 1
     assert kept.tags == ("codex",)
+
+
+def test_validated_classifier_actions_raises_for_task_missing_action_evidence():
+    """A task proposed with no ``action_evidence`` at all is a structural
+    contract miss, not an unproven-but-well-formed candidate: it must raise
+    so the classifier gets one corrective repair round, rather than being
+    silently dropped like a task whose evidence just failed the authority
+    gate."""
+    response = json.dumps({"actions": [
+        {"kind": "task", "index": 0, "title": "Synthetic review"},
+    ]})
+    with pytest.raises(PebbleCaptureError, match="without action_evidence"):
+        _validated_classifier_actions(
+            response, "Add a task to review the synthetic report.", "2030-01-01T10:00:00Z"
+        )
 
 
 @pytest.mark.parametrize(
@@ -705,6 +755,34 @@ async def test_mentioned_executor_cannot_gain_pickup_authority_after_markdown_re
     assert not _has_agent_pickup_tag(task.tags)
 
 
+def test_marker_governs_only_the_nearby_span_in_an_unpunctuated_run_on():
+    """A run-on, unpunctuated transcript is one whole clause, so a single
+    filing marker must not back every candidate span in it -- only the span
+    it actually governs."""
+    transcript = (
+        "remind me to call the synthetic plumber and then also we should probably repaint the "
+        "whole synthetic garage this weekend and honestly I have been meaning to redo the "
+        "synthetic budget spreadsheet since forever and finally book the synthetic dentist "
+        "appointment"
+    )
+    spans = [
+        "call the synthetic plumber",
+        "repaint the whole synthetic garage this weekend",
+        "redo the synthetic budget spreadsheet",
+        "book the synthetic dentist appointment",
+    ]
+    actions = validate_plan(
+        [
+            {"kind": "task", "index": index, "title": span, "action_evidence": span}
+            for index, span in enumerate(spans)
+        ],
+        transcript=transcript,
+        recorded_at="2030-01-01T10:00:00Z",
+    )
+    [action] = actions
+    assert action.action_evidence == "call the synthetic plumber"
+
+
 def test_task_delegation_is_scoped_to_the_named_action_not_the_whole_capture():
     transcript = "Buy milk. Assign code repair to Codex."
     actions = validate_plan([
@@ -720,10 +798,13 @@ def test_task_delegation_is_scoped_to_the_named_action_not_the_whole_capture():
         },
     ], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
     # Execution is bound to the exact source action, never the model's
-    # unrelated title. Reusing that source span cannot grant a second action.
-    assert actions[0].title == "code repair"
-    assert actions[0].tags == ("codex",)
-    assert actions[1].tags == ()
+    # unrelated title: index 0's filed title is the bound evidence, not "Buy
+    # milk". A second action citing the identical evidence span is dropped
+    # entirely -- one governed span backs at most one filed action.
+    [action] = actions
+    assert action.index == 0
+    assert action.title == "code repair"
+    assert action.tags == ("codex",)
 
 
 def test_task_delegation_accepts_paraphrase_but_files_source_scoped_action():
@@ -1136,6 +1217,44 @@ async def test_classifier_repairs_missing_delegation_evidence_before_apply(
 
 
 @pytest.mark.asyncio
+async def test_classifier_repairs_task_missing_action_evidence_before_apply(
+    stores, monkeypatch
+):
+    """A raw task proposed with no ``action_evidence`` at all raises out of
+    ``_validated_classifier_actions``, driving the same one-shot repair round
+    as any other structurally incomplete candidate -- not a silent drop."""
+    transcript = "Add a task to review the synthetic report."
+    incomplete = {"kind": "task", "index": 0, "title": "Review report"}
+    repaired = {**incomplete, "action_evidence": "review the synthetic report"}
+    responses = iter((
+        SimpleNamespace(text=json.dumps({"actions": [incomplete]})),
+        SimpleNamespace(text=json.dumps({"actions": [repaired]})),
+    ))
+    calls = []
+
+    class FakeLocalClient:
+        def __init__(self, *, base_url, timeout, trust_env):
+            assert base_url and timeout == 30 and trust_env is False
+
+        async def acreate(self, **kwargs):
+            calls.append(kwargs)
+            return next(responses)
+
+    monkeypatch.setattr("api.services.pebble_capture.LocalLLMClient", FakeLocalClient)
+    ledger, tasks, schedules = stores
+    consumer = PebbleCaptureConsumer(
+        ledger, tasks, schedules, LocalOnlyJournalClassifier(), apply=True
+    )
+    payload = {**_payload(), "capture_id": "repaired-task-evidence", "final_text": transcript}
+    assert await consumer.process(payload) == "complete"
+    [task] = tasks.list_tasks()
+    assert task.description == "Review report"
+    assert len(calls) == 2
+    assert len(calls[1]["messages"]) == 3
+    assert "previous candidate failed" in calls[1]["messages"][-1]["content"].lower()
+
+
+@pytest.mark.asyncio
 async def test_classifier_repairs_malformed_conditional_to_an_inert_plan(
     stores, monkeypatch
 ):
@@ -1436,9 +1555,19 @@ async def test_completed_schedule_receipt_preserves_user_edit_and_deletion(store
 @pytest.mark.asyncio
 async def test_multi_action_partial_completion_resumes_only_unfinished_action(stores, monkeypatch):
     ledger, tasks, schedules = stores
+    # Two distinct filing requests, each with its own governed evidence span:
+    # a single shared span cannot back two actions, so this exercises the
+    # partial-completion/resume path -- not the filing gate.
+    payload = {
+        **_payload(),
+        "final_text": (
+            "Add a task to handle the synthetic review. "
+            "Add a task to check the synthetic logs."
+        ),
+    }
     classifier = _Classifier([
-        {"kind": "task", "index": 0, "title": "Synthetic first", **_TASK_EVIDENCE},
-        {"kind": "task", "index": 1, "title": "Synthetic second", **_TASK_EVIDENCE},
+        {"kind": "task", "index": 0, "title": "Synthetic first", "action_evidence": "handle the synthetic review"},
+        {"kind": "task", "index": 1, "title": "Synthetic second", "action_evidence": "check the synthetic logs"},
     ])
     consumer = PebbleCaptureConsumer(ledger, tasks, schedules, classifier, apply=True)
     original = tasks.create_or_find_by_operation
@@ -1453,12 +1582,12 @@ async def test_multi_action_partial_completion_resumes_only_unfinished_action(st
 
     monkeypatch.setattr(tasks, "create_or_find_by_operation", fail_second)
     with pytest.raises(RuntimeError, match="second-action"):
-        await consumer.process(_payload())
+        await consumer.process(payload)
     assert [task.description for task in tasks.list_tasks()] == ["Synthetic first"]
     with ledger._connect() as db:
         db.execute("UPDATE pebble_effects SET claimed_at=0 WHERE action_index=1")
     monkeypatch.setattr(tasks, "create_or_find_by_operation", original)
-    assert await consumer.process(_payload()) == "complete"
+    assert await consumer.process(payload) == "complete"
     assert {task.description for task in tasks.list_tasks()} == {
         "Synthetic first", "Synthetic second",
     }

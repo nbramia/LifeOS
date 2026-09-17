@@ -45,25 +45,33 @@ _VALID_KINDS = {"task", "schedule", "human"}
 _EFFECT_LEASE_SECONDS = 60
 _INLINE_AUTHORITY_RE = re.compile(r"\[\s*\w+\s*::|#[\w-]+")
 # Positive-clause markers that prove a transcript is explicitly asking for a
-# task to be filed, not merely stating or imagining one. Covers plain filing
-# phrasing ("add a task", "put ... on my list", "remind me to", "task:") and
-# the same delegation-request shapes already recognized for tag authority
-# (assign/delegate/route ... to, ask/have/let <executor>, "<executor>, please
-# ...") so a genuinely delegated task never needs a second, different marker.
-_TASK_REQUEST_MARKER_RE = re.compile(
+# task to be filed, not merely stating or imagining one. Covers only plain
+# filing phrasing ("add a task", "put ... on my list", "remind me to",
+# "task:", "assign/delegate/route ... to"). A delegation-shaped request
+# (ask/have/let <executor>, "<executor>, please ...") is proven instead by
+# calling the same executor-constrained helpers tag authority already goes
+# through (`_explicit_tags`, `_scheduled_executors`) rather than
+# re-expressing those shapes as bare, unconstrained alternatives here: an
+# unconstrained copy matches ordinary prose ("I have a doctor's
+# appointment...", "Let me know how...") because it drops the valid-assignee
+# and clause-start anchoring those helpers already enforce.
+_PLAIN_TASK_FILING_RE = re.compile(
     r"\badd\s+(?:a\s+|an\s+)?(?:task|to-?do)\b"
     r"|\b(?:make|create)\s+(?:a\s+)?task\b"
     r"|\btask\s*:"
-    r"|\b(?:to|on)\s+(?:my|the)\s+(?:to-?do\s+)?list\b"
+    r"|\bput\s+[\s\S]{0,60}\bon\s+(?:my|the)\s+(?:to-?do\s+)?list\b"
+    r"|\badd\s+[\s\S]{0,60}\bto\s+(?:my|the)\s+(?:to-?do\s+)?list\b"
     r"|\bremind\s+me\s+to\b"
-    r"|\b(?:assign|delegate|route)\b[\s\S]{0,100}\bto\b"
-    r"|\bask\s+#?[\w-]+\s+to\b"
-    r"|\bhave\s+#?[\w-]+\s+(?:to\s+)?[\w-]+\b"
-    r"|\blet\s+#?[\w-]+\s+[\w-]+\b"
-    r"|\b#?[\w-]+\s*(?:,\s*(?:please\s+)?|please\s+)"
-    r"(?!i\b|we\b|they\b|he\b|she\b)[\w-]+\s+(?:this|it|that|the\b|[\w-]+)",
+    r"|\b(?:assign|delegate|route)\s+[\s\S]{0,100}\bto\b",
     re.I,
 )
+
+# How many characters an action_evidence span may sit from a filing marker
+# within the same clause and still count as governed by it. A marker must
+# govern the specific evidence span next to it, not merely co-occur
+# somewhere else in a long, unpunctuated transcript (common in voice
+# captures).
+_TASK_REQUEST_GOVERNANCE_WINDOW = 30
 
 
 class PebbleCaptureError(ValueError):
@@ -552,7 +560,11 @@ def _explicit_tags(text: str) -> set[str]:
             r"\b(?:assign|delegate|route)\s+[^.!?;\n]{0,100}?\bto\s+#?([\w-]+)\b",
             r"\bask\s+#?([\w-]+)\s+to\s+(?!whether\b)[\w-]+\s+(?:this|it|that|the\b|[\w-]+)",
             r"^\s*(?:please\s+)?have\s+#?([\w-]+)\s+(?:to\s+)?[\w-]+\s+(?:this|it|that|the\b|[\w-]+)",
-            r"^\s*(?:please\s+)?let\s+#?([\w-]+)\s+[\w-]+\s+(?:this|it|that|the\b|[\w-]+)",
+            # "let me <verb>" ("let me know", "let me check", ...) is
+            # idiomatic, not a self-delegation, even though "me" is itself a
+            # valid assignee tag: exclude it rather than let it read as a
+            # filing request.
+            r"^\s*(?:please\s+)?let\s+(?!me\b)#?([\w-]+)\s+[\w-]+\s+(?:this|it|that|the\b|[\w-]+)",
             r"\b#?([\w-]+)\s*(?:,\s*(?:please\s+)?|please\s+)(?!i\b|we\b|they\b|he\b|she\b)[\w-]+\s+(?:this|it|that|the\b|[\w-]+)",
         )
         if re.search(r"\bremind\s+me\b", clause, re.I):
@@ -616,14 +628,33 @@ def _explicit_task_request(transcript: str, action_evidence: str) -> bool:
     evidence-binding proof (`_explicit_action_evidence`) delegation already
     requires -- the clause itself stands in for the caller-supplied
     ``evidence`` argument, so a marker and its action must share one clause.
+
+    A shared clause is not enough on its own: unpunctuated voice transcripts
+    routinely chain several unrelated requests into one clause, so the marker
+    must also *govern* this specific evidence span -- start at or within
+    ``_TASK_REQUEST_GOVERNANCE_WINDOW`` characters of it -- rather than merely
+    appear somewhere else in the same clause.
     """
     if not action_evidence:
         return False
+    action_key = action_evidence.casefold()
     for clause in _positive_clauses(transcript):
-        if _TASK_REQUEST_MARKER_RE.search(clause) and _explicit_action_evidence(
-            transcript, clause, action_evidence
-        ):
-            return True
+        if not _explicit_action_evidence(transcript, clause, action_evidence):
+            continue
+        clause_key = clause.casefold()
+        start = 0
+        while (offset := clause_key.find(action_key, start)) >= 0:
+            window = clause[
+                max(0, offset - _TASK_REQUEST_GOVERNANCE_WINDOW):
+                offset + len(action_evidence) + _TASK_REQUEST_GOVERNANCE_WINDOW
+            ]
+            if (
+                _PLAIN_TASK_FILING_RE.search(window)
+                or _explicit_tags(window)
+                or _scheduled_executors(window)
+            ):
+                return True
+            start = offset + 1
     return False
 
 
@@ -651,7 +682,9 @@ def _scheduled_executors(text: str) -> set[str]:
         r"\b(?:run|execute)\b[\s\S]{0,80}\b(?:with|using)\s+#?([\w-]+)\b",
         r"\bask\s+#?([\w-]+)\s+to\s+(?!whether\b)[\w-]+\s+(?:this|it|that|the\b|[\w-]+)",
         r"^\s*(?:please\s+)?have\s+#?([\w-]+)\s+(?:to\s+)?[\w-]+\s+(?:this|it|that|the\b|[\w-]+)",
-        r"^\s*(?:please\s+)?let\s+#?([\w-]+)\s+[\w-]+\s+(?:this|it|that|the\b|[\w-]+)",
+        # See the matching exclusion in `_explicit_tags`: "let me <verb>" is
+        # idiomatic, not a delegation request.
+        r"^\s*(?:please\s+)?let\s+(?!me\b)#?([\w-]+)\s+[\w-]+\s+(?:this|it|that|the\b|[\w-]+)",
         r"\b#?([\w-]+)\s*(?:,\s*(?:please\s+)?|please\s+)(?!i\b|we\b|they\b|he\b|she\b)[\w-]+\s+(?:this|it|that|the\b|[\w-]+)",
         r"\b(?:assign|delegate|route)\s+(?:this|it|that|the\s+task)?\s*to\s+#?([\w-]+)\b",
     )
@@ -732,6 +765,11 @@ def validate_plan(raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at
         if not isinstance(evidence, str) or not isinstance(action_evidence, str):
             raise PebbleCaptureError("task delegation evidence is invalid")
         tags: list[str] = []
+        # A span already spent by an earlier action -- for delegation or for
+        # plain filing -- cannot also back this one: one governed span may
+        # justify at most one filed action, not several.
+        action_key = action_evidence.casefold()
+        reused_action_evidence = kind == "task" and bool(action_evidence) and action_key in used_action_evidence
         # Tags are task metadata. A model may redundantly copy an agent
         # schedule's executor into ``tags``; ignore it here so only the
         # schedule-specific authority check below consumes its evidence.
@@ -742,15 +780,13 @@ def validate_plan(raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at
                 tag = raw_tag.lstrip("#").lower()
                 if tag in _VALID_TASK_ASSIGNEES:
                     evidence_key = evidence.casefold()
-                    action_key = action_evidence.casefold()
-                    if (evidence_key not in used_delegations
-                            and action_key not in used_action_evidence
+                    if (not reused_action_evidence
+                            and evidence_key not in used_delegations
                             and _explicit_task_delegation(
                                 transcript, tag, evidence, action_evidence
                             )):
                         tags.append(tag)
                         used_delegations.add(evidence_key)
-                        used_action_evidence.add(action_key)
                 elif tag not in _ROUTING_TAGS and tag in allowed_tags:
                     tags.append(tag)
         normalized_tags = tuple(dict.fromkeys(tags))
@@ -765,11 +801,14 @@ def validate_plan(raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at
                     date.fromisoformat(due)
                 except (TypeError, ValueError) as exc:
                     raise PebbleCaptureError("task due date is invalid") from exc
-            if not _explicit_task_request(transcript, action_evidence):
-                # Log-only is the strong default. An unproven task is omitted,
-                # never raised: the capture must still log and complete, and
-                # under-filing is the safe failure direction here.
+            if not _explicit_task_request(transcript, action_evidence) or reused_action_evidence:
+                # Log-only is the strong default. An unproven task -- or one
+                # whose only proof is a span an earlier action already spent
+                # -- is omitted, never raised: the capture must still log and
+                # complete, and under-filing is the safe failure direction.
                 continue
+            if action_evidence:
+                used_action_evidence.add(action_key)
             if any(tag in _VALID_TASK_ASSIGNEES for tag in normalized_tags):
                 title = _safe_markdown_text(
                     action_evidence, field="action_evidence", limit=500
