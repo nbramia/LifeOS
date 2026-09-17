@@ -1,5 +1,5 @@
 """ssh mechanism for running (and killing) an executor's CLI subprocess on a
-board-assigned host other than the API host (#851).
+board-assigned host other than the API host.
 
 One mechanism serves both remote execution and the remote kill path:
 
@@ -50,7 +50,7 @@ def api_host_name() -> str:
     return socket.gethostname().split(".")[0]
 
 
-# (round 1, finding #2) A small static list of concrete credential env-var
+# A small static list of concrete credential env-var
 # names, unioned into every `env_names_matching_prefixes()` result below —
 # NOT filtered to just what THIS process's own environment happens to
 # contain. `env_names_matching_prefixes` alone enumerates names present in
@@ -203,8 +203,8 @@ def read_remote_pgid_line(line: str) -> Optional[int]:
 
 
 def read_line_with_deadline(stream, timeout: float) -> tuple[str, bool]:
-    """Read one line from `stream` with a bounded wait (round 1, finding
-    #3). Both executors block on `stream.readline()` for the `PGID:` line
+    """Read one line from `stream` with a bounded wait. Both executors
+    block on `stream.readline()` for the `PGID:` line
     BEFORE their own wall-clock watchdog starts — `ssh -o ConnectTimeout`
     bounds only the TCP handshake, not a stall during auth or a host that
     accepts the connection but never answers, so an unbounded `readline()`
@@ -237,7 +237,7 @@ def read_line_with_deadline(stream, timeout: float) -> tuple[str, bool]:
 
 
 def last_nonempty_line(text: str) -> str:
-    """Last non-blank line of `text` (round 1, finding #4) — used to fold
+    """Last non-blank line of `text` — for folding
     an ssh failure's stderr (e.g. `ssh: connect to host studio port 22:
     Connection refused`) into an executor's failure reason instead of
     leaving it reachable only via the transcript's `stderr_tail`."""

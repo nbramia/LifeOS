@@ -1,4 +1,4 @@
-"""Per-session tool result cache for the LifeOS MCP HTTP server (#139 §4).
+"""Per-session tool result cache for the LifeOS MCP HTTP server (§4).
 
 When an agent calls the same tool twice within a single session with identical
 arguments — e.g., `lifeos_calendar_upcoming` early to set context and again

@@ -1,4 +1,4 @@
-"""Operator root-spawn (#235, Phase 2 of #233).
+"""Operator root-spawn.
 
 `lifeos_agent_spawn` (inter_agent.py) is same-lineage only — it requires a
 parent agent session. This module adds the operator-initiated *root* spawn: a

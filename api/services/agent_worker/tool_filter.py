@@ -1,4 +1,4 @@
-"""Per-class tool filter helper (#139 §3, partial).
+"""Per-class tool filter helper (§3, partial).
 
 The full per-class session tool filtering flow is:
   1. Preflight picks `preset_class` (personal-comm / work-comm / research /
@@ -129,7 +129,7 @@ _CLASS_SPECIALTIES: dict[str, tuple[str, ...]] = {
 }
 
 
-# Per-class cache_creation token estimates (#139 §6). These are conservative
+# Per-class cache_creation token estimates (§6). These are conservative
 # hardcoded floors used by preflight's fail-fast budget check. The full §6
 # acceptance specifies a live per-class startup probe — that operational
 # experiment is deferred; meanwhile these estimates let the refuse-on-too-small
@@ -152,7 +152,7 @@ _CACHE_CREATION_TOKEN_ESTIMATES: dict[str, int] = {
 
 def estimated_cache_creation_tokens(preset_class: str | None) -> int:
     """Return the conservative cache_creation token estimate for a preset
-    class. Used by preflight (#139 §6) to refuse dispatch when the cache-
+    class. Used by preflight (§6) to refuse dispatch when the cache-
     cold cost would blow through the task's budget.
 
     None / unknown classes fall back to the fullstack estimate so we err

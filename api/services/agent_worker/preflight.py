@@ -4,7 +4,7 @@ A single, cheap Claude Haiku call returns structured JSON describing:
 - the budget the task should run with (parsed from natural-language hints)
 - which executor to use (local Gemma vs. Claude Opus vs. ask the user)
 - whether the title is ambiguous (and what clarifying question to ask)
-- the expected output shape (used to phrase the completion notification)
+- the expected output shape (for phrasing the completion notification)
 - a sanity flag (garbage / destructive titles get parked rather than run)
 
 The model is pinned to `claude-haiku-4-5` by default via
@@ -43,8 +43,8 @@ ROUTE_CLAUDE_CODE = "claude_code"
 # `agent_worker/codex_spawn.py`). Same semantics as ROUTE_CLAUDE_CODE —
 # preflight never emits it directly except via the `#codex` tag.
 ROUTE_CODEX = "codex"
-# `remote` is the #809 route for the `#cloud` tag: the configured remote
-# OpenAI-compatible provider (e.g. DeepSeek via Fireworks, #654) — never the
+# `remote` is the route for the `#cloud` tag: the configured remote
+# OpenAI-compatible provider (e.g. DeepSeek via Fireworks) — never the
 # Anthropic API. Like ROUTE_CLAUDE_CODE/ROUTE_CODEX, preflight's own JSON
 # schema never emits this (the model only ever returns "local"|"claude"|
 # "ask" — see `_PREFLIGHT_INSTRUCTIONS`); it's set exclusively by
@@ -55,7 +55,7 @@ ROUTE_CODEX = "codex"
 # (the `routing not in KNOWN_ROUTES` check below), not be treated as a
 # legitimate model-chosen route needing its own corroboration carve-out.
 ROUTE_REMOTE = "remote"
-# `hermes` is the #851 route for the `#hermes` tag (or a board card
+# `hermes` is the route for the `#hermes` tag (or a board card
 # assigned to the Hermes engine): the turn opens a Hermes conversation via
 # `HermesExecutor` instead of running a local CLI. Like ROUTE_CLAUDE_CODE/
 # ROUTE_CODEX, preflight's own JSON schema never emits this directly — it's
@@ -63,7 +63,7 @@ ROUTE_REMOTE = "remote"
 ROUTE_HERMES = "hermes"
 
 # All routing destinations `parse_preflight_response` accepts from the model,
-# and the same set `settings.agent_default_route` (#707) is validated
+# and the same set `settings.agent_default_route` is validated
 # against — one source of truth so the two checks can't drift apart.
 # `ROUTE_REMOTE` is intentionally NOT a member (see its own comment above):
 # it's real per-token spend on a third-party provider, reachable only via the
@@ -74,12 +74,12 @@ ROUTE_HERMES = "hermes"
 # mechanism — see that function's docstring, point 3a).
 KNOWN_ROUTES = (ROUTE_LOCAL, ROUTE_CLAUDE, ROUTE_CLAUDE_CODE, ROUTE_CODEX, ROUTE_HERMES, ROUTE_ASK)
 
-# Allowed expected-output shapes. Used to phrase the final Telegram summary.
+# Allowed expected-output shapes, for phrasing the final Telegram summary.
 OUTPUT_KINDS = ("text", "file", "external_action", "structured")
 
 # Per-task model identifiers emitted by preflight. The cloud routing case
 # defaults to Sonnet for general work; Haiku is selected by tag override (or
-# in future by smart routing — see #139 §2 rubric). "local" maps to the
+# in future by smart routing — see §2 rubric). "local" maps to the
 # local Gemma backend. None means "no override, use settings.agent_managed_model".
 MODEL_LOCAL = "local"
 MODEL_HAIKU = "claude-haiku-4-5"
@@ -111,7 +111,7 @@ class PreflightResult:
     # True only when a sane=False verdict is grounded in something the *code*
     # established deterministically — an empty title, or a title matched
     # against `_DESTRUCTIVE_TITLE_RE` — rather than merely the model's own inferred
-    # "this isn't executable" opinion (#747). The worker fails the task
+    # "this isn't executable" opinion. The worker fails the task
     # closed (cancels it) only when `sane_fatal` is True; a non-fatal
     # sane=False is parked like an ambiguous task instead, since a cheap
     # classifier ignoring the prompt's "mundane tasks are sane" rule has
@@ -121,33 +121,33 @@ class PreflightResult:
     # (see that field) rather than a sane_fatal verdict. Meaningless when
     # sane is True.
     sane_fatal: bool = False
-    # Whether the cloud (API) route was *asked for* rather than inferred (#584).
+    # Whether the cloud (API) route was *asked for* rather than inferred.
     # Only an explicit request — a `#cloud*` tag, or a model/engine named in the
     # title — may dispatch to the Anthropic API without confirmation; an
     # inferred cloud route is downgraded to `ask`. Defaults False so every path
     # that doesn't positively establish intent lands on the safe side.
     routing_explicit: bool = False
-    # Per-task model selection (#139 §2). For cloud routes, defaults to
+    # Per-task model selection (§2). For cloud routes, defaults to
     # MODEL_SONNET; can be overridden to MODEL_HAIKU by the `#cloud-haiku`
     # tag (or to MODEL_SONNET by `#cloud-sonnet`). For local routes, set
     # to MODEL_LOCAL. The worker uses this for client-side cost accounting;
     # actual remote-model selection still requires the agent preset to
     # match (section 3 territory).
     model: str | None = None
-    # Preset class for per-session tool filtering (#139 §3). When set, the
+    # Preset class for per-session tool filtering (§3). When set, the
     # managed executor will call driver.update_session() with the class's
     # filtered tool list (via tool_filter.class_to_tool_filter) between
     # session create and the first user message — scoping cache_creation
     # to the smaller tool set. Currently picked from tag overrides only;
     # LLM-side preflight emission is a follow-up.
     preset_class: str | None = None
-    # Cache-cold cost estimate for this dispatch (#139 §6). Computed from
+    # Cache-cold cost estimate for this dispatch (§6). Computed from
     # the per-class cache_creation token estimate + the model's input rate.
-    # Used to refuse dispatch when even the cache-cold cost would exceed
+    # Refuses dispatch when even the cache-cold cost would exceed
     # 2× max_dollars (refuse only when the cheap path can't fit either).
     estimated_cost_dollars: float = 0.0
     # When True, the orchestrator should surface a confirmation prompt to
-    # the operator before dispatching (#139 §7). Driven by
+    # the operator before dispatching (§7). Driven by
     # settings.agent_cost_confirm_threshold_dollars.
     needs_cost_confirmation: bool = False
 
@@ -167,7 +167,7 @@ class PreflightResult:
             ),
         )
     # Set when a non-null `ambiguity` was demoted to advisory-only because
-    # `settings.agent_default_route` is configured (#751) — holds the
+    # `settings.agent_default_route` is configured — holds the
     # original question text so the worker can log it as context (session
     # transcript / completion note) instead of discarding it silently.
     # `ambiguity` itself is cleared to None in the same step, since a
@@ -175,7 +175,7 @@ class PreflightResult:
     demoted_ambiguity: str | None = None
     # Set when an LLM-chosen route (local / claude_code / codex) was demoted
     # to `settings.agent_default_route` because the title didn't corroborate
-    # it (#757) — holds the route the model/parse actually produced, so the
+    # it — holds the route the model/parse actually produced, so the
     # worker can log it as context the same way `demoted_ambiguity` is
     # logged. `routing` itself is overwritten with the default route in the
     # same step. None when nothing was demoted. See `_apply_route_corroboration`.
@@ -183,7 +183,7 @@ class PreflightResult:
     # Set when a non-fatal sane=False verdict — the model's own inferred
     # "this isn't executable" opinion, never a `sane_fatal` one — was
     # demoted to advisory because `settings.agent_default_route` is
-    # configured and valid (#803). Holds the original `sane_reason` so the
+    # configured and valid. Holds the original `sane_reason` so the
     # worker can log it as context, the same way `demoted_ambiguity` and
     # `demoted_routing` are logged. `sane` itself is set to True in the same
     # step, since a demoted sanity objection must not park or block the
@@ -306,11 +306,11 @@ _JSON_BLOCK = re.compile(r"\{.*\}", re.DOTALL)
 
 # Phrasings the preflight model uses when it smuggles a method-of-execution /
 # engine-selection question into `ambiguity` instead of leaving it null
-# (#748) — e.g. "Should this task be routed to a local agent for code
+# — e.g. "Should this task be routed to a local agent for code
 # implementation, or is it a design/specification task for a human
 # engineer?". The prompt already forbids this explicitly, but this is the
 # *second* observed case of the model ignoring an explicit negative
-# constraint (see `_DESTRUCTIVE_TITLE_RE` / #747), so the code cannot rely on
+# constraint (see `_DESTRUCTIVE_TITLE_RE`), so the code cannot rely on
 # prompt compliance alone. There's no structural field distinguishing
 # ambiguity "kinds" today — adding one would just move the same compliance
 # risk into a different JSON key the model could also ignore — so this
@@ -336,21 +336,21 @@ _EXECUTOR_NOUN_RE = re.compile(
 
 def _is_routing_flavored_ambiguity(question: str) -> bool:
     """True when an `ambiguity.question` is actually a method-of-execution /
-    routing question (#748), not a genuine missing-referent ambiguity."""
+    routing question, not a genuine missing-referent ambiguity."""
     return bool(
         _ROUTING_DECISION_RE.search(question or "")
         and _EXECUTOR_NOUN_RE.search(question or "")
     )
 
 
-# Deterministic destructive-title check (#747). Matched against the title
+# Deterministic destructive-title check. Matched against the title
 # directly — NOT inferred from the model's `sane_reason` prose — so the code
 # can independently confirm a fail-closed verdict rather than trust a single
 # cheap model's judgement. Deliberately narrow, mirroring the prompt's own
 # examples ("rm -rf /", "delete all my data") plus a couple of obviously
 # analogous shapes: a broad matcher would start catching mundane tasks that
 # merely mention deletion (e.g. "delete the stale draft email"), which is
-# exactly the false-positive failure mode #747 exists to fix.
+# exactly the false-positive failure mode exists to fix.
 _DESTRUCTIVE_TITLE_RE = re.compile(
     r"(?i)\brm\s+-rf\b"
     r"|\bdelete\s+all\s+(my\s+)?(data|files|everything)\b"
@@ -361,7 +361,7 @@ _DESTRUCTIVE_TITLE_RE = re.compile(
 
 
 def _apply_sanity_gate(result: PreflightResult, title: str) -> PreflightResult:
-    """Establish `sane_fatal` independent of the model's own claim (#747).
+    """Establish `sane_fatal` independent of the model's own claim.
 
     A title matching `_DESTRUCTIVE_TITLE_RE` is always sane=False and fatal,
     regardless of what the model returned — this is the one case the code
@@ -439,11 +439,11 @@ def parse_preflight_response(text: str) -> PreflightResult:
     if isinstance(amb_raw, dict) and amb_raw.get("question"):
         question = str(amb_raw["question"])
         if _is_routing_flavored_ambiguity(question):
-            # #748: the model put a method-of-execution / engine-selection
+            # the model put a method-of-execution / engine-selection
             # question into `ambiguity` despite the prompt explicitly
             # excluding those ("Method-of-execution questions ... are NOT
             # ambiguity"). Routing (including LIFEOS_AGENT_DEFAULT_ROUTE,
-            # #707) owns that decision, not the operator-facing block —
+            #) owns that decision, not the operator-facing block —
             # leave ambiguity null so the task isn't blocked on it.
             logger.info(
                 "preflight ambiguity suppressed as routing-flavored: %r", question,
@@ -472,12 +472,12 @@ PreflightCaller = Callable[[str], str]
 
 
 def _remote_preflight_client():
-    """Build the #654 remote-provider `LocalLLMClient`, unconditionally.
+    """Build the remote-provider `LocalLLMClient`, unconditionally.
 
-    Same construction as the #704 fallback branch (order 3 below): base URL,
+    Same construction as the fallback branch (order 3 below): base URL,
     model, key, and timeout all come straight from `settings.remote_llm_*`.
     Callers are responsible for checking `settings.remote_llm_configured`
-    first — this never probes reachability itself (#706: "the remote client
+    first — this never probes reachability itself ("the remote client
     is used unprobed, by design"), so calling it against an unconfigured
     provider will fail on the request itself, not here.
     """
@@ -493,13 +493,13 @@ def _remote_preflight_client():
 
 def _default_llm_caller(prompt: str) -> str:
     """Production caller: pick a client per `settings.agent_preflight_engine`
-    (#808), then run one short completion.
+   , then run one short completion.
 
     `agent_preflight_engine` values:
 
-    - `auto` (default): today's #704 priority order, unchanged —
+    - `auto` (default): today's priority order, unchanged —
       1. Anthropic, when `settings.anthropic_api_key` is set. Byte-identical
-         to the pre-#704 behavior of this function — same import, same
+         to the pre-behavior of this function — same import, same
          client construction, same call — because this is the maintainer's
          own install and every other install with a key configured; no
          probe runs on this branch.
@@ -509,13 +509,13 @@ def _default_llm_caller(prompt: str) -> str:
          function, this always probes once there's no Anthropic key —
          preflight has no `agent_remote_executor` flag gate to hide behind;
          it just needs *some* usable client.
-      3. Otherwise, the #699 remote provider, when `agent_remote_executor`
+      3. Otherwise, the remote provider, when `agent_remote_executor`
          and `remote_llm_configured` — mirrors the remote branch of
          `local_executor._default_llm_client`.
       4. Otherwise, raise. `run_preflight`'s existing except-clause already
          degrades this to sane=False/routing=ask — unchanged.
-    - `remote`: build the #654 remote provider FIRST (via
-      `_remote_preflight_client`), unprobed by design (#706), when
+    - `remote`: build the remote provider FIRST (via
+      `_remote_preflight_client`), unprobed by design, when
       `settings.remote_llm_configured`. A failure of the call itself (bad
       key, endpoint down, ...) is not caught here — it propagates up to
       `run_preflight`'s existing except-clause, same as every other engine.
@@ -551,7 +551,7 @@ def _default_llm_caller(prompt: str) -> str:
                 temperature=0.0,
             )
             return response.text
-        # Fail closed (#808): a forced engine never silently reverts to
+        # Fail closed: a forced engine never silently reverts to
         # another one — in particular never to the Anthropic API, which is
         # exactly the spend `remote` exists to avoid. `run_preflight`'s
         # except-clause degrades this to sane=False/routing=ask, so the
@@ -662,22 +662,19 @@ def _detect_preset_class_from_tags(tags: list[str]) -> str | None:
 
 
 # Model/engine words that count as the operator naming the Anthropic API
-# route themselves. Used to corroborate the classifier's `routing_explicit`
-# before any API dispatch happens without a confirmation (#584) — the tags
+# route themselves. Corroborates the classifier's `routing_explicit`
+# before any API dispatch happens without a confirmation — the tags
 # are checked separately.
 #
-# (#809) "cloud" was dropped from this alternation. Before #809, a title
-# merely containing the bare word "cloud" was treated as sufficient
-# corroboration for a model-claimed `routing="claude"` — safe at the time
-# because "cloud" and "the Anthropic API" were the same thing. They no
-# longer are: `#cloud` the tag now means the configured remote provider, so
-# a title that happens to say "cloud" (with no other engine word) no longer
-# unambiguously names Anthropic. Leaving it in this regex would let such a
-# title corroborate a hallucinated `routing="claude"` straight into
-# Anthropic-API spend with no confirmation — exactly the hidden-spend shape
-# #584 exists to prevent. Dropping it means that case now falls through to
+# The bare word "cloud" is deliberately excluded from this alternation.
+# `#cloud` the tag means the configured remote provider, not the Anthropic
+# API, so a title that merely says "cloud" (with no other engine word)
+# does not unambiguously name Anthropic. Including it in this regex would
+# let such a title corroborate a hallucinated `routing="claude"` straight
+# into Anthropic-API spend with no confirmation — exactly the hidden-spend
+# shape this guards against. Excluding it means that case falls through to
 # `_apply_tag_overrides`'s downgrade-to-`ask` below, which is the safe
-# default the issue calls for: inference still asks, never spends.
+# default: inference still asks, never spends.
 _TITLE_NAMES_A_CLOUD_ENGINE = re.compile(
     r"(?i)\b(claude|opus|sonnet|haiku|anthropic|api)\b"
 )
@@ -685,7 +682,7 @@ _TITLE_NAMES_A_CLOUD_ENGINE = re.compile(
 # Title phrases that corroborate an LLM-chosen `local` route — lifted
 # verbatim from the prompt's own rule-3 cue list (`_PREFLIGHT_INSTRUCTIONS`:
 # "with local agent", "using gemma"). Used by `_apply_route_corroboration`
-# (#757) the same way `_TITLE_NAMES_A_CLOUD_ENGINE` is used for cloud: a
+# the same way `_TITLE_NAMES_A_CLOUD_ENGINE` is used for cloud: a
 # route the model claims is explicit only counts when the title itself
 # backs it up.
 _TITLE_NAMES_LOCAL_ENGINE = re.compile(
@@ -699,13 +696,13 @@ _TITLE_NAMES_LOCAL_ENGINE = re.compile(
 # `#claude`/`#codex` tags in `_apply_tag_overrides`. `KNOWN_ROUTES` accepts
 # them from the model anyway (parse_preflight_response has no per-route
 # schema enforcement), so a noncompliant model can emit one — the same
-# failure mode #757 exists to catch for `local` — and this gives that case
+# failure mode exists to catch for `local` — and this gives that case
 # a corroboration check too rather than leaving it unguarded.
 _TITLE_NAMES_CLAUDE_CODE_ENGINE = re.compile(r"(?i)\bclaude\s+code\b")
 _TITLE_NAMES_CODEX_ENGINE = re.compile(r"(?i)\bcodex\b")
 
 # Per-route corroboration pattern consulted by `_apply_route_corroboration`.
-# `ROUTE_CLAUDE` is deliberately absent — `_apply_tag_overrides`'s #584
+# `ROUTE_CLAUDE` is deliberately absent — `_apply_tag_overrides`'s
 # downgrade already performs this same title-corroboration check for cloud
 # and must be left to run it alone (see that function's docstring).
 # `ROUTE_ASK` is absent too: nothing to corroborate, and `_apply_default_route`
@@ -730,18 +727,18 @@ def _has_route_override_tag(tags: list[str]) -> bool:
 
 
 def _apply_tag_overrides(result: PreflightResult, tags: list[str], title: str = "") -> PreflightResult:
-    """Apply tag-based routing/model overrides (#139 §2 precedence).
+    """Apply tag-based routing/model overrides (§2 precedence).
 
     Tag precedence (a tag always wins over preflight's LLM choice):
       `#local`        → routing=local, model=local
       `#claude`       → routing=code   (Claude Code CLI, subscription-billed)
       `#codex`        → routing=codex  (Codex CLI, subscription-billed)
-      `#hermes`       → routing=hermes (Hermes conversation, #851; model is
+      `#hermes` → routing=hermes (Hermes conversation,; model is
                          whatever Hermes reports per turn — nothing for
                          preflight to select among ALLOWED_MODELS)
       `#cloud-haiku`  → routing=claude, model=claude-haiku-4-5   (Anthropic API, explicit)
       `#cloud-sonnet` → routing=claude, model=claude-sonnet-5    (Anthropic API, explicit)
-      `#cloud`        → routing=remote, model=""  (#809: the configured remote
+      `#cloud` → routing=remote, model="" (the configured remote
                          OpenAI-compatible provider, e.g. DeepSeek via
                          Fireworks — NEVER the Anthropic API. If the remote
                          provider isn't configured, the worker parks the task
@@ -777,7 +774,7 @@ def _apply_tag_overrides(result: PreflightResult, tags: list[str], title: str = 
         result.model = ""  # CLI picks its own model from ~/.codex/config.toml
         return result
     if "hermes" in normalized:
-        # (#851) Hermes route — dispatched through HermesExecutor, which
+        # Hermes route — dispatched through HermesExecutor, which
         # opens a Hermes conversation instead of running a local CLI.
         # Hermes reports its own model per turn (model_readout.py); nothing
         # for preflight to select among ALLOWED_MODELS.
@@ -799,13 +796,12 @@ def _apply_tag_overrides(result: PreflightResult, tags: list[str], title: str = 
         result.model = MODEL_SONNET
         return result
     if "cloud" in normalized:
-        # (#809) `#cloud` now means the configured remote OpenAI-compatible
-        # provider (e.g. DeepSeek via Fireworks, #654) — never the Anthropic
+        # `#cloud` means the configured remote OpenAI-compatible
+        # provider (e.g. DeepSeek via Fireworks) — never the Anthropic
         # API. `#cloud-haiku`/`#cloud-sonnet` above are the separate,
-        # unchanged explicit Anthropic escape hatches; only the bare `#cloud`
-        # tag's meaning moved. `model` is left "" — the remote provider's
-        # model id comes from `settings.remote_llm_model` at dispatch time
-        # (the same "the engine picks its own model" pattern the
+        # explicit Anthropic escape hatches. `model` is left "" — the
+        # remote provider's model id comes from `settings.remote_llm_model`
+        # at dispatch time (the same "the engine picks its own model" pattern the
         # `#claude`/`#codex` branches above use), not something preflight
         # selects among `ALLOWED_MODELS`. Whether the remote provider is
         # actually configured is a worker-side concern (`_dispatch` parks
@@ -818,7 +814,7 @@ def _apply_tag_overrides(result: PreflightResult, tags: list[str], title: str = 
         result.model = ""
         return result
     # No tag override. A cloud route that nobody asked for must not dispatch:
-    # downgrade it to `ask` so the worker confirms first (#584). The classifier's
+    # downgrade it to `ask` so the worker confirms first. The classifier's
     # own `routing_explicit` is trusted only when the title actually contains a
     # model/engine cue — a deterministic cross-check, so a hallucinated `true`
     # still lands on the safe side. `#cloud*` tags returned above already.
@@ -848,27 +844,28 @@ def _apply_tag_overrides(result: PreflightResult, tags: list[str], title: str = 
 def _apply_route_corroboration(
     result: PreflightResult, original_routing: str, title: str, tags_list: list[str]
 ) -> PreflightResult:
-    """(#757) Demote an uncorroborated LLM-chosen `local`/`claude_code`/`codex`
+    """Demote an uncorroborated LLM-chosen `local`/`claude_code`/`codex`
     route to `settings.agent_default_route` when the title doesn't back it up.
 
     **The bug this closes.** `_apply_default_route`'s route substitution only
     fires when `result.routing == ROUTE_ASK` — any other value the model
     returned short-circuits past it untouched, on the theory that a routing
-    the model was confident enough to name outright should stand. #757 is
-    the case where that confidence was fabricated: a noncompliant model
-    invented `routing="local"` with a reason that matched none of the
-    prompt's rule-3 cues and no tag was present, and because "local" isn't
-    `ask`, the operator's `LIFEOS_AGENT_DEFAULT_ROUTE=claude_code` never got
-    a look — the session ran locally with full Bash reach into the checkout.
-    This closes that gap the same way #584 already closes it for cloud: a
-    model-claimed route counts only when the *title* corroborates it, not
-    merely when the model sets `routing_explicit=true` (which #584's own
-    comment already calls "the guess it probably is"). `routing_explicit`
-    without a title match doesn't count; `routing_explicit=False` never
-    counts, regardless of what the title says.
+    the model was confident enough to name outright should stand. This
+    function handles the case where that confidence was fabricated: a
+    noncompliant model invented `routing="local"` with a reason that matched
+    none of the prompt's rule-3 cues and no tag was present, and because
+    "local" isn't `ask`, the operator's `LIFEOS_AGENT_DEFAULT_ROUTE=claude_code`
+    never got a look — the session ran locally with full Bash reach into the
+    checkout. This closes that gap the same way `_apply_tag_overrides`'s
+    cloud-route downgrade already closes it for cloud: a model-claimed route
+    counts only when the *title* corroborates it, not merely when the model
+    sets `routing_explicit=true` on its own — that flag alone is little more
+    than the model's own guess. `routing_explicit` without a title match
+    doesn't count; `routing_explicit=False` never counts, regardless of what
+    the title says.
 
     **Scope — why `ROUTE_CLAUDE` is excluded.** `_apply_tag_overrides`'s
-    #584 downgrade already runs this exact corroboration check for cloud
+    downgrade already runs this exact corroboration check for cloud
     (same "explicit AND title names the engine" shape, over
     `_TITLE_NAMES_A_CLOUD_ENGINE`) — but on a miss, it demotes to `ROUTE_ASK`
     and asks the operator, not to the configured default. That's
@@ -879,9 +876,10 @@ def _apply_route_corroboration(
     check (below) is what keeps that `ask` from being silently rescued into
     the default. Re-running a *second*, differently-shaped corroboration
     check over `ROUTE_CLAUDE` here would risk landing a different verdict
-    than #584's and double-guessing a flow that already does its own job
-    correctly. `ROUTE_ASK` is excluded too — there's nothing to corroborate,
-    and `_apply_default_route` already owns substituting it.
+    than `_apply_tag_overrides`'s and double-guessing a flow that already
+    does its own job correctly. `ROUTE_ASK` is excluded too — there's
+    nothing to corroborate, and `_apply_default_route` already owns
+    substituting it.
 
     **Why this runs on `original_routing`, but *after* `_apply_tag_overrides`
     executes.** The corroboration question is "did the *model* justify this
@@ -901,26 +899,26 @@ def _apply_route_corroboration(
     finishes, not interleaved with it or before it: if this function wrote
     a demoted route of `ROUTE_CLAUDE` (i.e. the operator configured
     `LIFEOS_AGENT_DEFAULT_ROUTE=claude`) before `_apply_tag_overrides` ran,
-    that write would walk straight into #584's own downgrade-to-`ask` gate
+    that write would walk straight into the downgrade-to-`ask` gate
     inside `_apply_tag_overrides` and get bounced right back to `ask` —
     undoing the very substitution the operator's default-route setting
     asked for. Running after `_apply_tag_overrides` means that gate has
     already had its say on the model's *original* cloud-or-not verdict and
     won't re-examine a value it never produced. It also runs before
-    `_apply_default_route`: that function's ambiguity demotion (#751) and
+    `_apply_default_route`: that function's ambiguity demotion and
     ask-substitution are unaffected either way (they only touch `ask`
     outcomes, which this function never produces), so the relative order
     between the two doesn't matter for correctness — but sitting this one
-    directly after `_apply_tag_overrides`, next to the #584 gate it mirrors,
+    directly after `_apply_tag_overrides`, next to the gate it mirrors,
     keeps the two corroboration checks readable side by side.
 
     No-op (returns `result` unchanged) whenever: no default route is
     configured, the configured value is invalid (`_apply_default_route`,
-    called right after this, owns that validation and its loud ERROR log —
-    duplicating it here would double-log), a recognized routing tag is
+    called immediately afterward, owns that validation and its loud ERROR
+    log — duplicating it here would double-log), a recognized routing tag is
     present, `original_routing` isn't one of `local`/`claude_code`/`codex`,
     or the route is corroborated. So an unset `LIFEOS_AGENT_DEFAULT_ROUTE`
-    is byte-identical to pre-#757 behavior.
+    leaves routing byte-identical to skipping this function entirely.
     """
     if not settings.agent_default_route or settings.agent_default_route not in KNOWN_ROUTES:
         return result
@@ -929,7 +927,7 @@ def _apply_route_corroboration(
 
     corroboration_re = _ROUTE_TITLE_CORROBORATION.get(original_routing)
     if corroboration_re is None:
-        return result  # ask (nothing to corroborate) or claude (#584 owns it)
+        return result # ask (nothing to corroborate) or claude (the cloud downgrade above owns it)
 
     if result.routing_explicit and corroboration_re.search(title or ""):
         return result  # corroborated by the title — the route stands
@@ -947,10 +945,9 @@ def _apply_route_corroboration(
         f"uncorroborated {original_routing} route demoted to "
         f"LIFEOS_AGENT_DEFAULT_ROUTE={default_route}"
     )
-    # The route it came from is no longer applicable, and this substitution
-    # is the operator's standing config, not something the model or a tag
-    # named — leave routing_explicit False (mirrors #584's own downgrade,
-    # which resets it the same way).
+    # This substitution is the operator's standing config, not something the
+    # model or a tag named — leave routing_explicit False (mirrors the cloud
+    # downgrade above, which resets it the same way).
     result.routing_explicit = False
     if default_route == ROUTE_CLAUDE:
         result.model = MODEL_SONNET
@@ -968,27 +965,28 @@ def _apply_route_corroboration(
 
 
 def _apply_default_route(result: PreflightResult, original_routing: str) -> PreflightResult:
-    """Apply `settings.agent_default_route` (#707), and — as of #751 and #803
-    — demote any non-null `ambiguity` and any non-fatal `sane=False` to
-    advisory once that setting is configured and valid. Empty setting
-    (default) is a no-op, so an unset install is byte-identical to pre-#707
-    behavior; all three parts of this function are gated on the setting
+    """Apply `settings.agent_default_route`, and demote any non-null
+    `ambiguity` and any non-fatal `sane=False` to advisory once that
+    setting is configured and valid. Empty setting (default) is a no-op,
+    so an unset install is byte-identical to skipping this function
+    entirely; all three parts of this function are gated on the setting
     being non-empty and valid.
 
     Three independent things happen here, in order:
 
-    1. **Ambiguity demotion (#751).** Configuring a default route is the
+    1. **Ambiguity demotion.** Configuring a default route is the
        operator saying "run untagged tasks without asking me" — a cheap
        classifier's hedging (`ambiguity`) shouldn't override that standing
        instruction, regardless of what routing was ultimately picked. So
        once the setting is confirmed non-empty and valid, any non-null
        `result.ambiguity` is stashed on `result.demoted_ambiguity` (for the
        worker to log as advisory context) and cleared. String-matching the
-       question text (#748's approach) is whack-a-mole — the model keeps
-       rephrasing around the pattern — so this demotes unconditionally on
+       question text (`_is_routing_flavored_ambiguity`'s approach above) is
+       whack-a-mole — the model keeps rephrasing around the pattern — so
+       this demotes unconditionally on
        the *value being non-null* rather than trying to classify its prose.
 
-    2. **Sanity demotion (#803).** The same standing-instruction argument
+    2. **Sanity demotion.** The same standing-instruction argument
        applies to a non-fatal `sane=False`: the classifier has repeatedly
        called ordinary feature requests "not a task an agent can execute",
        and treating that opinion as authoritative when the operator has
@@ -1006,7 +1004,7 @@ def _apply_default_route(result: PreflightResult, original_routing: str) -> Pref
        already (see `preflight_error`), so it has nothing left for this
        step to demote. Demoting sanity here (rather than only
        logging it) also means part 3's `not result.sane` half of its gate
-       no longer blocks route substitution for a demoted verdict — a
+       doesn't block route substitution for a demoted verdict — a
        demoted sanity objection is exactly as "resolved" as a demoted
        ambiguity, so it should be able to reach the default route the same
        way.
@@ -1035,17 +1033,17 @@ def _apply_default_route(result: PreflightResult, original_routing: str) -> Pref
        being that here the classifier never got to render an opinion, cues
        or no cues.
 
-       One more `ask` source needs excluding: `_apply_tag_overrides`'s #584
+       One more `ask` source needs excluding: `_apply_tag_overrides`'s
        downgrade, which turns an *inferred* (unconfirmed) cloud route into
        `ask` specifically so it can't auto-dispatch. That result is also
        sane=True, so it would slip through the gate above — this isn't
        "lack of cues", it's a cue nobody confirmed, and silently routing it
-       via the default would undo the confirmation #584 exists for.
+       via the default would undo the confirmation exists for.
        Excluded via `original_routing`: the routing value from BEFORE
        `_apply_tag_overrides` ran. Only when the original LLM/parse outcome
        was *already* `ask` — not downgraded from `claude` — do we know this
        is genuinely nothing-to-route-on. (Ambiguity/sanity demotion in parts
-       1-2 still run on this path — the #584 downgrade blocks via
+       1-2 still run on this path — the downgrade blocks via
        `routing == ask` either way, so demoting the ambiguity/sanity text
        just avoids a redundant question, not a redundant block.)
     """
@@ -1108,7 +1106,7 @@ def _apply_preset_class(result: PreflightResult, tags: list[str]) -> PreflightRe
     """Set `result.preset_class` from an explicit `#<class>` tag if present.
 
     LLM-side preset_class emission is a follow-up; this lets operators
-    force a class today via tag while the rest of #139 §3 wiring lands.
+    force a class today via tag while the rest of §3 wiring lands.
     """
     if result.preset_class:  # honor an LLM/caller pre-set value
         return result
@@ -1119,7 +1117,7 @@ def _apply_preset_class(result: PreflightResult, tags: list[str]) -> PreflightRe
 
 
 def _apply_cost_gates(result: PreflightResult) -> PreflightResult:
-    """Compute the cache-cold cost estimate and apply #139 §6 + §7 gates.
+    """Compute the cache-cold cost estimate and apply §6 + §7 gates.
 
     §6 (fail-fast): if the estimated cache-cold dispatch cost exceeds
     2× the task's `max_dollars`, refuse via `sane=False` with reason
@@ -1139,13 +1137,14 @@ def _apply_cost_gates(result: PreflightResult) -> PreflightResult:
     # is free. Per-session $ rollups for CLI routes still populate via the
     # rollout ingest (cc:/cx: sources in /agents).
     #
-    # (#809) ROUTE_REMOTE (the `#cloud` tag's remote OpenAI-compatible
+    # ROUTE_REMOTE (the `#cloud` tag's remote OpenAI-compatible
     # provider) is real per-token spend too, but is deliberately NOT gated
     # here. The §6/§7 confirmation ceremony exists specifically for the
     # Anthropic API — the operator's standing "expensive exception" — not
     # for third-party spend in general; the remote provider is treated like
-    # local/CLI for preflight cost-preview purposes, the same way #699's
-    # remote-fallback path never triggered this gate either. Real spend
+    # local/CLI for preflight cost-preview purposes, the same way
+    # `local_executor._default_llm_client`'s remote-fallback path never
+    # triggers this gate either. Real spend
     # still records correctly regardless — see
     # `local_executor.LocalExecutor._record_spend`'s `is_remote` branch.
     if result.routing != ROUTE_CLAUDE:
@@ -1198,9 +1197,9 @@ def _apply_cost_gates(result: PreflightResult) -> PreflightResult:
 
 def _finish(result: PreflightResult, tags_list: list[str], title: str = "") -> PreflightResult:
     """Shared post-processing pipeline for every `run_preflight` return path:
-    sanity gate (#747) > tag overrides > route corroboration (#757) > default
-    route (#707, now also demoting ambiguity per #751) > preset class > cost
-    gates.
+    sanity gate > tag overrides > route corroboration > default
+    route (which also demotes ambiguity and sanity, see step 4 below) >
+    preset class > cost gates.
 
     Precedence, and why each sits where it does:
 
@@ -1211,73 +1210,75 @@ def _finish(result: PreflightResult, tags_list: list[str], title: str = "") -> P
          deterministic destructive-title regex); it never demotes anything.
          A `sane_fatal` verdict fails the task closed regardless of
          routing/ambiguity/default-route configuration (checked immediately
-         in the worker, before any of them is consulted) — #751 and #803
-         both leave this untouched, since a default route answers "who
+         in the worker, before any of them is consulted) — the ambiguity
+         and sanity demotions in `_apply_default_route` (step 4) both
+         leave this untouched, since a default route answers "who
          resolves an open question" / "does this cheap opinion outrank a
          standing instruction", never "should this task run at all" once
          the code itself has flagged it destructive. A non-fatal
          `sane=False` — the model's own inferred opinion, not code-
          established — parks the task by default, unless step 4 below
-         demotes it (#803).
+         demotes it.
       2. **Tags** (`_apply_tag_overrides`) — the operator retagging a task
          is the most direct, most recent signal available; always wins,
-         over both the model's routing and (since #757) route corroboration.
+         over both the model's routing and `_apply_route_corroboration`.
       3. **Corroborated LLM route** — a routing the model returned (not
-         `ask`) stands only when the *title* backs it up (`_apply_route_
-         corroboration`, #757). This is the piece that used to be an
-         unconditional "explicit LLM route always wins": before #757, any
-         non-`ask` value from the model — including one it invented with no
-         cue at all — skipped `_apply_default_route`'s substitution
-         entirely, because that function only fires on `ask`. A model that
-         hallucinated `routing="local"` with a fabricated-sounding reason
-         (the field case this issue exists for) therefore silently beat a
-         configured `LIFEOS_AGENT_DEFAULT_ROUTE`. `_apply_route_
-         corroboration` closes that: for `local`/`claude_code`/`codex`, an
-         LLM route now needs `routing_explicit=True` *and* a matching
-         rule-3-style title cue to survive; otherwise it's demoted to the
-         configured default and logged (`demoted_routing`), mirroring how
-         #751 demotes `ambiguity`. `ROUTE_CLAUDE` is excluded from this
-         step on purpose — see point 3a.
-      3a. **Cloud is `_apply_tag_overrides`'s job, not #757's.** An
-         uncorroborated cloud route already gets its own, older
-         corroboration check inside `_apply_tag_overrides` (#584) — same
-         "explicit AND title names the engine" shape, but it demotes a miss
-         to `ROUTE_ASK` (a confirmation question) rather than to the
-         default route, because API spend is a real cost decision that
-         must stay a question even on an install with a default route
-         configured for everything else. `_apply_route_corroboration`
-         running *after* `_apply_tag_overrides` (not before, not
-         interleaved) is what keeps the two independent: if it ran first
-         and wrote a demoted route of `claude` (an operator could configure
-         `LIFEOS_AGENT_DEFAULT_ROUTE=claude`), that write would walk
-         straight back into #584's downgrade gate and get bounced to `ask`,
-         undoing the demotion the default-route setting asked for.
-      4. **Default route** (`_apply_default_route`, #707) — substitutes
+         `ask`) stands only when the *title* backs it up
+         (`_apply_route_corroboration`). Without this check, any non-`ask`
+         value from the model — including one it invented with no cue at
+         all — skips `_apply_default_route`'s substitution entirely,
+         because that function only fires on `ask`. A model that
+         hallucinates `routing="local"` with a fabricated-sounding reason
+         would therefore silently beat a configured
+         `LIFEOS_AGENT_DEFAULT_ROUTE`. `_apply_route_corroboration` closes
+         that: for `local`/`claude_code`/`codex`, an LLM route needs
+         `routing_explicit=True` *and* a matching rule-3-style title cue to
+         survive; otherwise it's demoted to the configured default and
+         logged (`demoted_routing`), mirroring how step 4 demotes
+         `ambiguity`. `ROUTE_CLAUDE` is excluded from this step on purpose
+         — see point 3a.
+      3a. **Cloud is `_apply_tag_overrides`'s job, not `_apply_route_
+         corroboration`'s.** An uncorroborated cloud route already gets
+         its own, older corroboration check inside `_apply_tag_overrides`
+         — same "explicit AND title names the engine" shape, but it
+         demotes a miss to `ROUTE_ASK` (a confirmation question) rather
+         than to the default route, because API spend is a real cost
+         decision that must stay a question even on an install with a
+         default route configured for everything else.
+         `_apply_route_corroboration` running *after* `_apply_tag_overrides`
+         (not before, not interleaved) is what keeps the two independent:
+         if it ran first and wrote a demoted route of `claude` (an operator
+         could configure `LIFEOS_AGENT_DEFAULT_ROUTE=claude`), that write
+         would walk straight back into `_apply_tag_overrides`'s downgrade
+         gate and get bounced to `ask`, undoing the demotion the
+         default-route setting asked for.
+      4. **Default route** (`_apply_default_route`) — substitutes
          `ask` for the configured route only when nothing above produced a
-         real answer. As of #751, this step *also* demotes a non-null
-         `ambiguity` to advisory (logged, not blocking) whenever the setting
-         is configured and valid — independent of whether step 4's route
-         substitution itself fires, since a corroborated route (step 3) can
-         still carry a stale ambiguity the model should not have set. As of
-         #803, it does the same for a non-fatal `sane=False`: the model's
-         own "not executable" opinion is demoted to advisory
-         (`demoted_sanity`, logged, not blocking) under the identical gate,
-         and `sane` is set back to True in the same step — a demoted
-         sanity objection is therefore just as capable of clearing this same
-         step's own route-substitution gate as a demoted ambiguity is,
-         since that gate also requires `result.sane`. `sane_fatal` verdicts never reach this
-         demotion (step 1 already established `sane_fatal` and the demotion
-         is gated on `not result.sane_fatal`), so fail-closed behavior for
+         real answer. This step *also* demotes a non-null `ambiguity` to
+         advisory (logged, not blocking) whenever the setting is configured
+         and valid — independent of whether step 4's route substitution
+         itself fires, since a corroborated route (step 3) can still carry
+         a stale ambiguity the model should not have set. It does the same
+         for a non-fatal `sane=False`: the model's own "not executable"
+         opinion is demoted to advisory (`demoted_sanity`, logged, not
+         blocking) under the identical gate, and `sane` is set back to True
+         in the same step — a demoted sanity objection is therefore just as
+         capable of clearing this same step's own route-substitution gate
+         as a demoted ambiguity is, since that gate also requires
+         `result.sane`. `sane_fatal` verdicts never reach this demotion
+         (step 1 already established `sane_fatal` and the demotion is
+         gated on `not result.sane_fatal`), so fail-closed behavior for
          empty titles and destructive-title matches is unaffected regardless
          of the setting. A preflight-call/parse error is excluded from route
          substitution by this same step's own `not result.preflight_error`
          clause instead — see `_apply_default_route` — since it carries no
-         verdict for this demotion to act on in the first place. This step's own
-         `original_routing` exclusion (only substitutes when the *pre-tag*
-         routing was already `ask`) is what keeps #584's downgraded-to-`ask`
-         cloud case from being rescued here too — see 3a.
+         verdict for this demotion to act on in the first place. This step's
+         own `original_routing` exclusion (only substitutes when the
+         *pre-tag* routing was already `ask`) is what keeps
+         `_apply_tag_overrides`'s downgraded-to-`ask` cloud case from being
+         rescued here too — see 3a.
       5. **Ask** — the fallback when nothing above resolved routing, or the
-         #584 unconfirmed-cloud downgrade parked it there.
+         unconfirmed-cloud downgrade parked it there.
 
     Centralized (rather than each return path chaining the calls itself) so
     `original_routing` is captured exactly once, right after the

@@ -1,20 +1,14 @@
 """Per-model pricing for budget enforcement.
 
 Prices are dollars per token. The Anthropic figures match
-https://platform.claude.com/docs/en/about-claude/pricing as verified 2026-08-23
-(#655 — this pass also caught the Opus 4.6/4.7/4.8 and Sonnet 5 entries
-below being wrong; see the inline notes).
+https://platform.claude.com/docs/en/about-claude/pricing as verified 2026-08-23.
 Update when models change.
 
 This is the **only** live pricing table in LifeOS — `cost_for()` below is
 called from every place that turns tokens into dollars: the agent worker
 (`managed_executor.py`, `managed_driver.py`, `local_executor.py`), the
 Claude Code session cost rollup (`claude_code/session_ingest.py`), and the
-cost-estimate endpoint (`routes/tasks.py`). A second, long-dead pricing
-table used to live in `api/services/cost_tracker.py` (tier-word keyed,
-disagreed with this one on Haiku) — it had no callers outside its own
-module and was removed in #656 rather than left as a second
-plausible-looking source of truth. Hermes-routed turns are the one
+cost-estimate endpoint (`routes/tasks.py`). Hermes-routed turns are the one
 exception: Hermes prices those upstream and LifeOS records `cost_usd`
 verbatim (see `_HermesTurnPersister` in `routes/hermes_proxy.py`) rather
 than recomputing it through this table.
@@ -42,12 +36,10 @@ PRICING: dict[str, dict[str, float]] = {
     # most expensive tier Anthropic currently serves, at $10/$50 per Mtok.
     # Not routed to by any LifeOS alias today, but listed here so a usage
     # row naming either (e.g. a manually-configured escalation model)
-    # prices correctly instead of falling through to fallback_rates() (#655).
+    # prices correctly instead of falling through to fallback_rates().
     "claude-fable-5":    {"input": 10.0e-6, "output": 50.0e-6},
     "claude-mythos-5":   {"input": 10.0e-6, "output": 50.0e-6},
     # Opus 5 / 4.8 / 4.7 / 4.6 / 4.5 all share the same $5/$25-per-Mtok rate.
-    # 4.8/4.7/4.6 were incorrectly 15.0e-6/75.0e-6 (Opus 4/4.1's retired
-    # rate) until #655.
     "claude-opus-5":     {"input":  5.0e-6, "output": 25.0e-6},
     "claude-opus-4-8":   {"input":  5.0e-6, "output": 25.0e-6},
     "claude-opus-4-7":   {"input":  5.0e-6, "output": 25.0e-6},
@@ -55,26 +47,24 @@ PRICING: dict[str, dict[str, float]] = {
     "claude-opus-4-5":   {"input":  5.0e-6, "output": 25.0e-6},
     # $2.00/$10.00 per Mtok — Sonnet 5's launch "introductory" rate became
     # the permanent rate (Anthropic cancelled the scheduled 2026-09-01
-    # increase to $3/$15). Was incorrectly 3.0e-6/15.0e-6 until #655.
+    # increase to $3/$15).
     "claude-sonnet-5":   {"input":  2.0e-6, "output": 10.0e-6},
     "claude-sonnet-4-6": {"input":  3.0e-6, "output": 15.0e-6},
     "claude-sonnet-4-5": {"input":  3.0e-6, "output": 15.0e-6},
-    # Retired but still referenced by historical usage rows (#656) — same
+    # Retired but still referenced by historical usage rows — same
     # rate as Sonnet 4.5/4.6 per Anthropic's pricing page.
     "claude-sonnet-4":   {"input":  3.0e-6, "output": 15.0e-6},
-    # $1.00/$5.00 per Mtok (Haiku 4.5's actual published rate). Was
-    # incorrectly 0.8e-6/4.0e-6 (Haiku 3.5's retired rate) until #656.
+    # $1.00/$5.00 per Mtok (Haiku 4.5's actual published rate).
     "claude-haiku-4-5":  {"input":  1.0e-6, "output":  5.0e-6},
     # Retired tiers, still served on Bedrock/Vertex and still named by
-    # historical usage rows -- absent until #669, which meant a row
-    # referencing one of these resolved to fallback_rates() and *understated*
-    # the Opus pair (fallback is $10/$50; these are the pricier $15/$75).
+    # historical usage rows. Without them here, a row referencing one
+    # would resolve to fallback_rates() and *understate* the Opus pair
+    # (fallback is $10/$50; these are the pricier $15/$75).
     # $15/$75 per Mtok, per https://platform.claude.com/docs/en/about-claude/pricing
     # (verified 2026-08-24).
     "claude-opus-4-1":   {"input": 15.0e-6, "output": 75.0e-6},
     "claude-opus-4":     {"input": 15.0e-6, "output": 75.0e-6},
-    # $0.80/$4.00 per Mtok -- Haiku 3.5's actual (retired) rate, same figure
-    # claude-haiku-4-5 was incorrectly assigned until #656.
+    # $0.80/$4.00 per Mtok -- Haiku 3.5's actual (retired) rate.
     "claude-haiku-3-5":  {"input":  0.8e-6, "output":  4.0e-6},
 
     # Local backend (llama-server) — compute is free.
@@ -86,7 +76,7 @@ PRICING: dict[str, dict[str, float]] = {
 # rows price correctly, but they are excluded from fallback_rates(): the ceiling
 # for an *unrecognized* model must be the priciest tier still being served, not
 # a retired one. Without this, adding Opus 4/4.1 ($15/$75 — pricier than any
-# current tier) silently raised every unknown-model estimate by 50% (#669).
+# current tier) silently raised every unknown-model estimate by 50%.
 RETIRED_MODELS: frozenset[str] = frozenset({
     "claude-opus-4-1",
     "claude-opus-4",
@@ -98,7 +88,7 @@ RETIRED_MODELS: frozenset[str] = frozenset({
 # "claude-sonnet-4-5-20250929" -> "claude-sonnet-4-5". Real usage rows
 # (Claude Code sessions in particular) record the exact snapshot id the API
 # echoed back rather than the bare tier id above, so a lookup needs both
-# forms to keep historical rows priced (#656).
+# forms to keep historical rows priced.
 _DATED_SNAPSHOT_SUFFIX = re.compile(r"-\d{8}$")
 
 
@@ -116,7 +106,7 @@ def is_known_model(model: str) -> bool:
     suffix) has a rate in PRICING.
 
     Exists for a caller that must distinguish "this model is genuinely
-    free" from "this model's rate is unknown" (#661) — `cost_for` collapses
+    free" from "this model's rate is unknown" — `cost_for` collapses
     that distinction into a conservative Opus-rate estimate, which is the
     right call for its existing budget-enforcement callers (an
     underestimate there could blow past a spend cap) but wrong for a usage
@@ -131,8 +121,7 @@ def fallback_rates() -> dict[str, float]:
     """Rates for an unrecognized model id: the priciest *currently-served* tier.
 
     Computed from the table rather than naming a specific model id, so this
-    doesn't itself go stale the next time a new top-tier model ships (as
-    happened across Opus 4.6/4.7/4.8 before #655).
+    doesn't itself go stale the next time a new top-tier model ships.
     """
     return max(
         (

@@ -166,20 +166,20 @@ class ExecutorOutcome:
     # remote session. Worker uses this to append a footer to the completion
     # summary so the operator knows which connectors are broken.
     init_failed_mcps: list[str] = field(default_factory=list)
-    # #699 — non-empty only when this session actually ran on the flag-gated
+    # — non-empty only when this session actually ran on the flag-gated
     # remote fallback provider (the model id it ran on). Empty for the
     # ordinary local llama-server path, including every install with the
     # flag off or the remote provider unconfigured. worker.py uses this to
-    # report what actually served the session (the #658 principle: report
+    # report what actually served the session (the principle: report
     # observed, not configured) instead of just the static "local" label.
     served_by: str = ""
-    # #760 — claude_code/codex-only: how many [NOTIFY]s the executor sent
+    # — claude_code/codex-only: how many [NOTIFY]s the executor sent
     # during this run (always 0 for codex, which has no notify convention).
     # Consumed by completion_signal.has_positive_completion_signal to decide
     # whether a nominal STATUS_COMPLETED outcome is an earned completion or
     # an interrupted mid-work session.
     notifications_sent: int = 0
-    # #760 — claude_code/codex-only: best-effort description of how the CLI
+    # — claude_code/codex-only: best-effort description of how the CLI
     # subprocess ended (returncode / signal / timed_out / whether a genuine
     # terminal stream event was seen), for the terminal transcript event.
     exit_meta: dict = field(default_factory=dict)
@@ -279,9 +279,9 @@ def _system_prompt(session_id: str, expected_output: str, budget, parent_session
     cache hits; only the small dynamic trailer changes per session.
 
     `session_id` and `parent_session_id` are accepted for backwards
-    compatibility with the issue #103 §5 inter-agent flow but no longer
-    injected into the prompt body — the model can't act on either, and
-    both are tracked in `lifeos_agent_sessions_list` / transcripts.
+    compatibility with the §5 inter-agent flow but are not injected into
+    the prompt body — the model can't act on either, and both are tracked
+    in `lifeos_agent_sessions_list` / transcripts.
     """
     del parent_session_id  # logging-only, not for the model
     wall = budget.get("wall_seconds")
@@ -413,11 +413,11 @@ def _default_llm_client(model_name: str) -> tuple[object, str, bool]:
 
     Default: bare `LocalLLMClient()` against the local llama-server,
     `model_name` unchanged (the caller's default, "local"), `is_remote`
-    False — byte-identical to the executor's pre-#699 construction
-    whenever the flag is off or the remote provider (#654) isn't fully
-    configured. That's the operator's standing behavior-neutrality
-    requirement, so both conditions are checked before this function does
-    anything else network-shaped.
+    False — this is the plain local construction, taken whenever the flag
+    is off or the remote provider isn't fully configured. That's the
+    operator's standing behavior-neutrality requirement, so both
+    conditions are checked ahead of anything else this function does
+    that's network-shaped.
 
     When `settings.agent_remote_executor` is on AND the remote OpenAI-
     compatible provider is configured, this does exactly one cheap
@@ -425,12 +425,10 @@ def _default_llm_client(model_name: str) -> tuple[object, str, bool]:
     `LocalLLMClient.is_available()`, a single short-timeout GET /health —
     at session-construction time. Deliberately not a background prober:
     llama-server either answers right now or it doesn't, and checking
-    once, right when we're about to use it, is cheap and honest. This is
-    also the #688 lesson applied in reverse — that issue was "configured"
-    silently standing in for "reachable"; the mirror-image mistake here
-    would be treating "remote is configured" as license to skip actually
-    checking whether local is still up, so the check happens regardless
-    of how confident the config looks.
+    once, right when we're about to use it, is cheap and honest. This also
+    guards the mirror-image mistake: treating "remote is configured" as
+    license to skip actually checking whether local is still up, so the
+    check happens regardless of how confident the config looks.
 
     - Local reachable   → local wins. Explicit `#agent local` routing on a
       host with a live llama-server is unaffected — remote is a fallback,
@@ -458,14 +456,14 @@ def _default_llm_client(model_name: str) -> tuple[object, str, bool]:
 
 
 def _remote_only_llm_client() -> tuple[object, str, bool]:
-    """(#809) Construct an LLM client pointed unconditionally at the
+    """Construct an LLM client pointed unconditionally at the
     configured remote OpenAI-compatible provider — the `#cloud` tag's
     executor. Returns `(client, model_name, is_remote=True)`.
 
     Unlike `_default_llm_client`, this never checks local llama-server
     reachability and never falls back to local: `#cloud` means "run on the
     remote provider", full stop, not "prefer it, fall back if it's down".
-    That's a deliberate, narrow difference from the #699 fallback above —
+    That's a deliberate, narrow difference from the fallback above —
     same underlying `LocalLLMClient` pointed at the same settings, but a
     first-class route (`ROUTE_REMOTE`) rather than a contingency for when
     local is unreachable. Also unlike `_default_llm_client`, this is not
@@ -513,7 +511,7 @@ class LocalExecutor:
             llm_client, model_name, is_remote = _default_llm_client(model_name)
         self.llm = llm_client
         self.model_name = model_name
-        # (#699) True iff this executor is running on the flag-gated remote
+        # True iff this executor is running on the flag-gated remote
         # fallback provider rather than the local llama-server. Drives both
         # spend pricing (_record_spend) and the served_by attribution on
         # ExecutorOutcome. Only ever True via `_default_llm_client`'s own
@@ -624,11 +622,11 @@ class LocalExecutor:
             if budget.get("max_tokens") and tokens_used >= budget["max_tokens"]:
                 return self._finalize_budget_exceeded(session, "max_tokens")
             # No per-session dollar cap in this loop — on the local route
-            # inference is free, so total_dollars is always 0. On the #809
+            # inference is free, so total_dollars is always 0. On the
             # remote-forced route (`self.is_remote`) it is real, non-zero
             # spend (see `_record_spend`), but this loop still doesn't cap
-            # it mid-run — the same pre-existing gap #699's remote-fallback
-            # path already shipped with, not something #809 introduces.
+            # it mid-run — the same pre-existing gap the remote-fallback
+            # path ships with, not something newly introduced here.
             # (max_tokens + wall_seconds still bound runaway sessions either
             # way; the lineage guard below still caps a family whose *root*
             # is a paid managed session.)
@@ -804,7 +802,7 @@ class LocalExecutor:
             else:
                 messages_for_llm.append(entry)
 
-        # (#851) Per-session thinking override. `effort` is the board's
+        # Per-session thinking override. `effort` is the board's
         # assignment field (`low|medium|high|max`); `high`/`max` turns
         # thinking on, `low`/`medium` turns it off, and unset/unrecognized
         # falls back to `settings.local_agent_enable_thinking` — same
@@ -815,7 +813,7 @@ class LocalExecutor:
         #
         # Gated on `isinstance(self.llm, LocalLLMClient)` — the exact same
         # check `run_agent_loop` uses — for two independent reasons: (1) the
-        # #809 remote-forced route (`self.is_remote`) is ALSO a LocalLLMClient
+        # remote-forced route (`self.is_remote`) is ALSO a LocalLLMClient
         # instance (same OpenAI-compatible plumbing) but isn't llama-server —
         # it doesn't understand llama-server's `chat_template_kwargs` switch,
         # so `enable_thinking` must never reach it (mirrors `run_agent_loop`'s
@@ -903,16 +901,15 @@ class LocalExecutor:
         This is a **record** path, not an estimate: an unrecognized model
         must not be silently billed at cost_for's conservative fallback
         rate (that's the right call for a *budget* estimate, wrong here) --
-        it's recorded as $0 and the session is flagged `unpriced` instead
-        (#669).
+        it's recorded as $0 and the session is flagged `unpriced` instead.
 
-        (#699) The remote fallback provider's model id (e.g. a Fireworks
+        The remote fallback provider's model id (e.g. a Fireworks
         path) is never in pricing.PRICING -- that table is Anthropic-only
         plus the free "local" sentinel. Its rate, when known, comes from
-        `settings.remote_llm_{input,output}_price_per_mtok` instead (set
-        by #654), mirroring the `force_remote` branch in
+        `settings.remote_llm_{input,output}_price_per_mtok` instead
+        (operator-configured), mirroring the `force_remote` branch in
         `agent_loop.py`'s `_track_usage` exactly. Unset rates still record
-        as real, unpriced spend -- never fallback-priced, same #669
+        as real, unpriced spend -- never fallback-priced, same
         convention as the unknown-model branch below.
         """
         usage = getattr(response, "usage", None)
@@ -1004,12 +1001,12 @@ class LocalExecutor:
             )
 
     def _served_by(self) -> str:
-        """(#699) Model id that actually ran this session, when that
+        """Model id that actually ran this session, when that
         differs from what the routing name ("local") implies -- i.e. this
         executor is on the flag-gated remote fallback. Empty for the
         ordinary local llama-server path, so a caller (worker.py) only
         needs to add anything to its messaging when there's something
-        worth reporting (#658: report observed, not configured)."""
+        worth reporting (report observed, not configured)."""
         return self.model_name if self.is_remote else ""
 
     def _finalize_completed(self, session, final_text: str) -> ExecutorOutcome:
