@@ -783,6 +783,87 @@ def test_marker_governs_only_the_nearby_span_in_an_unpunctuated_run_on():
     assert action.action_evidence == "call the synthetic plumber"
 
 
+def test_marker_governs_only_its_own_short_bystander_span_within_the_window():
+    """The old ±30-char governance window bounded distance, not specificity:
+    two short spans close together in an "and"-chained clause must not both
+    file just because they sit near the marker -- only the span whose own
+    segment carries the marker may. Both spans stay short and close to the
+    marker on purpose: a long bystander span (as in
+    ``test_marker_governs_only_the_nearby_span_in_an_unpunctuated_run_on``)
+    would fall outside even the old fixed-radius window and so could not
+    catch this."""
+    transcript = "add a task to buy milk and feed the cat before dinner"
+    actions = validate_plan(
+        [
+            {
+                "kind": "task", "index": 0, "title": "buy milk",
+                "action_evidence": "buy milk",
+            },
+            {
+                "kind": "task", "index": 1, "title": "feed the cat before dinner",
+                "action_evidence": "feed the cat before dinner",
+            },
+        ],
+        transcript=transcript,
+        recorded_at="2030-01-01T10:00:00Z",
+    )
+    [action] = actions
+    assert action.action_evidence == "buy milk"
+
+
+def test_comma_chained_spoken_list_files_only_the_marker_governed_span():
+    transcript = "remind me to check the mail, buy milk, walk the dog"
+    actions = validate_plan(
+        [
+            {
+                "kind": "task", "index": 0, "title": "check the mail",
+                "action_evidence": "check the mail",
+            },
+            {
+                "kind": "task", "index": 1, "title": "buy milk",
+                "action_evidence": "buy milk",
+            },
+            {
+                "kind": "task", "index": 2, "title": "walk the dog",
+                "action_evidence": "walk the dog",
+            },
+        ],
+        transcript=transcript,
+        recorded_at="2030-01-01T10:00:00Z",
+    )
+    [action] = actions
+    assert action.action_evidence == "check the mail"
+
+
+def test_unrelated_delegation_marker_does_not_govern_a_later_bystander_span():
+    """"assign it to Codex" governs the pronoun "it", not an unrelated span
+    that merely follows it in the same clause."""
+    transcript = "assign it to Codex then call the pharmacy for a refill"
+    assert validate_plan([{
+        "kind": "task", "index": 0, "title": "call the pharmacy for a refill",
+        "action_evidence": "call the pharmacy for a refill",
+    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z") == []
+
+
+def test_comma_delegation_still_files_with_its_tag_non_regression():
+    transcript = "Add a task assigned to #claude, to review the synthetic report."
+    [action] = validate_plan([{
+        "kind": "task", "index": 0, "title": "Review the synthetic report", "tags": ["claude"],
+        "delegation_evidence": transcript,
+        "action_evidence": "review the synthetic report",
+    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    assert action.tags == ("claude",)
+
+
+def test_conjunction_spanning_evidence_still_files_as_one_task_non_regression():
+    transcript = "Add a task to buy synthetic milk and synthetic eggs."
+    [action] = validate_plan([{
+        "kind": "task", "index": 0, "title": "buy synthetic milk and synthetic eggs",
+        "action_evidence": "buy synthetic milk and synthetic eggs",
+    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    assert action.action_evidence == "buy synthetic milk and synthetic eggs"
+
+
 def test_task_delegation_is_scoped_to_the_named_action_not_the_whole_capture():
     transcript = "Buy milk. Assign code repair to Codex."
     actions = validate_plan([
@@ -923,6 +1004,59 @@ def test_scheduled_pronoun_delegation_accepts_an_ordinary_action_verb():
         "action_evidence": "investigate it",
     }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
     assert action.executor == "codex"
+
+
+def _plumber_task_and_schedule():
+    transcript = "Have #claude call the plumber tomorrow."
+    task = {
+        "kind": "task", "index": 0, "title": "call the plumber",
+        "action_evidence": "call the plumber tomorrow",
+    }
+    schedule = {
+        "kind": "schedule", "index": 1, "title": "call the plumber",
+        "schedule_type": "once", "schedule_value": "2030-01-02T09:00:00",
+        "timezone": "UTC", "action": "agent", "executor": "claude",
+        "delegation_evidence": transcript,
+        "action_evidence": "call the plumber tomorrow",
+    }
+    return transcript, task, schedule
+
+
+def test_plain_task_evidence_consumption_never_aborts_an_independent_agent_schedule():
+    """A plain, untagged task's evidence consumption must not feed the set
+    the agent-schedule authority gate reads: that gate raises on collision,
+    so an unrelated plain task ordered first must never abort a
+    fully-evidenced, independently valid agent schedule."""
+    transcript, task, schedule = _plumber_task_and_schedule()
+    result = validate_plan(
+        [task, schedule], transcript=transcript, recorded_at="2030-01-01T10:00:00Z"
+    )
+    kinds = [(a.kind, a.index) for a in result]
+    assert ("schedule", 1) in kinds
+
+
+def test_agent_schedule_files_alone_with_the_same_evidence():
+    transcript, _task, schedule = _plumber_task_and_schedule()
+    [action] = validate_plan(
+        [schedule], transcript=transcript, recorded_at="2030-01-01T10:00:00Z"
+    )
+    assert action.kind == "schedule"
+    assert action.executor == "claude"
+
+
+def test_agent_schedule_ordered_first_still_blocks_a_reused_plain_task():
+    """The pre-existing cross-kind guard in the other direction is
+    unaffected: a schedule that spends a span first still blocks a later
+    task from reusing the identical evidence."""
+    transcript, task, schedule = _plumber_task_and_schedule()
+    schedule_first = {**schedule, "index": 0}
+    task_second = {**task, "index": 1}
+    result = validate_plan(
+        [schedule_first, task_second],
+        transcript=transcript,
+        recorded_at="2030-01-01T10:00:00Z",
+    )
+    assert [(a.kind, a.index) for a in result] == [("schedule", 0)]
 
 
 @pytest.mark.parametrize(

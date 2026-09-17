@@ -66,12 +66,48 @@ _PLAIN_TASK_FILING_RE = re.compile(
     re.I,
 )
 
-# How many characters an action_evidence span may sit from a filing marker
-# within the same clause and still count as governed by it. A marker must
-# govern the specific evidence span next to it, not merely co-occur
-# somewhere else in a long, unpunctuated transcript (common in voice
-# captures).
-_TASK_REQUEST_GOVERNANCE_WINDOW = 30
+# A comma or coordinating conjunction starts a new candidate request within
+# one positive clause: unpunctuated voice transcripts routinely chain
+# several unrelated requests together, so a marker must govern the specific
+# segment its evidence span starts in, not merely co-occur somewhere else in
+# the same clause. A comma directly followed by "please" is not a request
+# boundary: it is the same direct-address shape the marker patterns
+# themselves already span ("Codex, please handle this"; see
+# `_explicit_tags`), so splitting there would sever a name from its verb.
+_TASK_REQUEST_SEGMENT_RE = re.compile(
+    r"\b(?:and\s+then|and|then|also|plus|as\s+well\s+as)\b|,(?!\s*please\b)", re.I
+)
+# An infinitive complement ("to review...", "so that...", "in order to...")
+# continues the request that precedes it rather than starting a new one, so
+# it is merged back into the segment before it.
+_TASK_REQUEST_CONTINUATION_RE = re.compile(
+    r"^\s*(?:to|so\s+that|in\s+order\s+to)\s+\w", re.I
+)
+
+
+def _task_request_segments(clause: str) -> list[tuple[int, int]]:
+    """Split one positive clause into candidate-request spans.
+
+    Coordinating conjunctions and commas start a new segment; an infinitive
+    complement immediately after one is merged back into the segment before
+    it because it continues the same request instead of starting a new one
+    (e.g. "assigned to #claude, to review the report" is one request, not
+    two).
+    """
+    raw: list[tuple[int, int]] = []
+    last = 0
+    for match in _TASK_REQUEST_SEGMENT_RE.finditer(clause):
+        raw.append((last, match.start()))
+        last = match.end()
+    raw.append((last, len(clause)))
+    raw = [(start, end) for start, end in raw if clause[start:end].strip()]
+    merged: list[tuple[int, int]] = []
+    for start, end in raw:
+        if merged and _TASK_REQUEST_CONTINUATION_RE.match(clause[start:end]):
+            merged[-1] = (merged[-1][0], end)
+        else:
+            merged.append((start, end))
+    return merged
 
 
 class PebbleCaptureError(ValueError):
@@ -630,9 +666,10 @@ def _explicit_task_request(transcript: str, action_evidence: str) -> bool:
     ``evidence`` argument, so a marker and its action must share one clause.
 
     A shared clause is not enough on its own: unpunctuated voice transcripts
-    routinely chain several unrelated requests into one clause, so the marker
-    must also *govern* this specific evidence span -- start at or within
-    ``_TASK_REQUEST_GOVERNANCE_WINDOW`` characters of it -- rather than merely
+    routinely chain several unrelated requests into one clause ("and"/"then"/
+    comma-joined), so the marker must also *govern* this specific evidence
+    span -- the span must *start* inside a segment of the clause
+    (`_task_request_segments`) that itself carries a marker, not merely
     appear somewhere else in the same clause.
     """
     if not action_evidence:
@@ -642,19 +679,19 @@ def _explicit_task_request(transcript: str, action_evidence: str) -> bool:
         if not _explicit_action_evidence(transcript, clause, action_evidence):
             continue
         clause_key = clause.casefold()
-        start = 0
-        while (offset := clause_key.find(action_key, start)) >= 0:
-            window = clause[
-                max(0, offset - _TASK_REQUEST_GOVERNANCE_WINDOW):
-                offset + len(action_evidence) + _TASK_REQUEST_GOVERNANCE_WINDOW
-            ]
-            if (
-                _PLAIN_TASK_FILING_RE.search(window)
-                or _explicit_tags(window)
-                or _scheduled_executors(window)
+        for seg_start, seg_end in _task_request_segments(clause):
+            segment = clause[seg_start:seg_end]
+            if not (
+                _PLAIN_TASK_FILING_RE.search(segment)
+                or _explicit_tags(segment)
+                or _scheduled_executors(segment)
             ):
-                return True
-            start = offset + 1
+                continue
+            start = 0
+            while (offset := clause_key.find(action_key, start)) >= 0:
+                if seg_start <= offset < seg_end:
+                    return True
+                start = offset + 1
     return False
 
 
@@ -746,6 +783,13 @@ def validate_plan(raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at
     seen_indexes: set[int] = set()
     used_delegations: set[str] = set()
     used_action_evidence: set[str] = set()
+    # Read only by the agent-schedule authority gate below. A plain,
+    # non-delegated task's evidence consumption must not feed it -- that
+    # gate raises on collision, and an independently-valid agent schedule
+    # must never be aborted by an unrelated plain task that merely happened
+    # to cite the same span first. Only a delegated task (one that actually
+    # carries a proven assignee tag) or a filed schedule writes here.
+    used_scheduled_delegation_evidence: set[str] = set()
     for raw_action in raw:
         if not isinstance(raw_action, dict):
             raise PebbleCaptureError("classifier action must be an object")
@@ -809,10 +853,13 @@ def validate_plan(raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at
                 continue
             if action_evidence:
                 used_action_evidence.add(action_key)
-            if any(tag in _VALID_TASK_ASSIGNEES for tag in normalized_tags):
+            is_delegated_task = any(tag in _VALID_TASK_ASSIGNEES for tag in normalized_tags)
+            if is_delegated_task:
                 title = _safe_markdown_text(
                     action_evidence, field="action_evidence", limit=500
                 )
+                if action_evidence:
+                    used_scheduled_delegation_evidence.add(action_key)
             action = replace(action, title=title, due_date=due)
         elif kind == "schedule":
             schedule_type = raw_action.get("schedule_type")
@@ -850,13 +897,14 @@ def validate_plan(raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at
                 action_key = action_evidence.casefold()
                 if (executor not in _VALID_EXECUTORS
                         or evidence_key in used_delegations
-                        or action_key in used_action_evidence
+                        or action_key in used_scheduled_delegation_evidence
                         or not _explicit_scheduled_delegation(
                             transcript, executor, evidence, action_evidence
                         )):
                     raise PebbleCaptureError("agent schedule lacks explicit valid delegation")
                 used_delegations.add(evidence_key)
                 used_action_evidence.add(action_key)
+                used_scheduled_delegation_evidence.add(action_key)
                 title = _safe_markdown_text(
                     action_evidence, field="action_evidence", limit=500
                 )
