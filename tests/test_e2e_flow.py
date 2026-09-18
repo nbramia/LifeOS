@@ -411,6 +411,30 @@ class TestHealthCheck:
             data = response.json()
             assert data['checks']['scheduler_watcher'] is False
 
+    def test_health_reports_snooze_notifier_liveness(self):
+        """The agent-board snooze notifier is a Telegram-gated background
+        thread, the same shape as reminder_scheduler, so /health reports its
+        own liveness under a distinct key rather than folding it into an
+        unrelated check."""
+        from fastapi.testclient import TestClient
+        from unittest.mock import patch, MagicMock
+
+        from api.main import app
+        import api.main as main
+        client = TestClient(app)
+
+        with patch.object(main, "_snooze_notifier", None):
+            response = client.get("/health")
+            data = response.json()
+            assert data['checks']['snooze_notifier'] is False
+
+        alive_notifier = MagicMock()
+        alive_notifier.is_alive.return_value = True
+        with patch.object(main, "_snooze_notifier", alive_notifier):
+            response = client.get("/health")
+            data = response.json()
+            assert data['checks']['snooze_notifier'] is True
+
 
 class TestRealUserFlow:
     """

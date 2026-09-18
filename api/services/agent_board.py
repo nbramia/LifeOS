@@ -113,8 +113,9 @@ def is_snoozed(fields: Optional[dict], now: Optional[datetime] = None) -> bool:
     instant (tests, and the board's own stream tick — see
     `api/routes/agents.py`) pass one explicitly so the same task derives
     differently on either side of its wake-up time without a sleep. A past
-    or missing wake-up time returns False and is otherwise ignored — an
-    expired value is never cleaned up, only treated as absent.
+    or missing wake-up time returns False and is otherwise ignored. The
+    background snooze notifier removes an expired value after it successfully
+    delivers the wake-up message.
     """
     until = parse_snoozed_until((fields or {}).get(SNOOZED_UNTIL_FIELD))
     if until is None:

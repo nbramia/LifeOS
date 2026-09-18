@@ -103,6 +103,7 @@ _reminder_scheduler = None
 _scheduler_watcher = None
 _job_queue = None
 _task_watcher = None
+_snooze_notifier = None
 _pebble_capture_watcher = None
 
 # Health monitoring runs as an out-of-band watcher in nbramia/local-processing
@@ -146,7 +147,7 @@ def check_server_host_guard() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifespan - startup and shutdown."""
-    global _calendar_indexer, _telegram_listeners, _reminder_scheduler, _scheduler_watcher, _job_queue, _task_watcher, _pebble_capture_watcher
+    global _calendar_indexer, _telegram_listeners, _reminder_scheduler, _scheduler_watcher, _job_queue, _task_watcher, _snooze_notifier, _pebble_capture_watcher
 
     # Startup: refuse to run a second server on a non-designated machine.
     # Deliberately not wrapped in try/except — unlike the best-effort blocks
@@ -231,6 +232,14 @@ async def lifespan(app: FastAPI):
             _task_watcher.start()
         except Exception as e:
             logger.error(f"Failed to start task file watcher: {e}")
+
+        # Wake expired agent-board snoozes even when no board tab is open.
+        try:
+            from api.services.snooze_notifier import SnoozeNotifier
+            _snooze_notifier = SnoozeNotifier(task_manager=tm)
+            _snooze_notifier.start()
+        except Exception as e:
+            logger.error(f"Failed to start agent-board snooze notifier: {e}")
 
         # Pebble archive consumer is deliberately separate from native Journal
         # capture.  The producer retains ownership of LifeOS/Log/Pebble and this
@@ -325,6 +334,9 @@ async def lifespan(app: FastAPI):
     if _task_watcher:
         _task_watcher.stop()
         logger.info("Task file watcher stopped")
+    if _snooze_notifier:
+        _snooze_notifier.stop()
+        logger.info("Agent-board snooze notifier stopped")
     if _pebble_capture_watcher:
         # stop() waits for the sole active consumer and cancels queued paths.
         await asyncio.to_thread(_pebble_capture_watcher.stop)
@@ -531,6 +543,9 @@ async def health_check():
         # vault edits (e.g. via Obsidian) and re-indexes them, starts
         # unconditionally, and is tracked here as its own liveness signal.
         "scheduler_watcher": _scheduler_watcher.is_alive() if _scheduler_watcher else False,
+        # Same Telegram-gated shape as reminder_scheduler: wakes expired
+        # agent-board snoozes independently of any board tab being open.
+        "snooze_notifier": _snooze_notifier.is_alive() if _snooze_notifier else False,
         "pebble_capture_watcher": (
             _pebble_capture_watcher.is_alive() if _pebble_capture_watcher else not settings.pebble_capture_enabled
         ),
