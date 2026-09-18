@@ -18,44 +18,28 @@ reuses its worktree for a simpler reason still: the working directory
 persists on the session's own execution spec, so a resume never calls
 this module at all.
 
-Every git/gh command runs through an injectable ``Runner`` — the plain
-local subprocess by default, or (when the caller names a registered
-remote host) an ssh-wrapped one using the same host registry and ssh
-invocation shape the executors use for a remote CLI spawn. Provisioning
-against an unregistered host fails closed before any command runs.
-
-:func:`finalize_worktree_session` is the completion-time counterpart: it
-commits any changes the session itself left uncommitted (a safety net),
-pushes the branch, and — when the caller is finalizing a fully-complete
-session — opens a pull request (or reuses one that already exists for the
-branch). Both functions no-op on a directory that isn't a linked git
-worktree, so a non-git-repo task or an operator-spawned session without a
-worktree is unaffected.
+Every git command runs through an injectable ``Runner`` — the plain local
+subprocess by default, or (when the caller names a registered remote
+host) an ssh-wrapped one using the same host registry and ssh invocation
+shape the executors use for a remote CLI spawn. Provisioning against an
+unregistered host fails closed before any command runs.
 """
 from __future__ import annotations
 
-import dataclasses
-import json
 import os
 import re
 import shlex
 import subprocess
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
 
-DEFAULT_TIMEOUT = 60          # seconds, per git/gh subprocess call (status, rev-parse, fetch, ...)
-COMMIT_PUSH_TIMEOUT = 300     # seconds — commit/push may run pre-commit/pre-push hooks
-
-SAFETY_NET_COMMIT_MESSAGE = "chore: worker safety-net commit for uncommitted session changes"
+DEFAULT_TIMEOUT = 60  # seconds, per git subprocess call (status, rev-parse, fetch, ...)
 
 # The project's branch-naming convention (AGENTS.md § Development Workflow)
 # allows exactly these types. `agent` is not one of them.
 ALLOWED_BRANCH_TYPES = ("feat", "fix", "docs", "test", "refactor", "chore")
-
-MAX_PR_BODY_CHARS = 4000
 
 Runner = Callable[..., subprocess.CompletedProcess]
 
@@ -99,30 +83,11 @@ class WorktreeContext:
     repo_toplevel: str
 
 
-@dataclass(frozen=True)
-class FinalizeResult:
-    """Outcome of running the worker's own git discipline at session end.
-
-    ``applicable`` is False when the working directory isn't a linked git
-    worktree at all — every other field is then a no-op default and the
-    caller changes nothing about its existing notification/behavior.
-    """
-
-    applicable: bool
-    branch: Optional[str] = None
-    pushed: bool = False
-    safety_net_committed: bool = False
-    pr_url: Optional[str] = None
-    pr_opened: bool = False
-    nothing_to_push: bool = False
-    error: Optional[str] = None
-
-
 # ---------------------------------------------------------------------------
 # Command execution — local by default, ssh-wrapped for a registered remote
-# host. Every public function below runs its git/gh/test/mkdir commands
-# through this seam so provisioning and finalization work identically
-# regardless of which machine actually holds the worktree.
+# host. Every public function below runs its git/test/mkdir commands
+# through this seam so provisioning works identically regardless of which
+# machine actually holds the worktree.
 # ---------------------------------------------------------------------------
 
 def _local_runner(
@@ -161,8 +126,8 @@ def make_ssh_runner(target: str, *, connect_timeout: Optional[int] = None) -> Ru
 
 
 def resolve_runner_for_host(host: Optional[str]) -> Runner:
-    """The :data:`Runner` provisioning/finalization should use for ``host``
-    — the same board-facing host name (``[host:: ...]``, ``assignment.host``)
+    """The :data:`Runner` provisioning should use for ``host`` — the same
+    board-facing host name (``[host:: ...]``, ``assignment.host``)
     resolves through everywhere else
     (``remote_spawn.resolve_host_target``). None/local returns the plain
     local runner. A registered remote host returns an ssh-wrapped one using
@@ -197,8 +162,8 @@ def _run(
     non-zero :class:`subprocess.CompletedProcess` rather than letting
     ``TimeoutExpired``/``OSError`` escape — every caller's existing
     ``returncode != 0`` handling then reports it the same way it reports
-    any other git failure, and neither provisioning nor finalization can
-    crash the dispatch path on a slow hook or an unreachable host.
+    any other git failure, and provisioning can't crash the dispatch path
+    on a slow hook or an unreachable host.
     """
     active = runner or _local_runner
     try:
@@ -505,203 +470,13 @@ def ensure_worktree(
     )
 
 
-# ---------------------------------------------------------------------------
-# Completion — safety-net commit, push, pull request. Local-only: a
-# session's worktree lives on this worker's own filesystem whenever
-# `finalize_worktree_session` has anything to do — a remote-host session's
-# `working_dir` isn't a local path at all, so `is_linked_worktree` reports
-# False for it and this whole function no-ops, same as any other
-# non-worktree directory.
-# ---------------------------------------------------------------------------
-
-def _has_uncommitted_changes(working_dir: str, *, timeout: int) -> bool:
-    result = _run(["git", "status", "--porcelain"], cwd=working_dir, timeout=timeout)
-    return result.returncode == 0 and bool(result.stdout.strip())
-
-
-def _commits_ahead(working_dir: str, base_ref: str, branch: str, *, timeout: int) -> Optional[int]:
-    result = _run(["git", "rev-list", "--count", f"{base_ref}..{branch}"], cwd=working_dir, timeout=timeout)
-    if result.returncode != 0:
-        return None
-    try:
-        return int(result.stdout.strip())
-    except ValueError:
-        return None
-
-
-def _commit_log(working_dir: str, base_ref: str, branch: str, *, timeout: int) -> str:
-    result = _run(["git", "log", "--oneline", f"{base_ref}..{branch}"], cwd=working_dir, timeout=timeout)
-    return result.stdout.strip() if result.returncode == 0 else ""
-
-
-def _bounded(text: str, *, max_chars: int = MAX_PR_BODY_CHARS) -> str:
-    """``text`` capped at ``max_chars``, with a truncation note appended
-    when it was cut — never silently drops the fact that content is
-    missing."""
-    text = text or ""
-    if len(text) <= max_chars:
-        return text
-    return text[:max_chars].rstrip() + f"\n\n…(truncated — {len(text)} chars total)"
-
-
-def _build_pr_body(
-    *, card_title: str, summary: str, working_dir: str, base: str, branch: str, timeout: int,
-) -> str:
-    """The pull request description: the card title, a bounded summary of
-    the session's own completion message, and the branch's commit list —
-    in that order, so the reader sees what the card asked for before the
-    session's own account of what it did."""
-    sections = [f"## {card_title}" if card_title else "## Agent task"]
-    if summary:
-        sections.append(_bounded(summary.strip()))
-    commit_log = _commit_log(working_dir, base, branch, timeout=timeout)
-    if commit_log:
-        sections.append("### Commits\n```\n" + _bounded(commit_log, max_chars=1500) + "\n```")
-    return _bounded("\n\n".join(sections))
-
-
-def _find_existing_pr(branch: str, *, cwd: str, runner: Runner, timeout: int) -> Optional[str]:
-    result = _run(["gh", "pr", "view", branch, "--json", "url"], cwd=cwd, runner=runner, timeout=timeout)
-    if result.returncode != 0:
-        return None
-    try:
-        data = json.loads(result.stdout)
-    except (TypeError, ValueError):
-        return None
-    url = data.get("url") if isinstance(data, dict) else None
-    return url if isinstance(url, str) and url else None
-
-
-def _create_pr(
-    branch: str, base: str, title: str, body: str, *, cwd: str, runner: Runner, timeout: int,
-) -> str:
-    """``gh pr create``, with the body passed via a temp ``--body-file``
-    (never argv — an unbounded body can exceed argv limits, and a file
-    keeps the body out of process-listing visibility) written under the
-    system temp directory with `tempfile`'s private default permissions,
-    deleted again once `gh` has read it."""
-    fd, body_path = tempfile.mkstemp(prefix="lifeos_pr_body_", suffix=".md")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(body or "")
-        cmd = [
-            "gh", "pr", "create", "--base", base, "--head", branch,
-            "--title", title or branch, "--body-file", body_path,
-        ]
-        result = _run(cmd, cwd=cwd, runner=runner, timeout=timeout)
-    finally:
-        try:
-            os.unlink(body_path)
-        except OSError:
-            pass
-    if result.returncode != 0:
-        raise WorktreeError(f"gh pr create failed: {(result.stderr or '').strip()}")
-    lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
-    if not lines:
-        raise WorktreeError("gh pr create returned no URL")
-    return lines[-1]
-
-
-def finalize_worktree_session(
-    working_dir: Optional[str],
-    *,
-    open_pr: bool,
-    pr_title: str = "",
-    pr_body: str = "",
-    base_branch: Optional[str] = None,
-    gh_runner: Optional[Runner] = None,
-    timeout: int = DEFAULT_TIMEOUT,
-    commit_push_timeout: int = COMMIT_PUSH_TIMEOUT,
-) -> FinalizeResult:
-    """Run the worker's own git discipline at one session's completion.
-
-    Always (when ``working_dir`` is a linked worktree): commit any changes
-    the session itself left uncommitted (the safety net — ``git add -A``
-    honors ``.gitignore``, never ``--no-verify``), then push the branch.
-    Both run with ``commit_push_timeout`` (default 5 minutes) rather than
-    ``timeout`` — a pre-commit/pre-push hook can legitimately take longer
-    than a plain status/rev-parse call.
-
-    When ``open_pr`` is True and the push succeeded: open a pull request
-    against ``base_branch`` (auto-detected when omitted) whose body leads
-    with the card title, a bounded copy of ``pr_body`` (the session's own
-    completion summary), and the branch's commit list — reusing one that
-    already exists for the branch, or reporting ``nothing_to_push`` when
-    the branch carries no commits beyond its base (no empty PR).
-
-    No-ops (``applicable=False``) when ``working_dir`` isn't a linked git
-    worktree — a non-git-repo task or a worktree-less operator spawn is
-    unaffected.
-    """
-    if not working_dir or not is_linked_worktree(working_dir):
-        return FinalizeResult(applicable=False)
-
-    branch = current_branch(working_dir, timeout=timeout)
-    if not branch:
-        return FinalizeResult(applicable=False)
-
-    safety_net = False
-    if _has_uncommitted_changes(working_dir, timeout=timeout):
-        add = _run(["git", "add", "-A"], cwd=working_dir, timeout=commit_push_timeout)
-        if add.returncode != 0:
-            return FinalizeResult(applicable=True, branch=branch, error=f"git add -A failed: {add.stderr.strip()}")
-        commit = _run(
-            ["git", "commit", "-m", SAFETY_NET_COMMIT_MESSAGE], cwd=working_dir, timeout=commit_push_timeout,
-        )
-        if commit.returncode != 0:
-            return FinalizeResult(applicable=True, branch=branch, error=f"safety-net commit failed: {commit.stderr.strip()}")
-        safety_net = True
-
-    push = _run(["git", "push", "-u", "origin", branch], cwd=working_dir, timeout=commit_push_timeout)
-    if push.returncode != 0:
-        return FinalizeResult(
-            applicable=True, branch=branch, safety_net_committed=safety_net,
-            error=f"git push failed: {push.stderr.strip()}",
-        )
-
-    result = FinalizeResult(applicable=True, branch=branch, pushed=True, safety_net_committed=safety_net)
-    if not open_pr:
-        return result
-
-    toplevel = repo_toplevel(working_dir, timeout=timeout)
-    try:
-        base = base_branch or (_detect_default_branch(toplevel, runner=None, timeout=timeout) if toplevel else None)
-    except WorktreeError as exc:
-        return dataclasses.replace(result, error=str(exc))
-    if not base:
-        return dataclasses.replace(result, error="could not determine the base branch for the pull request")
-
-    ahead = _commits_ahead(working_dir, f"origin/{base}", branch, timeout=timeout)
-    if ahead == 0:
-        return dataclasses.replace(result, nothing_to_push=True)
-
-    runner = gh_runner or _local_runner
-    existing = _find_existing_pr(branch, cwd=working_dir, runner=runner, timeout=timeout)
-    if existing:
-        return dataclasses.replace(result, pr_url=existing, pr_opened=False)
-
-    body = _build_pr_body(
-        card_title=pr_title, summary=pr_body, working_dir=working_dir,
-        base=f"origin/{base}", branch=branch, timeout=timeout,
-    )
-    try:
-        pr_url = _create_pr(branch, base, pr_title, body, cwd=working_dir, runner=runner, timeout=timeout)
-    except WorktreeError as exc:
-        return dataclasses.replace(result, error=str(exc))
-    return dataclasses.replace(result, pr_url=pr_url, pr_opened=True)
-
-
 __all__ = [
     "DEFAULT_TIMEOUT",
-    "COMMIT_PUSH_TIMEOUT",
-    "SAFETY_NET_COMMIT_MESSAGE",
     "ALLOWED_BRANCH_TYPES",
-    "MAX_PR_BODY_CHARS",
     "Runner",
     "WorktreeError",
     "WorktreeResult",
     "WorktreeContext",
-    "FinalizeResult",
     "GIT_DISCIPLINE_INSTRUCTIONS",
     "git_discipline_text",
     "make_ssh_runner",
@@ -713,5 +488,4 @@ __all__ = [
     "derive_branch_name",
     "worktree_dir_for",
     "ensure_worktree",
-    "finalize_worktree_session",
 ]
