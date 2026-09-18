@@ -7,9 +7,14 @@ Surface mirrors :class:`ClaudeCodeExecutor` so the worker can route
   (``thread.started``, ``turn.started``, ``item.completed``,
   ``turn.completed``) instead of Claude's stream-json.
 - The final agent message is captured via ``--output-last-message``.
-- No ``[NOTIFY]/[CLARIFY]`` convention — Codex isn't trained on them.
-  We relay the final message verbatim and skip the plan/clarification
-  blocking paths.
+- No ``[NOTIFY]`` convention — Codex isn't trained on it, so every final
+  message relays verbatim and there's no plan-approval blocking path.
+  ``[CLARIFY]`` is different: a fresh session's briefing (the shared
+  git-discipline text) tells Codex to end its final message with
+  ``[CLARIFY] <question>`` when it needs to ask something before it's
+  done, and the completion path here (reusing Claude Code's own
+  ``_CLARIFY_RE``) treats that the same way Claude Code's live
+  ``[CLARIFY]`` does: a paused, resumable question, not a finished turn.
 - Cost is derived from the last ``turn.completed.usage`` block via the
   ingest module's pricing table.
 - Resume uses ``codex exec resume <session_id> [PROMPT]``.
@@ -35,6 +40,7 @@ from api.services.agent_worker.binary_resolver import resolve_for_spawn
 from api.services.agent_worker.capabilities_preamble import CAPABILITIES_PREAMBLE
 from api.services.agent_worker.claude_code_executor import (
     _ALTERNATE_AUTH_ENV_PREFIXES,
+    _CLARIFY_RE,
 )
 from api.services.agent_worker.delegation import delegation_preamble
 from api.services.agent_worker.local_executor import ExecutorOutcome
@@ -49,6 +55,7 @@ from api.services.agent_worker.remote_spawn import (
 )
 from api.services.agent_worker.remote_spawn import api_host_name as _api_host_name
 from api.services.agent_worker.session_store import (
+    STATUS_BLOCKED,
     STATUS_COMPLETED,
     STATUS_FAILED,
     STATUS_RUNNING,
@@ -87,6 +94,16 @@ def _delegation_header(session_id: str) -> str:
     )
 
 
+def _git_discipline_header(working_dir: str) -> str:
+    """Preamble block with the git-discipline instructions when
+    `working_dir` is a worker-provisioned worktree (see
+    `git_worktree.describe_worktree`), else an empty string — a vault- or
+    home-directory session has no worktree and gets nothing prepended."""
+    from api.services.agent_worker.git_worktree import git_discipline_text
+    text = git_discipline_text(working_dir)
+    return f"=== GIT DISCIPLINE ===\n{text}\n\n" if text else ""
+
+
 # Reason codes returned in ``ExecutorOutcome.reason``.
 REASON_TIMEOUT = "timeout"
 REASON_BINARY_NOT_FOUND = "binary_not_found"
@@ -94,6 +111,10 @@ REASON_BINARY_NOT_FOUND = "binary_not_found"
 # FAILED and signals this subprocess; we exit silently under this reason so the
 # worker skips the spurious "session failed" notice.
 REASON_KILLED = "killed"
+# A final message ending in `[CLARIFY] <question>` — parity with
+# ClaudeCodeExecutor's live [CLARIFY] pause, detected post-hoc here since
+# Codex has no mid-turn pause of its own.
+REASON_AWAITING_CLARIFICATION = "awaiting_clarification"
 
 # CODEX_* env vars kept when stripping the subprocess env (see `_clean_env`
 # and `_remote_unset_env_names`) — CODEX_HOME carries `~/.codex/auth.json`.
@@ -193,11 +214,13 @@ class CodexExecutor:
         # Prepend the LifeOS capabilities briefing so the fresh Codex turn has
         # the same situational awareness as the managed/local routes, plus a
         # per-session delegation header so the agent can hand off work it can't
-        # do (e.g. browser automation → a claude_code child). Only on the
-        # opening turn — resume() reloads the thread, which already carries
-        # this from the first prompt.
+        # do (e.g. browser automation → a claude_code child), and — only when
+        # `working_dir` is a worker-provisioned worktree — the git-discipline
+        # instructions. Only on the opening turn — resume() reloads the
+        # thread, which already carries this from the first prompt.
         delegation = _delegation_header(session.session_id)
-        full_prompt = f"{delegation}\n{CAPABILITIES_PREAMBLE}\n{prompt}"
+        git_discipline = _git_discipline_header(working_dir)
+        full_prompt = f"{delegation}\n{git_discipline}{CAPABILITIES_PREAMBLE}\n{prompt}"
         return self._with_identity(session, self._run(
             session=session,
             prompt=full_prompt,
@@ -546,6 +569,32 @@ class CodexExecutor:
         # way, so a genuinely-clean run with no `turn.completed` (an
         # interrupted stream that happens to exit 0) is still flagged there.
         if proc.returncode == 0:
+            # A final message ending `[CLARIFY] <question>` is a paused
+            # question, not a finished turn — checked before the completion
+            # write below so it never reaches STATUS_COMPLETED. Reuses
+            # ClaudeCodeExecutor's own `_CLARIFY_RE` so both engines honor
+            # exactly the same marker convention. A spawned child has no
+            # operator to pause for — parity with ClaudeCodeExecutor's
+            # `_CLARIFY_CHILD` convention, its question folds into the
+            # completed turn's text instead so the parent sees it via the
+            # normal completion path.
+            clarify_match = _CLARIFY_RE.search(state.final_text)
+            if clarify_match and not session.parent_session_id:
+                question = clarify_match.group(1).strip()
+                self.session_store.update_status(
+                    session.task_id, STATUS_BLOCKED,
+                    attempt_id=session.attempt_id, turn_id=session.turn_id,
+                )
+                self.transcript_store.append(sid, "codex_awaiting_clarification", {
+                    "question_chars": len(question),
+                })
+                return ExecutorOutcome(
+                    status=STATUS_BLOCKED,
+                    reason=REASON_AWAITING_CLARIFICATION,
+                    final_text=question,
+                )
+            if clarify_match and session.parent_session_id:
+                state.final_text = f"[needs clarification] {clarify_match.group(1).strip()}"
             exit_meta = self._exit_metadata(proc, timed_out, state)
             # `project=False`: a clean exit alone is not an earned completion —
             # the dispatch layer's own check runs on the outcome this call

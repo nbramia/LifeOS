@@ -185,7 +185,7 @@ ENVIRONMENT:
 - {platform_desc}
 - You have full filesystem access
 - Git and standard system tools are available
-
+{git_discipline}
 KEY LOCATIONS:
 - Obsidian vault: {vault_path}/
 - LifeOS project: {code_dir}/LifeOS
@@ -226,6 +226,17 @@ After presenting the plan, STOP and do not implement anything.
 The user will review and approve the plan before you proceed.
 
 """
+
+
+def _git_discipline_block(working_dir: str) -> str:
+    """Appended into the ENVIRONMENT section of `_SYSTEM_PROMPT` only when
+    `working_dir` is a freshly-provisioned worktree (see
+    `git_worktree.describe_worktree`) — a vault- or home-directory session
+    has no worktree and gets an empty string here, leaving that prompt
+    section unchanged."""
+    from api.services.agent_worker.git_worktree import git_discipline_text
+    text = git_discipline_text(working_dir)
+    return f"- {text}\n" if text else ""
 
 
 # Reason codes returned in `ExecutorOutcome.reason` for the worker (and tests)
@@ -433,6 +444,7 @@ class ClaudeCodeExecutor:
         model: Optional[str] = None,
         is_child: bool = False,
         effort: Optional[str] = None,
+        git_discipline: str = "",
     ) -> list[str]:
         platform_desc = (
             "Linux server running Ubuntu"
@@ -452,6 +464,7 @@ class ClaudeCodeExecutor:
                 user_name=settings.user_name,
                 code_dir=settings.code_dir,
                 platform_desc=platform_desc,
+                git_discipline=git_discipline,
                 clarification=_CLARIFY_CHILD if is_child else _CLARIFY_OPERATOR,
                 delegation=delegation_preamble(
                     session_id,
@@ -541,6 +554,10 @@ class ClaudeCodeExecutor:
         plan_mode: bool,
     ) -> ExecutorOutcome:
         sid = session.session_id
+        # Git-discipline instructions only belong on the opening turn — a
+        # resume reloads the same CLI thread, which already carries them
+        # from the first `--append-system-prompt`.
+        git_discipline = _git_discipline_block(working_dir) if resume_session_id is None else ""
         cmd = self._build_command(
             prompt, resume_session_id, session_id=sid,
             # `session.model` is the board-assignment
@@ -551,6 +568,7 @@ class ClaudeCodeExecutor:
             model=getattr(session, "model", None) or session.claude_code_model,
             is_child=bool(session.parent_session_id),
             effort=getattr(session, "effort", None),
+            git_discipline=git_discipline,
         )
 
         # Board-assigned host: resolve BEFORE any spawn call. An

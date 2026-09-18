@@ -10,11 +10,13 @@ import pytest
 from api.services.agent_worker import codex_spawn
 from api.services.agent_worker.codex_executor import (
     CodexExecutor,
+    REASON_AWAITING_CLARIFICATION,
     REASON_BINARY_NOT_FOUND,
     REASON_KILLED,
 )
 from api.services.agent_worker.executor_lifecycle import adapter_for
 from api.services.agent_worker.session_store import (
+    STATUS_BLOCKED,
     STATUS_COMPLETED,
     STATUS_FAILED,
     SessionStore,
@@ -880,3 +882,77 @@ def test_turn_completed_then_nonzero_exit_stays_failed(stores, tmp_path):
     kinds = [e["kind"] for e in tr_store.read(session.session_id)]
     assert "codex_failed" in kinds
     assert "codex_completed" not in kinds
+
+
+@pytest.mark.unit
+def test_codex_clarify_marker_returns_blocked_with_extracted_question(stores, tmp_path):
+    """A final message ending `[CLARIFY] <question>` is a paused question,
+    not a finished turn — Codex gets the same marker convention Claude
+    Code's live [CLARIFY] uses, detected post-hoc from the final message."""
+    sess_store, tr_store = stores
+    session = sess_store.create(
+        task_id="t-clarify", session_id="sess_codex_clarify", status="claimed",
+        routing="codex", origin="operator",
+    )
+    lines = [
+        {"type": "thread.started", "thread_id": "thread-clarify"},
+        {"type": "item.completed", "item": {
+            "type": "agent_message",
+            "text": "[CLARIFY] Which deployment environment should I target?",
+        }},
+        {"type": "turn.completed", "usage": {
+            "input_tokens": 10, "cached_input_tokens": 0,
+            "output_tokens": 5, "reasoning_output_tokens": 0,
+        }},
+    ]
+    executor = CodexExecutor(
+        session_store=sess_store, transcript_store=tr_store,
+        spawn_fn=lambda *a, **k: _FakeProc(lines, returncode=0),
+        binary_resolver=lambda: "/usr/bin/true",
+        heartbeat_interval=9999,
+    )
+
+    outcome = executor.execute(session, {"description": "deploy the thing", "working_dir": str(tmp_path)})
+
+    assert outcome.status == STATUS_BLOCKED
+    assert outcome.reason == REASON_AWAITING_CLARIFICATION
+    assert outcome.final_text == "Which deployment environment should I target?"
+    assert sess_store.get(session.task_id).status == STATUS_BLOCKED
+    kinds = [e["kind"] for e in tr_store.read(session.session_id)]
+    assert "codex_awaiting_clarification" in kinds
+    assert "codex_completed" not in kinds
+
+
+@pytest.mark.unit
+def test_codex_child_clarify_folds_into_completion_instead_of_pausing(stores, tmp_path):
+    """A spawned child has no operator to pause for — its [CLARIFY]
+    question folds into the completed turn's text (parity with
+    ClaudeCodeExecutor's `_CLARIFY_CHILD` convention) so the parent sees
+    it via the normal completion path instead of the child hanging."""
+    sess_store, tr_store = stores
+    session = sess_store.create(
+        task_id="t-child-clarify", session_id="sess_codex_child_clarify", status="claimed",
+        routing="codex", parent_session_id="sess_parent",
+    )
+    lines = [
+        {"type": "thread.started", "thread_id": "thread-child-clarify"},
+        {"type": "item.completed", "item": {
+            "type": "agent_message", "text": "[CLARIFY] Which branch should I use?",
+        }},
+        {"type": "turn.completed", "usage": {
+            "input_tokens": 10, "cached_input_tokens": 0,
+            "output_tokens": 5, "reasoning_output_tokens": 0,
+        }},
+    ]
+    executor = CodexExecutor(
+        session_store=sess_store, transcript_store=tr_store,
+        spawn_fn=lambda *a, **k: _FakeProc(lines, returncode=0),
+        binary_resolver=lambda: "/usr/bin/true",
+        heartbeat_interval=9999,
+    )
+
+    outcome = executor.execute(session, {"description": "sub-task", "working_dir": str(tmp_path)})
+
+    assert outcome.status == STATUS_COMPLETED
+    assert "[needs clarification]" in outcome.final_text
+    assert "Which branch should I use?" in outcome.final_text
