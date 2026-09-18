@@ -40,11 +40,15 @@ def scratch_env(session_id: str) -> dict[str, str]:
 
 
 def cleanup_session_scratch(session_id: str, *, host: str | None = None) -> None:
-    from api.services.agent_worker.git_worktree import resolve_runner_for_host
+    from api.services.agent_worker.git_worktree import WorktreeError, resolve_runner_for_host
 
     path = scratch_dir_for(session_id)
-    runner = resolve_runner_for_host(host)
-    runner(["rm", "-rf", "--", str(path)])
+    try:
+        runner = resolve_runner_for_host(host)
+    except WorktreeError:
+        runner = None
+    if runner is not None:
+        runner(["rm", "-rf", "--", str(path)])
     if host:
         shutil.rmtree(path, ignore_errors=True)
 
