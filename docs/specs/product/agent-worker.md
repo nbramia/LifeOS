@@ -134,6 +134,8 @@ The agent worker uses your existing Telegram bot (no second bot needed). Three m
 
 **Replying to a thread.** Every terminal notification — completion, failure, or budget cut-off — is replyable: use Telegram's native reply on it (any chunk of a long message) and the agent reopens that thread as a follow-up turn with full prior context ("actually, also CC Jane"). The reply gesture is the *only* way to continue a thread on Telegram — a plain message is always a normal chat query, so unrelated questions are never mistaken for a thread continuation.
 
+The immediate acknowledgment only ever confirms your note is queued — it never claims the session has already resumed, because a `/claude`/`/codex` session's actual resume happens on the worker's next poll cycle, not synchronously with your reply. A second, separate message confirms once that resumed run actually starts. If a resume doesn't start within a few minutes, a one-time alert names the stuck task/session rather than leaving it silently orphaned — check `#agent-running` on the card and, if it's still not moving, re-trigger it manually.
+
 **Starting an agent on demand.** You don't have to create a `#agent` task — send `/agent <task>` to spawn one immediately. The model is auto-routed by preflight; force it with `/agent local <task>` or `/agent claude <task>`. If routing is ambiguous — or the cloud route was only inferred — the bot asks which engine before starting. The same `/agent` command works in web chat. The resulting thread notifies and is replyable exactly like a `#agent` task.
 
 Default clarification timeout is 72 hours (`LIFEOS_AGENT_CLARIFICATION_TIMEOUT_HOURS`). After that the task is abandoned permanently and you get a Telegram heads-up. The transcript is preserved.
@@ -185,6 +187,7 @@ All in `.env` — see [`agent-worker-setup.md`](../../guides/agent-worker-setup.
 | `LIFEOS_AGENT_DEFAULT_BUDGET_DOLLARS` | Default per-task $-cap when title doesn't specify | `5.00` |
 | `LIFEOS_AGENT_WORKER_POLL_SECONDS` | Polling interval | `60` |
 | `LIFEOS_AGENT_CLARIFICATION_TIMEOUT_HOURS` | Telegram-clarification wait before abandoning | `72` |
+| `LIFEOS_AGENT_STUCK_SESSION_TIMEOUT_MINUTES` | How long a reopened `/claude`/`/codex` session may sit unresumed before the stuck-session alert fires | `15` |
 | `LIFEOS_AGENT_MANAGED_MODEL` | Informational; actual model lives in the cloud preset | `claude-sonnet-5` |
 
 ---

@@ -2849,6 +2849,37 @@ class SessionStore:
             for r in rows
         ]
 
+    def peek_pending_messages(self, session_id: str) -> list[dict]:
+        """Return undelivered pending messages WITHOUT marking them delivered.
+
+        Used by a caller that must not lose a message if what comes next
+        fails before it can confirm the message was actually acted on — the
+        caller marks the specific ids delivered itself, via
+        `mark_pending_delivered`, once it has that confirmation.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, sender_id, content, created_at FROM pending_messages "
+                "WHERE session_id = ? AND delivered = 0 ORDER BY id ASC",
+                (session_id,),
+            ).fetchall()
+        return [
+            {"id": r["id"], "sender_id": r["sender_id"], "content": r["content"], "created_at": r["created_at"]}
+            for r in rows
+        ]
+
+    def mark_pending_delivered(self, ids: list[int]) -> None:
+        """Mark specific `pending_messages` rows delivered by id — the
+        confirmation half of `peek_pending_messages`."""
+        if not ids:
+            return
+        placeholders = ",".join("?" for _ in ids)
+        with self._connect() as conn:
+            conn.execute(
+                f"UPDATE pending_messages SET delivered = 1 WHERE id IN ({placeholders})",
+                tuple(ids),
+            )
+
     # ------------------------------------------------------------------
     # Pending clarification questions (Issue F)
     # ------------------------------------------------------------------

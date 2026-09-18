@@ -342,6 +342,11 @@ LIFEOS_AGENT_WORKER_AUTOSTART=true
 # LIFEOS_AGENT_WORKER_POLL_SECONDS=60
 # LIFEOS_AGENT_DEFAULT_BUDGET_DOLLARS=5.00
 # LIFEOS_AGENT_DAILY_CAP_DOLLARS=100.00
+# LIFEOS_AGENT_CLARIFICATION_TIMEOUT_HOURS=72
+# How long a reopened /claude or /codex session (a Telegram reply on a
+# finished session, or the worker's own mid-run reopen) may sit unresumed
+# before the stuck-session sweep alerts naming the task/session.
+# LIFEOS_AGENT_STUCK_SESSION_TIMEOUT_MINUTES=15
 ```
 
 ```bash

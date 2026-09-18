@@ -541,6 +541,63 @@ async def chat_via_api_with_log(question: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Vault reopen (status-anchor resume)
+# ---------------------------------------------------------------------------
+
+def _reopen_vault_task_for_resume(task_id: str) -> bool:
+    """Swap a vault task's terminal lifecycle tag back to running and its
+    status back to in-progress, mirroring the reopen sequence the agent
+    worker's own internal reopen paths (`_resume_as_followup`,
+    `code_reopened_for_pending_messages`) already perform.
+
+    Calls `TaskManager` in-process (the Telegram listener runs inside the
+    same API process the worker's own `/api/tasks/*` writes ultimately
+    reach) rather than the worker's HTTP self-calls, which exist so the
+    worker can run on a different host from the API.
+
+    Returns True only once BOTH the tag swap and the status write succeed
+    — the session's `claimed`/tag/status triple must never be claimed as
+    consistent on a partial write. False means either no terminal tag was
+    present anymore (the card was retagged/reassigned since the session
+    finished) or the status write failed after a successful tag swap, in
+    which case the tag swap is undone (best-effort) so the card fails
+    closed at its original terminal tag rather than being left stranded
+    at `#agent-running` with a stale (still-terminal) status. Either way
+    the caller must not claim the session.
+    """
+    from api.services.agent_worker.worker import (
+        BUDGET_EXCEEDED_TAG, COMPLETED_TAG, FAILED_TAG, RUNNING_TAG,
+    )
+    from api.services.task_manager import TaskConflictError, get_task_manager
+
+    manager = get_task_manager()
+    swapped_from: str | None = None
+    for terminal_tag in (COMPLETED_TAG, FAILED_TAG, BUDGET_EXCEEDED_TAG):
+        try:
+            if manager.swap_tag(task_id, terminal_tag, RUNNING_TAG):
+                swapped_from = terminal_tag
+                break
+        except TaskConflictError as exc:
+            logger.warning(f"status-anchor reopen tag swap conflict for {task_id}: {exc}")
+        except Exception as exc:
+            logger.warning(f"status-anchor reopen tag swap failed for {task_id}: {exc}")
+    if swapped_from is None:
+        return False
+    try:
+        manager.update(task_id, status="in_progress")
+    except Exception as exc:
+        logger.warning(f"status-anchor reopen status write failed for {task_id}: {exc}")
+        try:
+            manager.swap_tag(task_id, RUNNING_TAG, swapped_from)
+        except Exception as restore_exc:
+            logger.warning(
+                f"status-anchor reopen tag restore failed for {task_id}: {restore_exc}"
+            )
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Bot listener (long-polling)
 # ---------------------------------------------------------------------------
 
@@ -1249,7 +1306,16 @@ class TelegramBotListener:
             return False
         store.deposit_answer(reply_to_message_id, text, bot=self._bot.name)
         label = "Codex" if session.routing == "codex" else "Claude Code"
-        await send_message_async(f"Resuming {label} session...", chat_id=chat_id)
+        # Truthful ack: the answer is queued now, but the worker's next tick
+        # is what actually reopens and dispatches the session
+        # (`_resume_as_followup`). A separate in-thread "resumed" message
+        # follows once that CLI turn actually starts; if it never does, the
+        # stuck-session sweep surfaces that instead of leaving this silent.
+        await send_message_async(
+            f"📨 Got it — queued for the {label} session. I'll confirm here "
+            f"once it actually resumes.",
+            chat_id=chat_id,
+        )
         return True
 
     async def _handle_status_anchor_reply(
@@ -1258,11 +1324,22 @@ class TelegramBotListener:
         """Route a threaded reply on a status/heartbeat/ack message back into
         its session as a context note.
 
-        The note is queued with the quoted message as context and rides the
-        session's next turn boundary: a RUNNING/CLAIMED/BLOCKED session picks
-        it up when its pending messages next drain; a terminal session with a
-        persisted CLI id is reopened (enqueue-then-CLAIM, mirroring the
-        reopen-on-send pattern) so the dispatch tick resumes it with the note.
+        A RUNNING/CLAIMED/BLOCKED session queues the note immediately — it
+        rides the next `pending_messages` drain regardless of what happens
+        here. A terminal session with a persisted CLI id is reopened
+        (guarded transition, THEN enqueue-then-CLAIM, mirroring the
+        reopen-on-send pattern) so the dispatch tick resumes it with the
+        note. The reopen swaps the backing vault task's terminal tag back
+        to running and its status back to in-progress — the same
+        tag/status pairing the worker's own reopen paths already perform —
+        *before* the note is queued or the session claimed: if that
+        transition fails (the terminal tag is no longer on the card, e.g.
+        the operator retagged it in the meantime, or the status write
+        itself fails), nothing is queued and the session is left exactly
+        as it was — the operator is told the resume could not be
+        completed rather than getting the ordinary "queued"
+        acknowledgment, and no note is left behind to surface unexpectedly
+        on some later, unrelated reopen.
         """
         from api.services.agent_worker.session_store import (
             STATUS_BUDGET_EXCEEDED, STATUS_COMPLETED, STATUS_FAILED, SessionStore,
@@ -1279,17 +1356,32 @@ class TelegramBotListener:
             composed = f'[operator replied to your status update: "{quoted}"]\n{text}'
         else:
             composed = f"(operator note) {text}"
-        store.enqueue_message(session.session_id, "operator", composed)
         terminal = session.status in (STATUS_COMPLETED, STATUS_FAILED, STATUS_BUDGET_EXCEEDED)
         if terminal:
             if session.routing in ("claude_code", "codex") and session.claude_code_session_id:
                 from api.services.agent_worker.session_store import STATUS_CLAIMED
-                store.update_status(session.task_id, STATUS_CLAIMED)
-                ack = "📨 Got it — waking the session with your note."
+                reopened = True
+                if session.origin != "operator":
+                    # Vault-task-backed session — swap the tag/status back to
+                    # running first, same as every internal reopen path. An
+                    # operator root-spawn has no backing card, so it skips
+                    # straight to the claim like `_resume_as_followup` does.
+                    reopened = _reopen_vault_task_for_resume(session.task_id)
+                if reopened:
+                    store.enqueue_message(session.session_id, "operator", composed)
+                    store.update_status(session.task_id, STATUS_CLAIMED)
+                    ack = ("📨 Got it — queued for the session. I'll confirm "
+                           "here once it actually resumes.")
+                else:
+                    ack = ("📨 Couldn't resume that session — its card isn't in "
+                           "a resumable state anymore (retagged or reassigned "
+                           "since it finished). Re-tag it with an engine "
+                           "assignee to retry.")
             else:
                 ack = ("📨 Noted, but that session already ended and can't be "
                        "resumed — send a fresh message to start a new one.")
         else:
+            store.enqueue_message(session.session_id, "operator", composed)
             ack = "📨 Noted — I'll pass this to the session at its next checkpoint."
         self._send_anchored_ack(store, session.session_id, session.task_id, ack, chat_id)
         return True
