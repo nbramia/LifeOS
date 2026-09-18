@@ -39,7 +39,7 @@ Within a poll cycle (default 60s), the worker:
 2. Atomically adds `#agent-running` (so two workers can't claim the same task)
 3. Routes the task — to your local Gemma model, a CLI engine, your configured remote provider, or Claude on Managed Agents — from your tags or an explicit request; when it can only *infer* that a cloud connector is needed, it asks you first
 4. Lets the agent execute: tool calls, MCP servers, web search, file I/O, the full kit
-5. On completion: marks the task done in your vault, swaps the tag to `#agent-completed`, writes the full result to an Agent Output note (`LifeOS/Tasks/Agent Output/`), and sends you a one-paragraph Telegram summary with the actual result (linking the note)
+5. On completion: marks the task done in your vault, swaps the tag to `#agent-completed`, writes the full result to an Agent Output note (`LifeOS/Tasks/Agent Output/`), records the run's outcome (the same completion summary, plus a coding session's branch and any pull request it opened) for the board's Review card to show, and sends you a one-paragraph Telegram summary with the actual result (linking the note)
 
 Cost for that task: usually under $0.10 on Claude Sonnet 4.6, free on local Gemma. The full transcript (every tool call, every model turn) lands in `data/agent_transcripts/<session_id>.jsonl` for later review.
 

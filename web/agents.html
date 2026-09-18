@@ -1508,6 +1508,51 @@
     border-color: var(--accent);
   }
   .board-chip-session:hover { filter: brightness(1.1); }
+  /* Review-lane card-face PR badge and the matching drawer chip — number
+     plus a color naming the merge state so it reads at a glance. */
+  .board-card-pr { margin-top: 0.3rem; }
+  .board-pr-badge {
+    display: inline-block;
+    border-radius: 999px;
+    padding: 0.05rem 0.5rem;
+    font-size: 0.68rem;
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+  }
+  .board-pr-badge-merged { color: var(--running); border-color: var(--running); }
+  .board-pr-badge-open { color: var(--yielded); border-color: var(--yielded); }
+  .board-pr-badge-closed { color: var(--failed); border-color: var(--failed); }
+  .board-pr-badge-unknown { color: var(--text-dim); border-color: var(--border); }
+  /* Drawer's read-only "Agent outcome" section — visually distinct from
+     the editable Notes box just below it. */
+  .drawer-outcome {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.6rem 0.75rem;
+  }
+  .drawer-outcome-meta {
+    display: flex;
+    justify-content: space-between;
+    gap: 0.5rem;
+    font-size: 0.72rem;
+    color: var(--text-dim);
+    margin-bottom: 0.35rem;
+  }
+  .drawer-outcome-summary {
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 0.82rem;
+    color: var(--text-primary);
+  }
+  .drawer-outcome-branch {
+    margin-top: 0.4rem;
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+  }
+  .drawer-outcome-prs { margin-top: 0.4rem; display: flex; flex-direction: column; gap: 0.3rem; }
+  .drawer-outcome-pr { display: flex; align-items: center; gap: 0.4rem; font-size: 0.8rem; }
+  .drawer-outcome-pr a { color: var(--accent); }
   /* Node selected → board tab reveal — a temporary highlight on the
      card `revealCard` scrolled to, so it's findable at a glance even in a
      lane with many cards. */

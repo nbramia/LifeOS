@@ -2321,3 +2321,82 @@ class TestCliSessionTeardown:
         assert r.status_code == 200, r.text
         assert session_store.get(task.id).session_id == worker.session_id
         assert session_store.get(task.id).status == "running"
+
+
+# ---------------------------------------------------------------------------
+# Review card outcome — GET /api/agents/board's `outcome` field
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+class TestBoardCardOutcome:
+    def test_card_outcome_is_none_by_default(self, client, stores):
+        task_manager, *_ = stores
+        task_manager.create("Ping the vendor", tags=["me"])
+        r = client.get("/api/agents/board")
+        card = r.json()["lanes"]["assigned"][0]
+        assert card["outcome"] is None
+
+    def test_card_outcome_carries_summary_branch_and_unrefreshed_pr(self, client, stores):
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Ship the fix", tags=["claude"])
+        session_store.record_card_outcome(
+            task.id, session_id="sess-1", engine_label="Claude Code",
+            summary="Implemented the fix and opened a PR.",
+            branch="feat/fix-it",
+            pr_urls=["https://github.com/nbramia/LifeOS/pull/1234"],
+        )
+        r = client.get("/api/agents/board")
+        card = next(c for c in r.json()["lanes"]["assigned"] if c["id"] == task.id)
+        outcome = card["outcome"]
+        assert outcome["engine_label"] == "Claude Code"
+        assert outcome["summary"] == "Implemented the fix and opened a PR."
+        assert outcome["branch"] == "feat/fix-it"
+        assert len(outcome["prs"]) == 1
+        pr = outcome["prs"][0]
+        assert pr["url"] == "https://github.com/nbramia/LifeOS/pull/1234"
+        # Never refreshed yet — no gh call ever happens on the board's own
+        # read path, so state is unknown and flagged stale rather than
+        # fabricated as "open" or omitted.
+        assert pr["number"] is None
+        assert pr["state"] is None
+        assert pr["stale"] is True
+
+    def test_card_outcome_pr_status_reflects_the_background_cache(self, client, stores):
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Ship the fix", tags=["claude"])
+        pr_url = "https://github.com/nbramia/LifeOS/pull/1234"
+        session_store.record_card_outcome(
+            task.id, session_id="sess-1", engine_label="Claude Code",
+            summary="Implemented the fix.", branch="feat/fix-it", pr_urls=[pr_url],
+        )
+        session_store.upsert_pr_status(pr_url, {
+            "number": 1234, "title": "Ship the fix", "state": "MERGED",
+            "merged_at": "2026-09-18T04:00:00Z",
+        })
+
+        r = client.get("/api/agents/board")
+        card = next(c for c in r.json()["lanes"]["assigned"] if c["id"] == task.id)
+        pr = card["outcome"]["prs"][0]
+        assert pr["number"] == 1234
+        assert pr["state"] == "MERGED"
+        assert pr["stale"] is False
+
+    def test_get_board_never_shells_out_to_gh(self, client, stores, monkeypatch):
+        """A board read must never block on the git host — PR status comes
+        entirely from the cache table, never a live `gh` call."""
+        import subprocess
+
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Ship the fix", tags=["claude"])
+        session_store.record_card_outcome(
+            task.id, session_id="sess-1", engine_label="Claude Code",
+            summary="Implemented the fix.", branch="feat/fix-it",
+            pr_urls=["https://github.com/nbramia/LifeOS/pull/1234"],
+        )
+
+        def _forbidden(*args, **kwargs):
+            raise AssertionError("GET /board must never invoke a subprocess for PR status")
+        monkeypatch.setattr(subprocess, "run", _forbidden)
+
+        r = client.get("/api/agents/board")
+        assert r.status_code == 200

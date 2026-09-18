@@ -633,6 +633,41 @@ CREATE TABLE IF NOT EXISTS cli_sessions (
     last_event_at    INTEGER NOT NULL,
     ended_at         INTEGER
 );
+
+-- One row per task: the outcome of that card's most recently *completed*
+-- agent run (see Worker._record_card_outcome). Replaced wholesale on every
+-- completion, including a resumed session's later completion, so a card
+-- never accumulates more than one outcome. Kept out of the vault task's
+-- `notes` field deliberately — the drawer renders this as its own read-only
+-- section rather than markdown stuffed into the editable notes textarea,
+-- and a multi-line report doesn't belong in a vault inline field either.
+CREATE TABLE IF NOT EXISTS card_outcomes (
+    task_id      TEXT PRIMARY KEY,
+    session_id   TEXT NOT NULL,
+    engine_label TEXT NOT NULL,
+    summary      TEXT NOT NULL DEFAULT '',
+    branch       TEXT,
+    pr_urls_json TEXT NOT NULL DEFAULT '[]',
+    created_at   INTEGER NOT NULL
+);
+
+-- Background-refreshed cache of a pull request's merge status, keyed by its
+-- GitHub URL and shared across every card outcome that references it. A
+-- board read (`GET /board`, the board stream) only ever reads this table —
+-- never `gh` directly — so it can't block on the git host. `stale=1` means
+-- the last refresh attempt failed (a timeout, an unreachable host, a `gh`
+-- error): the previously known number/title/state/merged_at are kept
+-- rather than cleared, and the reader shows them as possibly stale instead
+-- of blank. A URL with no row yet has never been refreshed at all.
+CREATE TABLE IF NOT EXISTS pr_status_cache (
+    url        TEXT PRIMARY KEY,
+    number     INTEGER,
+    title      TEXT,
+    state      TEXT,
+    merged_at  TEXT,
+    checked_at INTEGER NOT NULL,
+    stale      INTEGER NOT NULL DEFAULT 1
+);
 """
 
 
@@ -4106,6 +4141,142 @@ class SessionStore:
             if cli.status != CLI_STATUS_ENDED:
                 return True
         return False
+
+    # ------------------------------------------------------------------
+    # Card outcomes — what a completed run reports on its Review card
+    # ------------------------------------------------------------------
+
+    def record_card_outcome(
+        self,
+        task_id: str,
+        *,
+        session_id: str,
+        engine_label: str,
+        summary: str,
+        branch: str | None = None,
+        pr_urls: list[str] | None = None,
+    ) -> None:
+        """Replace `task_id`'s outcome record with this run's. Idempotent
+        per call and always a full replace — a resumed session that
+        completes again overwrites the earlier run's record rather than
+        appending to it, so a card carries exactly one outcome."""
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO card_outcomes "
+                "(task_id, session_id, engine_label, summary, branch, pr_urls_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(task_id) DO UPDATE SET "
+                "session_id = excluded.session_id, engine_label = excluded.engine_label, "
+                "summary = excluded.summary, branch = excluded.branch, "
+                "pr_urls_json = excluded.pr_urls_json, created_at = excluded.created_at",
+                (
+                    task_id, session_id, engine_label, summary, branch,
+                    json.dumps(pr_urls or []), _now(),
+                ),
+            )
+
+    def get_card_outcome(self, task_id: str) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM card_outcomes WHERE task_id = ?", (task_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            pr_urls = json.loads(row["pr_urls_json"] or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pr_urls = []
+        return {
+            "task_id": row["task_id"],
+            "session_id": row["session_id"],
+            "engine_label": row["engine_label"],
+            "summary": row["summary"],
+            "branch": row["branch"],
+            "pr_urls": pr_urls if isinstance(pr_urls, list) else [],
+            "created_at": row["created_at"],
+        }
+
+    def list_outcome_pr_urls(self) -> list[str]:
+        """Every distinct PR URL referenced by any recorded card outcome —
+        the working set the background PR-status refresher keeps current."""
+        with self._connect() as conn:
+            rows = conn.execute("SELECT pr_urls_json FROM card_outcomes").fetchall()
+        seen: list[str] = []
+        for row in rows:
+            try:
+                urls = json.loads(row["pr_urls_json"] or "[]")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            for url in urls:
+                if isinstance(url, str) and url and url not in seen:
+                    seen.append(url)
+        return seen
+
+    def get_pr_status(self, url: str) -> dict | None:
+        """The cached merge status for `url`, or None if it has never been
+        refreshed. `stale=True` means the *last refresh attempt* failed —
+        the other fields are still the last successfully observed values,
+        not necessarily current."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM pr_status_cache WHERE url = ?", (url,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "url": row["url"],
+            "number": row["number"],
+            "title": row["title"],
+            "state": row["state"],
+            "merged_at": row["merged_at"],
+            "checked_at": row["checked_at"],
+            "stale": bool(row["stale"]),
+        }
+
+    def list_stale_pr_urls(self, *, ttl_s: int) -> list[str]:
+        """PR urls referenced by a card outcome whose cache entry is
+        missing or older than `ttl_s` — what the background refresher
+        should look at next. Every outcome PR starts out missing from
+        `pr_status_cache` entirely, so a freshly completed run's PR is
+        picked up on the refresher's next tick without a special case."""
+        cutoff = _now() - int(ttl_s)
+        with self._connect() as conn:
+            fresh = {
+                row["url"] for row in conn.execute(
+                    "SELECT url FROM pr_status_cache WHERE checked_at >= ?", (cutoff,),
+                )
+            }
+        return [url for url in self.list_outcome_pr_urls() if url not in fresh]
+
+    def upsert_pr_status(
+        self, url: str, info: dict | None, *, checked_at: int | None = None,
+    ) -> None:
+        """Record one refresh attempt for `url`. `info` (from a successful
+        `gh pr view`) is `{number, title, state, merged_at}`; None marks a
+        failed/timed-out attempt, which keeps any previously known fields
+        but flips `stale` on rather than clearing them."""
+        ts = checked_at if checked_at is not None else _now()
+        with self._connect() as conn:
+            if info is not None:
+                conn.execute(
+                    "INSERT INTO pr_status_cache "
+                    "(url, number, title, state, merged_at, checked_at, stale) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 0) "
+                    "ON CONFLICT(url) DO UPDATE SET "
+                    "number = excluded.number, title = excluded.title, "
+                    "state = excluded.state, merged_at = excluded.merged_at, "
+                    "checked_at = excluded.checked_at, stale = 0",
+                    (
+                        url, info.get("number"), info.get("title"),
+                        info.get("state"), info.get("merged_at"), ts,
+                    ),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO pr_status_cache (url, checked_at, stale) VALUES (?, ?, 1) "
+                    "ON CONFLICT(url) DO UPDATE SET checked_at = excluded.checked_at, stale = 1",
+                    (url, ts),
+                )
 
     @staticmethod
     def _row_to_cli_session(row: sqlite3.Row) -> CliSession:

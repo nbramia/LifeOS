@@ -3763,6 +3763,50 @@ class Worker:
             pr_body=(getattr(outcome, "final_text", "") or "").strip(),
         )
 
+    def _record_card_outcome(
+        self, session: Session, summary: str | None, *, engine_label: str | None = None,
+        git_result=None,
+    ) -> None:
+        """Persist this run's outcome for its Review card: the agent's own
+        completion summary — the same text just sent to the operator, not
+        re-derived from the transcript — and, for a coding session, the
+        branch it worked on and any pull request it opened.
+
+        Branch/PR come from `git_result` (a `git_worktree.FinalizeResult`),
+        the authoritative record of what the worker's own git discipline
+        did at completion, not from grepping the transcript for a branch
+        name or a `github.com/.../pull/NNN` mention. `_discover_wip_branch`
+        is only a fallback for a session with no such result (e.g. one
+        whose worktree provisioning predates this being wired in).
+
+        Best-effort: this never raises into the caller. The card is already
+        marked done by the time this runs, so a failure here should cost
+        the operator a missing outcome section, not the completion itself.
+        """
+        try:
+            if not engine_label:
+                engine_label = _ENGINE_LABELS.get(session.routing, session.routing or "agent")
+                if session.routing == "claude_code" and session.claude_code_model:
+                    engine_label += f" ({session.claude_code_model})"
+            branch = None
+            pr_urls: list[str] = []
+            if git_result is not None and getattr(git_result, "applicable", False):
+                branch = git_result.branch
+                if git_result.pr_url:
+                    pr_urls = [git_result.pr_url]
+            if not branch:
+                branch = self._discover_wip_branch(session.session_id)
+            self.session_store.record_card_outcome(
+                session.task_id,
+                session_id=session.session_id,
+                engine_label=engine_label,
+                summary=(summary or "").strip(),
+                branch=branch,
+                pr_urls=pr_urls,
+            )
+        except Exception as exc:
+            logger.warning("recording card outcome failed for %s: %s", session.task_id, exc)
+
     def _dispatch_claude_code_session(self, session, pending: list[dict]) -> None:
         """Drive one ``routing='claude_code'`` session through ``ClaudeCodeExecutor``.
 
@@ -4126,6 +4170,10 @@ class Worker:
             })
             self._apply_repair_result(session, outcome.final_text)
             self._reconcile_vault_terminal(session, STATUS_COMPLETED)
+            if session.origin != "operator" and not session.parent_session_id:
+                self._record_card_outcome(
+                    session, outcome.final_text, git_result=git_result,
+                )
             # A reply that arrived MID-RUN (status-anchor route) is
             # queued in pending_messages with nothing to deliver it — the
             # dispatch tick only drains CLAIMED sessions. Reopen once the
@@ -4592,6 +4640,10 @@ class Worker:
             })
             self._apply_repair_result(session, outcome.final_text)
             self._reconcile_vault_terminal(session, STATUS_COMPLETED)
+            if session.origin != "operator" and not session.parent_session_id:
+                self._record_card_outcome(
+                    session, outcome.final_text, git_result=git_result,
+                )
             return
 
         label = "Codex session"
@@ -5373,6 +5425,8 @@ class Worker:
                 # follow-up turn (e.g., "now turn this into a .md in my vault").
                 body = self._completion_summary(session, task, outcome)
                 self._notify_terminal(session, body, label=title)
+                if has_vault_task:
+                    self._record_card_outcome(session, body)
             else:
                 # Child completion — record only; parent picks it up via yield_until.
                 self.transcript_store.append(sid, "child_completed_internal", {

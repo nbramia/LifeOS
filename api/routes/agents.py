@@ -1076,6 +1076,44 @@ def _pending_question_view(pq: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _card_outcome_view(task_id: str, session_store: SessionStore) -> dict[str, Any] | None:
+    """The Review-lane outcome for `task_id`, or None when its card has
+    never carried a completed run.
+
+    Each pull request's merge status is joined live from
+    `pr_status_cache` (kept current by the background PR-status
+    refresher) rather than the status recorded when the run completed —
+    the per-request cost is one indexed SQLite lookup per PR, never a
+    `gh` call. `state`/`number`/`merged_at` are None and `stale` is True
+    for a PR the refresher hasn't reached yet.
+    """
+    outcome = session_store.get_card_outcome(task_id)
+    if outcome is None:
+        return None
+    prs: list[dict[str, Any]] = []
+    for url in outcome["pr_urls"]:
+        status = session_store.get_pr_status(url)
+        prs.append({
+            "url": url,
+            "number": status["number"] if status else None,
+            "state": status["state"] if status else None,
+            "merged_at": status["merged_at"] if status else None,
+            "stale": status["stale"] if status else True,
+        })
+    return {
+        "session_id": outcome["session_id"],
+        "engine_label": outcome["engine_label"],
+        "summary": outcome["summary"],
+        "branch": outcome["branch"],
+        # ISO 8601, matching every other date the board payload carries
+        # (task dates come straight from the vault as ISO strings) — the
+        # stored value is a unix-epoch int for cheap SQLite ordering, but
+        # nothing downstream should have to know that.
+        "created_at": datetime.fromtimestamp(outcome["created_at"], tz=timezone.utc).isoformat(),
+        "prs": prs,
+    }
+
+
 def _task_card(task, sessions_by_task: dict[str, list[dict[str, Any]]],
                 open_question_by_task: dict[str, dict[str, Any]],
                 session_store: SessionStore) -> dict[str, Any]:
@@ -1106,6 +1144,7 @@ def _task_card(task, sessions_by_task: dict[str, list[dict[str, Any]]],
         "session": session,
         "pending_question": _pending_question_view(pq) if pq else None,
         "policy": _card_policy(task, session_store),
+        "outcome": _card_outcome_view(task.id, session_store),
     }
 
 
