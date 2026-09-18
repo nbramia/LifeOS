@@ -92,8 +92,11 @@ class WorktreeContext:
 
 def _local_runner(
     cmd: list[str], *, cwd: Optional[str] = None, timeout: int = DEFAULT_TIMEOUT,
+    input: Optional[str] = None,
 ) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False)
+    return subprocess.run(
+        cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False, input=input,
+    )
 
 
 def make_ssh_runner(target: str, *, connect_timeout: Optional[int] = None) -> Runner:
@@ -112,6 +115,7 @@ def make_ssh_runner(target: str, *, connect_timeout: Optional[int] = None) -> Ru
 
     def _runner(
         cmd: list[str], *, cwd: Optional[str] = None, timeout: int = DEFAULT_TIMEOUT,
+        input: Optional[str] = None,
     ) -> subprocess.CompletedProcess:
         remote_command = shlex.join(cmd)
         if cwd:
@@ -120,7 +124,10 @@ def make_ssh_runner(target: str, *, connect_timeout: Optional[int] = None) -> Ru
             "ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={resolved_connect_timeout}",
             target, "--", remote_command,
         ]
-        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+        # ssh forwards its own stdin to the remote command's stdin by
+        # default, so `input` (the gh pr body, delivered via `--body-file
+        # -`) reaches the remote `gh` process exactly like a local one.
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False, input=input)
 
     return _runner
 
@@ -155,7 +162,7 @@ def resolve_runner_for_host(host: Optional[str]) -> Runner:
 
 def _run(
     cmd: list[str], *, cwd: Optional[str] = None, timeout: int = DEFAULT_TIMEOUT,
-    runner: Optional[Runner] = None,
+    runner: Optional[Runner] = None, input: Optional[str] = None,
 ) -> subprocess.CompletedProcess:
     """Run one command through ``runner`` (default: the local subprocess),
     uniformly translating a hung or unreachable command into an ordinary
@@ -164,10 +171,17 @@ def _run(
     ``returncode != 0`` handling then reports it the same way it reports
     any other git failure, and provisioning can't crash the dispatch path
     on a slow hook or an unreachable host.
+
+    ``input`` is only forwarded when given (most commands need no stdin);
+    the two built-in runners and any test double that doesn't declare an
+    ``input`` parameter stay unaffected for every call that omits it.
     """
     active = runner or _local_runner
+    kwargs: dict = {"cwd": cwd, "timeout": timeout}
+    if input is not None:
+        kwargs["input"] = input
     try:
-        return active(cmd, cwd=cwd, timeout=timeout)
+        return active(cmd, **kwargs)
     except subprocess.TimeoutExpired as exc:
         return subprocess.CompletedProcess(cmd, returncode=124, stdout="", stderr=f"timed out after {timeout}s: {exc}")
     except OSError as exc:
@@ -204,17 +218,25 @@ def repo_toplevel(path: str, *, runner: Optional[Runner] = None, timeout: int = 
     return out or None
 
 
-def is_linked_worktree(working_dir: str) -> bool:
+def is_linked_worktree(working_dir: str, *, runner: Optional[Runner] = None, timeout: int = DEFAULT_TIMEOUT) -> bool:
     """True when ``working_dir`` is a linked git worktree — its own
     ``.git`` is a file pointing at the shared repo, never a directory the
-    way the primary checkout's is."""
-    return os.path.isfile(os.path.join(working_dir, ".git"))
+    way the primary checkout's is.
+
+    ``runner`` defaults to the local filesystem (a plain ``os.path.isfile``
+    check — cheaper than a subprocess for the common local case); callers
+    that need this checked on a remote host pass a resolved remote
+    ``runner``, which routes the check through ``test -f`` instead.
+    """
+    if runner is None:
+        return os.path.isfile(os.path.join(working_dir, ".git"))
+    return _path_exists(f"{working_dir.rstrip('/')}/.git", kind="f", runner=runner, timeout=timeout)
 
 
-def current_branch(working_dir: str, *, timeout: int = DEFAULT_TIMEOUT) -> Optional[str]:
+def current_branch(working_dir: str, *, runner: Optional[Runner] = None, timeout: int = DEFAULT_TIMEOUT) -> Optional[str]:
     """The branch checked out in ``working_dir``, or None on any git
     failure (detached HEAD, not a repo, timeout)."""
-    result = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=working_dir, timeout=timeout)
+    result = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=working_dir, runner=runner, timeout=timeout)
     if result.returncode != 0:
         return None
     branch = result.stdout.strip()

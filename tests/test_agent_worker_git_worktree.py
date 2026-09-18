@@ -360,3 +360,48 @@ def test_ensure_worktree_reuses_a_racing_concurrent_provision(tmp_path: Path, mo
     assert result.branch == branch
     assert result.working_dir == expected_dir
     assert call_count["n"] == 2  # primary check (missed) + post-failure re-probe (found)
+
+
+# ---------------------------------------------------------------------------
+# Runner-aware detection + stdin forwarding — plumbing the completion path
+# (finalize_worktree_session) needs to detect/operate on a remote worktree.
+# ---------------------------------------------------------------------------
+
+def test_is_linked_worktree_checks_through_a_given_runner(tmp_path: Path):
+    """When a runner is supplied, detection goes through it (`test -f`)
+    instead of the local filesystem — required for a remote worktree,
+    where the path doesn't exist on this machine at all."""
+    repo = _init_repo_with_origin(tmp_path)
+    result = ensure_worktree(str(repo), "task-runner-detect", "fix the thing")
+
+    calls = []
+
+    def fake_runner(cmd, *, cwd=None, timeout=git_worktree.DEFAULT_TIMEOUT):
+        calls.append(cmd)
+        return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+
+    assert is_linked_worktree(result.working_dir, runner=fake_runner) is True
+    assert any(cmd[:2] == ["test", "-f"] for cmd in calls)
+
+
+def test_run_only_forwards_input_when_given(tmp_path: Path):
+    """A runner that doesn't declare an `input` parameter must keep
+    working for every call that doesn't need one — `_run` only adds
+    `input` to the call when a caller actually passes it."""
+    def strict_runner(cmd, *, cwd=None, timeout=git_worktree.DEFAULT_TIMEOUT):
+        # Would raise TypeError if `_run` always forwarded `input=None`.
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="ok\n", stderr="")
+
+    result = git_worktree._run(["true"], runner=strict_runner)
+    assert result.returncode == 0
+
+
+def test_run_forwards_input_when_given():
+    captured = {}
+
+    def capturing_runner(cmd, *, cwd=None, timeout=git_worktree.DEFAULT_TIMEOUT, input=None):
+        captured["input"] = input
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+
+    git_worktree._run(["cat"], runner=capturing_runner, input="hello body")
+    assert captured["input"] == "hello body"
