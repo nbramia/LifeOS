@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-09-03
+> **Last Updated:** 2026-09-18
 
 LifeOS includes an external **agent worker** that picks up engine-assigned tasks and completes them autonomously — running locally on a self-hosted LLM or on Anthropic's Managed Agents cloud, with budget caps you can specify in the task title and full audit transcripts on every run. When the agent finishes (or gets stuck), it notifies you on Telegram. If it has a question mid-run, it asks via Telegram and waits for your reply.
 
@@ -135,6 +135,8 @@ The agent worker uses your existing Telegram bot (no second bot needed). Three m
 **Replying to a thread.** Every terminal notification — completion, failure, or budget cut-off — is replyable: use Telegram's native reply on it (any chunk of a long message) and the agent reopens that thread as a follow-up turn with full prior context ("actually, also CC Jane"). The reply gesture is the *only* way to continue a thread on Telegram — a plain message is always a normal chat query, so unrelated questions are never mistaken for a thread continuation.
 
 The immediate acknowledgment only ever confirms your note is queued — it never claims the session has already resumed, because a `/claude`/`/codex` session's actual resume happens on the worker's next poll cycle, not synchronously with your reply. A second, separate message confirms once that resumed run actually starts. If a resume doesn't start within a few minutes, a one-time alert names the stuck task/session rather than leaving it silently orphaned — check `#agent-running` on the card and, if it's still not moving, re-trigger it manually.
+
+Every session message begins with the card's short title. After the session's first message, progress updates, questions, completion, failure, and budget notices appear as Telegram replies to that first message, keeping concurrent sessions visibly attributable. A completed Claude Code run sends one coherent final result; an unfinished trailing aside does not replace a summary that was already reported.
 
 **Starting an agent on demand.** You don't have to create a `#agent` task — send `/agent <task>` to spawn one immediately. The model is auto-routed by preflight; force it with `/agent local <task>` or `/agent claude <task>`. If routing is ambiguous — or the cloud route was only inferred — the bot asks which engine before starting. The same `/agent` command works in web chat. The resulting thread notifies and is replyable exactly like a `#agent` task.
 

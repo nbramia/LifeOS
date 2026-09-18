@@ -63,6 +63,7 @@ from api.services.agent_worker.session_store import (
 )
 from api.services.agent_worker.transcript_store import TranscriptStore
 from api.services.agent_worker.usage_ledger import UsageLedger
+from api.services.secret_redaction import scrub_and_bound
 from api.services.codex.session_ingest import _cost_from_usage
 from config.settings import settings
 
@@ -138,6 +139,7 @@ class _RunState:
     started_at: float = field(default_factory=time.time)
     last_notify_at: float = field(default_factory=time.time)
     terminal: bool = False
+    last_error: str = ""
 
 
 NotificationCallback = Callable[[str], None]
@@ -159,6 +161,7 @@ class CodexExecutor:
         session_store: SessionStore,
         transcript_store: TranscriptStore,
         notification_callback: Optional[NotificationCallback] = None,
+        operator_send: Optional[Callable[[object, str], None]] = None,
         spawn_fn: Optional[SpawnFn] = None,
         binary_resolver: Optional[Callable[[], str]] = None,
         timeout_seconds: Optional[int] = None,
@@ -167,6 +170,7 @@ class CodexExecutor:
         self.session_store = session_store
         self.transcript_store = transcript_store
         self._notify = notification_callback or (lambda _msg: None)
+        self._operator_send = operator_send
         self._spawn_fn = spawn_fn or subprocess.Popen
         self._binary_resolver = binary_resolver or _resolve_codex_binary
         # Reuse the existing /claude wall-clock knob — operators have one less
@@ -224,6 +228,7 @@ class CodexExecutor:
         return self._with_identity(session, self._run(
             session=session,
             prompt=full_prompt,
+            task_title=prompt,
             working_dir=working_dir,
             resume_session_id=None,
         ))
@@ -246,6 +251,7 @@ class CodexExecutor:
         return self._with_identity(session, self._run(
             session=session,
             prompt=message,
+            task_title=session.task_id,
             working_dir=wd,
             resume_session_id=resume_id,
         ))
@@ -357,6 +363,7 @@ class CodexExecutor:
         *,
         session,
         prompt: str,
+        task_title: str,
         working_dir: str,
         resume_session_id: Optional[str],
     ) -> ExecutorOutcome:
@@ -505,7 +512,7 @@ class CodexExecutor:
 
         heartbeat_thread = threading.Thread(
             target=self._heartbeat_loop,
-            args=(state, stop_heartbeat),
+            args=(session, state, stop_heartbeat),
             daemon=True,
             name=f"CodexHeartbeat-{sid[:8]}",
         )
@@ -664,14 +671,18 @@ class CodexExecutor:
         })
         # Fold the ssh failure's stderr into the
         # reason on the remote path — see ClaudeCodeExecutor._run for why.
-        reason = f"codex exited with code {proc.returncode}"
+        title = task_title or session.task_id
+        detail = last_nonempty_line(stderr_tail) or state.last_error
+        if not detail:
+            detail = "no error output was captured"
+        reason = f"task '{title}': codex exited with code {proc.returncode}: {detail}"
         if is_remote:
             last_line = last_nonempty_line(stderr_tail)
             if last_line:
                 reason = f"ssh to {host} failed (exit {proc.returncode}): {last_line}"
         return ExecutorOutcome(
             status=STATUS_FAILED,
-            reason=reason,
+            reason=scrub_and_bound(reason),
         )
 
     @staticmethod
@@ -762,9 +773,16 @@ class CodexExecutor:
                     self.transcript_store.append(sid, "codex_assistant_text", {
                         "text": text, "chars": len(text),
                     })
-            elif itype in ("command_executed", "local_shell_call", "function_call"):
+            elif itype in (
+                "command_executed", "command_execution", "local_shell_call",
+                "function_call", "mcp_tool_call", "file_change", "web_search",
+            ):
                 state.tool_call_count += 1
-                cmd_preview = str(item.get("command") or item.get("name") or "")
+                changes = item.get("changes") or [{}]
+                cmd_preview = str(
+                    item.get("command") or item.get("name")
+                    or changes[0].get("path") or ""
+                )
                 state.last_activity = f"running {cmd_preview[:40]}" if cmd_preview else "running a tool"
                 self.transcript_store.append(sid, "codex_tool_use", {
                     "type": itype,
@@ -774,6 +792,13 @@ class CodexExecutor:
                 # Drop reasoning text from the transcript — it's verbose
                 # and the cumulative token count gives us the size signal.
                 pass
+            return
+
+        if etype in ("error", "turn.failed"):
+            error = event.get("error") or event.get("message") or {}
+            if isinstance(error, dict):
+                error = error.get("message") or error.get("code") or ""
+            state.last_error = str(error).strip()
             return
 
         if etype == "turn.completed":
@@ -852,7 +877,9 @@ class CodexExecutor:
             except Exception as exc:  # pragma: no cover — defensive
                 logger.warning("watchdog terminate failed: %s", exc)
 
-    def _heartbeat_loop(self, state: _RunState, stop_event: threading.Event) -> None:
+    def _heartbeat_loop(
+        self, session, state: _RunState, stop_event: threading.Event,
+    ) -> None:
         while not stop_event.wait(self._heartbeat_interval):
             if state.terminal:
                 return
@@ -864,7 +891,11 @@ class CodexExecutor:
             activity = f" — {state.last_activity}" if state.last_activity else ""
             cost = f" | ${state.cost_usd:.2f}" if state.cost_usd > 0 else ""
             try:
-                self._notify(f"Still working{activity} ({minutes}m elapsed{cost})")
+                body = f"Still working{activity} ({minutes}m elapsed{cost})"
+                if self._operator_send is not None:
+                    self._operator_send(session, body)
+                else:
+                    self._notify(body)
             except Exception as exc:  # pragma: no cover — defensive
                 logger.warning("heartbeat callback raised: %s", exc)
             state.last_notify_at = now

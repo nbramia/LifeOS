@@ -2993,6 +2993,16 @@ class SessionStore:
                     (json.dumps(merged), row["id"]),
                 )
 
+    def get_first_reply_anchor(self, session_id: str) -> int | None:
+        """Return the earliest Telegram message id recorded for a session."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT sent_message_id FROM pending_questions "
+                "WHERE session_id = ? ORDER BY sent_at ASC, id ASC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        return int(row["sent_message_id"]) if row is not None else None
+
     def has_pending_messages(self, session_id: str) -> bool:
         """True when undelivered pending messages exist for `session_id`."""
         with self._connect() as conn:
@@ -3297,7 +3307,8 @@ class SessionStore:
     def get_question_by_message_id(self, sent_message_id: int) -> dict | None:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT * FROM pending_questions WHERE sent_message_id = ?",
+                "SELECT * FROM pending_questions WHERE sent_message_id = ? "
+                "ORDER BY CASE WHEN kind = 'status_anchor' THEN 1 ELSE 0 END, id ASC",
                 (int(sent_message_id),),
             ).fetchone()
         return dict(row) if row else None
@@ -3348,7 +3359,8 @@ class SessionStore:
                 "AND (sent_message_id = ? OR (sent_message_ids IS NOT NULL "
                 "AND EXISTS (SELECT 1 FROM json_each(sent_message_ids) WHERE value = ?)))"
                 + bot_clause +
-                " ORDER BY id ASC LIMIT 1",
+                " ORDER BY CASE WHEN kind = 'status_anchor' THEN 1 ELSE 0 END, "
+                "id ASC LIMIT 1",
                 (int(sent_message_id), int(sent_message_id), *bot_params),
             ).fetchone()
         return dict(row) if row else None

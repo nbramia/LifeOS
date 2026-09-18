@@ -122,6 +122,59 @@ class TestSendMessage:
         assert result is True
         assert mock_post.call_count == 2
 
+    @patch("api.services.telegram.settings")
+    @patch("api.services.telegram.httpx.post")
+    def test_send_message_retry_can_degrade_without_reply(self, mock_post, mock_settings):
+        from api.services.telegram import send_message
+
+        mock_settings.telegram_enabled = True
+        mock_settings.telegram_bot_token = "test-token"
+        mock_settings.telegram_chat_id = "12345"
+        mock_post.side_effect = [
+            MagicMock(status_code=400, text="Bad Request"),
+            MagicMock(status_code=200),
+        ]
+
+        assert send_message("Update", reply_to_message_id=17) is True
+        retry_payload = mock_post.call_args_list[1].kwargs["json"]
+        assert retry_payload["reply_to_message_id"] == 17
+        assert retry_payload["allow_sending_without_reply"] is True
+
+    @patch("api.services.telegram.settings")
+    @patch("api.services.telegram.httpx.post")
+    def test_capture_ids_includes_optional_reply_id(self, mock_post, mock_settings):
+        from api.services.telegram import send_message_capture_ids
+
+        mock_settings.telegram_enabled = True
+        mock_settings.telegram_bot_token = "test-token"
+        mock_settings.telegram_chat_id = "12345"
+        mock_post.return_value = MagicMock(
+            status_code=200,
+            json=lambda: {"result": {"message_id": 91}},
+        )
+
+        assert send_message_capture_ids("Update", reply_to_message_id=17) == [91]
+        assert mock_post.call_args.kwargs["json"]["reply_to_message_id"] == 17
+        assert mock_post.call_args.kwargs["json"]["allow_sending_without_reply"] is True
+
+    @patch("api.services.telegram.settings")
+    @patch("api.services.telegram.httpx.post")
+    def test_capture_ids_retry_can_degrade_without_reply(self, mock_post, mock_settings):
+        from api.services.telegram import send_message_capture_ids
+
+        mock_settings.telegram_enabled = True
+        mock_settings.telegram_bot_token = "test-token"
+        mock_settings.telegram_chat_id = "12345"
+        mock_post.side_effect = [
+            MagicMock(status_code=400, text="Bad Request"),
+            MagicMock(status_code=200, json=lambda: {"result": {"message_id": 92}}),
+        ]
+
+        assert send_message_capture_ids("Update", reply_to_message_id=17) == [92]
+        retry_payload = mock_post.call_args_list[1].kwargs["json"]
+        assert retry_payload["reply_to_message_id"] == 17
+        assert retry_payload["allow_sending_without_reply"] is True
+
 
 class TestChatViaApi:
     """Tests for the internal chat client."""

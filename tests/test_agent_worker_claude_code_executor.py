@@ -715,7 +715,104 @@ def test_nonzero_exit_without_terminal_returns_failed(tmp_path: Path):
     session = _seed_session(store)
     outcome = executor.execute(session, {"description": "broken thing"})
     assert outcome.status == STATUS_FAILED
-    assert "exited with code 2" in outcome.reason
+    assert outcome.reason == "task 'broken thing': claude exited with code 2: boom"
+
+
+def test_nonzero_exit_scrubs_and_bounds_operator_failure_reason(tmp_path: Path):
+    fake_token = "sk-SYNTHETICFAKECREDENTIAL1234567890"
+    stderr = f"failure using {fake_token} " + ("synthetic detail " * 40)
+    executor, store, _ = _build_executor(
+        tmp_path, spawn_fn=_spawn_with([], returncode=2, stderr=stderr),
+    )
+    session = _seed_session(store)
+
+    outcome = executor.execute(session, {"description": "synthetic failing task"})
+
+    assert fake_token not in outcome.reason
+    assert "sk-<REDACTED>" in outcome.reason
+    assert len(outcome.reason) <= 300
+
+
+def test_nonzero_exit_uses_structured_error_when_stderr_empty(tmp_path: Path):
+    events = [{"type": "result", "subtype": "error_during_execution", "result": "Synthetic tool failed"}]
+    executor, store, _ = _build_executor(
+        tmp_path, spawn_fn=_spawn_with(events, returncode=2),
+    )
+    session = _seed_session(store)
+
+    outcome = executor.execute(session, {"description": "compile report"})
+
+    assert outcome.reason == (
+        "task 'compile report': claude exited with code 2: Synthetic tool failed"
+    )
+
+
+def test_nonzero_exit_says_when_no_error_output_was_captured(tmp_path: Path):
+    executor, store, _ = _build_executor(
+        tmp_path, spawn_fn=_spawn_with([], returncode=2),
+    )
+    session = _seed_session(store)
+
+    outcome = executor.execute(session, {"description": "compile report"})
+
+    assert outcome.reason.endswith(": no error output was captured")
+
+
+def test_trailing_fragment_after_notify_does_not_replace_final_text(tmp_path: Path):
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "cli-final-text"},
+        {
+            "type": "assistant",
+            "message": {"content": [{
+                "type": "text",
+                "text": "[NOTIFY] Completed the migration and all checks pass.",
+            }]},
+        },
+        {
+            "type": "assistant",
+            "message": {"content": [{
+                "type": "text",
+                "text": "Moving hidden folders out of the skills tree:",
+            }]},
+        },
+        {
+            "type": "result",
+            "session_id": "cli-final-text",
+            "total_cost_usd": 0.01,
+            "result": "Moving hidden folders out of the skills tree:",
+        },
+    ]
+    notifications: list[str] = []
+    executor, store, _ = _build_executor(
+        tmp_path, spawn_fn=_spawn_with(events), notifications=notifications,
+    )
+    session = _seed_session(store)
+
+    outcome = executor.execute(session, {"description": "migrate skills"})
+
+    assert notifications == ["Completed the migration and all checks pass."]
+    assert outcome.final_text == ""
+
+
+def test_later_summary_after_notify_replaces_final_text(tmp_path: Path):
+    executor, store, _ = _build_executor(tmp_path, spawn_fn=_spawn_with([]), notifications=[])
+    session = _seed_session(store)
+    state = _RunState(final_text="Completed the initial migration successfully.")
+
+    executor._handle_assistant_event(
+        {"message": {"content": [{"type": "text", "text": "[NOTIFY] Initial migration complete."}]}},
+        session,
+        state,
+    )
+    executor._handle_assistant_event(
+        {"message": {"content": [{"type": "text", "text": "Moved the hidden folders and reran every targeted test successfully."}]}},
+        session,
+        state,
+    )
+
+    assert state.final_text == (
+        "Moved the hidden folders and reran every targeted test successfully."
+    )
 
 
 def test_result_event_then_nonzero_exit_returns_failed(tmp_path: Path):

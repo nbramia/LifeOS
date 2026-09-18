@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Platform
-> **Last Updated:** 2026-09-10
+> **Last Updated:** 2026-09-18
 
 LifeOS exposes the orchestrator to **HTTP consumers** — thin clients that submit text and consume SSE without importing LifeOS Python modules. Endpoint and event **shapes** are defined in [api-reference.md](../product/api-reference.md); this doc covers **who consumes them**, **whisper-relay integration**, and **breaking-change policy**.
 
@@ -35,6 +35,8 @@ filesystem exception details remain server-side.
 ---
 
 ## Telegram bot backends
+
+Worker session notifications are bot-native messages, not HTTP response frames. Each one carries a card-title prefix; after the first message for a session, the sender sets Telegram's `reply_to_message_id` to that session's earliest recorded message. This visual threading does not alter `/api/ask/stream`, `/api/hermes/ask/stream`, or any SSE contract described here.
 
 Every LifeOS persona bot — fitness, therapist, doctor, finance, journal — answers through the **Hermes proxy** (`/api/hermes/ask/stream`) by default, the same backend `/chat` prefers when it's available (see "Default backend selection" below). The **primary** bot always answers through the native pipeline (`/api/ask/stream`) instead. This is entirely a decision the Telegram *listener* (`api/services/telegram.py`) makes about which endpoint to call for a given bot's turn — it is unrelated to, and does not change, the `backend` field `/chat` sends on `POST /api/ask/stream` (documented above), the `orchestrates` flag's meaning (below), or anything `GET /api/personas` reports.
 
