@@ -178,6 +178,9 @@ _BLOCKED_PROMPT_RETRY_DELAY_S = 0.5
 # releases only claims inherited at process start; live claims are cleaned up by
 # the same-process exception/ownership path in `_process_clarification_answers`.
 _QUESTION_CLAIM_RECOVERY_LIMIT = 100
+_RESOURCE_CLEANUP_INTERVAL_SECONDS = 300
+_RESOURCE_CLEANUP_BATCH_SIZE = 10
+_WORKTREE_RECENT_SECONDS = 24 * 60 * 60
 
 # A recurring (cron) schedule stamps its handed-off #agent task with a
 # `sched-<id>` tag (see scheduler_store._hand_off_to_agent). The worker reads
@@ -707,6 +710,8 @@ class Worker:
         self._hermes_inflight: set[str] = set()
         self._hermes_lock = threading.Lock()
         self._executor_registry = ExecutorRegistry(session_store=self.session_store)
+        self._last_resource_cleanup = 0.0
+        self._pr_state_cache: dict[str, tuple[float, str | None]] = {}
         self._warn_deprecated_settings()
 
     def _project_session_status(
@@ -716,6 +721,9 @@ class Worker:
     ) -> bool:
         """Project a session transition to the public task surface."""
         session = self.session_store.get(task_id)
+        if session is not None and status in TERMINAL_STATUSES:
+            from api.services.agent_worker.session_resources import cleanup_session_scratch
+            cleanup_session_scratch(session.session_id)
         if session is None or session.origin == "operator" or session.parent_session_id:
             return False
         try:
@@ -991,6 +999,7 @@ class Worker:
         # gets a one-time alert rather than staying silently orphaned. Also
         # ungated on the spend cap: it never starts new work, only alerts.
         self._reconcile_stuck_claimed_sessions()
+        self._cleanup_session_resources()
 
         # Use the configured per-task default budget as the "can I afford to
         # start the cheapest task right now?" estimate. Calling with 0.0 would
@@ -1065,6 +1074,64 @@ class Worker:
             self._dispatch(task)
             handled += 1
         return handled
+
+    def _cleanup_session_resources(self, *, force: bool = False) -> int:
+        """Bounded, off-dispatch reconciliation for scratch and worktrees."""
+        now = time.time()
+        if not force and now - self._last_resource_cleanup < _RESOURCE_CLEANUP_INTERVAL_SECONDS:
+            return 0
+        self._last_resource_cleanup = now
+        from api.services.agent_worker.git_worktree import (
+            pull_request_state,
+            remove_worker_worktree,
+        )
+        from api.services.agent_worker.session_resources import cleanup_session_scratch
+
+        cleaned = 0
+        sessions = self.session_store.list_sessions(limit=200)
+        for session in sessions:
+            if cleaned >= _RESOURCE_CLEANUP_BATCH_SIZE:
+                break
+            if session.status in TERMINAL_STATUSES:
+                cleanup_session_scratch(session.session_id)
+            if session.routing not in {ROUTE_CLAUDE_CODE, ROUTE_CODEX} or not session.execution_spec:
+                continue
+            working_dir = ExecutionSpec.from_dict(session.execution_spec).working_dir
+            if not working_dir or "-wt-agent-" not in os.path.basename(working_dir):
+                continue
+            try:
+                task = self._fetch_task(session.task_id)
+            except Exception as exc:
+                logger.warning("resource cleanup task fetch %s failed: %s", session.task_id, exc)
+                continue
+            tags = self._norm_task_tags(task or {})
+            card_terminal = task is None or (task or {}).get("status") in {"cancelled", "done"}
+            accepted = "accepted" in tags
+            should_remove = accepted or (task or {}).get("status") == "cancelled"
+            if not should_remove and session.status == STATUS_COMPLETED:
+                cached = self._pr_state_cache.get(working_dir)
+                if cached and now - cached[0] < _RESOURCE_CLEANUP_INTERVAL_SECONDS:
+                    pr_state = cached[1]
+                else:
+                    try:
+                        pr_state = pull_request_state(working_dir, host=session.host)
+                    except Exception as exc:
+                        logger.warning("PR state check failed for %s: %s", working_dir, exc)
+                        pr_state = None
+                    self._pr_state_cache[working_dir] = (now, pr_state)
+                should_remove = pr_state == "MERGED"
+            recent = now - session.last_activity_at < _WORKTREE_RECENT_SECONDS
+            if not should_remove and session.status in TERMINAL_STATUSES and not recent and card_terminal:
+                should_remove = True
+            if not should_remove:
+                continue
+            result = remove_worker_worktree(working_dir, host=session.host)
+            if result.removed:
+                cleaned += 1
+                self._pr_state_cache.pop(working_dir, None)
+            elif result.applicable and result.error:
+                logger.warning("worktree cleanup failed for %s: %s", working_dir, result.error)
+        return cleaned
 
     def _resume_yielded_for_children(self) -> None:
         """Resume yielded sessions whose listed children have all terminated.
@@ -1616,7 +1683,11 @@ class Worker:
         if session is None:
             return CancelResult(cancelled=False, reason="not_found")
         self._lifecycle_adapter(session)
-        return self._executor_registry.cancel_once(session, reason)
+        result = self._executor_registry.cancel_once(session, reason)
+        if result.cancelled:
+            from api.services.agent_worker.session_resources import cleanup_session_scratch
+            cleanup_session_scratch(session.session_id)
+        return result
 
     def _execute_start(self, session, request: dict[str, Any]):
         """Start one route through the lifecycle adapter.
@@ -1632,7 +1703,9 @@ class Worker:
         if not self._executor_registry.begin(session, "start"):
             return None
         try:
-            return adapter.start(session, request)
+            from api.services.agent_worker.session_resources import session_scratch_context
+            with session_scratch_context(session.session_id):
+                return adapter.start(session, request)
         finally:
             self._executor_registry.finish(session, "start")
 
@@ -1643,7 +1716,9 @@ class Worker:
         if not self._executor_registry.begin(session, "resume"):
             return None
         try:
-            return adapter.resume(session, message, working_dir=working_dir)
+            from api.services.agent_worker.session_resources import session_scratch_context
+            with session_scratch_context(session.session_id):
+                return adapter.resume(session, message, working_dir=working_dir)
         finally:
             self._executor_registry.finish(session, "resume")
 
