@@ -3772,12 +3772,15 @@ class Worker:
         re-derived from the transcript — and, for a coding session, the
         branch it worked on and any pull request it opened.
 
-        Branch/PR come from `git_result` (a `git_worktree.FinalizeResult`),
+        Branch/PR come ONLY from `git_result` (a `git_worktree.FinalizeResult`),
         the authoritative record of what the worker's own git discipline
-        did at completion, not from grepping the transcript for a branch
-        name or a `github.com/.../pull/NNN` mention. `_discover_wip_branch`
-        is only a fallback for a session with no such result (e.g. one
-        whose worktree provisioning predates this being wired in).
+        did at completion — never from grepping the transcript for a
+        branch name or a `github.com/.../pull/NNN` mention. When `git_result`
+        is given but its own `branch`/`pr_url` are absent (no worker-
+        provisioned worktree, or finalization itself failed), that absence
+        is recorded as-is rather than papered over with a transcript guess
+        (`_discover_wip_branch` exists for other callers that want a
+        best-effort branch name; this one deliberately never calls it).
 
         Best-effort: this never raises into the caller. The card is already
         marked done by the time this runs, so a failure here should cost
@@ -3794,8 +3797,6 @@ class Worker:
                 branch = git_result.branch
                 if git_result.pr_url:
                     pr_urls = [git_result.pr_url]
-            if not branch:
-                branch = self._discover_wip_branch(session.session_id)
             self.session_store.record_card_outcome(
                 session.task_id,
                 session_id=session.session_id,

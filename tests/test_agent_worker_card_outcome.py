@@ -239,7 +239,11 @@ def test_record_card_outcome_uses_finalize_result_branch_and_pr_over_transcript_
     assert outcome["pr_urls"] == [PR_URL]
 
 
-def test_record_card_outcome_falls_back_to_transcript_grep_without_a_finalize_result(tmp_path: Path, monkeypatch):
+def test_record_card_outcome_never_falls_back_to_transcript_grep_without_a_finalize_result(tmp_path: Path, monkeypatch):
+    """No `FinalizeResult` at all (the generic local/remote/Hermes/Managed
+    Agents path never provisions a worktree) records no branch — a
+    transcript command that merely looks like a branch checkout is never
+    trusted as one."""
     worker, manager, sessions = _make_real_route_worker(tmp_path, monkeypatch)
     task_id = _seed_claimed_task(manager, assignee="claude")
     session = sessions.create(task_id=task_id, routing="claude_code")
@@ -250,7 +254,46 @@ def test_record_card_outcome_falls_back_to_transcript_grep_without_a_finalize_re
     worker._record_card_outcome(session, "Did the thing.", git_result=None)
 
     outcome = sessions.get_card_outcome(task_id)
-    assert outcome["branch"] == "grepped-branch"
+    assert outcome["branch"] is None
+    assert outcome["pr_urls"] == []
+
+
+def test_record_card_outcome_records_a_finalize_results_absent_branch_as_is(tmp_path: Path, monkeypatch):
+    """A `FinalizeResult` that is applicable but never determined a branch
+    (e.g. an unresolvable host, per `resolve_runner_for_host`'s own
+    `FinalizeResult(applicable=True, error=...)`) records that absence —
+    never papered over by a transcript grep that would fabricate one."""
+    worker, manager, sessions = _make_real_route_worker(tmp_path, monkeypatch)
+    task_id = _seed_claimed_task(manager, assignee="claude")
+    session = sessions.create(task_id=task_id, routing="claude_code")
+    worker.transcript_store.append(session.session_id, "claude_code_tool_use", {
+        "name": "Bash", "input": {"command": "git checkout -b grepped-branch"},
+    })
+    git_result = FinalizeResult(applicable=True, branch=None, error="cannot resolve host")
+
+    worker._record_card_outcome(session, "Did the thing.", git_result=git_result)
+
+    outcome = sessions.get_card_outcome(task_id)
+    assert outcome["branch"] is None
+    assert outcome["pr_urls"] == []
+
+
+def test_record_card_outcome_records_no_branch_when_finalize_result_is_not_applicable(tmp_path: Path, monkeypatch):
+    """`applicable=False` (no worker-provisioned worktree at all) records
+    no branch either, even with a matching transcript command — the same
+    "use the FinalizeResult's own absence, never grep" rule."""
+    worker, manager, sessions = _make_real_route_worker(tmp_path, monkeypatch)
+    task_id = _seed_claimed_task(manager, assignee="claude")
+    session = sessions.create(task_id=task_id, routing="claude_code")
+    worker.transcript_store.append(session.session_id, "claude_code_tool_use", {
+        "name": "Bash", "input": {"command": "git checkout -b grepped-branch"},
+    })
+    git_result = FinalizeResult(applicable=False)
+
+    worker._record_card_outcome(session, "Did the thing.", git_result=git_result)
+
+    outcome = sessions.get_card_outcome(task_id)
+    assert outcome["branch"] is None
     assert outcome["pr_urls"] == []
 
 

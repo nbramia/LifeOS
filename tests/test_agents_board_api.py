@@ -2400,3 +2400,60 @@ class TestBoardCardOutcome:
 
         r = client.get("/api/agents/board")
         assert r.status_code == 200
+
+    def test_get_board_bulk_loads_outcomes_and_pr_status_instead_of_per_card_queries(
+        self, client, stores, monkeypatch,
+    ):
+        """A board with many outcome-carrying cards must not pay one
+        `get_card_outcome`/`get_pr_status` SQLite round trip per card/PR —
+        `_build_board` bulk-loads both once via `list_all_card_outcomes`/
+        `list_all_pr_statuses` instead. Patches the exact `session_store`
+        instance `agents.py` uses (not the class), since a session-scoped
+        isolation fixture elsewhere subclasses `SessionStore` for other
+        tests and class-level patching would silently miss that."""
+        task_manager, _sched, session_store, _transcript = stores
+        for n in range(50):
+            task = task_manager.create(f"Ship fix {n}", tags=["claude"])
+            pr_url = f"https://github.com/nbramia/LifeOS/pull/{n}"
+            session_store.record_card_outcome(
+                task.id, session_id=f"sess-{n}", engine_label="Claude Code",
+                summary="Implemented the fix.", branch="feat/fix-it", pr_urls=[pr_url],
+            )
+            session_store.upsert_pr_status(pr_url, {
+                "number": n, "title": "t", "state": "OPEN", "merged_at": None,
+            })
+
+        per_card_calls = {"get_card_outcome": 0, "get_pr_status": 0}
+        bulk_calls = {"list_all_card_outcomes": 0, "list_all_pr_statuses": 0}
+        original_get_card_outcome = session_store.get_card_outcome
+        original_get_pr_status = session_store.get_pr_status
+        original_list_outcomes = session_store.list_all_card_outcomes
+        original_list_statuses = session_store.list_all_pr_statuses
+
+        def counted_get_card_outcome(*a, **kw):
+            per_card_calls["get_card_outcome"] += 1
+            return original_get_card_outcome(*a, **kw)
+
+        def counted_get_pr_status(*a, **kw):
+            per_card_calls["get_pr_status"] += 1
+            return original_get_pr_status(*a, **kw)
+
+        def counted_list_outcomes(*a, **kw):
+            bulk_calls["list_all_card_outcomes"] += 1
+            return original_list_outcomes(*a, **kw)
+
+        def counted_list_statuses(*a, **kw):
+            bulk_calls["list_all_pr_statuses"] += 1
+            return original_list_statuses(*a, **kw)
+
+        monkeypatch.setattr(session_store, "get_card_outcome", counted_get_card_outcome)
+        monkeypatch.setattr(session_store, "get_pr_status", counted_get_pr_status)
+        monkeypatch.setattr(session_store, "list_all_card_outcomes", counted_list_outcomes)
+        monkeypatch.setattr(session_store, "list_all_pr_statuses", counted_list_statuses)
+
+        r = client.get("/api/agents/board")
+
+        assert r.status_code == 200
+        assert len(r.json()["lanes"]["assigned"]) == 50
+        assert per_card_calls == {"get_card_outcome": 0, "get_pr_status": 0}
+        assert bulk_calls == {"list_all_card_outcomes": 1, "list_all_pr_statuses": 1}

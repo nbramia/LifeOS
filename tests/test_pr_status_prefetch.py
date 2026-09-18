@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from api.services import pr_status_prefetch
+from api.services.agent_worker import session_store as session_store_module
 from api.services.agent_worker.session_store import SessionStore
 
 pytestmark = pytest.mark.unit
@@ -138,3 +139,71 @@ def test_a_pr_open_at_completion_reads_merged_after_a_later_refresh(tmp_path: Pa
     )
     status = store.get_pr_status(PR_URL)
     assert status["state"] == "MERGED" and status["stale"] is False
+
+
+def test_refresh_stale_eventually_covers_every_url_without_starving_the_tail(tmp_path: Path):
+    """Reproduces the starvation failure mode directly: more urls than
+    `ttl_s / tick × max_refresh` would ever reach in the naive
+    first-N-in-table-order selection. Fair ordering (never-checked first,
+    then oldest checked_at) guarantees every url is attempted exactly
+    once across enough ticks, with no repeats crowding out the tail."""
+    store = _store(tmp_path)
+    urls = [f"https://github.com/o/r/pull/{n}" for n in range(40)]
+    store.record_card_outcome(
+        "task-1", session_id="s1", engine_label="Claude Code",
+        summary="a", branch=None, pr_urls=urls,
+    )
+    max_refresh = 3
+    ticks = -(-len(urls) // max_refresh)  # ceil(40 / 3) == 14
+
+    attempted: list[str] = []
+
+    def viewer(url):
+        attempted.append(url)
+        return {"number": 1, "title": "t", "state": "OPEN", "merged_at": None}
+
+    # A large ttl_s means a url just refreshed this run never re-qualifies
+    # as stale within the loop — isolating the ordering guarantee from
+    # TTL expiry, which is covered by the other freshness tests above.
+    for _ in range(ticks):
+        pr_status_prefetch.refresh_stale(store, ttl_s=300, max_refresh=max_refresh, viewer=viewer)
+
+    assert len(attempted) == len(urls)
+    assert set(attempted) == set(urls)
+
+
+def test_refresh_stale_does_not_permanently_starve_the_tail_once_entries_recur(
+    tmp_path: Path, monkeypatch,
+):
+    """Reproduces the exact production failure mode: entries near the
+    front of the outcome table go stale again (real TTL expiry, real
+    ticking) before the scan ever reaches the tail. Mirrors the review's
+    own repro shape — 40 PRs, a 3-per-tick batch, a TTL shorter than a
+    full pass needs — and asserts every url gets attempted at least once
+    within that many ticks, not just the front third of the table."""
+    clock = [1_000_000]
+    monkeypatch.setattr(session_store_module, "_now", lambda: clock[0])
+    store = _store(tmp_path)
+    urls = [f"https://github.com/o/r/pull/{n}" for n in range(40)]
+    store.record_card_outcome(
+        "task-1", session_id="s1", engine_label="Claude Code",
+        summary="a", branch=None, pr_urls=urls,
+    )
+
+    attempts: dict[str, int] = {url: 0 for url in urls}
+
+    def viewer(url):
+        attempts[url] += 1
+        return {"number": 1, "title": "t", "state": "OPEN", "merged_at": None}
+
+    tick_seconds = 30
+    ttl_s = 300  # a url refreshed at tick N is stale again by tick N+10
+    for _ in range(30):
+        pr_status_prefetch.refresh_stale(store, ttl_s=ttl_s, max_refresh=3, viewer=viewer)
+        clock[0] += tick_seconds
+
+    never_attempted = [url for url, count in attempts.items() if count == 0]
+    assert never_attempted == [], (
+        f"{len(never_attempted)} of {len(urls)} urls were never refreshed — "
+        "the front of the table is starving the tail"
+    )
