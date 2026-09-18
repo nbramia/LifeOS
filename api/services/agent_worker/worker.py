@@ -301,6 +301,30 @@ def _with_reply_footer(text: str, replyable: bool = True) -> str:
     return f"{text}\n\n{REPLYABLE_FOOTER if replyable else NO_REPLY_FOOTER}"
 
 
+def _with_git_status_note(body: str, result, *, want_pr: bool) -> str:
+    """Fold a `git_worktree.FinalizeResult` into a session's completion/
+    question/failure notice.
+
+    ``result.applicable`` False (no worker-provisioned worktree involved)
+    leaves ``body`` unchanged. A push/PR failure is always reported (never
+    silently swallowed as success), regardless of ``want_pr``.
+    """
+    if not result.applicable:
+        return body
+    if result.error:
+        note = f"⚠️ git: {result.error}"
+    elif want_pr:
+        if result.pr_url:
+            note = f"PR: {result.pr_url}"
+        elif result.nothing_to_push:
+            note = f"Branch `{result.branch}` pushed — nothing to open a pull request for."
+        else:
+            note = f"Branch: `{result.branch}` (pushed)"
+    else:
+        note = f"Branch: `{result.branch}` (pushed)"
+    return f"{body}\n\n{note}" if body else note
+
+
 def _is_affirmative(text: str) -> bool:
     """True when a goal-approval reply means 'lock it and go'.
 
@@ -2302,7 +2326,7 @@ class Worker:
             task = self._revalidate_task_resume(
                 session,
                 "followup_resume",
-                {COMPLETED_TAG, FAILED_TAG, BUDGET_EXCEEDED_TAG},
+                {COMPLETED_TAG, FAILED_TAG, BUDGET_EXCEEDED_TAG, BLOCKED_TAG},
             )
             if task is None:
                 self.session_store.mark_question_processed(q["id"])
@@ -2314,13 +2338,14 @@ class Worker:
         if session.status in TERMINAL_STATUSES:
             session = self.session_store.begin_new_execution(task_id)
 
-        # The task may be parked at any terminal tag — completed, failed, or
-        # budget-exceeded are all replyable now. Swap whichever is current
-        # back to running. Operator root-spawns have no backing vault
-        # task, so skip the tag/status mutations (they would 404).
+        # The task may be parked at any terminal tag — completed, failed,
+        # budget-exceeded, or blocked (a CLI question-pause card in the
+        # Human queue lane) — are all replyable now. Swap whichever is
+        # current back to running. Operator root-spawns have no backing
+        # vault task, so skip the tag/status mutations (they would 404).
         if session.origin != "operator":
             lifecycle_swapped = False
-            for terminal_tag in (COMPLETED_TAG, FAILED_TAG, BUDGET_EXCEEDED_TAG):
+            for terminal_tag in (COMPLETED_TAG, FAILED_TAG, BUDGET_EXCEEDED_TAG, BLOCKED_TAG):
                 if self._swap_tag(task_id, terminal_tag, RUNNING_TAG):
                     lifecycle_swapped = True
                     break
@@ -3074,14 +3099,17 @@ class Worker:
             return False
 
     def _reconcile_vault_terminal(self, session, status: str) -> None:
-        """Update the backing #agent vault task when a CLI session ends.
+        """Update the backing #agent vault task when a CLI session ends or
+        pauses on a question (``status`` may be any of the terminal
+        statuses, or ``STATUS_BLOCKED``).
 
         The ``claude_code`` / ``codex`` dispatch paths don't go through
         ``_handle_outcome`` (which owns vault reconciliation for the local
-        and managed routes), so terminal outcomes there must reconcile the
-        vault themselves — otherwise a vault-routed ``#agent #claude`` /
-        ``#codex`` task is stranded at ``[/]`` / ``#agent-running`` forever
-        even though the agent finished.
+        and managed routes), so every one of these transitions must
+        reconcile the vault itself — otherwise a vault-routed ``#agent
+        #claude``/``#codex`` task is stranded at ``[/]``/``#agent-running``
+        forever even though the agent finished, or is blocked awaiting the
+        operator's answer but the card never shows it.
 
         Operator-spawned sessions (``origin='operator'``) and spawned
         children (``parent_session_id`` set) have no backing #agent vault
@@ -3101,6 +3129,12 @@ class Worker:
         elif status == STATUS_FAILED:
             self._swap_tag(task_id, RUNNING_TAG, FAILED_TAG)
             self._set_task_status(task_id, "cancelled")
+        elif status == STATUS_BLOCKED:
+            # Human queue lane — the same tag `_mark_blocked` uses for the
+            # preflight/ambiguity block path. `_resume_as_followup`'s
+            # swap-back loop reverses this once the operator answers.
+            self._swap_tag(task_id, RUNNING_TAG, BLOCKED_TAG)
+            self._set_task_status(task_id, "blocked")
 
     def _discover_wip_branch(self, session_id: str) -> str | None:
         """Best-effort scan of this session's OWN past transcript for a WIP
@@ -3512,6 +3546,39 @@ class Worker:
         except Exception as exc:
             logger.warning("web-thread mirror failed for %s: %s", session_id, exc)
 
+    @staticmethod
+    def _session_working_dir(session) -> str | None:
+        """The working directory frozen on this session's own execution
+        spec at dispatch time — the same field `_dispatch()`'s worktree
+        provisioning seam writes the provisioned path onto."""
+        if not session.execution_spec:
+            return None
+        return ExecutionSpec.from_dict(session.execution_spec).working_dir
+
+    def _finalize_worktree_for_session(self, session, task: dict, outcome, *, open_pr: bool):
+        """Run the worker's own git discipline at one CLI session's
+        completion or question-pause: commit any changes the session
+        itself left uncommitted, push its branch, and — when finalizing a
+        fully-complete session — open a pull request. A no-op
+        (`FinalizeResult(applicable=False)`) for a session with no
+        worker-provisioned worktree at all — a vault/home-directory task,
+        an operator `/claude` spawn, or a spawned child (children never go
+        through the worktree-provisioning seam themselves, so their own
+        git discipline is their parent's).
+        """
+        from api.services.agent_worker.git_worktree import FinalizeResult, finalize_worktree_session
+
+        if session.parent_session_id:
+            return FinalizeResult(applicable=False)
+        working_dir = self._session_working_dir(session)
+        return finalize_worktree_session(
+            working_dir,
+            open_pr=open_pr,
+            host=getattr(session, "host", None),
+            pr_title=(task.get("description") or "").strip()[:100],
+            pr_body=(getattr(outcome, "final_text", "") or "").strip(),
+        )
+
     def _dispatch_claude_code_session(self, session, pending: list[dict]) -> None:
         """Drive one ``routing='claude_code'`` session through ``ClaudeCodeExecutor``.
 
@@ -3708,6 +3775,12 @@ class Worker:
                 prompt = f"{goal_body}\n\n{instruction}" if goal_body else instruction
             else:
                 prompt = "Awaiting your reply to continue."
+            # A session pausing for the operator's input pushes whatever it
+            # committed so far — no pull request yet, since the task isn't
+            # considered done. No-ops for a session with no
+            # worker-provisioned worktree.
+            git_result = self._finalize_worktree_for_session(session, task, outcome, open_pr=False)
+            prompt = _with_git_status_note(prompt, git_result, want_pr=False)
             # Goal-approval replies route through `_resume_goal` (which injects
             # `/goal <condition>` on a yes); everything else is a followup.
             kind = "goal_approval" if outcome.reason == REASON_AWAITING_GOAL_APPROVAL else "followup"
@@ -3754,6 +3827,10 @@ class Worker:
                 self.transcript_store.append(sid, "code_block_prompt_registered", {
                     "reason": outcome.reason, "message_ids": sent_ids,
                 })
+                # Human queue lane — preserves resumability: the swap-back
+                # to running happens in `_resume_as_followup` once the
+                # operator answers.
+                self._reconcile_vault_terminal(session, STATUS_BLOCKED)
                 return
             # Delivery failed after all retries. Without a sent message id there
             # is no anchor for the operator to reply to, so the session would sit
@@ -3802,6 +3879,13 @@ class Worker:
             # message; the child's final_text reaches the parent via
             # _child_final_text instead.
             body = outcome.final_text.strip() if outcome.final_text else ""
+            # A fully-complete session pushes its branch and opens a pull
+            # request against the default branch — the outcome (PR URL, or
+            # honestly reporting nothing to push / a push failure) rides in
+            # the same completion notice. No-ops for a session with no
+            # worker-provisioned worktree, leaving `body` unchanged.
+            git_result = self._finalize_worktree_for_session(session, task, outcome, open_pr=True)
+            body = _with_git_status_note(body, git_result, want_pr=True)
             if body and not session.parent_session_id:
                 try:
                     sent_ids = _send_with_id(_with_reply_footer(body)) or []
@@ -3866,6 +3950,15 @@ class Worker:
             # just skip the spurious "failed" notice + web mirror. (Status
             # persistence and vault reconciliation below still run.)
             notice = f"⚠️ {label} failed: {outcome.reason}."
+        # A session that stopped without completing may still have left
+        # real, uncommitted work in its worktree — commit and push it as a
+        # safety net regardless of why the session stopped (including an
+        # operator kill, which never gets a notice of its own — folded into
+        # `notice` only when one exists). No-ops for a session with no
+        # worker-provisioned worktree.
+        git_result = self._finalize_worktree_for_session(session, task, outcome, open_pr=False)
+        if notice:
+            notice = _with_git_status_note(notice, git_result, want_pr=False)
         # spawned children stay silent to the operator on failure/budget
         # too — the parent's resume turn carries the child's [failed] /
         # [budget_exceeded] status header, so the notice would be duplicate
@@ -4001,12 +4094,19 @@ class Worker:
         """Drive one ``routing='codex'`` session through ``CodexExecutor``.
 
         Mirrors ``_dispatch_claude_code_session`` but without plan-mode /
-        [CLARIFY] branches — Codex doesn't have those conventions. A
-        completed session relays its final agent message to the operator's
-        chat and registers it as a follow-up anchor so a threaded reply
-        resumes the session.
+        goal-approval branches — Codex has no such conventions. It does
+        share the ``[CLARIFY]`` question-pause path: a final message ending
+        in ``[CLARIFY] <question>`` comes back from the executor as
+        ``STATUS_BLOCKED``, handled the same way Claude Code's live
+        ``[CLARIFY]`` is (push, no pull request, register an answer anchor,
+        Human queue lane). A completed session relays its final agent
+        message to the operator's chat and registers it as a follow-up
+        anchor so a threaded reply resumes the session.
         """
-        from api.services.agent_worker.codex_executor import REASON_KILLED
+        from api.services.agent_worker.codex_executor import (
+            REASON_AWAITING_CLARIFICATION,
+            REASON_KILLED,
+        )
         from api.services.agent_worker.codex_spawn import parse_codex_spawn_payload
 
         if session.origin != "operator" and not session.parent_session_id:
@@ -4119,6 +4219,68 @@ class Worker:
             return
         session = current
 
+        if outcome.status == STATUS_BLOCKED and outcome.reason == REASON_AWAITING_CLARIFICATION:
+            question_body = (outcome.final_text or "").strip()
+            prompt = (
+                f"{question_body}\n\nAnswer by replying to this message." if question_body
+                else "Awaiting your reply — reply to this message to continue."
+            )
+            # A session pausing for the operator's input pushes whatever it
+            # committed so far — no pull request yet. No-ops for a session
+            # with no worker-provisioned worktree.
+            git_result = self._finalize_worktree_for_session(session, task, outcome, open_pr=False)
+            prompt = _with_git_status_note(prompt, git_result, want_pr=False)
+            sent_ids: list = []
+            for attempt in range(_BLOCKED_PROMPT_SEND_ATTEMPTS):
+                try:
+                    sent_ids = self._telegram_send_with_id(_with_reply_footer(prompt)) or []
+                except Exception as exc:
+                    logger.warning(
+                        "codex blocked reply prompt send failed (attempt %d/%d): %s",
+                        attempt + 1, _BLOCKED_PROMPT_SEND_ATTEMPTS, exc,
+                    )
+                    sent_ids = []
+                if sent_ids:
+                    break
+                if attempt + 1 < _BLOCKED_PROMPT_SEND_ATTEMPTS and _BLOCKED_PROMPT_RETRY_DELAY_S:
+                    time.sleep(_BLOCKED_PROMPT_RETRY_DELAY_S)
+            if sent_ids:
+                self.session_store.create_pending_question(
+                    session_id=sid,
+                    task_id=session.task_id,
+                    question=prompt,
+                    sent_message_id=sent_ids[0],
+                    sent_message_ids=sent_ids,
+                    kind="followup",
+                    attempt_id=session.attempt_id,
+                    turn_id=session.turn_id,
+                )
+                self.transcript_store.append(sid, "codex_block_prompt_registered", {
+                    "reason": outcome.reason, "message_ids": sent_ids,
+                })
+                # Human queue lane — `_resume_as_followup` swaps it back to
+                # running once the operator answers.
+                self._reconcile_vault_terminal(session, STATUS_BLOCKED)
+                return
+            # Delivery failed after every retry — no anchor for the operator
+            # to reply to, so escalate instead of leaving it silently stuck.
+            self.transcript_store.append(sid, "codex_block_prompt_undelivered", {
+                "reason": outcome.reason, "attempts": _BLOCKED_PROMPT_SEND_ATTEMPTS,
+            })
+            self.session_store.update_status(
+                session.task_id, STATUS_FAILED,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
+            try:
+                self._telegram_send(
+                    "⚠️ A codex session needs your input, but the question couldn't be "
+                    "delivered. It was marked failed — re-trigger it to retry."
+                )
+            except Exception as exc:  # best-effort; the surface may be down
+                logger.warning("codex blocked-session escalation send failed: %s", exc)
+            self._reconcile_vault_terminal(session, STATUS_FAILED)
+            return
+
         if outcome.status == STATUS_COMPLETED:
             # parity with the claude_code gate — a clean exit doesn't
             # mean the agent finished. Codex has no [NOTIFY] convention, so
@@ -4138,6 +4300,11 @@ class Worker:
             # matters for reopen-on-send: an operator threaded reply and
             # a parent answer must not both enqueue against the same child.
             body = outcome.final_text.strip() if outcome.final_text else ""
+            # A fully-complete session pushes its branch and opens a pull
+            # request — parity with the claude_code branch. No-ops for a
+            # session with no worker-provisioned worktree.
+            git_result = self._finalize_worktree_for_session(session, task, outcome, open_pr=True)
+            body = _with_git_status_note(body, git_result, want_pr=True)
             if body and not session.parent_session_id:
                 try:
                     sent_ids = self._telegram_send_with_id(body) or []
@@ -4179,6 +4346,13 @@ class Worker:
             # claude_code dispatch; status persistence + vault reconciliation
             # below still run.
             notice = f"⚠️ {label} failed: {outcome.reason}."
+        # Safety-net commit + push any uncommitted worktree changes,
+        # regardless of why the session stopped — parity with the
+        # claude_code branch. No-ops for a session with no
+        # worker-provisioned worktree.
+        git_result = self._finalize_worktree_for_session(session, task, outcome, open_pr=False)
+        if notice:
+            notice = _with_git_status_note(notice, git_result, want_pr=False)
         # spawned children stay silent to the operator on failure/budget
         # too — parity with the claude_code branch; the parent's resume turn
         # carries the child's terminal status header.
