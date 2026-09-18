@@ -13,12 +13,14 @@ from pathlib import Path
 
 import pytest
 
+from api.services.agent_worker import git_worktree
 from api.services.agent_worker.git_worktree import (
     WorktreeError,
     derive_branch_name,
     describe_worktree,
     ensure_worktree,
     is_linked_worktree,
+    resolve_runner_for_host,
     worktree_dir_for,
 )
 
@@ -62,9 +64,23 @@ def test_derive_branch_name_uses_conventional_type_prefix():
     assert branch.endswith("abc12345")
 
 
-def test_derive_branch_name_defaults_to_agent_type_with_no_prefix():
+def test_derive_branch_name_infers_allowed_type_from_leading_keyword():
     branch = derive_branch_name("clean up the reports folder", "task-xyz98765")
-    assert branch.startswith("agent/clean-up-the-reports-folder-")
+    assert branch.startswith("refactor/clean-up-the-reports-folder-")
+
+
+def test_derive_branch_name_defaults_to_feat_never_agent(tmp_path=None):
+    branch = derive_branch_name("summarize the weekly digest", "task-xyz98765")
+    assert branch.startswith("feat/summarize-the-weekly-digest-")
+    assert not branch.startswith("agent/")
+
+
+def test_derive_branch_name_type_is_always_an_allowed_branch_type():
+    from api.services.agent_worker.git_worktree import ALLOWED_BRANCH_TYPES
+
+    for title in ("clean up the reports folder", "summarize the weekly digest", "fix: the bug", ""):
+        branch_type = derive_branch_name(title, "task-abc12345").split("/", 1)[0]
+        assert branch_type in ALLOWED_BRANCH_TYPES
 
 
 def test_derive_branch_name_never_collides_on_same_title_different_task():
@@ -219,3 +235,128 @@ def test_describe_worktree_detects_a_linked_worktree(tmp_path: Path):
     # A linked worktree is its own git toplevel (it shares the common .git
     # dir with the primary checkout, but not a working-tree root).
     assert context.repo_toplevel == result.working_dir
+
+
+# ---------------------------------------------------------------------------
+# Remote-host provisioning — resolve_runner_for_host / make_ssh_runner /
+# ensure_worktree(host=...). No real ssh is ever invoked: either the
+# resolved runner is swapped for a fake, or the ssh argv is inspected via a
+# faked `subprocess.run`.
+# ---------------------------------------------------------------------------
+
+def test_resolve_runner_for_host_local_returns_the_local_runner(monkeypatch):
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_hosts", {}, raising=False)
+
+    runner = resolve_runner_for_host(None)
+
+    assert runner is git_worktree._local_runner
+
+
+def test_resolve_runner_for_host_unregistered_fails_closed(monkeypatch):
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_hosts", {}, raising=False)
+
+    with pytest.raises(WorktreeError):
+        resolve_runner_for_host("no-such-host")
+
+
+def test_resolve_runner_for_host_remote_builds_an_ssh_runner(monkeypatch):
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_hosts", {"studio": "user@studio.example"}, raising=False)
+
+    captured: dict = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        return subprocess.CompletedProcess(argv, returncode=0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr(git_worktree.subprocess, "run", fake_run)
+
+    runner = resolve_runner_for_host("studio")
+    runner(["git", "status"], cwd="/remote/path/repo", timeout=5)
+
+    argv = captured["argv"]
+    assert argv[0] == "ssh"
+    assert "user@studio.example" in argv
+    # cwd folds into a `cd ... &&` prefix on the remote command — ssh has
+    # no cwd concept of its own.
+    remote_command = argv[-1]
+    assert remote_command.startswith("cd /remote/path/repo &&")
+    assert "git status" in remote_command
+
+
+def test_ensure_worktree_routes_every_command_through_the_resolved_runner(tmp_path: Path, monkeypatch):
+    """A registered remote host provisions through whatever runner
+    `resolve_runner_for_host` returns — never falls back to the plain
+    local subprocess standing in for a machine this worker isn't."""
+    repo = _init_repo_with_origin(tmp_path)
+    calls: list[list[str]] = []
+
+    def fake_runner(cmd, *, cwd=None, timeout=git_worktree.DEFAULT_TIMEOUT):
+        calls.append(cmd)
+        return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+
+    def fake_resolve(host):
+        assert host == "studio"
+        return fake_runner
+
+    monkeypatch.setattr(git_worktree, "resolve_runner_for_host", fake_resolve)
+
+    result = ensure_worktree(str(repo), "task-remote-1", "fix the thing", host="studio")
+
+    assert result.is_git is True
+    assert Path(result.working_dir).is_dir()
+    # Every git call provisioning made went through the resolved runner.
+    assert any(cmd[:2] == ["git", "fetch"] for cmd in calls)
+    assert any(cmd[:3] == ["git", "worktree", "add"] for cmd in calls)
+
+
+def test_ensure_worktree_fails_closed_for_an_unregistered_remote_host(tmp_path: Path, monkeypatch):
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_hosts", {}, raising=False)
+
+    repo = _init_repo_with_origin(tmp_path, name="repo-unreg")
+
+    with pytest.raises(WorktreeError):
+        ensure_worktree(str(repo), "task-remote-2", "fix the thing", host="no-such-host")
+
+
+# ---------------------------------------------------------------------------
+# Race tolerance — after `git worktree add` fails, re-read the registered
+# worktree list and reuse it if a concurrent dispatch landed it first.
+# ---------------------------------------------------------------------------
+
+def test_ensure_worktree_reuses_a_racing_concurrent_provision(tmp_path: Path, monkeypatch):
+    """Simulates the exact race the review's probe hit: the primary reuse
+    check misses (as it would for two ticks racing the same task, both
+    starting before either's worktree is registered), `git worktree add`
+    then fails because the worktree already exists, and `ensure_worktree`
+    must reuse it instead of raising."""
+    repo = _init_repo_with_origin(tmp_path, name="repo-race")
+
+    # Pre-create the branch AND the worktree at the exact deterministic
+    # path/branch `ensure_worktree` would itself compute — standing in for
+    # "a concurrent dispatch already won the race."
+    branch = derive_branch_name("fix the thing", "task-race-1")
+    expected_dir = worktree_dir_for(str(repo), "task-race-1")
+    assert _git(repo, "worktree", "add", "-b", branch, expected_dir, "origin/main").returncode == 0
+
+    real_probe = git_worktree._registered_worktree_branch
+    call_count = {"n": 0}
+
+    def probe_missing_then_real(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return None  # the primary reuse check "misses" the race
+        return real_probe(*args, **kwargs)
+
+    monkeypatch.setattr(git_worktree, "_registered_worktree_branch", probe_missing_then_real)
+
+    result = ensure_worktree(str(repo), "task-race-1", "fix the thing")
+
+    assert result.is_git is True
+    assert result.reused is True
+    assert result.branch == branch
+    assert result.working_dir == expected_dir
+    assert call_count["n"] == 2  # primary check (missed) + post-failure re-probe (found)

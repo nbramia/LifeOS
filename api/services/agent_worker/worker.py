@@ -4620,16 +4620,16 @@ class Worker:
         # directory is inside a git repository, give the session its own
         # worktree and branch instead, so it commits, pushes, and opens a
         # pull request the way every other change in this project is made.
-        # Skipped for an explicit remote-host assignment: the worktree
-        # would be provisioned on this worker's filesystem, not the
-        # assigned host's, so a remote-host task keeps the legacy directory
-        # unchanged (out of scope for this seam). A directory that isn't a
-        # git repository at all is also unaffected — `ensure_worktree`
-        # returns it verbatim.
-        if pre.routing in (ROUTE_CLAUDE_CODE, ROUTE_CODEX) and not assignment.host:
+        # An explicit remote-host assignment doesn't skip this — `host` is
+        # passed straight through to `ensure_worktree`, which provisions
+        # over ssh on that same host (never this worker's own filesystem
+        # standing in for it) and fails the task closed if the host isn't
+        # registered. A directory that isn't a git repository at all is
+        # unaffected either way — `ensure_worktree` returns it verbatim.
+        if pre.routing in (ROUTE_CLAUDE_CODE, ROUTE_CODEX):
             from api.services.agent_worker.git_worktree import WorktreeError, ensure_worktree
             try:
-                provisioned = ensure_worktree(candidate_working_dir, task_id, title)
+                provisioned = ensure_worktree(candidate_working_dir, task_id, title, host=assignment.host)
             except WorktreeError as exc:
                 self._mark_failed(session, task, f"worktree provisioning failed: {exc}")
                 return

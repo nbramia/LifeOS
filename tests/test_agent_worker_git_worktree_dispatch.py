@@ -176,14 +176,30 @@ def test_non_git_directory_task_is_unaffected(tmp_path, monkeypatch):
     assert capture.tasks[0]["working_dir"] == str(plain_dir)
 
 
-def test_remote_host_assignment_skips_worktree_provisioning(tmp_path, monkeypatch):
-    """A task pinned to a remote host runs on that host's filesystem, not
-    this worker's — provisioning here would create a worktree the remote
-    host can't see, so the legacy directory is left unchanged."""
+def test_remote_host_assignment_still_provisions_a_worktree(tmp_path, monkeypatch):
+    """A task pinned to a remote host must never run directly in the
+    resolved directory either — provisioning happens over the resolved
+    runner for that host (never this worker's own filesystem standing in
+    for it). No real ssh is invoked: the runner `resolve_runner_for_host`
+    would build is swapped for a fake that records every command."""
     from config.settings import settings
+    from api.services.agent_worker import git_worktree
+
     monkeypatch.setattr(settings, "agent_hosts", {"studio": "user@studio.example"}, raising=False)
 
     repo = _init_repo_with_origin(tmp_path, name="repo3")
+    calls: list[list[str]] = []
+
+    def fake_runner(cmd, *, cwd=None, timeout=git_worktree.DEFAULT_TIMEOUT):
+        calls.append(cmd)
+        return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+
+    def fake_resolve(host):
+        assert host == "studio"
+        return fake_runner
+
+    monkeypatch.setattr(git_worktree, "resolve_runner_for_host", fake_resolve)
+
     capture = _TaskCaptureExecutor(ExecutorOutcome(status=STATUS_COMPLETED, final_text="done", notifications_sent=1))
     task = {
         "id": "board-remote-1",
@@ -197,7 +213,36 @@ def test_remote_host_assignment_skips_worktree_provisioning(tmp_path, monkeypatc
 
     worker._dispatch(task)
 
-    assert capture.tasks[0]["working_dir"] == str(repo)
+    working_dir = capture.tasks[0]["working_dir"]
+    assert working_dir != str(repo)
+    assert working_dir == worktree_dir_for(str(repo), "board-remote-1")
+    assert any(cmd[:3] == ["git", "worktree", "add"] for cmd in calls)
+
+
+def test_unregistered_remote_host_fails_the_task_closed(tmp_path, monkeypatch):
+    """An unregistered host must never fall back to provisioning locally —
+    that would create a worktree on the wrong machine and then run the
+    session against it as though it were real."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_hosts", {}, raising=False)
+
+    repo = _init_repo_with_origin(tmp_path, name="repo3b")
+    capture = _TaskCaptureExecutor(ExecutorOutcome(status=STATUS_COMPLETED, final_text="done", notifications_sent=1))
+    task = {
+        "id": "board-remote-2",
+        "description": "deploy the thing",
+        "tags": ["agent", "claude"],
+        "fields": {"working_dir": str(repo), "host": "nowhere"},
+    }
+    backing_task = {**task, "tags": ["agent-running", "claude"]}
+    worker = _make_worker(tmp_path, backing_task=backing_task, routing="claude_code", claude_code_executor=capture)
+    worker.session_store.create(task_id="board-remote-2", status="claimed")
+
+    worker._dispatch(task)
+
+    assert capture.tasks == []
+    session = worker.session_store.get("board-remote-2")
+    assert session.status == STATUS_FAILED
 
 
 def test_worktree_provisioning_failure_fails_the_task_closed(tmp_path, monkeypatch):
