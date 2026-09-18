@@ -87,6 +87,16 @@ def _delegation_header(session_id: str) -> str:
     )
 
 
+def _git_discipline_header(working_dir: str) -> str:
+    """Preamble block with the git-discipline instructions when
+    `working_dir` is a worker-provisioned worktree (see
+    `git_worktree.describe_worktree`), else an empty string — a vault- or
+    home-directory session has no worktree and gets nothing prepended."""
+    from api.services.agent_worker.git_worktree import git_discipline_text
+    text = git_discipline_text(working_dir)
+    return f"=== GIT DISCIPLINE ===\n{text}\n\n" if text else ""
+
+
 # Reason codes returned in ``ExecutorOutcome.reason``.
 REASON_TIMEOUT = "timeout"
 REASON_BINARY_NOT_FOUND = "binary_not_found"
@@ -193,11 +203,13 @@ class CodexExecutor:
         # Prepend the LifeOS capabilities briefing so the fresh Codex turn has
         # the same situational awareness as the managed/local routes, plus a
         # per-session delegation header so the agent can hand off work it can't
-        # do (e.g. browser automation → a claude_code child). Only on the
-        # opening turn — resume() reloads the thread, which already carries
-        # this from the first prompt.
+        # do (e.g. browser automation → a claude_code child), and — only when
+        # `working_dir` is a worker-provisioned worktree — the git-discipline
+        # instructions. Only on the opening turn — resume() reloads the
+        # thread, which already carries this from the first prompt.
         delegation = _delegation_header(session.session_id)
-        full_prompt = f"{delegation}\n{CAPABILITIES_PREAMBLE}\n{prompt}"
+        git_discipline = _git_discipline_header(working_dir)
+        full_prompt = f"{delegation}\n{git_discipline}{CAPABILITIES_PREAMBLE}\n{prompt}"
         return self._with_identity(session, self._run(
             session=session,
             prompt=full_prompt,

@@ -168,6 +168,7 @@ The agent runs with the operator's full filesystem and shell access — no sandb
 2. **Daily $-cap** — backstop against runaway loops; pauses all new claims when crossed.
 3. **Per-task budgets** — enforced from outside the agent loop, so the model can't override them.
 4. **Telegram notification on every terminal state** — you find out quickly if something runs that shouldn't have.
+5. **Isolated worktree for coding sessions** — a Claude Code or Codex task that touches a git repository always runs in its own worktree on a fresh branch, off the current `main`, never in your primary checkout — the same working tree the production server runs from. The session is told this and expected to commit its work.
 
 Operators should still audit handed-off tasks before they reach the worker (your task list is the queue), keep budgets set, and treat agent-touchable secrets the same as operator-touchable secrets.
 

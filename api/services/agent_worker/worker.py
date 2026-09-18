@@ -4607,6 +4607,33 @@ class Worker:
         # model pins are scoped to that resolved route and cannot leak across
         # a later explicit engine override.
         from api.services.directory_resolver import resolve_working_directory
+        # Scheduled handoffs may carry an explicit canonical working
+        # directory in task fields; otherwise retain the legacy
+        # description-based resolver.
+        candidate_working_dir = (
+            (task.get("fields") or {}).get("working_dir") or resolve_working_directory(title)
+        )
+        # A fresh CLI-routed dispatch (Claude Code, Codex) never runs
+        # directly in whatever directory the resolver above picked — that
+        # can be the operator's own primary checkout, the exact working
+        # tree the production API server runs from. When the resolved
+        # directory is inside a git repository, give the session its own
+        # worktree and branch instead, so it commits, pushes, and opens a
+        # pull request the way every other change in this project is made.
+        # Skipped for an explicit remote-host assignment: the worktree
+        # would be provisioned on this worker's filesystem, not the
+        # assigned host's, so a remote-host task keeps the legacy directory
+        # unchanged (out of scope for this seam). A directory that isn't a
+        # git repository at all is also unaffected — `ensure_worktree`
+        # returns it verbatim.
+        if pre.routing in (ROUTE_CLAUDE_CODE, ROUTE_CODEX) and not assignment.host:
+            from api.services.agent_worker.git_worktree import WorktreeError, ensure_worktree
+            try:
+                provisioned = ensure_worktree(candidate_working_dir, task_id, title)
+            except WorktreeError as exc:
+                self._mark_failed(session, task, f"worktree provisioning failed: {exc}")
+                return
+            candidate_working_dir = provisioned.working_dir
         execution = self._resolve_session_execution(
             session,
             request=ExecutionRequest(),
@@ -4614,11 +4641,7 @@ class Worker:
                 assignment, executor=pre.routing,
             ),
             workflow=pre.execution_layer(
-                # Scheduled handoffs may carry an explicit canonical working
-                # directory in task fields; otherwise retain the legacy
-                # description-based resolver.
-                working_dir=(task.get("fields") or {}).get("working_dir")
-                or resolve_working_directory(title),
+                working_dir=candidate_working_dir,
             ),
         )
         if not execution.ok:
