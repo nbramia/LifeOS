@@ -3655,7 +3655,7 @@ class Worker:
 
     def _confirm_resume_or_requeue(
         self, session, sid: str, pending_ids: list[int], prior_launches: int,
-        *, spawn_kind: str, not_found_kind: str,
+        *, spawn_kind: str, not_found_kind: str, report_failure: bool,
     ) -> bool:
         """After a resume attempt returns (or raises), confirm whether a CLI
         subprocess actually launched during THIS call before treating the
@@ -3667,16 +3667,33 @@ class Worker:
         confirmed, since `_execute_resume` runs the whole CLI turn
         synchronously and can fail before a subprocess ever starts
         (resolution failure, a fenced/rejected turn, a crash in worker
-        glue code). A launch that never happened must not mark the note
+        glue code, or an ordinary FAILED outcome the executor returned
+        without ever spawning — e.g. a missing binary or a permission
+        error). A launch that never happened must not mark the note
         delivered (it would otherwise be silently lost) or claim the
         session resumed.
 
-        Returns True once a launch is confirmed (pending marked
-        delivered, "Resumed" sent to a top-level session). Returns False
-        when it is not — the note stays queued and, for a top-level
-        session, a truthful "didn't start" notice is sent instead; the
-        caller should not proceed to generic outcome handling on a
-        possibly stale/absent outcome in that case.
+        Returns whether a launch was confirmed. When it was, the note is
+        marked delivered and, for a top-level session, a truthful
+        "Resumed" confirmation is sent. When it wasn't, the note is left
+        queued; a truthful "didn't start" notice is sent only when
+        `report_failure` is True. Pass `report_failure=True` from the
+        `_execute_resume` exception handler — nothing else reports that
+        failure, since an exception unwinds past the ordinary FAILED-
+        outcome handling entirely. Pass `report_failure=False` when
+        `_execute_resume` instead returned an ordinary (non-raising)
+        outcome and the caller falls through to that same shared FAILED-
+        outcome handling afterward — it already reports an accurate
+        reason and reconciles the vault tag, so reporting here too would
+        just duplicate the notice.
+
+        Two accepted, deliberate residual gaps (not fixed by this
+        method): a worker/process crash landing strictly between a
+        confirmed launch and this method's own call can still deliver a
+        note twice on a later manual reopen (at-least-once, not
+        exactly-once, delivery); and a session left FAILED here after a
+        pre-launch failure has no automatic re-claim — the note rides
+        the next resume only if an operator triggers one.
         """
         launched = self._cli_subprocess_launch_count(
             sid, spawn_kind, not_found_kind,
@@ -3685,14 +3702,13 @@ class Worker:
             self.session_store.mark_pending_delivered(pending_ids)
             if not session.parent_session_id:
                 self._send_session_message(session, "▶️ Resumed — continuing from your note.")
-            return True
-        if not session.parent_session_id:
+        elif report_failure and not session.parent_session_id:
             self._send_session_message(
                 session,
                 "⚠️ Resume didn't start — your note is still queued and "
                 "will ride the next resume attempt.",
             )
-        return False
+        return launched
 
     def _mirror_to_conversation(self, session_id: str, text: str) -> None:
         """mirror a web-spawned session's operator-facing output into its
@@ -3882,17 +3898,23 @@ class Worker:
                 self._confirm_resume_or_requeue(
                     session, sid, pending_ids, prior_launches,
                     spawn_kind="claude_code_spawn", not_found_kind="claude_code_binary_not_found",
+                    report_failure=True,
                 )
                 return
             # A resume is only ever acknowledged as "queued" at reply time
             # (Telegram ack, followup or status-anchor) — confirm the turn
             # actually launched a subprocess before claiming it resumed or
-            # marking the note delivered.
-            if not self._confirm_resume_or_requeue(
+            # marking the note delivered. A non-launch here (an ordinary
+            # FAILED outcome the executor returned without ever spawning —
+            # a missing binary, a permission error) is NOT reported here;
+            # it falls through to the shared FAILED-outcome handling below,
+            # which already reports the accurate reason and reconciles the
+            # vault tag — reporting it here too would just duplicate it.
+            self._confirm_resume_or_requeue(
                 session, sid, pending_ids, prior_launches,
                 spawn_kind="claude_code_spawn", not_found_kind="claude_code_binary_not_found",
-            ):
-                return
+                report_failure=False,
+            )
         else:
             # A fresh dispatch (first turn): the caller (`_dispatch_spawned_sessions`,
             # or `_dispatch`'s synthetic in-memory payload) already drained
@@ -4383,17 +4405,20 @@ class Worker:
                 self._confirm_resume_or_requeue(
                     session, sid, pending_ids, prior_launches,
                     spawn_kind="codex_spawn", not_found_kind="codex_binary_not_found",
+                    report_failure=True,
                 )
                 return
             # Mirrors the claude_code dispatch: the reply-time ack only ever
             # promises the note is queued — confirm the turn actually
             # launched a subprocess before claiming it resumed or marking
-            # the note delivered.
-            if not self._confirm_resume_or_requeue(
+            # the note delivered. A non-launch here falls through to the
+            # shared FAILED-outcome handling below rather than being
+            # reported here too — see the matching claude_code comment.
+            self._confirm_resume_or_requeue(
                 session, sid, pending_ids, prior_launches,
                 spawn_kind="codex_spawn", not_found_kind="codex_binary_not_found",
-            ):
-                return
+                report_failure=False,
+            )
         else:
             # See the claude_code dispatch's matching comment: the caller
             # already drained this fresh dispatch's one spawn-payload row

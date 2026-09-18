@@ -614,11 +614,28 @@ class ClaudeCodeExecutor:
                 # path reaches the actual CLI process over ssh instead.
                 start_new_session=True,
             )
-        except FileNotFoundError as exc:
+        except OSError as exc:
+            # Any spawn-time OS failure — not just a missing binary
+            # (FileNotFoundError) but e.g. PermissionError, ENOMEM, or any
+            # other errno Popen can surface — must write the SAME
+            # compensating marker the missing-binary case does. The
+            # `claude_code_spawn` event just above is written unconditionally
+            # *before* Popen (a deliberate crash-safety margin: a worker that
+            # dies between that write and Popen returning must still be
+            # treated as "may have launched" on restart, never silently
+            # re-executed). `_cli_subprocess_launch_count` nets spawns against
+            # this "not found" marker to recover the true launch count — an
+            # uncompensated exception type would otherwise be miscounted as a
+            # real launch and let a caller (e.g. the resume dispatch's
+            # `_confirm_resume_or_requeue`) wrongly confirm a resume that
+            # never actually started a subprocess.
             self.transcript_store.append(sid, "claude_code_binary_not_found", {"error": str(exc)})
             return ExecutorOutcome(
                 status=STATUS_FAILED,
-                reason=REASON_BINARY_NOT_FOUND,
+                reason=(
+                    REASON_BINARY_NOT_FOUND if isinstance(exc, FileNotFoundError)
+                    else f"claude spawn failed: {exc}"
+                ),
             )
 
         # Worker may have created the session in CLAIMED state. Move it to

@@ -383,10 +383,13 @@ class TestResumedConfirmation:
         assert not w.session_store.has_pending_messages(session.session_id)
 
     def test_resume_that_never_launches_leaves_note_queued_and_reports_failure(self, tmp_path):
-        """A resume attempt that returns without ever starting a subprocess
-        (a resolution failure inside the executor, no `claude_code_spawn`
-        transcript event) must not claim the session resumed or lose the
-        operator's note."""
+        """A resume attempt that returns an ordinary FAILED outcome without
+        ever starting a subprocess (a resolution failure inside the
+        executor, no `claude_code_spawn` transcript event) must not claim
+        the session resumed or lose the operator's note. Since the
+        executor returned a real outcome (no exception), the failure is
+        reported by the ordinary shared FAILED-outcome handling — with the
+        executor's own accurate reason — rather than a separate notice."""
         stub = _StubCliExecutor(
             outcome=ExecutorOutcome(status=STATUS_FAILED, reason="no claude_code_session_id on record"),
             tmp_path=tmp_path, launches=False,
@@ -400,8 +403,9 @@ class TestResumedConfirmation:
 
         assert not any("Resumed" in text for _id, text in w._sent_with_ids)
         assert not any("Resumed" in text for text in w._sent)
-        assert any("didn't start" in text for text in w._sent) or any(
-            "didn't start" in text for _id, text in w._sent_with_ids
+        assert w.session_store.get("cc-never-launched").status == STATUS_FAILED
+        assert any("no claude_code_session_id on record" in text for text in w._sent) or any(
+            "no claude_code_session_id on record" in text for _id, text in w._sent_with_ids
         )
         # The note was never confirmed delivered — it's still queued.
         assert w.session_store.has_pending_messages(session.session_id)
@@ -449,6 +453,40 @@ class TestResumedConfirmation:
         assert w.session_store.get("cc-crash-after").status == STATUS_FAILED
         assert any("Resumed" in text for _id, text in w._sent_with_ids)
         assert not w.session_store.has_pending_messages(session.session_id)
+
+    def test_permission_error_on_spawn_is_not_counted_as_a_launch(self, tmp_path):
+        """The real `ClaudeCodeExecutor` writes its `claude_code_spawn`
+        transcript marker unconditionally before `Popen` (a deliberate
+        crash-safety margin), then must compensate that marker on ANY
+        spawn-time OS failure — not just `FileNotFoundError`. A
+        `PermissionError` (binary exists, isn't executable) is exactly as
+        real a non-launch as a missing binary: uncompensated, it would
+        make `_cli_subprocess_launch_count` miscount a launch that never
+        happened, and `_confirm_resume_or_requeue` would send a false
+        "Resumed" while marking the note delivered."""
+        from api.services.agent_worker.claude_code_executor import ClaudeCodeExecutor
+
+        def _raise_permission_error(*_args, **_kwargs):
+            raise PermissionError(13, "Permission denied")
+
+        session_store = SessionStore(db_path=tmp_path / "sessions.db")
+        transcript_store = TranscriptStore(transcripts_dir=tmp_path / "transcripts")
+        executor = ClaudeCodeExecutor(
+            session_store=session_store, transcript_store=transcript_store,
+            spawn_fn=_raise_permission_error,
+        )
+        w = _make_worker(tmp_path, claude_code_executor=executor)
+        session = _seed_reopened_top_level_session(
+            w.session_store, task_id="cc-permission-error", routing="claude_code", cli_id="cli-perm-1",
+        )
+
+        w._dispatch_spawned_sessions()
+
+        assert w.session_store.get("cc-permission-error").status == STATUS_FAILED
+        assert not any("Resumed" in text for _id, text in w._sent_with_ids)
+        assert not any("Resumed" in text for text in w._sent)
+        # The note must not be lost — no subprocess actually launched.
+        assert w.session_store.has_pending_messages(session.session_id)
 
     def test_spawned_child_resume_does_not_send_a_resumed_confirmation(self, tmp_path):
         """Children stay silent to the operator, same as every other
