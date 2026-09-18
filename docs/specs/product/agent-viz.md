@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-09-15
+> **Last Updated:** 2026-09-18
 
 `/agents` is a Kanban board of the operator's work queue — vault tasks, agent questions, and scheduled work in one place, organized into lanes by status and tag. A **Graph** tab shows a deterministic delegation timeline as a secondary, read-mostly view for watching what's actively running: every LifeOS agent worker task (`#agent`-tagged), local CLI sessions discovered on the filesystem from both Claude Code (`~/.claude/projects/`) and Codex (`~/.codex/sessions/`), and Claude Code / Codex sessions registered from **any other machine** on the tailnet via a lightweight hook script.
 
@@ -42,7 +42,7 @@ The board is backed by the vault task store (`LifeOS/Tasks/`) — every card is 
 | **Scheduled** | A scheduler entry (`docs/guides/scheduler.md`) with at least one future fire. |
 | **Review** | The agent worker's `#agent-completed` tag is set and the card hasn't been accepted yet. |
 | **Done** | Status `done` or `cancelled` (cancelled cards are hidden behind the "include cancelled" filter by default whenever the Done column is shown), plus scheduler entries that have fired (one-off) or been disabled (recurring). Hidden by default in the lane filter below — the least useful lane day to day. |
-| **Snoozed** | The task carries a future wake-up time; the card returns to its natural lane on its own once that time passes, with no other change to the task. A snooze can never hide a running or finished card — it only applies while the card would otherwise be in Unassigned, Assigned, Human queue, or Review, so a card that starts running or finishes while snoozed surfaces immediately rather than staying hidden. Any Unassigned, Assigned, Human queue, or Review card can be snoozed; In progress, Done, and scheduler entries cannot. Set through the drawer's **Snooze** picker (or `PUT /api/agents/board/cards/{id}/snooze` directly) and cleared through **Unsnooze** (`DELETE` on the same path) or by dragging the card to another lane. Hidden by default in the lane filter below, the same as Done. |
+| **Snoozed** | The task carries a future wake-up time; the card returns to its natural lane on its own once that time passes, and LifeOS sends a Telegram notification naming the card. A snooze can never hide a running or finished card — it only applies while the card would otherwise be in Unassigned, Assigned, Human queue, or Review, so a card that starts running or finishes while snoozed surfaces immediately rather than staying hidden. Any Unassigned, Assigned, Human queue, or Review card can be snoozed; In progress, Done, and scheduler entries cannot. Set through the drawer's **Snooze** picker (or `PUT /api/agents/board/cards/{id}/snooze` directly) and cleared through **Unsnooze** (`DELETE` on the same path) or by dragging the card to another lane. Hidden by default in the lane filter below, the same as Done. |
 
 Each lane header carries a small accent colour — the same palette the Graph tab uses for a node's fill, so a session's lane reads identically on both tabs.
 

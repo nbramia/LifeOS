@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-09-16
+> **Last Updated:** 2026-09-18
 
 Engineering view of the `/agents` page — endpoint shapes, ingest paths, status inference, layout, and security boundaries. For the consumer view see [product/agent-viz.md](../product/agent-viz.md).
 
@@ -163,7 +163,11 @@ The drawer's Tags field (`web/agents/board.js`) is gated by `policy.assignee` �
 
 ### Snooze
 
-A snooze is a wake-up time stored on the task as the custom field `[snoozed_until:: <ISO-8601 with offset>]` (`agent_board.SNOOZED_UNTIL_FIELD`) — status and tags are untouched. `agent_board.parse_snoozed_until` parses it, rejecting a missing, unparseable, or offset-less value, and normalizes an accepted value to `parsed.isoformat()` (UTC, canonical `+00:00` form) when the write endpoint persists it — `fromisoformat` accepts a compact form, a space separator, and a `Z` suffix, none of which a browser's `Date` constructor parses uniformly, so the vault never stores one of those verbatim. `agent_board.is_snoozed(fields, now=None)` is true only while the parsed value is strictly after `now` (real clock by default, injectable for tests) — a past value is treated exactly as absent, and is never cleaned up.
+A snooze is a wake-up time stored on the task as the custom field `[snoozed_until:: <ISO-8601 with offset>]` (`agent_board.SNOOZED_UNTIL_FIELD`) — status and tags are untouched. `agent_board.parse_snoozed_until` parses it, rejecting a missing, unparseable, or offset-less value, and normalizes an accepted value to `parsed.isoformat()` (UTC, canonical `+00:00` form) when the write endpoint persists it — `fromisoformat` accepts a compact form, a space separator, and a `Z` suffix, none of which a browser's `Date` constructor parses uniformly, so the vault never stores one of those verbatim. `agent_board.is_snoozed(fields, now=None)` is true only while the parsed value is strictly after `now` (real clock by default, injectable for tests); a past value is treated exactly as absent from lane derivation.
+
+`SnoozeNotifier` polls tasks every 30 seconds while Telegram is configured. For each expired snooze whose natural lane remains snooze-eligible, it sends `⏰ LifeOS snooze ended` plus the card description through the primary Telegram bot. A successful send clears `snoozed_until`, making the task write the durable deduplication record; a failed send leaves the field intact for the next poll. The clear uses `TaskManager.update` with an exact-value precondition, so an operator re-snoozing or unsnoozing the card during delivery is never overwritten by the older wake-up. The service starts and stops with the API lifespan and runs independently of whether the board is open, reporting its own thread liveness at `/health` as `snooze_notifier`, the same shape as `reminder_scheduler`.
+
+This is a standalone poller rather than a `scheduler_store.SchedulerScheduler` entry (the existing 60-second Telegram-delivery watcher used for `notify`/`prompt`/`endpoint`/`agent` actions) because that scheduler fires from entries the operator authors ahead of time in the vault, not from a wake-up time picked interactively per card — folding a snooze in would mean writing and deleting a throwaway schedule entry on every snooze instead of reading the wake-up time already stored on the card.
 
 `agent_board.natural_lane(status, tags)` is the status/tag-only priority chain (Review, Human queue, In progress, Done, Assigned, Unassigned) with no knowledge of any snooze — what `derive_lane` would return if the task carried no `snoozed_until` at all. `derive_lane(status, tags, fields=None, now=None)` computes the natural lane first, then overrides it with `snoozed` only when that natural lane is itself in `agent_board.SNOOZABLE_LANES` (`unassigned`, `assigned`, `human_queue`, `review`) AND the wake-up time is still in the future. **A future `snoozed_until` on a task whose natural lane is `in_progress` or `done` is ignored — a snooze can never hide a running or finished card.** This is a derivation invariant, not just a write-time restriction on the snooze endpoint.
 
