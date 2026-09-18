@@ -425,6 +425,9 @@ def test_timeout_marks_question_and_nudges(tmp_path: Path):
         task_id="t1", status=STATUS_BLOCKED, routing="local",
         budget={"wall_seconds": 60, "max_tokens": 100, "max_dollars": 1.0},
     )
+    from api.services.agent_worker.session_resources import ensure_session_scratch
+    scratch = ensure_session_scratch(session.session_id)
+    (scratch / "synthetic-secret.txt").write_text("synthetic")
     qid = w.session_store.create_pending_question(
         session_id=session.session_id, task_id="t1",
         question="Which John?", sent_message_id=42,
@@ -439,6 +442,7 @@ def test_timeout_marks_question_and_nudges(tmp_path: Path):
     w._timeout_stale_clarifications()
     refreshed = w.session_store.get_question_by_message_id(42)
     assert refreshed["timed_out"] == 1
+    assert not scratch.exists()
     assert any("still waiting on your reply" in s for s in w._sent)
 
 

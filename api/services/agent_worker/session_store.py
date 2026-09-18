@@ -2759,7 +2759,7 @@ class SessionStore:
         status: str | None = None,
         routing: str | None = None,
         parent_session_id: str | None = None,
-        limit: int = 200,
+        limit: int | None = 200,
     ) -> list[Session]:
         """Filtered listing for the `lifeos_agent_sessions_list` tool."""
         conditions = []
@@ -2774,10 +2774,12 @@ class SessionStore:
             conditions.append("parent_session_id = ?")
             params.append(parent_session_id)
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        params.append(int(limit))
+        limit_sql = " LIMIT ?" if limit is not None else ""
+        if limit is not None:
+            params.append(int(limit))
         with self._connect() as conn:
             rows = conn.execute(
-                f"SELECT * FROM sessions {where} ORDER BY started_at DESC LIMIT ?",
+                f"SELECT * FROM sessions {where} ORDER BY started_at DESC{limit_sql}",
                 tuple(params),
             ).fetchall()
         return [self._row_to_session(r) for r in rows]

@@ -181,6 +181,7 @@ _QUESTION_CLAIM_RECOVERY_LIMIT = 100
 _RESOURCE_CLEANUP_INTERVAL_SECONDS = 300
 _RESOURCE_CLEANUP_BATCH_SIZE = 10
 _WORKTREE_RECENT_SECONDS = 24 * 60 * 60
+_TASK_FETCH_FAILED = object()
 
 # A recurring (cron) schedule stamps its handed-off #agent task with a
 # `sched-<id>` tag (see scheduler_store._hand_off_to_agent). The worker reads
@@ -723,7 +724,7 @@ class Worker:
         session = self.session_store.get(task_id)
         if session is not None and status in TERMINAL_STATUSES:
             from api.services.agent_worker.session_resources import cleanup_session_scratch
-            cleanup_session_scratch(session.session_id)
+            cleanup_session_scratch(session.session_id, host=getattr(session, "host", None))
         if session is None or session.origin == "operator" or session.parent_session_id:
             return False
         try:
@@ -1082,27 +1083,35 @@ class Worker:
             return 0
         self._last_resource_cleanup = now
         from api.services.agent_worker.git_worktree import (
+            list_worker_worktrees,
             pull_request_state,
             remove_worker_worktree,
         )
         from api.services.agent_worker.session_resources import cleanup_session_scratch
 
         cleaned = 0
-        sessions = self.session_store.list_sessions(limit=200)
+        sessions = self.session_store.list_sessions(limit=None)
+        session_by_worktree: dict[tuple[str | None, str], Any] = {}
+        managed_repos: set[tuple[str | None, str]] = set()
         for session in sessions:
             if cleaned >= _RESOURCE_CLEANUP_BATCH_SIZE:
                 break
             if session.status in TERMINAL_STATUSES:
-                cleanup_session_scratch(session.session_id)
+                cleanup_session_scratch(session.session_id, host=getattr(session, "host", None))
             if session.routing not in {ROUTE_CLAUDE_CODE, ROUTE_CODEX} or not session.execution_spec:
                 continue
             working_dir = ExecutionSpec.from_dict(session.execution_spec).working_dir
             if not working_dir or "-wt-agent-" not in os.path.basename(working_dir):
                 continue
-            try:
-                task = self._fetch_task(session.task_id)
-            except Exception as exc:
-                logger.warning("resource cleanup task fetch %s failed: %s", session.task_id, exc)
+            session_by_worktree[(session.host, os.path.normpath(working_dir))] = session
+            managed_repos.add((session.host, working_dir))
+            if (
+                session.status not in TERMINAL_STATUSES
+                or self._executor_registry.is_inflight(session)
+            ):
+                continue
+            task = self._fetch_task(session.task_id, distinguish_failure=True)
+            if task is _TASK_FETCH_FAILED:
                 continue
             tags = self._norm_task_tags(task or {})
             card_terminal = task is None or (task or {}).get("status") in {"cancelled", "done"}
@@ -1131,6 +1140,15 @@ class Worker:
                 self._pr_state_cache.pop(working_dir, None)
             elif result.applicable and result.error:
                 logger.warning("worktree cleanup failed for %s: %s", working_dir, result.error)
+        for host, repo in managed_repos:
+            for working_dir in list_worker_worktrees(repo, host=host):
+                if cleaned >= _RESOURCE_CLEANUP_BATCH_SIZE:
+                    return cleaned
+                if (host, os.path.normpath(working_dir)) in session_by_worktree:
+                    continue
+                result = remove_worker_worktree(working_dir, host=host)
+                if result.removed:
+                    cleaned += 1
         return cleaned
 
     def _resume_yielded_for_children(self) -> None:
@@ -1686,7 +1704,7 @@ class Worker:
         result = self._executor_registry.cancel_once(session, reason)
         if result.cancelled:
             from api.services.agent_worker.session_resources import cleanup_session_scratch
-            cleanup_session_scratch(session.session_id)
+            cleanup_session_scratch(session.session_id, host=getattr(session, "host", None))
         return result
 
     def _execute_start(self, session, request: dict[str, Any]):
@@ -2676,6 +2694,11 @@ class Worker:
                 "question_id": q["id"],
             })
             stale_session = self.session_store.get_by_session_id(q["session_id"])
+            if stale_session is not None:
+                from api.services.agent_worker.session_resources import cleanup_session_scratch
+                cleanup_session_scratch(
+                    stale_session.session_id, host=getattr(stale_session, "host", None),
+                )
             label = _worker_label(stale_session.routing if stale_session else None)
             self._notify(
                 f"⏰ {label}: task is still waiting on your reply.\n\n"
@@ -4732,7 +4755,9 @@ class Worker:
         )
         return self._hermes_executor
 
-    def _fetch_task(self, task_id: str) -> dict[str, Any] | None:
+    def _fetch_task(
+        self, task_id: str, *, distinguish_failure: bool = False,
+    ) -> dict[str, Any] | None | object:
         try:
             resp = self._http.get(f"{self.api_base}/api/tasks/{task_id}")
             if resp.status_code == 404:
@@ -4744,11 +4769,11 @@ class Worker:
             # an empty object). Treat malformed/mismatched payloads as an
             # unavailable recheck rather than a false ownership signal.
             if not isinstance(payload, dict) or payload.get("id") != task_id:
-                return None
+                return _TASK_FETCH_FAILED if distinguish_failure else None
             return payload
         except Exception as exc:
             logger.warning("fetch_task %s failed: %s", task_id, exc)
-            return None
+            return _TASK_FETCH_FAILED if distinguish_failure else None
 
     def _last_reassignment(self, session_id: str) -> dict[str, Any] | None:
         """Return the latest board reassign marker, if any."""

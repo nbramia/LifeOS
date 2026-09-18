@@ -14,10 +14,17 @@ _active_scratch_env: ContextVar[dict[str, str] | None] = ContextVar(
     "agent_session_scratch_env", default=None,
 )
 
+_SESSION_ID_RE = re.compile(r"sess_[0-9a-f]{16}\Z")
+
 
 def scratch_dir_for(session_id: str) -> Path:
-    safe = re.sub(r"[^A-Za-z0-9_.-]", "-", session_id)
-    return Path(tempfile.gettempdir()) / "lifeos-agent-worker" / safe
+    if not _SESSION_ID_RE.fullmatch(session_id):
+        raise ValueError(f"invalid internal session id: {session_id!r}")
+    container = (Path(tempfile.gettempdir()) / "lifeos-agent-worker").resolve()
+    path = (container / session_id).resolve()
+    if path.parent != container:
+        raise ValueError(f"session scratch path escaped its container: {session_id!r}")
+    return path
 
 
 def ensure_session_scratch(session_id: str) -> Path:
@@ -32,8 +39,14 @@ def scratch_env(session_id: str) -> dict[str, str]:
     return {"TMPDIR": value, "TMP": value, "TEMP": value}
 
 
-def cleanup_session_scratch(session_id: str) -> None:
-    shutil.rmtree(scratch_dir_for(session_id), ignore_errors=True)
+def cleanup_session_scratch(session_id: str, *, host: str | None = None) -> None:
+    from api.services.agent_worker.git_worktree import resolve_runner_for_host
+
+    path = scratch_dir_for(session_id)
+    runner = resolve_runner_for_host(host)
+    runner(["rm", "-rf", "--", str(path)])
+    if host:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 def active_scratch_env() -> dict[str, str] | None:

@@ -860,6 +860,41 @@ def pull_request_state(
     return state if state in {"OPEN", "MERGED", "CLOSED"} else None
 
 
+def list_worker_worktrees(
+    repo: str, *, host: Optional[str] = None, timeout: int = DEFAULT_TIMEOUT,
+    runner: Optional[Runner] = None,
+) -> list[str]:
+    """List marker-owned worker worktrees registered to one repository."""
+    try:
+        active = runner or resolve_runner_for_host(host)
+    except WorktreeError:
+        return []
+    result = _run(["git", "worktree", "list", "--porcelain"], cwd=repo, runner=active, timeout=timeout)
+    if result.returncode != 0:
+        return []
+    blocks = result.stdout.split("\n\n")
+    first_repo_line = blocks[0].splitlines()[:1] if blocks else []
+    if not first_repo_line or not first_repo_line[0].startswith("worktree "):
+        return []
+    primary = first_repo_line[0].removeprefix("worktree ")
+    owned: list[str] = []
+    for block in blocks:
+        first = block.splitlines()[:1]
+        if not first or not first[0].startswith("worktree "):
+            continue
+        path = first[0].removeprefix("worktree ")
+        if "-wt-agent-" not in Path(path).name:
+            continue
+        marker = _read_worker_marker(path, runner=active, timeout=timeout)
+        if (
+            marker
+            and os.path.normpath(str(marker.get("worktree_dir", ""))) == os.path.normpath(path)
+            and os.path.normpath(str(marker.get("repo_toplevel", ""))) == os.path.normpath(primary)
+        ):
+            owned.append(path)
+    return owned
+
+
 def remove_worker_worktree(
     working_dir: str,
     *,
@@ -939,5 +974,6 @@ __all__ = [
     "ensure_worktree",
     "finalize_worktree_session",
     "pull_request_state",
+    "list_worker_worktrees",
     "remove_worker_worktree",
 ]
