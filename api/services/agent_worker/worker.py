@@ -984,6 +984,13 @@ class Worker:
         # session — see `_reconcile_lifecycle_drift`). Also never gated on
         # the spend cap: it reconciles existing state, never starts new work.
         self._reconcile_lifecycle_drift()
+        # Sibling sweep: a CLAIMED session with an undelivered queued message
+        # is expected to be picked up by `_dispatch_spawned_sessions` below
+        # within this same tick or the next one — see that method's skip
+        # guard. A session still sitting there past the configured threshold
+        # gets a one-time alert rather than staying silently orphaned. Also
+        # ungated on the spend cap: it never starts new work, only alerts.
+        self._reconcile_stuck_claimed_sessions()
 
         # Use the configured per-task default budget as the "can I afford to
         # start the cheapest task right now?" estimate. Calling with 0.0 would
@@ -1199,11 +1206,30 @@ class Worker:
         claimed = self.session_store.list_by_status(STATUS_CLAIMED)
         for session in claimed:
             # Skip top-level claimed sessions from the #agent tick claim path
-            # (those are dispatched by _dispatch). Pick up spawned children
-            # (parent set) and operator root-spawns (no parent but
-            # origin='operator').
+            # (those are dispatched by _dispatch) — EXCEPT a top-level
+            # claude_code/codex session carrying an undelivered pending
+            # message. That combination is the signature every reopen path
+            # leaves behind (a Telegram followup/status-anchor reply, or the
+            # worker's own code_reopened_for_pending_messages): none of them
+            # can flip the session straight to RUNNING inline the way a fresh
+            # top-level claim does, so the reopened session just sits at
+            # CLAIMED until some dispatch tick picks it up again. A fresh
+            # top-level claim never produces this signature — `_dispatch`
+            # synthesizes its first-turn payload in-memory and hands it
+            # straight to `_submit_cli_dispatch`, never through
+            # `pending_messages` — so this check cannot also grab a session
+            # the tick's own top-level claim loop claimed for the first time
+            # this same tick (that loop runs after this method returns, and
+            # a fresh claim's session carries no pending_messages row for
+            # this check to match). Pick up spawned children (parent set)
+            # and operator root-spawns (no parent but origin='operator')
+            # unconditionally, as before.
             if not session.parent_session_id and session.origin != "operator":
-                continue
+                if (
+                    session.routing not in ("claude_code", "codex")
+                    or not self.session_store.has_pending_messages(session.session_id)
+                ):
+                    continue
             if session.execution_request:
                 parsed = parse_execution_request(session.execution_request)
                 if not parsed.ok:
@@ -1240,14 +1266,32 @@ class Worker:
             # consuming the prompt so a second scan cannot drain a CLI turn that
             # is already queued/running, and a failed resolution leaves the input
             # available for an operator-directed retry.
-            if session.routing in ("claude_code", "codex"):
+            is_cli_route = session.routing in ("claude_code", "codex")
+            if is_cli_route:
                 with self._cli_lock:
                     if session.session_id in self._cli_inflight:
                         continue
-            pending = self.session_store.drain_pending_messages(
-                session.session_id,
-                attempt_id=attempt_id_for(session), turn_id=turn_id_for(session),
-            )
+            if is_cli_route and session.claude_code_session_id:
+                # Resume, not a fresh dispatch: peek rather than drain. A
+                # resume dispatch runs off-tick and can fail before it ever
+                # confirms the subprocess started (crash, resolution
+                # failure, a killed worker). Marking these delivered here —
+                # before that confirmation exists — would lose the message
+                # on any such failure. The resume dispatch
+                # (`_dispatch_claude_code_session`/`_dispatch_codex_session`,
+                # via `_confirm_resume_or_requeue`) marks each id delivered
+                # itself, once it can confirm the message was actually acted
+                # on. A fresh dispatch has no such later confirmation point
+                # (there's no persisted `claude_code_session_id` yet for it
+                # to key a "did it launch" check on) and no equivalent
+                # truthful-ack promise riding on it, so it keeps draining
+                # eagerly, attempt/turn-fenced, exactly as every other route.
+                pending = self.session_store.peek_pending_messages(session.session_id)
+            else:
+                pending = self.session_store.drain_pending_messages(
+                    session.session_id,
+                    attempt_id=attempt_id_for(session), turn_id=turn_id_for(session),
+                )
             description = pending[0]["content"] if pending else session.session_id
             task = {"id": session.task_id, "description": description}
             if execution.spec.working_dir:
@@ -2796,6 +2840,91 @@ class Worker:
                 healed += 1
         return healed
 
+    def _reconcile_stuck_claimed_sessions(self) -> int:
+        """Alert once for a top-level claude_code/codex session stuck at
+        CLAIMED with an undelivered queued message past the configured
+        threshold — the safety net for a reopened session that a dispatch
+        tick never picked back up.
+
+        A session in this exact shape (top-level, `claude_code`/`codex`
+        routing, an undelivered `pending_messages` row) is the same
+        candidate set `_dispatch_spawned_sessions` now admits, so under
+        normal operation it drains within a tick or two of being reopened —
+        by a Telegram followup/status-anchor reply, or the worker's own
+        `code_reopened_for_pending_messages`. This sweep exists for the case
+        where something still prevents that (a stale in-flight guard
+        surviving a worker restart, a dispatch-time crash swallowed before
+        the session could be marked failed): rather than re-driving dispatch
+        itself — which risks a second concurrent attempt on a session whose
+        executor may genuinely still be starting up — it tells the operator
+        plainly that a resume did not take, naming the task and session, so
+        they know exactly what to check.
+
+        One alert per stuck episode: `last_activity_at` is bumped every time
+        the session is reopened to CLAIMED (`update_status` sets it), so the
+        alert is recorded in the transcript keyed to that value. A session
+        reopened again later carries a new `last_activity_at` and is
+        eligible for a fresh alert if it gets stuck again.
+
+        A candidate's backing card must still be actively claimed
+        (`RUNNING_TAG`) before it's alerted on — the operator can cancel,
+        retag, or reassign a card after a reopen queued the session's note,
+        and dispatch is correctly skipped for it from then on. That's not
+        an actionable stuck resume; it's a resolved episode the sweep
+        retires silently (a transcript note, no Telegram message) rather
+        than reporting as if it still needed attention.
+        """
+        threshold_seconds = settings.agent_stuck_session_timeout_minutes * 60
+        cutoff = int(time.time()) - threshold_seconds
+        alerted = 0
+        for session in self.session_store.list_by_status(STATUS_CLAIMED):
+            # Same candidate shape `_dispatch_spawned_sessions` now admits —
+            # spawned children and operator root-spawns are always eligible
+            # for pickup already and aren't a subject of this sweep.
+            if session.parent_session_id or session.origin == "operator":
+                continue
+            if session.routing not in ("claude_code", "codex"):
+                continue
+            if not self.session_store.has_pending_messages(session.session_id):
+                continue
+            if session.last_activity_at > cutoff:
+                continue  # still inside its normal pickup window
+            events = self.transcript_store.read(session.session_id)
+            task = self._fetch_task(session.task_id)
+            if RUNNING_TAG not in self._norm_task_tags(task):
+                already_retired = any(
+                    e.get("kind") == "stuck_claimed_episode_retired"
+                    and e.get("payload", {}).get("last_activity_at") == session.last_activity_at
+                    for e in events
+                )
+                if not already_retired:
+                    self.transcript_store.append(session.session_id, "stuck_claimed_episode_retired", {
+                        "last_activity_at": session.last_activity_at,
+                        "reason": "card no longer carries the running tag",
+                    })
+                continue
+            already_alerted = any(
+                e.get("kind") == "stuck_claimed_session_alerted"
+                and e.get("payload", {}).get("last_activity_at") == session.last_activity_at
+                for e in events
+            )
+            if already_alerted:
+                continue
+            title = (task or {}).get("description", session.task_id)
+            label = _worker_label(session.routing)
+            self._notify(
+                f"⚠️ {label}: a resume for task '{title}' (session "
+                f"{session.session_id}) queued a note but never actually "
+                f"restarted — it's still sitting at claimed. Check the "
+                f"worker logs; it may need a manual re-trigger.",
+                bot=session.bot,
+            )
+            self.transcript_store.append(session.session_id, "stuck_claimed_session_alerted", {
+                "last_activity_at": session.last_activity_at,
+            })
+            alerted += 1
+        return alerted
+
     def _check_human_queue_done_when(self, done_when: dict) -> tuple[bool, str]:
         """Evaluate one card's `done_when`. Returns `(passed, description)`;
         raises on a malformed check or a request/IO error — the caller
@@ -3524,6 +3653,63 @@ class Worker:
             logger.warning("spawn-marker read failed for %s: %s", session_id, exc)
             return 0
 
+    def _confirm_resume_or_requeue(
+        self, session, sid: str, pending_ids: list[int], prior_launches: int,
+        *, spawn_kind: str, not_found_kind: str, report_failure: bool,
+    ) -> bool:
+        """After a resume attempt returns (or raises), confirm whether a CLI
+        subprocess actually launched during THIS call before treating the
+        queued note as delivered or telling the operator the session
+        resumed.
+
+        The deposit-time Telegram ack only ever promises the note is
+        queued — this is the first point a resume can be truthfully
+        confirmed, since `_execute_resume` runs the whole CLI turn
+        synchronously and can fail before a subprocess ever starts
+        (resolution failure, a fenced/rejected turn, a crash in worker
+        glue code, or an ordinary FAILED outcome the executor returned
+        without ever spawning — e.g. a missing binary or a permission
+        error). A launch that never happened must not mark the note
+        delivered (it would otherwise be silently lost) or claim the
+        session resumed.
+
+        Returns whether a launch was confirmed. When it was, the note is
+        marked delivered and, for a top-level session, a truthful
+        "Resumed" confirmation is sent. When it wasn't, the note is left
+        queued; a truthful "didn't start" notice is sent only when
+        `report_failure` is True. Pass `report_failure=True` from the
+        `_execute_resume` exception handler — nothing else reports that
+        failure, since an exception unwinds past the ordinary FAILED-
+        outcome handling entirely. Pass `report_failure=False` when
+        `_execute_resume` instead returned an ordinary (non-raising)
+        outcome and the caller falls through to that same shared FAILED-
+        outcome handling afterward — it already reports an accurate
+        reason and reconciles the vault tag, so reporting here too would
+        just duplicate the notice.
+
+        Two accepted, deliberate residual gaps (not fixed by this
+        method): a worker/process crash landing strictly between a
+        confirmed launch and this method's own call can still deliver a
+        note twice on a later manual reopen (at-least-once, not
+        exactly-once, delivery); and a session left FAILED here after a
+        pre-launch failure has no automatic re-claim — the note rides
+        the next resume only if an operator triggers one.
+        """
+        launched = self._cli_subprocess_launch_count(
+            sid, spawn_kind, not_found_kind,
+        ) > prior_launches
+        if launched:
+            self.session_store.mark_pending_delivered(pending_ids)
+            if not session.parent_session_id:
+                self._send_session_message(session, "▶️ Resumed — continuing from your note.")
+        elif report_failure and not session.parent_session_id:
+            self._send_session_message(
+                session,
+                "⚠️ Resume didn't start — your note is still queued and "
+                "will ride the next resume attempt.",
+            )
+        return launched
+
     def _mirror_to_conversation(self, session_id: str, text: str) -> None:
         """mirror a web-spawned session's operator-facing output into its
         linked conversation thread (additive — Telegram is untouched).
@@ -3674,17 +3860,22 @@ class Worker:
             return
 
         if is_resume:
-            # Every drained message rides the resume turn, in order. Draining
-            # returns ALL pending rows, and reopen-on-send makes
+            # Every peeked message rides the resume turn, in order. Peeking
+            # returns ALL undelivered rows, and reopen-on-send makes
             # multi-enqueue likely (e.g. a parent answers twice before the
             # dispatch tick claims the reopened child) — resuming with only
             # pending[0] would silently drop messages `lifeos_agent_send`
-            # already acknowledged as delivered.
+            # already acknowledged as delivered. Not yet marked delivered —
+            # see `_confirm_resume_or_requeue` below.
             resume_message = "\n\n".join(m["content"] for m in pending) if pending else ""
+            pending_ids = [m["id"] for m in pending if "id" in m]
             task: dict = {"id": session.task_id, "description": resume_message}
             self.transcript_store.append(sid, "claude_code_user_prompt", {
                 "text": resume_message, "resume": True,
             })
+            prior_launches = self._cli_subprocess_launch_count(
+                sid, "claude_code_spawn", "claude_code_binary_not_found"
+            )
             try:
                 spec = (
                     ExecutionSpec.from_dict(session.execution_spec)
@@ -3704,8 +3895,32 @@ class Worker:
                     session.task_id, STATUS_FAILED,
                     attempt_id=session.attempt_id, turn_id=session.turn_id,
                 )
+                self._confirm_resume_or_requeue(
+                    session, sid, pending_ids, prior_launches,
+                    spawn_kind="claude_code_spawn", not_found_kind="claude_code_binary_not_found",
+                    report_failure=True,
+                )
                 return
+            # A resume is only ever acknowledged as "queued" at reply time
+            # (Telegram ack, followup or status-anchor) — confirm the turn
+            # actually launched a subprocess before claiming it resumed or
+            # marking the note delivered. A non-launch here (an ordinary
+            # FAILED outcome the executor returned without ever spawning —
+            # a missing binary, a permission error) is NOT reported here;
+            # it falls through to the shared FAILED-outcome handling below,
+            # which already reports the accurate reason and reconciles the
+            # vault tag — reporting it here too would just duplicate it.
+            self._confirm_resume_or_requeue(
+                session, sid, pending_ids, prior_launches,
+                spawn_kind="claude_code_spawn", not_found_kind="claude_code_binary_not_found",
+                report_failure=False,
+            )
         else:
+            # A fresh dispatch (first turn): the caller (`_dispatch_spawned_sessions`,
+            # or `_dispatch`'s synthetic in-memory payload) already drained
+            # this session's one spawn-payload row eagerly, attempt/turn-
+            # fenced, exactly as before — there's no later "confirm the
+            # launch" point to defer to here the way the resume branch has.
             payload = parse_claude_code_spawn_payload(pending[0]["content"]) if pending else {
                 "prompt": "", "working_dir": None, "plan_mode": False, "chat_id": None,
             }
@@ -4154,15 +4369,20 @@ class Worker:
             return
 
         if is_resume:
-            # All drained messages ride the resume turn in order — same
+            # All peeked messages ride the resume turn in order — same
             # multi-enqueue rationale as the claude_code dispatch above
             # (a codex child can collect both an operator threaded reply
-            # and a parent reopen answer before the tick claims it).
+            # and a parent reopen answer before the tick claims it). Not
+            # yet marked delivered — see `_confirm_resume_or_requeue`.
             resume_message = "\n\n".join(m["content"] for m in pending) if pending else ""
+            pending_ids = [m["id"] for m in pending if "id" in m]
             task: dict = {"id": session.task_id, "description": resume_message}
             self.transcript_store.append(sid, "codex_user_prompt", {
                 "text": resume_message, "resume": True,
             })
+            prior_launches = self._cli_subprocess_launch_count(
+                sid, "codex_spawn", "codex_binary_not_found"
+            )
             try:
                 spec = (
                     ExecutionSpec.from_dict(session.execution_spec)
@@ -4182,8 +4402,28 @@ class Worker:
                     session.task_id, STATUS_FAILED,
                     attempt_id=session.attempt_id, turn_id=session.turn_id,
                 )
+                self._confirm_resume_or_requeue(
+                    session, sid, pending_ids, prior_launches,
+                    spawn_kind="codex_spawn", not_found_kind="codex_binary_not_found",
+                    report_failure=True,
+                )
                 return
+            # Mirrors the claude_code dispatch: the reply-time ack only ever
+            # promises the note is queued — confirm the turn actually
+            # launched a subprocess before claiming it resumed or marking
+            # the note delivered. A non-launch here falls through to the
+            # shared FAILED-outcome handling below rather than being
+            # reported here too — see the matching claude_code comment.
+            self._confirm_resume_or_requeue(
+                session, sid, pending_ids, prior_launches,
+                spawn_kind="codex_spawn", not_found_kind="codex_binary_not_found",
+                report_failure=False,
+            )
         else:
+            # See the claude_code dispatch's matching comment: the caller
+            # already drained this fresh dispatch's one spawn-payload row
+            # eagerly, attempt/turn-fenced — there's no later confirmation
+            # point to defer to here the way the resume branch has.
             payload = parse_codex_spawn_payload(pending[0]["content"]) if pending else {
                 "prompt": "", "working_dir": None, "chat_id": None,
             }

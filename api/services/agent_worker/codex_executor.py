@@ -418,10 +418,21 @@ class CodexExecutor:
                 # remote kill path reaches the real CLI over ssh.
                 start_new_session=True,
             )
-        except FileNotFoundError as exc:
+        except OSError as exc:
+            # Mirrors ClaudeCodeExecutor's matching handler: any spawn-time
+            # OS failure, not just a missing binary, must write the SAME
+            # compensating `codex_binary_not_found` marker the missing-binary
+            # case does, or `_cli_subprocess_launch_count` would miscount an
+            # uncompensated failure as a real launch.
             self.transcript_store.append(sid, "codex_binary_not_found", {"error": str(exc)})
             self._cleanup_tempfile(last_msg_path)
-            return ExecutorOutcome(status=STATUS_FAILED, reason=REASON_BINARY_NOT_FOUND)
+            return ExecutorOutcome(
+                status=STATUS_FAILED,
+                reason=(
+                    REASON_BINARY_NOT_FOUND if isinstance(exc, FileNotFoundError)
+                    else f"codex spawn failed: {exc}"
+                ),
+            )
 
         self.session_store.update_status(
             session.task_id, STATUS_RUNNING,

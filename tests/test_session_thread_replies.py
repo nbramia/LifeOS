@@ -265,6 +265,49 @@ class TestBlockedClarifyPromptMerged:
         assert text.endswith(REPLYABLE_FOOTER)
 
 
+class TestFollowupReplyAck:
+    """A reply on a completion/failure message's ``kind='followup'`` row
+    only deposits the answer — the worker's own tick is what actually
+    reopens and dispatches the session (`_resume_as_followup`). The
+    deposit-time ack must say so truthfully rather than claim the resume
+    is already underway."""
+
+    def _listener(self):
+        from api.services.telegram import TelegramBotListener
+        from config.settings import TelegramBotConfig
+        return TelegramBotListener(TelegramBotConfig(
+            name="doctor", token="TOK", chat_id="999", persona="P", orchestrates=True,
+        ))
+
+    @pytest.mark.asyncio
+    async def test_ack_says_queued_not_resuming(self, tmp_path):
+        store = SessionStore(db_path=tmp_path / "sessions.db")
+        s = store.create(task_id="t1", routing="claude_code", origin="operator", bot="doctor")
+        store.set_claude_code_session_id("t1", "cli-1")
+        store.create_pending_question(
+            session_id=s.session_id, task_id="t1", question="done",
+            sent_message_id=7000, kind="followup", bot="doctor",
+        )
+        listener = self._listener()
+        sent: list[str] = []
+
+        async def _capture(text, chat_id=None):
+            sent.append(text)
+
+        with patch("api.services.agent_worker.session_store.SessionStore",
+                   return_value=store), \
+             patch("api.services.telegram.send_message_async", side_effect=_capture):
+            consumed = await listener._maybe_handle_claude_code_reply(
+                7000, "one more thing", "999",
+            )
+
+        assert consumed is True
+        assert any("queued for the" in t for t in sent)
+        assert not any(t.lower().startswith("resuming") for t in sent)
+        answered = store.list_answered_unprocessed_questions()
+        assert [q["answer"] for q in answered] == ["one more thing"]
+
+
 # ---------------------------------------------------------------------------
 # telegram listener — threaded reply on an anchored message
 # ---------------------------------------------------------------------------
@@ -341,7 +384,7 @@ class TestStatusAnchorReplies:
         consumed, sent = await self._reply(listener, store, "one more thing")
 
         assert consumed is True
-        assert any("waking the session" in t for t in sent)
+        assert any("queued for the session" in t for t in sent)
         assert store.get("t1").status == STATUS_CLAIMED
 
     @pytest.mark.asyncio
@@ -370,6 +413,142 @@ class TestStatusAnchorReplies:
         assert ack_q["session_id"] == s.session_id
         # And the ack text carries the replyable footer.
         assert any(t.endswith(REPLYABLE_FOOTER) for t in sent)
+
+
+class TestStatusAnchorVaultReopen:
+    """A vault-task-backed session (no `origin='operator'`) reopened via a
+    status-anchor reply must swap the card's terminal tag/status back to
+    running before the session is claimed — the same sequence
+    `_resume_as_followup` and `code_reopened_for_pending_messages` already
+    perform — and must not claim the session at all when that swap fails."""
+
+    def _listener(self):
+        from api.services.telegram import TelegramBotListener
+        from config.settings import TelegramBotConfig
+        return TelegramBotListener(TelegramBotConfig(
+            name="doctor", token="TOK", chat_id="999", persona="P", orchestrates=True,
+        ))
+
+    def _seed(self, tmp_path):
+        store = SessionStore(db_path=tmp_path / "sessions.db")
+        s = store.create(
+            task_id="t1", routing="claude_code", bot="doctor", status=STATUS_COMPLETED,
+        )
+        store.set_claude_code_session_id("t1", "cli-1")
+        store.update_status("t1", STATUS_COMPLETED)
+        store.add_reply_anchors(s.session_id, "t1", [7000], bot="doctor")
+        return store, s
+
+    async def _reply(self, listener, store, fake_manager):
+        sent: list[str] = []
+
+        def _capture_ids(t, chat_id=None, bot=None):
+            sent.append(t)
+            return [8000 + len(sent)]
+
+        async def _capture_async(t, chat_id=None, bot=None):
+            sent.append(t)
+            return True
+
+        with patch("api.services.agent_worker.session_store.SessionStore",
+                   return_value=store), \
+             patch("api.services.telegram.send_message_capture_ids",
+                   side_effect=_capture_ids), \
+             patch("api.services.telegram.send_message_async",
+                   side_effect=_capture_async), \
+             patch("api.services.task_manager.get_task_manager",
+                   return_value=fake_manager):
+            consumed = await listener._maybe_handle_claude_code_reply(
+                7000, "one more thing", "999",
+            )
+        return consumed, sent
+
+    @pytest.mark.asyncio
+    async def test_successful_swap_reopens_before_claiming(self, tmp_path):
+        from api.services.agent_worker.worker import COMPLETED_TAG, RUNNING_TAG
+
+        class _FakeManager:
+            def __init__(self):
+                self.swap_calls = []
+                self.update_calls = []
+
+            def swap_tag(self, task_id, from_tag, to_tag):
+                self.swap_calls.append((task_id, from_tag, to_tag))
+                return from_tag == COMPLETED_TAG
+
+            def update(self, task_id, **kwargs):
+                self.update_calls.append((task_id, kwargs))
+
+        listener = self._listener()
+        store, s = self._seed(tmp_path)
+        manager = _FakeManager()
+
+        consumed, sent = await self._reply(listener, store, manager)
+
+        assert consumed is True
+        assert manager.swap_calls[0] == ("t1", COMPLETED_TAG, RUNNING_TAG)
+        assert manager.update_calls == [("t1", {"status": "in_progress"})]
+        assert store.get("t1").status == STATUS_CLAIMED
+        assert any("queued for the session" in t for t in sent)
+        # Truthful ack: it must not claim to have already resumed.
+        assert not any("resumed" in t.lower() and "confirm" not in t.lower() for t in sent)
+
+    @pytest.mark.asyncio
+    async def test_failed_swap_does_not_claim_the_session(self, tmp_path):
+        class _FakeManager:
+            def swap_tag(self, task_id, from_tag, to_tag):
+                return False  # every terminal tag is gone — retagged/reassigned
+
+            def update(self, task_id, **kwargs):
+                raise AssertionError("status must not be written when the swap failed")
+
+        listener = self._listener()
+        store, s = self._seed(tmp_path)
+        manager = _FakeManager()
+
+        consumed, sent = await self._reply(listener, store, manager)
+
+        assert consumed is True
+        assert store.get("t1").status == STATUS_COMPLETED  # left alone, not claimed
+        assert any("couldn't resume" in t.lower() for t in sent)
+        # The operator's note must not be left queued behind a "couldn't
+        # resume" ack — it would otherwise resurface on some later,
+        # unrelated reopen.
+        assert store.drain_pending_messages(s.session_id) == []
+
+    @pytest.mark.asyncio
+    async def test_status_write_failure_restores_tag_and_does_not_claim(self, tmp_path):
+        """A successful tag swap followed by a failing status write must not
+        be treated as a successful reopen — the tag/status/claimed triple
+        would be left inconsistent (running tag, stale terminal status).
+        The tag swap is undone and the session is left alone."""
+        from api.services.agent_worker.worker import COMPLETED_TAG, RUNNING_TAG
+
+        class _FakeManager:
+            def __init__(self):
+                self.swap_calls = []
+
+            def swap_tag(self, task_id, from_tag, to_tag):
+                self.swap_calls.append((task_id, from_tag, to_tag))
+                return True  # both the forward swap and the restore succeed
+
+            def update(self, task_id, **kwargs):
+                raise RuntimeError("status write failed")
+
+        listener = self._listener()
+        store, s = self._seed(tmp_path)
+        manager = _FakeManager()
+
+        consumed, sent = await self._reply(listener, store, manager)
+
+        assert consumed is True
+        assert manager.swap_calls == [
+            ("t1", COMPLETED_TAG, RUNNING_TAG),   # the forward swap
+            ("t1", RUNNING_TAG, COMPLETED_TAG),   # restored on status-write failure
+        ]
+        assert store.get("t1").status == STATUS_COMPLETED  # left alone, not claimed
+        assert any("couldn't resume" in t.lower() for t in sent)
+        assert store.drain_pending_messages(s.session_id) == []
 
 
 # Fresh messages route through the same chat pipeline every other bot
