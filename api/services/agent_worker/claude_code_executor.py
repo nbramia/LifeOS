@@ -21,6 +21,7 @@ from typing import Callable, NamedTuple, Optional
 
 from api.services.agent_worker.assignment import ENGINE_CLAUDE_CODE, map_effort_for_engine
 from api.services.agent_worker.binary_resolver import resolve_for_spawn
+from api.services.agent_worker.completion_signal import looks_like_finished_thought
 from api.services.agent_worker.delegation import delegation_preamble
 from api.services.agent_worker.local_executor import ExecutorOutcome
 from api.services.agent_worker.remote_spawn import (
@@ -42,6 +43,7 @@ from api.services.agent_worker.session_store import (
 )
 from api.services.agent_worker.transcript_store import TranscriptStore
 from api.services.agent_worker.usage_ledger import UsageLedger
+from api.services.secret_redaction import scrub_and_bound
 from config.settings import settings
 
 
@@ -282,6 +284,7 @@ class _RunState:
     # reader's fall-through to avoid double-finalizing if the subprocess exits
     # right after we already saw the terminal event.
     terminal: bool = False
+    last_error: str = ""
 
 
 def _summarize_tool_call(tool_name: str, tool_input: dict) -> str:
@@ -402,6 +405,7 @@ class ClaudeCodeExecutor:
         return self._with_identity(session, self._run(
             session=session,
             prompt=prompt,
+            task_title=(task.get("description") or session.task_id).strip(),
             working_dir=working_dir,
             resume_session_id=None,
             plan_mode=plan_mode,
@@ -427,6 +431,7 @@ class ClaudeCodeExecutor:
         return self._with_identity(session, self._run(
             session=session,
             prompt=message,
+            task_title=session.task_id,
             working_dir=wd,
             resume_session_id=resume_id,
             plan_mode=False,
@@ -549,6 +554,7 @@ class ClaudeCodeExecutor:
         *,
         session,
         prompt: str,
+        task_title: str,
         working_dir: str,
         resume_session_id: Optional[str],
         plan_mode: bool,
@@ -892,14 +898,18 @@ class ClaudeCodeExecutor:
         # unreachable-host failure (`Connection refused`, `Permission
         # denied (publickey)`) only ever surfaced in the transcript's
         # `stderr_tail`, never where the operator actually looks.
-        reason = f"claude exited with code {proc.returncode}"
+        title = task_title or session.task_id
+        detail = last_nonempty_line(stderr_tail) or state.last_error
+        if not detail:
+            detail = "no error output was captured"
+        reason = f"task '{title}': claude exited with code {proc.returncode}: {detail}"
         if is_remote:
             last_line = last_nonempty_line(stderr_tail)
             if last_line:
                 reason = f"ssh to {host} failed (exit {proc.returncode}): {last_line}"
         return ExecutorOutcome(
             status=STATUS_FAILED,
-            reason=reason,
+            reason=scrub_and_bound(reason),
         )
 
     def _record_usage(self, session, state: _RunState) -> None:
@@ -986,8 +996,12 @@ class ClaudeCodeExecutor:
                 # Streaming the tags out here would otherwise make the worker's
                 # terminal summary repeat each tagged body verbatim.
                 scan = _scan_protocol_tags(text)
-                if scan.narrative.strip():
-                    state.final_text = scan.narrative.strip()
+                narrative = scan.narrative.strip()
+                if narrative and (
+                    state.notifications_sent == 0
+                    or looks_like_finished_thought(narrative)
+                ):
+                    state.final_text = narrative
                 for body in scan.clarify:
                     state.notifications_sent += 1
                     state.last_notify_at = time.time()
@@ -1093,6 +1107,11 @@ class ClaudeCodeExecutor:
         # the CLI's own limits still bound runaway sessions.
         state.cost_usd = float(event.get("total_cost_usd") or 0.0)
 
+        if event.get("subtype") in {"error_during_execution", "error_max_turns"}:
+            state.last_error = str(
+                event.get("error") or event.get("message") or event.get("result") or ""
+            ).strip()
+
         if state.pending_clarification:
             # Agent asked a question — surface as BLOCKED outcome so the
             # worker can register the question for follow-up reply routing.
@@ -1120,7 +1139,10 @@ class ClaudeCodeExecutor:
             # Strip any [NOTIFY]/[CLARIFY] tags (fence-aware) that already
             # streamed via assistant events so we don't double-surface them.
             narrative = _scan_protocol_tags(result_text).narrative.strip()
-            if narrative:
+            if narrative and (
+                state.notifications_sent == 0
+                or looks_like_finished_thought(narrative)
+            ):
                 state.final_text = narrative
         state.terminal = True
 

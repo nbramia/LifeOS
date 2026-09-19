@@ -2956,8 +2956,12 @@ class Worker:
         Returns the Telegram message_id (or None if Telegram isn't configured
         — caller should mark the session blocked anyway since we can't ask).
         """
+        session = self.session_store.get_by_session_id(session_id)
         try:
-            sent_ids = self._telegram_send_with_id(question) or []
+            sent_ids = (
+                self._send_session_message(session, question) if session is not None
+                else self._telegram_send_with_id(question)
+            ) or []
         except Exception as exc:
             logger.warning(f"ask_user_via_telegram failed: {exc}")
             return None
@@ -3351,15 +3355,6 @@ class Worker:
             )
         message = "\n\n".join(parts)
 
-        def _send(text):
-            return self._telegram_send(text, bot=bot) if bot else self._telegram_send(text)
-
-        def _send_with_id(text):
-            return (
-                self._telegram_send_with_id(text, bot=bot) if bot
-                else self._telegram_send_with_id(text)
-            )
-
         if resumable:
             # project=False: the vault tag stays at the running tag here —
             # only the session row moves to BLOCKED. The claimed-card guard
@@ -3372,7 +3367,7 @@ class Worker:
             )
             sent_ids: list = []
             try:
-                sent_ids = _send_with_id(_with_reply_footer(message)) or []
+                sent_ids = self._send_session_message(session, message) or []
             except Exception as exc:
                 logger.warning("interrupted-session notice send failed: %s", exc)
             if sent_ids:
@@ -3403,7 +3398,10 @@ class Worker:
             attempt_id=session.attempt_id, turn_id=session.turn_id,
         )
         try:
-            _send(_with_reply_footer(message, replyable=False))
+            if bot:
+                self._telegram_send(_with_reply_footer(message, replyable=False), bot=bot)
+            else:
+                self._telegram_send(_with_reply_footer(message, replyable=False))
         except Exception as exc:
             logger.warning("interrupted-session (unresumable) notice send failed: %s", exc)
         self._mirror_to_conversation(sid, message)
@@ -3799,10 +3797,10 @@ class Worker:
         # Only thread `bot` when set so the primary path's send signature
         # stays byte-identical to the plain call. bot=None → primary.
         def _send(text):
-            return self._telegram_send(text, bot=bot) if bot else self._telegram_send(text)
+            return bool(self._send_session_message(session, text))
 
         def _send_with_id(text):
-            return self._telegram_send_with_id(text, bot=bot) if bot else self._telegram_send_with_id(text)
+            return self._send_session_message(session, text)
 
         # Build the task dict + resume message from drained pending messages.
         # Fresh spawns carry the JSON payload produced by spawn_claude_code_session;
@@ -4228,7 +4226,7 @@ class Worker:
         )
         self._reconcile_vault_terminal(session, outcome.status)
 
-    def _send_session_message(self, session, body: str) -> None:
+    def _send_session_message(self, session, body: str) -> list[int]:
         """Send an operator-facing session message (streamed [NOTIFY] body,
         heartbeat) with reply-anchor registration: the message ends with the
         "reply in thread" footer, its Telegram message id(s) are captured and
@@ -4238,11 +4236,28 @@ class Worker:
         capture is unavailable or fails.
         """
         bot = session.bot
-        text = _with_reply_footer(body)
+        task = self._fetch_task(session.task_id)
+        title = ((task or {}).get("description") or session.task_id).strip()
+        if len(title) > 72:
+            title = title[:69].rstrip() + "…"
+        safe_title = re.sub(r"([_*\[\]()`])", r"\\\1", title)
+        for footer in (REPLYABLE_FOOTER, NO_REPLY_FOOTER):
+            suffix = f"\n\n{footer}"
+            if body.endswith(suffix):
+                body = body[:-len(suffix)]
+                break
+        prefixed_body = f"📌 {safe_title}\n\n{body}"
+        text = _with_reply_footer(prefixed_body)
+        reply_to_message_id = self.session_store.get_first_reply_anchor(
+            session.session_id,
+        )
         try:
             sent_ids = (
-                self._telegram_send_with_id(text, bot=bot) if bot
-                else self._telegram_send_with_id(text)
+                self._telegram_send_with_id(
+                    text, bot=bot, reply_to_message_id=reply_to_message_id,
+                ) if bot else self._telegram_send_with_id(
+                    text, reply_to_message_id=reply_to_message_id,
+                )
             ) or []
         except Exception as exc:
             logger.warning("session message send (with id) failed for %s: %s",
@@ -4251,12 +4266,12 @@ class Worker:
         if not sent_ids:
             try:
                 if bot:
-                    self._telegram_send(body, bot=bot)
+                    self._telegram_send(prefixed_body, bot=bot)
                 else:
-                    self._telegram_send(body)
+                    self._telegram_send(prefixed_body)
             except Exception as exc:  # pragma: no cover — defensive
                 logger.warning("session message fallback send failed: %s", exc)
-            return
+            return []
         try:
             self.session_store.add_reply_anchors(
                 session.session_id, session.task_id, sent_ids, bot=bot,
@@ -4265,6 +4280,7 @@ class Worker:
         except Exception as exc:  # best-effort — a lost anchor only loses
             logger.warning("reply-anchor registration failed for %s: %s",
                            session.task_id, exc)  # the reply route, not the message
+        return sent_ids
 
     def _get_claude_code_executor(self, bot: str | None = None):
         """Lazy-construct the ClaudeCodeExecutor for /claude sessions.
@@ -4358,7 +4374,8 @@ class Worker:
                 attempt_id=session.attempt_id, turn_id=session.turn_id,
             )
             try:
-                self._telegram_send(
+                self._send_session_message(
+                    session,
                     "⚠️ A codex session may have already started before it could be "
                     "resumed safely, so it wasn't retried automatically. It's marked "
                     "failed — re-trigger it to retry."
@@ -4473,7 +4490,7 @@ class Worker:
             sent_ids: list = []
             for attempt in range(_BLOCKED_PROMPT_SEND_ATTEMPTS):
                 try:
-                    sent_ids = self._telegram_send_with_id(_with_reply_footer(prompt)) or []
+                    sent_ids = self._send_session_message(session, prompt) or []
                 except Exception as exc:
                     logger.warning(
                         "codex blocked reply prompt send failed (attempt %d/%d): %s",
@@ -4512,7 +4529,8 @@ class Worker:
                 attempt_id=session.attempt_id, turn_id=session.turn_id,
             )
             try:
-                self._telegram_send(
+                self._send_session_message(
+                    session,
                     "⚠️ A codex session needs your input, but the question couldn't be "
                     "delivered. It was marked failed — re-trigger it to retry."
                 )
@@ -4547,7 +4565,7 @@ class Worker:
             body = _with_git_status_note(body, git_result, want_pr=True)
             if body and not session.parent_session_id:
                 try:
-                    sent_ids = self._telegram_send_with_id(body) or []
+                    sent_ids = self._send_session_message(session, body) or []
                 except Exception as exc:
                     logger.warning("codex completion send failed: %s", exc)
                     sent_ids = []
@@ -4597,7 +4615,7 @@ class Worker:
         # too — parity with the claude_code branch; the parent's resume turn
         # carries the child's terminal status header.
         if notice and not session.parent_session_id:
-            self._telegram_send(notice)
+            self._send_session_message(session, notice)
             # mirror the same failure/budget notice into the web/voice
             # thread (no-op for Telegram-origin). A child is never
             # conversation-linked, so the child gate above also keeps this correct.
@@ -4623,6 +4641,7 @@ class Worker:
             session_store=self.session_store,
             transcript_store=self.transcript_store,
             notification_callback=self._telegram_send,
+            operator_send=self._send_session_message,
         )
         return self._codex_executor
 
@@ -6123,7 +6142,10 @@ class Worker:
             return self._raw_telegram_send(text, bot=bot)
         return self._raw_telegram_send(text)
 
-    def _send_on_channel_with_id(self, text: str, chat_id=None, bot: str | None = None):
+    def _send_on_channel_with_id(
+        self, text: str, chat_id=None, bot: str | None = None,
+        reply_to_message_id: int | None = None,
+    ):
         """Deliver one operator-facing message and return the ids a reply can
         be matched against.
 
@@ -6135,9 +6157,12 @@ class Worker:
         """
         if bot == HERMES_CHANNEL:
             return []
+        kwargs = {}
+        if reply_to_message_id is not None:
+            kwargs["reply_to_message_id"] = reply_to_message_id
         if bot:
-            return self._raw_telegram_send_with_id(text, bot=bot)
-        return self._raw_telegram_send_with_id(text)
+            return self._raw_telegram_send_with_id(text, bot=bot, **kwargs)
+        return self._raw_telegram_send_with_id(text, **kwargs)
 
     def _notify(self, text: str, bot: str | None = None) -> None:
         try:
@@ -6164,12 +6189,16 @@ class Worker:
             self._notify(body, bot=channel)
             return
         sent_ids: list[int] = []
+        delivery_attempted = False
         try:
-            sent_ids = self._telegram_send_with_id(_with_reply_footer(body)) or []
+            sent_ids = self._send_session_message(session, body) or []
+            delivery_attempted = True
         except Exception as exc:
             logger.warning("terminal notify (with id) failed for %s: %s", session.task_id, exc)
-        if not sent_ids:
+        if not delivery_attempted:
             self._notify(body)  # no registered anchor → no (false) footer
+            return
+        if not sent_ids:
             return
         try:
             self.session_store.register_completion_followup(

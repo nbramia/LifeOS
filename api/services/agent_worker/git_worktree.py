@@ -46,6 +46,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
+from api.services.secret_redaction import scrub_secrets
+
 
 DEFAULT_TIMEOUT = 60          # seconds, per git/gh subprocess call (status, rev-parse, fetch, ...)
 COMMIT_PUSH_TIMEOUT = 300     # seconds — commit/push may run pre-commit/pre-push hooks
@@ -589,27 +591,6 @@ def _bounded(text: str, *, max_chars: int = MAX_PR_BODY_CHARS) -> str:
 # a specific prefix (bot token, `sk-`, `ghp_`, ...) is redacted whole
 # before the generic long-hex/base64 catch-alls run, so a matched prefix's
 # own body isn't then reported twice under a vaguer label.
-_SECRET_PATTERNS: tuple[tuple["re.Pattern[str]", str], ...] = (
-    (re.compile(r"bot\d+:[A-Za-z0-9_-]+"), "bot<REDACTED>"),                    # Telegram bot token
-    (re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"), "sk-<REDACTED>"),                # OpenAI/Anthropic-shaped key
-    (re.compile(r"\bghp_[A-Za-z0-9]{20,}\b"), "ghp_<REDACTED>"),                # GitHub personal access token (classic)
-    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"), "github_pat_<REDACTED>"), # GitHub fine-grained PAT
-    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "AKIA<REDACTED>"),                    # AWS access key id
-    (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}"), "Bearer <REDACTED>"),
-    (re.compile(r"\b[0-9a-fA-F]{32,}\b"), "<REDACTED-HEX>"),                    # long hex token/hash
-    (re.compile(r"\b[A-Za-z0-9+/]{32,}={0,2}\b"), "<REDACTED-TOKEN>"),          # long base64-ish token
-)
-
-
-def _scrub_secrets(text: str) -> str:
-    """Redact obvious secret shapes from ``text`` — bot tokens, common API
-    key prefixes, AWS-style access keys, ``Bearer`` tokens, and long hex/
-    base64-ish strings (32+ chars, the shape of an opaque credential)."""
-    for pattern, replacement in _SECRET_PATTERNS:
-        text = pattern.sub(replacement, text)
-    return text
-
-
 def _build_pr_body(
     *, card_title: str, summary: str, working_dir: str, base: str, branch: str,
     runner: Optional[Runner], timeout: int,
@@ -627,7 +608,7 @@ def _build_pr_body(
     commit_log = _commit_log(working_dir, base, branch, runner=runner, timeout=timeout)
     if commit_log:
         sections.append("### Commits\n```\n" + commit_log[:1500] + "\n```")
-    return _bounded(_scrub_secrets("\n\n".join(sections)))
+    return _bounded(scrub_secrets("\n\n".join(sections)))
 
 
 def _find_existing_pr(branch: str, *, cwd: str, runner: Runner, timeout: int) -> Optional[str]:

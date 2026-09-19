@@ -196,7 +196,12 @@ class TypingIndicator:
                 pass
 
 
-def send_message_capture_ids(text: str, chat_id: str = None, bot: str = None) -> list[int]:
+def send_message_capture_ids(
+    text: str,
+    chat_id: str = None,
+    bot: str = None,
+    reply_to_message_id: int | None = None,
+) -> list[int]:
     """Send a message and return the Telegram `message_id` of every chunk sent.
 
     Used by the agent worker to track clarification questions and terminal-state
@@ -217,16 +222,21 @@ def send_message_capture_ids(text: str, chat_id: str = None, bot: str = None) ->
     text = _clean_markdown_for_telegram(text)
     ids: list[int] = []
     for part in _split_message(text):
+        payload = {"chat_id": chat_id, "text": part, "parse_mode": "Markdown"}
+        if reply_to_message_id is not None:
+            payload["reply_to_message_id"] = int(reply_to_message_id)
+            payload["allow_sending_without_reply"] = True
         try:
             resp = httpx.post(
                 _telegram_url("sendMessage", token),
-                json={"chat_id": chat_id, "text": part, "parse_mode": "Markdown"},
+                json=payload,
                 timeout=30.0,
             )
             if resp.status_code != 200:
+                payload.pop("parse_mode", None)
                 resp = httpx.post(
                     _telegram_url("sendMessage", token),
-                    json={"chat_id": chat_id, "text": part},
+                    json=payload,
                     timeout=30.0,
                 )
             if resp.status_code == 200:
@@ -240,7 +250,12 @@ def send_message_capture_ids(text: str, chat_id: str = None, bot: str = None) ->
     return ids
 
 
-def send_message(text: str, chat_id: str = None, bot: str = None) -> bool:
+def send_message(
+    text: str,
+    chat_id: str = None,
+    bot: str = None,
+    reply_to_message_id: int | None = None,
+) -> bool:
     """
     Send a message via Telegram (synchronous).
 
@@ -261,21 +276,22 @@ def send_message(text: str, chat_id: str = None, bot: str = None) -> bool:
 
     success = True
     for part in _split_message(text):
+        payload = {"chat_id": chat_id, "text": part, "parse_mode": "Markdown"}
+        if reply_to_message_id is not None:
+            payload["reply_to_message_id"] = int(reply_to_message_id)
+            payload["allow_sending_without_reply"] = True
         try:
             resp = httpx.post(
                 _telegram_url("sendMessage", token),
-                json={
-                    "chat_id": chat_id,
-                    "text": part,
-                    "parse_mode": "Markdown",
-                },
+                json=payload,
                 timeout=30.0,
             )
             if resp.status_code != 200:
                 # Retry without parse_mode (plain text fallback)
+                payload.pop("parse_mode", None)
                 resp = httpx.post(
                     _telegram_url("sendMessage", token),
-                    json={"chat_id": chat_id, "text": part},
+                    json=payload,
                     timeout=30.0,
                 )
             if resp.status_code != 200:
@@ -287,7 +303,12 @@ def send_message(text: str, chat_id: str = None, bot: str = None) -> bool:
     return success
 
 
-async def send_message_async(text: str, chat_id: str = None, bot: str = None) -> bool:
+async def send_message_async(
+    text: str,
+    chat_id: str = None,
+    bot: str = None,
+    reply_to_message_id: int | None = None,
+) -> bool:
     """
     Send a message via Telegram (async).
 
@@ -307,19 +328,20 @@ async def send_message_async(text: str, chat_id: str = None, bot: str = None) ->
     success = True
     async with httpx.AsyncClient(timeout=30.0) as client:
         for part in _split_message(text):
+            payload = {"chat_id": chat_id, "text": part, "parse_mode": "Markdown"}
+            if reply_to_message_id is not None:
+                payload["reply_to_message_id"] = int(reply_to_message_id)
+                payload["allow_sending_without_reply"] = True
             try:
                 resp = await client.post(
                     _telegram_url("sendMessage", token),
-                    json={
-                        "chat_id": chat_id,
-                        "text": part,
-                        "parse_mode": "Markdown",
-                    },
+                    json=payload,
                 )
                 if resp.status_code != 200:
+                    payload.pop("parse_mode", None)
                     resp = await client.post(
                         _telegram_url("sendMessage", token),
-                        json={"chat_id": chat_id, "text": part},
+                        json=payload,
                     )
                 if resp.status_code != 200:
                     logger.error(f"Telegram send failed: {resp.status_code} {resp.text[:200]}")

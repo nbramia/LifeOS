@@ -154,7 +154,8 @@ class TestSendSessionMessage:
 
         w._send_session_message(s, "Running the tests now.")
 
-        assert w._plain_sent == ["Running the tests now."]
+        assert w._plain_sent == ["📌 t1\n\nRunning the tests now."]
+        assert REPLYABLE_FOOTER not in w._plain_sent[0]
 
 
 class TestCompletedWithPendingReopens:

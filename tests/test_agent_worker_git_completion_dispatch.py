@@ -228,7 +228,7 @@ def test_claude_code_no_worktree_session_unaffected(tmp_path: Path, monkeypatch)
 
     worker._dispatch_claude_code_session(session, [{"content": "do a thing"}])
 
-    assert sent and sent[0].startswith("All done.")
+    assert sent and sent[0].startswith("📌 task-plain\n\nAll done.")
     assert not any("Branch:" in t or "PR:" in t for t in sent)
 
 

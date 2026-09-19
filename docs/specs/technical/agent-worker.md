@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-09-16
+> **Last Updated:** 2026-09-18
 
 Engineering view of the agent worker — the stand-alone process that consumes engine-assigned tasks and runs them on either a local LLM or Anthropic Managed Agents. For consumer-facing behavior, see [product/agent-worker.md](../product/agent-worker.md). For operator setup, see [guides/agent-worker-setup.md](../../guides/agent-worker-setup.md).
 
@@ -607,6 +607,12 @@ Both `_dispatch_claude_code_session` and `_dispatch_codex_session` gate their `S
 - the final text references a PR/issue — a `github.com/…/pull|issues/…` URL is the strong signal; a bare issue/PR number alone only counts alongside merge/PR-ish phrasing nearby (`PR`, `merged`, `opened`, `closes`, `fixes`, `resolves`), to avoid mistaking a passing issue-number mention for "I opened it";
 - the final text reads like a finished summary rather than an instruction fragment: non-empty, above a small length floor, and not trailing off mid-clause (ending in `:`/`,`/`;`/a dash, or on a dangling connective word like "the"/"and"/"to").
 
+After a Claude Code `[NOTIFY]` has been delivered, later assistant narrative replaces `final_text` only when it passes that same finished-summary check. A trailing work note or unfinished aside therefore cannot displace the coherent result that already reached the operator; a genuine later summary remains authoritative.
+
+For a non-zero local CLI exit, the outcome reason names the task and uses the last non-empty stderr line. When stderr is empty, the executor uses the most recent structured stream error (`result` error subtype for Claude Code; `error` or `turn.failed` for Codex), or states that no error output was captured. Remote SSH failures retain their host-specific stderr reason.
+
+Codex activity follows the JSONL vocabulary emitted by the installed CLI: completed `command_execution`, `file_change`, `mcp_tool_call`, `web_search`, and compatibility command/tool item types count as tool activity, while `turn.completed.usage` supplies input, cached-input, output, and reasoning token totals and the model-priced cost estimate.
+
 Failing all three routes the outcome to `Worker._handle_cli_interrupted`, which parks it rather than either completing or bare-failing it:
 
 - **Resumable** (a `claude_code_session_id` / codex thread id was persisted): the session row moves to `BLOCKED` and an operator message — "Session interrupted mid-work — reply to resume", the last `final_text` as context, and the WIP branch name if discovered (below) — is sent via the id-capturing sender and registered as a `kind='followup'` `pending_questions` row. This reuses the *exact* round-trip a genuine `[CLARIFY]`/`[GOAL]`/plan `BLOCKED` outcome already uses: `_process_clarification_answers` → `_resume_as_followup`, which for `claude_code`/`codex` routing just re-enqueues the reply and flips the session to `CLAIMED` so the next dispatch tick drains it through `resume()` on the persisted CLI id. The vault tag is deliberately left at `#agent-running` (mirroring the CLARIFY/GOAL/PLAN block path, which also doesn't swap it) — only the session row moves.
@@ -737,6 +743,8 @@ When the worker needs operator input mid-task — preflight routing=ask, ambigui
 4. For managed sessions: also calls `driver.kill_session` to stop session-hour billing while waiting.
 
 When the operator replies (using Telegram's native reply feature), the bot's `_maybe_deposit_agent_answer()` hook intercepts the `reply_to_message_id` and calls `SessionStore.deposit_answer()`, which matches a reply landing on **any** chunk (membership in `sent_message_ids`, not just the first). The worker's `_process_clarification_answers()` runs each tick, picks up answered questions, parses the answer (for routing questions: extracts `claude code` / `codex` / `local` / `cloud` from free-text, last mention winning), updates the session, and re-dispatches.
+
+Every worker-originated session message starts with a short, Markdown-escaped card-title prefix. The first delivered message is recorded as the session's thread anchor; later progress, question, completion, failure, and budget messages include Telegram's `reply_to_message_id` pointing to that earliest anchor. All delivered chunk ids remain registered for inbound reply matching.
 
 For local sessions, the parent session resumes via the existing pending_messages drain.
 For managed sessions, a new remote session is created with the resolved routing.

@@ -404,7 +404,8 @@ def test_remote_ssh_failure_reason_includes_stderr(tmp_path, monkeypatch):
     land in `outcome.reason` (what `worker.py` uses verbatim for the
     #agent-failed card), not just the transcript's `stderr_tail`."""
     spawn_calls: list = []
-    ssh_stderr = "ssh: connect to host studio port 22: Connection refused\n"
+    fake_token = "Bearer SYNTHETICFAKECREDENTIAL1234567890"
+    ssh_stderr = f"ssh: connect to host studio port 22: Connection refused {fake_token}\n"
     store = SessionStore(db_path=tmp_path / "sessions.db")
     transcripts = TranscriptStore(transcripts_dir=tmp_path / "transcripts")
     from config.settings import settings
@@ -422,6 +423,8 @@ def test_remote_ssh_failure_reason_includes_stderr(tmp_path, monkeypatch):
     assert outcome.status == STATUS_FAILED
     assert "studio" in outcome.reason
     assert "Connection refused" in outcome.reason
+    assert fake_token not in outcome.reason
+    assert "Bearer <REDACTED>" in outcome.reason
 
 
 def test_local_host_name_matches_api_host_runs_locally(tmp_path, monkeypatch):

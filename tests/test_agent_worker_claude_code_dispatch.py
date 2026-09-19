@@ -844,6 +844,30 @@ def test_interrupted_message_preserves_final_text_and_exit_meta(tmp_path: Path):
     assert any(FIELD_FRAGMENT in s for s in sent)
 
 
+def test_interrupted_message_has_card_prefix_and_threads_to_session_anchor(tmp_path: Path):
+    stub = _StubClaudeCodeExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=FIELD_FRAGMENT)
+    )
+    worker, store, _, _ = _capturing_worker(tmp_path, claude_code_executor=stub)
+    session = store.create(task_id="threaded-1", routing="claude_code", origin="operator")
+    store.set_claude_code_session_id("threaded-1", "cli-threaded-1")
+    store.add_reply_anchors(session.session_id, session.task_id, [41])
+    worker._fetch_task = lambda _task_id: {"description": "Synthetic release card"}
+    captured: list[tuple[str, int | None]] = []
+    worker._telegram_send_with_id = lambda text, **kwargs: (
+        captured.append((text, kwargs.get("reply_to_message_id"))) or [42]
+    )
+
+    worker._dispatch_claude_code_session(session, [{"content": "do the thing"}])
+
+    assert len(captured) == 1
+    assert captured[0][1] == 41
+    assert captured[0][0].startswith("📌 Synthetic release card\n\n⚠️ Session interrupted")
+    question = store.get_open_question_by_message_id(42)
+    assert question is not None
+    assert question["kind"] == "followup"
+
+
 def test_interrupted_message_names_discoverable_wip_branch(tmp_path: Path):
     """Best-effort WIP-branch discovery: a `git switch -c <branch>`
     tool_use recorded earlier in this session's transcript is surfaced in
