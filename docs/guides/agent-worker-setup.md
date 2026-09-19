@@ -643,6 +643,12 @@ you're comfortable with the agent having full shell access inside, the
 same trust model the worker already has everywhere else (see
 [Security model](#security-model)).
 
+### Session scratch lifecycle
+
+The worker creates a mode-`0700` temporary directory for each board session and exports it to subprocesses as `TMPDIR`, `TMP`, and `TEMP`. No setting is needed; the directory lives beneath the operating system's temporary directory and is removed at every terminal outcome. A host-assigned Claude Code or Codex session gets the corresponding directory on that host through its SSH launcher.
+
+Worker-created coding worktrees are reclaimed after pull-request merge, card acceptance/cancellation, or orphan detection. Keep `git` and `gh` authenticated on every registered execution host: cleanup uses the same host runner as provisioning and refuses removal when it cannot first commit and push remaining work. Remote branches are not deleted.
+
 ## Cost-aware iteration
 
 Iterating on Managed Agents prompts has a hidden tax: every fresh managed

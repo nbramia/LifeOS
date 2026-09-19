@@ -42,6 +42,7 @@ import os
 import re
 import shlex
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -59,6 +60,7 @@ SAFETY_NET_COMMIT_MESSAGE = "chore: worker safety-net commit for uncommitted ses
 ALLOWED_BRANCH_TYPES = ("feat", "fix", "docs", "test", "refactor", "chore")
 
 MAX_PR_BODY_CHARS = 4000
+WORKER_MARKER = "lifeos-agent-worktree.json"
 
 Runner = Callable[..., subprocess.CompletedProcess]
 
@@ -122,6 +124,15 @@ class FinalizeResult:
     pr_url: Optional[str] = None
     pr_opened: bool = False
     nothing_to_push: bool = False
+    error: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class CleanupResult:
+    """Outcome of an ownership-checked worktree cleanup attempt."""
+
+    removed: bool
+    applicable: bool = True
     error: Optional[str] = None
 
 
@@ -463,6 +474,49 @@ def _registered_worktree_branch(
     return None
 
 
+def _git_dir(working_dir: str, *, runner: Optional[Runner], timeout: int) -> Optional[str]:
+    result = _run(["git", "rev-parse", "--absolute-git-dir"], cwd=working_dir, runner=runner, timeout=timeout)
+    value = result.stdout.strip() if result.returncode == 0 else ""
+    return value or None
+
+
+def _write_worker_marker(
+    working_dir: str, marker: dict, *, runner: Optional[Runner], timeout: int,
+) -> None:
+    git_dir = _git_dir(working_dir, runner=runner, timeout=timeout)
+    if not git_dir:
+        raise WorktreeError("could not resolve linked worktree git directory")
+    payload = json.dumps(marker, sort_keys=True) + "\n"
+    result = _run(
+        [
+            "python3", "-c",
+            "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text(sys.argv[2], encoding='utf-8')",
+            f"{git_dir.rstrip('/')}/{WORKER_MARKER}", payload,
+        ],
+        runner=runner, timeout=timeout,
+    )
+    if result.returncode != 0:
+        raise WorktreeError(f"could not write worktree ownership marker: {result.stderr.strip()}")
+
+
+def _read_worker_marker(
+    working_dir: str, *, runner: Optional[Runner], timeout: int,
+) -> Optional[dict]:
+    git_dir = _git_dir(working_dir, runner=runner, timeout=timeout)
+    if not git_dir:
+        return None
+    result = _run(
+        ["cat", f"{git_dir.rstrip('/')}/{WORKER_MARKER}"], runner=runner, timeout=timeout,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        marker = json.loads(result.stdout)
+    except (TypeError, ValueError):
+        return None
+    return marker if isinstance(marker, dict) else None
+
+
 def ensure_worktree(
     working_dir: str,
     task_id: str,
@@ -499,6 +553,11 @@ def ensure_worktree(
 
     reused_branch = _registered_worktree_branch(toplevel, worktree_dir, runner=runner, timeout=timeout)
     if reused_branch:
+        marker = _read_worker_marker(worktree_dir, runner=runner, timeout=timeout)
+        if not marker or marker.get("task_id") != task_id:
+            raise WorktreeError(
+                f"refusing to reuse unowned worktree at {worktree_dir!r}"
+            )
         return WorktreeResult(
             working_dir=worktree_dir, is_git=True, branch=reused_branch,
             repo_toplevel=toplevel, reused=True,
@@ -522,11 +581,32 @@ def ensure_worktree(
         # `_registered_worktree_branch`'s docstring.
         raced_branch = _registered_worktree_branch(toplevel, worktree_dir, runner=runner, timeout=timeout)
         if raced_branch:
+            marker = _read_worker_marker(worktree_dir, runner=runner, timeout=timeout)
+            if not marker or marker.get("task_id") != task_id:
+                raise WorktreeError(
+                    f"refusing to reuse unowned worktree at {worktree_dir!r}"
+                )
             return WorktreeResult(
                 working_dir=worktree_dir, is_git=True, branch=raced_branch,
                 repo_toplevel=toplevel, reused=True,
             )
         raise WorktreeError(f"git worktree add failed: {add.stderr.strip()}")
+
+    _write_worker_marker(
+        worktree_dir,
+        {
+            "version": 1,
+            "task_id": task_id,
+            "repo_toplevel": toplevel,
+            "worktree_dir": worktree_dir,
+            "branch": branch,
+            "host": host,
+            "state": "ready",
+            "created_at": int(time.time()),
+        },
+        runner=runner,
+        timeout=timeout,
+    )
 
     return WorktreeResult(
         working_dir=worktree_dir, is_git=True, branch=branch,
@@ -653,6 +733,7 @@ def finalize_worktree_session(
     base_branch: Optional[str] = None,
     host: Optional[str] = None,
     gh_runner: Optional[Runner] = None,
+    runner: Optional[Runner] = None,
     timeout: int = DEFAULT_TIMEOUT,
     commit_push_timeout: int = COMMIT_PUSH_TIMEOUT,
 ) -> FinalizeResult:
@@ -694,7 +775,7 @@ def finalize_worktree_session(
         return FinalizeResult(applicable=False)
 
     try:
-        runner = resolve_runner_for_host(host)
+        runner = runner or resolve_runner_for_host(host)
     except WorktreeError as exc:
         return FinalizeResult(applicable=True, error=str(exc))
 
@@ -762,6 +843,112 @@ def finalize_worktree_session(
     return dataclasses.replace(result, pr_url=pr_url, pr_opened=True)
 
 
+def pull_request_state(
+    working_dir: str, *, host: Optional[str] = None, timeout: int = DEFAULT_TIMEOUT,
+    runner: Optional[Runner] = None,
+) -> Optional[str]:
+    """Return the branch PR state (OPEN/MERGED/CLOSED), or None on a miss/failure."""
+    active = runner or resolve_runner_for_host(host)
+    branch = current_branch(working_dir, runner=active, timeout=timeout)
+    if not branch:
+        return None
+    result = _run(
+        ["gh", "pr", "view", branch, "--json", "state", "--jq", ".state"],
+        cwd=working_dir, runner=active, timeout=timeout,
+    )
+    state = result.stdout.strip().upper() if result.returncode == 0 else ""
+    return state if state in {"OPEN", "MERGED", "CLOSED"} else None
+
+
+def list_worker_worktrees(
+    repo: str, *, host: Optional[str] = None, timeout: int = DEFAULT_TIMEOUT,
+    runner: Optional[Runner] = None,
+) -> list[str]:
+    """List marker-owned worker worktrees registered to one repository."""
+    try:
+        active = runner or resolve_runner_for_host(host)
+    except WorktreeError:
+        return []
+    result = _run(["git", "worktree", "list", "--porcelain"], cwd=repo, runner=active, timeout=timeout)
+    if result.returncode != 0:
+        return []
+    blocks = result.stdout.split("\n\n")
+    first_repo_line = blocks[0].splitlines()[:1] if blocks else []
+    if not first_repo_line or not first_repo_line[0].startswith("worktree "):
+        return []
+    primary = first_repo_line[0].removeprefix("worktree ")
+    owned: list[str] = []
+    for block in blocks:
+        first = block.splitlines()[:1]
+        if not first or not first[0].startswith("worktree "):
+            continue
+        path = first[0].removeprefix("worktree ")
+        if "-wt-agent-" not in Path(path).name:
+            continue
+        marker = _read_worker_marker(path, runner=active, timeout=timeout)
+        if (
+            marker
+            and os.path.normpath(str(marker.get("worktree_dir", ""))) == os.path.normpath(path)
+            and os.path.normpath(str(marker.get("repo_toplevel", ""))) == os.path.normpath(primary)
+        ):
+            owned.append(path)
+    return owned
+
+
+def remove_worker_worktree(
+    working_dir: str,
+    *,
+    host: Optional[str] = None,
+    timeout: int = DEFAULT_TIMEOUT,
+    commit_push_timeout: int = COMMIT_PUSH_TIMEOUT,
+    runner: Optional[Runner] = None,
+) -> CleanupResult:
+    """Safely remove one worker-owned worktree without deleting its branch.
+
+    Ownership requires both the deterministic path pattern and a valid marker
+    stored in the linked worktree's git directory. The marker is changed to
+    ``cleaning`` before finalization, making an interrupted attempt explicit
+    and retryable. Finalization must commit and push successfully before git
+    is allowed to remove the worktree.
+    """
+    try:
+        active = runner or resolve_runner_for_host(host)
+    except WorktreeError as exc:
+        return CleanupResult(removed=False, error=str(exc))
+    if "-wt-agent-" not in Path(working_dir).name:
+        return CleanupResult(removed=False, applicable=False, error="path is not worker-managed")
+    if not is_linked_worktree(working_dir, runner=active, timeout=timeout):
+        return CleanupResult(removed=False, applicable=False, error="not a linked worktree")
+    marker = _read_worker_marker(working_dir, runner=active, timeout=timeout)
+    if not marker or os.path.normpath(str(marker.get("worktree_dir", ""))) != os.path.normpath(working_dir):
+        return CleanupResult(removed=False, applicable=False, error="worker ownership marker missing or invalid")
+    repo = str(marker.get("repo_toplevel") or "")
+    if not repo or os.path.normpath(repo) == os.path.normpath(working_dir):
+        return CleanupResult(removed=False, applicable=False, error="refusing primary checkout")
+    marker["state"] = "cleaning"
+    marker["cleanup_started_at"] = int(time.time())
+    try:
+        _write_worker_marker(working_dir, marker, runner=active, timeout=timeout)
+    except WorktreeError as exc:
+        return CleanupResult(removed=False, error=str(exc))
+    finalized = finalize_worktree_session(
+        working_dir, open_pr=False, host=host, timeout=timeout,
+        commit_push_timeout=commit_push_timeout, runner=active,
+    )
+    if not finalized.applicable or finalized.error or not finalized.pushed:
+        return CleanupResult(removed=False, error=finalized.error or "worktree finalization did not push")
+    removed = _run(
+        ["git", "worktree", "remove", "--force", working_dir], cwd=repo,
+        runner=active, timeout=commit_push_timeout,
+    )
+    if removed.returncode != 0:
+        return CleanupResult(removed=False, error=f"git worktree remove failed: {removed.stderr.strip()}")
+    pruned = _run(["git", "worktree", "prune"], cwd=repo, runner=active, timeout=timeout)
+    if pruned.returncode != 0:
+        return CleanupResult(removed=True, error=f"git worktree prune failed: {pruned.stderr.strip()}")
+    return CleanupResult(removed=True)
+
+
 __all__ = [
     "DEFAULT_TIMEOUT",
     "COMMIT_PUSH_TIMEOUT",
@@ -773,6 +960,7 @@ __all__ = [
     "WorktreeResult",
     "WorktreeContext",
     "FinalizeResult",
+    "CleanupResult",
     "GIT_DISCIPLINE_INSTRUCTIONS",
     "git_discipline_text",
     "make_ssh_runner",
@@ -785,4 +973,7 @@ __all__ = [
     "worktree_dir_for",
     "ensure_worktree",
     "finalize_worktree_session",
+    "pull_request_state",
+    "list_worker_worktrees",
+    "remove_worker_worktree",
 ]

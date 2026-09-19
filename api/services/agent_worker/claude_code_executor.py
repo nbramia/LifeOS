@@ -521,6 +521,8 @@ class ClaudeCodeExecutor:
             # mcp_server.py derives stdio caller identity from this process-
             # bound value; the model cannot choose another session id.
             env["LIFEOS_AGENT_SESSION_ID"] = session_id
+            from api.services.agent_worker.session_resources import scratch_env
+            env.update(scratch_env(session_id))
         return env
 
     @staticmethod
@@ -594,6 +596,7 @@ class ClaudeCodeExecutor:
                 target=target,
                 unset_env_names=self._remote_unset_env_names(),
                 session_id=sid,
+                env={key: value for key, value in self._clean_env(sid).items() if key in {"TMPDIR", "TMP", "TEMP"}},
             )
 
         self.transcript_store.append(sid, "claude_code_spawn", {
