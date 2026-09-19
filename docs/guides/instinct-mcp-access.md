@@ -14,7 +14,7 @@ This is the LifeOS-side half of the setup. Instinct's own remote-MCP connector (
 
 - **A second MCP HTTP process** (`lifeos-mcp-instinct.service`), on its own port, alongside the existing `lifeos-mcp-http.service`. Both bind to `127.0.0.1` only.
 - **A distinct bearer credential** (`LIFEOS_MCP_INSTINCT_BEARER_TOKEN`), separate from `LIFEOS_MCP_BEARER_TOKEN`. Rotating or revoking it never affects Managed Agents or any other MCP client.
-- **A required tool allowlist** (`LIFEOS_MCP_INSTINCT_ALLOWED_TOOLS`). The dedicated instance refuses to start without one — an unset allowlist is only valid on the default (`:8765`) instance, where it means "every tool," unchanged from before this mechanism existed.
+- **A required tool allowlist** (`LIFEOS_MCP_INSTINCT_ALLOWED_TOOLS`). The dedicated instance refuses to start without one — an unset allowlist is only valid on the default (`:8765`) instance, where it means "every tool."
 - **A stable HTTPS `/mcp` URL** via the same outbound-only Cloudflare Tunnel pattern used for Managed Agents — see [agent-worker-setup.md Step 4](agent-worker-setup.md#step-4--expose-via-cloudflare-tunnel).
 - **A disabled-by-default systemd unit** — `setup-systemd.sh` only enables it once both the credential and the allowlist are configured.
 

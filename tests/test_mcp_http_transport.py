@@ -606,3 +606,30 @@ def test_redaction_covers_child_logger_and_uvicorn_error_logger():
     assert secret not in uvicorn_output
     assert "Bearer <REDACTED>" in child_output
     assert "Bearer <REDACTED>" in uvicorn_output
+
+
+@pytest.mark.unit
+def test_run_http_passes_redacting_log_config_to_uvicorn(
+    server: mcp_server.LifeOSMCPServer, monkeypatch
+):
+    """`run_http` must pass the redacting log_config to `uvicorn.run` —
+    a regression to a bare `uvicorn.run(app, host=..., port=..., log_level=...)`
+    with no `log_config` argument would leave every uvicorn-installed handler
+    unfiltered, and no test that only exercises
+    `_uvicorn_log_config_with_redaction()` directly would catch it."""
+    import uvicorn
+
+    captured: dict[str, Any] = {}
+
+    def fake_run(app, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(uvicorn, "run", fake_run)
+
+    mcp_server.run_http(server, "127.0.0.1", 0, "synthetic-token")
+
+    assert "log_config" in captured, captured
+    handlers = captured["log_config"].get("handlers", {})
+    assert handlers, captured["log_config"]
+    for name, handler in handlers.items():
+        assert "bearer_redact" in handler.get("filters", []), (name, handler)

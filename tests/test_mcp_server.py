@@ -1391,18 +1391,19 @@ def test_main_named_instance_agent_tool_in_allowlist_exits_2(monkeypatch):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
-def test_path_param_traversal_is_percent_encoded_not_normalized():
-    """A '../' value in a path param must reach the wire as an opaque,
-    percent-encoded path segment under the tool's own route prefix — never
-    as literal '/' characters a server (or an intermediate normalizer) could
-    resolve into a different route."""
+def test_path_param_containing_slash_is_rejected_before_any_request():
+    """A value containing '/' — including a '../' traversal attempt — is
+    rejected outright before any request, rather than percent-encoded: a
+    percent-encoded '/' (%2F) is decoded back into a literal separator
+    before routing, so encoding it doesn't stop the value from reaching a
+    different, non-allowlisted route under the same prefix."""
     module = _load_module()
     server = module.LifeOSMCPServer.__new__(module.LifeOSMCPServer)
 
-    captured = {}
+    called = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        captured["raw_path"] = request.url.raw_path.decode()
+        called.append(str(request.url))
         return httpx.Response(200, json={"ok": True})
 
     server.client = httpx.Client(transport=httpx.MockTransport(handler))
@@ -1411,15 +1412,33 @@ def test_path_param_traversal_is_percent_encoded_not_normalized():
         "lifeos_person_profile", {"person_id": "../../monarch/accounts"}
     )
 
-    assert "raw_path" in captured, f"no upstream request captured: {result}"
-    prefix = "/api/crm/people/"
-    assert captured["raw_path"].startswith(prefix), captured["raw_path"]
-    suffix = captured["raw_path"][len(prefix):]
-    # The value's own "/" characters must survive only as "%2F" — a literal
-    # "/" here would mean the substituted value split the URL into a new
-    # path segment (e.g. escaping to /api/monarch/accounts).
-    assert "/" not in suffix, captured["raw_path"]
-    assert "%2F" in suffix, captured["raw_path"]
+    assert called == [], f"upstream request was made: {called}"
+    assert "error" in result
+
+
+@pytest.mark.unit
+def test_path_param_sibling_route_via_slash_is_rejected_before_any_request():
+    """A same-prefix sibling-route value (no '..', just an extra '/'
+    segment) must be rejected before any request — otherwise a tool
+    allowlisted only for one endpoint (e.g. lifeos_person_profile) could
+    reach a sibling, non-allowlisted endpoint's route (e.g. the
+    lifeos_person_timeline tool's .../timeline) via a percent-encoded '/'
+    that the server decodes back into a literal separator before routing."""
+    module = _load_module()
+    server = module.LifeOSMCPServer.__new__(module.LifeOSMCPServer)
+
+    called = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        called.append(str(request.url))
+        return httpx.Response(200, json={"ok": True})
+
+    server.client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    result = server._call_api("lifeos_person_profile", {"person_id": "x/timeline"})
+
+    assert called == [], f"upstream request was made: {called}"
+    assert "error" in result
 
 
 @pytest.mark.unit

@@ -1378,13 +1378,15 @@ class LifeOSMCPServer:
             if turn_id:
                 headers[TURN_ID_HEADER] = turn_id
 
-        # Handle path parameters. Values are percent-encoded (including "/")
-        # so a caller-supplied value can never introduce a new path segment,
-        # and an exact "", "." or ".." is rejected outright — quoting alone
-        # leaves those dot-segments intact, and one substituted between the
-        # endpoint's literal "/" characters (e.g. person_id=".." on
-        # "/api/crm/people/{person_id}/facts") would still normalize the URL
-        # to a different route, bypassing the tool allowlist.
+        # Handle path parameters. Every route's path params are a single URL
+        # segment, so a value is rejected outright — before any request —
+        # if it's "", ".", ".." or contains "/": a percent-encoded "/"
+        # (%2F) is decoded back into a literal separator before routing, so
+        # encoding it doesn't stop a value from reaching a different,
+        # non-allowlisted route under the same prefix (e.g.
+        # person_id="x/timeline" on "/api/crm/people/{person_id}" reaching
+        # the .../timeline route). Surviving values are percent-encoded,
+        # preserving ":" so ids like "sync:gmail" reach the API unchanged.
         if "{" in endpoint_path:
             import re
             import urllib.parse
@@ -1392,9 +1394,9 @@ class LifeOSMCPServer:
             for param in path_params:
                 if param in arguments:
                     value = str(arguments.pop(param))
-                    if value in ("", ".", ".."):
+                    if value in ("", ".", "..") or "/" in value:
                         return {"error": f"Invalid {param}: {value!r}"}
-                    url = url.replace(f"{{{param}}}", urllib.parse.quote(value, safe=""))
+                    url = url.replace(f"{{{param}}}", urllib.parse.quote(value, safe=":"))
 
         try:
             if method == "GET":
@@ -2371,9 +2373,8 @@ def _load_http_config(instance: str) -> tuple[str, "frozenset[str] | None"]:
 
     The default (unnamed) instance — `instance == ""`, what `:8765` runs
     today — reads `LIFEOS_MCP_BEARER_TOKEN` and, optionally,
-    `LIFEOS_MCP_ALLOWED_TOOLS`; an unset allowlist there returns `None`
-    (every registered tool stays callable, unchanged from before this
-    mechanism existed).
+    `LIFEOS_MCP_ALLOWED_TOOLS`; an unset allowlist there returns `None`,
+    leaving every registered tool callable.
 
     A named instance (e.g. "instinct") reads `LIFEOS_MCP_<INSTANCE>_BEARER_TOKEN`
     and `LIFEOS_MCP_<INSTANCE>_ALLOWED_TOOLS` instead — a distinct credential
