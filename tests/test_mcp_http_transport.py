@@ -8,6 +8,7 @@ monkey-patching `LifeOSMCPServer._call_api`.
 """
 from __future__ import annotations
 
+import io
 import json
 import logging
 from typing import Any
@@ -421,3 +422,187 @@ def test_401_response_body_never_contains_the_token(client: TestClient, bearer_t
     )
     assert resp.status_code == 401
     assert bearer_token not in resp.text
+
+
+@pytest.mark.unit
+def test_missing_header_401_response_body_never_contains_the_token(client: TestClient, bearer_token: str):
+    """No-`Authorization`-header 401 is a distinct code path from the
+    wrong-token 401 above (`_check_auth` raises before ever comparing
+    tokens) — must not echo the configured token either."""
+    resp = client.post("/mcp", json=_initialize_request())
+    assert resp.status_code == 401
+    assert bearer_token not in resp.text
+
+
+@pytest.mark.unit
+def test_call_api_exception_response_never_contains_the_token(client: TestClient, bearer_token: str, monkeypatch):
+    """A `_call_api` exception is caught by `dispatch()`'s outer handler and
+    turned into `str(e)` inside the JSON-RPC error body — that path must
+    never surface the configured bearer token, even though nothing today
+    threads it into an exception message."""
+    def _raise(self, tool_name, arguments):
+        raise RuntimeError("upstream connection failed")
+
+    monkeypatch.setattr(mcp_server.LifeOSMCPServer, "_call_api", _raise)
+    resp = client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "lifeos_search", "arguments": {"query": "hello"}},
+        },
+        headers={"Authorization": f"Bearer {bearer_token}"},
+    )
+    assert resp.status_code == 200
+    assert bearer_token not in resp.text
+
+
+@pytest.mark.unit
+def test_allowed_call_on_restricted_instance_reaches_call_api_and_succeeds(bearer_token: str, monkeypatch):
+    """The allowlist boundary must let an allowed call through end to end —
+    not just reject a disallowed one. A restricted instance's own approved
+    tool must reach `_call_api` and come back without `isError`."""
+    restricted = mcp_server.LifeOSMCPServer(allowed_tools=frozenset({"lifeos_health"}))
+    calls = []
+
+    def fake_call(self, tool_name, arguments):
+        calls.append(tool_name)
+        return {"status": "ok"}
+
+    monkeypatch.setattr(mcp_server.LifeOSMCPServer, "_call_api", fake_call)
+    app = mcp_server.build_http_app(restricted, bearer_token=bearer_token)
+    restricted_client = TestClient(app)
+
+    resp = restricted_client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "lifeos_health", "arguments": {}},
+        },
+        headers={"Authorization": f"Bearer {bearer_token}"},
+    )
+    assert resp.status_code == 200
+    assert calls == ["lifeos_health"]
+    assert resp.json()["result"].get("isError") is not True
+
+
+@pytest.mark.unit
+def test_disallowed_tool_rejected_in_batch_request(bearer_token: str, monkeypatch):
+    """The allowlist check in `dispatch()` runs per-request regardless of
+    transport shape — a disallowed tool inside a JSON-RPC batch must be
+    rejected the same way a single request is, without reaching `_call_api`."""
+    restricted = mcp_server.LifeOSMCPServer(allowed_tools=frozenset({"lifeos_health"}))
+
+    def _fail_if_called(self, tool_name, arguments):
+        raise AssertionError(f"_call_api must not be reached for {tool_name!r}")
+
+    monkeypatch.setattr(mcp_server.LifeOSMCPServer, "_call_api", _fail_if_called)
+    app = mcp_server.build_http_app(restricted, bearer_token=bearer_token)
+    restricted_client = TestClient(app)
+
+    resp = restricted_client.post(
+        "/mcp",
+        json=[
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "lifeos_search", "arguments": {"query": "hello"}},
+            },
+        ],
+        headers={"Authorization": f"Bearer {bearer_token}"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert isinstance(body, list)
+    assert body[0]["result"]["isError"] is True
+
+
+@pytest.mark.unit
+def test_disallowed_tool_rejected_on_root_route(bearer_token: str, monkeypatch):
+    """The `/` route shares `_handle` with `/mcp` — a disallowed tool posted
+    there must be rejected the same way, without reaching `_call_api`."""
+    restricted = mcp_server.LifeOSMCPServer(allowed_tools=frozenset({"lifeos_health"}))
+
+    def _fail_if_called(self, tool_name, arguments):
+        raise AssertionError(f"_call_api must not be reached for {tool_name!r}")
+
+    monkeypatch.setattr(mcp_server.LifeOSMCPServer, "_call_api", _fail_if_called)
+    app = mcp_server.build_http_app(restricted, bearer_token=bearer_token)
+    restricted_client = TestClient(app)
+
+    resp = restricted_client.post(
+        "/",
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "lifeos_search", "arguments": {"query": "hello"}},
+        },
+        headers={"Authorization": f"Bearer {bearer_token}"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["result"]["isError"] is True
+
+
+@pytest.mark.unit
+def test_redaction_covers_child_logger_and_uvicorn_error_logger():
+    """Behavioral pin for the redaction backstop's effective coverage — not
+    just that a filter object exists somewhere, but that a record logged
+    against a plain `mcp_server` child logger (redacted via the root-handler
+    install `build_http_app` performs) AND a record logged through
+    `uvicorn.error` (redacted via the log_config `run_http` passes to
+    uvicorn, since uvicorn.run() otherwise installs its own handlers that
+    never propagate to root) both come back with the token redacted."""
+    import logging.config
+
+    from api.services.log_redaction import install_bearer_token_redaction_filter
+
+    secret = "synthetic-instinct-token-abc123"
+
+    root = logging.getLogger()
+    uvicorn_logger = logging.getLogger("uvicorn")
+    uvicorn_error_logger = logging.getLogger("uvicorn.error")
+
+    prior = {
+        "root_handlers": list(root.handlers),
+        "root_filters": list(root.filters),
+        "uvicorn_handlers": list(uvicorn_logger.handlers),
+        "uvicorn_propagate": uvicorn_logger.propagate,
+        "uvicorn_level": uvicorn_logger.level,
+        "uvicorn_error_handlers": list(uvicorn_error_logger.handlers),
+        "uvicorn_error_propagate": uvicorn_error_logger.propagate,
+        "uvicorn_error_level": uvicorn_error_logger.level,
+    }
+
+    child_buf = io.StringIO()
+    uvicorn_buf = io.StringIO()
+    try:
+        root.handlers = [logging.StreamHandler(child_buf)]
+        install_bearer_token_redaction_filter()
+
+        logging.config.dictConfig(mcp_server._uvicorn_log_config_with_redaction())
+        uvicorn_logger.handlers[0].stream = uvicorn_buf
+
+        logging.getLogger("mcp_server").error(f"failure — Authorization: Bearer {secret}")
+        uvicorn_error_logger.error(f"failure — Authorization: Bearer {secret}")
+
+        child_output = child_buf.getvalue()
+        uvicorn_output = uvicorn_buf.getvalue()
+    finally:
+        root.handlers = prior["root_handlers"]
+        root.filters = prior["root_filters"]
+        uvicorn_logger.handlers = prior["uvicorn_handlers"]
+        uvicorn_logger.propagate = prior["uvicorn_propagate"]
+        uvicorn_logger.setLevel(prior["uvicorn_level"])
+        uvicorn_error_logger.handlers = prior["uvicorn_error_handlers"]
+        uvicorn_error_logger.propagate = prior["uvicorn_error_propagate"]
+        uvicorn_error_logger.setLevel(prior["uvicorn_error_level"])
+
+    assert secret not in child_output
+    assert secret not in uvicorn_output
+    assert "Bearer <REDACTED>" in child_output
+    assert "Bearer <REDACTED>" in uvicorn_output

@@ -31,7 +31,7 @@ lifeos_health,lifeos_search,lifeos_calendar_upcoming,lifeos_calendar_search,life
 Exclude, deliberately:
 - Every write/create/update/delete tool (`lifeos_*_create`, `*_update`, `*_delete`, `*_complete`, `lifeos_person_update`, `lifeos_vault_write`, …).
 - Every send tool (`lifeos_gmail_send`, `lifeos_gmail_draft`, `lifeos_telegram_send`).
-- The `lifeos_agent_*` inter-agent tools — they derive HMAC caller proofs from the transport secret and aren't meant for an external client.
+- The `lifeos_agent_*` inter-agent tools — they derive HMAC caller proofs from the transport secret, which the Instinct instance's own credential would let an external client forge; a named instance's allowlist containing any of them fails to start (`_load_http_config` exits with an error rather than accepting it).
 - Home/eero controls (`lifeos_home_eero_*`).
 - Financial tools (`lifeos_monarch_*`, `lifeos_investments`).
 
@@ -54,9 +54,10 @@ LIFEOS_MCP_INSTINCT_ALLOWED_TOOLS=lifeos_health,lifeos_search,lifeos_calendar_up
 Optional override (default shown):
 
 ```bash
-# LIFEOS_MCP_HTTP_HOST is shared with the default instance; the Instinct
-# unit's ExecStart passes its own --port directly (8766), not an env var —
-# see config/systemd/lifeos-mcp-instinct.service.
+# The Instinct unit's ExecStart passes --host 127.0.0.1 and --port 8766
+# directly, not through env vars, so it isn't affected by LIFEOS_MCP_HTTP_HOST
+# (which only applies to the default instance) — see
+# config/systemd/lifeos-mcp-instinct.service.
 ```
 
 ## Step 3 — Enable the systemd unit
@@ -143,13 +144,15 @@ Calls using the old token 401 as soon as the restart completes.
 
 ## Revocation / disabling
 
-To stop Instinct from calling LifeOS immediately, without a full teardown:
+To stop Instinct from calling LifeOS and keep it stopped:
 
 ```bash
-sudo systemctl stop lifeos-mcp-instinct
+sudo systemctl disable --now lifeos-mcp-instinct
 ```
 
-The process isn't listening at all while stopped, so every call — including ones that already have the correct token — fails (connection refused locally, and a tunnel/gateway error through Cloudflare). To also remove it from Instinct's side, delete or disable the registered connection there.
+Then remove `LIFEOS_MCP_INSTINCT_BEARER_TOKEN` from `.env` (and revoke or rotate it). `stop` alone isn't enough for a real revocation: the unit stays enabled, so a reboot (this host reboots itself via its network watchdog) or a `setup-systemd.sh` re-run restarts it with the same credential still valid. `disable` is not in the passwordless sudoers allowlist that `setup-systemd.sh` installs (`start`/`stop`/`restart`/`reset-failed` only), so this command prompts for a password, unlike the `stop`/`start`/`restart` commands elsewhere in this guide.
+
+The process isn't listening at all once stopped, so every call — including ones that already have the correct token — fails (connection refused locally, and a tunnel/gateway error through Cloudflare). To also remove it from Instinct's side, delete or disable the registered connection there.
 
 ## Teardown
 

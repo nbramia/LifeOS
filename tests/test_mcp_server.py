@@ -1305,3 +1305,141 @@ def test_load_http_config_named_instance_with_allowlist_ok(monkeypatch):
     token, allowed_tools = module._load_http_config("instinct")
     assert token == "instinct-token"
     assert allowed_tools == frozenset({"lifeos_health", "lifeos_search"})
+
+
+@pytest.mark.unit
+def test_load_http_config_named_instance_rejects_agent_tools(monkeypatch):
+    """`lifeos_agent_*` tools derive their caller proof from the transport's
+    own bearer token; on a named instance the external client holds that
+    token, so it could forge a proof for any session. A named instance must
+    refuse to start with one of these in its allowlist."""
+    module = _load_module()
+    monkeypatch.setenv("LIFEOS_MCP_INSTINCT_BEARER_TOKEN", "instinct-token")
+    monkeypatch.setenv(
+        "LIFEOS_MCP_INSTINCT_ALLOWED_TOOLS", "lifeos_health, lifeos_agent_spawn"
+    )
+    with pytest.raises(module._HTTPStartupError, match="lifeos_agent_spawn"):
+        module._load_http_config("instinct")
+
+
+# ---------------------------------------------------------------------------
+# main() — the argv/env wiring that turns `_load_http_config`'s resolved
+# allowlist into a restricted `LifeOSMCPServer`. Nothing above this point
+# exercises main() itself, so a bug here (e.g. main() constructing
+# `LifeOSMCPServer()` without passing `allowed_tools`) would leave every
+# other test in this file green while the HTTP transport silently exposed
+# every tool.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_main_wires_resolved_allowlist_into_server(monkeypatch):
+    module = _load_module()
+    monkeypatch.setenv("LIFEOS_MCP_INSTINCT_BEARER_TOKEN", "instinct-token")
+    monkeypatch.setenv("LIFEOS_MCP_INSTINCT_ALLOWED_TOOLS", "lifeos_health")
+    monkeypatch.setattr(
+        sys, "argv",
+        ["mcp_server.py", "--transport", "http", "--instance", "instinct"],
+    )
+
+    captured = {}
+
+    def fake_run_http(server, host, port, bearer_token):
+        captured["server"] = server
+
+    monkeypatch.setattr(module, "run_http", fake_run_http)
+
+    module.main()
+
+    assert "server" in captured, "main() never called run_http"
+    assert [t["name"] for t in captured["server"].tools] == ["lifeos_health"]
+
+
+@pytest.mark.unit
+def test_main_unknown_allowlist_name_exits_2(monkeypatch):
+    module = _load_module()
+    monkeypatch.setenv("LIFEOS_MCP_INSTINCT_BEARER_TOKEN", "instinct-token")
+    monkeypatch.setenv("LIFEOS_MCP_INSTINCT_ALLOWED_TOOLS", "not_a_real_tool_xyz")
+    monkeypatch.setattr(
+        sys, "argv",
+        ["mcp_server.py", "--transport", "http", "--instance", "instinct"],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        module.main()
+    assert exc_info.value.code == 2
+
+
+@pytest.mark.unit
+def test_main_named_instance_agent_tool_in_allowlist_exits_2(monkeypatch):
+    module = _load_module()
+    monkeypatch.setenv("LIFEOS_MCP_INSTINCT_BEARER_TOKEN", "instinct-token")
+    monkeypatch.setenv("LIFEOS_MCP_INSTINCT_ALLOWED_TOOLS", "lifeos_agent_spawn")
+    monkeypatch.setattr(
+        sys, "argv",
+        ["mcp_server.py", "--transport", "http", "--instance", "instinct"],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        module.main()
+    assert exc_info.value.code == 2
+
+
+# ---------------------------------------------------------------------------
+# Path-param traversal (_call_api). A caller-supplied path-param value must
+# not be able to change which upstream route gets requested — the allowlist
+# boundary only means anything if a tool always maps to the same endpoint.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_path_param_traversal_is_percent_encoded_not_normalized():
+    """A '../' value in a path param must reach the wire as an opaque,
+    percent-encoded path segment under the tool's own route prefix — never
+    as literal '/' characters a server (or an intermediate normalizer) could
+    resolve into a different route."""
+    module = _load_module()
+    server = module.LifeOSMCPServer.__new__(module.LifeOSMCPServer)
+
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["raw_path"] = request.url.raw_path.decode()
+        return httpx.Response(200, json={"ok": True})
+
+    server.client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    result = server._call_api(
+        "lifeos_person_profile", {"person_id": "../../monarch/accounts"}
+    )
+
+    assert "raw_path" in captured, f"no upstream request captured: {result}"
+    prefix = "/api/crm/people/"
+    assert captured["raw_path"].startswith(prefix), captured["raw_path"]
+    suffix = captured["raw_path"][len(prefix):]
+    # The value's own "/" characters must survive only as "%2F" — a literal
+    # "/" here would mean the substituted value split the URL into a new
+    # path segment (e.g. escaping to /api/monarch/accounts).
+    assert "/" not in suffix, captured["raw_path"]
+    assert "%2F" in suffix, captured["raw_path"]
+
+
+@pytest.mark.unit
+def test_path_param_exact_dotdot_is_rejected_before_any_request():
+    """An exact '..' value is rejected outright rather than percent-encoded:
+    quoting leaves the literal dot-segment untouched, and substituting it
+    between the endpoint's own '/' characters (e.g.
+    /api/crm/people/../facts) would still normalize to a different route."""
+    module = _load_module()
+    server = module.LifeOSMCPServer.__new__(module.LifeOSMCPServer)
+
+    called = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        called.append(str(request.url))
+        return httpx.Response(200, json={"ok": True})
+
+    server.client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    result = server._call_api("lifeos_person_profile", {"person_id": ".."})
+
+    assert called == [], f"upstream request was made: {called}"
+    assert "error" in result

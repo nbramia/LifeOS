@@ -1378,13 +1378,23 @@ class LifeOSMCPServer:
             if turn_id:
                 headers[TURN_ID_HEADER] = turn_id
 
-        # Handle path parameters
+        # Handle path parameters. Values are percent-encoded (including "/")
+        # so a caller-supplied value can never introduce a new path segment,
+        # and an exact "", "." or ".." is rejected outright — quoting alone
+        # leaves those dot-segments intact, and one substituted between the
+        # endpoint's literal "/" characters (e.g. person_id=".." on
+        # "/api/crm/people/{person_id}/facts") would still normalize the URL
+        # to a different route, bypassing the tool allowlist.
         if "{" in endpoint_path:
             import re
+            import urllib.parse
             path_params = re.findall(r"\{(\w+)\}", endpoint_path)
             for param in path_params:
                 if param in arguments:
-                    url = url.replace(f"{{{param}}}", str(arguments.pop(param)))
+                    value = str(arguments.pop(param))
+                    if value in ("", ".", ".."):
+                        return {"error": f"Invalid {param}: {value!r}"}
+                    url = url.replace(f"{{{param}}}", urllib.parse.quote(value, safe=""))
 
         try:
             if method == "GET":
@@ -2304,12 +2314,47 @@ def build_http_app(server: "LifeOSMCPServer", bearer_token: str):
     return app
 
 
+def _uvicorn_log_config_with_redaction() -> dict:
+    """A copy of uvicorn's own logging config with the bearer-token
+    redaction filter attached to uvicorn's handlers.
+
+    `uvicorn.run()` applies `uvicorn.config.LOGGING_CONFIG` after
+    `build_http_app` has already installed the filter on root's handlers —
+    that dictConfig call creates fresh handlers on `uvicorn`/`uvicorn.error`/
+    `uvicorn.access` with `propagate=False`, so a record uvicorn logs through
+    those handlers never reaches root's and is never redacted. Passing this
+    config to `uvicorn.run(log_config=...)` closes that gap. Falls back to
+    the unmodified config if the redaction filter isn't importable, matching
+    `build_http_app`'s posture of keeping the HTTP transport bootable
+    without the `api` package.
+    """
+    import copy
+
+    import uvicorn
+
+    log_config = copy.deepcopy(uvicorn.config.LOGGING_CONFIG)
+    try:
+        import api.services.log_redaction  # noqa: F401  (import check only)
+    except Exception:  # pragma: no cover — keep the HTTP transport bootable without the api package importable
+        return log_config
+
+    log_config.setdefault("filters", {})["bearer_redact"] = {
+        "()": "api.services.log_redaction.BearerTokenRedactionFilter",
+    }
+    for handler in log_config.get("handlers", {}).values():
+        handler.setdefault("filters", []).append("bearer_redact")
+    return log_config
+
+
 def run_http(server: "LifeOSMCPServer", host: str, port: int, bearer_token: str) -> None:
     """Run the HTTP transport via uvicorn."""
     import uvicorn  # local import — only needed for HTTP mode
 
     app = build_http_app(server, bearer_token=bearer_token)
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    uvicorn.run(
+        app, host=host, port=port, log_level="info",
+        log_config=_uvicorn_log_config_with_redaction(),
+    )
 
 
 class _HTTPStartupError(Exception):
@@ -2364,6 +2409,19 @@ def _load_http_config(instance: str) -> tuple[str, "frozenset[str] | None"]:
         )
     else:
         allowed_tools = None
+
+    # Inter-agent tools derive their caller proof from the transport's own
+    # bearer token (HMAC(bearer_token, session_id)) — on a named instance
+    # the external client holds that token, so it could forge a proof for
+    # any session. Refuse at startup rather than let one into the allowlist.
+    if instance and allowed_tools is not None:
+        agent_tools = sorted(name for name in allowed_tools if name.startswith("lifeos_agent_"))
+        if agent_tools:
+            raise _HTTPStartupError(
+                f"Named instance '{instance}' cannot allowlist inter-agent tools: "
+                f"{', '.join(agent_tools)} (their caller proof is forgeable by "
+                "any holder of this instance's bearer token)."
+            )
 
     return bearer_token, allowed_tools
 

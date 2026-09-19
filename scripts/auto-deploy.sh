@@ -428,7 +428,7 @@ FAILED=()
 CODE_MTIME=$(newest_code_mtime)
 ENV_MTIME=$(env_file_mtime)
 if [ -n "$CODE_MTIME" ] || [ -n "$ENV_MTIME" ]; then
-    for unit in lifeos-api lifeos-agent-worker lifeos-mcp-http; do
+    for unit in lifeos-api lifeos-agent-worker lifeos-mcp-http lifeos-mcp-instinct; do
         systemctl is-active --quiet "$unit" || continue
         active_since=$(service_active_since_epoch "$unit") || {
             log "drift-check: could not read $unit's start time — skipping"
