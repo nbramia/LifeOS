@@ -12,6 +12,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from api.services.agent_worker.git_worktree import WorktreeResult
 from api.services.agent_worker.local_executor import ExecutorOutcome
 from api.services.agent_worker.session_store import STATUS_COMPLETED, SessionStore
 from api.services.agent_worker.spend_tracker import SpendTracker
@@ -102,6 +103,17 @@ def _make_worker(
 def test_dispatch_records_assignment_fields_on_session_before_cli_executor_runs(tmp_path, monkeypatch):
     from config.settings import settings
     monkeypatch.setattr(settings, "agent_hosts", {}, raising=False)
+    # This test is about assignment-field wiring, not worktree provisioning
+    # (covered by tests/test_agent_worker_git_worktree.py and
+    # tests/test_agent_worker_git_completion_dispatch.py) — a local CLI route
+    # would otherwise run `ensure_worktree` for real against whatever
+    # directory the task title happens to resolve to on the host machine.
+    monkeypatch.setattr(
+        "api.services.agent_worker.git_worktree.ensure_worktree",
+        lambda working_dir, task_id, title, host=None: WorktreeResult(
+            working_dir=working_dir, is_git=False,
+        ),
+    )
 
     stub = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="done"))
     task = {

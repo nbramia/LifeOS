@@ -74,7 +74,7 @@ def test_local_bash_subprocess_receives_session_scratch(tmp_path, monkeypatch):
     monkeypatch.setattr("tempfile.tempdir", str(tmp_path))
     with session_scratch_context("sess_1111111111111111"):
         result = _tool_bash({"command": "printf '%s|%s|%s' \"$TMPDIR\" \"$TMP\" \"$TEMP\""})
-    expected = str(tmp_path / "lifeos-agent-worker" / "sess_1111111111111111")
+    expected = str(scratch_dir_for("sess_1111111111111111"))
     assert result.is_error is False
     assert result.output == f"{expected}|{expected}|{expected}"
 
@@ -150,15 +150,41 @@ def test_remote_scratch_cleanup_uses_host_runner(tmp_path, monkeypatch):
 
     assert calls == [[
         "rm", "-rf", "--",
-        str(tmp_path / "lifeos-agent-worker" / "sess_2222222222222222"),
+        str(scratch_dir_for("sess_2222222222222222")),
     ]]
 
 
-@pytest.mark.parametrize("session_id", ["..", "sess_../escape", "sess_synthetic"])
-def test_scratch_path_rejects_non_internal_session_ids(tmp_path, monkeypatch, session_id):
+@pytest.mark.parametrize(
+    "session_id", ["..", ".", "sess_../escape", "../../etc/passwd", "sess_synthetic"],
+)
+def test_scratch_path_stays_contained_for_any_session_id(tmp_path, monkeypatch, session_id):
     monkeypatch.setattr("tempfile.tempdir", str(tmp_path))
-    with pytest.raises(ValueError, match="invalid internal session id"):
-        scratch_dir_for(session_id)
+    container = (tmp_path / "lifeos-agent-worker").resolve()
+
+    path = scratch_dir_for(session_id)
+
+    assert path.parent == container
+    assert path.is_relative_to(container)
+
+
+@pytest.mark.parametrize(
+    "session_id_a,session_id_b",
+    [
+        ("sess_abcdef0123456789", "sess_ABCDEF0123456789"),
+        ("sess_synthetic", "SESS_SYNTHETIC"),
+    ],
+)
+def test_scratch_path_is_unique_for_ids_differing_only_by_case(
+    tmp_path, monkeypatch, session_id_a, session_id_b,
+):
+    """Two distinct session ids that differ only in case must resolve to two
+    distinct directories — on a case-insensitive filesystem (default macOS),
+    a mapping that preserves either id verbatim would let one session's
+    cleanup delete the other's live scratch."""
+    monkeypatch.setattr("tempfile.tempdir", str(tmp_path))
+
+    assert scratch_dir_for(session_id_a) != scratch_dir_for(session_id_b)
+    assert scratch_dir_for(session_id_a).name.lower() != scratch_dir_for(session_id_b).name.lower()
 
 
 def test_pull_request_state_uses_injected_remote_runner():

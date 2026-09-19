@@ -80,7 +80,7 @@ class WorktreeResult:
     ``working_dir`` is the freshly-provisioned (or reused) worktree path
     when ``is_git`` is True. When ``is_git`` is False, ``working_dir`` is
     the original directory unchanged — it wasn't inside a git repository
-    at all, so behavior is identical to before this module existed.
+    at all, so behavior matches a caller that never provisions a worktree.
     """
 
     working_dir: str
@@ -94,7 +94,7 @@ class WorktreeResult:
 class WorktreeContext:
     """A session's own worktree/branch, detected from its working directory.
 
-    Used to decide whether the git-discipline prompt block applies to a
+    Decides whether the git-discipline prompt block applies to a
     fresh CLI session — derived straight from the filesystem/git state
     rather than threaded through the dispatch payload, so it stays correct
     regardless of how the working directory was set.
@@ -743,7 +743,7 @@ def finalize_worktree_session(
     (``resolve_runner_for_host``) — every git/`gh` operation below runs
     through that same resolved runner, so a remote-host session's worktree
     is finalized on the host that actually holds it. An unresolvable host
-    (a session pinned to a host no longer registered) returns
+    (a session pinned to a host that isn't registered) returns
     ``applicable=True`` with ``error`` set — never a silent
     ``applicable=False``, which would read as "there was nothing to
     finalize" when there really was.

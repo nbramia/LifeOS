@@ -3030,13 +3030,21 @@ class SessionStore:
                     (json.dumps(merged), row["id"]),
                 )
 
-    def get_first_reply_anchor(self, session_id: str) -> int | None:
-        """Return the earliest Telegram message id recorded for a session."""
+    def get_first_reply_anchor(self, session_id: str, *, bot: str | None = None) -> int | None:
+        """Return the earliest Telegram message id recorded for a session on
+        `bot`'s channel (`None` = primary).
+
+        Scoped by `bot` because a message id only means something inside the
+        chat it was sent on: a session that reports through more than one
+        channel (e.g. an Hermes-anchored question, then a later one forced
+        onto the primary bot when Hermes can't be used) must never anchor a
+        reply to a different channel's message id.
+        """
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT sent_message_id FROM pending_questions "
-                "WHERE session_id = ? ORDER BY sent_at ASC, id ASC LIMIT 1",
-                (session_id,),
+                "WHERE session_id = ? AND bot IS ? ORDER BY sent_at ASC, id ASC LIMIT 1",
+                (session_id, bot),
             ).fetchone()
         return int(row["sent_message_id"]) if row is not None else None
 
@@ -4290,7 +4298,7 @@ class SessionStore:
     ) -> None:
         """Record one refresh attempt for `url`. `info` (from a successful
         `gh pr view`) is `{number, title, state, merged_at}`; None marks a
-        failed/timed-out attempt, which keeps any previously known fields
+        failed/timed-out attempt, which keeps any already-cached fields
         but flips `stale` on rather than clearing them."""
         ts = checked_at if checked_at is not None else _now()
         with self._connect() as conn:

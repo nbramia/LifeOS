@@ -1355,7 +1355,7 @@ class TelegramBotListener:
         to running and its status back to in-progress — the same
         tag/status pairing the worker's own reopen paths already perform —
         *before* the note is queued or the session claimed: if that
-        transition fails (the terminal tag is no longer on the card, e.g.
+        transition fails (the terminal tag isn't on the card, e.g.
         the operator retagged it in the meantime, or the status write
         itself fails), nothing is queued and the session is left exactly
         as it was — the operator is told the resume could not be

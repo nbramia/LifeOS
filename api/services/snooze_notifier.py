@@ -82,8 +82,8 @@ class SnoozeNotifier:
         """Attempt to remove the now-stale `snoozed_until` value.
 
         Returns "cleared" on success, "changed" if an operator re-snoozed or
-        unsnoozed the card in the meantime (its current value no longer
-        matches `raw_until`, so there's nothing of this wake-up left to
+        unsnoozed the card in the meantime (its current value doesn't
+        match `raw_until`, so there's nothing of this wake-up left to
         clear), or "failed" for any other write error — the caller keeps
         retrying a "failed" clear without re-sending.
         """
