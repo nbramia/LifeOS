@@ -286,6 +286,15 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"Failed to start agent transcript mirror loop: {e}")
 
+        # Startup: background PR-status refresher — keeps the merge status
+        # on a Review card's pull request(s) current without GET /board or
+        # its stream ever calling `gh` on the request path.
+        try:
+            from api.services import pr_status_prefetch
+            pr_status_prefetch.start()
+        except Exception as e:
+            logger.error(f"Failed to start PR status prefetch loop: {e}")
+
         # Hint for new users who haven't set their person ID yet
         if not settings.my_person_id and settings.user_name and settings.user_name != "User":
             logger.info(
@@ -355,6 +364,12 @@ async def lifespan(app: FastAPI):
     try:
         from api.services import agent_transcript_mirror
         agent_transcript_mirror.stop()
+    except Exception:
+        pass
+
+    try:
+        from api.services import pr_status_prefetch
+        pr_status_prefetch.stop()
     except Exception:
         pass
 
