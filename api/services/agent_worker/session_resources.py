@@ -1,6 +1,7 @@
 """Private scratch lifecycle for board-dispatched agent sessions."""
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -14,14 +15,26 @@ _active_scratch_env: ContextVar[dict[str, str] | None] = ContextVar(
     "agent_session_scratch_env", default=None,
 )
 
-_SESSION_ID_RE = re.compile(r"sess_[0-9a-f]{16}\Z")
+_SAFE_SESSION_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def _safe_dir_name(session_id: str) -> str:
+    """Map any session id to a filesystem-safe, single-segment directory name.
+
+    Session ids that already look like a plain path segment (letters, digits,
+    underscore, hyphen) are used as-is so directories stay human-readable.
+    Anything else — including '.', '..', and ids containing a path separator —
+    is mapped to a stable hash so it can never resolve outside its container.
+    """
+    if session_id not in (".", "..") and _SAFE_SESSION_NAME_RE.fullmatch(session_id):
+        return session_id
+    digest = hashlib.sha256(session_id.encode("utf-8", "surrogatepass")).hexdigest()
+    return f"sess-{digest}"
 
 
 def scratch_dir_for(session_id: str) -> Path:
-    if not _SESSION_ID_RE.fullmatch(session_id):
-        raise ValueError(f"invalid internal session id: {session_id!r}")
     container = (Path(tempfile.gettempdir()) / "lifeos-agent-worker").resolve()
-    path = (container / session_id).resolve()
+    path = (container / _safe_dir_name(session_id)).resolve()
     if path.parent != container:
         raise ValueError(f"session scratch path escaped its container: {session_id!r}")
     return path

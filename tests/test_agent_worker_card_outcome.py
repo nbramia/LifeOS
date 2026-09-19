@@ -110,7 +110,7 @@ def test_list_stale_pr_urls_includes_never_checked_and_excludes_fresh(tmp_path: 
     store.upsert_pr_status(PR_URL, {"number": 1234, "title": "t", "state": "OPEN", "merged_at": None})
     assert store.list_stale_pr_urls(ttl_s=300) == []
 
-    # A checked_at far enough in the past falls outside the TTL again.
+    # A checked_at old enough falls outside the TTL again.
     import time
     store.upsert_pr_status(PR_URL, {"number": 1234, "title": "t", "state": "OPEN", "merged_at": None},
                             checked_at=int(time.time()) - 1000)
@@ -125,7 +125,7 @@ def test_upsert_pr_status_failed_refresh_keeps_last_known_value_but_flags_stale(
         "merged_at": None, "checked_at": store.get_pr_status(PR_URL)["checked_at"], "stale": False,
     }
     # A failed refresh attempt (viewer returned None) never clears the
-    # previously observed state — only flips `stale` on.
+    # last-observed state — only flips `stale` on.
     store.upsert_pr_status(PR_URL, None)
     status = store.get_pr_status(PR_URL)
     assert status["state"] == "OPEN" and status["number"] == 1234

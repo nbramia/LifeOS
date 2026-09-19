@@ -434,7 +434,7 @@ def test_finalize_remote_host_routes_every_operation_through_the_resolved_runner
 
 
 def test_finalize_unresolvable_host_reports_error_not_silently_false(tmp_path: Path, monkeypatch):
-    """A provisioned worktree pinned to a host that no longer resolves
+    """A provisioned worktree pinned to a host that fails to resolve
     must never read as `applicable=False` ("nothing to finalize") — it's a
     real finalization failure and must be reported as one."""
     from config.settings import settings

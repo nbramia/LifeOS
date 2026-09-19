@@ -2,7 +2,7 @@
 dispatch tick, without double-dispatching a session the same tick's
 top-level claim loop just claimed fresh; a session that stays stuck at
 CLAIMED past a threshold gets a one-time operator alert (or is silently
-retired once its card is no longer actively claimed); and a resume sends
+retired once its card isn't actively claimed); and a resume sends
 a truthful "resumed" confirmation only once a subprocess is confirmed to
 have actually launched, never losing the queued note on a failure that
 happens before that.
@@ -15,7 +15,7 @@ Covers:
   * ``_reconcile_stuck_claimed_sessions`` alerting once per stuck episode
     for a session that stays CLAIMED with an undelivered pending message
     past the configured threshold, staying silent for one still inside its
-    window, and silently retiring one whose card is no longer actively
+    window, and silently retiring one whose card isn't actively
     claimed.
   * ``_confirm_resume_or_requeue``: the "Resumed" confirmation and the
     queued note's delivery both depend on a confirmed subprocess launch,
@@ -218,8 +218,8 @@ class TestReopenedTopLevelSessionIsDispatched:
 
     def test_spawned_child_still_dispatches_without_pending_message(self, tmp_path):
         """Regression: a spawned child (parent set) is unconditionally
-        eligible, same as before this change — it doesn't need a pending
-        message to qualify."""
+        eligible regardless of pending-message state — it doesn't need a
+        pending message to qualify."""
         stub = _StubCliExecutor(
             outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="ok"), tmp_path=tmp_path,
         )
@@ -236,7 +236,7 @@ class TestReopenedTopLevelSessionIsDispatched:
 
     def test_operator_root_spawn_still_dispatches_without_pending_message(self, tmp_path):
         """Regression: an operator root-spawn (no parent, origin='operator')
-        is unconditionally eligible, same as before this change."""
+        is unconditionally eligible regardless of pending-message state."""
         stub = _StubCliExecutor(
             outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="ok"), tmp_path=tmp_path,
         )
@@ -325,7 +325,7 @@ class TestStuckClaimedSessionSweep:
     def test_card_no_longer_actively_claimed_is_silently_retired(self, tmp_path, monkeypatch):
         """The operator can cancel/retag/reassign a card after a reopen
         queued the session's note. A stuck CLAIMED session whose backing
-        card no longer carries the running tag is not the operator's
+        card lacks the running tag is not the operator's
         problem to be alerted about — it's retired without a Telegram
         message."""
         monkeypatch.setattr(settings, "agent_stuck_session_timeout_minutes", -1_000_000)

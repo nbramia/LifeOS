@@ -17,6 +17,7 @@ trivially restartable and lets the API enforce its own locking.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -1304,9 +1305,10 @@ class Worker:
             # straight to `_submit_cli_dispatch`, never through
             # `pending_messages` — so this check cannot also grab a session
             # the tick's own top-level claim loop claimed for the first time
-            # this same tick (that loop runs after this method returns, and
-            # a fresh claim's session carries no pending_messages row for
-            # this check to match). Pick up spawned children (parent set)
+            # this same tick (that loop only runs once this method has
+            # returned, and a fresh claim's session carries no
+            # pending_messages row for this check to match). Pick up
+            # spawned children (parent set)
             # and operator root-spawns (no parent but origin='operator')
             # unconditionally, as before.
             if not session.parent_session_id and session.origin != "operator":
@@ -2946,7 +2948,7 @@ class Worker:
 
         A session in this exact shape (top-level, `claude_code`/`codex`
         routing, an undelivered `pending_messages` row) is the same
-        candidate set `_dispatch_spawned_sessions` now admits, so under
+        candidate set `_dispatch_spawned_sessions` admits, so under
         normal operation it drains within a tick or two of being reopened —
         by a Telegram followup/status-anchor reply, or the worker's own
         `code_reopened_for_pending_messages`. This sweep exists for the case
@@ -2976,7 +2978,7 @@ class Worker:
         cutoff = int(time.time()) - threshold_seconds
         alerted = 0
         for session in self.session_store.list_by_status(STATUS_CLAIMED):
-            # Same candidate shape `_dispatch_spawned_sessions` now admits —
+            # Same candidate shape `_dispatch_spawned_sessions` admits —
             # spawned children and operator root-spawns are always eligible
             # for pickup already and aren't a subject of this sweep.
             if session.parent_session_id or session.origin == "operator":
@@ -3053,8 +3055,18 @@ class Worker:
 
         Returns the Telegram message_id (or None if Telegram isn't configured
         — caller should mark the session blocked anyway since we can't ask).
+
+        A session whose reporting channel is Hermes still reaches the
+        primary bot here rather than its own channel: Hermes carries no
+        message id to anchor a reply against (see `_reporting_channel`), so
+        this is the explicit non-Hermes path a caller takes when a
+        Hermes-anchored question isn't available or allowed. Delivering it
+        through `session.bot` anyway would silently retarget it right back
+        at Hermes via `_send_session_message`'s own one-way fallback.
         """
         session = self.session_store.get_by_session_id(session_id)
+        if session is not None and _reporting_channel(session) is not None:
+            session = dataclasses.replace(session, bot=None)
         try:
             sent_ids = (
                 self._send_session_message(session, question) if session is not None
@@ -3937,13 +3949,17 @@ class Worker:
         bot = session.bot
         sid = session.session_id
 
-        # Only thread `bot` when set so the primary path's send signature
-        # stays byte-identical to the plain call. bot=None → primary.
+        # `_send` is the one-shot escalation notice: no id attempt, so a
+        # surface that just failed a delivery retry isn't asked for one
+        # more round-trip. `_send_with_id` is used inside the bounded retry
+        # loop below; `fallback_on_failure=False` keeps a failed attempt
+        # from silently delivering an anchorless duplicate ahead of a later
+        # attempt that succeeds.
         def _send(text):
-            return bool(self._send_session_message(session, text))
+            return bool(self._send_session_message(session, text, want_id=False))
 
         def _send_with_id(text):
-            return self._send_session_message(session, text)
+            return self._send_session_message(session, text, fallback_on_failure=False)
 
         # Build the task dict + resume message from drained pending messages.
         # Fresh spawns carry the JSON payload produced by spawn_claude_code_session;
@@ -4373,7 +4389,9 @@ class Worker:
         )
         self._reconcile_vault_terminal(session, outcome.status)
 
-    def _send_session_message(self, session, body: str) -> list[int]:
+    def _send_session_message(
+        self, session, body: str, *, want_id: bool = True, fallback_on_failure: bool = True,
+    ) -> list[int]:
         """Send an operator-facing session message (streamed [NOTIFY] body,
         heartbeat) with reply-anchor registration: the message ends with the
         "reply in thread" footer, its Telegram message id(s) are captured and
@@ -4381,6 +4399,17 @@ class Worker:
         into the session as a context note. Falls back to the plain
         one-way sender (no footer — the affordance would be a lie) when id
         capture is unavailable or fails.
+
+        `want_id=False` skips the id-capturing attempt entirely and sends
+        the plain one-way form directly — for a caller (a bounded delivery
+        retry loop's own final escalation notice) that has already decided
+        no reply anchor will exist for this message, where an id attempt
+        would only cost another round-trip to a surface just shown to be
+        down. `fallback_on_failure=False` disables the automatic plain-send
+        fallback on a failed id attempt — for a caller (the retry loop
+        itself) that is about to try again and would otherwise have this
+        method silently deliver an anchorless duplicate on every failed
+        attempt before a later one succeeds.
         """
         bot = session.bot
         task = self._fetch_task(session.task_id)
@@ -4394,6 +4423,16 @@ class Worker:
                 body = body[:-len(suffix)]
                 break
         prefixed_body = f"📌 {safe_title}\n\n{body}"
+        if not want_id:
+            try:
+                if bot:
+                    self._telegram_send(prefixed_body, bot=bot)
+                else:
+                    self._telegram_send(prefixed_body)
+            except Exception as exc:  # pragma: no cover — defensive
+                logger.warning("session message plain send failed for %s: %s",
+                               session.task_id, exc)
+            return []
         text = _with_reply_footer(prefixed_body)
         reply_to_message_id = self.session_store.get_first_reply_anchor(
             session.session_id,
@@ -4411,13 +4450,14 @@ class Worker:
                            session.task_id, exc)
             sent_ids = []
         if not sent_ids:
-            try:
-                if bot:
-                    self._telegram_send(prefixed_body, bot=bot)
-                else:
-                    self._telegram_send(prefixed_body)
-            except Exception as exc:  # pragma: no cover — defensive
-                logger.warning("session message fallback send failed: %s", exc)
+            if fallback_on_failure:
+                try:
+                    if bot:
+                        self._telegram_send(prefixed_body, bot=bot)
+                    else:
+                        self._telegram_send(prefixed_body)
+                except Exception as exc:  # pragma: no cover — defensive
+                    logger.warning("session message fallback send failed: %s", exc)
             return []
         try:
             self.session_store.add_reply_anchors(
@@ -4637,7 +4677,12 @@ class Worker:
             sent_ids: list = []
             for attempt in range(_BLOCKED_PROMPT_SEND_ATTEMPTS):
                 try:
-                    sent_ids = self._send_session_message(session, prompt) or []
+                    # `fallback_on_failure=False` — a failed attempt here is
+                    # retried, not silently delivered anchorless ahead of a
+                    # later attempt that succeeds.
+                    sent_ids = self._send_session_message(
+                        session, prompt, fallback_on_failure=False,
+                    ) or []
                 except Exception as exc:
                     logger.warning(
                         "codex blocked reply prompt send failed (attempt %d/%d): %s",
@@ -4676,10 +4721,13 @@ class Worker:
                 attempt_id=session.attempt_id, turn_id=session.turn_id,
             )
             try:
+                # `want_id=False` — the surface just failed every retry, so
+                # this best-effort notice doesn't cost it another round-trip.
                 self._send_session_message(
                     session,
                     "⚠️ A codex session needs your input, but the question couldn't be "
-                    "delivered. It was marked failed — re-trigger it to retry."
+                    "delivered. It was marked failed — re-trigger it to retry.",
+                    want_id=False,
                 )
             except Exception as exc:  # best-effort; the surface may be down
                 logger.warning("codex blocked-session escalation send failed: %s", exc)

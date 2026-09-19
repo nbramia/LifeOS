@@ -1,4 +1,4 @@
-"""Browser test for the Review-lane card outcome (#1140): the compact
+"""Browser test for the Review-lane card outcome: the compact
 pull-request badge on the card face and the drawer's read-only "Agent
 outcome" section.
 

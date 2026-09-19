@@ -154,11 +154,17 @@ def test_remote_scratch_cleanup_uses_host_runner(tmp_path, monkeypatch):
     ]]
 
 
-@pytest.mark.parametrize("session_id", ["..", "sess_../escape", "sess_synthetic"])
-def test_scratch_path_rejects_non_internal_session_ids(tmp_path, monkeypatch, session_id):
+@pytest.mark.parametrize(
+    "session_id", ["..", ".", "sess_../escape", "../../etc/passwd", "sess_synthetic"],
+)
+def test_scratch_path_stays_contained_for_any_session_id(tmp_path, monkeypatch, session_id):
     monkeypatch.setattr("tempfile.tempdir", str(tmp_path))
-    with pytest.raises(ValueError, match="invalid internal session id"):
-        scratch_dir_for(session_id)
+    container = (tmp_path / "lifeos-agent-worker").resolve()
+
+    path = scratch_dir_for(session_id)
+
+    assert path.parent == container
+    assert path.is_relative_to(container)
 
 
 def test_pull_request_state_uses_injected_remote_runner():

@@ -4290,7 +4290,7 @@ class SessionStore:
     ) -> None:
         """Record one refresh attempt for `url`. `info` (from a successful
         `gh pr view`) is `{number, title, state, merged_at}`; None marks a
-        failed/timed-out attempt, which keeps any previously known fields
+        failed/timed-out attempt, which keeps any already-cached fields
         but flips `stale` on rather than clearing them."""
         ts = checked_at if checked_at is not None else _now()
         with self._connect() as conn:

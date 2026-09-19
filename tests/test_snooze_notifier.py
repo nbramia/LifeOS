@@ -297,8 +297,9 @@ def test_stop_does_not_falsely_report_stopped_during_an_in_flight_send(mock_sett
     send — only once it has genuinely exited."""
     mock_settings.telegram_enabled = True
     # The polling thread's own check_once() call uses the real clock (no
-    # `now` is injected), so the fixture task's wake-up must be in the past
-    # relative to wall-clock time, not the fixed instant other tests use.
+    # `now` is injected), so the fixture task's wake-up must already have
+    # elapsed relative to wall-clock time, not the fixed instant other
+    # tests use.
     real_now = datetime.now(timezone.utc)
     manager.create(
         "Escalate synthetic incident",
