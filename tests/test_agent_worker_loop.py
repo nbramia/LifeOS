@@ -60,6 +60,31 @@ def _redirect_agent_output(tmp_path, monkeypatch):
     monkeypatch.setattr(_settings, "vault_path", tmp_path / "vault", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _stub_worktree_provisioning(monkeypatch):
+    """A `claude_code`/`codex`-routed dispatch calls `ensure_worktree` on
+    whatever directory the task title resolves to via
+    `directory_resolver.resolve_working_directory` — a plain-language title
+    with no vault/LifeOS/project keyword resolves to `$HOME` itself — and
+    its completion calls `finalize_worktree_session` on that same
+    directory. None of these poll-loop tests are about worktree
+    provisioning or finalization (covered by
+    tests/test_agent_worker_git_worktree*.py), so stand in passthroughs
+    that never touch git."""
+    from api.services.agent_worker.git_worktree import FinalizeResult, WorktreeResult
+
+    monkeypatch.setattr(
+        "api.services.agent_worker.git_worktree.ensure_worktree",
+        lambda working_dir, task_id, title, host=None: WorktreeResult(
+            working_dir=working_dir, is_git=False,
+        ),
+    )
+    monkeypatch.setattr(
+        "api.services.agent_worker.git_worktree.finalize_worktree_session",
+        lambda working_dir, **kwargs: FinalizeResult(applicable=False),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Fake API
 # ---------------------------------------------------------------------------
