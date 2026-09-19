@@ -3030,13 +3030,21 @@ class SessionStore:
                     (json.dumps(merged), row["id"]),
                 )
 
-    def get_first_reply_anchor(self, session_id: str) -> int | None:
-        """Return the earliest Telegram message id recorded for a session."""
+    def get_first_reply_anchor(self, session_id: str, *, bot: str | None = None) -> int | None:
+        """Return the earliest Telegram message id recorded for a session on
+        `bot`'s channel (`None` = primary).
+
+        Scoped by `bot` because a message id only means something inside the
+        chat it was sent on: a session that reports through more than one
+        channel (e.g. an Hermes-anchored question, then a later one forced
+        onto the primary bot when Hermes can't be used) must never anchor a
+        reply to a different channel's message id.
+        """
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT sent_message_id FROM pending_questions "
-                "WHERE session_id = ? ORDER BY sent_at ASC, id ASC LIMIT 1",
-                (session_id,),
+                "WHERE session_id = ? AND bot IS ? ORDER BY sent_at ASC, id ASC LIMIT 1",
+                (session_id, bot),
             ).fetchone()
         return int(row["sent_message_id"]) if row is not None else None
 

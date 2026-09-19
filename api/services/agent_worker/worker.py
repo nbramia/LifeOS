@@ -4435,7 +4435,7 @@ class Worker:
             return []
         text = _with_reply_footer(prefixed_body)
         reply_to_message_id = self.session_store.get_first_reply_anchor(
-            session.session_id,
+            session.session_id, bot=bot,
         )
         try:
             sent_ids = (

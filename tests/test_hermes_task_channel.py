@@ -92,13 +92,17 @@ def _make_worker(tmp_path: Path, tasks=()):
     client = httpx.Client(transport=httpx.MockTransport(api.handler), base_url="http://api")
     telegram: list[tuple[str, str | None]] = []
     telegram_ids: list[str] = []
+    telegram_id_calls: list[dict] = []
 
     def _send(text, chat_id=None, bot=None):
         telegram.append((text, bot))
         return True
 
-    def _send_with_id(text, chat_id=None, bot=None):
+    def _send_with_id(text, chat_id=None, bot=None, reply_to_message_id=None):
         telegram_ids.append(text)
+        telegram_id_calls.append(
+            {"text": text, "bot": bot, "reply_to_message_id": reply_to_message_id},
+        )
         return [1000 + len(telegram_ids)]
 
     worker = Worker(
@@ -112,6 +116,7 @@ def _make_worker(tmp_path: Path, tasks=()):
     )
     worker._telegram_calls = telegram  # type: ignore[attr-defined]
     worker._telegram_id_calls = telegram_ids  # type: ignore[attr-defined]
+    worker._telegram_id_call_details = telegram_id_calls  # type: ignore[attr-defined]
     worker._fake_api = api  # type: ignore[attr-defined]
     return worker
 
@@ -260,6 +265,39 @@ def test_a_question_delivered_to_hermes_is_anchored_by_its_message_identity(
     assert open_question is not None
     assert open_question["bot"] == HERMES_CHANNEL
     assert get_question_thread_store().lookup("5550001111", "591") == open_question["id"]
+
+
+def test_forced_primary_question_does_not_reuse_a_hermes_reply_anchor(
+    tmp_path, sent_hermes, monkeypatch,
+):
+    """A session that already has a Hermes question anchor, then later asks a
+    question forced onto the primary bot (Hermes questions turned off),
+    must not carry the Hermes message id as its reply anchor — that id
+    names a message in a different chat. The primary send gets its own
+    fresh anchor, and no anchorless duplicate fallback fires alongside it."""
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "hermes_task_questions", True, raising=False)
+    worker = _make_worker(tmp_path)
+    session = _hermes_session(worker)
+    worker._mark_blocked(session, {"id": "t-1", "description": "Weekly report"}, "which week?")
+    assert any("which week?" in text for text in sent_hermes)
+    open_question = worker.session_store.get_open_question_by_session_id(session.session_id)
+    assert open_question is not None
+    assert open_question["bot"] == HERMES_CHANNEL
+
+    monkeypatch.setattr(settings, "hermes_task_questions", False, raising=False)
+    session = worker.session_store.get(session.task_id)
+    worker._mark_blocked(session, {"id": "t-1", "description": "Weekly report"}, "which format?")
+
+    assert worker._telegram_id_call_details, "the primary bot should have been sent to"
+    primary_call = worker._telegram_id_call_details[-1]
+    assert primary_call["reply_to_message_id"] is None
+    assert any("which format?" in text for text in worker._telegram_id_calls)
+    primary_anchor = worker.session_store.get_first_reply_anchor(session.session_id, bot=None)
+    assert primary_anchor is not None
+    # No extra one-way fallback notice alongside the successful with-id send.
+    assert worker._telegram_calls == []
 
 
 def test_a_question_falls_back_to_the_primary_bot_when_hermes_delivery_fails(

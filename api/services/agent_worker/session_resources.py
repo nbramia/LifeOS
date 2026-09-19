@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-import re
 import shutil
 import tempfile
 from contextlib import contextmanager
@@ -15,19 +14,17 @@ _active_scratch_env: ContextVar[dict[str, str] | None] = ContextVar(
     "agent_session_scratch_env", default=None,
 )
 
-_SAFE_SESSION_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
-
 
 def _safe_dir_name(session_id: str) -> str:
-    """Map any session id to a filesystem-safe, single-segment directory name.
+    """Map any session id to a fixed-format, filesystem-safe directory name.
 
-    Session ids that already look like a plain path segment (letters, digits,
-    underscore, hyphen) are used as-is so directories stay human-readable.
-    Anything else — including '.', '..', and ids containing a path separator —
-    is mapped to a stable hash so it can never resolve outside its container.
+    Every id — including the worker's own `sess_<hex>` ids, a Hermes id, a
+    test's readable id, or a deliberate path-escape attempt — hashes to a
+    lowercase hex digest, never a literal segment of the id itself. Hashing
+    unconditionally (rather than passing a "looks safe" id through as-is)
+    keeps two ids that differ only in case from mapping to the same
+    directory on a case-insensitive filesystem.
     """
-    if session_id not in (".", "..") and _SAFE_SESSION_NAME_RE.fullmatch(session_id):
-        return session_id
     digest = hashlib.sha256(session_id.encode("utf-8", "surrogatepass")).hexdigest()
     return f"sess-{digest}"
 
