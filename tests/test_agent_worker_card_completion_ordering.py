@@ -117,7 +117,15 @@ def _make_real_route_worker(tmp_path: Path, monkeypatch, *, codex_executor=None,
     other `__init__` wiring runs) whose HTTP client is a real FastAPI
     `TestClient` backed by a real `TaskManager` over a temp vault — the
     claimed-card guard in `update_task` runs for real, not a mock.
+
+    A session created with no explicit `working_dir` falls back to the
+    executor's own `os.getcwd()` default (`ClaudeCodeExecutor.execute`,
+    `CodexExecutor.execute`), which then feeds `git_discipline_text` a real
+    git inspection of wherever the test process happens to be running —
+    `monkeypatch.chdir` keeps that fallback inside this test's own tmp_path
+    instead of the checkout the suite runs from.
     """
+    monkeypatch.chdir(tmp_path)
     manager = TaskManager(vault_path=tmp_path / "vault", index_path=tmp_path / "task_index.json")
     monkeypatch.setattr(task_manager_module, "_task_manager", manager)
     sessions = SessionStore(db_path=tmp_path / "sessions.db")

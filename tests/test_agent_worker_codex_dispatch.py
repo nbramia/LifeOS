@@ -674,7 +674,7 @@ def test_codex_child_session_bypasses_interrupted_gate(tmp_path: Path):
     assert "codex_handled_completion" in kinds
 
 
-def test_codex_session_with_real_executor_reaches_completed_disposition(tmp_path: Path):
+def test_codex_session_with_real_executor_reaches_completed_disposition(tmp_path: Path, monkeypatch):
     """A real ``CodexExecutor`` driving a subprocess through the exact event
     shape a live Codex CLI run produces (`thread.started`, `item.completed`,
     `turn.completed`, returncode 0) ends the worker dispatch at the completed
@@ -682,6 +682,10 @@ def test_codex_session_with_real_executor_reaches_completed_disposition(tmp_path
     operator, `codex_handled_completion` recorded."""
     from api.services.agent_worker.codex_executor import CodexExecutor
 
+    # The dispatched session carries no `working_dir`, so `CodexExecutor.
+    # execute` falls back to `os.getcwd()` -- confine that fallback to this
+    # test's own tmp_path rather than wherever the process happens to run.
+    monkeypatch.chdir(tmp_path)
     session_store = SessionStore(db_path=tmp_path / "sessions.db")
     transcript_store = TranscriptStore(transcripts_dir=tmp_path / "transcripts")
     final_text = "There are **194 Python files** under `api/`."

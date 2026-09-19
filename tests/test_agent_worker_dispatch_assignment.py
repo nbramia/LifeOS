@@ -138,6 +138,16 @@ def test_dispatch_records_assignment_fields_on_session_before_cli_executor_runs(
 def test_dispatch_records_host_field_on_session(tmp_path, monkeypatch):
     from config.settings import settings
     monkeypatch.setattr(settings, "agent_hosts", {"studio": "user@studio.example"}, raising=False)
+    # This test is about the host field reaching the session, not worktree
+    # provisioning — a local CLI route would otherwise run `ensure_worktree`
+    # for real against whatever directory the task title happens to resolve
+    # to, over ssh to the registered (but unreachable in tests) host.
+    monkeypatch.setattr(
+        "api.services.agent_worker.git_worktree.ensure_worktree",
+        lambda working_dir, task_id, title, host=None: WorktreeResult(
+            working_dir=working_dir, is_git=False,
+        ),
+    )
 
     stub = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="done"))
     task = {

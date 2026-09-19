@@ -18,6 +18,16 @@ from api.services.agent_worker.transcript_store import TranscriptStore
 pytestmark = pytest.mark.unit
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_cwd(tmp_path, monkeypatch):
+    """`execute()` falls back to `os.getcwd()` when a task carries no
+    `working_dir` (the tests below never set one), which then feeds
+    `git_discipline_text` a real git inspection of wherever the process
+    happens to be running. Confine that fallback to this test's own
+    tmp_path."""
+    monkeypatch.chdir(tmp_path)
+
+
 class _FakeStdout:
     def __init__(self, lines: list[str]):
         self._lines = list(lines)
