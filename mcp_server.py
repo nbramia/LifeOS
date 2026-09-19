@@ -399,7 +399,12 @@ CURATED_TOOL_COUNT = 62
 class LifeOSMCPServer:
     """MCP Server that dynamically discovers LifeOS API endpoints."""
 
-    def __init__(self, *, trusted_session_id: str | None = None):
+    def __init__(
+        self,
+        *,
+        trusted_session_id: str | None = None,
+        allowed_tools: "frozenset[str] | None" = None,
+    ):
         self.client = httpx.Client(timeout=30.0)
         self.openapi_spec: dict | None = None
         self.tools: list[dict] = []
@@ -425,6 +430,33 @@ class LifeOSMCPServer:
         self._load_openapi_spec()
         self._cap_people_search_limit()
         self._register_inter_agent_tools()
+        # `allowed_tools=None` (the default) leaves every registered tool in
+        # place — this is what the existing HTTP instance and the stdio
+        # transport both use, so their behavior is unaffected. A caller that
+        # passes a set restricts `self.tools` to it; an unrecognized name in
+        # that set fails construction rather than silently granting nothing.
+        if allowed_tools is not None:
+            self._apply_tool_allowlist(allowed_tools)
+        self._tool_names: frozenset[str] = frozenset(tool["name"] for tool in self.tools)
+
+    def _apply_tool_allowlist(self, allowed_tools: "frozenset[str]") -> None:
+        """Restrict `self.tools` to `allowed_tools`.
+
+        Runs after every other tool-registration step so it sees the full
+        catalog (curated endpoints plus lifeos_agent_* inter-agent tools).
+        Every name in `allowed_tools` must match a tool this server actually
+        registered — an unrecognized name (e.g. a typo) fails construction
+        instead of silently granting an empty or partial tool set, the same
+        fail-closed posture the HTTP transport already applies to a missing
+        bearer token.
+        """
+        known = {tool["name"] for tool in self.tools}
+        unknown = sorted(allowed_tools - known)
+        if unknown:
+            raise ValueError(
+                f"Unknown tool name(s) in allowlist: {', '.join(unknown)}"
+            )
+        self.tools = [tool for tool in self.tools if tool["name"] in allowed_tools]
 
     def _cap_people_search_limit(self) -> None:
         """Advertise a smaller `limit` default/max for lifeos_people_search
@@ -1346,13 +1378,25 @@ class LifeOSMCPServer:
             if turn_id:
                 headers[TURN_ID_HEADER] = turn_id
 
-        # Handle path parameters
+        # Handle path parameters. Every route's path params are a single URL
+        # segment, so a value is rejected outright — before any request —
+        # if it's "", ".", ".." or contains "/": a percent-encoded "/"
+        # (%2F) is decoded back into a literal separator before routing, so
+        # encoding it doesn't stop a value from reaching a different,
+        # non-allowlisted route under the same prefix (e.g.
+        # person_id="x/timeline" on "/api/crm/people/{person_id}" reaching
+        # the .../timeline route). Surviving values are percent-encoded,
+        # preserving ":" so ids like "sync:gmail" reach the API unchanged.
         if "{" in endpoint_path:
             import re
+            import urllib.parse
             path_params = re.findall(r"\{(\w+)\}", endpoint_path)
             for param in path_params:
                 if param in arguments:
-                    url = url.replace(f"{{{param}}}", str(arguments.pop(param)))
+                    value = str(arguments.pop(param))
+                    if value in ("", ".", "..") or "/" in value:
+                        return {"error": f"Invalid {param}: {value!r}"}
+                    url = url.replace(f"{{{param}}}", urllib.parse.quote(value, safe=":"))
 
         try:
             if method == "GET":
@@ -2137,7 +2181,18 @@ def dispatch(server: "LifeOSMCPServer", request: dict) -> dict | None:
             params = request.get("params", {})
             tool_name = params.get("name")
             arguments = params.get("arguments", {})
-            data = server._call_api(tool_name, arguments)
+            # `_tool_names` reflects any allowlist applied at construction
+            # (frozenset(all names) when none was). A name outside it is
+            # rejected here — before any API call — the same boundary that
+            # already hides it from tools/list. Absent on a server object
+            # built without going through __init__ (e.g. `__new__` in a
+            # test double); such objects keep the pre-allowlist behavior of
+            # dispatching every call straight to `_call_api`.
+            tool_names = getattr(server, "_tool_names", None)
+            if tool_names is not None and tool_name not in tool_names:
+                data = {"error": f"Unknown tool: {tool_name}"}
+            else:
+                data = server._call_api(tool_name, arguments)
             formatted = server._format_response(tool_name, data)
             result = {"content": [{"type": "text", "text": formatted}]}
             # Same "error" key convention the agent worker's ToolRegistry
@@ -2196,6 +2251,17 @@ def build_http_app(server: "LifeOSMCPServer", bearer_token: str):
     # forwarded to the inter-agent dispatcher or persisted.
     server._mcp_transport_secret = bearer_token
 
+    # Backstop redaction: nothing on this path logs the token today (the
+    # auth-failure details below never include it, and uvicorn's default
+    # access log doesn't render headers), but a future log line, exception
+    # string, or library change could — this makes that unable to leak the
+    # credential into `logs/mcp-http.log` (or a named instance's own log).
+    try:
+        from api.services.log_redaction import install_bearer_token_redaction_filter
+        install_bearer_token_redaction_filter()
+    except Exception:  # pragma: no cover — keep the HTTP transport bootable without the api package importable
+        logger.warning("bearer-token log redaction filter not installed")
+
     import hmac
 
     from fastapi import FastAPI, HTTPException, Request, Response
@@ -2250,12 +2316,115 @@ def build_http_app(server: "LifeOSMCPServer", bearer_token: str):
     return app
 
 
+def _uvicorn_log_config_with_redaction() -> dict:
+    """A copy of uvicorn's own logging config with the bearer-token
+    redaction filter attached to uvicorn's handlers.
+
+    `uvicorn.run()` applies `uvicorn.config.LOGGING_CONFIG` after
+    `build_http_app` has already installed the filter on root's handlers —
+    that dictConfig call creates fresh handlers on `uvicorn`/`uvicorn.error`/
+    `uvicorn.access` with `propagate=False`, so a record uvicorn logs through
+    those handlers never reaches root's and is never redacted. Passing this
+    config to `uvicorn.run(log_config=...)` closes that gap. Falls back to
+    the unmodified config if the redaction filter isn't importable, matching
+    `build_http_app`'s posture of keeping the HTTP transport bootable
+    without the `api` package.
+    """
+    import copy
+
+    import uvicorn
+
+    log_config = copy.deepcopy(uvicorn.config.LOGGING_CONFIG)
+    try:
+        import api.services.log_redaction  # noqa: F401  (import check only)
+    except Exception:  # pragma: no cover — keep the HTTP transport bootable without the api package importable
+        return log_config
+
+    log_config.setdefault("filters", {})["bearer_redact"] = {
+        "()": "api.services.log_redaction.BearerTokenRedactionFilter",
+    }
+    for handler in log_config.get("handlers", {}).values():
+        handler.setdefault("filters", []).append("bearer_redact")
+    return log_config
+
+
 def run_http(server: "LifeOSMCPServer", host: str, port: int, bearer_token: str) -> None:
     """Run the HTTP transport via uvicorn."""
     import uvicorn  # local import — only needed for HTTP mode
 
     app = build_http_app(server, bearer_token=bearer_token)
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    uvicorn.run(
+        app, host=host, port=port, log_level="info",
+        log_config=_uvicorn_log_config_with_redaction(),
+    )
+
+
+class _HTTPStartupError(Exception):
+    """The HTTP transport's environment-based configuration is invalid.
+
+    Raised by `_load_http_config` for a missing credential, or a missing
+    tool allowlist on a named instance; `main()` logs it and exits(2) the
+    same way it already does for a missing default bearer token.
+    """
+
+
+def _load_http_config(instance: str) -> tuple[str, "frozenset[str] | None"]:
+    """Resolve the bearer token and tool allowlist for an HTTP instance.
+
+    The default (unnamed) instance — `instance == ""`, what `:8765` runs
+    today — reads `LIFEOS_MCP_BEARER_TOKEN` and, optionally,
+    `LIFEOS_MCP_ALLOWED_TOOLS`; an unset allowlist there returns `None`,
+    leaving every registered tool callable.
+
+    A named instance (e.g. "instinct") reads `LIFEOS_MCP_<INSTANCE>_BEARER_TOKEN`
+    and `LIFEOS_MCP_<INSTANCE>_ALLOWED_TOOLS` instead — a distinct credential
+    from the default instance's, so it can be rotated or revoked without
+    affecting other LifeOS clients — and its allowlist is required: a named
+    instance with no allowlist configured raises, the same fail-closed
+    posture as a missing credential, rather than silently exposing every
+    tool.
+
+    Tool *names* in the allowlist aren't validated here — that happens once
+    `LifeOSMCPServer` has built the full tool catalog and can tell a typo
+    from a real tool.
+    """
+    prefix = f"LIFEOS_MCP_{instance.upper()}_" if instance else "LIFEOS_MCP_"
+    token_env = f"{prefix}BEARER_TOKEN"
+    allowlist_env = f"{prefix}ALLOWED_TOOLS"
+
+    bearer_token = os.environ.get(token_env, "")
+    if not bearer_token:
+        raise _HTTPStartupError(
+            f"HTTP transport requires {token_env}. Generate one with: openssl rand -hex 32"
+        )
+
+    allowlist_raw = os.environ.get(allowlist_env, "").strip()
+    if allowlist_raw:
+        allowed_tools = frozenset(
+            name.strip() for name in allowlist_raw.split(",") if name.strip()
+        )
+    elif instance:
+        raise _HTTPStartupError(
+            f"Named instance '{instance}' requires {allowlist_env} "
+            "(a comma-separated tool allowlist)."
+        )
+    else:
+        allowed_tools = None
+
+    # Inter-agent tools derive their caller proof from the transport's own
+    # bearer token (HMAC(bearer_token, session_id)) — on a named instance
+    # the external client holds that token, so it could forge a proof for
+    # any session. Refuse at startup rather than let one into the allowlist.
+    if instance and allowed_tools is not None:
+        agent_tools = sorted(name for name in allowed_tools if name.startswith("lifeos_agent_"))
+        if agent_tools:
+            raise _HTTPStartupError(
+                f"Named instance '{instance}' cannot allowlist inter-agent tools: "
+                f"{', '.join(agent_tools)} (their caller proof is forgeable by "
+                "any holder of this instance's bearer token)."
+            )
+
+    return bearer_token, allowed_tools
 
 
 def main():
@@ -2280,20 +2449,28 @@ def main():
         default=int(os.environ.get("LIFEOS_MCP_HTTP_PORT", "8765")),
         help="HTTP bind port (default: 8765)",
     )
+    parser.add_argument(
+        "--instance",
+        default=os.environ.get("LIFEOS_MCP_INSTANCE", ""),
+        help=(
+            "Named HTTP instance (e.g. 'instinct'), for running a second "
+            "HTTP transport with its own credential and a required tool "
+            "allowlist — see _load_http_config. Leaving this unset keeps "
+            "the default instance's behavior (LIFEOS_MCP_BEARER_TOKEN, "
+            "allowlist optional) unchanged."
+        ),
+    )
     args = parser.parse_args()
 
-    server = LifeOSMCPServer()
-
     if args.transport == "stdio":
-        run_stdio(server)
+        run_stdio(LifeOSMCPServer())
         return
 
-    bearer_token = os.environ.get("LIFEOS_MCP_BEARER_TOKEN", "")
-    if not bearer_token:
-        logger.error(
-            "HTTP transport requires LIFEOS_MCP_BEARER_TOKEN. "
-            "Generate one with: openssl rand -hex 32"
-        )
+    try:
+        bearer_token, allowed_tools = _load_http_config(args.instance.strip())
+        server = LifeOSMCPServer(allowed_tools=allowed_tools)
+    except (_HTTPStartupError, ValueError) as e:
+        logger.error(str(e))
         sys.exit(2)
 
     logger.info(f"LifeOS MCP HTTP transport listening on {args.host}:{args.port}")

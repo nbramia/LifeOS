@@ -34,6 +34,14 @@ query parameter, never the access logger's own line.
 ``RequestQueryStringRedactionFilter`` / ``install_query_string_redaction_filter()``
 strip everything from the first ``?`` onward in that line, for every route,
 not just this one.
+
+A fourth filter covers the MCP HTTP transport's (``mcp_server.py``) bearer
+credential: nothing on that path logs the ``Authorization`` header or the
+token today, but ``BearerTokenRedactionFilter`` /
+``install_bearer_token_redaction_filter()`` is a backstop against a future
+log line, exception string, or library change that would otherwise put the
+credential in ``logs/mcp-http.log`` — the same never-drop, redact-in-place
+approach as the Telegram filter above.
 """
 from __future__ import annotations
 
@@ -188,3 +196,53 @@ def install_query_string_redaction_filter() -> None:
     access_logger = logging.getLogger("uvicorn.access")
     if not any(isinstance(f, RequestQueryStringRedactionFilter) for f in access_logger.filters):
         access_logger.addFilter(RequestQueryStringRedactionFilter())
+
+
+# Matches an HTTP bearer credential wherever it appears in a rendered log
+# message: the `Authorization: Bearer <token>` header shape, or a bare
+# `Bearer <token>` fragment (e.g. a stringified request or exception that
+# dropped the header name). The token-character class covers both alphabets
+# LifeOS bearer credentials are generated in (hex, and base64url from
+# `secrets.token_urlsafe`).
+BEARER_TOKEN_PATTERN = re.compile(r"Bearer\s+[A-Za-z0-9._~+/-]+=*", re.IGNORECASE)
+
+REDACTED_BEARER = "Bearer <REDACTED>"
+
+
+class BearerTokenRedactionFilter(logging.Filter):
+    """Rewrites any log record whose message contains a bearer credential.
+
+    Same never-drop, redact-in-place approach as
+    `TelegramTokenRedactionFilter`. Installed on the MCP HTTP transport's
+    root logger (`mcp_server.py`'s `build_http_app`) so a bearer token can't
+    reach `logs/mcp-http.log` (or a named instance's own log file) through a
+    future log line, library change, or stringified exception, even though
+    the auth-failure paths never include it today.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:
+            # Don't let a malformed record (bad % args, etc.) break logging.
+            return True
+
+        if BEARER_TOKEN_PATTERN.search(message):
+            record.msg = BEARER_TOKEN_PATTERN.sub(REDACTED_BEARER, message)
+            record.args = ()
+
+        return True
+
+
+def install_bearer_token_redaction_filter() -> None:
+    """Install `BearerTokenRedactionFilter` on the root logger and every
+    handler currently attached to it. Idempotent."""
+    root = logging.getLogger()
+    filt = BearerTokenRedactionFilter()
+
+    if not any(isinstance(f, BearerTokenRedactionFilter) for f in root.filters):
+        root.addFilter(filt)
+
+    for handler in root.handlers:
+        if not any(isinstance(f, BearerTokenRedactionFilter) for f in handler.filters):
+            handler.addFilter(filt)

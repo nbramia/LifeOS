@@ -68,6 +68,7 @@ Runs on Linux or macOS. Optionally, a Mac can act as an Apple Data Agent for iMe
 | How does the task store work internally (id-addressed writes, notes body, conflict files)? | [specs/technical/task-management.md](docs/specs/technical/task-management.md) |
 | What can I do with tasks (statuses, API, chat)? | [specs/product/task-management.md](docs/specs/product/task-management.md) |
 | How do I set up the agent worker? | [guides/agent-worker-setup.md](docs/guides/agent-worker-setup.md) |
+| How do I give Instinct secure access to the LifeOS MCP? | [guides/instinct-mcp-access.md](docs/guides/instinct-mcp-access.md) |
 | How does the doctor self-repair bot work? | [guides/doctor-bot.md](docs/guides/doctor-bot.md) |
 | How do agents hand work to the human? | [guides/human-queue.md](docs/guides/human-queue.md) |
 | How do I pause/resume household internet access via eero? | [guides/home-eero.md](docs/guides/home-eero.md) |
