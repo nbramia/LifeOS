@@ -341,6 +341,14 @@ def test_ensure_worktree_reuses_a_racing_concurrent_provision(tmp_path: Path, mo
     branch = derive_branch_name("fix the thing", "task-race-1")
     expected_dir = worktree_dir_for(str(repo), "task-race-1")
     assert _git(repo, "worktree", "add", "-b", branch, expected_dir, "origin/main").returncode == 0
+    git_worktree._write_worker_marker(
+        expected_dir,
+        {
+            "version": 1, "task_id": "task-race-1", "repo_toplevel": str(repo),
+            "worktree_dir": expected_dir, "branch": branch, "state": "ready",
+        },
+        runner=None, timeout=git_worktree.DEFAULT_TIMEOUT,
+    )
 
     real_probe = git_worktree._registered_worktree_branch
     call_count = {"n": 0}
