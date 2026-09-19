@@ -327,6 +327,12 @@ class ExecutorRegistry:
         with self._lock:
             self._inflight.discard(key)
 
+    def is_inflight(self, session: Any) -> bool:
+        session_id = getattr(session, "session_id", "")
+        attempt_id = attempt_id_for(session) or ""
+        with self._lock:
+            return any(key[:2] == (session_id, attempt_id) for key in self._inflight)
+
     def cancel_once(self, session: Any, reason: str = "") -> CancelResult:
         if self._session_store is not None:
             try:

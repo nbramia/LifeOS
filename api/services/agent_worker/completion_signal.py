@@ -45,11 +45,10 @@ _DANGLING_TRAILING_WORDS = frozenset({
 _MIN_SUMMARY_CHARS = 20
 
 
-def _looks_like_summary(text: str) -> bool:
-    """Cheap, deterministic check — NOT an LLM judgement. Fails closed:
-    anything that doesn't clearly look like a finished thought is treated as
-    a fragment."""
-    if len(text) < _MIN_SUMMARY_CHARS:
+def looks_like_finished_thought(text: str) -> bool:
+    """Return whether text ends as a complete thought rather than a fragment."""
+    text = text.strip()
+    if not text:
         return False
     if text[-1] in _DANGLING_TRAILING_CHARS:
         return False
@@ -60,6 +59,12 @@ def _looks_like_summary(text: str) -> bool:
     if last_word in _DANGLING_TRAILING_WORDS:
         return False
     return True
+
+
+def _looks_like_summary(text: str) -> bool:
+    """Cheap, deterministic check — NOT an LLM judgement. Fails closed:
+    anything that doesn't clearly look like a finished summary is rejected."""
+    return len(text) >= _MIN_SUMMARY_CHARS and looks_like_finished_thought(text)
 
 
 def has_positive_completion_signal(final_text: str | None, notifications_sent: int) -> bool:

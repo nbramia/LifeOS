@@ -1076,9 +1076,51 @@ def _pending_question_view(pq: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _card_outcome_view(
+    outcome: dict[str, Any] | None, pr_status_by_url: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    """The Review-lane outcome view for one task, or None when it never
+    carried a completed run. Pure — no I/O — so a board build can bulk-load
+    every outcome and every cached PR status once (`list_all_card_outcomes`/
+    `list_all_pr_statuses`) instead of paying a query per card and per PR.
+
+    Each pull request's merge status is joined from the bulk-loaded
+    `pr_status_by_url` map (kept current by the background PR-status
+    refresher) rather than the status recorded when the run completed, and
+    never by calling `gh` here. `state`/`number`/`merged_at` are None and
+    `stale` is True for a PR the refresher hasn't reached yet.
+    """
+    if outcome is None:
+        return None
+    prs: list[dict[str, Any]] = []
+    for url in outcome["pr_urls"]:
+        status = pr_status_by_url.get(url)
+        prs.append({
+            "url": url,
+            "number": status["number"] if status else None,
+            "state": status["state"] if status else None,
+            "merged_at": status["merged_at"] if status else None,
+            "stale": status["stale"] if status else True,
+        })
+    return {
+        "session_id": outcome["session_id"],
+        "engine_label": outcome["engine_label"],
+        "summary": outcome["summary"],
+        "branch": outcome["branch"],
+        # ISO 8601, matching every other date the board payload carries
+        # (task dates come straight from the vault as ISO strings) — the
+        # stored value is a unix-epoch int for cheap SQLite ordering, but
+        # nothing downstream should have to know that.
+        "created_at": datetime.fromtimestamp(outcome["created_at"], tz=timezone.utc).isoformat(),
+        "prs": prs,
+    }
+
+
 def _task_card(task, sessions_by_task: dict[str, list[dict[str, Any]]],
                 open_question_by_task: dict[str, dict[str, Any]],
-                session_store: SessionStore) -> dict[str, Any]:
+                session_store: SessionStore,
+                outcomes_by_task: dict[str, dict[str, Any]],
+                pr_status_by_url: dict[str, dict[str, Any]]) -> dict[str, Any]:
     from api.services import agent_board
 
     candidates = sessions_by_task.get(task.id) or []
@@ -1106,6 +1148,7 @@ def _task_card(task, sessions_by_task: dict[str, list[dict[str, Any]]],
         "session": session,
         "pending_question": _pending_question_view(pq) if pq else None,
         "policy": _card_policy(task, session_store),
+        "outcome": _card_outcome_view(outcomes_by_task.get(task.id), pr_status_by_url),
     }
 
 
@@ -1168,10 +1211,18 @@ def _build_board() -> dict[str, Any]:
     for q in session_store.list_open_questions():
         open_question_by_task[q["task_id"]] = q
 
+    # Bulk-loaded once per board build (two queries total, one connection
+    # each) rather than per card/per PR — see `_card_outcome_view`.
+    outcomes_by_task = session_store.list_all_card_outcomes()
+    pr_status_by_url = session_store.list_all_pr_statuses()
+
     lanes: dict[str, list[dict[str, Any]]] = {lane: [] for lane in agent_board.LANES}
     for task in tasks:
         lane = agent_board.derive_lane(task.status, task.tags, task.fields, now)
-        lanes[lane].append(_task_card(task, sessions_by_task, open_question_by_task, session_store))
+        lanes[lane].append(_task_card(
+            task, sessions_by_task, open_question_by_task, session_store,
+            outcomes_by_task, pr_status_by_url,
+        ))
 
     for entry in scheduler_store.list_all():
         bucket = "scheduled" if agent_board.is_schedule_active(entry.enabled, entry.next_trigger_at) else "done"

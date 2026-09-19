@@ -21,6 +21,7 @@ from typing import Callable, NamedTuple, Optional
 
 from api.services.agent_worker.assignment import ENGINE_CLAUDE_CODE, map_effort_for_engine
 from api.services.agent_worker.binary_resolver import resolve_for_spawn
+from api.services.agent_worker.completion_signal import looks_like_finished_thought
 from api.services.agent_worker.delegation import delegation_preamble
 from api.services.agent_worker.local_executor import ExecutorOutcome
 from api.services.agent_worker.remote_spawn import (
@@ -42,6 +43,7 @@ from api.services.agent_worker.session_store import (
 )
 from api.services.agent_worker.transcript_store import TranscriptStore
 from api.services.agent_worker.usage_ledger import UsageLedger
+from api.services.secret_redaction import scrub_and_bound
 from config.settings import settings
 
 
@@ -185,7 +187,7 @@ ENVIRONMENT:
 - {platform_desc}
 - You have full filesystem access
 - Git and standard system tools are available
-
+{git_discipline}
 KEY LOCATIONS:
 - Obsidian vault: {vault_path}/
 - LifeOS project: {code_dir}/LifeOS
@@ -226,6 +228,17 @@ After presenting the plan, STOP and do not implement anything.
 The user will review and approve the plan before you proceed.
 
 """
+
+
+def _git_discipline_block(working_dir: str) -> str:
+    """Appended into the ENVIRONMENT section of `_SYSTEM_PROMPT` only when
+    `working_dir` is a freshly-provisioned worktree (see
+    `git_worktree.describe_worktree`) — a vault- or home-directory session
+    has no worktree and gets an empty string here, leaving that prompt
+    section unchanged."""
+    from api.services.agent_worker.git_worktree import git_discipline_text
+    text = git_discipline_text(working_dir)
+    return f"- {text}\n" if text else ""
 
 
 # Reason codes returned in `ExecutorOutcome.reason` for the worker (and tests)
@@ -271,6 +284,7 @@ class _RunState:
     # reader's fall-through to avoid double-finalizing if the subprocess exits
     # right after we already saw the terminal event.
     terminal: bool = False
+    last_error: str = ""
 
 
 def _summarize_tool_call(tool_name: str, tool_input: dict) -> str:
@@ -391,6 +405,7 @@ class ClaudeCodeExecutor:
         return self._with_identity(session, self._run(
             session=session,
             prompt=prompt,
+            task_title=(task.get("description") or session.task_id).strip(),
             working_dir=working_dir,
             resume_session_id=None,
             plan_mode=plan_mode,
@@ -416,6 +431,7 @@ class ClaudeCodeExecutor:
         return self._with_identity(session, self._run(
             session=session,
             prompt=message,
+            task_title=session.task_id,
             working_dir=wd,
             resume_session_id=resume_id,
             plan_mode=False,
@@ -433,6 +449,7 @@ class ClaudeCodeExecutor:
         model: Optional[str] = None,
         is_child: bool = False,
         effort: Optional[str] = None,
+        git_discipline: str = "",
     ) -> list[str]:
         platform_desc = (
             "Linux server running Ubuntu"
@@ -452,6 +469,7 @@ class ClaudeCodeExecutor:
                 user_name=settings.user_name,
                 code_dir=settings.code_dir,
                 platform_desc=platform_desc,
+                git_discipline=git_discipline,
                 clarification=_CLARIFY_CHILD if is_child else _CLARIFY_OPERATOR,
                 delegation=delegation_preamble(
                     session_id,
@@ -503,6 +521,8 @@ class ClaudeCodeExecutor:
             # mcp_server.py derives stdio caller identity from this process-
             # bound value; the model cannot choose another session id.
             env["LIFEOS_AGENT_SESSION_ID"] = session_id
+            from api.services.agent_worker.session_resources import scratch_env
+            env.update(scratch_env(session_id))
         return env
 
     @staticmethod
@@ -536,11 +556,16 @@ class ClaudeCodeExecutor:
         *,
         session,
         prompt: str,
+        task_title: str,
         working_dir: str,
         resume_session_id: Optional[str],
         plan_mode: bool,
     ) -> ExecutorOutcome:
         sid = session.session_id
+        # Git-discipline instructions only belong on the opening turn — a
+        # resume reloads the same CLI thread, which already carries them
+        # from the first `--append-system-prompt`.
+        git_discipline = _git_discipline_block(working_dir) if resume_session_id is None else ""
         cmd = self._build_command(
             prompt, resume_session_id, session_id=sid,
             # `session.model` is the board-assignment
@@ -551,6 +576,7 @@ class ClaudeCodeExecutor:
             model=getattr(session, "model", None) or session.claude_code_model,
             is_child=bool(session.parent_session_id),
             effort=getattr(session, "effort", None),
+            git_discipline=git_discipline,
         )
 
         # Board-assigned host: resolve BEFORE any spawn call. An
@@ -570,6 +596,7 @@ class ClaudeCodeExecutor:
                 target=target,
                 unset_env_names=self._remote_unset_env_names(),
                 session_id=sid,
+                env={key: value for key, value in self._clean_env(sid).items() if key in {"TMPDIR", "TMP", "TEMP"}},
             )
 
         self.transcript_store.append(sid, "claude_code_spawn", {
@@ -596,11 +623,28 @@ class ClaudeCodeExecutor:
                 # path reaches the actual CLI process over ssh instead.
                 start_new_session=True,
             )
-        except FileNotFoundError as exc:
+        except OSError as exc:
+            # Any spawn-time OS failure — not just a missing binary
+            # (FileNotFoundError) but e.g. PermissionError, ENOMEM, or any
+            # other errno Popen can surface — must write the SAME
+            # compensating marker the missing-binary case does. The
+            # `claude_code_spawn` event just above is written unconditionally
+            # *before* Popen (a deliberate crash-safety margin: a worker that
+            # dies between that write and Popen returning must still be
+            # treated as "may have launched" on restart, never silently
+            # re-executed). `_cli_subprocess_launch_count` nets spawns against
+            # this "not found" marker to recover the true launch count — an
+            # uncompensated exception type would otherwise be miscounted as a
+            # real launch and let a caller (e.g. the resume dispatch's
+            # `_confirm_resume_or_requeue`) wrongly confirm a resume that
+            # never actually started a subprocess.
             self.transcript_store.append(sid, "claude_code_binary_not_found", {"error": str(exc)})
             return ExecutorOutcome(
                 status=STATUS_FAILED,
-                reason=REASON_BINARY_NOT_FOUND,
+                reason=(
+                    REASON_BINARY_NOT_FOUND if isinstance(exc, FileNotFoundError)
+                    else f"claude spawn failed: {exc}"
+                ),
             )
 
         # Worker may have created the session in CLAIMED state. Move it to
@@ -857,14 +901,18 @@ class ClaudeCodeExecutor:
         # unreachable-host failure (`Connection refused`, `Permission
         # denied (publickey)`) only ever surfaced in the transcript's
         # `stderr_tail`, never where the operator actually looks.
-        reason = f"claude exited with code {proc.returncode}"
+        title = task_title or session.task_id
+        detail = last_nonempty_line(stderr_tail) or state.last_error
+        if not detail:
+            detail = "no error output was captured"
+        reason = f"task '{title}': claude exited with code {proc.returncode}: {detail}"
         if is_remote:
             last_line = last_nonempty_line(stderr_tail)
             if last_line:
                 reason = f"ssh to {host} failed (exit {proc.returncode}): {last_line}"
         return ExecutorOutcome(
             status=STATUS_FAILED,
-            reason=reason,
+            reason=scrub_and_bound(reason),
         )
 
     def _record_usage(self, session, state: _RunState) -> None:
@@ -951,8 +999,12 @@ class ClaudeCodeExecutor:
                 # Streaming the tags out here would otherwise make the worker's
                 # terminal summary repeat each tagged body verbatim.
                 scan = _scan_protocol_tags(text)
-                if scan.narrative.strip():
-                    state.final_text = scan.narrative.strip()
+                narrative = scan.narrative.strip()
+                if narrative and (
+                    state.notifications_sent == 0
+                    or looks_like_finished_thought(narrative)
+                ):
+                    state.final_text = narrative
                 for body in scan.clarify:
                     state.notifications_sent += 1
                     state.last_notify_at = time.time()
@@ -1058,6 +1110,11 @@ class ClaudeCodeExecutor:
         # the CLI's own limits still bound runaway sessions.
         state.cost_usd = float(event.get("total_cost_usd") or 0.0)
 
+        if event.get("subtype") in {"error_during_execution", "error_max_turns"}:
+            state.last_error = str(
+                event.get("error") or event.get("message") or event.get("result") or ""
+            ).strip()
+
         if state.pending_clarification:
             # Agent asked a question — surface as BLOCKED outcome so the
             # worker can register the question for follow-up reply routing.
@@ -1085,7 +1142,10 @@ class ClaudeCodeExecutor:
             # Strip any [NOTIFY]/[CLARIFY] tags (fence-aware) that already
             # streamed via assistant events so we don't double-surface them.
             narrative = _scan_protocol_tags(result_text).narrative.strip()
-            if narrative:
+            if narrative and (
+                state.notifications_sent == 0
+                or looks_like_finished_thought(narrative)
+            ):
                 state.final_text = narrative
         state.terminal = True
 

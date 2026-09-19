@@ -31,8 +31,9 @@ BUDGET_EXCEEDED_TAG = "agent-budget-exceeded"
 
 
 def _make_worker(sessions: SessionStore, manager: TaskManager):
-    """A tick-free `Worker` stub wired just enough for the lifecycle-drift
-    sweep: real store + real projector, no HTTP/Telegram/executors.
+    """A `Worker` stub wired just enough for the lifecycle-drift sweep and
+    (for the handful of tests that call it) `tick()`: real store + real
+    projector, no HTTP/Telegram/executors.
 
     The HTTP helpers read and write `manager` directly instead of hitting
     the API, each standing in for one endpoint and returning what that
@@ -62,6 +63,12 @@ def _make_worker(sessions: SessionStore, manager: TaskManager):
     worker._set_task_status = lambda task_id, status: manager.update(
         task_id, status=status,
     ) is not None
+    # `tick()` also runs the off-dispatch resource-cleanup sweep; none of
+    # these tests give a session an `execution_spec`, so it never reaches
+    # `_executor_registry` or `_pr_state_cache` — only the interval gate
+    # needs a real value.
+    worker._last_resource_cleanup = 0.0
+    worker._pr_state_cache = {}
     return worker
 
 

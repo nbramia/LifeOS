@@ -10,11 +10,13 @@ import pytest
 from api.services.agent_worker import codex_spawn
 from api.services.agent_worker.codex_executor import (
     CodexExecutor,
+    REASON_AWAITING_CLARIFICATION,
     REASON_BINARY_NOT_FOUND,
     REASON_KILLED,
 )
 from api.services.agent_worker.executor_lifecycle import adapter_for
 from api.services.agent_worker.session_store import (
+    STATUS_BLOCKED,
     STATUS_COMPLETED,
     STATUS_FAILED,
     SessionStore,
@@ -880,3 +882,147 @@ def test_turn_completed_then_nonzero_exit_stays_failed(stores, tmp_path):
     kinds = [e["kind"] for e in tr_store.read(session.session_id)]
     assert "codex_failed" in kinds
     assert "codex_completed" not in kinds
+
+
+@pytest.mark.unit
+def test_codex_clarify_marker_returns_blocked_with_extracted_question(stores, tmp_path):
+    """A final message ending `[CLARIFY] <question>` is a paused question,
+    not a finished turn — Codex gets the same marker convention Claude
+    Code's live [CLARIFY] uses, detected post-hoc from the final message."""
+    sess_store, tr_store = stores
+    session = sess_store.create(
+        task_id="t-clarify", session_id="sess_codex_clarify", status="claimed",
+        routing="codex", origin="operator",
+    )
+    lines = [
+        {"type": "thread.started", "thread_id": "thread-clarify"},
+        {"type": "item.completed", "item": {
+            "type": "agent_message",
+            "text": "[CLARIFY] Which deployment environment should I target?",
+        }},
+        {"type": "turn.completed", "usage": {
+            "input_tokens": 10, "cached_input_tokens": 0,
+            "output_tokens": 5, "reasoning_output_tokens": 0,
+        }},
+    ]
+    executor = CodexExecutor(
+        session_store=sess_store, transcript_store=tr_store,
+        spawn_fn=lambda *a, **k: _FakeProc(lines, returncode=0),
+        binary_resolver=lambda: "/usr/bin/true",
+        heartbeat_interval=9999,
+    )
+
+    outcome = executor.execute(session, {"description": "deploy the thing", "working_dir": str(tmp_path)})
+
+    assert outcome.status == STATUS_BLOCKED
+    assert outcome.reason == REASON_AWAITING_CLARIFICATION
+    assert outcome.final_text == "Which deployment environment should I target?"
+    assert sess_store.get(session.task_id).status == STATUS_BLOCKED
+    kinds = [e["kind"] for e in tr_store.read(session.session_id)]
+    assert "codex_awaiting_clarification" in kinds
+    assert "codex_completed" not in kinds
+
+
+@pytest.mark.unit
+def test_codex_child_clarify_folds_into_completion_instead_of_pausing(stores, tmp_path):
+    """A spawned child has no operator to pause for — its [CLARIFY]
+    question folds into the completed turn's text (parity with
+    ClaudeCodeExecutor's `_CLARIFY_CHILD` convention) so the parent sees
+    it via the normal completion path instead of the child hanging."""
+    sess_store, tr_store = stores
+    session = sess_store.create(
+        task_id="t-child-clarify", session_id="sess_codex_child_clarify", status="claimed",
+        routing="codex", parent_session_id="sess_parent",
+    )
+    lines = [
+        {"type": "thread.started", "thread_id": "thread-child-clarify"},
+        {"type": "item.completed", "item": {
+            "type": "agent_message", "text": "[CLARIFY] Which branch should I use?",
+        }},
+        {"type": "turn.completed", "usage": {
+            "input_tokens": 10, "cached_input_tokens": 0,
+            "output_tokens": 5, "reasoning_output_tokens": 0,
+        }},
+    ]
+    executor = CodexExecutor(
+        session_store=sess_store, transcript_store=tr_store,
+        spawn_fn=lambda *a, **k: _FakeProc(lines, returncode=0),
+        binary_resolver=lambda: "/usr/bin/true",
+        heartbeat_interval=9999,
+    )
+
+    outcome = executor.execute(session, {"description": "sub-task", "working_dir": str(tmp_path)})
+
+    assert outcome.status == STATUS_COMPLETED
+    assert "[needs clarification]" in outcome.final_text
+    assert "Which branch should I use?" in outcome.final_text
+
+
+@pytest.mark.unit
+def test_current_codex_json_counts_file_and_command_activity(stores):
+    sess_store, tr_store = stores
+    session = _seed_codex_session(sess_store, task_id="cx-current-json")
+    executor = CodexExecutor(session_store=sess_store, transcript_store=tr_store)
+    from api.services.agent_worker.codex_executor import _RunState
+    state = _RunState(model="gpt-5.5")
+    events = [
+        {"type": "item.completed", "item": {"id": "item_1", "type": "file_change", "changes": [{"path": "/tmp/synthetic/hello.txt", "kind": "add"}], "status": "completed"}},
+        {"type": "item.completed", "item": {"id": "item_2", "type": "command_execution", "command": "cat hello.txt", "aggregated_output": "hi\n", "exit_code": 0, "status": "completed"}},
+        {"type": "turn.completed", "usage": {"input_tokens": 1200, "cached_input_tokens": 800, "output_tokens": 40, "reasoning_output_tokens": 10}},
+    ]
+
+    for event in events:
+        executor._handle_event(event, session, state)
+
+    assert state.tool_call_count == 2
+    assert state.last_usage["input_tokens"] == 1200
+    assert state.cost_usd > 0
+
+
+@pytest.mark.unit
+def test_codex_nonzero_exit_uses_structured_error_when_stderr_empty(stores, tmp_path):
+    sess_store, tr_store = stores
+    session = _seed_codex_session(sess_store, task_id="cx-structured-failure")
+    lines = [
+        {"type": "thread.started", "thread_id": "thread-fail"},
+        {"type": "error", "message": "Synthetic sandbox initialization failed"},
+    ]
+    executor = CodexExecutor(
+        session_store=sess_store,
+        transcript_store=tr_store,
+        spawn_fn=_spawn_capturing({}, _FakeProc(lines, returncode=1)),
+        binary_resolver=lambda: "/usr/bin/true",
+        heartbeat_interval=9999,
+    )
+
+    outcome = executor.execute(
+        session, {"description": "create synthetic file", "working_dir": str(tmp_path)},
+    )
+
+    assert outcome.reason == (
+        "task 'create synthetic file': codex exited with code 1: "
+        "Synthetic sandbox initialization failed"
+    )
+
+
+@pytest.mark.unit
+def test_codex_nonzero_exit_scrubs_and_bounds_operator_failure_reason(stores, tmp_path):
+    sess_store, tr_store = stores
+    session = _seed_codex_session(sess_store, task_id="cx-redacted-failure")
+    fake_token = "ghp_SYNTHETICFAKECREDENTIAL1234567890"
+    stderr = f"failure using {fake_token} " + ("synthetic detail " * 40)
+    executor = CodexExecutor(
+        session_store=sess_store,
+        transcript_store=tr_store,
+        spawn_fn=_spawn_capturing({}, _FakeProc([], returncode=1, stderr_text=stderr)),
+        binary_resolver=lambda: "/usr/bin/true",
+        heartbeat_interval=9999,
+    )
+
+    outcome = executor.execute(
+        session, {"description": "synthetic failing task", "working_dir": str(tmp_path)},
+    )
+
+    assert fake_token not in outcome.reason
+    assert "ghp_<REDACTED>" in outcome.reason
+    assert len(outcome.reason) <= 300

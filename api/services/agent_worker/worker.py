@@ -17,6 +17,7 @@ trivially restartable and lets the API enforce its own locking.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -178,6 +179,10 @@ _BLOCKED_PROMPT_RETRY_DELAY_S = 0.5
 # releases only claims inherited at process start; live claims are cleaned up by
 # the same-process exception/ownership path in `_process_clarification_answers`.
 _QUESTION_CLAIM_RECOVERY_LIMIT = 100
+_RESOURCE_CLEANUP_INTERVAL_SECONDS = 300
+_RESOURCE_CLEANUP_BATCH_SIZE = 10
+_WORKTREE_RECENT_SECONDS = 24 * 60 * 60
+_TASK_FETCH_FAILED = object()
 
 # A recurring (cron) schedule stamps its handed-off #agent task with a
 # `sched-<id>` tag (see scheduler_store._hand_off_to_agent). The worker reads
@@ -299,6 +304,30 @@ NO_REPLY_FOOTER = "\U0001f6ab do not reply"
 def _with_reply_footer(text: str, replyable: bool = True) -> str:
     """Append the reply-affordance footer as the message's final line."""
     return f"{text}\n\n{REPLYABLE_FOOTER if replyable else NO_REPLY_FOOTER}"
+
+
+def _with_git_status_note(body: str, result, *, want_pr: bool) -> str:
+    """Fold a `git_worktree.FinalizeResult` into a session's completion/
+    question/failure notice.
+
+    ``result.applicable`` False (no worker-provisioned worktree involved)
+    leaves ``body`` unchanged. A push/PR failure is always reported (never
+    silently swallowed as success), regardless of ``want_pr``.
+    """
+    if not result.applicable:
+        return body
+    if result.error:
+        note = f"⚠️ git: {result.error}"
+    elif want_pr:
+        if result.pr_url:
+            note = f"PR: {result.pr_url}"
+        elif result.nothing_to_push:
+            note = f"Branch `{result.branch}` pushed — nothing to open a pull request for."
+        else:
+            note = f"Branch: `{result.branch}` (pushed)"
+    else:
+        note = f"Branch: `{result.branch}` (pushed)"
+    return f"{body}\n\n{note}" if body else note
 
 
 def _is_affirmative(text: str) -> bool:
@@ -683,6 +712,8 @@ class Worker:
         self._hermes_inflight: set[str] = set()
         self._hermes_lock = threading.Lock()
         self._executor_registry = ExecutorRegistry(session_store=self.session_store)
+        self._last_resource_cleanup = 0.0
+        self._pr_state_cache: dict[str, tuple[float, str | None]] = {}
         self._warn_deprecated_settings()
 
     def _project_session_status(
@@ -692,6 +723,9 @@ class Worker:
     ) -> bool:
         """Project a session transition to the public task surface."""
         session = self.session_store.get(task_id)
+        if session is not None and status in TERMINAL_STATUSES:
+            from api.services.agent_worker.session_resources import cleanup_session_scratch
+            cleanup_session_scratch(session.session_id, host=getattr(session, "host", None))
         if session is None or session.origin == "operator" or session.parent_session_id:
             return False
         try:
@@ -960,6 +994,14 @@ class Worker:
         # session — see `_reconcile_lifecycle_drift`). Also never gated on
         # the spend cap: it reconciles existing state, never starts new work.
         self._reconcile_lifecycle_drift()
+        # Sibling sweep: a CLAIMED session with an undelivered queued message
+        # is expected to be picked up by `_dispatch_spawned_sessions` below
+        # within this same tick or the next one — see that method's skip
+        # guard. A session still sitting there past the configured threshold
+        # gets a one-time alert rather than staying silently orphaned. Also
+        # ungated on the spend cap: it never starts new work, only alerts.
+        self._reconcile_stuck_claimed_sessions()
+        self._cleanup_session_resources()
 
         # Use the configured per-task default budget as the "can I afford to
         # start the cheapest task right now?" estimate. Calling with 0.0 would
@@ -1034,6 +1076,81 @@ class Worker:
             self._dispatch(task)
             handled += 1
         return handled
+
+    def _cleanup_session_resources(self, *, force: bool = False) -> int:
+        """Bounded, off-dispatch reconciliation for scratch and worktrees."""
+        now = time.time()
+        if not force and now - self._last_resource_cleanup < _RESOURCE_CLEANUP_INTERVAL_SECONDS:
+            return 0
+        self._last_resource_cleanup = now
+        from api.services.agent_worker.git_worktree import (
+            list_worker_worktrees,
+            pull_request_state,
+            remove_worker_worktree,
+        )
+        from api.services.agent_worker.session_resources import cleanup_session_scratch
+
+        cleaned = 0
+        sessions = self.session_store.list_sessions(limit=None)
+        session_by_worktree: dict[tuple[str | None, str], Any] = {}
+        managed_repos: set[tuple[str | None, str]] = set()
+        for session in sessions:
+            if cleaned >= _RESOURCE_CLEANUP_BATCH_SIZE:
+                break
+            if session.status in TERMINAL_STATUSES:
+                cleanup_session_scratch(session.session_id, host=getattr(session, "host", None))
+            if session.routing not in {ROUTE_CLAUDE_CODE, ROUTE_CODEX} or not session.execution_spec:
+                continue
+            working_dir = ExecutionSpec.from_dict(session.execution_spec).working_dir
+            if not working_dir or "-wt-agent-" not in os.path.basename(working_dir):
+                continue
+            session_by_worktree[(session.host, os.path.normpath(working_dir))] = session
+            managed_repos.add((session.host, working_dir))
+            if (
+                session.status not in TERMINAL_STATUSES
+                or self._executor_registry.is_inflight(session)
+            ):
+                continue
+            task = self._fetch_task(session.task_id, distinguish_failure=True)
+            if task is _TASK_FETCH_FAILED:
+                continue
+            tags = self._norm_task_tags(task or {})
+            card_terminal = task is None or (task or {}).get("status") in {"cancelled", "done"}
+            accepted = "accepted" in tags
+            should_remove = accepted or (task or {}).get("status") == "cancelled"
+            if not should_remove and session.status == STATUS_COMPLETED:
+                cached = self._pr_state_cache.get(working_dir)
+                if cached and now - cached[0] < _RESOURCE_CLEANUP_INTERVAL_SECONDS:
+                    pr_state = cached[1]
+                else:
+                    try:
+                        pr_state = pull_request_state(working_dir, host=session.host)
+                    except Exception as exc:
+                        logger.warning("PR state check failed for %s: %s", working_dir, exc)
+                        pr_state = None
+                    self._pr_state_cache[working_dir] = (now, pr_state)
+                should_remove = pr_state == "MERGED"
+            recent = now - session.last_activity_at < _WORKTREE_RECENT_SECONDS
+            if not should_remove and session.status in TERMINAL_STATUSES and not recent and card_terminal:
+                should_remove = True
+            if not should_remove:
+                continue
+            result = remove_worker_worktree(working_dir, host=session.host)
+            if result.removed:
+                cleaned += 1
+                self._pr_state_cache.pop(working_dir, None)
+            elif result.applicable and result.error:
+                logger.warning("worktree cleanup failed for %s: %s", working_dir, result.error)
+        for host, repo in managed_repos:
+            for working_dir in list_worker_worktrees(repo, host=host):
+                if cleaned >= _RESOURCE_CLEANUP_BATCH_SIZE:
+                    return cleaned
+                if (host, os.path.normpath(working_dir)) in session_by_worktree:
+                    continue
+                result = remove_worker_worktree(working_dir, host=host)
+                if result.removed:
+                    cleaned += 1
+        return cleaned
 
     def _resume_yielded_for_children(self) -> None:
         """Resume yielded sessions whose listed children have all terminated.
@@ -1175,11 +1292,31 @@ class Worker:
         claimed = self.session_store.list_by_status(STATUS_CLAIMED)
         for session in claimed:
             # Skip top-level claimed sessions from the #agent tick claim path
-            # (those are dispatched by _dispatch). Pick up spawned children
-            # (parent set) and operator root-spawns (no parent but
-            # origin='operator').
+            # (those are dispatched by _dispatch) — EXCEPT a top-level
+            # claude_code/codex session carrying an undelivered pending
+            # message. That combination is the signature every reopen path
+            # leaves behind (a Telegram followup/status-anchor reply, or the
+            # worker's own code_reopened_for_pending_messages): none of them
+            # can flip the session straight to RUNNING inline the way a fresh
+            # top-level claim does, so the reopened session just sits at
+            # CLAIMED until some dispatch tick picks it up again. A fresh
+            # top-level claim never produces this signature — `_dispatch`
+            # synthesizes its first-turn payload in-memory and hands it
+            # straight to `_submit_cli_dispatch`, never through
+            # `pending_messages` — so this check cannot also grab a session
+            # the tick's own top-level claim loop claimed for the first time
+            # this same tick (that loop only runs once this method has
+            # returned, and a fresh claim's session carries no
+            # pending_messages row for this check to match). Pick up
+            # spawned children (parent set)
+            # and operator root-spawns (no parent but origin='operator')
+            # unconditionally, as before.
             if not session.parent_session_id and session.origin != "operator":
-                continue
+                if (
+                    session.routing not in ("claude_code", "codex")
+                    or not self.session_store.has_pending_messages(session.session_id)
+                ):
+                    continue
             if session.execution_request:
                 parsed = parse_execution_request(session.execution_request)
                 if not parsed.ok:
@@ -1216,14 +1353,32 @@ class Worker:
             # consuming the prompt so a second scan cannot drain a CLI turn that
             # is already queued/running, and a failed resolution leaves the input
             # available for an operator-directed retry.
-            if session.routing in ("claude_code", "codex"):
+            is_cli_route = session.routing in ("claude_code", "codex")
+            if is_cli_route:
                 with self._cli_lock:
                     if session.session_id in self._cli_inflight:
                         continue
-            pending = self.session_store.drain_pending_messages(
-                session.session_id,
-                attempt_id=attempt_id_for(session), turn_id=turn_id_for(session),
-            )
+            if is_cli_route and session.claude_code_session_id:
+                # Resume, not a fresh dispatch: peek rather than drain. A
+                # resume dispatch runs off-tick and can fail before it ever
+                # confirms the subprocess started (crash, resolution
+                # failure, a killed worker). Marking these delivered here —
+                # before that confirmation exists — would lose the message
+                # on any such failure. The resume dispatch
+                # (`_dispatch_claude_code_session`/`_dispatch_codex_session`,
+                # via `_confirm_resume_or_requeue`) marks each id delivered
+                # itself, once it can confirm the message was actually acted
+                # on. A fresh dispatch has no such later confirmation point
+                # (there's no persisted `claude_code_session_id` yet for it
+                # to key a "did it launch" check on) and no equivalent
+                # truthful-ack promise riding on it, so it keeps draining
+                # eagerly, attempt/turn-fenced, exactly as every other route.
+                pending = self.session_store.peek_pending_messages(session.session_id)
+            else:
+                pending = self.session_store.drain_pending_messages(
+                    session.session_id,
+                    attempt_id=attempt_id_for(session), turn_id=turn_id_for(session),
+                )
             description = pending[0]["content"] if pending else session.session_id
             task = {"id": session.task_id, "description": description}
             if execution.spec.working_dir:
@@ -1548,7 +1703,11 @@ class Worker:
         if session is None:
             return CancelResult(cancelled=False, reason="not_found")
         self._lifecycle_adapter(session)
-        return self._executor_registry.cancel_once(session, reason)
+        result = self._executor_registry.cancel_once(session, reason)
+        if result.cancelled:
+            from api.services.agent_worker.session_resources import cleanup_session_scratch
+            cleanup_session_scratch(session.session_id, host=getattr(session, "host", None))
+        return result
 
     def _execute_start(self, session, request: dict[str, Any]):
         """Start one route through the lifecycle adapter.
@@ -1564,7 +1723,9 @@ class Worker:
         if not self._executor_registry.begin(session, "start"):
             return None
         try:
-            return adapter.start(session, request)
+            from api.services.agent_worker.session_resources import session_scratch_context
+            with session_scratch_context(session.session_id):
+                return adapter.start(session, request)
         finally:
             self._executor_registry.finish(session, "start")
 
@@ -1575,7 +1736,9 @@ class Worker:
         if not self._executor_registry.begin(session, "resume"):
             return None
         try:
-            return adapter.resume(session, message, working_dir=working_dir)
+            from api.services.agent_worker.session_resources import session_scratch_context
+            with session_scratch_context(session.session_id):
+                return adapter.resume(session, message, working_dir=working_dir)
         finally:
             self._executor_registry.finish(session, "resume")
 
@@ -2302,7 +2465,7 @@ class Worker:
             task = self._revalidate_task_resume(
                 session,
                 "followup_resume",
-                {COMPLETED_TAG, FAILED_TAG, BUDGET_EXCEEDED_TAG},
+                {COMPLETED_TAG, FAILED_TAG, BUDGET_EXCEEDED_TAG, BLOCKED_TAG},
             )
             if task is None:
                 self.session_store.mark_question_processed(q["id"])
@@ -2314,13 +2477,14 @@ class Worker:
         if session.status in TERMINAL_STATUSES:
             session = self.session_store.begin_new_execution(task_id)
 
-        # The task may be parked at any terminal tag — completed, failed, or
-        # budget-exceeded are all replyable now. Swap whichever is current
-        # back to running. Operator root-spawns have no backing vault
-        # task, so skip the tag/status mutations (they would 404).
+        # The task may be parked at any terminal tag — completed, failed,
+        # budget-exceeded, or blocked (a CLI question-pause card in the
+        # Human queue lane) — are all replyable now. Swap whichever is
+        # current back to running. Operator root-spawns have no backing
+        # vault task, so skip the tag/status mutations (they would 404).
         if session.origin != "operator":
             lifecycle_swapped = False
-            for terminal_tag in (COMPLETED_TAG, FAILED_TAG, BUDGET_EXCEEDED_TAG):
+            for terminal_tag in (COMPLETED_TAG, FAILED_TAG, BUDGET_EXCEEDED_TAG, BLOCKED_TAG):
                 if self._swap_tag(task_id, terminal_tag, RUNNING_TAG):
                     lifecycle_swapped = True
                     break
@@ -2532,6 +2696,11 @@ class Worker:
                 "question_id": q["id"],
             })
             stale_session = self.session_store.get_by_session_id(q["session_id"])
+            if stale_session is not None:
+                from api.services.agent_worker.session_resources import cleanup_session_scratch
+                cleanup_session_scratch(
+                    stale_session.session_id, host=getattr(stale_session, "host", None),
+                )
             label = _worker_label(stale_session.routing if stale_session else None)
             self._notify(
                 f"⏰ {label}: task is still waiting on your reply.\n\n"
@@ -2771,6 +2940,91 @@ class Worker:
                 healed += 1
         return healed
 
+    def _reconcile_stuck_claimed_sessions(self) -> int:
+        """Alert once for a top-level claude_code/codex session stuck at
+        CLAIMED with an undelivered queued message past the configured
+        threshold — the safety net for a reopened session that a dispatch
+        tick never picked back up.
+
+        A session in this exact shape (top-level, `claude_code`/`codex`
+        routing, an undelivered `pending_messages` row) is the same
+        candidate set `_dispatch_spawned_sessions` admits, so under
+        normal operation it drains within a tick or two of being reopened —
+        by a Telegram followup/status-anchor reply, or the worker's own
+        `code_reopened_for_pending_messages`. This sweep exists for the case
+        where something still prevents that (a stale in-flight guard
+        surviving a worker restart, a dispatch-time crash swallowed before
+        the session could be marked failed): rather than re-driving dispatch
+        itself — which risks a second concurrent attempt on a session whose
+        executor may genuinely still be starting up — it tells the operator
+        plainly that a resume did not take, naming the task and session, so
+        they know exactly what to check.
+
+        One alert per stuck episode: `last_activity_at` is bumped every time
+        the session is reopened to CLAIMED (`update_status` sets it), so the
+        alert is recorded in the transcript keyed to that value. A session
+        reopened again later carries a new `last_activity_at` and is
+        eligible for a fresh alert if it gets stuck again.
+
+        A candidate's backing card must still be actively claimed
+        (`RUNNING_TAG`) before it's alerted on — the operator can cancel,
+        retag, or reassign a card after a reopen queued the session's note,
+        and dispatch is correctly skipped for it from then on. That's not
+        an actionable stuck resume; it's a resolved episode the sweep
+        retires silently (a transcript note, no Telegram message) rather
+        than reporting as if it still needed attention.
+        """
+        threshold_seconds = settings.agent_stuck_session_timeout_minutes * 60
+        cutoff = int(time.time()) - threshold_seconds
+        alerted = 0
+        for session in self.session_store.list_by_status(STATUS_CLAIMED):
+            # Same candidate shape `_dispatch_spawned_sessions` admits —
+            # spawned children and operator root-spawns are always eligible
+            # for pickup already and aren't a subject of this sweep.
+            if session.parent_session_id or session.origin == "operator":
+                continue
+            if session.routing not in ("claude_code", "codex"):
+                continue
+            if not self.session_store.has_pending_messages(session.session_id):
+                continue
+            if session.last_activity_at > cutoff:
+                continue  # still inside its normal pickup window
+            events = self.transcript_store.read(session.session_id)
+            task = self._fetch_task(session.task_id)
+            if RUNNING_TAG not in self._norm_task_tags(task):
+                already_retired = any(
+                    e.get("kind") == "stuck_claimed_episode_retired"
+                    and e.get("payload", {}).get("last_activity_at") == session.last_activity_at
+                    for e in events
+                )
+                if not already_retired:
+                    self.transcript_store.append(session.session_id, "stuck_claimed_episode_retired", {
+                        "last_activity_at": session.last_activity_at,
+                        "reason": "card no longer carries the running tag",
+                    })
+                continue
+            already_alerted = any(
+                e.get("kind") == "stuck_claimed_session_alerted"
+                and e.get("payload", {}).get("last_activity_at") == session.last_activity_at
+                for e in events
+            )
+            if already_alerted:
+                continue
+            title = (task or {}).get("description", session.task_id)
+            label = _worker_label(session.routing)
+            self._notify(
+                f"⚠️ {label}: a resume for task '{title}' (session "
+                f"{session.session_id}) queued a note but never actually "
+                f"restarted — it's still sitting at claimed. Check the "
+                f"worker logs; it may need a manual re-trigger.",
+                bot=session.bot,
+            )
+            self.transcript_store.append(session.session_id, "stuck_claimed_session_alerted", {
+                "last_activity_at": session.last_activity_at,
+            })
+            alerted += 1
+        return alerted
+
     def _check_human_queue_done_when(self, done_when: dict) -> tuple[bool, str]:
         """Evaluate one card's `done_when`. Returns `(passed, description)`;
         raises on a malformed check or a request/IO error — the caller
@@ -2801,9 +3055,23 @@ class Worker:
 
         Returns the Telegram message_id (or None if Telegram isn't configured
         — caller should mark the session blocked anyway since we can't ask).
+
+        A session whose reporting channel is Hermes still reaches the
+        primary bot here rather than its own channel: Hermes carries no
+        message id to anchor a reply against (see `_reporting_channel`), so
+        this is the explicit non-Hermes path a caller takes when a
+        Hermes-anchored question isn't available or allowed. Delivering it
+        through `session.bot` anyway would silently retarget it right back
+        at Hermes via `_send_session_message`'s own one-way fallback.
         """
+        session = self.session_store.get_by_session_id(session_id)
+        if session is not None and _reporting_channel(session) is not None:
+            session = dataclasses.replace(session, bot=None)
         try:
-            sent_ids = self._telegram_send_with_id(question) or []
+            sent_ids = (
+                self._send_session_message(session, question) if session is not None
+                else self._telegram_send_with_id(question)
+            ) or []
         except Exception as exc:
             logger.warning(f"ask_user_via_telegram failed: {exc}")
             return None
@@ -3074,14 +3342,17 @@ class Worker:
             return False
 
     def _reconcile_vault_terminal(self, session, status: str) -> None:
-        """Update the backing #agent vault task when a CLI session ends.
+        """Update the backing #agent vault task when a CLI session ends or
+        pauses on a question (``status`` may be any of the terminal
+        statuses, or ``STATUS_BLOCKED``).
 
         The ``claude_code`` / ``codex`` dispatch paths don't go through
         ``_handle_outcome`` (which owns vault reconciliation for the local
-        and managed routes), so terminal outcomes there must reconcile the
-        vault themselves — otherwise a vault-routed ``#agent #claude`` /
-        ``#codex`` task is stranded at ``[/]`` / ``#agent-running`` forever
-        even though the agent finished.
+        and managed routes), so every one of these transitions must
+        reconcile the vault itself — otherwise a vault-routed ``#agent
+        #claude``/``#codex`` task is stranded at ``[/]``/``#agent-running``
+        forever even though the agent finished, or is blocked awaiting the
+        operator's answer but the card never shows it.
 
         Operator-spawned sessions (``origin='operator'``) and spawned
         children (``parent_session_id`` set) have no backing #agent vault
@@ -3101,6 +3372,12 @@ class Worker:
         elif status == STATUS_FAILED:
             self._swap_tag(task_id, RUNNING_TAG, FAILED_TAG)
             self._set_task_status(task_id, "cancelled")
+        elif status == STATUS_BLOCKED:
+            # Human queue lane — the same tag `_mark_blocked` uses for the
+            # preflight/ambiguity block path. `_resume_as_followup`'s
+            # swap-back loop reverses this once the operator answers.
+            self._swap_tag(task_id, RUNNING_TAG, BLOCKED_TAG)
+            self._set_task_status(task_id, "blocked")
 
     def _discover_wip_branch(self, session_id: str) -> str | None:
         """Best-effort scan of this session's OWN past transcript for a WIP
@@ -3188,15 +3465,6 @@ class Worker:
             )
         message = "\n\n".join(parts)
 
-        def _send(text):
-            return self._telegram_send(text, bot=bot) if bot else self._telegram_send(text)
-
-        def _send_with_id(text):
-            return (
-                self._telegram_send_with_id(text, bot=bot) if bot
-                else self._telegram_send_with_id(text)
-            )
-
         if resumable:
             # project=False: the vault tag stays at the running tag here —
             # only the session row moves to BLOCKED. The claimed-card guard
@@ -3209,7 +3477,7 @@ class Worker:
             )
             sent_ids: list = []
             try:
-                sent_ids = _send_with_id(_with_reply_footer(message)) or []
+                sent_ids = self._send_session_message(session, message) or []
             except Exception as exc:
                 logger.warning("interrupted-session notice send failed: %s", exc)
             if sent_ids:
@@ -3240,7 +3508,10 @@ class Worker:
             attempt_id=session.attempt_id, turn_id=session.turn_id,
         )
         try:
-            _send(_with_reply_footer(message, replyable=False))
+            if bot:
+                self._telegram_send(_with_reply_footer(message, replyable=False), bot=bot)
+            else:
+                self._telegram_send(_with_reply_footer(message, replyable=False))
         except Exception as exc:
             logger.warning("interrupted-session (unresumable) notice send failed: %s", exc)
         self._mirror_to_conversation(sid, message)
@@ -3490,6 +3761,63 @@ class Worker:
             logger.warning("spawn-marker read failed for %s: %s", session_id, exc)
             return 0
 
+    def _confirm_resume_or_requeue(
+        self, session, sid: str, pending_ids: list[int], prior_launches: int,
+        *, spawn_kind: str, not_found_kind: str, report_failure: bool,
+    ) -> bool:
+        """After a resume attempt returns (or raises), confirm whether a CLI
+        subprocess actually launched during THIS call before treating the
+        queued note as delivered or telling the operator the session
+        resumed.
+
+        The deposit-time Telegram ack only ever promises the note is
+        queued — this is the first point a resume can be truthfully
+        confirmed, since `_execute_resume` runs the whole CLI turn
+        synchronously and can fail before a subprocess ever starts
+        (resolution failure, a fenced/rejected turn, a crash in worker
+        glue code, or an ordinary FAILED outcome the executor returned
+        without ever spawning — e.g. a missing binary or a permission
+        error). A launch that never happened must not mark the note
+        delivered (it would otherwise be silently lost) or claim the
+        session resumed.
+
+        Returns whether a launch was confirmed. When it was, the note is
+        marked delivered and, for a top-level session, a truthful
+        "Resumed" confirmation is sent. When it wasn't, the note is left
+        queued; a truthful "didn't start" notice is sent only when
+        `report_failure` is True. Pass `report_failure=True` from the
+        `_execute_resume` exception handler — nothing else reports that
+        failure, since an exception unwinds past the ordinary FAILED-
+        outcome handling entirely. Pass `report_failure=False` when
+        `_execute_resume` instead returned an ordinary (non-raising)
+        outcome and the caller falls through to that same shared FAILED-
+        outcome handling afterward — it already reports an accurate
+        reason and reconciles the vault tag, so reporting here too would
+        just duplicate the notice.
+
+        Two accepted, deliberate residual gaps (not fixed by this
+        method): a worker/process crash landing strictly between a
+        confirmed launch and this method's own call can still deliver a
+        note twice on a later manual reopen (at-least-once, not
+        exactly-once, delivery); and a session left FAILED here after a
+        pre-launch failure has no automatic re-claim — the note rides
+        the next resume only if an operator triggers one.
+        """
+        launched = self._cli_subprocess_launch_count(
+            sid, spawn_kind, not_found_kind,
+        ) > prior_launches
+        if launched:
+            self.session_store.mark_pending_delivered(pending_ids)
+            if not session.parent_session_id:
+                self._send_session_message(session, "▶️ Resumed — continuing from your note.")
+        elif report_failure and not session.parent_session_id:
+            self._send_session_message(
+                session,
+                "⚠️ Resume didn't start — your note is still queued and "
+                "will ride the next resume attempt.",
+            )
+        return launched
+
     def _mirror_to_conversation(self, session_id: str, text: str) -> None:
         """mirror a web-spawned session's operator-facing output into its
         linked conversation thread (additive — Telegram is untouched).
@@ -3511,6 +3839,84 @@ class Worker:
                 )
         except Exception as exc:
             logger.warning("web-thread mirror failed for %s: %s", session_id, exc)
+
+    @staticmethod
+    def _session_working_dir(session) -> str | None:
+        """The working directory frozen on this session's own execution
+        spec at dispatch time — the same field `_dispatch()`'s worktree
+        provisioning seam writes the provisioned path onto."""
+        if not session.execution_spec:
+            return None
+        return ExecutionSpec.from_dict(session.execution_spec).working_dir
+
+    def _finalize_worktree_for_session(self, session, task: dict, outcome, *, open_pr: bool):
+        """Run the worker's own git discipline at one CLI session's
+        completion or question-pause: commit any changes the session
+        itself left uncommitted, push its branch, and — when finalizing a
+        fully-complete session — open a pull request. A no-op
+        (`FinalizeResult(applicable=False)`) for a session with no
+        worker-provisioned worktree at all — a vault/home-directory task,
+        an operator `/claude` spawn, or a spawned child (children never go
+        through the worktree-provisioning seam themselves, so their own
+        git discipline is their parent's).
+        """
+        from api.services.agent_worker.git_worktree import FinalizeResult, finalize_worktree_session
+
+        if session.parent_session_id:
+            return FinalizeResult(applicable=False)
+        working_dir = self._session_working_dir(session)
+        return finalize_worktree_session(
+            working_dir,
+            open_pr=open_pr,
+            host=getattr(session, "host", None),
+            pr_title=(task.get("description") or "").strip()[:100],
+            pr_body=(getattr(outcome, "final_text", "") or "").strip(),
+        )
+
+    def _record_card_outcome(
+        self, session: Session, summary: str | None, *, engine_label: str | None = None,
+        git_result=None,
+    ) -> None:
+        """Persist this run's outcome for its Review card: the agent's own
+        completion summary — the same text just sent to the operator, not
+        re-derived from the transcript — and, for a coding session, the
+        branch it worked on and any pull request it opened.
+
+        Branch/PR come ONLY from `git_result` (a `git_worktree.FinalizeResult`),
+        the authoritative record of what the worker's own git discipline
+        did at completion — never from grepping the transcript for a
+        branch name or a `github.com/.../pull/NNN` mention. When `git_result`
+        is given but its own `branch`/`pr_url` are absent (no worker-
+        provisioned worktree, or finalization itself failed), that absence
+        is recorded as-is rather than papered over with a transcript guess
+        (`_discover_wip_branch` exists for other callers that want a
+        best-effort branch name; this one deliberately never calls it).
+
+        Best-effort: this never raises into the caller. The card is already
+        marked done by the time this runs, so a failure here should cost
+        the operator a missing outcome section, not the completion itself.
+        """
+        try:
+            if not engine_label:
+                engine_label = _ENGINE_LABELS.get(session.routing, session.routing or "agent")
+                if session.routing == "claude_code" and session.claude_code_model:
+                    engine_label += f" ({session.claude_code_model})"
+            branch = None
+            pr_urls: list[str] = []
+            if git_result is not None and getattr(git_result, "applicable", False):
+                branch = git_result.branch
+                if git_result.pr_url:
+                    pr_urls = [git_result.pr_url]
+            self.session_store.record_card_outcome(
+                session.task_id,
+                session_id=session.session_id,
+                engine_label=engine_label,
+                summary=(summary or "").strip(),
+                branch=branch,
+                pr_urls=pr_urls,
+            )
+        except Exception as exc:
+            logger.warning("recording card outcome failed for %s: %s", session.task_id, exc)
 
     def _dispatch_claude_code_session(self, session, pending: list[dict]) -> None:
         """Drive one ``routing='claude_code'`` session through ``ClaudeCodeExecutor``.
@@ -3543,13 +3949,17 @@ class Worker:
         bot = session.bot
         sid = session.session_id
 
-        # Only thread `bot` when set so the primary path's send signature
-        # stays byte-identical to the plain call. bot=None → primary.
+        # `_send` is the one-shot escalation notice: no id attempt, so a
+        # surface that just failed a delivery retry isn't asked for one
+        # more round-trip. `_send_with_id` is used inside the bounded retry
+        # loop below; `fallback_on_failure=False` keeps a failed attempt
+        # from silently delivering an anchorless duplicate ahead of a later
+        # attempt that succeeds.
         def _send(text):
-            return self._telegram_send(text, bot=bot) if bot else self._telegram_send(text)
+            return bool(self._send_session_message(session, text, want_id=False))
 
         def _send_with_id(text):
-            return self._telegram_send_with_id(text, bot=bot) if bot else self._telegram_send_with_id(text)
+            return self._send_session_message(session, text, fallback_on_failure=False)
 
         # Build the task dict + resume message from drained pending messages.
         # Fresh spawns carry the JSON payload produced by spawn_claude_code_session;
@@ -3607,17 +4017,22 @@ class Worker:
             return
 
         if is_resume:
-            # Every drained message rides the resume turn, in order. Draining
-            # returns ALL pending rows, and reopen-on-send makes
+            # Every peeked message rides the resume turn, in order. Peeking
+            # returns ALL undelivered rows, and reopen-on-send makes
             # multi-enqueue likely (e.g. a parent answers twice before the
             # dispatch tick claims the reopened child) — resuming with only
             # pending[0] would silently drop messages `lifeos_agent_send`
-            # already acknowledged as delivered.
+            # already acknowledged as delivered. Not yet marked delivered —
+            # see `_confirm_resume_or_requeue` below.
             resume_message = "\n\n".join(m["content"] for m in pending) if pending else ""
+            pending_ids = [m["id"] for m in pending if "id" in m]
             task: dict = {"id": session.task_id, "description": resume_message}
             self.transcript_store.append(sid, "claude_code_user_prompt", {
                 "text": resume_message, "resume": True,
             })
+            prior_launches = self._cli_subprocess_launch_count(
+                sid, "claude_code_spawn", "claude_code_binary_not_found"
+            )
             try:
                 spec = (
                     ExecutionSpec.from_dict(session.execution_spec)
@@ -3637,8 +4052,32 @@ class Worker:
                     session.task_id, STATUS_FAILED,
                     attempt_id=session.attempt_id, turn_id=session.turn_id,
                 )
+                self._confirm_resume_or_requeue(
+                    session, sid, pending_ids, prior_launches,
+                    spawn_kind="claude_code_spawn", not_found_kind="claude_code_binary_not_found",
+                    report_failure=True,
+                )
                 return
+            # A resume is only ever acknowledged as "queued" at reply time
+            # (Telegram ack, followup or status-anchor) — confirm the turn
+            # actually launched a subprocess before claiming it resumed or
+            # marking the note delivered. A non-launch here (an ordinary
+            # FAILED outcome the executor returned without ever spawning —
+            # a missing binary, a permission error) is NOT reported here;
+            # it falls through to the shared FAILED-outcome handling below,
+            # which already reports the accurate reason and reconciles the
+            # vault tag — reporting it here too would just duplicate it.
+            self._confirm_resume_or_requeue(
+                session, sid, pending_ids, prior_launches,
+                spawn_kind="claude_code_spawn", not_found_kind="claude_code_binary_not_found",
+                report_failure=False,
+            )
         else:
+            # A fresh dispatch (first turn): the caller (`_dispatch_spawned_sessions`,
+            # or `_dispatch`'s synthetic in-memory payload) already drained
+            # this session's one spawn-payload row eagerly, attempt/turn-
+            # fenced, exactly as before — there's no later "confirm the
+            # launch" point to defer to here the way the resume branch has.
             payload = parse_claude_code_spawn_payload(pending[0]["content"]) if pending else {
                 "prompt": "", "working_dir": None, "plan_mode": False, "chat_id": None,
             }
@@ -3708,6 +4147,12 @@ class Worker:
                 prompt = f"{goal_body}\n\n{instruction}" if goal_body else instruction
             else:
                 prompt = "Awaiting your reply to continue."
+            # A session pausing for the operator's input pushes whatever it
+            # committed so far — no pull request yet, since the task isn't
+            # considered done. No-ops for a session with no
+            # worker-provisioned worktree.
+            git_result = self._finalize_worktree_for_session(session, task, outcome, open_pr=False)
+            prompt = _with_git_status_note(prompt, git_result, want_pr=False)
             # Goal-approval replies route through `_resume_goal` (which injects
             # `/goal <condition>` on a yes); everything else is a followup.
             kind = "goal_approval" if outcome.reason == REASON_AWAITING_GOAL_APPROVAL else "followup"
@@ -3754,6 +4199,10 @@ class Worker:
                 self.transcript_store.append(sid, "code_block_prompt_registered", {
                     "reason": outcome.reason, "message_ids": sent_ids,
                 })
+                # Human queue lane — preserves resumability: the swap-back
+                # to running happens in `_resume_as_followup` once the
+                # operator answers.
+                self._reconcile_vault_terminal(session, STATUS_BLOCKED)
                 return
             # Delivery failed after all retries. Without a sent message id there
             # is no anchor for the operator to reply to, so the session would sit
@@ -3802,6 +4251,13 @@ class Worker:
             # message; the child's final_text reaches the parent via
             # _child_final_text instead.
             body = outcome.final_text.strip() if outcome.final_text else ""
+            # A fully-complete session pushes its branch and opens a pull
+            # request against the default branch — the outcome (PR URL, or
+            # honestly reporting nothing to push / a push failure) rides in
+            # the same completion notice. No-ops for a session with no
+            # worker-provisioned worktree, leaving `body` unchanged.
+            git_result = self._finalize_worktree_for_session(session, task, outcome, open_pr=True)
+            body = _with_git_status_note(body, git_result, want_pr=True)
             if body and not session.parent_session_id:
                 try:
                     sent_ids = _send_with_id(_with_reply_footer(body)) or []
@@ -3829,6 +4285,10 @@ class Worker:
             })
             self._apply_repair_result(session, outcome.final_text)
             self._reconcile_vault_terminal(session, STATUS_COMPLETED)
+            if session.origin != "operator" and not session.parent_session_id:
+                self._record_card_outcome(
+                    session, outcome.final_text, git_result=git_result,
+                )
             # A reply that arrived MID-RUN (status-anchor route) is
             # queued in pending_messages with nothing to deliver it — the
             # dispatch tick only drains CLAIMED sessions. Reopen once the
@@ -3866,6 +4326,15 @@ class Worker:
             # just skip the spurious "failed" notice + web mirror. (Status
             # persistence and vault reconciliation below still run.)
             notice = f"⚠️ {label} failed: {outcome.reason}."
+        # A session that stopped without completing may still have left
+        # real, uncommitted work in its worktree — commit and push it as a
+        # safety net regardless of why the session stopped (including an
+        # operator kill, which never gets a notice of its own — folded into
+        # `notice` only when one exists). No-ops for a session with no
+        # worker-provisioned worktree.
+        git_result = self._finalize_worktree_for_session(session, task, outcome, open_pr=False)
+        if notice:
+            notice = _with_git_status_note(notice, git_result, want_pr=False)
         # spawned children stay silent to the operator on failure/budget
         # too — the parent's resume turn carries the child's [failed] /
         # [budget_exceeded] status header, so the notice would be duplicate
@@ -3920,7 +4389,9 @@ class Worker:
         )
         self._reconcile_vault_terminal(session, outcome.status)
 
-    def _send_session_message(self, session, body: str) -> None:
+    def _send_session_message(
+        self, session, body: str, *, want_id: bool = True, fallback_on_failure: bool = True,
+    ) -> list[int]:
         """Send an operator-facing session message (streamed [NOTIFY] body,
         heartbeat) with reply-anchor registration: the message ends with the
         "reply in thread" footer, its Telegram message id(s) are captured and
@@ -3928,27 +4399,66 @@ class Worker:
         into the session as a context note. Falls back to the plain
         one-way sender (no footer — the affordance would be a lie) when id
         capture is unavailable or fails.
+
+        `want_id=False` skips the id-capturing attempt entirely and sends
+        the plain one-way form directly — for a caller (a bounded delivery
+        retry loop's own final escalation notice) that has already decided
+        no reply anchor will exist for this message, where an id attempt
+        would only cost another round-trip to a surface just shown to be
+        down. `fallback_on_failure=False` disables the automatic plain-send
+        fallback on a failed id attempt — for a caller (the retry loop
+        itself) that is about to try again and would otherwise have this
+        method silently deliver an anchorless duplicate on every failed
+        attempt before a later one succeeds.
         """
         bot = session.bot
-        text = _with_reply_footer(body)
+        task = self._fetch_task(session.task_id)
+        title = ((task or {}).get("description") or session.task_id).strip()
+        if len(title) > 72:
+            title = title[:69].rstrip() + "…"
+        safe_title = re.sub(r"([_*\[\]()`])", r"\\\1", title)
+        for footer in (REPLYABLE_FOOTER, NO_REPLY_FOOTER):
+            suffix = f"\n\n{footer}"
+            if body.endswith(suffix):
+                body = body[:-len(suffix)]
+                break
+        prefixed_body = f"📌 {safe_title}\n\n{body}"
+        if not want_id:
+            try:
+                if bot:
+                    self._telegram_send(prefixed_body, bot=bot)
+                else:
+                    self._telegram_send(prefixed_body)
+            except Exception as exc:  # pragma: no cover — defensive
+                logger.warning("session message plain send failed for %s: %s",
+                               session.task_id, exc)
+            return []
+        text = _with_reply_footer(prefixed_body)
+        reply_to_message_id = self.session_store.get_first_reply_anchor(
+            session.session_id, bot=bot,
+        )
         try:
             sent_ids = (
-                self._telegram_send_with_id(text, bot=bot) if bot
-                else self._telegram_send_with_id(text)
+                self._telegram_send_with_id(
+                    text, bot=bot, reply_to_message_id=reply_to_message_id,
+                ) if bot else self._telegram_send_with_id(
+                    text, reply_to_message_id=reply_to_message_id,
+                )
             ) or []
         except Exception as exc:
             logger.warning("session message send (with id) failed for %s: %s",
                            session.task_id, exc)
             sent_ids = []
         if not sent_ids:
-            try:
-                if bot:
-                    self._telegram_send(body, bot=bot)
-                else:
-                    self._telegram_send(body)
-            except Exception as exc:  # pragma: no cover — defensive
-                logger.warning("session message fallback send failed: %s", exc)
-            return
+            if fallback_on_failure:
+                try:
+                    if bot:
+                        self._telegram_send(prefixed_body, bot=bot)
+                    else:
+                        self._telegram_send(prefixed_body)
+                except Exception as exc:  # pragma: no cover — defensive
+                    logger.warning("session message fallback send failed: %s", exc)
+            return []
         try:
             self.session_store.add_reply_anchors(
                 session.session_id, session.task_id, sent_ids, bot=bot,
@@ -3957,6 +4467,7 @@ class Worker:
         except Exception as exc:  # best-effort — a lost anchor only loses
             logger.warning("reply-anchor registration failed for %s: %s",
                            session.task_id, exc)  # the reply route, not the message
+        return sent_ids
 
     def _get_claude_code_executor(self, bot: str | None = None):
         """Lazy-construct the ClaudeCodeExecutor for /claude sessions.
@@ -4001,12 +4512,19 @@ class Worker:
         """Drive one ``routing='codex'`` session through ``CodexExecutor``.
 
         Mirrors ``_dispatch_claude_code_session`` but without plan-mode /
-        [CLARIFY] branches — Codex doesn't have those conventions. A
-        completed session relays its final agent message to the operator's
-        chat and registers it as a follow-up anchor so a threaded reply
-        resumes the session.
+        goal-approval branches — Codex has no such conventions. It does
+        share the ``[CLARIFY]`` question-pause path: a final message ending
+        in ``[CLARIFY] <question>`` comes back from the executor as
+        ``STATUS_BLOCKED``, handled the same way Claude Code's live
+        ``[CLARIFY]`` is (push, no pull request, register an answer anchor,
+        Human queue lane). A completed session relays its final agent
+        message to the operator's chat and registers it as a follow-up
+        anchor so a threaded reply resumes the session.
         """
-        from api.services.agent_worker.codex_executor import REASON_KILLED
+        from api.services.agent_worker.codex_executor import (
+            REASON_AWAITING_CLARIFICATION,
+            REASON_KILLED,
+        )
         from api.services.agent_worker.codex_spawn import parse_codex_spawn_payload
 
         if session.origin != "operator" and not session.parent_session_id:
@@ -4043,7 +4561,8 @@ class Worker:
                 attempt_id=session.attempt_id, turn_id=session.turn_id,
             )
             try:
-                self._telegram_send(
+                self._send_session_message(
+                    session,
                     "⚠️ A codex session may have already started before it could be "
                     "resumed safely, so it wasn't retried automatically. It's marked "
                     "failed — re-trigger it to retry."
@@ -4054,15 +4573,20 @@ class Worker:
             return
 
         if is_resume:
-            # All drained messages ride the resume turn in order — same
+            # All peeked messages ride the resume turn in order — same
             # multi-enqueue rationale as the claude_code dispatch above
             # (a codex child can collect both an operator threaded reply
-            # and a parent reopen answer before the tick claims it).
+            # and a parent reopen answer before the tick claims it). Not
+            # yet marked delivered — see `_confirm_resume_or_requeue`.
             resume_message = "\n\n".join(m["content"] for m in pending) if pending else ""
+            pending_ids = [m["id"] for m in pending if "id" in m]
             task: dict = {"id": session.task_id, "description": resume_message}
             self.transcript_store.append(sid, "codex_user_prompt", {
                 "text": resume_message, "resume": True,
             })
+            prior_launches = self._cli_subprocess_launch_count(
+                sid, "codex_spawn", "codex_binary_not_found"
+            )
             try:
                 spec = (
                     ExecutionSpec.from_dict(session.execution_spec)
@@ -4082,8 +4606,28 @@ class Worker:
                     session.task_id, STATUS_FAILED,
                     attempt_id=session.attempt_id, turn_id=session.turn_id,
                 )
+                self._confirm_resume_or_requeue(
+                    session, sid, pending_ids, prior_launches,
+                    spawn_kind="codex_spawn", not_found_kind="codex_binary_not_found",
+                    report_failure=True,
+                )
                 return
+            # Mirrors the claude_code dispatch: the reply-time ack only ever
+            # promises the note is queued — confirm the turn actually
+            # launched a subprocess before claiming it resumed or marking
+            # the note delivered. A non-launch here falls through to the
+            # shared FAILED-outcome handling below rather than being
+            # reported here too — see the matching claude_code comment.
+            self._confirm_resume_or_requeue(
+                session, sid, pending_ids, prior_launches,
+                spawn_kind="codex_spawn", not_found_kind="codex_binary_not_found",
+                report_failure=False,
+            )
         else:
+            # See the claude_code dispatch's matching comment: the caller
+            # already drained this fresh dispatch's one spawn-payload row
+            # eagerly, attempt/turn-fenced — there's no later confirmation
+            # point to defer to here the way the resume branch has.
             payload = parse_codex_spawn_payload(pending[0]["content"]) if pending else {
                 "prompt": "", "working_dir": None, "chat_id": None,
             }
@@ -4119,6 +4663,77 @@ class Worker:
             return
         session = current
 
+        if outcome.status == STATUS_BLOCKED and outcome.reason == REASON_AWAITING_CLARIFICATION:
+            question_body = (outcome.final_text or "").strip()
+            prompt = (
+                f"{question_body}\n\nAnswer by replying to this message." if question_body
+                else "Awaiting your reply — reply to this message to continue."
+            )
+            # A session pausing for the operator's input pushes whatever it
+            # committed so far — no pull request yet. No-ops for a session
+            # with no worker-provisioned worktree.
+            git_result = self._finalize_worktree_for_session(session, task, outcome, open_pr=False)
+            prompt = _with_git_status_note(prompt, git_result, want_pr=False)
+            sent_ids: list = []
+            for attempt in range(_BLOCKED_PROMPT_SEND_ATTEMPTS):
+                try:
+                    # `fallback_on_failure=False` — a failed attempt here is
+                    # retried, not silently delivered anchorless ahead of a
+                    # later attempt that succeeds.
+                    sent_ids = self._send_session_message(
+                        session, prompt, fallback_on_failure=False,
+                    ) or []
+                except Exception as exc:
+                    logger.warning(
+                        "codex blocked reply prompt send failed (attempt %d/%d): %s",
+                        attempt + 1, _BLOCKED_PROMPT_SEND_ATTEMPTS, exc,
+                    )
+                    sent_ids = []
+                if sent_ids:
+                    break
+                if attempt + 1 < _BLOCKED_PROMPT_SEND_ATTEMPTS and _BLOCKED_PROMPT_RETRY_DELAY_S:
+                    time.sleep(_BLOCKED_PROMPT_RETRY_DELAY_S)
+            if sent_ids:
+                self.session_store.create_pending_question(
+                    session_id=sid,
+                    task_id=session.task_id,
+                    question=prompt,
+                    sent_message_id=sent_ids[0],
+                    sent_message_ids=sent_ids,
+                    kind="followup",
+                    attempt_id=session.attempt_id,
+                    turn_id=session.turn_id,
+                )
+                self.transcript_store.append(sid, "codex_block_prompt_registered", {
+                    "reason": outcome.reason, "message_ids": sent_ids,
+                })
+                # Human queue lane — `_resume_as_followup` swaps it back to
+                # running once the operator answers.
+                self._reconcile_vault_terminal(session, STATUS_BLOCKED)
+                return
+            # Delivery failed after every retry — no anchor for the operator
+            # to reply to, so escalate instead of leaving it silently stuck.
+            self.transcript_store.append(sid, "codex_block_prompt_undelivered", {
+                "reason": outcome.reason, "attempts": _BLOCKED_PROMPT_SEND_ATTEMPTS,
+            })
+            self.session_store.update_status(
+                session.task_id, STATUS_FAILED,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
+            try:
+                # `want_id=False` — the surface just failed every retry, so
+                # this best-effort notice doesn't cost it another round-trip.
+                self._send_session_message(
+                    session,
+                    "⚠️ A codex session needs your input, but the question couldn't be "
+                    "delivered. It was marked failed — re-trigger it to retry.",
+                    want_id=False,
+                )
+            except Exception as exc:  # best-effort; the surface may be down
+                logger.warning("codex blocked-session escalation send failed: %s", exc)
+            self._reconcile_vault_terminal(session, STATUS_FAILED)
+            return
+
         if outcome.status == STATUS_COMPLETED:
             # parity with the claude_code gate — a clean exit doesn't
             # mean the agent finished. Codex has no [NOTIFY] convention, so
@@ -4138,9 +4753,14 @@ class Worker:
             # matters for reopen-on-send: an operator threaded reply and
             # a parent answer must not both enqueue against the same child.
             body = outcome.final_text.strip() if outcome.final_text else ""
+            # A fully-complete session pushes its branch and opens a pull
+            # request — parity with the claude_code branch. No-ops for a
+            # session with no worker-provisioned worktree.
+            git_result = self._finalize_worktree_for_session(session, task, outcome, open_pr=True)
+            body = _with_git_status_note(body, git_result, want_pr=True)
             if body and not session.parent_session_id:
                 try:
-                    sent_ids = self._telegram_send_with_id(body) or []
+                    sent_ids = self._send_session_message(session, body) or []
                 except Exception as exc:
                     logger.warning("codex completion send failed: %s", exc)
                     sent_ids = []
@@ -4167,6 +4787,10 @@ class Worker:
             })
             self._apply_repair_result(session, outcome.final_text)
             self._reconcile_vault_terminal(session, STATUS_COMPLETED)
+            if session.origin != "operator" and not session.parent_session_id:
+                self._record_card_outcome(
+                    session, outcome.final_text, git_result=git_result,
+                )
             return
 
         label = "Codex session"
@@ -4179,11 +4803,18 @@ class Worker:
             # claude_code dispatch; status persistence + vault reconciliation
             # below still run.
             notice = f"⚠️ {label} failed: {outcome.reason}."
+        # Safety-net commit + push any uncommitted worktree changes,
+        # regardless of why the session stopped — parity with the
+        # claude_code branch. No-ops for a session with no
+        # worker-provisioned worktree.
+        git_result = self._finalize_worktree_for_session(session, task, outcome, open_pr=False)
+        if notice:
+            notice = _with_git_status_note(notice, git_result, want_pr=False)
         # spawned children stay silent to the operator on failure/budget
         # too — parity with the claude_code branch; the parent's resume turn
         # carries the child's terminal status header.
         if notice and not session.parent_session_id:
-            self._telegram_send(notice)
+            self._send_session_message(session, notice)
             # mirror the same failure/budget notice into the web/voice
             # thread (no-op for Telegram-origin). A child is never
             # conversation-linked, so the child gate above also keeps this correct.
@@ -4209,6 +4840,7 @@ class Worker:
             session_store=self.session_store,
             transcript_store=self.transcript_store,
             notification_callback=self._telegram_send,
+            operator_send=self._send_session_message,
         )
         return self._codex_executor
 
@@ -4224,7 +4856,9 @@ class Worker:
         )
         return self._hermes_executor
 
-    def _fetch_task(self, task_id: str) -> dict[str, Any] | None:
+    def _fetch_task(
+        self, task_id: str, *, distinguish_failure: bool = False,
+    ) -> dict[str, Any] | None | object:
         try:
             resp = self._http.get(f"{self.api_base}/api/tasks/{task_id}")
             if resp.status_code == 404:
@@ -4236,11 +4870,11 @@ class Worker:
             # an empty object). Treat malformed/mismatched payloads as an
             # unavailable recheck rather than a false ownership signal.
             if not isinstance(payload, dict) or payload.get("id") != task_id:
-                return None
+                return _TASK_FETCH_FAILED if distinguish_failure else None
             return payload
         except Exception as exc:
             logger.warning("fetch_task %s failed: %s", task_id, exc)
-            return None
+            return _TASK_FETCH_FAILED if distinguish_failure else None
 
     def _last_reassignment(self, session_id: str) -> dict[str, Any] | None:
         """Return the latest board reassign marker, if any."""
@@ -4607,6 +5241,33 @@ class Worker:
         # model pins are scoped to that resolved route and cannot leak across
         # a later explicit engine override.
         from api.services.directory_resolver import resolve_working_directory
+        # Scheduled handoffs may carry an explicit canonical working
+        # directory in task fields; otherwise retain the legacy
+        # description-based resolver.
+        candidate_working_dir = (
+            (task.get("fields") or {}).get("working_dir") or resolve_working_directory(title)
+        )
+        # A fresh CLI-routed dispatch (Claude Code, Codex) never runs
+        # directly in whatever directory the resolver above picked — that
+        # can be the operator's own primary checkout, the exact working
+        # tree the production API server runs from. When the resolved
+        # directory is inside a git repository, give the session its own
+        # worktree and branch instead, so it commits, pushes, and opens a
+        # pull request the way every other change in this project is made.
+        # An explicit remote-host assignment doesn't skip this — `host` is
+        # passed straight through to `ensure_worktree`, which provisions
+        # over ssh on that same host (never this worker's own filesystem
+        # standing in for it) and fails the task closed if the host isn't
+        # registered. A directory that isn't a git repository at all is
+        # unaffected either way — `ensure_worktree` returns it verbatim.
+        if pre.routing in (ROUTE_CLAUDE_CODE, ROUTE_CODEX):
+            from api.services.agent_worker.git_worktree import WorktreeError, ensure_worktree
+            try:
+                provisioned = ensure_worktree(candidate_working_dir, task_id, title, host=assignment.host)
+            except WorktreeError as exc:
+                self._mark_failed(session, task, f"worktree provisioning failed: {exc}")
+                return
+            candidate_working_dir = provisioned.working_dir
         execution = self._resolve_session_execution(
             session,
             request=ExecutionRequest(),
@@ -4614,11 +5275,7 @@ class Worker:
                 assignment, executor=pre.routing,
             ),
             workflow=pre.execution_layer(
-                # Scheduled handoffs may carry an explicit canonical working
-                # directory in task fields; otherwise retain the legacy
-                # description-based resolver.
-                working_dir=(task.get("fields") or {}).get("working_dir")
-                or resolve_working_directory(title),
+                working_dir=candidate_working_dir,
             ),
         )
         if not execution.ok:
@@ -4917,6 +5574,8 @@ class Worker:
                 # follow-up turn (e.g., "now turn this into a .md in my vault").
                 body = self._completion_summary(session, task, outcome)
                 self._notify_terminal(session, body, label=title)
+                if has_vault_task:
+                    self._record_card_outcome(session, body)
             else:
                 # Child completion — record only; parent picks it up via yield_until.
                 self.transcript_store.append(sid, "child_completed_internal", {
@@ -5686,7 +6345,10 @@ class Worker:
             return self._raw_telegram_send(text, bot=bot)
         return self._raw_telegram_send(text)
 
-    def _send_on_channel_with_id(self, text: str, chat_id=None, bot: str | None = None):
+    def _send_on_channel_with_id(
+        self, text: str, chat_id=None, bot: str | None = None,
+        reply_to_message_id: int | None = None,
+    ):
         """Deliver one operator-facing message and return the ids a reply can
         be matched against.
 
@@ -5698,9 +6360,12 @@ class Worker:
         """
         if bot == HERMES_CHANNEL:
             return []
+        kwargs = {}
+        if reply_to_message_id is not None:
+            kwargs["reply_to_message_id"] = reply_to_message_id
         if bot:
-            return self._raw_telegram_send_with_id(text, bot=bot)
-        return self._raw_telegram_send_with_id(text)
+            return self._raw_telegram_send_with_id(text, bot=bot, **kwargs)
+        return self._raw_telegram_send_with_id(text, **kwargs)
 
     def _notify(self, text: str, bot: str | None = None) -> None:
         try:
@@ -5727,12 +6392,16 @@ class Worker:
             self._notify(body, bot=channel)
             return
         sent_ids: list[int] = []
+        delivery_attempted = False
         try:
-            sent_ids = self._telegram_send_with_id(_with_reply_footer(body)) or []
+            sent_ids = self._send_session_message(session, body) or []
+            delivery_attempted = True
         except Exception as exc:
             logger.warning("terminal notify (with id) failed for %s: %s", session.task_id, exc)
-        if not sent_ids:
+        if not delivery_attempted:
             self._notify(body)  # no registered anchor → no (false) footer
+            return
+        if not sent_ids:
             return
         try:
             self.session_store.register_completion_followup(

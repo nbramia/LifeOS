@@ -1,7 +1,7 @@
 # Scripts Reference
 
 > **Status:** Complete
-> **Last Updated:** 2026-09-16
+> **Last Updated:** 2026-09-18
 > **Audience:** Operators
 
 Reference for the operator-facing scripts under `scripts/`, with usage examples. One-off CRM entity-repair scripts (`merge_people.py`, `split_person.py`, `fix_*`, etc.), git hooks, and Claude Code worktree/session-diagnostic helpers aren't covered here — they're self-documenting via `--help` or their own docstring.
@@ -338,6 +338,8 @@ Installs and enables:
 - **Services** — `lifeos-api`, `lifeos-chromadb`, `lifeos-llm` (local LLM; enabled only when `LIFEOS_LOCAL_LLM_AUTOSTART=true`), `lifeos-mcp-http` (enabled only when `LIFEOS_MCP_BEARER_TOKEN` is set), `lifeos-agent-worker` (enabled only when `LIFEOS_AGENT_WORKER_AUTOSTART=true`).
 - **Timers** — `lifeos-watchdog`, `lifeos-server-watchdog`, `lifeos-gpu-watchdog`, `lifeos-network-watchdog`, `lifeos-sync` (nightly unified sync), and `lifeos-autodeploy` (enabled only when `LIFEOS_AUTODEPLOY_ENABLED=true`).
 - **Supporting config** — a logrotate rule (`/etc/logrotate.d/lifeos`), a passwordless-`systemctl` sudoers rule (`/etc/sudoers.d/lifeos`) so `server.sh` and the sync scripts can manage units without a password, and an 8 GB swap file as an OOM safety net (created only if no swap is already active).
+
+The logrotate rule covers `logs/server.log`, `logs/agent-worker.log`, and the other files under `logs/*.log`. It rotates them daily, retains seven compressed rotations, skips missing or empty logs, and uses `copytruncate` so systemd services continue writing to the active paths without a restart or reload. The installed host copy is generated from `config/logrotate-lifeos.conf` only when `sudo ./scripts/setup-systemd.sh` runs; re-run that command to apply template updates to `/etc/logrotate.d/lifeos`.
 
 ---
 
