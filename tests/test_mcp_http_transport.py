@@ -9,6 +9,7 @@ monkey-patching `LifeOSMCPServer._call_api`.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 import pytest
@@ -296,3 +297,127 @@ def test_stdio_notification_returns_none(server: mcp_server.LifeOSMCPServer):
         {"jsonrpc": "2.0", "method": "notifications/initialized"},
     )
     assert response is None
+
+
+# ---------------------------------------------------------------------------
+# Tool allowlist enforcement at the transport level. `server`/`client` above
+# build a plain `LifeOSMCPServer()` (no allowlist) — the shape the existing
+# :8765 instance runs today — so those fixtures double as the "unaffected
+# behavior" baseline here.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_unset_allowlist_lists_and_calls_every_tool(client: TestClient, bearer_token: str, server: mcp_server.LifeOSMCPServer):
+    """The existing :8765 instance (no allowlist configured) must keep
+    listing and accepting every registered tool — the allowlist mechanism
+    is opt-in and must not narrow default behavior."""
+    list_resp = client.post(
+        "/mcp",
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        headers={"Authorization": f"Bearer {bearer_token}"},
+    )
+    listed_names = {t["name"] for t in list_resp.json()["result"]["tools"]}
+    assert listed_names == {t["name"] for t in server.tools}
+    assert len(listed_names) > 1
+
+    for name in listed_names:
+        call_resp = client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": name, "arguments": {}}},
+            headers={"Authorization": f"Bearer {bearer_token}"},
+        )
+        body = call_resp.json()
+        assert "result" in body, f"{name} was rejected instead of dispatched: {body}"
+        assert body["result"].get("isError") is not True
+
+
+@pytest.mark.unit
+def test_disallowed_tool_rejected_before_call_api(bearer_token: str, monkeypatch):
+    """A tool outside the configured allowlist must be rejected by
+    tools/call without `_call_api` (and therefore the LifeOS API) ever being
+    reached — and hidden from tools/list, the same boundary."""
+    restricted = mcp_server.LifeOSMCPServer(allowed_tools=frozenset({"lifeos_health"}))
+
+    def _fail_if_called(self, tool_name, arguments):
+        raise AssertionError(f"_call_api must not be reached for {tool_name!r}")
+
+    monkeypatch.setattr(mcp_server.LifeOSMCPServer, "_call_api", _fail_if_called)
+    app = mcp_server.build_http_app(restricted, bearer_token=bearer_token)
+    restricted_client = TestClient(app)
+
+    list_resp = restricted_client.post(
+        "/mcp",
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        headers={"Authorization": f"Bearer {bearer_token}"},
+    )
+    listed_names = {t["name"] for t in list_resp.json()["result"]["tools"]}
+    assert listed_names == {"lifeos_health"}
+    assert "lifeos_search" not in listed_names
+
+    call_resp = restricted_client.post(
+        "/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "lifeos_search", "arguments": {"query": "hello"}},
+        },
+        headers={"Authorization": f"Bearer {bearer_token}"},
+    )
+    assert call_resp.status_code == 200
+    body = call_resp.json()
+    assert body["result"]["isError"] is True
+
+
+@pytest.mark.unit
+def test_bearer_token_redaction_filter_redacts_message():
+    """Unit-level check of the redaction logic itself, independent of
+    logger/handler wiring: a record whose rendered message contains an
+    `Authorization: Bearer <token>` header comes back with the token
+    redacted, never verbatim."""
+    from api.services.log_redaction import BearerTokenRedactionFilter
+
+    secret = "super-secret-instinct-token-abc123"
+    record = logging.LogRecord(
+        name="mcp_server", level=logging.ERROR, pathname=__file__, lineno=1,
+        msg=f"unexpected failure — Authorization: Bearer {secret}", args=(), exc_info=None,
+    )
+    BearerTokenRedactionFilter().filter(record)
+    assert secret not in record.getMessage()
+    assert "Bearer <REDACTED>" in record.getMessage()
+
+
+@pytest.mark.unit
+def test_build_http_app_installs_bearer_redaction_filter(server: mcp_server.LifeOSMCPServer, bearer_token: str):
+    """`build_http_app` must wire the backstop redaction filter onto the
+    process's root logger — not just define it. Starts from a clean slate
+    (stripping any instance a prior test's `build_http_app` call already
+    installed) so this only passes if *this* call installed one."""
+    from api.services.log_redaction import BearerTokenRedactionFilter
+
+    root = logging.getLogger()
+    for f in list(root.filters):
+        if isinstance(f, BearerTokenRedactionFilter):
+            root.removeFilter(f)
+    for h in root.handlers:
+        for f in list(h.filters):
+            if isinstance(f, BearerTokenRedactionFilter):
+                h.removeFilter(f)
+    assert not any(isinstance(f, BearerTokenRedactionFilter) for f in root.filters)
+
+    mcp_server.build_http_app(server, bearer_token=bearer_token)
+
+    assert any(isinstance(f, BearerTokenRedactionFilter) for f in root.filters)
+
+
+@pytest.mark.unit
+def test_401_response_body_never_contains_the_token(client: TestClient, bearer_token: str):
+    """The 401 paths (missing/wrong credential) must never echo the
+    configured bearer token back in the response body."""
+    resp = client.post(
+        "/mcp",
+        json=_initialize_request(),
+        headers={"Authorization": "Bearer wrong-token"},
+    )
+    assert resp.status_code == 401
+    assert bearer_token not in resp.text

@@ -23,6 +23,7 @@ This directory contains operational guides — how to set up, configure, and run
 - `human-queue.md` — Human queue: fire-and-forget cards agents file for the operator, `done_when` auto-resolve
 - `home-eero.md` — Home — eero: pause/resume household internet access, login, target config, Private Wi-Fi Address, failure alerts
 - `agent-worker-setup.md` — External agent worker prerequisites (Gemma swap, MCP HTTP transport, Cloudflare Tunnel, bearer token)
+- `instinct-mcp-access.md` — Dedicated Instinct MCP HTTP instance: own credential, required tool allowlist, rotation/revocation/teardown
 - `agents-go-to.md` — /agents "Go To" wezterm pane setup (SessionStart hook + FD probe)
 
 ## Key Principles

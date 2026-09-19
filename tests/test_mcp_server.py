@@ -1206,3 +1206,102 @@ class TestWriteEndpointNeverReturnsSuccessShapedFailure:
                 "— remove it from _KNOWN_EXEMPTIONS and its note in "
                 "docs/specs/technical/architecture.md"
             )
+
+
+# ---------------------------------------------------------------------------
+# Per-instance tool allowlist (LifeOSMCPServer's `allowed_tools` kwarg) and
+# the env-var resolution the HTTP transport's `main()` uses to build it
+# (`_load_http_config`). The default (unnamed) HTTP instance passes
+# `allowed_tools=None` and must be unaffected; a named instance (e.g.
+# "instinct") requires both its own credential and a non-empty allowlist.
+# ---------------------------------------------------------------------------
+
+def _load_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.unit
+def test_allowlist_none_keeps_full_tool_set():
+    """`allowed_tools=None` — what the default (unnamed) HTTP instance and
+    the stdio transport both use — must register exactly the same tools as
+    not passing the kwarg at all."""
+    module = _load_module()
+    baseline = {t["name"] for t in module.LifeOSMCPServer().tools}
+    explicit_none = {t["name"] for t in module.LifeOSMCPServer(allowed_tools=None).tools}
+    assert explicit_none == baseline
+    assert len(baseline) > 1
+
+
+@pytest.mark.unit
+def test_allowlist_restricts_tool_set():
+    """A non-None allowlist narrows `self.tools` to exactly those names —
+    the mechanism `_apply_tool_allowlist` implements."""
+    module = _load_module()
+    server = module.LifeOSMCPServer(allowed_tools=frozenset({"lifeos_health", "lifeos_search"}))
+    assert {t["name"] for t in server.tools} == {"lifeos_health", "lifeos_search"}
+
+
+@pytest.mark.unit
+def test_allowlist_unknown_tool_name_raises():
+    """An allowlist entry that doesn't match any registered tool (a typo)
+    fails construction instead of silently granting a smaller-than-intended
+    tool set."""
+    module = _load_module()
+    with pytest.raises(ValueError, match="not_a_real_tool_xyz"):
+        module.LifeOSMCPServer(allowed_tools=frozenset({"lifeos_health", "not_a_real_tool_xyz"}))
+
+
+@pytest.mark.unit
+def test_load_http_config_default_instance_missing_token_raises(monkeypatch):
+    module = _load_module()
+    monkeypatch.delenv("LIFEOS_MCP_BEARER_TOKEN", raising=False)
+    with pytest.raises(module._HTTPStartupError, match="LIFEOS_MCP_BEARER_TOKEN"):
+        module._load_http_config("")
+
+
+@pytest.mark.unit
+def test_load_http_config_default_instance_allowlist_optional(monkeypatch):
+    """The existing (unnamed) instance must not require an allowlist —
+    unset it keeps behaving as it does today: every tool stays callable."""
+    module = _load_module()
+    monkeypatch.setenv("LIFEOS_MCP_BEARER_TOKEN", "test-token")
+    monkeypatch.delenv("LIFEOS_MCP_ALLOWED_TOOLS", raising=False)
+    token, allowed_tools = module._load_http_config("")
+    assert token == "test-token"
+    assert allowed_tools is None
+
+
+@pytest.mark.unit
+def test_load_http_config_named_instance_missing_token_raises(monkeypatch):
+    """A named instance reads a distinct, instance-prefixed credential
+    env var — not the default instance's LIFEOS_MCP_BEARER_TOKEN."""
+    module = _load_module()
+    monkeypatch.setenv("LIFEOS_MCP_BEARER_TOKEN", "default-instance-token")
+    monkeypatch.delenv("LIFEOS_MCP_INSTINCT_BEARER_TOKEN", raising=False)
+    with pytest.raises(module._HTTPStartupError, match="LIFEOS_MCP_INSTINCT_BEARER_TOKEN"):
+        module._load_http_config("instinct")
+
+
+@pytest.mark.unit
+def test_load_http_config_named_instance_missing_allowlist_raises(monkeypatch):
+    """A named instance must fail closed without an allowlist, the same
+    posture as a missing credential — even when its token is configured."""
+    module = _load_module()
+    monkeypatch.setenv("LIFEOS_MCP_INSTINCT_BEARER_TOKEN", "instinct-token")
+    monkeypatch.delenv("LIFEOS_MCP_INSTINCT_ALLOWED_TOOLS", raising=False)
+    with pytest.raises(module._HTTPStartupError, match="LIFEOS_MCP_INSTINCT_ALLOWED_TOOLS"):
+        module._load_http_config("instinct")
+
+
+@pytest.mark.unit
+def test_load_http_config_named_instance_with_allowlist_ok(monkeypatch):
+    module = _load_module()
+    monkeypatch.setenv("LIFEOS_MCP_INSTINCT_BEARER_TOKEN", "instinct-token")
+    monkeypatch.setenv("LIFEOS_MCP_INSTINCT_ALLOWED_TOOLS", "lifeos_health, lifeos_search")
+    token, allowed_tools = module._load_http_config("instinct")
+    assert token == "instinct-token"
+    assert allowed_tools == frozenset({"lifeos_health", "lifeos_search"})

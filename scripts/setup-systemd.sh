@@ -58,6 +58,8 @@ LLM_MODEL_PATH=$(_read_env "LIFEOS_LLM_MODEL_PATH" "")
 LLM_MMPROJ_PATH=$(_read_env "LIFEOS_LLM_MMPROJ_PATH" "")
 LLM_AUTOSTART=$(_read_env "LIFEOS_LOCAL_LLM_AUTOSTART" "false")
 MCP_BEARER_TOKEN=$(_read_env "LIFEOS_MCP_BEARER_TOKEN" "")
+INSTINCT_MCP_BEARER_TOKEN=$(_read_env "LIFEOS_MCP_INSTINCT_BEARER_TOKEN" "")
+INSTINCT_MCP_ALLOWED_TOOLS=$(_read_env "LIFEOS_MCP_INSTINCT_ALLOWED_TOOLS" "")
 AGENT_WORKER_AUTOSTART=$(_read_env "LIFEOS_AGENT_WORKER_AUTOSTART" "false")
 AUTODEPLOY_ENABLED=$(_read_env "LIFEOS_AUTODEPLOY_ENABLED" "false")
 
@@ -118,6 +120,11 @@ if [ -n "$MCP_BEARER_TOKEN" ]; then
     echo "  MCP HTTP:   enabled (token configured)"
 else
     echo "  MCP HTTP:   disabled (set LIFEOS_MCP_BEARER_TOKEN to enable)"
+fi
+if [ -n "$INSTINCT_MCP_BEARER_TOKEN" ] && [ -n "$INSTINCT_MCP_ALLOWED_TOOLS" ]; then
+    echo "  MCP Instinct: enabled (token + allowlist configured)"
+else
+    echo "  MCP Instinct: disabled (set LIFEOS_MCP_INSTINCT_BEARER_TOKEN and LIFEOS_MCP_INSTINCT_ALLOWED_TOOLS to enable)"
 fi
 echo "  Agent Worker: $AGENT_WORKER_AUTOSTART"
 echo "  Auto-Deploy:  $AUTODEPLOY_ENABLED"
@@ -193,6 +200,21 @@ else
     echo "  lifeos-mcp-http: disabled (set LIFEOS_MCP_BEARER_TOKEN to enable)"
 fi
 
+# The dedicated Instinct MCP instance uses its own credential and a required
+# tool allowlist (a separate process from lifeos-mcp-http, so rotating or
+# revoking either credential never affects the other client). It's only
+# enabled when both are configured — mcp_server.py's `--instance` handling
+# already refuses to start on just a token with no allowlist, so there's no
+# point enabling the unit with one but not the other.
+if [ -n "$INSTINCT_MCP_BEARER_TOKEN" ] && [ -n "$INSTINCT_MCP_ALLOWED_TOOLS" ]; then
+    systemctl enable --now lifeos-mcp-instinct.service
+    echo "  lifeos-mcp-instinct: $(systemctl is-active lifeos-mcp-instinct.service)"
+else
+    systemctl disable lifeos-mcp-instinct.service 2>/dev/null || true
+    systemctl stop lifeos-mcp-instinct.service 2>/dev/null || true
+    echo "  lifeos-mcp-instinct: disabled (set LIFEOS_MCP_INSTINCT_BEARER_TOKEN and LIFEOS_MCP_INSTINCT_ALLOWED_TOOLS to enable)"
+fi
+
 # Agent worker is opt-in via LIFEOS_AGENT_WORKER_AUTOSTART. Off by default
 # so fresh clones don't start polling the task list with no preflight call
 # wired up. Issue B installs the no-op dispatcher; later issues add real
@@ -241,7 +263,7 @@ TMP_SUDOERS=$(mktemp)
 # failed state. lifeos-llm intentionally lacks `restart` because of GPU
 # memory cleanup concerns — operator uses stop + start instead.
 _sudo_cmds=()
-for unit in lifeos-api lifeos-mcp-http lifeos-agent-worker; do
+for unit in lifeos-api lifeos-mcp-http lifeos-mcp-instinct lifeos-agent-worker; do
     for verb in start stop restart reset-failed; do
         _sudo_cmds+=("/usr/bin/systemctl $verb $unit" "/usr/bin/systemctl $verb $unit.service")
     done
