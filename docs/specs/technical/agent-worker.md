@@ -760,6 +760,16 @@ valid; Hermes specifically requires a `done` event, non-empty content, and no
 error. Session/attempt identity and usage fields are transport data; ledger and
 served-model provenance remains owned by the usage ledger.
 
+Project-handoff recovery preserves the source turn fence across process
+restarts. Reconciliation can activate staged children and the bounded
+coordinator only after it verifies the persisted source session, attempt, and
+turn have quiesced. A missing, unsupported, or failed executor stop remains a
+pending handoff; recovery neither clears the source pause nor re-arms ordinary
+execution. The existing scoped project cancellation path is also fenced by
+verified teardown, so it may remain pending and be retried without reporting a
+false terminal outcome. This applies to an interrupted stage before any child
+exists as well as to an already-derived project.
+
 `SessionStore` persists an immutable `attempt_id` and attempt number for each
 deliberate execution, plus a new immutable `turn_id` for every executor start
 or native continuation. The current ids are mirrored on `sessions`; additive

@@ -475,27 +475,39 @@ def project_action_policy(
     *,
     hierarchy_valid: bool = True,
     execution_paused: bool = False,
+    handoff_pending: bool = False,
 ) -> dict[str, bool]:
     """Pure project/paused-task action availability for board consumers."""
     summary = project_summary or {}
     coordinator = summary.get("coordinator") or {}
     live = bool(coordinator.get("live"))
     pending = bool(summary.get("cancellation_pending"))
+    handoff_pending = bool(handoff_pending or summary.get("handoff_pending"))
     is_project = bool(project_summary)
     terminal = (current_status or "").lower() in {"done", "cancelled"}
     agent_owner = derive_assignee(current_tags) in AGENT_ASSIGNEES
     return {
-        "can_start_project": bool(is_project and hierarchy_valid and not terminal and not live and not pending),
-        "can_plan_project": bool(is_project and agent_owner and hierarchy_valid and not terminal and not live and not pending),
+        "can_start_project": bool(
+            is_project and hierarchy_valid and not terminal and not live
+            and not pending and not handoff_pending
+        ),
+        "can_plan_project": bool(
+            is_project and agent_owner and hierarchy_valid and not terminal and not live
+            and not pending and not handoff_pending
+        ),
         "can_complete_project": bool(
             is_project and hierarchy_valid and not terminal and not live and not pending
+            and not handoff_pending
             and summary.get("ready_to_close")
         ),
         # Pending cancellation remains actionable: the retry must reuse the
         # operation ID returned by the preview endpoint.
-        "can_cancel_project": bool(is_project and hierarchy_valid and not terminal),
+        "can_cancel_project": bool(
+            (is_project or handoff_pending) and hierarchy_valid and not terminal
+        ),
         "can_resume_execution": bool(
             not is_project and execution_paused and hierarchy_valid and not pending
+            and not handoff_pending
         ),
     }
 

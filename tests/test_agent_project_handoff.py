@@ -4,12 +4,14 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from api.main import app
+from api.services import agent_board
 from api.services.agent_worker.execution import (
     BillingClass,
     ExecutionConstraints,
@@ -21,6 +23,8 @@ from api.services.agent_worker.session_store import (
     STATUS_BLOCKED,
     STATUS_CLAIMED,
     STATUS_COMPLETED,
+    STATUS_FAILED,
+    STATUS_RUNNING,
     SessionStore,
 )
 from api.services.agent_worker.transcript_store import TranscriptStore
@@ -30,8 +34,12 @@ from api.services.task_manager import TaskManager
 from api.services.task_projects import (
     HANDOFF_OPERATION_FIELD,
     HANDOFF_QUIESCENT_EVENT,
+    HANDOFF_READY_AT_FIELD,
     HANDOFF_REQUEST_EVENT,
+    HANDOFF_SOURCE_TURN_FIELD,
+    LAST_ABORTED_HANDOFF_FIELD,
     LAST_HANDOFF_OPERATION_FIELD,
+    ProjectHandoffError,
     ProjectConflictError,
     ProjectTaskService,
     build_task_hierarchy,
@@ -116,6 +124,70 @@ def _request(operation_id: str = "synthetic-launch-v1") -> dict:
             },
         ],
     }
+
+
+def _task_payload(manager: TaskManager, task_id: str) -> dict | None:
+    task = manager.get(task_id)
+    if task is None:
+        return None
+    return {
+        "id": task.id,
+        "description": task.description,
+        "status": task.status,
+        "tags": task.tags,
+        "fields": task.fields,
+    }
+
+
+def _handoff_worker(
+    tmp_path: Path,
+    manager: TaskManager,
+    store: SessionStore,
+    transcripts: TranscriptStore,
+    service: ProjectTaskService,
+) -> tuple[Worker, list[dict]]:
+    finalizers: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/tasks":
+            tasks = [
+                payload
+                for task in manager.list_tasks()
+                if (payload := _task_payload(manager, task.id)) is not None
+            ]
+            return httpx.Response(200, json={"tasks": tasks, "total": len(tasks)})
+        if request.method == "GET" and request.url.path.startswith("/api/tasks/"):
+            task_id = request.url.path.rsplit("/", 1)[-1]
+            payload = _task_payload(manager, task_id)
+            return httpx.Response(200, json=payload) if payload else httpx.Response(404)
+        if request.method == "POST" and request.url.path.endswith(
+            "/project/handoff/finalize"
+        ):
+            task_id = request.url.path.split("/api/tasks/", 1)[1].split("/", 1)[0]
+            body = json.loads(request.content)
+            finalizers.append(body)
+            try:
+                result = service.finalize_handoff(task_id, **body)
+            except ProjectHandoffError as exc:
+                return httpx.Response(
+                    409,
+                    json={"detail": {"code": exc.code, "message": str(exc)}},
+                )
+            return httpx.Response(200, json=result)
+        return httpx.Response(404)
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(handler), base_url="http://synthetic-api",
+    )
+    return Worker(
+        api_base="http://synthetic-api",
+        session_store=store,
+        transcript_store=transcripts,
+        spend_tracker=SpendTracker(
+            db_path=tmp_path / "worker-spend.db", daily_cap_dollars=100,
+        ),
+        http_client=client,
+    ), finalizers
 
 
 def test_handoff_stages_fenced_children_and_blocked_coordinator(handoff):
@@ -420,3 +492,392 @@ def test_finalize_route_rechecks_exact_source_identity(handoff, monkeypatch):
     assert stale.json()["detail"]["code"] == "stale_turn"
     assert activated.status_code == 200
     assert activated.json()["state"] == "activated"
+
+
+@pytest.mark.parametrize("fail_on_call", [1, 2])
+def test_resume_pending_repairs_interrupted_child_staging(
+    handoff, tmp_path: Path, monkeypatch, fail_on_call,
+):
+    manager, store, transcripts, source, ctx = handoff
+    create = manager.create_or_find_by_operation
+    calls = 0
+
+    def fail_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == fail_on_call:
+            raise RuntimeError("synthetic child persistence interruption")
+        return create(*args, **kwargs)
+
+    monkeypatch.setattr(manager, "create_or_find_by_operation", fail_once)
+    failed = dispatch(ctx, "lifeos_agent_project_handoff", _request())
+    assert failed["ok"] is False
+    assert failed["error"] == "crashed"
+    assert HANDOFF_READY_AT_FIELD not in manager.get(source.task_id).fields
+    assert len(build_task_hierarchy(manager.list_tasks()).children(source.task_id)) == (
+        fail_on_call - 1
+    )
+
+    monkeypatch.setattr(manager, "create_or_find_by_operation", create)
+    service = ProjectTaskService(manager, store, transcripts)
+    worker, finalizers = _handoff_worker(
+        tmp_path, manager, store, transcripts, service,
+    )
+
+    worker.resume_pending()
+
+    parent = manager.get(source.task_id)
+    assert parent.fields[LAST_HANDOFF_OPERATION_FIELD] == _request()["operation_id"]
+    assert HANDOFF_OPERATION_FIELD not in parent.fields
+    assert len(build_task_hierarchy(manager.list_tasks()).children(source.task_id)) == 2
+    assert len(finalizers) == 1
+    assert store.get(source.task_id).status == STATUS_COMPLETED
+    assert store.list_all_card_outcomes() == {}
+
+
+def test_resume_pending_reconciles_quiescent_handoff_without_rolling_back_coordinator(
+    handoff, tmp_path: Path,
+):
+    manager, store, transcripts, source, ctx = handoff
+    staged = dispatch(ctx, "lifeos_agent_project_handoff", _request())
+    transcripts.append(source.session_id, HANDOFF_QUIESCENT_EVENT, {
+        "operation_id": staged["operation_id"],
+        "attempt_id": source.attempt_id,
+        "turn_id": source.turn_id,
+    })
+    assert store.update_status(
+        source.task_id,
+        STATUS_COMPLETED,
+        attempt_id=source.attempt_id,
+        turn_id=source.turn_id,
+        project=False,
+    )
+    worker, finalizers = _handoff_worker(
+        tmp_path, manager, store, transcripts,
+        ProjectTaskService(manager, store, transcripts),
+    )
+
+    worker.resume_pending()
+
+    assert len(finalizers) == 1
+    assert manager.get(source.task_id).fields[LAST_HANDOFF_OPERATION_FIELD] == (
+        staged["operation_id"]
+    )
+    coordinator = store.get_by_session_id(staged["coordinator_session_id"])
+    assert coordinator.status == STATUS_CLAIMED
+
+
+def test_handoff_retry_repairs_coordinator_without_execution_snapshot(
+    handoff, monkeypatch,
+):
+    manager, store, _transcripts, source, ctx = handoff
+    persist_snapshot = store.set_execution_snapshot
+    calls = 0
+
+    def fail_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("synthetic coordinator snapshot interruption")
+        return persist_snapshot(*args, **kwargs)
+
+    monkeypatch.setattr(store, "set_execution_snapshot", fail_once)
+    failed = dispatch(ctx, "lifeos_agent_project_handoff", _request())
+    assert failed["ok"] is False
+    assert failed["error"] == "crashed"
+
+    coordinator = next(
+        session for session in store.list_non_terminal()
+        if session.task_id != source.task_id
+    )
+    assert coordinator.execution_spec is None
+
+    retried = dispatch(ctx, "lifeos_agent_project_handoff", _request())
+
+    assert retried["ok"] is True
+    assert retried["state"] == "staged"
+    repaired = store.get_by_session_id(coordinator.session_id)
+    assert repaired.execution_spec is not None
+    assert repaired.status == STATUS_BLOCKED
+
+
+@pytest.mark.asyncio
+async def test_zero_child_pending_handoff_can_be_cancelled(handoff, monkeypatch):
+    from api.routes import tasks as task_routes
+
+    manager, store, transcripts, source, ctx = handoff
+
+    def fail_first_child(*_args, **_kwargs):
+        raise RuntimeError("synthetic interruption before first child")
+
+    monkeypatch.setattr(manager, "create_or_find_by_operation", fail_first_child)
+    assert dispatch(ctx, "lifeos_agent_project_handoff", _request())["ok"] is False
+    assert build_task_hierarchy(manager.list_tasks()).children(source.task_id) == []
+    fields = ProjectTaskService(manager, store, transcripts).read_fields(source.task_id)
+    assert fields["is_project"] is False
+    policy = agent_board.project_action_policy(
+        manager.get(source.task_id).status,
+        manager.get(source.task_id).tags,
+        fields["project"],
+        execution_paused=True,
+        handoff_pending=bool(
+            manager.get(source.task_id).fields.get(HANDOFF_OPERATION_FIELD)
+        ),
+    )
+    assert policy["can_cancel_project"] is True
+    assert policy["can_resume_execution"] is False
+    monkeypatch.setattr(task_routes, "get_task_manager", lambda: manager)
+    monkeypatch.setattr(task_routes, "_session_store", store)
+    monkeypatch.setattr(task_routes, "_transcript_store", transcripts)
+    response = TestClient(app).get(f"/api/tasks/{source.task_id}")
+    assert response.status_code == 200
+    assert response.json()["is_project"] is False
+    assert response.json()["fields"][HANDOFF_OPERATION_FIELD] == _request()["operation_id"]
+    stopped: list[str] = []
+
+    async def stop_session(session):
+        stopped.append(session.session_id)
+        store.update_status(
+            session.task_id,
+            STATUS_FAILED,
+            attempt_id=session.attempt_id,
+            turn_id=session.turn_id,
+            project=False,
+        )
+        return [session.session_id], []
+
+    service = ProjectTaskService(
+        manager, store, transcripts, session_teardown=stop_session,
+    )
+    preview = service.cancel_preview(source.task_id)
+    result = await service.cancel_project(
+        source.task_id, operation_id="cancel-interrupted-handoff",
+    )
+
+    assert preview["unfinished_count"] == 0
+    assert preview["running_count"] == 1
+    assert result["complete"] is True
+    assert stopped == [source.session_id]
+    parent = manager.get(source.task_id)
+    assert parent.status == "cancelled"
+    assert parent.fields[LAST_ABORTED_HANDOFF_FIELD] == _request()["operation_id"]
+    assert HANDOFF_OPERATION_FIELD not in parent.fields
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_state", ["terminal", "absent"])
+async def test_cancel_does_not_treat_terminal_or_absent_source_as_stop_proof(
+    handoff, monkeypatch, source_state,
+):
+    manager, store, transcripts, source, ctx = handoff
+
+    def fail_first_child(*_args, **_kwargs):
+        raise RuntimeError("synthetic interruption before first child")
+
+    monkeypatch.setattr(manager, "create_or_find_by_operation", fail_first_child)
+    assert dispatch(ctx, "lifeos_agent_project_handoff", _request())["ok"] is False
+    if source_state == "terminal":
+        assert store.update_status(
+            source.task_id,
+            STATUS_FAILED,
+            attempt_id=source.attempt_id,
+            turn_id=source.turn_id,
+            project=False,
+        )
+    else:
+        with store._connect() as conn:
+            conn.execute("DELETE FROM sessions WHERE session_id = ?", (source.session_id,))
+
+    result = await ProjectTaskService(manager, store, transcripts).cancel_project(
+        source.task_id, operation_id=f"cancel-{source_state}-source",
+    )
+
+    assert result["complete"] is False
+    assert result["pending"] is True
+    parent = manager.get(source.task_id)
+    assert parent.status != "cancelled"
+    assert parent.fields[HANDOFF_OPERATION_FIELD] == _request()["operation_id"]
+
+
+class _ManagedRecoveryDriver:
+    def __init__(self, status: str):
+        self.status = status
+        self.kills: list[tuple[str, str]] = []
+
+    def kill_session(self, session_id: str, reason: str = "") -> None:
+        self.kills.append((session_id, reason))
+
+    def get_session_state(self, session_id: str):
+        return SimpleNamespace(session_id=session_id, status=self.status)
+
+
+@pytest.mark.parametrize(
+    "route,verified",
+    [("local", True), ("remote", True), ("claude_code", False), ("codex", False),
+     ("hermes", False)],
+)
+def test_resume_pending_only_recovers_routes_with_restart_stop_proof(
+    tmp_path: Path, route: str, verified: bool,
+):
+    store = SessionStore(tmp_path / f"{route}.db")
+    transcripts = TranscriptStore(tmp_path / f"{route}-transcripts")
+    manager = TaskManager(
+        vault_path=tmp_path / f"{route}-vault",
+        index_path=tmp_path / f"{route}-index" / "tasks.json",
+        live_session_checker=lambda *_args: False,
+    )
+    parent = manager.create(
+        f"Synthetic {route} handoff",
+        status="in_progress",
+        tags=[route, "agent-running"],
+    )
+    source = store.create(
+        parent.id,
+        status=STATUS_CLAIMED,
+        routing=route,
+        execution_spec=_spec(route),
+    )
+    source = store.begin_executor_turn(parent.id, "execute", session=source)
+    assert store.mark_executor_turn_running(parent.id, source.attempt_id, source.turn_id)
+    source = store.get(parent.id)
+    result = ProjectTaskService(manager, store, transcripts).stage_handoff(
+        source,
+        operation_id=f"{route}-restart",
+        children=_request()["children"],
+    )
+    worker, finalizers = _handoff_worker(
+        tmp_path, manager, store, transcripts,
+        ProjectTaskService(manager, store, transcripts),
+    )
+
+    worker.resume_pending()
+
+    current = store.get(parent.id)
+    if verified:
+        assert current.status == STATUS_COMPLETED
+        assert len(finalizers) == 1
+        assert manager.get(parent.id).fields[LAST_HANDOFF_OPERATION_FIELD] == result["operation_id"]
+    else:
+        assert current.status == STATUS_RUNNING
+        assert finalizers == []
+        assert manager.get(parent.id).fields[HANDOFF_OPERATION_FIELD] == result["operation_id"]
+        assert store.get_by_session_id(result["coordinator_session_id"]).status == STATUS_BLOCKED
+        assert transcripts.read(source.session_id)[-1]["kind"] == (
+            "project_handoff_recovery_pending"
+        )
+
+
+@pytest.mark.parametrize("remote_status,activated", [("cancelled", True), ("running", False)])
+def test_resume_pending_managed_requires_post_kill_remote_stop_proof(
+    tmp_path: Path, remote_status: str, activated: bool,
+):
+    store = SessionStore(tmp_path / "managed.db")
+    transcripts = TranscriptStore(tmp_path / "managed-transcripts")
+    manager = TaskManager(
+        vault_path=tmp_path / "managed-vault",
+        index_path=tmp_path / "managed-index" / "tasks.json",
+        live_session_checker=lambda *_args: False,
+    )
+    parent = manager.create(
+        "Synthetic managed handoff",
+        status="in_progress",
+        tags=["cloud-sonnet", "agent-running"],
+    )
+    source = store.create(
+        parent.id,
+        status=STATUS_CLAIMED,
+        routing="claude",
+        execution_spec=_spec("claude"),
+    )
+    source = store.begin_executor_turn(parent.id, "execute", session=source)
+    assert store.mark_executor_turn_running(parent.id, source.attempt_id, source.turn_id)
+    store.set_managed_session_id(parent.id, "managed-synthetic")
+    source = store.get(parent.id)
+    staged = ProjectTaskService(manager, store, transcripts).stage_handoff(
+        source,
+        operation_id="managed-restart",
+        children=_request()["children"],
+    )
+    worker, finalizers = _handoff_worker(
+        tmp_path, manager, store, transcripts,
+        ProjectTaskService(manager, store, transcripts),
+    )
+    driver = _ManagedRecoveryDriver(remote_status)
+    worker._managed_executor = SimpleNamespace(driver=driver)
+
+    worker.resume_pending()
+
+    assert driver.kills == [
+        ("managed-synthetic", "project_handoff_restart_recovery"),
+    ]
+    current = store.get(parent.id)
+    if activated:
+        assert current.status == STATUS_COMPLETED
+        assert len(finalizers) == 1
+        assert manager.get(parent.id).fields[LAST_HANDOFF_OPERATION_FIELD] == staged["operation_id"]
+    else:
+        assert current.status == STATUS_RUNNING
+        assert finalizers == []
+        assert manager.get(parent.id).fields[HANDOFF_OPERATION_FIELD] == staged["operation_id"]
+        assert store.get_by_session_id(staged["coordinator_session_id"]).status == STATUS_BLOCKED
+
+
+def test_resume_pending_does_not_rearm_a_newer_turn_over_stale_handoff_identity(
+    handoff, tmp_path: Path,
+):
+    manager, store, transcripts, source, ctx = handoff
+    staged = dispatch(ctx, "lifeos_agent_project_handoff", _request())
+    manager.update(
+        source.task_id,
+        fields={HANDOFF_SOURCE_TURN_FIELD: "turn-stale-synthetic"},
+        _project_operation="handoff-stage",
+    )
+    worker, finalizers = _handoff_worker(
+        tmp_path, manager, store, transcripts,
+        ProjectTaskService(manager, store, transcripts),
+    )
+
+    worker.resume_pending()
+
+    assert store.get(source.task_id).status == STATUS_RUNNING
+    assert finalizers == []
+    parent = manager.get(source.task_id)
+    assert parent.status == "in_progress"
+    assert parent.fields[HANDOFF_OPERATION_FIELD] == staged["operation_id"]
+    assert "agent-running" in parent.tags
+
+
+def test_remove_tag_returns_conflict_for_handoff_fences_and_allows_ordinary_task(
+    handoff, monkeypatch,
+):
+    from api.routes import tasks as task_routes
+
+    manager, store, transcripts, source, ctx = handoff
+    staged = dispatch(ctx, "lifeos_agent_project_handoff", _request())
+    child_id = staged["child_tasks"][0]["task_id"]
+    child = manager.get(child_id)
+    manager.update(
+        child_id,
+        tags=[*child.tags, "agent-running"],
+        _project_operation="handoff-stage",
+    )
+    ordinary = manager.create("Synthetic ordinary running task", tags=["agent-running"])
+    monkeypatch.setattr(task_routes, "get_task_manager", lambda: manager)
+    monkeypatch.setattr(task_routes, "_session_store", store)
+    monkeypatch.setattr(task_routes, "_transcript_store", transcripts)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    parent_response = client.post(
+        f"/api/tasks/{source.task_id}/remove-tag", params={"tag": "agent-running"},
+    )
+    child_response = client.post(
+        f"/api/tasks/{child_id}/remove-tag", params={"tag": "agent-running"},
+    )
+    ordinary_response = client.post(
+        f"/api/tasks/{ordinary.id}/remove-tag", params={"tag": "agent-running"},
+    )
+
+    assert parent_response.status_code == 409
+    assert child_response.status_code == 409
+    assert ordinary_response.status_code == 200
+    assert ordinary_response.json() == {"ok": True, "reason": None}

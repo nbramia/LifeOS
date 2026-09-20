@@ -1031,7 +1031,11 @@ def _card_policy(
     `PUT /api/tasks/{id}`).
     """
     from api.services import agent_board
-    from api.services.task_projects import EXECUTION_PAUSED_FIELD, field_truthy
+    from api.services.task_projects import (
+        EXECUTION_PAUSED_FIELD,
+        HANDOFF_OPERATION_FIELD,
+        field_truthy,
+    )
 
     has_live = session_store.has_live_session(task.id, status=task.status, tags=task.tags)
     hierarchy_fields = hierarchy_fields or {}
@@ -1072,6 +1076,7 @@ def _card_policy(
         project,
         hierarchy_valid=hierarchy_fields.get("hierarchy_valid", True),
         execution_paused=field_truthy(task.fields.get(EXECUTION_PAUSED_FIELD)),
+        handoff_pending=bool(task.fields.get(HANDOFF_OPERATION_FIELD)),
     )
     return {
         "claimed": agent_board.is_claimed(task.status, task.tags, has_live),

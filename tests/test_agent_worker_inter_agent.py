@@ -1306,6 +1306,9 @@ def test_teardown_managed_session_skips_local_kill_but_does_managed(
         def kill_session(self, sid, reason=""):
             managed_calls.append((sid, reason))
 
+        def get_session_state(self, sid):
+            return type("State", (), {"status": "cancelled", "session_id": sid})()
+
     result = teardown_session(
         store, transcript, target,
         transcript_kind="operator_killed",
@@ -1323,6 +1326,34 @@ def test_teardown_managed_session_skips_local_kill_but_does_managed(
     kinds = [e["kind"] for e in transcript.read(target.session_id)]
     assert "operator_killed" in kinds
     assert "local_subprocess_killed" not in kinds
+
+
+@pytest.mark.unit
+def test_teardown_does_not_treat_managed_kill_return_as_stop_proof(
+    store, transcript, parent,
+):
+    target = store.create(
+        task_id="managed_unverified", status=STATUS_RUNNING, routing="claude",
+        parent_session_id=parent.session_id, root_session_id=parent.session_id,
+    )
+    store.set_managed_session_id(target.task_id, "remote_unverified")
+    target = store.get_by_session_id(target.session_id)
+
+    class _SwallowingDriver:
+        def kill_session(self, _sid, reason=""):
+            return None
+
+        def get_session_state(self, sid):
+            return type("State", (), {"status": "running", "session_id": sid})()
+
+    result = teardown_session(
+        store, transcript, target,
+        transcript_kind="operator_killed",
+        transcript_payload={"reason": "stop"},
+        managed_driver=_SwallowingDriver(),
+    )
+
+    assert result["managed_failure"] == "managed runtime still reports running"
 
 
 # ---------------------------------------------------------------------------

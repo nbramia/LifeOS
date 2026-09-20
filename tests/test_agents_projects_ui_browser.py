@@ -305,3 +305,54 @@ def test_pending_project_cancellation_reuses_preview_operation_id(page: Page, ag
         {"confirm": False, "operation_id": None},
         {"confirm": True, "operation_id": retry_operation_id},
     ]
+
+
+def test_pending_handoff_is_visible_and_keeps_project_cancellation_available(page: Page, agents_base_url):
+    """Test a pending handoff explains its execution fence while cancellation remains available."""
+    state, seen = _state(), []
+    state["lanes"]["assigned"][0]["project"]["handoff_pending"] = True
+    _open(page, agents_base_url, state, seen)
+    page.locator('[data-card-id="project-1"]').click()
+
+    expect(page.locator('[data-field="handoff-pending"]')).to_contain_text(
+        "Child execution is blocked until the source agent stop is verified"
+    )
+    expect(page.locator('[data-action="project-start"]')).to_be_disabled()
+    expect(page.locator('[data-action="project-plan"]')).to_be_disabled()
+    expect(page.locator('[data-action="project-complete"]')).to_be_disabled()
+    expect(page.locator('[data-action="project-cancel"]')).to_be_enabled()
+
+    with page.expect_request(lambda request: (
+        request.method == "POST"
+        and request.url.rstrip("/").endswith("/api/tasks/project-1/project/cancel")
+    )) as request_info:
+        page.locator('[data-action="project-cancel"]').click()
+
+    assert request_info.value.post_data_json == {"confirm": False, "operation_id": None}
+    expect(page.locator('.modal')).to_contain_text("3 unfinished children")
+
+
+def test_zero_child_pending_handoff_uses_existing_cancellation_route(page: Page, agents_base_url):
+    """Test an interrupted handoff remains visible and cancellable before it derives a project."""
+    state, seen = _state(), []
+    pending = _card(
+        "pending-handoff-1", "Interrupted synthetic handoff",
+        fields={"execution_paused": "true", "project_handoff_operation_id": "synthetic-handoff"},
+    )
+    state["lanes"]["in_progress"].append(pending)
+    _open(page, agents_base_url, state, seen)
+    page.locator('[data-card-id="pending-handoff-1"]').click()
+
+    expect(page.locator('[data-field="handoff-pending"]')).to_contain_text(
+        "Child execution is blocked until the source agent stop is verified"
+    )
+    expect(page.locator('[data-action="resume-execution"]')).to_have_count(0)
+    expect(page.locator('[data-action="project-cancel"]')).to_have_text("Cancel handoff")
+
+    with page.expect_request(lambda request: (
+        request.method == "POST"
+        and request.url.rstrip("/").endswith("/api/tasks/pending-handoff-1/project/cancel")
+    )) as request_info:
+        page.locator('[data-action="project-cancel"]').click()
+
+    assert request_info.value.post_data_json == {"confirm": False, "operation_id": None}

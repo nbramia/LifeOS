@@ -986,11 +986,14 @@ class Worker:
         )
         if recovered_claims:
             logger.info("released %d abandoned answered-question claim(s)", recovered_claims)
+        # Snapshot the sessions that existed before reconciliation. A handoff
+        # finalizer may release its blocked coordinator to CLAIMED; that newly
+        # released work is dispatchable, not an orphan from the prior process.
+        pending = self.session_store.list_non_terminal()
         # Reconcile task projections left between the durable marker and the
         # HTTP/Markdown write before dispatching any sessions.
         self._reconcile_project_handoffs()
         self.lifecycle_projector.replay_pending()
-        pending = self.session_store.list_non_terminal()
         # Sessions the detached-restart primitive deliberately killed. Read once
         # and cleared after the loop so a single marker is honored exactly once.
         self_restart_sids, self_restart_tids = _read_self_restart_marker(
@@ -6437,16 +6440,28 @@ class Worker:
         return finalized
 
     def _recover_project_handoff_session(self, session: Session) -> bool:
-        """Keep staged handoffs fenced; only in-process restart proves quiescence."""
+        """Keep staged handoffs fenced until this restart proves source quiescence."""
         task = self._fetch_task(session.task_id)
         fields = (task or {}).get("fields") or {}
-        if (
-            not fields.get(HANDOFF_OPERATION_FIELD)
-            or fields.get(HANDOFF_SOURCE_SESSION_FIELD) != session.session_id
-            or fields.get(HANDOFF_SOURCE_ATTEMPT_FIELD) != session.attempt_id
-            or fields.get(HANDOFF_SOURCE_TURN_FIELD) != session.turn_id
-        ):
+        operation_id = fields.get(HANDOFF_OPERATION_FIELD)
+        if not operation_id:
             return False
+        exact_source = (
+            fields.get(HANDOFF_SOURCE_SESSION_FIELD) == session.session_id
+            and fields.get(HANDOFF_SOURCE_ATTEMPT_FIELD) == session.attempt_id
+            and fields.get(HANDOFF_SOURCE_TURN_FIELD) == session.turn_id
+        )
+        if not exact_source:
+            self.transcript_store.append(
+                session.session_id,
+                "project_handoff_recovery_pending",
+                {
+                    "operation_id": operation_id,
+                    "reason": "persisted handoff source identity does not match current turn",
+                    "routing": session.routing,
+                },
+            )
+            return True
         if session.routing in {ROUTE_LOCAL, ROUTE_REMOTE}:
             recovery_outcome = SimpleNamespace(
                 attempt_id=session.attempt_id,
@@ -6454,12 +6469,49 @@ class Worker:
                 executor=session.routing,
             )
             self._maybe_finalize_project_handoff(session, recovery_outcome)
+        elif session.routing == ROUTE_CLAUDE and session.managed_agent_session_id:
+            managed = self._get_managed_executor()
+            verified = False
+            reason = "managed runtime termination could not be verified"
+            if managed is not None and managed.driver is not None:
+                try:
+                    managed.driver.kill_session(
+                        session.managed_agent_session_id,
+                        reason="project_handoff_restart_recovery",
+                    )
+                    remote = managed.driver.get_session_state(
+                        session.managed_agent_session_id,
+                    )
+                    verified = remote.status in {
+                        "idle", "completed", "failed", "cancelled", "budget_exceeded",
+                    }
+                    if not verified:
+                        reason = f"managed runtime still reports {remote.status}"
+                except Exception as exc:
+                    reason = f"managed runtime verification failed: {type(exc).__name__}"
+            if verified:
+                recovery_outcome = SimpleNamespace(
+                    attempt_id=session.attempt_id,
+                    turn_id=session.turn_id,
+                    executor=session.routing,
+                )
+                self._maybe_finalize_project_handoff(session, recovery_outcome)
+            else:
+                self.transcript_store.append(
+                    session.session_id,
+                    "project_handoff_recovery_pending",
+                    {
+                        "operation_id": operation_id,
+                        "reason": reason,
+                        "routing": session.routing,
+                    },
+                )
         else:
             self.transcript_store.append(
                 session.session_id,
                 "project_handoff_recovery_pending",
                 {
-                    "operation_id": fields.get(HANDOFF_OPERATION_FIELD),
+                    "operation_id": operation_id,
                     "reason": "runtime termination is not yet verified",
                     "routing": session.routing,
                 },

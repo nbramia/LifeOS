@@ -77,7 +77,7 @@ const DRAWER_EDITABLE_FIELDS = [
   // Hierarchy data is derived server-side and can change after an external
   // vault edit or a child mutation while this drawer is open.
   'parent_id', 'parent_title', 'is_project', 'child_count',
-  'hierarchy_valid', 'hierarchy_error', 'project',
+  'hierarchy_valid', 'hierarchy_error', 'project', 'fields',
   // Read-only, but a background refresh can change a PR's merge status
   // after the drawer first opened — without watching it here, an open
   // drawer would show a stale status until the operator closed and
@@ -2812,9 +2812,14 @@ export function initBoard() {
     return ASSIGNEES.find(assignee => tags.has(assignee)) || '';
   }
 
+  function handoffPending(card) {
+    return Boolean(card.project?.handoff_pending || card.fields?.project_handoff_operation_id);
+  }
+
   function projectDetailsHtml(card) {
     if (card.is_project) {
       const project = card.project || {};
+      const pendingHandoff = handoffPending(card);
       const coordinator = project.coordinator;
       const coordination = coordinator ? `
         <div class="project-coordination" data-field="project-coordination">
@@ -2830,6 +2835,7 @@ export function initBoard() {
           <div class="project-status-row">${projectCountsHtml(project)}</div>
           ${project.execution_paused ? '<div class="project-coordination">Parent execution is paused while children own the work.</div>' : ''}
           ${project.cancellation_pending ? '<div class="project-error">Cancellation is still being reconciled. Retry cancellation after resolving any listed failures.</div>' : ''}
+          ${pendingHandoff ? '<div class="project-error" data-field="handoff-pending">Handoff pending. Child execution is blocked until the source agent stop is verified. You can cancel the handoff; cancellation stays pending until that stop is verified.</div>' : ''}
           ${coordination}
           <div class="drawer-actions">
             <button type="button" class="drawer-action" data-action="project-start">Start project</button>
@@ -2846,6 +2852,13 @@ export function initBoard() {
       return `<div class="drawer-section project-summary" data-field="parent-navigation">
         <label class="drawer-label">Project</label>
         <button type="button" class="drawer-action" data-action="open-parent" data-parent-id="${escapeAttr(card.parent_id)}">Open ${escapeHtml(card.parent_title || 'project')}</button>
+      </div>`;
+    }
+    if (handoffPending(card)) {
+      return `<div class="drawer-section project-summary" data-field="handoff-pending">
+        <label class="drawer-label">Handoff pending</label>
+        <div class="project-error">Child execution is blocked until the source agent stop is verified. You can cancel the handoff; cancellation stays pending until that stop is verified.</div>
+        <button type="button" class="drawer-action danger" data-action="project-cancel">Cancel handoff</button>
       </div>`;
     }
     if (card.fields && card.fields.execution_paused) {
@@ -3183,7 +3196,14 @@ export function initBoard() {
         showToast('Execution resumed.', false);
       } catch (error) { showToast(`Couldn't resume execution: ${error.message}`, true); }
     };
-    if (!card.is_project) return;
+    const pendingHandoff = handoffPending(card);
+    if (!card.is_project && !pendingHandoff) return;
+
+    if (!card.is_project) {
+      const cancel = drawerEl.querySelector('[data-action="project-cancel"]');
+      if (cancel) cancel.onclick = () => openProjectCancellation(card);
+      return;
+    }
 
     const actions = {
       'project-start': async () => projectRequest(`/api/tasks/${encodeURIComponent(card.id)}/project/start`),
@@ -3199,7 +3219,7 @@ export function initBoard() {
       if (!button) return;
       const policyName = action === 'project-start' ? 'can_start_project'
         : action === 'project-plan' ? 'can_plan_project' : 'can_complete_project';
-      if (card.policy && card.policy[policyName] === false) button.disabled = true;
+      if ((card.policy && card.policy[policyName] === false) || pendingHandoff) button.disabled = true;
       button.onclick = async () => {
         button.disabled = true;
         try {

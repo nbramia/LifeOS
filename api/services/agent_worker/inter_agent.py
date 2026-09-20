@@ -1319,6 +1319,11 @@ def teardown_session(
         if session.managed_agent_session_id and managed_driver is not None:
             try:
                 managed_driver.kill_session(session.managed_agent_session_id, reason=reason)
+                remote = managed_driver.get_session_state(session.managed_agent_session_id)
+                if remote.status not in {
+                    "idle", "completed", "failed", "cancelled", "budget_exceeded",
+                }:
+                    managed_failure = f"managed runtime still reports {remote.status}"
             except Exception as exc:  # noqa: BLE001 — local teardown still proceeds
                 managed_failure = str(exc)
                 logger.warning("kill_session %s failed: %s", session.managed_agent_session_id, exc)

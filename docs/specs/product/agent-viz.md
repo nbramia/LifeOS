@@ -42,6 +42,14 @@ Opening a project uses a wider drawer. Its notes remain the objective and accept
 
 **Start project** marks a project active without pretending its owner executed the child work. **Plan and delegate** starts one bounded coordination run for the assigned owner; the drawer exposes that run's state, result, and session. **Complete project** requires every child to be resolved and any coordinator/cancellation work to be finished; closing with cancelled children asks for an explicit reduced-scope acknowledgement. **Cancel project** first previews unfinished, running, and awaiting-review work, then confirms a cascade that preserves completed work and pending-review output without accepting it. A partial cancellation remains visibly pending until its stop failures can be retried.
 
+A project created by an executor handoff can show **Handoff pending** in this
+same drawer. Its message explains that child execution remains blocked until
+the source agent's stop is verified; conflicting project actions are disabled,
+while **Cancel project** remains available. Cancellation is not presented as
+complete until the scoped stop and teardown are verified. A pending handoff
+with no child is still an ordinary card and is surfaced by its pending-handoff
+state rather than being classified as a project.
+
 ### Lanes
 
 | Lane | What lands here |

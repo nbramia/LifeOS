@@ -664,14 +664,22 @@ class ProjectTaskService:
                 raise ProjectHandoffError(
                     "corrupt_state", "handoff request transcript is missing or corrupt",
                 )
-            if not task.fields.get(HANDOFF_READY_AT_FIELD):
-                raise ProjectHandoffError("not_ready", "handoff staging is incomplete")
             if source.status not in TERMINAL_STATUSES:
                 raise ProjectHandoffError("pending_quiescence", "source session is not terminal")
             if not self._has_handoff_quiescence(
                 source_session_id, operation_id, source_attempt_id, source_turn_id,
             ):
                 raise ProjectHandoffError("pending_quiescence", "source turn has no quiescence proof")
+            if not task.fields.get(HANDOFF_READY_AT_FIELD):
+                self._stage_handoff_locked(
+                    source,
+                    operation_id=operation_id,
+                    normalized=normalized,
+                    request_hash=request_hash,
+                )
+                task = self.manager.get(task_id)
+                if task is None or not task.fields.get(HANDOFF_READY_AT_FIELD):
+                    raise ProjectHandoffError("not_ready", "handoff staging is incomplete")
             staged = self._validate_staged_handoff(task, normalized, operation_id)
 
             owner = _owner_tag_for_session(source, task)
@@ -817,30 +825,29 @@ class ProjectTaskService:
         normalized: dict[str, Any],
     ) -> Session:
         synthetic_task_id = _coordinator_task_id(task.id, operation_id)
+        source_spec = (
+            ExecutionSpec.from_dict(source.execution_spec)
+            if source.execution_spec else None
+        )
+        if source_spec is None:
+            raise ProjectHandoffError(
+                "missing_execution_snapshot", "source execution snapshot is unavailable",
+            )
+        request = ExecutionRequest(
+            executor=source_spec.executor,
+            model_id=source_spec.model_id,
+            effort=source_spec.effort,
+            host=source_spec.host,
+            working_dir=source_spec.working_dir,
+            constraints=ExecutionConstraints(
+                allowed_executors=source_spec.constraints.allowed_executors,
+                required_capabilities=source_spec.constraints.required_capabilities,
+                allowed_billing=source_spec.constraints.allowed_billing,
+            ),
+        )
         session = self.session_store.get(synthetic_task_id)
         if session is None:
             from api.services.agent_worker.operator_spawn import create_operator_session
-
-            source_spec = (
-                ExecutionSpec.from_dict(source.execution_spec)
-                if source.execution_spec else None
-            )
-            if source_spec is None:
-                raise ProjectHandoffError(
-                    "missing_execution_snapshot", "source execution snapshot is unavailable",
-                )
-            request = ExecutionRequest(
-                executor=source_spec.executor,
-                model_id=source_spec.model_id,
-                effort=source_spec.effort,
-                host=source_spec.host,
-                working_dir=source_spec.working_dir,
-                constraints=ExecutionConstraints(
-                    allowed_executors=source_spec.constraints.allowed_executors,
-                    required_capabilities=source_spec.constraints.required_capabilities,
-                    allowed_billing=source_spec.constraints.allowed_billing,
-                ),
-            )
             try:
                 result = create_operator_session(
                     self.session_store,
@@ -1166,7 +1173,7 @@ class ProjectTaskService:
         task = hierarchy.tasks.get(task_id)
         if task is None:
             raise KeyError(task_id)
-        if not hierarchy.is_project(task_id):
+        if not hierarchy.is_project(task_id) and not task.fields.get(HANDOFF_OPERATION_FIELD):
             raise ProjectConflictError("task is not a project")
         children = []
         running_count = 0
@@ -1211,14 +1218,18 @@ class ProjectTaskService:
         parent = hierarchy.tasks.get(task_id)
         if parent is None:
             raise KeyError(task_id)
-        if not hierarchy.is_project(task_id):
+        if not hierarchy.is_project(task_id) and not parent.fields.get(HANDOFF_OPERATION_FIELD):
             raise ProjectConflictError("task is not a project")
         pending = parent.fields.get(CANCEL_OPERATION_FIELD)
         if pending and pending != operation_id:
             raise ProjectConflictError(f"project cancellation is already pending as {pending}")
         if not pending:
             def cancel_precondition(current: "Task") -> None:
-                self._require_project_current(current)
+                if (
+                    not self.hierarchy().is_project(current.id)
+                    and not current.fields.get(HANDOFF_OPERATION_FIELD)
+                ):
+                    raise ProjectConflictError("task is not a project")
                 existing = current.fields.get(CANCEL_OPERATION_FIELD)
                 if existing and existing != operation_id:
                     raise ProjectConflictError(
@@ -1253,6 +1264,20 @@ class ProjectTaskService:
                     failures.append({
                         "session_id": source_id,
                         "reason": "handoff source teardown could not be verified",
+                    })
+                if (
+                    source_id in killed
+                    and not errors
+                    and refreshed is not None
+                    and refreshed.status in TERMINAL_STATUSES
+                ):
+                    self.transcript_store.append(source_id, HANDOFF_QUIESCENT_EVENT, {
+                        "project_id": parent.id,
+                        "operation_id": parent.fields.get(HANDOFF_OPERATION_FIELD),
+                        "attempt_id": parent.fields.get(HANDOFF_SOURCE_ATTEMPT_FIELD),
+                        "turn_id": parent.fields.get(HANDOFF_SOURCE_TURN_FIELD),
+                        "executor": source.routing,
+                        "reason": "project cancellation",
                     })
 
         coordinator_id = parent.fields.get(COORDINATOR_SESSION_FIELD)
@@ -1403,7 +1428,15 @@ class ProjectTaskService:
 
     def _handoff_source_live(self, task: "Task") -> bool:
         session_id = task.fields.get(HANDOFF_SOURCE_SESSION_FIELD)
-        return bool(session_id and self._session_id_is_live(session_id))
+        if not session_id:
+            return False
+        operation_id = task.fields.get(HANDOFF_OPERATION_FIELD)
+        attempt_id = task.fields.get(HANDOFF_SOURCE_ATTEMPT_FIELD)
+        turn_id = task.fields.get(HANDOFF_SOURCE_TURN_FIELD)
+        if operation_id and attempt_id and turn_id and self.transcript_store is not None:
+            if self._has_handoff_quiescence(session_id, operation_id, attempt_id, turn_id):
+                return False
+        return True
 
     def _require_project_current(self, task: "Task") -> None:
         if not self.hierarchy().is_project(task.id):

@@ -124,7 +124,12 @@ its own explicit assignment and execution request; omitted assignment remains
 unassigned. A successful staging response tells the caller to stop, and work
 does not become runnable until the worker observes and records that terminal
 turn boundary. If termination cannot be verified, the handoff remains visibly
-pending rather than reporting the parent complete.
+pending rather than reporting the parent complete. Recovery retains that fence
+across restarts: it does not release staged work until the matching source turn
+is verified stopped. The existing project cancellation operation remains the
+operator escape hatch, and reports pending rather than success until scoped
+teardown is verified; this applies even before a staged request has created a
+child, when the source remains an ordinary task.
 
 ### Human Queue Tools
 
