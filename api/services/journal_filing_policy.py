@@ -28,6 +28,38 @@ def _behavior_examples() -> str:
     )
 
 
+# Disposition wording shared between the generative prompt above (via
+# `filing_rules`) and the Jev Pebble classifier's typed `disposition`
+# question (`api/services/pebble_capture.JevPebbleClassifier`), so both
+# surfaces judge the same five outcomes with the same boundary.
+PEBBLE_DISPOSITION_CRITERIA: dict[str, str] = {
+    "log_only": (
+        "Log-only is the strong default. Nothing was actively requested: the "
+        "speaker describes, notes, muses, plans, hedges (\"I should...\", "
+        "\"I need to ... at some point\", \"I keep meaning to\"), states a "
+        "fact, asks a question, or gives a bare imperative without asking "
+        "for it to be filed."
+    ),
+    "task": (
+        "The speaker actively asks for a to-do for themselves to be filed: "
+        "\"add a task to...\", \"put X on my list\", \"remind me to X\" with "
+        "no definite time, or \"assign it to me\"."
+    ),
+    "notify_schedule": (
+        "The speaker asks to be reminded at a definite future time or on a "
+        "recurrence -- not \"remind me to X\" with no time given."
+    ),
+    "delegated_task": (
+        "The speaker actively asks for work to be filed for a named AI "
+        "agent to do, with no definite future time or recurrence attached."
+    ),
+    "agent_schedule": (
+        "The speaker actively asks for work to be filed for a named AI "
+        "agent to do, at a definite future time or on a recurrence."
+    ),
+}
+
+
 def filing_rules(*, allow_agent_schedule: bool, allow_clarification: bool = False) -> str:
     """Shared authority boundary for Journal and Pebble filing surfaces."""
     agent_rule = (

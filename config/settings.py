@@ -1464,6 +1464,14 @@ class Settings(BaseSettings):
     pebble_capture_apply: bool = Field(default=False, alias="LIFEOS_PEBBLE_CAPTURE_APPLY")
     pebble_capture_dir: str = Field(default="LifeOS/Log/Pebble", alias="LIFEOS_PEBBLE_CAPTURE_DIR")
     pebble_capture_scan_seconds: int = Field(default=60, ge=10, alias="LIFEOS_PEBBLE_CAPTURE_SCAN_SECONDS")
+    pebble_classifier: str = Field(
+        default="llm", alias="LIFEOS_PEBBLE_CLASSIFIER",
+        description="Which classifier files a Pebble capture: 'llm' (default) "
+                    "-- the configured remote provider, else the local "
+                    "llama-server -- or 'jev', TypeSafe's typed-judgment API "
+                    "(requires TYPESAFE_API_KEY; falls back to 'llm' with a "
+                    "warning if the key is absent)."
+    )
 
     # Monarch Money
     monarch_email: str = Field(
