@@ -1138,6 +1138,55 @@ class TestBoardLoad:
         card = page.locator('[data-card-id="t3"]')
         expect(card.locator(".board-card-question")).to_contain_text("Which environment?")
 
+    def test_budget_question_shows_continue_and_stop_alongside_answer(self, page: Page, agents_base_url):
+        """A `budget` pending question (a task parked on a budget breach)
+        gets Continue/Stop buttons in the drawer alongside the existing
+        free-text Answer — Continue posts `yes`, Stop posts `stop`, both
+        through the same answer endpoint Answer's composer uses, without
+        opening a modal. t3's plain `clarification` question (no `kind`
+        in its fixture — the server default) must NOT get these buttons."""
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["human_queue"].append({
+            "kind": "task", "id": "t-budget", "title": "Long-running task",
+            "notes": "", "status": "blocked", "tags": ["agent-blocked", "local"], "assignee": "local",
+            "fields": {}, "context": "Ops", "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None,
+            "pending_question": {
+                "id": 42, "session_id": "s-budget", "kind": "budget",
+                "question": "Local agent worker: task 'Long-running task' hit its "
+                             "budget (max_dollars) after $5.12 and 38 min (cap $5.00).",
+                "asked_at": 0, "bot": None,
+            },
+        })
+        _open_board(page, agents_base_url, board_state=board_state)
+
+        answer_calls = []
+
+        def answer_handler(route):
+            body = json.loads(route.request.post_data or "{}")
+            answer_calls.append(body.get("answer"))
+            route.fulfill(status=200, content_type="application/json", body="{}")
+
+        page.route(re.compile(r"/api/agents/pending-questions/42/answer$"), answer_handler)
+
+        # t3's ordinary clarification gets Answer only.
+        page.locator('[data-card-id="t3"]').click()
+        expect(page.locator('.drawer-actions [data-action="answer"]')).to_be_visible()
+        expect(page.locator('.drawer-actions [data-action="continue"]')).to_have_count(0)
+        expect(page.locator('.drawer-actions [data-action="stop"]')).to_have_count(0)
+        page.keyboard.press("Escape")
+
+        page.locator('[data-card-id="t-budget"]').click()
+        expect(page.locator('.drawer-actions [data-action="answer"]')).to_be_visible()
+        expect(page.locator('.drawer-actions [data-action="continue"]')).to_be_visible()
+        expect(page.locator('.drawer-actions [data-action="stop"]')).to_be_visible()
+
+        page.locator('.drawer-actions [data-action="continue"]').click()
+        _wait_for(lambda: answer_calls == ["yes"], page=page)
+
+        page.locator('.drawer-actions [data-action="stop"]').click()
+        _wait_for(lambda: answer_calls == ["yes", "stop"], page=page)
+
     def test_lane_headers_carry_the_shared_lane_colour_accent(self, page: Page, agents_base_url):
         """Each lane header's `border-top-color` equals `laneColor(lane.id)`
         (web/agents/lanes.js) — the same palette the graph tab uses for its

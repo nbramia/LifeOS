@@ -510,6 +510,73 @@ def _format_budget_spend(dollars: float, active_seconds: float) -> str:
     return f"${(dollars or 0.0):.2f} and {minutes} min"
 
 
+_BUDGET_STOP_RE = re.compile(r"^\s*stop\b", re.IGNORECASE)
+_BUDGET_YES_RE = re.compile(r"^\s*yes\b", re.IGNORECASE)
+_BUDGET_DOLLAR_RE = re.compile(r"\$\s*([0-9]+(?:\.[0-9]+)?)")
+_BUDGET_MINUTES_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*min(?:ute)?s?\b", re.IGNORECASE)
+_BUDGET_TOKENS_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*tokens?\b", re.IGNORECASE)
+
+
+@dataclasses.dataclass(frozen=True)
+class _BudgetReply:
+    """A parsed reply to a `budget` pending question."""
+    action: str                # "extend" | "stop"
+    unit: str | None = None    # "dollars" | "minutes" | "tokens" — None for a bare "yes"
+    amount: float | None = None
+
+
+def _parse_budget_reply(answer: str) -> "_BudgetReply | None":
+    """Parse an operator reply to a `budget` pending question.
+
+    Recognizes `stop`, a bare `yes` (double the breached cap), and
+    `yes $<amount>` / `yes <amount> min` / `yes <amount> tokens` (set the
+    cap to that amount). Returns None for anything else — an unparseable
+    reply is answered with a short usage note and leaves the session
+    parked rather than guessing at what the operator meant.
+    """
+    text = (answer or "").strip()
+    if _BUDGET_STOP_RE.match(text):
+        return _BudgetReply(action="stop")
+    if not _BUDGET_YES_RE.match(text):
+        return None
+    rest = text[3:].strip()
+    if not rest:
+        return _BudgetReply(action="extend")
+    m = _BUDGET_DOLLAR_RE.search(rest)
+    if m:
+        return _BudgetReply(action="extend", unit="dollars", amount=float(m.group(1)))
+    m = _BUDGET_MINUTES_RE.search(rest)
+    if m:
+        return _BudgetReply(action="extend", unit="minutes", amount=float(m.group(1)))
+    m = _BUDGET_TOKENS_RE.search(rest)
+    if m:
+        return _BudgetReply(action="extend", unit="tokens", amount=float(m.group(1)))
+    return None
+
+
+# Maps a breach dimension to the reply unit that can set it explicitly, and
+# the raw-value conversion from that unit. `lineage_max_dollars` shares the
+# dollar unit — the reply `yes $12` doesn't distinguish "this session's own
+# cap" from "the family's" texture; which budget_json gets the write is a
+# worker-side decision (the lineage root's, for that dimension), not part of
+# what the reply itself names.
+_BUDGET_DIMENSION_UNIT: dict[str, str] = {
+    "max_dollars": "dollars",
+    "lineage_max_dollars": "dollars",
+    "wall_seconds": "minutes",
+    "max_tokens": "tokens",
+}
+
+
+def _budget_raw_value(unit: str, amount: float) -> float:
+    """Convert a reply amount in `unit` to the raw value a budget dict
+    stores (seconds for wall_seconds, dollars for the two dollar
+    dimensions, a token count for max_tokens)."""
+    if unit == "minutes":
+        return amount * 60
+    return amount
+
+
 def _is_readable_tool_result(text: str) -> bool:
     """Heuristic: is this tool result useful to dump inline as the
     operator-facing completion body? Skip raw JSON dumps (list_threads,
@@ -864,7 +931,12 @@ class Worker:
         """Finalize sessions left non-terminal by a previous crash.
 
         - STATUS_YIELDED with a `sleeps` row: leave alone — the wake-up loop
-          in `tick()` will pick it up at the right time.
+          in `tick()` will pick it up at the right time. A STATUS_YIELDED
+          session parked on an open `budget` question has no `sleeps` row
+          either, but is left alone the same way — every STATUS_YIELDED
+          session is skipped unconditionally below, so it stays parked,
+          makes no provider calls, and only an operator reply through
+          `_resume_budget` ever moves it again.
         - STATUS_RUNNING / STATUS_CLAIMED / STATUS_BLOCKED: mark FAILED and
           roll the tag back to #agent so the operator can retry. We can't
           safely re-enter a partially-driven LLM conversation without risking
@@ -1883,6 +1955,10 @@ class Worker:
                 self._resume_as_followup(q, session, answer)
                 continue
 
+            if kind == "budget":
+                self._resume_budget(q, session, answer)
+                continue
+
             task = None
             if session.origin != "operator":
                 task = self._revalidate_task_resume(
@@ -2670,6 +2746,221 @@ class Worker:
         self._mark_failed(session, task, f"followup with unknown routing: {session.routing}")
         self.session_store.mark_question_processed(q["id"])
 
+    def _recorded_budget_breach(self, session_id: str) -> str | None:
+        """The dimension a session's most recent budget-breach yield named.
+
+        `pending_questions` carries no structured payload column, so this
+        is read from the transcript event the yield itself recorded — the
+        same idiom `_recorded_goal_condition` uses for a goal's condition.
+        """
+        dimension = None
+        for event in self.transcript_store.read(session_id):
+            if event.get("kind") == "budget_yielded":
+                dimension = (event.get("payload") or {}).get("kind")
+        return dimension
+
+    def _extend_budget(
+        self, session: Session, dimension: str, reply: "_BudgetReply",
+    ) -> bool:
+        """Write the cap `reply` names (or double the current one for a
+        bare "yes") for `dimension`.
+
+        `lineage_max_dollars` writes the lineage root's own `max_dollars` —
+        the field the executor's lineage check actually reads — rather
+        than the breaching (descendant) session's own `budget_json`, which
+        may not carry that key at all. Every other dimension writes the
+        breaching session's own budget.
+        """
+        if dimension == "lineage_max_dollars":
+            root_id = session.root_session_id or session.session_id
+            root = self.session_store.get_by_session_id(root_id)
+            if root is None:
+                return False
+            current_cap = (root.budget or {}).get("max_dollars")
+            if reply.unit is not None:
+                new_cap = _budget_raw_value(reply.unit, reply.amount)
+            elif current_cap is not None:
+                new_cap = float(current_cap) * 2
+            else:
+                new_cap = settings.agent_default_budget_dollars
+            new_budget = dict(root.budget or {})
+            new_budget["max_dollars"] = new_cap
+            return self.session_store.update_budget(
+                root.task_id, new_budget,
+                attempt_id=root.attempt_id, turn_id=root.turn_id,
+            )
+        current_cap = (session.budget or {}).get(dimension)
+        if reply.unit is not None:
+            new_cap = _budget_raw_value(reply.unit, reply.amount)
+        elif current_cap is not None:
+            new_cap = float(current_cap) * 2
+        else:
+            return False
+        new_budget = dict(session.budget or {})
+        new_budget[dimension] = new_cap
+        return self.session_store.update_budget(
+            session.task_id, new_budget,
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
+
+    def _finalize_budget_stop(
+        self, session: Session, task: dict[str, Any] | None, dimension: str,
+    ) -> None:
+        """Operator replied `stop` to a budget question — end the session
+        exactly as an unattended breach used to, by feeding the same
+        ``STATUS_BUDGET_EXCEEDED`` outcome through ``_handle_outcome`` so
+        the tag swap, vault status, and cut-off notice stay one code path.
+
+        `_handle_outcome`'s own tag swap for this status always moves FROM
+        ``RUNNING_TAG`` — the question parked the card at ``BLOCKED_TAG``
+        instead, so that's restored first (mirroring every other resume
+        path in this module, which always un-parks back to RUNNING before
+        handing off).
+        """
+        from api.services.agent_worker.local_executor import ExecutorOutcome
+        has_vault_task = session.origin != "operator" and not session.parent_session_id
+        if has_vault_task:
+            self._swap_tag(session.task_id, BLOCKED_TAG, RUNNING_TAG)
+        if session.managed_agent_session_id:
+            managed = self._get_managed_executor()
+            if managed is not None and managed.driver is not None:
+                try:
+                    managed.driver.kill_session(
+                        session.managed_agent_session_id, reason="budget_stop",
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "kill_session %s on budget stop failed: %s",
+                        session.managed_agent_session_id, exc,
+                    )
+        if task is None:
+            task = {"id": session.task_id, "description": session.task_id}
+        outcome = ExecutorOutcome(
+            status=STATUS_BUDGET_EXCEEDED, reason=f"budget exceeded ({dimension})",
+            session_id=session.session_id, attempt_id=session.attempt_id,
+            turn_id=session.turn_id, executor=session.routing,
+        )
+        self._handle_outcome(session, task, outcome)
+
+    def _resume_budget(self, q: dict, session: Session, answer: str) -> None:
+        """Operator replied to a `budget` breach question.
+
+        `yes` doubles the breached cap, `yes $12` / `yes 90 min` set it,
+        `stop` finalizes exactly as an unattended breach used to, and an
+        unparseable (or wrong-unit) reply gets a short usage note and
+        leaves the session parked. A resume never re-seeds the
+        conversation — the breach never cleared the session's stored
+        messages — and never injects the reply itself as a turn: `yes` /
+        `stop` are administrative, not part of the task.
+
+        Local/remote routes resume by calling the executor again, which
+        re-reads the (now-extended) budget from the row rather than a
+        stale copy. The Managed Agents route never touched its remote
+        session on breach, so resuming there is just flipping status back
+        to RUNNING — the ordinary poll loop continues it from here.
+        """
+        sid = session.session_id
+        task_id = session.task_id
+        # A session with no real backing vault task — an operator root-
+        # spawn, or a spawned child (the only kind of session a
+        # `lineage_max_dollars` breach can ever ask about — see
+        # `_handle_outcome`) — has no card to revalidate, swap tags on, or
+        # set a vault status for. Mirrors `_ask_budget_question`'s own gate.
+        has_vault_task = session.origin != "operator" and not session.parent_session_id
+        if not self.session_store.question_claimed(q["id"]):
+            self.transcript_store.append(sid, "answered_claim_retired", {
+                "question_id": q["id"], "operation": "budget_resume",
+            })
+            return
+
+        task = None
+        if has_vault_task:
+            task = self._revalidate_task_resume(session, "budget_resume", {BLOCKED_TAG})
+            if task is None:
+                self.session_store.mark_question_processed(q["id"])
+                return
+
+        dimension = self._recorded_budget_breach(sid) or "max_dollars"
+        reply = _parse_budget_reply(answer)
+        usage = (
+            "I couldn't parse that reply. Reply `yes` to double the cap, "
+            "`yes $12` (or `yes 90 min` for a wall-clock cap) to set a "
+            "specific one, or `stop` to end the task."
+        )
+        expected_unit = _BUDGET_DIMENSION_UNIT.get(dimension)
+        if reply is None or reply.action == "extend" and (
+            reply.unit is not None and reply.unit != expected_unit
+        ):
+            self.session_store.mark_question_processed(q["id"])
+            self.transcript_store.append(sid, "budget_reply_unparseable", {
+                "answer_chars": len(answer),
+            })
+            if not (
+                _reporting_channel(session) is not None
+                and settings.hermes_task_questions
+                and self._ask_user_via_hermes(session, usage, kind="budget")
+            ):
+                sent_id = self.ask_user_via_telegram(sid, task_id, usage, kind="budget")
+                if sent_id is None:
+                    self._notify(usage)
+            return
+
+        if reply.action == "stop":
+            self.session_store.mark_question_processed(q["id"])
+            self._finalize_budget_stop(session, task, dimension)
+            return
+
+        if not self._extend_budget(session, dimension, reply):
+            # Cap couldn't be written (attempt/turn no longer current, or
+            # nothing to double) — leave the question claimed-but-
+            # unprocessed so a retry can be attempted.
+            self.transcript_store.append(sid, "budget_extend_failed", {"dimension": dimension})
+            self.session_store.release_question_claim(q["id"])
+            return
+
+        if has_vault_task:
+            if not self._swap_tag(task_id, BLOCKED_TAG, RUNNING_TAG):
+                self.transcript_store.append(sid, "answered_claim_lifecycle_swap_failed", {
+                    "question_id": q["id"], "from": BLOCKED_TAG, "to": RUNNING_TAG,
+                })
+                self.session_store.mark_question_processed(q["id"])
+                return
+            if not self.session_store.question_claimed(q["id"]):
+                return
+            self._set_task_status(task_id, "in_progress")
+        if not self.session_store.question_claimed(q["id"]):
+            return
+        self.session_store.update_status(
+            task_id, STATUS_RUNNING,
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
+        self.transcript_store.append(sid, "budget_extended", {
+            "dimension": dimension, "unit": reply.unit, "amount": reply.amount,
+        })
+        self.session_store.mark_question_processed(q["id"])
+
+        # Re-fetch: the session now carries the extended budget_json and
+        # RUNNING status just written above. Every resume path below must
+        # see this row, not the pre-extension snapshot passed into this
+        # method.
+        current = self.session_store.get_by_session_id(sid)
+        if current is None:
+            return
+        if task is None:
+            task = {"id": task_id, "description": task_id}
+        task = self._task_with_execution_snapshot(current, task)
+
+        if current.routing == ROUTE_CLAUDE:
+            return
+
+        try:
+            outcome = self._execute_start(current, task)
+        except Exception as exc:
+            logger.exception("budget resume crashed for %s: %s", task_id, exc)
+            self._mark_failed(current, task, f"budget resume crashed: {exc}")
+            return
+        self._handle_outcome(current, task, outcome)
+
     @staticmethod
     def _parse_routing_answer(answer: str) -> str | None:
         """Best-effort parse of an engine choice from a free-text Telegram reply.
@@ -3072,6 +3363,8 @@ class Worker:
         session_id: str,
         task_id: str,
         question: str,
+        *,
+        kind: str = "clarification",
     ) -> int | None:
         """Send a clarification question via Telegram and record the
         sent_message_id so the reply-thread hook can match it back.
@@ -3086,6 +3379,11 @@ class Worker:
         Hermes-anchored question isn't available or allowed. Delivering it
         through `session.bot` anyway would silently retarget it right back
         at Hermes via `_send_session_message`'s own one-way fallback.
+
+        `kind` records what kind of pending question this is — the default
+        "clarification" for an agent-initiated mid-task question, or
+        "budget" for a breach question — so `_process_claimed_answers` can
+        dispatch the reply to the right resume path.
         """
         session = self.session_store.get_by_session_id(session_id)
         if session is not None and _reporting_channel(session) is not None:
@@ -3106,6 +3404,7 @@ class Worker:
             question=question,
             sent_message_id=sent_ids[0],
             sent_message_ids=sent_ids,
+            kind=kind,
         )
         self.transcript_store.append(session_id, "clarification_sent", {
             "sent_message_id": sent_ids[0],
@@ -3114,7 +3413,9 @@ class Worker:
         })
         return sent_ids[0]
 
-    def _ask_user_via_hermes(self, session: Session, question: str) -> bool:
+    def _ask_user_via_hermes(
+        self, session: Session, question: str, *, kind: str = "clarification",
+    ) -> bool:
         """Deliver a clarification question on the Hermes channel and anchor
         it, so a threaded reply in that DM routes back to this question via
         `POST /api/hermes/deposit-answer`.
@@ -3142,6 +3443,7 @@ class Worker:
             question=question,
             sent_message_id=anchor_id,
             bot=HERMES_CHANNEL,
+            kind=kind,
         )
         if not question_id:
             return False
@@ -3158,6 +3460,77 @@ class Worker:
             "question_chars": len(question),
         })
         return True
+
+    def _budget_cap_text(self, session: Session, dimension: str) -> str:
+        """Render the cap a budget-breach question names for `dimension`.
+
+        `lineage_max_dollars` reads the lineage root's own `max_dollars` —
+        the field the executor's lineage check actually compares against —
+        since the breaching (descendant) session's own budget may not carry
+        that key at all.
+        """
+        if dimension == "lineage_max_dollars":
+            root_id = session.root_session_id or session.session_id
+            root = self.session_store.get_by_session_id(root_id)
+            cap = (root.budget or {}).get("max_dollars") if root else None
+            return f"${float(cap):.2f} family total" if cap is not None else "unset"
+        cap = (session.budget or {}).get(dimension)
+        if cap is None:
+            return "unset"
+        if dimension == "max_dollars":
+            return f"${float(cap):.2f}"
+        if dimension == "wall_seconds":
+            return f"{int(cap) // 60} min"
+        if dimension == "max_tokens":
+            return f"{int(cap):,} tokens"
+        return str(cap)
+
+    def _ask_budget_question(
+        self, session: Session, task: dict[str, Any], dimension: str,
+    ) -> None:
+        """Turn a budget-breach yield into an operator-facing pending
+        question of kind `budget`.
+
+        Mirrors `_mark_blocked`'s send-and-park shape (tag swap, Hermes-
+        first delivery, Telegram fallback) but never writes
+        ``STATUS_BLOCKED`` — the executor already left the session at
+        ``STATUS_YIELDED``, and the yield/ask contract keeps it there
+        indefinitely until answered. The card still lands in the Human
+        queue lane through the same ``BLOCKED_TAG`` swap a clarification
+        uses: `natural_lane` derives that lane from the tag alone, not
+        from `session.status`.
+        """
+        title = task.get("description", session.task_id)
+        sid = session.session_id
+        has_vault_task = session.origin != "operator" and not session.parent_session_id
+        refreshed = self.session_store.get_by_session_id(sid) or session
+        spend = _format_budget_spend(
+            refreshed.total_dollars or 0.0, refreshed.total_active_seconds or 0.0,
+        )
+        cap_text = self._budget_cap_text(refreshed, dimension)
+        label = _worker_label(session.routing)
+        body = (
+            f"⏸ {label}: task '{title}' hit its budget ({dimension}) after "
+            f"{spend} (cap {cap_text}).\n\n"
+            "Reply `yes` to double the cap and keep going, `yes $12` (or "
+            "`yes 90 min` for a wall-clock cap) to set a specific one, or "
+            "`stop` to end the task."
+        )
+        if has_vault_task:
+            self._swap_tag(session.task_id, RUNNING_TAG, BLOCKED_TAG)
+            self._set_task_status(session.task_id, "blocked")
+        self.transcript_store.append(sid, "budget_question_sent", {"dimension": dimension})
+        if (
+            _reporting_channel(session) is not None
+            and settings.hermes_task_questions
+            and self._ask_user_via_hermes(session, body, kind="budget")
+        ):
+            return
+        sent_id = self.ask_user_via_telegram(sid, session.task_id, body, kind="budget")
+        if sent_id is None:
+            # Telegram not configured — fall back to the legacy one-way
+            # message so the operator at least sees the question.
+            self._notify(body)
 
     def _wake_sleeping_sessions(self) -> None:
         """Resume any sessions whose `sleeps` row has expired."""
@@ -5838,6 +6211,37 @@ class Worker:
             return
 
         if outcome.status == STATUS_YIELDED:
+            breach = (outcome.termination_evidence or {}).get("budget_breach")
+            if breach:
+                # A lineage breach can only ever be detected by a
+                # descendant (the check that finds it explicitly skips a
+                # session that is its own root) — every session it fires
+                # for is, by construction, `is_spawned`. Excluding it from
+                # asking the way an ordinary child breach is excluded
+                # would make this dimension's ask-and-extend contract
+                # unreachable, so it alone asks even though the session is
+                # spawned: `_ask_budget_question` sends via Telegram/Hermes
+                # regardless of a backing vault task (there is none for a
+                # spawned child) and only skips the tag swap, which a
+                # child has no vault card to carry anyway.
+                if is_spawned and breach != "lineage_max_dollars":
+                    # Every other dimension on a spawned child has no
+                    # operator-facing channel to ask through — preserve the
+                    # old terminal behavior so a runaway child doesn't
+                    # dangle at "yielded" forever with nothing able to ever
+                    # resume it. The parent consumes this the same way it
+                    # already consumes any other child terminal outcome.
+                    self.session_store.update_status(
+                        session.task_id, STATUS_BUDGET_EXCEEDED,
+                        attempt_id=session.attempt_id, turn_id=session.turn_id,
+                    )
+                    self.transcript_store.append(sid, "child_budget_exceeded_internal", {
+                        "parent_session_id": session.parent_session_id,
+                        "reason": f"budget exceeded ({breach})",
+                    })
+                    return
+                self._ask_budget_question(session, task, breach)
+                return
             # Session is sleeping. The transcript already records "sleep".
             # No Telegram on yield — operator only hears about terminal states.
             return

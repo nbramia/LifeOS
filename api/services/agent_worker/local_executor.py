@@ -6,14 +6,17 @@ The executor drives one session of conversation with the local llama-server
   1. Load the session's prior messages from the DB
   2. Call the LLM with the tool catalog
   3. Persist the assistant turn + token usage
-  4. Check wall + token budgets — kill the loop on breach
+  4. Check wall/token/lineage-dollar budgets — yield and ask on breach
   5. If the model produced tool calls, dispatch each, append tool_result
      blocks to the conversation, and loop
   6. If the model produced a final text answer, mark the session complete
 
 Sleep is a "yield": the executor writes a `sleeps` row, returns
 `ExecutorOutcome(status="sleeping", ...)`, and the worker's main loop wakes
-the session at the requested time by calling `execute(session)` again.
+the session at the requested time by calling `execute(session)` again. A
+budget breach yields the same way but with no `sleeps` row and
+`termination_evidence["budget_breach"]` set — the worker turns that into a
+`budget` pending question, and only an operator reply resumes it.
 """
 from __future__ import annotations
 
@@ -26,7 +29,6 @@ from dataclasses import dataclass, field
 from api.services.agent_worker.delegation import INTER_AGENT_BLOCK
 from api.services.agent_worker.pricing import cost_for, is_known_model
 from api.services.agent_worker.session_store import (
-    STATUS_BUDGET_EXCEEDED,
     STATUS_COMPLETED,
     STATUS_FAILED,
     STATUS_YIELDED,
@@ -294,6 +296,9 @@ def _system_prompt(session_id: str, expected_output: str, budget, parent_session
     # so day-relative reasoning works.
     today = _today()
     output_dir = _output_dir()
+    # No token cap is the default (opt-in only via a title hint) — omit the
+    # clause entirely rather than rendering "~None tokens".
+    token_clause = f" / ~{max_tokens} tokens" if max_tokens is not None else ""
     return (
         _SYSTEM_PROMPT_STATIC
         + "\n\n<this_task>\n"
@@ -301,7 +306,7 @@ def _system_prompt(session_id: str, expected_output: str, budget, parent_session
         + f"lifeos_session_id={session_id}; "
         + f"output_dir={output_dir}; "
         + f"expected_output={expected_output}; "
-        + f"soft budget ~{wall}s wall / ~{max_tokens} tokens / {dollars_str}.\n"
+        + f"soft budget ~{wall}s wall{token_clause} / {dollars_str}.\n"
         + "</this_task>"
     )
 
@@ -614,13 +619,21 @@ class LocalExecutor:
                 return self._cancelled_outcome(session)
             # Wall-clock budget check — uses cumulative active seconds, not
             # wall-from-start (so sleeps don't eat into the run budget).
+            # Re-read the budget from the row on every iteration rather than
+            # the `budget` copy captured before the loop: a resume after a
+            # breach extends `budget_json` in the store, and this executor
+            # keeps running the *same* while-loop turn across that resume
+            # (a fresh `execute()` call reuses this loop, it doesn't start a
+            # new one) — reading the stale outer copy would immediately
+            # re-trip the cap it was just extended past.
             updated = self.session_store.get(session.task_id)
+            budget = updated.budget or {}
             if budget.get("wall_seconds"):
                 if (updated.total_active_seconds or 0) >= budget["wall_seconds"]:
-                    return self._finalize_budget_exceeded(session, "wall_seconds")
+                    return self._finalize_budget_yielded(session, "wall_seconds")
             tokens_used = (updated.total_input_tokens or 0) + (updated.total_output_tokens or 0)
             if budget.get("max_tokens") and tokens_used >= budget["max_tokens"]:
-                return self._finalize_budget_exceeded(session, "max_tokens")
+                return self._finalize_budget_yielded(session, "max_tokens")
             # No per-session dollar cap in this loop — on the local route
             # inference is free, so total_dollars is always 0. On the
             # remote-forced route (`self.is_remote`) it is real, non-zero
@@ -631,10 +644,11 @@ class LocalExecutor:
             # way; the lineage guard below still caps a family whose *root*
             # is a paid managed session.)
 
-            # Lineage budget — for sessions with descendants, the *root* budget
-            # caps the total spend across the family. When breached we cascade-
-            # kill the entire lineage so a runaway sub-tree can't keep burning
-            # tokens after the root's budget is exhausted.
+            # Lineage budget — for sessions with descendants, the *root*
+            # budget caps the total spend across the family. A breach yields
+            # and asks exactly like the other dimensions; it does not
+            # cascade-kill siblings, since killing them would lose their
+            # conversations for a cap the operator may simply raise.
             root_id = updated.root_session_id or updated.session_id
             if root_id != updated.session_id:
                 root = self.session_store.get_by_session_id(root_id)
@@ -643,8 +657,7 @@ class LocalExecutor:
                     if root_cap is not None:
                         lineage_spend = self.session_store.lineage_total_dollars(root_id)
                         if lineage_spend >= float(root_cap):
-                            self._cascade_kill_lineage(root_id, reason="lineage_max_dollars")
-                            return self._finalize_budget_exceeded(session, "lineage_max_dollars")
+                            return self._finalize_budget_yielded(session, "lineage_max_dollars")
 
             turn_start = time.time()
             try:
@@ -977,29 +990,6 @@ class LocalExecutor:
     # Finalizers
     # ------------------------------------------------------------------
 
-    def _cascade_kill_lineage(self, root_session_id: str, reason: str) -> None:
-        """Mark all non-terminal descendants of `root_session_id` as FAILED.
-
-        Called when the root's lineage-aggregate budget is exhausted so a
-        runaway sub-tree can't keep spending after the root has hit its cap.
-        Managed-driven children are also killed remotely if a driver is
-        available (the parent local executor doesn't have one — that's
-        handled by Worker._cascade_kill_managed_children when triggered from
-        the worker side; here we just flip DB status).
-        """
-        from api.services.agent_worker.session_store import STATUS_FAILED, TERMINAL_STATUSES
-        for descendant in self.session_store.list_descendants(root_session_id):
-            if descendant.status in TERMINAL_STATUSES:
-                continue
-            self.session_store.update_status(
-                descendant.task_id, STATUS_FAILED,
-                attempt_id=descendant.attempt_id, turn_id=descendant.turn_id,
-            )
-            self.transcript_store.append(
-                descendant.session_id, "cascade_killed",
-                {"root": root_session_id, "reason": reason},
-            )
-
     def _served_by(self) -> str:
         """Model id that actually ran this session, when that
         differs from what the routing name ("local") implies -- i.e. this
@@ -1047,23 +1037,33 @@ class LocalExecutor:
             turn_id=session.turn_id, executor="remote" if self.is_remote else "local",
         )
 
-    def _finalize_budget_exceeded(self, session, kind: str) -> ExecutorOutcome:
+    def _finalize_budget_yielded(self, session, kind: str) -> ExecutorOutcome:
+        """A wall/token/dollar/lineage-dollar breach parks the session
+        instead of ending it: status becomes ``STATUS_YIELDED`` (not
+        ``STATUS_BUDGET_EXCEEDED``), the conversation stays untouched in the
+        session store, and ``termination_evidence["budget_breach"]`` tells
+        the worker to turn this outcome into a `budget` pending question
+        instead of treating it as an ordinary sleep/yield. `kind` names the
+        breached dimension: "wall_seconds", "max_tokens", "max_dollars", or
+        "lineage_max_dollars".
+        """
         if not self._turn_is_current(session):
-            return self._cancelled_outcome(session, f"budget exceeded ({kind})")
+            return self._cancelled_outcome(session, f"budget breach ({kind})")
         updated = self.session_store.update_status(
-            session.task_id, STATUS_BUDGET_EXCEEDED,
+            session.task_id, STATUS_YIELDED,
             attempt_id=session.attempt_id, turn_id=session.turn_id,
         )
         if not updated:
-            return self._cancelled_outcome(session, f"budget exceeded ({kind})")
+            return self._cancelled_outcome(session, f"budget breach ({kind})")
         self.transcript_store.append(
-            session.session_id, "budget_exceeded", {"kind": kind}
+            session.session_id, "budget_yielded", {"kind": kind}
         )
         return ExecutorOutcome(
-            status=STATUS_BUDGET_EXCEEDED, reason=f"budget exceeded ({kind})",
+            status=STATUS_YIELDED, reason=f"budget breach ({kind})",
             served_by=self._served_by(),
             session_id=session.session_id, attempt_id=session.attempt_id,
             turn_id=session.turn_id, executor="remote" if self.is_remote else "local",
+            termination_evidence={"budget_breach": kind},
         )
 
     def _finalize_sleeping(self, session, seconds: int) -> ExecutorOutcome:

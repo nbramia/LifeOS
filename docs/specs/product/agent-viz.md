@@ -103,6 +103,8 @@ Each bulk action runs its write once per selected card, reading each card's curr
 
 When an agent asks a clarifying question, the card carrying that session shows the question text and an **Answer** button in the drawer. Answering writes the reply through the same path a Telegram reply takes — the worker resumes the session on its next tick exactly as if you'd answered by text.
 
+A budget-breach question (the card is in Human queue, having hit its wall-clock, token, or dollar cap) additionally shows **Continue** and **Stop** buttons alongside Answer. Continue posts `yes` — doubling the breached cap and resuming the session from right where it left off — without opening Answer's free-text composer; Stop posts `stop`, ending the task exactly as an unattended breach used to (`#agent-budget-exceeded`). Answer is still there for naming a specific new cap (`yes $12`, `yes 90 min`) instead of doubling it.
+
 ### Scheduled column
 
 Each card shows the entry's next fire time, a recurring badge for cron entries, an action chip summarizing what firing it actually does, and — once it has fired at least once — the most recent run's outcome and a short result snippet. A **manual** schedule (no cron or one-off trigger) shows "Manual — trigger only" in place of a next fire time and carries no recurring badge, since it never fires on its own. The action chip reads `notify`, `prompt`, `endpoint: <METHOD> <path>` (the path truncated with an ellipsis beyond 40 characters, with the full path available as the chip's tooltip), or `agent: <executor>` (`agent: default` when the schedule carries no executor tag). The drawer edits the whole schedule, saving through the same `PUT /api/scheduler/{id}` the `/api/scheduler` UI uses — there's no separate write path for the board. Its shared fields are: name, an enabled checkbox, schedule type (cron, one-off, or manual) and the schedule value (a cron expression or an ISO datetime — the field's label and placeholder switch with the type, and the value input is hidden for manual, which has none), an IANA timezone, and the action (`notify`, `prompt`, `endpoint`, or `agent`).
@@ -440,6 +442,7 @@ All in `.env`. None are required — the defaults work for the standard LifeOS i
 
 - [API Reference](api-reference.md) — HTTP contracts for the board's lane, accept, and cancel endpoints
 - [ADR-011: External Agent Ingest](../../adr/011-external-agent-ingest.md) — Why Claude Code sessions surface read-only via a foreign-schema adapter
+- [ADR-026: A Budget Breach Asks; It Does Not Fail](../../adr/026-budget-breach-asks.md) — Why a `budget` question gets Continue/Stop on the card
 - [Agent Viz — Technical](../technical/agent-viz.md) — Endpoint shapes, delegation timeline layout, status inference rules, security boundaries, and the board's lane-derivation rules
 - [Agent Worker](agent-worker.md) — The other half of the picture: how `#agent` tasks get claimed and run
 - [Claude Code Orchestration (product)](claude-code-orchestration.md) — The orchestrator that spawns the Claude Code sessions surfaced here

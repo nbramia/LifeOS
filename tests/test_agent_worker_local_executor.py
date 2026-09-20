@@ -20,7 +20,6 @@ from api.services.agent_worker.local_executor import (
 )
 from api.services.agent_worker.pricing import cost_for, is_known_model
 from api.services.agent_worker.session_store import (
-    STATUS_BUDGET_EXCEEDED,
     STATUS_COMPLETED,
     STATUS_FAILED,
     STATUS_YIELDED,
@@ -317,8 +316,12 @@ def test_executor_yields_on_sleep_tool(tmp_path: Path, fake_session):
 
 
 @pytest.mark.unit
-def test_executor_kills_loop_on_token_budget(tmp_path: Path):
-    """One call exceeds the budget; the next loop iteration's check kills us."""
+def test_executor_yields_on_token_budget_breach(tmp_path: Path):
+    """A budget breach parks the session (`STATUS_YIELDED`) instead of
+    ending it — the operator gets a `budget` pending question (built by
+    worker.py from `termination_evidence["budget_breach"]`) rather than an
+    immediate `#agent-budget-exceeded` card. The conversation the executor
+    already persisted stays in the session store untouched."""
     store = SessionStore(db_path=tmp_path / "sessions.db")
     store.create(
         task_id="t1",
@@ -328,7 +331,7 @@ def test_executor_kills_loop_on_token_budget(tmp_path: Path):
     )
     session = store.get("t1")
     # First call spends 60 tokens — over the 50-token cap. The top-of-loop
-    # check kills before the second call is attempted.
+    # check yields before the second call is attempted.
     llm = _ScriptedLLM([
         _FakeResponse(
             text="",
@@ -338,9 +341,110 @@ def test_executor_kills_loop_on_token_budget(tmp_path: Path):
     ])
     executor = _make_executor(store, tmp_path / "transcripts", llm)
     outcome = executor.execute(session, {"id": "t1", "description": "loop"})
-    assert outcome.status == STATUS_BUDGET_EXCEEDED
+    assert outcome.status == STATUS_YIELDED
     assert "max_tokens" in outcome.reason
+    assert outcome.termination_evidence["budget_breach"] == "max_tokens"
     assert len(llm.calls) == 1
+    assert store.get("t1").status == STATUS_YIELDED
+    # The turn's assistant message + tool_result are still there — a resume
+    # replays this conversation rather than re-seeding it.
+    messages = store.get_messages(session.session_id)
+    roles = [m.get("role") for m in messages]
+    assert "assistant" in roles
+    assert roles[-1] == "user"  # the tool_result turn
+
+
+@pytest.mark.unit
+def test_executor_yields_on_wall_seconds_budget_breach(tmp_path: Path):
+    """The wall-clock dimension breaches the same way the token one does."""
+    store = SessionStore(db_path=tmp_path / "sessions.db")
+    store.create(
+        task_id="t1",
+        routing="local",
+        budget={"wall_seconds": 1, "max_tokens": None, "max_dollars": 5.0},
+        expected_output="text",
+    )
+    session = store.get("t1")
+    store.record_active_seconds(session.task_id, 2.0)
+    llm = _ScriptedLLM([_FakeResponse(text="should not be reached")])
+    executor = _make_executor(store, tmp_path / "transcripts", llm)
+    outcome = executor.execute(session, {"id": "t1", "description": "loop"})
+    assert outcome.status == STATUS_YIELDED
+    assert outcome.termination_evidence["budget_breach"] == "wall_seconds"
+    assert len(llm.calls) == 0
+
+
+@pytest.mark.unit
+def test_executor_yields_on_lineage_dollar_breach_without_killing_siblings(tmp_path: Path):
+    """A descendant whose family (lineage-root) dollar cap is exhausted
+    yields and asks exactly like the other dimensions — it does not
+    cascade-kill sibling descendants, since killing them would lose their
+    conversations for a cap the operator may simply raise."""
+    store = SessionStore(db_path=tmp_path / "sessions.db")
+    store.create(
+        task_id="root",
+        session_id="sess_root",
+        routing="claude",
+        budget={"max_dollars": 1.0},
+        expected_output="text",
+    )
+    store.create(
+        task_id="child",
+        session_id="sess_child",
+        routing="local",
+        parent_session_id="sess_root",
+        root_session_id="sess_root",
+        budget={"wall_seconds": 3600, "max_tokens": None, "max_dollars": None},
+        expected_output="text",
+    )
+    store.create(
+        task_id="sibling",
+        session_id="sess_sibling",
+        routing="local",
+        parent_session_id="sess_root",
+        root_session_id="sess_root",
+        budget={"wall_seconds": 3600, "max_tokens": None, "max_dollars": None},
+        expected_output="text",
+    )
+    store.record_spend("child", tokens_in=100, tokens_out=100, dollars=1.5)
+    child = store.get("child")
+    llm = _ScriptedLLM([_FakeResponse(text="should not be reached")])
+    executor = _make_executor(store, tmp_path / "transcripts", llm)
+    outcome = executor.execute(child, {"id": "child", "description": "spend"})
+    assert outcome.status == STATUS_YIELDED
+    assert outcome.termination_evidence["budget_breach"] == "lineage_max_dollars"
+    assert len(llm.calls) == 0
+    assert store.get("child").status == STATUS_YIELDED
+    # The sibling was left running — no cascade-kill.
+    assert store.get("sibling").status != STATUS_FAILED
+
+
+@pytest.mark.unit
+def test_executor_remote_client_yields_on_budget_breach_same_as_local(tmp_path: Path, fake_session):
+    """The flag-gated remote-fallback route (`is_remote=True`) shares the
+    same executor loop as local Gemma — a breach yields there exactly the
+    same way, `served_by` reporting aside."""
+    store, session = fake_session
+    llm = _ScriptedLLM([
+        _FakeResponse(
+            text="",
+            usage=_FakeUsage(4000, 2000),
+            tool_calls=[{"id": "c1", "name": "Bash", "input": {"command": "echo a"}}],
+        ),
+    ])
+    executor = LocalExecutor(
+        session_store=store,
+        transcript_store=TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
+        tool_registry=ToolRegistry(lifeos_mcp_server=_FakeMCPServer()),
+        llm_client=llm,
+        model_name="accounts/fireworks/models/deepseek-v3",
+        is_remote=True,
+    )
+    outcome = executor.execute(session, {"id": "t1", "description": "loop"})
+    assert outcome.status == STATUS_YIELDED
+    assert outcome.termination_evidence["budget_breach"] == "max_tokens"
+    assert outcome.executor == "remote"
+    assert outcome.served_by == "accounts/fireworks/models/deepseek-v3"
 
 
 @pytest.mark.unit
@@ -1043,6 +1147,19 @@ def test_system_prompt_carries_soft_budget_in_this_task_section():
     assert "~90s" in prompt
     assert "~5000 tokens" in prompt
     assert "~$0.25" in prompt
+
+
+@pytest.mark.unit
+def test_system_prompt_omits_token_clause_when_max_tokens_is_none():
+    """No token cap is the default (opt-in only via a title hint) — the
+    prompt must not render the literal "~None tokens"."""
+    prompt = _system_prompt(
+        session_id="sess_x", expected_output="text",
+        budget={"wall_seconds": 90, "max_tokens": None, "max_dollars": 0.25},
+    )
+    assert "None" not in prompt
+    assert "tokens" not in prompt
+    assert "~90s wall / ~$0.25" in prompt
 
 
 @pytest.mark.unit

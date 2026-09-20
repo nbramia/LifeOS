@@ -1913,6 +1913,29 @@ class SessionStore:
             turn_id=turn_id,
         )
 
+    def update_budget(
+        self,
+        task_id: str,
+        budget: dict,
+        *,
+        attempt_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> bool:
+        """Rewrite `budget_json` alone — routing/expected_output/preset_class
+        are left untouched, unlike `set_routing_and_budget`. Used to extend
+        a session's cap after a `budget` pending question is answered
+        `yes` / `yes $N` / `yes N min`; the caller re-fetches the session
+        afterward so the executor's next `execute()` call sees the new cap
+        rather than the one captured before the breach.
+        """
+        return self._guarded_update(
+            task_id,
+            "UPDATE sessions SET budget_json = ?, last_activity_at = ? WHERE task_id = ?",
+            (json.dumps(budget) if budget else None, _now()),
+            attempt_id=attempt_id,
+            turn_id=turn_id,
+        )
+
     def record_spend(
         self,
         task_id: str,
@@ -2978,6 +3001,23 @@ class SessionStore:
             )
         return cur.lastrowid
 
+    def has_open_budget_question(self, session_id: str) -> bool:
+        """Whether `session_id` has an unanswered `kind='budget'` pending
+        question. The Managed Agents poll loop uses this to skip a session
+        parked on a budget breach without making a provider call — a
+        breached-and-yielded session's remote handle is deliberately left
+        alive (see `ManagedExecutor.poll`), so without this guard the
+        ordinary poll loop would keep hitting it every tick.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM pending_questions "
+                "WHERE session_id = ? AND kind = 'budget' AND answered_at IS NULL "
+                "LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        return row is not None
+
     def add_reply_anchors(
         self,
         session_id: str,
@@ -3207,9 +3247,10 @@ class SessionStore:
         """List unanswered, unprocessed, not-timed-out questions.
 
         Powers `GET /api/agents/pending-questions` — the board's "waiting on
-        an answer" list. Scoped to `kind IN ('clarification', 'goal_approval')`
-        — the two kinds `worker.py::_process_clarification_answers` treats as
-        real questions awaiting a reply. `status_anchor` rows are routing
+        an answer" list. Scoped to
+        `kind IN ('clarification', 'goal_approval', 'budget')` — the three
+        kinds `worker.py::_process_clarification_answers` treats as real
+        questions awaiting a reply. `status_anchor` rows are routing
         plumbing, and `followup` rows are completion notices (see
         `notify_task_completed`), not questions — a Review card should not
         render a fake pending-question badge for one. Oldest first, so the
@@ -3219,7 +3260,7 @@ class SessionStore:
             rows = conn.execute(
                 "SELECT * FROM pending_questions "
                 "WHERE answered_at IS NULL AND processed = 0 AND timed_out = 0 "
-                "AND kind IN ('clarification', 'goal_approval') "
+                "AND kind IN ('clarification', 'goal_approval', 'budget') "
                 "ORDER BY id ASC",
             ).fetchall()
         return [dict(r) for r in rows]

@@ -220,6 +220,15 @@ export function decideActions(session, card) {
   const pendingQuestion = c ? c.pending_question : (s && s.pending_question);
   if (pendingQuestion) {
     out.push({ id: 'answer', label: 'Answer', enabled: true, reason: null, danger: false });
+    // A `budget` question is a yes/no decision at heart (keep going or
+    // stop) — Continue/Stop post the same `yes` / `stop` replies Answer's
+    // free-text box would, without opening the modal, alongside Answer
+    // for an operator who wants to name a specific amount instead
+    // (`yes $12` / `yes 90 min`).
+    if (pendingQuestion.kind === 'budget') {
+      out.push({ id: 'continue', label: 'Continue', enabled: true, reason: null, danger: false });
+      out.push({ id: 'stop', label: 'Stop', enabled: true, reason: null, danger: true });
+    }
   }
 
   // Accept — a card sitting in Review. Card-only.
@@ -328,6 +337,28 @@ export function openAnswerPrompt(pendingQuestion, onSent) {
       btn.textContent = 'Send';
     }
   };
+}
+
+// ---------------------------------------------------------------------
+// Continue / Stop — the one-click replies to a `budget` pending question.
+// No modal: `yes` / `stop` are the whole answer, posted straight to the
+// same answer endpoint Answer's free-text box uses.
+// ---------------------------------------------------------------------
+
+export async function sendPendingAnswer(pendingQuestion, answer, onSent) {
+  if (!pendingQuestion) return;
+  try {
+    const r = await fetch(`/api/agents/pending-questions/${encodeURIComponent(pendingQuestion.id)}/answer`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ answer }),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    showToast(answer === 'stop' ? 'Task stopped.' : 'Budget extended — resuming.', false);
+    if (onSent) onSent();
+  } catch (err) {
+    showToast(`Couldn't send reply: ${err.message}`, true);
+  }
 }
 
 // ---------------------------------------------------------------------
@@ -850,6 +881,10 @@ export function renderActionRow(container, opts = {}) {
       btn.onclick = () => openKillModal(session, { getDescendants, onKilled: onChange });
     } else if (d.id === 'answer') {
       btn.onclick = () => openAnswerPrompt(pendingQuestion, onChange);
+    } else if (d.id === 'continue') {
+      btn.onclick = () => sendPendingAnswer(pendingQuestion, 'yes', onChange);
+    } else if (d.id === 'stop') {
+      btn.onclick = () => sendPendingAnswer(pendingQuestion, 'stop', onChange);
     } else if (handlers[d.id]) {
       btn.onclick = async () => {
         // Accept is destructive enough that duplicate clicks must not issue

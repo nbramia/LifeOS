@@ -164,7 +164,7 @@ Inter-agent messages queued for delivery to a peer/child/parent session — writ
 
 ### `pending_questions`
 
-Open clarification questions sent to the operator via Telegram, and completion-message follow-ups (an operator reply to a finished task's Telegram message that continues the thread). `kind` distinguishes the two: `"clarification"` blocks the session until answered; `"followup"` reopens an already-`completed` session and appends the reply as a new turn.
+Open clarification questions sent to the operator via Telegram, and completion-message follow-ups (an operator reply to a finished task's Telegram message that continues the thread). `kind` distinguishes several flows: `"clarification"` blocks the session until answered; `"followup"` reopens an already-`completed` session and appends the reply as a new turn; `"budget"` parks a `STATUS_YIELDED` session after an in-process budget breach — `yes`/`yes $N`/`yes N min` extends the cap and resumes, `stop` finalizes as `budget_exceeded` (see [Breach → yield → ask](#breach--yield--ask)). `kind` is a plain value in this free-text column, not a separate schema element — adding `"budget"` required no migration beyond the pre-existing idempotent `ALTER TABLE ... ADD COLUMN kind` that already runs for a legacy DB predating this column at all.
 
 | Column | Meaning |
 |---|---|
@@ -301,10 +301,12 @@ poll → resolve Human-queue cards whose done_when passes (throttled by
             └────┬────┘
                  ├────► COMPLETED  (terminal — task done)
                  ├────► FAILED      (terminal — executor error, sanity reject, etc.)
-                 ├────► BUDGET_EXCEEDED  (terminal — wall/tokens/dollars cap)
+                 ├────► BUDGET_EXCEEDED  (terminal — operator replied `stop` to a budget question)
                  ├────► BLOCKED     (waiting on Telegram, or Managed Agents not configured)
-                 └────► YIELDED     (sleep tool / yield_until — wake on timer or child completion)
+                 └────► YIELDED     (sleep tool / yield_until / budget breach — wake on timer, child completion, or an operator reply)
 ```
+
+`BUDGET_EXCEEDED` is reached only by an operator's `stop` reply on an in-process route (local, remote-forced, or Managed Agents) — a wall/token/dollar/lineage-dollar breach itself lands on `YIELDED`, not this status; see [Budget enforcement](#budget-enforcement). The Claude Code and Codex CLI routes carry no budget enforcement at all and never produce this status.
 
 Each session also tracks `routing`, `budget`, `expected_output`, `total_input_tokens`, `total_output_tokens`, `total_dollars`, `managed_agent_session_id`, `started_at`, `parent_session_id`, `root_session_id`, `spawn_depth` (for lineage budgets), and `yield_waiting_for` (when in `YIELDED` from `yield_until`).
 
@@ -375,7 +377,7 @@ Hardening: response is parsed defensively (handles `` ```json `` fences, partial
 
 Per-turn flow:
 
-1. Check budgets at top-of-loop — kill with `STATUS_BUDGET_EXCEEDED` if `total_tokens >= max_tokens` OR `wall_seconds_elapsed >= wall_seconds` OR lineage budget breached. Cascade-kill descendants on lineage breach. There is no per-session dollar cap on the local route (local inference is free, so `total_dollars` is always 0); the lineage check still enforces an ancestor's `max_dollars` for a mixed family rooted at a paid managed session.
+1. Check budgets at top-of-loop, re-read fresh from the row each iteration (not a copy captured before the loop started, so an operator's cap extension on resume takes effect immediately) — yield with `STATUS_YIELDED` and `termination_evidence["budget_breach"]` set if `total_tokens >= max_tokens` (only when a title hint set one) OR `wall_seconds_elapsed >= wall_seconds` OR the lineage budget is breached; see [Breach → yield → ask](#breach--yield--ask). There is no per-session dollar cap check on the local route (local inference is free, so `total_dollars` is always 0) or the remote-forced route (a pre-existing gap this decision doesn't close); the lineage check still enforces the lineage root's own `max_dollars` for a mixed family rooted at a paid managed session.
 2. Build the message list (system prompt + prior user/assistant/tool_result turns).
 3. Call the local LLM with the tool catalog (`STANDARD_HANDLERS` + `lifeos_agent_*` inter-agent tools + LifeOS MCP tools, all in OpenAI format).
 4. Parse response — handles both OpenAI `{"function": {"name", "arguments"}}` and Anthropic `{"name", "input"}` shapes via `_normalize_tool_calls`.
@@ -436,7 +438,7 @@ Synthesized terminal status precedence:
 3. `session.status_idle` event → status=`completed`.
 4. Otherwise → still running.
 
-Cost accounting: delta-tracks token spend each poll using `pricing.cost_for(model, …)` and adds `(wall_seconds / 3600) × $0.08` session-hour overhead. Mid-flight budget breach kills the remote session via `DELETE /v1/sessions/{id}` and finalizes locally.
+Cost accounting: delta-tracks token spend each poll using `pricing.cost_for(model, …)` and adds `(wall_seconds / 3600) × $0.08` session-hour overhead. A mid-flight dollar or token breach no longer kills the remote session — it yields (`STATUS_YIELDED`, `termination_evidence["budget_breach"]` set) and leaves the session alive, untouched; see [Breach → yield → ask](#breach--yield--ask). `poll()` itself refuses to make the `get_session_state` provider call at all while the session's `budget` pending question is still open (`SessionStore.has_open_budget_question`), returning the ordinary `STATUS_RUNNING` no-op signal instead — the same early-return shape the stale-lifecycle-turn guard above it uses. This is unrelated to the separate runaway-detection kill (tool-loop / no-progress, `_detect_runaway`), which still calls `DELETE /v1/sessions/{id}` and finalizes as `STATUS_BUDGET_EXCEEDED` immediately — that mechanism isn't a budget dimension and this decision doesn't touch it.
 
 ### MCP-init failure handling
 
@@ -555,7 +557,7 @@ Local agents can spawn child sessions and coordinate via the `lifeos_agent_*` to
 
 Security: lineage checks ensure a session can only message / kill / yield-on its own descendants (rooted at `root_session_id`).
 
-Lineage budgets: every session tracks `root_session_id` + `spawn_depth`. Budget breaches at any descendant cascade-kill the entire lineage. Limits configurable via `LIFEOS_AGENT_MAX_SPAWN_DEPTH`, `LIFEOS_AGENT_MAX_DESCENDANTS_PER_ROOT`, `LIFEOS_AGENT_MAX_CONCURRENT_LOCAL`, `LIFEOS_AGENT_MAX_CONCURRENT_MANAGED`.
+Lineage budgets: every session tracks `root_session_id` + `spawn_depth`. A `lineage_max_dollars` breach at a descendant yields and asks (see [Breach → yield → ask](#breach--yield--ask)) rather than cascade-killing the lineage — the one dimension a spawned child is allowed to ask about, since the cap it names is the lineage root's own, not anything the child owns. Limits configurable via `LIFEOS_AGENT_MAX_SPAWN_DEPTH`, `LIFEOS_AGENT_MAX_DESCENDANTS_PER_ROOT`, `LIFEOS_AGENT_MAX_CONCURRENT_LOCAL`, `LIFEOS_AGENT_MAX_CONCURRENT_MANAGED`.
 
 ### Operator root-spawn
 
@@ -727,12 +729,29 @@ subscription routes.
 as one transaction: the session ledger is authoritative, and the projection is
 safe to replay after a crash.
 
-Four overlapping layers, executed in this order:
+Four overlapping layers, executed in this order. On an in-process route (local, remote-forced, managed), any breach in layers 2–3 **yields and asks instead of ending the session** — see [Breach → yield → ask](#breach--yield--ask) below. The Claude Code and Codex CLI routes are outside all of this: subscription-billed with no marginal cost, they carry no wall/token/dollar enforcement and never yield or ask on a breach.
 
-1. **Daily $-cap** — `SpendTracker.can_start_task(estimated)` short-circuits to False when `daily_cap_dollars <= 0` (operator pause). Otherwise blocks new claims when accumulated day spend ≥ cap.
-2. **Per-task token / wall caps** — checked at the top of every executor turn (local) or every poll (managed). The **dollar cap (`max_dollars`) is enforced only on the managed/API route** — the only route with marginal per-task cost. The Claude Code and Codex CLI routes are subscription-billed and the local route is free, so none of them enforce a per-task dollar cap (they track cost for `/agents` reporting but never stop on it). Because that exemption is load-bearing, "subscription-billed" is enforced rather than assumed: `ClaudeCodeExecutor._clean_env` strips every `ANTHROPIC_*` and `CLAUDE*` variable from the CLI subprocess (an inherited `ANTHROPIC_API_KEY` takes precedence over the claude.ai login, and would put an uncapped session on the API), and `inter_agent.spawn` rejects `model="claude"` when the lineage's root is a CLI session.
-3. **Lineage caps** — for child sessions, the entire lineage's combined spend is checked against any ancestor's `max_dollars`. Breach cascade-kills the lineage.
-4. **Remote (cloud only)** — when the worker detects a mid-flight breach for a managed session, it calls `DELETE /v1/sessions/{id}` to stop Anthropic-side billing immediately.
+1. **Daily $-cap** — `SpendTracker.can_start_task(estimated)` short-circuits to False when `daily_cap_dollars <= 0` (operator pause). Otherwise blocks new claims when accumulated day spend ≥ cap. Unaffected by this decision — a daily-cap pause is not a per-task budget breach and doesn't yield or ask.
+2. **Per-task token / wall caps** — checked at the top of every executor turn (local) or every poll (managed). The token cap only applies when a title hint set one (`max_tokens` defaults to `None`). The **dollar cap (`max_dollars`) is a real backstop only on the managed/API route and the remote-forced route** — the two with marginal per-task cost. The Claude Code and Codex CLI routes are subscription-billed and the local route is free, so none of them enforce a per-task dollar cap (they track cost for `/agents` reporting but never stop on it). Because that exemption is load-bearing, "subscription-billed" is enforced rather than assumed: `ClaudeCodeExecutor._clean_env` strips every `ANTHROPIC_*` and `CLAUDE*` variable from the CLI subprocess (an inherited `ANTHROPIC_API_KEY` takes precedence over the claude.ai login, and would put an uncapped session on the API), and `inter_agent.spawn` rejects `model="claude"` when the lineage's root is a CLI session.
+3. **Lineage caps** — for child sessions, the entire lineage's combined spend is checked against the lineage root's own `max_dollars`. Breach yields and asks exactly like the other dimensions — it no longer cascade-kills the rest of the lineage, since killing siblings would discard their conversations for a cap the operator may simply raise. This is the one breach a spawned child (which otherwise has no operator-facing channel) is allowed to ask about, because the cap it names lives on the lineage root, not the child itself.
+4. **Remote (managed only)** — a mid-flight breach for a managed session no longer calls `DELETE /v1/sessions/{id}`. The remote session is left alive, untouched (no new message posted), so a `yes` reply can genuinely resume the same conversation; `ManagedExecutor.poll`'s own entry guard (`SessionStore.has_open_budget_question`) skips a parked session so leaving it alive costs no further provider calls while unanswered.
+
+### Breach → yield → ask
+
+A breach in layer 2 or 3 above, on an in-process route, ends the executor's turn with session status `YIELDED` (not `BUDGET_EXCEEDED`) and `ExecutorOutcome.termination_evidence["budget_breach"]` set to the dimension name (`"wall_seconds"`, `"max_tokens"`, `"max_dollars"`, or `"lineage_max_dollars"`). `LocalExecutor._finalize_budget_yielded` is the local/remote-forced implementation; `ManagedExecutor.poll`'s dollar/token breach block is the managed one. Both leave the session's stored conversation untouched — nothing is cleared or re-seeded.
+
+`Worker._handle_outcome`'s `STATUS_YIELDED` branch reads that evidence field and, for a non-spawned session (or a spawned child whose breach was specifically `lineage_max_dollars`), calls `_ask_budget_question`: it swaps the vault tag `agent-running` → `agent-blocked` (the same tag a clarification uses — Human queue lane derivation is tag-based, so this works even though `session.status` stays `YIELDED`, not `BLOCKED`) and sends a `kind='budget'` pending question through the same Telegram/Hermes channel `ask_user_via_telegram`/`_ask_user_via_hermes` already serve clarifications with. A spawned child's breach on any *other* dimension keeps the pre-existing terminal treatment (`STATUS_BUDGET_EXCEEDED`, recorded via `child_budget_exceeded_internal` for the parent to consume) — children have no operator channel to ask through.
+
+`Worker._process_clarification_answers`/`_process_claimed_answers` dispatch a `kind='budget'` reply to `_resume_budget`, which reads the breached dimension from the session's `budget_yielded` transcript event (`_recorded_budget_breach`, the same idiom `_recorded_goal_condition` uses) and parses the reply (`_parse_budget_reply`):
+
+- **`stop`** → `_finalize_budget_stop`: restores the `agent-running` tag, kills the remote session first if one exists, then feeds a synthetic `ExecutorOutcome(status=STATUS_BUDGET_EXCEEDED, ...)` through the ordinary `_handle_outcome` — the same tag swap, vault status, and cut-off notice a breach produced before this decision.
+- **A bare `yes`** → `_extend_budget` doubles the current raw value of the breached dimension (seconds for `wall_seconds`, dollars for `max_dollars`/`lineage_max_dollars`, tokens for `max_tokens`); for `lineage_max_dollars` this writes the lineage **root's** `budget_json`, not the breaching (descendant) session's own, via `SessionStore.update_budget`.
+- **`yes $12` / `yes 90 min`** → sets the cap to that value instead of doubling it; a reply whose unit doesn't match the breached dimension (e.g. a dollar amount for a wall-clock breach) is treated as unparseable.
+- **Anything else** → a short usage-note question is sent (`kind='budget'` again) and the session stays parked.
+
+A successful extension swaps the tag back to `agent-running`, writes `STATUS_RUNNING`, and resumes: on the local/remote-forced route by calling `_execute_start` again (the executor re-reads `budget_json` fresh from the row at the top of its loop each iteration, not a copy captured before the breach, so the extension takes effect immediately and a session that still breaches the new cap asks again); on the managed route, by simply flipping status back to `RUNNING` and letting `_poll_managed_sessions`' ordinary loop continue a remote session that was never actually interrupted.
+
+An unanswered `budget` question leaves the session `YIELDED` indefinitely. `Worker.resume_pending()`'s startup-recovery sweep already skips every `STATUS_YIELDED` session unconditionally (there for a sleeping session's `sleeps` row) — a budget-parked session has no `sleeps` row, but is skipped by the same unconditional check, so it costs nothing and is never re-dispatched until an operator reply resolves it.
 
 ---
 
@@ -844,6 +863,7 @@ Full reference in [`agent-worker-setup.md`](../../guides/agent-worker-setup.md).
 
 - [ADR-008: Managed Agents Cloud Routing](../../adr/008-managed-agents-cloud-routing.md) — Decision record for the local-vs-cloud executor split
 - [ADR-018: API Spend Requires Operator Consent](../../adr/018-api-spend-requires-consent.md) — Why an inferred cloud route asks, and why the CLI subprocess carries no API credential
+- [ADR-026: A Budget Breach Asks; It Does Not Fail](../../adr/026-budget-breach-asks.md) — Decision record for the yield-and-ask contract described in [Budget enforcement](#budget-enforcement)
 - [Agent Worker — Product](../product/agent-worker.md) — What `#agent` does, consumer view
 - [Agent Worker — Setup](../../guides/agent-worker-setup.md) — Operator setup walkthrough
 - [Agent Worker — Setup § Working directory](../../guides/agent-worker-setup.md#working-directory-run-a-local-or-cloud-card-in-an-isolated-checkout-925) — Operator-facing walkthrough for the guard described here

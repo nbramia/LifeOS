@@ -1073,6 +1073,7 @@ def _pending_question_view(pq: dict[str, Any]) -> dict[str, Any]:
         "question": pq["question"],
         "asked_at": pq["sent_at"],
         "bot": pq.get("bot"),
+        "kind": pq.get("kind") or "clarification",
     }
 
 
