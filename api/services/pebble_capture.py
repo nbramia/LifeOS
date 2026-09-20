@@ -68,11 +68,14 @@ EXECUTOR_ALIASES: dict[str, str] = {
 # Alternation tried longest-phrase-first, so a multi-word alias like "cloud
 # code" is matched whole before the identity entry for the bare "cloud" tag
 # nested inside it could otherwise fire and leave " code" dangling.
+# ASCII-only word-boundary/case-folding: every alias and canonical tag is
+# plain ASCII, and this keeps an exotic Unicode case fold from producing a
+# matched span that isn't literally one of EXECUTOR_ALIASES' keys.
 _EXECUTOR_ALIAS_RE = re.compile(
     r"\b(?:" + "|".join(
         re.escape(phrase) for phrase in sorted(EXECUTOR_ALIASES, key=len, reverse=True)
     ) + r")\b",
-    re.IGNORECASE,
+    re.IGNORECASE | re.ASCII,
 )
 
 
@@ -89,7 +92,7 @@ def normalize_executor(text: str) -> Optional[str]:
     match = _EXECUTOR_ALIAS_RE.fullmatch(text.strip())
     if not match:
         return None
-    return EXECUTOR_ALIASES[match.group(0).casefold()]
+    return EXECUTOR_ALIASES.get(match.group(0).casefold())
 
 
 def canonicalize_executor_mentions(text: str) -> str:
@@ -106,7 +109,7 @@ def canonicalize_executor_mentions(text: str) -> str:
     if not text:
         return text
     return _EXECUTOR_ALIAS_RE.sub(
-        lambda match: EXECUTOR_ALIASES[match.group(0).casefold()], text
+        lambda match: EXECUTOR_ALIASES.get(match.group(0).casefold(), match.group(0)), text
     )
 
 
@@ -982,6 +985,17 @@ class PebbleJournalClassifier:
 
 _JEV_SPLIT_RE = re.compile(r",\s*|\s+(?:and|before|but|then|so)\s+|[.;!?]\s+")
 
+# A recurring cadence -- "every morning", "weekly", "on weekdays" -- names
+# more than the single instant `parse_contextual_time` can resolve; filing a
+# schedule anyway would silently collapse a recurrence into one one-time
+# reminder at whatever hour it happened to parse.
+_RECURRENCE_RE = re.compile(
+    r"\b(every|each|daily|weekly|monthly|hourly|nightly|weekdays?|weekends?)\b",
+    re.IGNORECASE,
+)
+
+_JEV_DISPOSITIONS = frozenset({"task", "notify_schedule", "delegated_task", "agent_schedule"})
+
 
 def _segment_transcript(text: str) -> list[str]:
     """Split a transcript into small candidate fragments.
@@ -1050,7 +1064,7 @@ class JevPebbleClassifier:
     async def classify(self, final_text: str, recorded_at: str) -> list[dict[str, Any]]:
         fragments = _segment_transcript(final_text)
         item_criteria = {f"s{i}": fragment for i, fragment in enumerate(fragments)}
-        item_criteria["none"] = "No item was asked to be filed"
+        item_criteria["none"] = "No single fragment -- the whole note is the request"
         work_criteria = {f"s{i}": fragment for i, fragment in enumerate(fragments)}
         questions = {
             "disposition": {
@@ -1093,56 +1107,83 @@ class JevPebbleClassifier:
             logger.warning("Jev Pebble classification failed; filing log-only")
             return []
         self.last_answers = answers
-        disposition = answers.get("disposition") or {}
-        confidence = disposition.get("confidence")
-        if not isinstance(confidence, (int, float)) or confidence < 0.5:
+        try:
+            return _jev_plan_from_answers(answers, final_text, recorded_at, item_criteria, work_criteria)
+        except (KeyError, TypeError, AttributeError, ValueError):
+            logger.warning("Jev Pebble classification returned a malformed answer; filing log-only")
             return []
-        item_choice = (answers.get("item") or {}).get("choice")
-        item = item_criteria.get(item_choice) if item_choice and item_choice != "none" else final_text.strip(" .")
-        work_choice = (answers.get("work") or {}).get("choice")
-        work = work_criteria.get(work_choice) or item
-        executor_choice = (answers.get("executor") or {}).get("choice")
-        executor = executor_choice if executor_choice in AGENT_EXECUTOR_TAGS else None
-        delegation_evidence = final_text.strip(" .")
 
-        disp = disposition.get("choice")
-        if disp == "log_only":
-            return []
-        if disp == "notify_schedule":
-            recorded_local = _utc(recorded_at).astimezone(ZoneInfo(settings.timezone))
-            when = parse_contextual_time(final_text, recorded_local)
-            if when is None:
-                return [{"kind": "task", "index": 0, "title": item, "action_evidence": item}]
-            return [{
-                "kind": "schedule", "index": 0, "title": item, "schedule_type": "once",
-                "schedule_value": when.isoformat(), "timezone": settings.timezone,
-                "action": "notify", "message": item,
-            }]
-        if disp == "delegated_task":
-            if executor is None:
-                return [{"kind": "task", "index": 0, "title": item, "action_evidence": item}]
-            return [{
-                "kind": "task", "index": 0, "title": work, "action_evidence": work,
-                "tags": [executor], "delegation_evidence": delegation_evidence,
-            }]
-        if disp == "agent_schedule":
-            if executor is None:
-                return [{"kind": "task", "index": 0, "title": item, "action_evidence": item}]
-            recorded_local = _utc(recorded_at).astimezone(ZoneInfo(settings.timezone))
-            when = parse_contextual_time(final_text, recorded_local)
-            if when is None:
-                return [{
-                    "kind": "task", "index": 0, "title": work, "action_evidence": work,
-                    "tags": [executor], "delegation_evidence": delegation_evidence,
-                }]
-            return [{
-                "kind": "schedule", "index": 0, "title": work, "schedule_type": "once",
-                "schedule_value": when.isoformat(), "timezone": settings.timezone,
-                "action": "agent", "executor": executor, "message": work,
-                "delegation_evidence": delegation_evidence, "action_evidence": work,
-            }]
-        # "task" disposition, and the fallback for any other/unexpected value.
+
+def _jev_plan_from_answers(
+    answers: dict[str, Any], final_text: str, recorded_at: str,
+    item_criteria: dict[str, str], work_criteria: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Turn one Jev answers dict into a raw action list.
+
+    Log-only (an empty list) below the confidence floor, for a "log_only"
+    or any unrecognized disposition, for a recurring cadence a single-instant
+    time parse can't represent, and for a delegation with no recognized
+    executor -- never a silently reassigned or invented action. Raises
+    `KeyError`/`TypeError`/`AttributeError`/`ValueError` on a malformed
+    answers shape; the caller treats that the same as a failed Jev call.
+    """
+    disposition = answers.get("disposition") or {}
+    confidence = disposition.get("confidence")
+    if not isinstance(confidence, (int, float)) or confidence < 0.5:
+        return []
+    disp = disposition.get("choice")
+    if disp not in _JEV_DISPOSITIONS:
+        return []
+
+    item_choice = (answers.get("item") or {}).get("choice")
+    item = item_criteria.get(item_choice) if item_choice and item_choice != "none" else final_text.strip(" .")
+    work_choice = (answers.get("work") or {}).get("choice")
+    work = work_criteria.get(work_choice) or item
+    executor_choice = (answers.get("executor") or {}).get("choice")
+    executor = executor_choice if executor_choice in AGENT_EXECUTOR_TAGS else None
+    delegation_evidence = final_text.strip(" .")
+
+    if disp == "task":
         return [{"kind": "task", "index": 0, "title": item, "action_evidence": item}]
+
+    if disp in ("notify_schedule", "agent_schedule") and _RECURRENCE_RE.search(final_text):
+        return []
+
+    if disp == "notify_schedule":
+        recorded_local = _utc(recorded_at).astimezone(ZoneInfo(settings.timezone))
+        when = parse_contextual_time(final_text, recorded_local)
+        if when is None:
+            return [{"kind": "task", "index": 0, "title": item, "action_evidence": item}]
+        return [{
+            "kind": "schedule", "index": 0, "title": item, "schedule_type": "once",
+            "schedule_value": when.isoformat(), "timezone": settings.timezone,
+            "action": "notify", "message": item,
+        }]
+
+    if disp == "delegated_task":
+        if executor is None:
+            return []
+        return [{
+            "kind": "task", "index": 0, "title": work, "action_evidence": work,
+            "tags": [executor], "delegation_evidence": delegation_evidence,
+        }]
+
+    # disp == "agent_schedule"
+    if executor is None:
+        return []
+    recorded_local = _utc(recorded_at).astimezone(ZoneInfo(settings.timezone))
+    when = parse_contextual_time(final_text, recorded_local)
+    if when is None:
+        return [{
+            "kind": "task", "index": 0, "title": work, "action_evidence": work,
+            "tags": [executor], "delegation_evidence": delegation_evidence,
+        }]
+    return [{
+        "kind": "schedule", "index": 0, "title": work, "schedule_type": "once",
+        "schedule_value": when.isoformat(), "timezone": settings.timezone,
+        "action": "agent", "executor": executor, "message": work,
+        "delegation_evidence": delegation_evidence, "action_evidence": work,
+    }]
 
 
 def _default_pebble_classifier() -> Any:

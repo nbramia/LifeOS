@@ -1433,13 +1433,25 @@ async def test_jev_classifier_delegated_task_files_the_work_fragment_not_the_who
 
 
 @pytest.mark.asyncio
-async def test_jev_classifier_delegated_task_with_no_named_executor_files_a_plain_task():
+async def test_jev_classifier_delegated_task_with_no_named_executor_files_log_only():
+    """Log-only is the policy default; no executor must never silently
+    reassign a delegation to the operator as a plain task."""
     client = _FakeJevClient(_jev_answers(disposition="delegated_task", item="s0", executor="none"))
-    [action] = await JevPebbleClassifier(client=client).classify(
+    actions = await JevPebbleClassifier(client=client).classify(
         "Ask someone to fix the synthetic login bug", "2030-01-01T10:00:00Z"
     )
-    assert action["kind"] == "task"
-    assert "tags" not in action
+    assert actions == []
+
+
+@pytest.mark.asyncio
+async def test_jev_classifier_agent_schedule_with_no_named_executor_files_log_only():
+    client = _FakeJevClient(
+        _jev_answers(disposition="agent_schedule", work="s0", executor="none")
+    )
+    actions = await JevPebbleClassifier(client=client).classify(
+        "Have someone review the synthetic report tomorrow at 9 AM", "2030-01-01T10:00:00Z"
+    )
+    assert actions == []
 
 
 @pytest.mark.asyncio
@@ -1452,6 +1464,43 @@ async def test_jev_classifier_agent_schedule_without_a_parseable_time_files_a_de
     )
     assert action["kind"] == "task"
     assert action["tags"] == ["claude"]
+
+
+@pytest.mark.asyncio
+async def test_jev_classifier_unknown_disposition_files_log_only():
+    """An unrecognized/missing disposition choice is treated as log-only,
+    never as a silently-invented task."""
+    client = _FakeJevClient(_jev_answers(disposition="banana", confidence=0.99, item="s0"))
+    actions = await JevPebbleClassifier(client=client).classify(
+        "Add a task to buy synthetic milk.", "2030-01-01T10:00:00Z"
+    )
+    assert actions == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disposition", ["notify_schedule", "agent_schedule"])
+async def test_jev_classifier_recurring_cadence_files_log_only(disposition):
+    """`parse_contextual_time` only ever resolves a single instant; a
+    recurrence must not collapse into one one-time reminder."""
+    client = _FakeJevClient(
+        _jev_answers(disposition=disposition, item="s0", work="s0", executor="claude")
+    )
+    actions = await JevPebbleClassifier(client=client).classify(
+        "Every Monday remind me to water the synthetic plants", "2030-01-01T10:00:00Z"
+    )
+    assert actions == []
+
+
+@pytest.mark.asyncio
+async def test_jev_classifier_malformed_answers_shape_files_log_only():
+    class MalformedClient:
+        async def aask(self, state, questions):
+            return {"disposition": "not-a-dict"}
+
+    actions = await JevPebbleClassifier(client=MalformedClient()).classify(
+        "Add a task to buy synthetic milk.", "2030-01-01T10:00:00Z"
+    )
+    assert actions == []
 
 
 @pytest.mark.asyncio

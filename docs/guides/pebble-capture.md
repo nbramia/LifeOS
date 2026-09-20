@@ -110,6 +110,14 @@ made by setting `LIFEOS_PEBBLE_CLASSIFIER=jev` explicitly. A missing key
 falls back to `PebbleJournalClassifier` with a logged warning, never a
 failed capture.
 
+`JevPebbleClassifier` files a recurring reminder ("every morning", "weekly",
+"on weekdays", ...) log-only rather than as a schedule: `parse_contextual_time`
+only ever resolves a single instant, so it can't represent a recurrence, and
+filing one anyway would silently collapse it into a single one-time reminder
+at whatever hour happened to parse. `PebbleJournalClassifier` has no such
+limit -- the model emits a `cron` schedule directly, so it still files
+recurring reminders as schedules.
+
 ## Verification Matrix
 
 | Concern | Evidence |
