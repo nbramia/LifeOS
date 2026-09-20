@@ -185,12 +185,10 @@ def scrape_linkedin_profiles(
         logger.info(f"  URL: {person.linkedin_url}")
 
         try:
-            # This is where we'd call Claude in Chrome MCP
-            # For now, just mark as needing external scraping
+            # This script only marks the person as ready; it doesn't call
+            # Claude in Chrome MCP itself -- the actual scrape is a separate,
+            # out-of-band step run by an agent with MCP tool access.
             logger.info(f"  → Ready for MCP scraping (person_id: {person.id})")
-
-            # The actual scraping will be done by calling this script
-            # with special flags or by orchestrating from outside
 
         except Exception as e:
             logger.error(f"  Error: {e}")
@@ -205,7 +203,7 @@ def scrape_linkedin_profiles(
             logger.info(f"  Waiting {delay:.1f}s before next profile...")
             time.sleep(delay)
 
-    logger.info(f"\n=== Scrape Summary ===")
+    logger.info("\n=== Scrape Summary ===")
     logger.info(f"Total profiles: {stats['profiles_to_scrape']}")
     logger.info(f"Already completed: {stats['already_completed']}")
     logger.info(f"Newly completed: {stats['newly_completed']}")

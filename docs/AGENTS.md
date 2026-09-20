@@ -267,7 +267,7 @@ Use only the buckets that apply — omit empty buckets rather than including the
 
 **Specs are living:**
 - Update when the design changes, not when tasks complete.
-- If a spec describes a target that's not yet built, the `Status: Partial` value is appropriate.
+- If a spec describes a target the implementation hasn't reached, the `Status: Partial` value is appropriate.
 - Specs are not changelogs, and neither are comments, docstrings, or tests. Don't cite an issue or PR number as a record of what happened, describe current behavior by contrasting it with an earlier state, or reference review-round or reviewer-finding numbers anywhere in the repo; that's what `git log` and `git blame` are for.
 
 **Plans are ephemeral:**

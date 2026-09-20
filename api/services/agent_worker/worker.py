@@ -1156,10 +1156,10 @@ class Worker:
         """Resume yielded sessions whose listed children have all terminated.
 
         Local sessions get the children's outputs injected as a new user turn
-        and re-enter the executor loop. Managed yield-and-resume is not yet
-        supported (session was killed remotely; re-creation with full history
-        transfer is a follow-up PR) — for now those land in FAILED with a
-        clear reason so the operator can re-tag.
+        and re-enter the executor loop. Managed yield-and-resume is
+        unsupported — the managed session was killed remotely, so it can't
+        be resumed with the children's outputs injected — so those land in
+        FAILED with a clear reason so the operator can re-tag.
         """
         from api.services.agent_worker.session_store import TERMINAL_STATUSES as _TS
         yielded = self.session_store.list_yielded_waiting_on_children()
@@ -2059,14 +2059,14 @@ class Worker:
                 # otherwise: managed session is now running, _poll_managed_sessions takes over
             else:
                 # Other managed-side clarification (mid-loop lifeos_agent_user_ask):
-                # not yet supported because the original session was killed.
+                # unsupported because the original session was killed.
                 self.session_store.mark_question_processed(q["id"])
                 self.transcript_store.append(
                     session_id, "managed_clarification_resume_unsupported", {},
                 )
                 self._mark_failed(
                     session, task,
-                    "managed clarification resume not yet supported",
+                    "managed clarification resume is unsupported",
                 )
 
     def _repair_lineage_root(self, session: Session) -> Session:

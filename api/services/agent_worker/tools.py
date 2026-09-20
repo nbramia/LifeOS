@@ -5,10 +5,10 @@ The local executor exposes a small fixed set of operating-system tools
 surface proxied through `LifeOSMCPServer._call_api`. The agent sees Anthropic-
 style tool definitions; the dispatcher routes calls to Python handlers.
 
-WebSearch is stubbed — LifeOS doesn't ship a built-in search backend in
-Issue C. The tool definition is exposed so the agent knows the affordance
-exists; the handler returns a structured "not configured" reply so the
-agent can pivot rather than hang.
+WebSearch is stubbed — LifeOS doesn't ship a built-in search backend. The
+tool definition is exposed so the agent knows the affordance exists; the
+handler always returns a structured "not configured" reply so the agent
+can pivot rather than hang.
 
 No sandboxing per the user's design decision: the worker runs with the
 operator's full filesystem and shell access. This is intentional and is
@@ -108,7 +108,7 @@ STANDARD_TOOLS: list[dict[str, Any]] = [
     },
     {
         "name": "WebSearch",
-        "description": "Run a web search. NOTE: this LifeOS install does not yet have a search backend configured. The tool returns 'not configured' until a backend is wired up.",
+        "description": "Run a web search. NOTE: LifeOS does not ship a search backend for this tool — it always returns 'not configured'; use WebFetch with a specific URL instead.",
         "input_schema": {
             "type": "object",
             "properties": {"query": {"type": "string"}},
@@ -292,8 +292,8 @@ def _tool_webfetch(args: dict, base_dir: str | None = None) -> ToolResult:
 
 
 def _tool_websearch(args: dict, base_dir: str | None = None) -> ToolResult:
-    # Search backend is intentionally not configured in Issue C. We surface
-    # the tool so the agent can plan around it, but calling it returns a
+    # LifeOS ships no search backend for this tool. We surface the tool
+    # definition so the agent can plan around it, but calling it returns a
     # structured "not configured" message rather than failing silently.
     del base_dir  # unused — WebSearch doesn't touch the local filesystem
     return ToolResult(

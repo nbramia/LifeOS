@@ -103,7 +103,7 @@ def _parse_abcdp_contact(plist_data: dict, identifier: str) -> dict | None:
         "department": plist_data.get("Department", ""),
         "emails": emails,
         "phones": phones,
-        "addresses": [],  # Postal addresses have complex plist structure; omit for now
+        "addresses": [],  # Postal addresses have complex plist structure; omitted from export
         "social_profiles": [],
         "note": "",  # Notes may contain sensitive data; omit from export
         "image_available": False,
@@ -262,7 +262,7 @@ def _fetch_abcddb_contacts(db_path: Path) -> list[dict]:
             "department": r["ZDEPARTMENT"] or "",
             "emails": emails_by_owner.get(r["Z_PK"], []),
             "phones": phones_by_owner.get(r["Z_PK"], []),
-            "addresses": [],  # Postal addresses have complex plist structure; omit for now
+            "addresses": [],  # Postal addresses have complex plist structure; omitted from export
             "social_profiles": [],
             "note": "",  # Notes may contain sensitive data; omit from export
             "image_available": False,

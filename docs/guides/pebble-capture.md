@@ -122,4 +122,5 @@ test-suite gate, since it makes a real network call.
 
 ## Related Documents
 
+- [Journal Ring Ingest](journal-ring-ingest.md) — The webhook a ring device posts to; this guide covers the file-watcher capture path and its filing controls.
 - [Configuration](configuration.md) — Authoritative environment-variable reference.

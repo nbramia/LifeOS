@@ -1,10 +1,11 @@
 """Routes a task to the appropriate executor based on preflight output.
 
-Issue C wires only the `local` branch. `claude` rolls the tag back to
-`#agent` and logs; Issue D adds the managed-agents driver and finishes the
-wiring. `ask` is handled before routing by the worker — preflight returns
-`routing="ask"` and the worker sends a clarification + parks the task as
-`#agent-blocked` without ever invoking the router.
+`local` routing runs through `local_executor.execute()`. `claude` routing
+(the Anthropic-API/Managed-Agents route) isn't dispatched here — it logs and
+rolls the tag back to `#agent` via `on_claude_unavailable`. `ask` is handled
+before routing by the worker — preflight returns `routing="ask"` and the
+worker sends a clarification + parks the task as `#agent-blocked` without
+ever invoking the router.
 """
 from __future__ import annotations
 
@@ -25,8 +26,9 @@ def dispatch(
     local_executor: LocalExecutor,
     on_claude_unavailable: Callable[[], None] | None = None,
 ) -> ExecutorOutcome | None:
-    """Run the executor for `session`. Returns the outcome, or None when the
-    routing destination isn't implemented yet (caller decides how to handle).
+    """Run the executor for `session`. Returns the outcome, or None when this
+    function doesn't dispatch the routing destination itself (caller decides
+    how to handle).
     """
     routing = session.routing
     if routing == ROUTE_LOCAL:
@@ -34,7 +36,7 @@ def dispatch(
 
     if routing == ROUTE_CLAUDE:
         logger.info(
-            "Claude routing not yet implemented (Issue D) — leaving task for later"
+            "Claude routing is dispatched by the worker directly, not this router — leaving task for later"
         )
         if on_claude_unavailable is not None:
             on_claude_unavailable()
