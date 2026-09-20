@@ -30,7 +30,10 @@ import pytest
 # marker selection -- this import adds no new cost. The module-scoped
 # playwright/browser fixture overrides at the bottom of this file delegate
 # to upstream's own bodies through it instead of copying them.
-import pytest_playwright.pytest_playwright as _pw_plugin
+try:
+    import pytest_playwright.pytest_playwright as _pw_plugin
+except ImportError:
+    _pw_plugin = None
 
 # Lightweight (no chromadb/torch at module scope) -- used below to build
 # _LIVE_VECTORSTORE_COLLECTIONS without hardcoding these as string literals.
@@ -1595,33 +1598,34 @@ def _no_local_telegram_bots_override(tmp_path_factory, monkeypatch):
 # silently passing arguments in the wrong shape.
 # ---------------------------------------------------------------------------
 
-@pytest.fixture(scope="module")
-def playwright():
-    yield from _pw_plugin.playwright.__wrapped__()
+if _pw_plugin is not None:
+    @pytest.fixture(scope="module")
+    def playwright():
+        yield from _pw_plugin.playwright.__wrapped__()
 
 
-@pytest.fixture(scope="module")
-def browser_type(playwright, browser_name):
-    return _pw_plugin.browser_type.__wrapped__(playwright, browser_name)
+    @pytest.fixture(scope="module")
+    def browser_type(playwright, browser_name):
+        return _pw_plugin.browser_type.__wrapped__(playwright, browser_name)
 
 
-@pytest.fixture(scope="module")
-def browser_context_args(pytestconfig, playwright, device, base_url, _pw_artifacts_folder):
-    return _pw_plugin.browser_context_args.__wrapped__(
-        pytestconfig, playwright, device, base_url, _pw_artifacts_folder
-    )
+    @pytest.fixture(scope="module")
+    def browser_context_args(pytestconfig, playwright, device, base_url, _pw_artifacts_folder):
+        return _pw_plugin.browser_context_args.__wrapped__(
+            pytestconfig, playwright, device, base_url, _pw_artifacts_folder
+        )
 
 
-@pytest.fixture(scope="module")
-def launch_browser(browser_type_launch_args, browser_type, connect_options):
-    return _pw_plugin.launch_browser.__wrapped__(
-        browser_type_launch_args, browser_type, connect_options
-    )
+    @pytest.fixture(scope="module")
+    def launch_browser(browser_type_launch_args, browser_type, connect_options):
+        return _pw_plugin.launch_browser.__wrapped__(
+            browser_type_launch_args, browser_type, connect_options
+        )
 
 
-@pytest.fixture(scope="module")
-def browser(launch_browser):
-    yield from _pw_plugin.browser.__wrapped__(launch_browser)
+    @pytest.fixture(scope="module")
+    def browser(launch_browser):
+        yield from _pw_plugin.browser.__wrapped__(launch_browser)
 
 
 # A guard test for this delegation lives in

@@ -8,7 +8,10 @@ NOTE: sentence_transformers is imported lazily to avoid slow startup.
 This allows tests to import this module without loading the ML library.
 """
 import errno
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 import logging
 import os
 import threading
@@ -279,7 +282,8 @@ class EmbeddingService:
             outcome = _LOCK_ERROR
             while True:
                 try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    if fcntl is not None:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     acquired = True
                     outcome = _LOCK_ACQUIRED
                     break
@@ -305,7 +309,8 @@ class EmbeddingService:
         finally:
             if acquired:
                 try:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    if fcntl is not None:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
                 except OSError:
                     pass
             try:
