@@ -122,8 +122,11 @@ jobs:
           # The decision itself is the runner's candidate_lanes.py, which
           # mirrors scripts/test.sh's docs-only rule, so a docs-only
           # candidate executes nothing and is published as such.
-          CHANGED="$(git -C candidate diff --name-only --merge-base "$TRUSTED_RUNNER_SHA" "$CANDIDATE_SHA" 2>/dev/null \
-            || git -C candidate diff --name-only "$TRUSTED_RUNNER_SHA" "$CANDIDATE_SHA" 2>/dev/null \
+          # The candidate checkout is a depth-1 clone of the candidate alone,
+          # so the base commit is fetched into it before either diff can run.
+          CHANGED="$(git -C candidate fetch --no-tags --depth=1 origin "$TRUSTED_RUNNER_SHA" 2>/dev/null \
+            && { git -C candidate diff --name-only --merge-base "$TRUSTED_RUNNER_SHA" "$CANDIDATE_SHA" 2>/dev/null \
+                 || git -C candidate diff --name-only "$TRUSTED_RUNNER_SHA" "$CANDIDATE_SHA" 2>/dev/null; } \
             || true)"
           echo "changed files:"; printf '%s\n' "$CHANGED" | sed 's/^/  /'
           printf '%s\n' "$CHANGED" | python3 trusted-runner/scripts/candidate_lanes.py | tee "$RUNNER_TEMP/lifeos-lane-selection"
