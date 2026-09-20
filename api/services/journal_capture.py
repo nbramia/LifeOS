@@ -14,7 +14,10 @@ error. Only the vault-relative path of the day file is ever recorded.
 """
 from __future__ import annotations
 
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 import logging
 import os
 import re
@@ -100,7 +103,8 @@ def capture_fragment(text: str, *, now: Optional[datetime] = None) -> CaptureRes
     # fire if _LOG_DIR_PARTS itself is ever changed to something unsafe — but a
     # write path that quietly relocates is exactly the failure this issue is
     # about, so it is checked rather than assumed.
-    if target.parent != vault_root.joinpath(*_LOG_DIR_PARTS):
+    if target.parent != vault_root.joinpath(*_LOG_DIR_PARTS).resolve():
+        print(f"DEBUG: target.parent={target.parent!r}, expected={vault_root.joinpath(*_LOG_DIR_PARTS).resolve()!r}")
         raise JournalCaptureError(
             f"journal capture target resolved outside {'/'.join(_LOG_DIR_PARTS)}/"
         )
@@ -110,7 +114,8 @@ def capture_fragment(text: str, *, now: Optional[datetime] = None) -> CaptureRes
         # Binary mode: the trailing-byte probe below must not have to decode a
         # partial multi-byte character out of a hand-edited file.
         with target.open("ab+") as f:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            if fcntl is not None:
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
             try:
                 f.seek(0, os.SEEK_END)
                 size = f.tell()
@@ -130,7 +135,8 @@ def capture_fragment(text: str, *, now: Optional[datetime] = None) -> CaptureRes
                 f.flush()
                 os.fsync(f.fileno())
             finally:
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+                if fcntl is not None:
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
     except OSError as e:
         # `from None`: an OSError's message carries errno and a path, but
         # chaining it would put the whole write frame — and the local holding

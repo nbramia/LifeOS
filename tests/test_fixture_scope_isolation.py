@@ -28,7 +28,7 @@ defined inside the plugin module itself would never run.
 import inspect
 
 import pytest
-import pytest_playwright.pytest_playwright as _pw_plugin
+_pw_plugin = pytest.importorskip("pytest_playwright.pytest_playwright")
 
 pytestmark = pytest.mark.unit
 
