@@ -168,9 +168,9 @@ Engine-assigned task worker. Product spec: [agent-worker.md](../specs/product/ag
 | `LIFEOS_AGENT_WORKER_AUTOSTART` | bool | `false` | When `true`, the worker starts on boot. Default off to require explicit opt-in. |
 | `LIFEOS_AGENT_WORKER_POLL_SECONDS` | float | `60` | Poll interval for new engine-assigned tasks. |
 | `LIFEOS_HUMAN_QUEUE_POLL_SECONDS` | float | `300` | Poll interval for Human-queue `done_when` checks. See [human-queue.md](human-queue.md). |
-| `LIFEOS_AGENT_DEFAULT_BUDGET_DOLLARS` | float | `5.00` | Per-task $-cap when the task title doesn't specify one. |
+| `LIFEOS_AGENT_DEFAULT_BUDGET_DOLLARS` | float | `10.00` | Per-task $-cap when the task title doesn't specify one — a backstop, not a quota ordinary tasks are expected to approach. |
 | `LIFEOS_AGENT_DEFAULT_WALL_SECONDS` | int | `14400` (4 h) | Per-task wall-time cap when title doesn't specify. |
-| `LIFEOS_AGENT_DEFAULT_MAX_TOKENS` | int | `500000` | Per-task token cap when title doesn't specify. |
+| `LIFEOS_AGENT_DEFAULT_MAX_TOKENS` | int \| None | `None` | Per-task token cap. Unset (default) means no token cap applies; set only when a title doesn't already name one explicitly (e.g. "50k tokens"). |
 | `LIFEOS_AGENT_DAILY_CAP_DOLLARS` | float | `100.00` | Global daily $-cap. When crossed, the worker stops claiming new tasks until next local midnight. Set to `0` to pause new claims entirely. |
 | `LIFEOS_AGENT_CLARIFICATION_TIMEOUT_HOURS` | int | `72` | How long to wait for a Telegram clarification before abandoning the task. |
 | `LIFEOS_AGENT_STUCK_SESSION_TIMEOUT_MINUTES` | int | `15` | How long a top-level `claude_code`/`codex` session may sit at `status=claimed` with an undelivered queued message before the stuck-session sweep alerts the operator by name. |

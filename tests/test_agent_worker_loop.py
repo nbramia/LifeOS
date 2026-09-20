@@ -811,6 +811,41 @@ def test_executor_budget_exceeded_sets_budget_exceeded_tag(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_budget_exceeded_notice_leads_with_dollars_and_minutes(tmp_path: Path):
+    """The notice headlines dollars (2dp) and active minutes spent — never a
+    raw token count — so the operator sees real cost, not the (now opt-in)
+    token cap."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "long task", "status": "todo", "tags": ["local"]},
+    ])
+
+    class _SpendingStubExecutor(_StubExecutor):
+        def execute(self, session, task):
+            self.calls.append((session.task_id, task.get("description")))
+            store = getattr(self, "_session_store", None)
+            if store is not None:
+                store.add_session_hour_overhead(session.task_id, 5.123)
+                store.record_active_seconds(session.task_id, 38 * 60 + 20)
+            return self.outcome
+
+    executor = _SpendingStubExecutor(outcome=ExecutorOutcome(
+        status=STATUS_BUDGET_EXCEEDED, reason="max_dollars",
+    ))
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=executor)
+    executor._session_store = w.session_store
+    w.tick()
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    notice = next(s for s in sent if "hit its budget" in s)
+    assert "(max_dollars)" in notice
+    assert "$5.12" in notice
+    assert "38 min" in notice
+    assert "500000" not in notice
+    assert "tokens" not in notice
+
+
+@pytest.mark.unit
 def test_claude_routing_without_managed_credentials_blocks(tmp_path: Path, monkeypatch):
     """Without Managed Agents credentials configured the worker parks Claude-
     routed tasks at #agent-blocked. Same UX as ambiguity / sanity / ask."""

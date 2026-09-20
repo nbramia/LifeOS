@@ -746,19 +746,24 @@ class Settings(BaseSettings):
                     "Off by default — opt-in via setup-systemd.sh."
     )
     agent_default_budget_dollars: float = Field(
-        default=5.0,
+        default=10.0,
         alias="LIFEOS_AGENT_DEFAULT_BUDGET_DOLLARS",
-        description="Default per-task dollar budget when the task title doesn't specify one."
+        description="Default per-task dollar budget when the task title doesn't "
+                    "specify one — a backstop against a runaway, not a quota "
+                    "ordinary tasks are expected to approach."
     )
     agent_default_wall_seconds: int = Field(
         default=14400,
         alias="LIFEOS_AGENT_DEFAULT_WALL_SECONDS",
         description="Default per-task wall-clock budget (seconds); 14400 = 4h."
     )
-    agent_default_max_tokens: int = Field(
-        default=500_000,
+    agent_default_max_tokens: int | None = Field(
+        default=None,
         alias="LIFEOS_AGENT_DEFAULT_MAX_TOKENS",
-        description="Default per-task token budget (input + output combined)."
+        description="Default per-task token budget (input + output combined). "
+                    "None (default) means no token cap applies — the dollar and "
+                    "wall-clock budgets are the real backstops. Set only when a "
+                    "task title names one explicitly (e.g. \"50k tokens\")."
     )
     agent_default_route: str = Field(
         default="",

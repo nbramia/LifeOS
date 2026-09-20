@@ -499,6 +499,17 @@ def _format_token_buckets(
     return " + ".join(parts)
 
 
+def _format_budget_spend(dollars: float, active_seconds: float) -> str:
+    """Render "$x.xx and N min" for a budget notice headline.
+
+    Dollars and active minutes are the two real backstop dimensions
+    (`max_dollars`, `wall_seconds`) — a raw token count is never the
+    headline here.
+    """
+    minutes = round((active_seconds or 0.0) / 60)
+    return f"${(dollars or 0.0):.2f} and {minutes} min"
+
+
 def _is_readable_tool_result(text: str) -> bool:
     """Heuristic: is this tool result useful to dump inline as the
     operator-facing completion body? Skip raw JSON dumps (list_threads,
@@ -4330,7 +4341,12 @@ class Worker:
         label = "Code session"
         notice = ""
         if outcome.status == STATUS_BUDGET_EXCEEDED:
-            notice = f"⚠️ {label} hit its budget ({outcome.reason})."
+            spent_row = self.session_store.get_by_session_id(sid)
+            spend = _format_budget_spend(
+                spent_row.total_dollars if spent_row else 0.0,
+                spent_row.total_active_seconds if spent_row else 0.0,
+            )
+            notice = f"⚠️ {label} hit its budget ({outcome.reason}) after {spend}."
         elif outcome.status == STATUS_FAILED and outcome.reason != REASON_KILLED:
             # an operator-killed session must NOT emit a post-kill notice —
             # the operator stopped it deliberately. The row is already FAILED and
@@ -4808,7 +4824,12 @@ class Worker:
         label = "Codex session"
         notice = ""
         if outcome.status == STATUS_BUDGET_EXCEEDED:
-            notice = f"⚠️ {label} hit its budget ({outcome.reason})."
+            spent_row = self.session_store.get_by_session_id(sid)
+            spend = _format_budget_spend(
+                spent_row.total_dollars if spent_row else 0.0,
+                spent_row.total_active_seconds if spent_row else 0.0,
+            )
+            notice = f"⚠️ {label} hit its budget ({outcome.reason}) after {spend}."
         elif outcome.status == STATUS_FAILED and outcome.reason != REASON_KILLED:
             # an operator-killed codex session must NOT emit a post-kill
             # notice — the operator stopped it deliberately. Parity with the
@@ -5779,9 +5800,15 @@ class Worker:
                 if has_vault_task:
                     self._swap_tag(session.task_id, RUNNING_TAG, BUDGET_EXCEEDED_TAG)
                     self._set_task_status(session.task_id, "cancelled")
+                spent_row = self.session_store.get_by_session_id(sid)
+                spend = _format_budget_spend(
+                    spent_row.total_dollars if spent_row else 0.0,
+                    spent_row.total_active_seconds if spent_row else 0.0,
+                )
                 self._notify_terminal(
                     session,
-                    f"⚠️ {label}: task '{title}' hit its budget ({outcome.reason}). "
+                    f"⚠️ {label}: task '{title}' hit its budget ({outcome.reason}) "
+                    f"after {spend}. "
                     f"Transcript: `data/agent_transcripts/{sid}.jsonl`",
                     label=title,
                 )

@@ -94,7 +94,7 @@ You can put a budget in the task title. The preflight parses natural-language hi
 | `max $0.50` / `budget $1.00` | `max_dollars` |
 | `10k tokens` / `50000 tokens` | `max_tokens` |
 
-If no budget appears in the title, defaults from `.env` apply (default `$5.00`, `~4 hours wall`, `500k tokens`). The worker enforces the wall and token caps externally for every route — it kills the session when either is breached and the task lands at `#agent-budget-exceeded`. The **dollar cap is enforced only on the cloud Claude (Managed Agents / API) route**, the only one with marginal per-task cost; on the local (free) and Claude Code / Codex CLI (subscription) routes a `max $…` hint is recorded but never stops the task.
+If no budget appears in the title, defaults from `.env` apply: `$10.00` and `~4 hours wall`, and no token cap — the token cap only applies when a title names one explicitly (e.g. `50k tokens`). The worker enforces the wall and (when set) token caps externally for every route — it kills the session when either is breached and the task lands at `#agent-budget-exceeded`. The **dollar cap is enforced only on the cloud Claude (Managed Agents / API) route**, the only one with marginal per-task cost; on the local (free) and Claude Code / Codex CLI (subscription) routes a `max $…` hint is recorded but never stops the task.
 
 There's also a global daily $-cap (`LIFEOS_AGENT_DAILY_CAP_DOLLARS`, default `$100`). When the day's accumulated cost crosses the cap, the worker stops claiming new tasks until the next local midnight. Tasks already running aren't killed.
 
@@ -187,7 +187,7 @@ All in `.env` — see [`agent-worker-setup.md`](../../guides/agent-worker-setup.
 |---|---|---|
 | `LIFEOS_AGENT_WORKER_AUTOSTART` | Enable the worker on boot | `false` |
 | `LIFEOS_AGENT_DAILY_CAP_DOLLARS` | Global daily $-cap (set to 0 to pause new claims) | `100.00` |
-| `LIFEOS_AGENT_DEFAULT_BUDGET_DOLLARS` | Default per-task $-cap when title doesn't specify | `5.00` |
+| `LIFEOS_AGENT_DEFAULT_BUDGET_DOLLARS` | Default per-task $-cap when title doesn't specify | `10.00` |
 | `LIFEOS_AGENT_WORKER_POLL_SECONDS` | Polling interval | `60` |
 | `LIFEOS_AGENT_CLARIFICATION_TIMEOUT_HOURS` | Telegram-clarification wait before abandoning | `72` |
 | `LIFEOS_AGENT_STUCK_SESSION_TIMEOUT_MINUTES` | How long a reopened `/claude`/`/codex` session may sit unresumed before the stuck-session alert fires | `15` |

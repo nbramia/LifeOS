@@ -344,6 +344,42 @@ def test_executor_kills_loop_on_token_budget(tmp_path: Path):
 
 
 @pytest.mark.unit
+def test_executor_no_token_cap_runs_past_cumulative_default_ceiling(tmp_path: Path):
+    """`max_tokens: None` (the no-hint default) means no token cap applies —
+    the loop's `budget.get("max_tokens")` check treats the falsy value as
+    "no cap", so a session runs to completion even after accumulating far
+    more than the old 500k default, as long as it stays inside the dollar
+    and wall-clock budgets."""
+    store = SessionStore(db_path=tmp_path / "sessions.db")
+    store.create(
+        task_id="t1",
+        routing="local",
+        budget={"wall_seconds": 3600, "max_tokens": None, "max_dollars": 5.0},
+        expected_output="text",
+    )
+    session = store.get("t1")
+    # Two calls totaling 600,000 tokens — comfortably past the old 500k
+    # default token cap — followed by a normal completion.
+    llm = _ScriptedLLM([
+        _FakeResponse(
+            text="",
+            usage=_FakeUsage(280_000, 20_000),
+            tool_calls=[{"id": "c1", "name": "Bash", "input": {"command": "echo a"}}],
+        ),
+        _FakeResponse(
+            text="",
+            usage=_FakeUsage(280_000, 20_000),
+            tool_calls=[{"id": "c2", "name": "Bash", "input": {"command": "echo b"}}],
+        ),
+        _FakeResponse(text="Done.", usage=_FakeUsage(30, 15)),
+    ])
+    executor = _make_executor(store, tmp_path / "transcripts", llm)
+    outcome = executor.execute(session, {"id": "t1", "description": "big task"})
+    assert outcome.status == STATUS_COMPLETED
+    assert len(llm.calls) == 3
+
+
+@pytest.mark.unit
 def test_executor_marks_failed_on_llm_exception(tmp_path: Path, fake_session):
     store, session = fake_session
 
