@@ -115,7 +115,7 @@ class JobQueue:
         self._init_db()
 
     def _init_db(self):
-        with sqlite3.connect(self.db_path) as conn:
+        with self._conn() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS jobs (

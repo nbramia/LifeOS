@@ -7,7 +7,6 @@ Supports both a rolling document with all entries and appending to daily notes.
 import hashlib
 import json
 import logging
-import sqlite3
 import yaml
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -16,6 +15,7 @@ from typing import Optional
 
 from api.services.sheets import get_sheets_service
 from api.services.google_auth import GoogleAccount
+from api.services.sqlite_connect import connect_closing
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -164,7 +164,7 @@ class GSheetSyncService:
 
     def _init_db(self):
         """Initialize SQLite database for tracking synced rows."""
-        with sqlite3.connect(self.db_path) as conn:
+        with connect_closing(self.db_path) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS synced_rows (
@@ -202,7 +202,7 @@ class GSheetSyncService:
 
     def _is_row_synced(self, sheet_id: str, row_hash: str) -> bool:
         """Check if a row has already been synced."""
-        with sqlite3.connect(self.db_path) as conn:
+        with connect_closing(self.db_path) as conn:
             cursor = conn.execute(
                 "SELECT 1 FROM synced_rows WHERE sheet_id = ? AND row_hash = ?",
                 (sheet_id, row_hash)
@@ -211,7 +211,7 @@ class GSheetSyncService:
 
     def _mark_row_synced(self, sheet_id: str, entry: JournalEntry):
         """Mark a row as synced in the database."""
-        with sqlite3.connect(self.db_path) as conn:
+        with connect_closing(self.db_path) as conn:
             conn.execute(
                 """INSERT OR IGNORE INTO synced_rows
                    (sheet_id, row_hash, entry_date, raw_data)
@@ -222,7 +222,7 @@ class GSheetSyncService:
 
     def _get_all_synced_entries(self, sheet_id: str) -> list[dict]:
         """Get all synced entries for rebuilding rolling doc."""
-        with sqlite3.connect(self.db_path) as conn:
+        with connect_closing(self.db_path) as conn:
             cursor = conn.execute(
                 """SELECT entry_date, raw_data FROM synced_rows
                    WHERE sheet_id = ? ORDER BY entry_date DESC""",
