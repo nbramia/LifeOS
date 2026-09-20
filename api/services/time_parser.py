@@ -37,6 +37,37 @@ def get_smart_default_time(now: Optional[datetime] = None) -> datetime:
     return tomorrow.replace(hour=9, minute=0, second=0, microsecond=0)
 
 
+def _explicit_clock_time(expr: str) -> Optional[tuple[int, int]]:
+    """(hour, minute) for a clock time named anywhere in the expression --
+    "at 3 PM", "at 14:30", "noon", "midnight", or a bare "4pm" -- or None
+    when the expression names no specific time, only a day/relative phrase
+    with an implicit default hour.
+    """
+    if re.search(r'\bnoon\b', expr):
+        return 12, 0
+    if re.search(r'\bmidnight\b', expr):
+        return 0, 0
+    match = re.search(r'at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?', expr)
+    if match:
+        hour = int(match.group(1))
+        minute = int(match.group(2)) if match.group(2) else 0
+        ampm = match.group(3)
+    else:
+        match = re.search(r'(\d{1,2})\s*(am|pm)', expr)
+        if not match:
+            return None
+        hour = int(match.group(1))
+        minute = 0
+        ampm = match.group(2)
+
+    if ampm:
+        if ampm == 'pm' and hour != 12:
+            hour += 12
+        elif ampm == 'am' and hour == 12:
+            hour = 0
+    return hour, minute
+
+
 def parse_contextual_time(
     expression: str,
     now: Optional[datetime] = None,
@@ -53,6 +84,12 @@ def parse_contextual_time(
     - "next week" -> next Monday 9am
     - "in X hours/minutes" -> now + X
     - "at X:XX" or "at Xpm" -> today/tomorrow at that time
+
+    A day phrase and an explicit clock time combine: the day is resolved
+    first, then an explicit time named anywhere in the expression ("at 3
+    PM", "noon", "midnight") is applied to that day in place of the day's
+    implicit default hour -- "tomorrow at 3 PM" and "next Tuesday at noon"
+    use the stated hour, not the bare day's 9am default.
 
     Args:
         expression: Natural language time expression
@@ -78,38 +115,48 @@ def parse_contextual_time(
         else:
             return now + timedelta(minutes=amount)
 
+    explicit_time = _explicit_clock_time(expr)
+
     # "later today" - context-aware
     if 'later today' in expr:
-        hour = now.hour
-        if hour < 17:  # Before 5pm
-            return now.replace(hour=17, minute=0, second=0, microsecond=0)
+        if explicit_time:
+            hour, minute = explicit_time
+        elif now.hour < 17:  # Before 5pm
+            hour, minute = 17, 0
         else:  # After 5pm
-            return now.replace(hour=20, minute=0, second=0, microsecond=0)
+            hour, minute = 20, 0
+        return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
     # "tonight" - 8pm today
     if 'tonight' in expr:
-        return now.replace(hour=20, minute=0, second=0, microsecond=0)
+        hour, minute = explicit_time or (20, 0)
+        return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
     # "this evening" - 6pm today
     if 'this evening' in expr:
-        return now.replace(hour=18, minute=0, second=0, microsecond=0)
+        hour, minute = explicit_time or (18, 0)
+        return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
     # "this afternoon" - 2pm today
     if 'this afternoon' in expr:
-        return now.replace(hour=14, minute=0, second=0, microsecond=0)
+        hour, minute = explicit_time or (14, 0)
+        return now.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
     # "tomorrow" variants
     tomorrow = now + timedelta(days=1)
     if 'tomorrow' in expr:
-        if 'morning' in expr:
-            return tomorrow.replace(hour=9, minute=0, second=0, microsecond=0)
+        if explicit_time:
+            hour, minute = explicit_time
+        elif 'morning' in expr:
+            hour, minute = 9, 0
         elif 'afternoon' in expr:
-            return tomorrow.replace(hour=14, minute=0, second=0, microsecond=0)
+            hour, minute = 14, 0
         elif 'evening' in expr or 'night' in expr:
-            return tomorrow.replace(hour=18, minute=0, second=0, microsecond=0)
+            hour, minute = 18, 0
         else:
             # Default tomorrow to 9am
-            return tomorrow.replace(hour=9, minute=0, second=0, microsecond=0)
+            hour, minute = 9, 0
+        return tomorrow.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
     # "next week" - next Monday 9am
     if 'next week' in expr:
@@ -117,7 +164,8 @@ def parse_contextual_time(
         if days_until_monday == 0:
             days_until_monday = 7  # If today is Monday, go to next Monday
         next_monday = now + timedelta(days=days_until_monday)
-        return next_monday.replace(hour=9, minute=0, second=0, microsecond=0)
+        hour, minute = explicit_time or (9, 0)
+        return next_monday.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
     # "next monday/tuesday/etc"
     day_names = {
@@ -130,41 +178,16 @@ def parse_contextual_time(
             if days_ahead == 0:
                 days_ahead = 7  # If today, go to next week
             target_day = now + timedelta(days=days_ahead)
-            return target_day.replace(hour=9, minute=0, second=0, microsecond=0)
+            hour, minute = explicit_time or (9, 0)
+            return target_day.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
-    # "at X:XX" or "at Xpm/am" - parse specific time
-    time_match = re.search(r'at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?', expr)
-    if time_match:
-        hour = int(time_match.group(1))
-        minute = int(time_match.group(2)) if time_match.group(2) else 0
-        ampm = time_match.group(3)
-
-        if ampm:
-            if ampm == 'pm' and hour != 12:
-                hour += 12
-            elif ampm == 'am' and hour == 12:
-                hour = 0
-
-        # Determine if today or tomorrow
+    # No day phrase: a bare clock time ("at 3pm", "noon", "5pm") applies to
+    # today, rolling to tomorrow if that time has already passed.
+    if explicit_time:
+        hour, minute = explicit_time
         target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
         if target <= now:
             target += timedelta(days=1)  # Move to tomorrow if time has passed
-        return target
-
-    # "X pm/am" without "at"
-    bare_time_match = re.search(r'(\d{1,2})\s*(am|pm)', expr)
-    if bare_time_match:
-        hour = int(bare_time_match.group(1))
-        ampm = bare_time_match.group(2)
-
-        if ampm == 'pm' and hour != 12:
-            hour += 12
-        elif ampm == 'am' and hour == 12:
-            hour = 0
-
-        target = now.replace(hour=hour, minute=0, second=0, microsecond=0)
-        if target <= now:
-            target += timedelta(days=1)
         return target
 
     return None

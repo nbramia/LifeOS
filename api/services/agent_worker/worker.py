@@ -5117,6 +5117,11 @@ class Worker:
             # unparseable — no verdict was obtained (see
             # `preflight.PreflightResult.preflight_error`).
             "preflight_error": pre.preflight_error,
+            # Jev destructiveness judgment (shadow/block gate — see
+            # `preflight.PreflightResult.destructive_score`). Both None when
+            # Jev isn't configured, the gate is off, or the call failed.
+            "destructive_score": pre.destructive_score,
+            "destructive_probability": pre.destructive_probability,
             "budget": {
                 "wall_seconds": pre.budget.wall_seconds,
                 "max_tokens": pre.budget.max_tokens,
@@ -5239,28 +5244,107 @@ class Worker:
         # Freeze the execution target before the first executor side effect.
         # Preflight supplies route/budget/working-directory defaults; board
         # model pins are scoped to that resolved route and cannot leak across
-        # a later explicit engine override.
+        # a later explicit engine override. `_resolve_session_execution`
+        # persists this resolution write-once (`set_execution_snapshot`'s
+        # `execution_spec_json IS NULL` guard) — every downstream read of
+        # `session.execution_spec` for this task sees exactly this
+        # `working_dir`, so any host-aware adjustment has to happen in this
+        # one call, not after the fact.
         from api.services.directory_resolver import resolve_working_directory
+        from api.services.agent_worker.remote_spawn import (
+            api_host_name as _api_host_name,
+            is_local_host,
+        )
+        # A CLI route (#claude/#codex) dispatched to a remote
+        # LIFEOS_AGENT_HOSTS host can't be cloned into from this process,
+        # and there's no evidence an uncloned GitHub-only repo exists on
+        # that other machine either — the resolver falls back to the
+        # keyword cascade for that case instead (see
+        # `resolve_working_directory`'s `allow_uncloned`). Every other
+        # route runs in-process on this host regardless of `session.host`,
+        # so it keeps today's behavior.
+        is_remote_cli_spawn = (
+            pre.routing in (ROUTE_CLAUDE_CODE, ROUTE_CODEX)
+            and not is_local_host(session.host, _api_host_name())
+        )
         # Scheduled handoffs may carry an explicit canonical working
         # directory in task fields; otherwise retain the legacy
         # description-based resolver.
         candidate_working_dir = (
-            (task.get("fields") or {}).get("working_dir") or resolve_working_directory(title)
+            (task.get("fields") or {}).get("working_dir")
+            or resolve_working_directory(title, allow_uncloned=not is_remote_cli_spawn)
         )
-        # A fresh CLI-routed dispatch (Claude Code, Codex) never runs
-        # directly in whatever directory the resolver above picked — that
-        # can be the operator's own primary checkout, the exact working
-        # tree the production API server runs from. When the resolved
-        # directory is inside a git repository, give the session its own
-        # worktree and branch instead, so it commits, pushes, and opens a
-        # pull request the way every other change in this project is made.
-        # An explicit remote-host assignment doesn't skip this — `host` is
-        # passed straight through to `ensure_worktree`, which provisions
-        # over ssh on that same host (never this worker's own filesystem
-        # standing in for it) and fails the task closed if the host isn't
-        # registered. A directory that isn't a git repository at all is
-        # unaffected either way — `ensure_worktree` returns it verbatim.
         if pre.routing in (ROUTE_CLAUDE_CODE, ROUTE_CODEX):
+            # Clone-on-demand: a Jev-chosen location may name a repository
+            # the operator owns but that isn't checked out on this host
+            # yet. This has to run before `ensure_worktree` below — that
+            # call only provisions a worktree for a directory that already
+            # exists as a git repo; given a not-yet-cloned path it just
+            # returns `is_git=False` and passes the path through
+            # unchanged, which would otherwise leave the session running
+            # in the freshly-cloned repo's own primary checkout rather
+            # than an isolated worktree. Only attempted for a local spawn
+            # — a remote spawn never reaches here with an uncloned
+            # GitHub-only path in the first place (see `is_remote_cli_spawn`
+            # above). Gated on the missing directory's name actually being
+            # one of the operator's known GitHub repos (`_github_repos()`)
+            # — an arbitrary missing path under code_dir that Jev never
+            # named (e.g. a keyword-cascade guess, or simply no `gh`/no
+            # key at all, which makes `_github_repos()` always `[]`) falls
+            # through unchanged instead of being treated as a clone
+            # failure and parked.
+            from pathlib import Path
+
+            code_root = Path(settings.code_dir).expanduser().resolve()
+            candidate_under_code_dir = False
+            if candidate_working_dir:
+                try:
+                    candidate_under_code_dir = Path(candidate_working_dir).resolve().is_relative_to(code_root)
+                except (OSError, RuntimeError, ValueError):
+                    candidate_under_code_dir = False
+
+            if (
+                candidate_under_code_dir
+                and not os.path.isdir(candidate_working_dir)
+                and not is_remote_cli_spawn
+            ):
+                from api.services.directory_resolver import _github_repos
+
+                repo_name = Path(candidate_working_dir).name
+                known_repo_names = {name for name, _desc, _path in _github_repos()}
+                if repo_name in known_repo_names:
+                    from api.services.directory_resolver import ensure_cloned
+
+                    if not ensure_cloned(candidate_working_dir):
+                        self._swap_tag(task_id, RUNNING_TAG, BLOCKED_TAG)
+                        self._set_task_status(task_id, "blocked")
+                        self.session_store.update_status(
+                            task_id, STATUS_BLOCKED,
+                            attempt_id=session.attempt_id, turn_id=session.turn_id,
+                        )
+                        self.transcript_store.append(sid, "clone_failed", {"repository": repo_name})
+                        self._notify(
+                            f"⏸ {_worker_label(pre.routing)}: task '{title}' needs "
+                            f"repository '{repo_name}', which isn't cloned on this host "
+                            f"and couldn't be cloned automatically. Clone it manually "
+                            f"under {code_root}, then re-tag with an engine assignee to retry."
+                        )
+                        return
+
+            # A fresh CLI-routed dispatch (Claude Code, Codex) never runs
+            # directly in whatever directory was resolved above — that can
+            # be the operator's own primary checkout, the exact working
+            # tree the production API server runs from. When the resolved
+            # directory is inside a git repository, give the session its
+            # own worktree and branch instead, so it commits, pushes, and
+            # opens a pull request the way every other change in this
+            # project is made. An explicit remote-host assignment doesn't
+            # skip this — `host` is passed straight through to
+            # `ensure_worktree`, which provisions over ssh on that same
+            # host (never this worker's own filesystem standing in for it)
+            # and fails the task closed if the host isn't registered. A
+            # directory that isn't a git repository at all is unaffected
+            # either way — `ensure_worktree` returns it verbatim.
             from api.services.agent_worker.git_worktree import WorktreeError, ensure_worktree
             try:
                 provisioned = ensure_worktree(candidate_working_dir, task_id, title, host=assignment.host)
@@ -5400,6 +5484,61 @@ class Worker:
         # top-level #agent task gets the identical off-tick treatment.
         if session.routing in (ROUTE_CLAUDE_CODE, ROUTE_CODEX):
             working_dir = execution.spec.working_dir or resolve_working_directory(title)
+
+            # Clone-on-demand: a defensive backstop for the same guard
+            # already applied upstream (before `ensure_worktree`, in the
+            # execution-spec resolution above) — a no-op in the normal
+            # case, since `execution.spec.working_dir` was already cloned
+            # (or never needed to be) by the time it's persisted. Kept
+            # here in case that path was ever bypassed (e.g. a resumed
+            # session's pre-existing spec). Only attempted when this
+            # process is itself the executing host, and only for a
+            # missing directory whose name is one of the operator's known
+            # GitHub repos (`_github_repos()`) — never for an arbitrary
+            # missing path under code_dir, which falls through unchanged
+            # instead of being treated as a clone failure and parked.
+            from pathlib import Path
+
+            from api.services.agent_worker.remote_spawn import (
+                api_host_name as _api_host_name,
+                is_local_host,
+            )
+            code_root = Path(settings.code_dir).expanduser().resolve()
+            under_code_dir = False
+            if working_dir:
+                try:
+                    under_code_dir = Path(working_dir).resolve().is_relative_to(code_root)
+                except (OSError, RuntimeError, ValueError):
+                    under_code_dir = False
+
+            if (
+                under_code_dir
+                and not os.path.isdir(working_dir)
+                and is_local_host(session.host, _api_host_name())
+            ):
+                from api.services.directory_resolver import _github_repos
+
+                repo_name = Path(working_dir).name
+                known_repo_names = {name for name, _desc, _path in _github_repos()}
+                if repo_name in known_repo_names:
+                    from api.services.directory_resolver import ensure_cloned
+
+                    if not ensure_cloned(working_dir):
+                        self._swap_tag(task_id, RUNNING_TAG, BLOCKED_TAG)
+                        self._set_task_status(task_id, "blocked")
+                        self.session_store.update_status(
+                            task_id, STATUS_BLOCKED,
+                            attempt_id=session.attempt_id, turn_id=session.turn_id,
+                        )
+                        self.transcript_store.append(sid, "clone_failed", {"repository": repo_name})
+                        self._notify(
+                            f"⏸ {_worker_label(session.routing)}: task '{title}' needs "
+                            f"repository '{repo_name}', which isn't cloned on this host "
+                            f"and couldn't be cloned automatically. Clone it manually "
+                            f"under {code_root}, then re-tag with an engine assignee to retry."
+                        )
+                        return
+
             if session.claude_code_session_id:
                 # A compatible reassignment keeps the native CLI thread. Do
                 # not feed the JSON fresh-spawn envelope to resume(); pass a

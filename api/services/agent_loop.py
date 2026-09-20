@@ -22,11 +22,13 @@ from dataclasses import dataclass, field
 from typing import AsyncGenerator
 from api.services.agent_system_prompt import build_system_prompt
 from api.services.agent_tools import TOOL_STATUS_MESSAGES, execute_tool_parallel, begin_email_send_turn, tools_for_persona
+from api.services.chat_helpers import role_content
 from api.services.synthesizer import build_message_content
 from api.services.perf_trace import trace_span
 from api.services.llm_client import get_local_llm, openai_tool_calls_to_anthropic, LLMUsage, LocalLLMClient
 from api.services.agent_worker.pricing import cost_for, is_known_model
 from api.services.resilience import is_retryable_api_error
+from api.services.jev_orchestrator_shadow import cancel_and_forget, start_inloop_task, finish_inloop_span
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -123,19 +125,10 @@ _PUSHBACK_PATTERNS = re.compile(
 )
 
 
-def _role_content(msg) -> tuple[str, str]:
-    """Extract (role, content) from a Message object or dict; '' for missing."""
-    role = getattr(msg, "role", None) or (msg.get("role") if isinstance(msg, dict) else None)
-    content = getattr(msg, "content", None)
-    if content is None and isinstance(msg, dict):
-        content = msg.get("content")
-    return (role or ""), (content if isinstance(content, str) else "")
-
-
 def _last_assistant_text(conversation_history) -> str:
     """Return the most recent assistant message's text, or '' if none."""
     for msg in reversed(conversation_history or []):
-        role, content = _role_content(msg)
+        role, content = role_content(msg)
         if role == "assistant":
             return content
     return ""
@@ -168,7 +161,7 @@ def _count_escalation_cycles(conversation_history) -> int:
     """
     cycles = 0
     for msg in reversed(conversation_history or []):
-        role, content = _role_content(msg)
+        role, content = role_content(msg)
         if role == "assistant":
             if not _is_refusal(content):
                 break
@@ -184,7 +177,7 @@ def _original_request(conversation_history, fallback: str) -> str:
     turn that ISN'T a pushback. Used so an engine handoff at the top of the
     ladder gets the real task, not the bare pushback that triggered it."""
     for msg in reversed(conversation_history or []):
-        role, content = _role_content(msg)
+        role, content = role_content(msg)
         if role == "user" and not _PUSHBACK_PATTERNS.search(content):
             return content or fallback
     return fallback
@@ -692,233 +685,281 @@ async def run_agent_loop(
     # Narrowed for the journal persona — see tools_for_persona.
     tools = tools_for_persona(persona_id)
 
-    for round_num in range(1, max_tool_rounds + 1):
-        print(f"[agent] Round {round_num}/{max_tool_rounds} starting")
+    # Per-round call breakdown (tool, input, result_preview) for the
+    # LIFEOS_JEV_ORCHESTRATOR=shadow in-loop judgment below. Kept local to
+    # this call rather than on `result` -- it exists only to build that
+    # judgment's state and is never part of the AgentResult contract.
+    calls_by_round: dict[int, list[dict]] = {}
+    # (task, start_monotonic, round_num) for every in-loop shadow call
+    # fired this turn -- awaited together, capped, just before the final
+    # "result" event below on the happy path. Everything from here to that
+    # final yield is wrapped in the try/except below so an abnormal exit
+    # (an exception, a cancellation, or the caller closing this generator
+    # early via aclose()) cancels and forgets any task still pending
+    # instead of leaking it -- see jev_orchestrator_shadow.cancel_and_forget.
+    pending_inloop: list[tuple] = []
 
-        text_this_round = ""
-        tool_use_blocks = []
-        usage_this_round = LLMUsage()
-        finish_reason = ""
+    try:
+        for round_num in range(1, max_tool_rounds + 1):
+            print(f"[agent] Round {round_num}/{max_tool_rounds} starting")
 
-        api_error_fatal = False
-        with trace_span(f"llm_api_round_{round_num}"):
-            max_api_retries = 2
-            for api_attempt in range(max_api_retries + 1):
-                try:
-                    async for event in client.astream(
-                        messages,
-                        system=system_prompt,
-                        max_tokens=4096,
-                        tools=tools,
-                        **astream_kwargs,
-                    ):
-                        if event["type"] == "text":
-                            text_this_round += event["content"]
-                            yield {"type": "text", "content": event["content"]}
-                        elif event["type"] == "tool_calls":
-                            tool_use_blocks = openai_tool_calls_to_anthropic(event["calls"])
-                        elif event["type"] == "usage_update":
-                            # Anthropic-only -- see AgentResult's
-                            # provisional_* fields. Folded into total_* (and
-                            # cleared) by _track_usage once "done" arrives
-                            # below, so this is never added twice.
-                            result.provisional_input_tokens = event["usage"].input_tokens
-                            result.provisional_output_tokens = event["usage"].output_tokens
-                        elif event["type"] == "done":
-                            usage_this_round = event["usage"]
-                            finish_reason = event.get("finish_reason", "")
-                    break  # success
-                except Exception as e:
-                    if api_attempt < max_api_retries and is_retryable_api_error(e):
-                        delay = 2 * (2 ** api_attempt)  # 2s, 4s
-                        logger.warning(f"Round {round_num} transient error ({e}), retry {api_attempt + 1}/{max_api_retries} in {delay}s")
-                        if text_this_round:
-                            yield {"type": "self_correction"}
-                            text_this_round = ""
-                        yield {"type": "status", "message": f"LLM temporarily unavailable, retrying in {delay}s..."}
-                        await asyncio.sleep(delay)
-                        continue
-                    print(f"[agent] Round {round_num} API error: {e}")
-                    # Deliberately not str(e) here -- this reaches the
-                    # user verbatim, and on a keyless/misconfigured install
-                    # it would otherwise be the provider SDK's raw internal
-                    # message. The full exception is still logged above.
-                    if result.full_text:
-                        yield {"type": "text", "content": "\n\n(Search interrupted: the request could not be completed.)"}
-                    else:
-                        yield {"type": "text", "content": "Sorry, I encountered an error and could not complete this request."}
-                    result.error_message = "The request could not be completed."
-                    api_error_fatal = True
-                    break
-        if api_error_fatal:
-            break
+            text_this_round = ""
+            tool_use_blocks = []
+            usage_this_round = LLMUsage()
+            finish_reason = ""
 
-        _track_usage(usage_this_round)
+            api_error_fatal = False
+            with trace_span(f"llm_api_round_{round_num}"):
+                max_api_retries = 2
+                for api_attempt in range(max_api_retries + 1):
+                    try:
+                        async for event in client.astream(
+                            messages,
+                            system=system_prompt,
+                            max_tokens=4096,
+                            tools=tools,
+                            **astream_kwargs,
+                        ):
+                            if event["type"] == "text":
+                                text_this_round += event["content"]
+                                yield {"type": "text", "content": event["content"]}
+                            elif event["type"] == "tool_calls":
+                                tool_use_blocks = openai_tool_calls_to_anthropic(event["calls"])
+                            elif event["type"] == "usage_update":
+                                # Anthropic-only -- see AgentResult's
+                                # provisional_* fields. Folded into total_* (and
+                                # cleared) by _track_usage once "done" arrives
+                                # below, so this is never added twice.
+                                result.provisional_input_tokens = event["usage"].input_tokens
+                                result.provisional_output_tokens = event["usage"].output_tokens
+                            elif event["type"] == "done":
+                                usage_this_round = event["usage"]
+                                finish_reason = event.get("finish_reason", "")
+                        break  # success
+                    except Exception as e:
+                        if api_attempt < max_api_retries and is_retryable_api_error(e):
+                            delay = 2 * (2 ** api_attempt)  # 2s, 4s
+                            logger.warning(f"Round {round_num} transient error ({e}), retry {api_attempt + 1}/{max_api_retries} in {delay}s")
+                            if text_this_round:
+                                yield {"type": "self_correction"}
+                                text_this_round = ""
+                            yield {"type": "status", "message": f"LLM temporarily unavailable, retrying in {delay}s..."}
+                            await asyncio.sleep(delay)
+                            continue
+                        print(f"[agent] Round {round_num} API error: {e}")
+                        # Deliberately not str(e) here -- this reaches the
+                        # user verbatim, and on a keyless/misconfigured install
+                        # it would otherwise be the provider SDK's raw internal
+                        # message. The full exception is still logged above.
+                        if result.full_text:
+                            yield {"type": "text", "content": "\n\n(Search interrupted: the request could not be completed.)"}
+                        else:
+                            yield {"type": "text", "content": "Sorry, I encountered an error and could not complete this request."}
+                        result.error_message = "The request could not be completed."
+                        api_error_fatal = True
+                        break
+            if api_error_fatal:
+                break
 
-        # Build assistant content for message history (keep narration text
-        # for the LLM context even if we strip it from the user-facing response)
-        assistant_content = []
-        if text_this_round:
-            assistant_content.append({"type": "text", "text": text_this_round})
-        for block in tool_use_blocks:
-            assistant_content.append({
-                "type": "tool_use",
-                "id": block.id,
-                "name": block.name,
-                "input": block.input,
-            })
+            _track_usage(usage_this_round)
 
-        tool_names = [b.name for b in tool_use_blocks]
-        print(f"[agent] Round {round_num} done: stop={finish_reason}, tools={tool_names}, text={len(text_this_round)}ch")
+            # Build assistant content for message history (keep narration text
+            # for the LLM context even if we strip it from the user-facing response)
+            assistant_content = []
+            if text_this_round:
+                assistant_content.append({"type": "text", "text": text_this_round})
+            for block in tool_use_blocks:
+                assistant_content.append({
+                    "type": "tool_use",
+                    "id": block.id,
+                    "name": block.name,
+                    "input": block.input,
+                })
 
-        # If model produced text AND tool calls, the text is narration ("I need
-        # to look up...") — clear it from the user-facing response. The LLM
-        # context (assistant_content above) keeps it for continuity.
-        if tool_use_blocks and text_this_round.strip():
-            yield {"type": "self_correction"}
+            tool_names = [b.name for b in tool_use_blocks]
+            print(f"[agent] Round {round_num} done: stop={finish_reason}, tools={tool_names}, text={len(text_this_round)}ch")
+
+            # If model produced text AND tool calls, the text is narration ("I need
+            # to look up...") — clear it from the user-facing response. The LLM
+            # context (assistant_content above) keeps it for continuity.
+            if tool_use_blocks and text_this_round.strip():
+                yield {"type": "self_correction"}
+            else:
+                result.full_text += text_this_round
+
+            # If no tool calls, we're done — unless the model is giving up without trying
+            # finish_reason is "tool_calls" (OpenAI) or "tool_use" (Anthropic)
+            if finish_reason not in ("tool_calls", "tool_use") or not tool_use_blocks:
+                if (
+                    round_num == 1
+                    and not result.tool_calls_log
+                    and text_this_round.strip()
+                    and _looks_like_giving_up(text_this_round)
+                ):
+                    print("[agent] Self-correction triggered: model gave up without using tools")
+                    yield {"type": "self_correction"}
+                    result.full_text = ""
+                    messages.append({"role": "assistant", "content": assistant_content})
+                    messages.append({"role": "user", "content": SELF_CORRECTION_NUDGE})
+                    continue
+                if (
+                    not phantom_write_nudged
+                    and not result.tool_calls_log
+                    and text_this_round.strip()
+                    and _claims_write_without_tools(text_this_round)
+                ):
+                    phantom_write_nudged = True
+                    print("[agent] Self-correction triggered: reply claims a write but no tool was called")
+                    yield {"type": "self_correction"}
+                    result.full_text = ""
+                    messages.append({"role": "assistant", "content": assistant_content})
+                    messages.append({"role": "user", "content": PHANTOM_WRITE_NUDGE})
+                    continue
+                break
+
+            # Append the assistant message with tool use blocks
+            messages.append({"role": "assistant", "content": assistant_content})
+
+            # Execute tools in parallel
+            async def _exec_one(block):
+                name = block.name
+                logger.info(f"Executing tool: {name} with input: {block.input}")
+                with trace_span(f"tool_{name}") as span_meta:
+                    tool_result_str = await execute_tool_parallel(
+                        name, block.input, persona_id=persona_id, user_message=user_message,
+                    )
+                    # str() defensively -- execute_tool_parallel's contract is
+                    # always a str, but a non-str result must not raise here.
+                    span_meta["result_preview"] = str(tool_result_str)[:300]
+                is_error = tool_result_str.startswith("Error:")
+                result.tool_calls_log.append({
+                    "tool": name,
+                    "input": block.input,
+                    "result_preview": tool_result_str[:200],
+                    "is_error": is_error,
+                })
+                calls_by_round.setdefault(round_num, []).append({
+                    "tool": name,
+                    "input": block.input,
+                    "result_preview": str(tool_result_str)[:300],
+                })
+                return {
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": tool_result_str,
+                    "is_error": is_error,
+                }
+
+            # Emit status for each tool (with sub-action lookup for consolidated tools)
+            for block in tool_use_blocks:
+                status_msg = TOOL_STATUS_MESSAGES.get(block.name, f"Running {block.name}...")
+                if block.name in _CONSOLIDATED_TOOLS:
+                    action = block.input.get("action", "")
+                    sub_key = f"{block.name}.{action}"
+                    status_msg = TOOL_STATUS_MESSAGES.get(sub_key, status_msg)
+                yield {"type": "status", "message": status_msg}
+
+            tool_results = await asyncio.gather(*[_exec_one(b) for b in tool_use_blocks])
+            print(f"[agent] Round {round_num} tools executed: {[b.name for b in tool_use_blocks]}")
+
+            # LIFEOS_JEV_ORCHESTRATOR=shadow in-loop judgment: fired once this
+            # round's tool results are gathered, starting with the second round
+            # onward (the first round has nothing yet to call repeating).
+            # Fire-and-forget here -- never awaited in the loop's critical
+            # path; every pending call is awaited together, capped, just
+            # before the final "result" event.
+            if round_num >= 2:
+                _inloop_task, _inloop_start = start_inloop_task(user_message, calls_by_round, round_num)
+                if _inloop_task is not None:
+                    pending_inloop.append((_inloop_task, _inloop_start, round_num))
+
+            # Append tool results as a user message
+            messages.append({"role": "user", "content": list(tool_results)})
+
         else:
-            result.full_text += text_this_round
+            # Exhausted all tool rounds — force a final synthesis round without tools.
+            # Add an explicit instruction so the LLM knows to produce a text answer
+            # instead of trying to call more tools.
+            print("[agent] Exhausted tool rounds, running synthesis round")
+            messages.append({
+                "role": "user",
+                "content": (
+                    "You have finished gathering information. Now answer the original "
+                    "question based on everything you found above. Do not call any more "
+                    "tools — just provide your answer in plain text."
+                ),
+            })
+            try:
+                synthesis_events = 0
+                async for event in client.astream(
+                    messages,
+                    system=system_prompt,
+                    max_tokens=4096,
+                    timeout=180,
+                    **astream_kwargs,
+                ):
+                    synthesis_events += 1
+                    if event["type"] == "text":
+                        result.full_text += event["content"]
+                        yield {"type": "text", "content": event["content"]}
+                    elif event["type"] == "tool_calls":
+                        # LLM tried to call tools despite no tools in request —
+                        # log and ignore (the text, if any, was already captured)
+                        print(f"[agent] Synthesis round produced tool_calls (ignored): {[c.get('function', {}).get('name', '?') for c in event.get('calls', [])]}")
+                    elif event["type"] == "usage_update":
+                        # Same provisional tracking as the tool-round loop above.
+                        result.provisional_input_tokens = event["usage"].input_tokens
+                        result.provisional_output_tokens = event["usage"].output_tokens
+                    elif event["type"] == "done":
+                        _track_usage(event["usage"])
+                        print(f"[agent] Synthesis round done: finish_reason={event.get('finish_reason', '?')}, events={synthesis_events}")
+            except Exception as e:
+                error_msg = str(e) or f"{type(e).__name__} (no message)"
+                print(f"[agent] Synthesis round error: {error_msg}")
+                # Deliberately not error_msg here -- see the matching
+                # comment in the tool-round loop above. Full detail is still
+                # logged on the line above.
+                result.error_message = "The request could not be completed."
+                yield {"type": "text", "content": "\n\n(Error during synthesis: the request could not be completed.)"}
 
-        # If no tool calls, we're done — unless the model is giving up without trying
-        # finish_reason is "tool_calls" (OpenAI) or "tool_use" (Anthropic)
-        if finish_reason not in ("tool_calls", "tool_use") or not tool_use_blocks:
-            if (
-                round_num == 1
-                and not result.tool_calls_log
-                and text_this_round.strip()
-                and _looks_like_giving_up(text_this_round)
-            ):
-                print("[agent] Self-correction triggered: model gave up without using tools")
+        # If we ran tools but still ended up with no text, construct a fallback
+        # from tool results so the user gets something useful.
+        if not result.full_text.strip() and result.tool_calls_log:
+            # Clear any whitespace-only content that was already streamed
+            if result.full_text:
                 yield {"type": "self_correction"}
                 result.full_text = ""
-                messages.append({"role": "assistant", "content": assistant_content})
-                messages.append({"role": "user", "content": SELF_CORRECTION_NUDGE})
-                continue
-            if (
-                not phantom_write_nudged
-                and not result.tool_calls_log
-                and text_this_round.strip()
-                and _claims_write_without_tools(text_this_round)
-            ):
-                phantom_write_nudged = True
-                print("[agent] Self-correction triggered: reply claims a write but no tool was called")
-                yield {"type": "self_correction"}
-                result.full_text = ""
-                messages.append({"role": "assistant", "content": assistant_content})
-                messages.append({"role": "user", "content": PHANTOM_WRITE_NUDGE})
-                continue
-            break
+            # Exclude sensitive tools from raw fallback output
+            _SENSITIVE_TOOLS = {"get_message_history", "search_email"}
+            non_error_results = [
+                tc["result_preview"]
+                for tc in result.tool_calls_log
+                if not tc.get("is_error")
+                and tc["tool"] not in _SENSITIVE_TOOLS
+                and tc.get("result_preview", "").strip()
+            ]
+            if non_error_results:
+                fallback = "Here's what I found:\n\n" + "\n\n".join(non_error_results)
+            else:
+                fallback = "I searched but couldn't find relevant information to answer your question."
+            result.full_text = fallback
+            yield {"type": "text", "content": fallback}
+            print(f"[agent] Used fallback response ({len(fallback)}ch)")
 
-        # Append the assistant message with tool use blocks
-        messages.append({"role": "assistant", "content": assistant_content})
+        # Await every pending in-loop shadow call (each capped at 500ms from
+        # its own start) and record its span, before the turn's final event —
+        # so the spans land while chat.py's perf trace is still open.
+        for _task, _start, _round_idx in pending_inloop:
+            await finish_inloop_span(_task, _start, round_index=_round_idx)
 
-        # Execute tools in parallel
-        async def _exec_one(block):
-            name = block.name
-            logger.info(f"Executing tool: {name} with input: {block.input}")
-            with trace_span(f"tool_{name}"):
-                tool_result_str = await execute_tool_parallel(
-                    name, block.input, persona_id=persona_id, user_message=user_message,
-                )
-            is_error = tool_result_str.startswith("Error:")
-            result.tool_calls_log.append({
-                "tool": name,
-                "input": block.input,
-                "result_preview": tool_result_str[:200],
-                "is_error": is_error,
-            })
-            return {
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": tool_result_str,
-                "is_error": is_error,
-            }
-
-        # Emit status for each tool (with sub-action lookup for consolidated tools)
-        for block in tool_use_blocks:
-            status_msg = TOOL_STATUS_MESSAGES.get(block.name, f"Running {block.name}...")
-            if block.name in _CONSOLIDATED_TOOLS:
-                action = block.input.get("action", "")
-                sub_key = f"{block.name}.{action}"
-                status_msg = TOOL_STATUS_MESSAGES.get(sub_key, status_msg)
-            yield {"type": "status", "message": status_msg}
-
-        tool_results = await asyncio.gather(*[_exec_one(b) for b in tool_use_blocks])
-        print(f"[agent] Round {round_num} tools executed: {[b.name for b in tool_use_blocks]}")
-
-        # Append tool results as a user message
-        messages.append({"role": "user", "content": list(tool_results)})
-
-    else:
-        # Exhausted all tool rounds — force a final synthesis round without tools.
-        # Add an explicit instruction so the LLM knows to produce a text answer
-        # instead of trying to call more tools.
-        print("[agent] Exhausted tool rounds, running synthesis round")
-        messages.append({
-            "role": "user",
-            "content": (
-                "You have finished gathering information. Now answer the original "
-                "question based on everything you found above. Do not call any more "
-                "tools — just provide your answer in plain text."
-            ),
-        })
-        try:
-            synthesis_events = 0
-            async for event in client.astream(
-                messages,
-                system=system_prompt,
-                max_tokens=4096,
-                timeout=180,
-                **astream_kwargs,
-            ):
-                synthesis_events += 1
-                if event["type"] == "text":
-                    result.full_text += event["content"]
-                    yield {"type": "text", "content": event["content"]}
-                elif event["type"] == "tool_calls":
-                    # LLM tried to call tools despite no tools in request —
-                    # log and ignore (the text, if any, was already captured)
-                    print(f"[agent] Synthesis round produced tool_calls (ignored): {[c.get('function', {}).get('name', '?') for c in event.get('calls', [])]}")
-                elif event["type"] == "usage_update":
-                    # Same provisional tracking as the tool-round loop above.
-                    result.provisional_input_tokens = event["usage"].input_tokens
-                    result.provisional_output_tokens = event["usage"].output_tokens
-                elif event["type"] == "done":
-                    _track_usage(event["usage"])
-                    print(f"[agent] Synthesis round done: finish_reason={event.get('finish_reason', '?')}, events={synthesis_events}")
-        except Exception as e:
-            error_msg = str(e) or f"{type(e).__name__} (no message)"
-            print(f"[agent] Synthesis round error: {error_msg}")
-            # Deliberately not error_msg here -- see the matching
-            # comment in the tool-round loop above. Full detail is still
-            # logged on the line above.
-            result.error_message = "The request could not be completed."
-            yield {"type": "text", "content": "\n\n(Error during synthesis: the request could not be completed.)"}
-
-    # If we ran tools but still ended up with no text, construct a fallback
-    # from tool results so the user gets something useful.
-    if not result.full_text.strip() and result.tool_calls_log:
-        # Clear any whitespace-only content that was already streamed
-        if result.full_text:
-            yield {"type": "self_correction"}
-            result.full_text = ""
-        # Exclude sensitive tools from raw fallback output
-        _SENSITIVE_TOOLS = {"get_message_history", "search_email"}
-        non_error_results = [
-            tc["result_preview"]
-            for tc in result.tool_calls_log
-            if not tc.get("is_error")
-            and tc["tool"] not in _SENSITIVE_TOOLS
-            and tc.get("result_preview", "").strip()
-        ]
-        if non_error_results:
-            fallback = "Here's what I found:\n\n" + "\n\n".join(non_error_results)
-        else:
-            fallback = "I searched but couldn't find relevant information to answer your question."
-        result.full_text = fallback
-        yield {"type": "text", "content": fallback}
-        print(f"[agent] Used fallback response ({len(fallback)}ch)")
-
-    print(f"[agent] Loop complete: {len(result.tool_calls_log)} tool calls, {len(result.full_text)}ch text")
-    # Yield the final result
-    yield {"type": "result", "result": result}
+        print(f"[agent] Loop complete: {len(result.tool_calls_log)} tool calls, {len(result.full_text)}ch text")
+        # Yield the final result
+        yield {"type": "result", "result": result}
+    except BaseException:
+        # Abandoning the turn (an exception, a cancellation, or the caller
+        # closing this generator early) -- never leave an in-loop shadow
+        # task running unconsumed. Cleanup is synchronous and never raises;
+        # the original exception always propagates unchanged.
+        for _task, _start, _round_idx in pending_inloop:
+            cancel_and_forget(_task)
+        raise

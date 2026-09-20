@@ -24,6 +24,7 @@ from api.services.agent_worker.execution import (
     CatalogState,
     ExecutionFacts,
     ExecutionRequest,
+    ExecutionSpec,
     ExecutorFacts,
     ReadinessState,
 )
@@ -2888,3 +2889,204 @@ def test_resume_pending_rolls_back_top_level_cli_session_same_as_before(tmp_path
     assert AGENT_TAG in api.tasks["t1"]["tags"]
     assert RUNNING_TAG not in api.tasks["t1"]["tags"]
     assert api.tasks["t1"]["status"] == "todo"
+
+
+@pytest.mark.unit
+def test_clone_on_demand_parks_when_clone_fails(tmp_path: Path, monkeypatch):
+    """A CLI-routed task whose resolved working directory is an uncloned
+    repo under code_dir must park at #agent-blocked (naming the repo) when
+    the automatic `gh repo clone` fails — never spawn into a directory that
+    doesn't exist. Mirrors `test_cloud_tag_parks_when_remote_provider_
+    unconfigured`'s not-configured-parks shape, for the clone-on-demand
+    not-available-parks case."""
+    import os as _os
+
+    from config.settings import settings as _settings
+    code_dir = str(tmp_path / "Code")
+    monkeypatch.setattr(_settings, "code_dir", code_dir, raising=False)
+    missing_repo = _os.path.join(code_dir, "MissingRepo")
+
+    import api.services.directory_resolver as dr
+    monkeypatch.setattr(dr, "resolve_working_directory", lambda title, allow_uncloned=True: missing_repo)
+    monkeypatch.setattr(dr, "ensure_cloned", lambda path: False)
+    # Clone-on-demand only fires for a missing directory whose name is one
+    # of the operator's known GitHub repos — "MissingRepo" has to be in
+    # that list for this test to exercise the park-on-clone-failure path
+    # rather than the (correct, for an unknown name) fall-through.
+    monkeypatch.setattr(dr, "_github_repos", lambda: [("MissingRepo", "d", missing_repo)])
+
+    calls: list = []
+
+    class _Executor:
+        def execute(self, session, task):
+            calls.append((session.task_id, task.get("description")))
+            return ExecutorOutcome(status=STATUS_COMPLETED, final_text="done")
+
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "fix the bug in missingrepo", "status": "todo",
+         "tags": ["claude"]},
+    ])
+    pool = _CapturingPool()
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="claude"),
+                     local_executor=None,
+                     claude_code_executor=_Executor(),
+                     cli_pool=pool)
+
+    handled = w.tick()
+
+    assert handled == 1
+    assert calls == []
+    assert pool.submitted == []
+    assert BLOCKED_TAG in api.tasks["t1"]["tags"]
+    assert RUNNING_TAG not in api.tasks["t1"]["tags"]
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    assert any("MissingRepo" in s for s in sent)
+
+
+
+class _ReadyCliExecutor:
+    """A CLI executor stub whose mere presence makes the claude_code route
+    READY, so dispatch tests that only care about working-directory
+    handling never depend on a real `claude` binary being installed on
+    the host (it isn't on the hosted verification runner)."""
+
+    def execute(self, session, task):
+        return ExecutorOutcome(status=STATUS_COMPLETED, final_text="stubbed", notifications_sent=1)
+
+
+@pytest.mark.unit
+def test_missing_directory_not_a_known_repo_falls_through_unchanged(tmp_path: Path, monkeypatch):
+    """A CLI-routed task whose resolved working directory happens to be
+    missing under code_dir, but isn't one of the operator's known GitHub
+    repos (`_github_repos()` returns `[]` — no `gh`, no key, or simply an
+    unrelated repo name), must never be treated as a clone-on-demand
+    candidate: `ensure_cloned` is never called, and the task is never
+    parked. Regression test for the CI failure mode this gate fixes — a
+    CI runner with no ~/Code/gh made every missing test/keyword-cascade
+    working directory look like a failed clone and park the task."""
+    import os as _os
+
+    from config.settings import settings as _settings
+    code_dir = str(tmp_path / "Code")
+    monkeypatch.setattr(_settings, "code_dir", code_dir, raising=False)
+    missing_dir = _os.path.join(code_dir, "SomeRandomDir")
+
+    import api.services.directory_resolver as dr
+    monkeypatch.setattr(dr, "resolve_working_directory", lambda title, allow_uncloned=True: missing_dir)
+    monkeypatch.setattr(dr, "_github_repos", lambda: [])  # no gh/key on this host, as on CI
+
+    def _fail_if_called(path):
+        raise AssertionError("ensure_cloned must not run for a name outside the known repo list")
+
+    monkeypatch.setattr(dr, "ensure_cloned", _fail_if_called)
+
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "fix the bug", "status": "todo", "tags": ["claude"]},
+    ])
+    pool = _CapturingPool()
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="claude"),
+                     local_executor=None,
+                     claude_code_executor=_ReadyCliExecutor(),
+                     cli_pool=pool)
+
+    handled = w.tick()
+
+    assert handled == 1
+    assert BLOCKED_TAG not in api.tasks["t1"]["tags"]
+    assert len(pool.submitted) == 1
+
+
+@pytest.mark.unit
+def test_clone_on_demand_skipped_for_remote_host(tmp_path: Path, monkeypatch):
+    """A session assigned to a remote host (LIFEOS_AGENT_HOSTS) must never
+    attempt a clone on this process — `ensure_cloned` is not this host's to
+    call when the CLI itself will run over ssh on another machine. Drive
+    `_dispatch` directly on an already-claimed, host-assigned card, the
+    same way `test_routing_ask_lands_in_blocked_with_model_question` does."""
+    import os as _os
+
+    from config.settings import settings as _settings
+    code_dir = str(tmp_path / "Code")
+    monkeypatch.setattr(_settings, "code_dir", code_dir, raising=False)
+    monkeypatch.setattr(_settings, "agent_hosts", {"studio": "user@studio"}, raising=False)
+    missing_repo = _os.path.join(code_dir, "MissingRepo")
+
+    import api.services.directory_resolver as dr
+    monkeypatch.setattr(dr, "resolve_working_directory", lambda title, allow_uncloned=True: missing_repo)
+
+    def _fail_if_called(path):
+        raise AssertionError("ensure_cloned must not run for a remote-host spawn")
+
+    monkeypatch.setattr(dr, "ensure_cloned", _fail_if_called)
+
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "fix the bug in missingrepo", "status": "in_progress",
+         "tags": [RUNNING_TAG, "claude"], "fields": {"host": "studio"}},
+    ])
+    pool = _CapturingPool()
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="claude"),
+                     local_executor=None,
+                     claude_code_executor=_ReadyCliExecutor(),
+                     cli_pool=pool)
+    w.session_store.create(task_id="t1", status=STATUS_CLAIMED)
+    w._dispatch(api.tasks["t1"])
+
+    # Never blocked over a clone failure — the guard simply doesn't apply
+    # to a remote-host spawn. The ssh-side executor itself isn't under
+    # test here (no claude_code_executor stub is wired up); only that the
+    # clone guard didn't block the dispatch before reaching that point.
+    assert BLOCKED_TAG not in api.tasks["t1"]["tags"]
+    assert len(pool.submitted) == 1
+
+
+@pytest.mark.unit
+def test_remote_cli_spawn_falls_back_to_keyword_cascade_for_uncloned_repo(tmp_path: Path, monkeypatch):
+    """A remote-host CLI spawn whose Jev-judged location is a GitHub-only
+    repo (no local directory) must resolve to the keyword-cascade result
+    instead — this process can neither clone into the remote host nor
+    confirm the repo exists there. Exercises the real
+    `resolve_working_directory`, not a stub, so it proves the
+    `allow_uncloned` plumbing through `_resolve_session_execution`'s
+    write-once persisted spec, not just the clone-on-demand block."""
+    import os as _os
+
+    from config.settings import settings as _settings
+    monkeypatch.setattr(_settings, "agent_hosts", {"studio": "user@studio"}, raising=False)
+
+    import api.services.directory_resolver as dr
+    from api.services.jev_task_routing import JevAnswer, TaskJudgment
+    monkeypatch.setattr(dr, "_location_options", lambda: [
+        ("widget", "an uncloned repo", "/code/Widget"),
+    ])
+    monkeypatch.setattr(
+        "api.services.jev_task_routing.judge_task",
+        lambda title: TaskJudgment(
+            location=JevAnswer(choice="widget", confidence=0.9),
+            difficulty=None, preset_class=None, software_work=None,
+        ),
+    )
+
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "do something random", "status": "in_progress",
+         "tags": [RUNNING_TAG, "claude"], "fields": {"host": "studio"}},
+    ])
+    pool = _CapturingPool()
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="claude"),
+                     local_executor=None,
+                     claude_code_executor=_ReadyCliExecutor(),
+                     cli_pool=pool)
+    w.session_store.create(task_id="t1", status=STATUS_CLAIMED)
+    w._dispatch(api.tasks["t1"])
+
+    refreshed = w.session_store.get("t1")
+    spec = ExecutionSpec.from_dict(refreshed.execution_spec)
+    # "do something random" matches no keyword cascade phrase, so the
+    # cascade's own default (home) is the expected fallback — proving the
+    # Jev-chosen "/code/Widget" (which doesn't exist on this host) was
+    # rejected, not silently substituted for something else Jev-flavored.
+    assert spec.working_dir == _os.path.expanduser("~")
+    assert BLOCKED_TAG not in api.tasks["t1"]["tags"]

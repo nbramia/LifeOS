@@ -208,3 +208,19 @@ def test_agent_hosts_validator_receives_raw_string(monkeypatch, raw_value, expec
 
     s = Settings(_env_file=None)
     assert s.agent_hosts == expected
+
+
+def test_typesafe_api_key_from_env(monkeypatch):
+    """Mutation-check witness for the TYPESAFE_API_KEY alias on
+    typesafe_api_key: changing the alias string would make this env var no
+    longer bind to the field, so `typesafe_api_key` would read as the
+    default "" and `jev_configured` would stay False.
+
+    `_env_file=None` so a real `.env`'s own TYPESAFE_API_KEY (if any) can't
+    leak into this test."""
+    monkeypatch.setenv("TYPESAFE_API_KEY", "k")
+    from config.settings import Settings
+
+    s = Settings(_env_file=None)
+    assert s.typesafe_api_key == "k"
+    assert s.jev_configured is True

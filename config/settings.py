@@ -635,6 +635,51 @@ class Settings(BaseSettings):
         unpriced (see remote_llm_input_price_per_mtok)."""
         return bool(self.remote_llm_base_url and self.remote_llm_model and self.remote_llm_api_key)
 
+    # TypeSafe's Jev typed-judgment API — an opt-in provider for calibrated
+    # choice/score/noul answers, distinct from the generative LLM providers
+    # above. Empty (default) means no surface that consults it makes a
+    # network call; each caller is independently opt-in on top of this key
+    # being set (see api/services/jev_client.py).
+    typesafe_api_key: str = Field(
+        default="", alias="TYPESAFE_API_KEY",
+        description="Bearer token for TypeSafe's Jev API "
+                    "(https://docs.typesafe.ai). Empty (default) disables "
+                    "every Jev-backed judgment; each surface falls back to "
+                    "its existing behavior."
+    )
+
+    @property
+    def jev_configured(self) -> bool:
+        """True once a TypeSafe API key is set. Mirrors remote_llm_configured's
+        "configured" convention — a key is the only prerequisite, there's no
+        separate URL/model to wire up."""
+        return bool(self.typesafe_api_key)
+
+    # GitHub login whose repos `directory_resolver._github_repos()` lists as
+    # working-directory candidates. Empty (default) resolves it from
+    # `gh api user -q .login` instead, caching the result on disk.
+    github_owner: str = Field(default="", alias="LIFEOS_GITHUB_OWNER")
+
+    jev_orchestrator: str = Field(
+        default="off",
+        alias="LIFEOS_JEV_ORCHESTRATOR",
+        description="Controls the chat orchestrator's Jev shadow instrumentation "
+                    "(see `api/services/jev_orchestrator_shadow.py`). One of: `off` "
+                    "(default) — no Jev call, no `jev_preturn`/`jev_inloop` span; "
+                    "`shadow` — a pre-turn judgment runs concurrently with the "
+                    "first round and an in-loop judgment runs after each round "
+                    "from the second on, both recorded as perf-trace spans, and "
+                    "neither changes the tool catalog, round cap, or model choice "
+                    "for the turn. In `shadow` mode, TypeSafe receives the current "
+                    "message, the last two conversation turns, and (for in-loop "
+                    "calls) each round's tool names, argument summaries, and "
+                    "300-char result previews; none of that reaches a log line or "
+                    "a perf-trace span. Effectively `off` whenever no TypeSafe key "
+                    "is configured (`typesafe_api_key`/`jev_configured`), "
+                    "regardless of this setting. An unrecognized value logs a "
+                    "warning and is treated as `off`."
+    )
+
     # Lets the agent worker's `local` route fall back to the remote
     # OpenAI-compatible provider above when the local llama-server isn't
     # reachable. Exists for a real deployment with NO other #agent executor
@@ -784,6 +829,25 @@ class Settings(BaseSettings):
                     "changes which client runs the preflight classifier — it "
                     "has no effect on which engine an #agent task itself is "
                     "dispatched to."
+    )
+    agent_jev_destructive_gate: str = Field(
+        default="shadow",
+        alias="LIFEOS_AGENT_JEV_DESTRUCTIVE_GATE",
+        description="Controls the Jev destructiveness judgment that runs "
+                    "alongside preflight's regex-based sanity gate (see "
+                    "`agent_worker/preflight.py`'s `_apply_destructive_judgment`). "
+                    "One of: `off` — no Jev call; `shadow` (default) — the "
+                    "judgment runs and its harm score / irreversible "
+                    "probability are recorded on the preflight result and "
+                    "logged, but never change `sane`/`sane_fatal`; `block` — "
+                    "a harm score >= 2.5 or an irreversible probability >= "
+                    "0.85 parks the task for operator approval (non-fatal "
+                    "`sane=False`), never cancels it. Effectively `off` "
+                    "whenever no TypeSafe key is configured "
+                    "(`typesafe_api_key`/`jev_configured`), regardless of "
+                    "this setting. The regex sanity gate runs unconditionally "
+                    "in every mode. An unrecognized value logs a warning and "
+                    "is treated as `shadow`."
     )
     agent_managed_model: str = Field(
         default="claude-sonnet-5",
@@ -1432,6 +1496,14 @@ class Settings(BaseSettings):
     pebble_capture_apply: bool = Field(default=False, alias="LIFEOS_PEBBLE_CAPTURE_APPLY")
     pebble_capture_dir: str = Field(default="LifeOS/Log/Pebble", alias="LIFEOS_PEBBLE_CAPTURE_DIR")
     pebble_capture_scan_seconds: int = Field(default=60, ge=10, alias="LIFEOS_PEBBLE_CAPTURE_SCAN_SECONDS")
+    pebble_classifier: str = Field(
+        default="llm", alias="LIFEOS_PEBBLE_CLASSIFIER",
+        description="Which classifier files a Pebble capture: 'llm' (default) "
+                    "-- the configured remote provider, else the local "
+                    "llama-server -- or 'jev', TypeSafe's typed-judgment API "
+                    "(requires TYPESAFE_API_KEY; falls back to 'llm' with a "
+                    "warning if the key is absent)."
+    )
 
     # Monarch Money
     monarch_email: str = Field(

@@ -450,6 +450,55 @@ def _guard_git_worktree_hermeticity(monkeypatch):
     monkeypatch.setattr(git_worktree, "_run", guarded_run)
 
 
+# ---------------------------------------------------------------------------
+# directory_resolver gh hermeticity guard
+#
+# `directory_resolver.py`'s `_resolve_github_owner`, `_github_repos`, and
+# `ensure_cloned` all funnel their real `gh` subprocess call through the
+# single `_run_gh` seam. A test that exercises any of these without mocking
+# anything gh-related would otherwise hit the real `gh` binary — on a
+# developer machine with `gh` authenticated (as this box's `gh auth status`
+# shows), that means a real `gh api user`/`gh repo list` network call, and
+# `gh repo clone` writing a real repository into whatever directory the test
+# happened to resolve. On GitHub Actions this is just as real a risk: `gh`
+# is commonly pre-authenticated there via `GITHUB_TOKEN`, so the same test
+# could reach the network or clone onto the runner instead of failing
+# closed the way an unauthenticated `gh` would.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _guard_directory_resolver_gh_hermeticity(monkeypatch):
+    """Make `directory_resolver._run_gh` raise before any real `gh`
+    subprocess call — unless a test has already neutralized it itself by
+    replacing `directory_resolver.subprocess.run` (the same escape hatch
+    the git-worktree guard above grants for `git_worktree.subprocess.run`).
+
+    Every caller of `_run_gh` already wraps it in a broad `except
+    Exception: return []/""/False` (its documented no-gh-available
+    fallback), so a test that mocks nothing sees exactly the same
+    "gh unavailable" behavior an unauthenticated CI runner would produce —
+    not a real network call or a real `gh repo clone`. A test that wants to
+    observe the raise directly calls `directory_resolver._run_gh(...)`
+    itself (see `tests/test_directory_resolver_gh_hermetic_guard.py`).
+    """
+    from api.services import directory_resolver
+
+    real_subprocess_run = subprocess.run
+    original_run_gh = directory_resolver._run_gh
+
+    def guarded_run_gh(cmd, *, timeout):
+        if directory_resolver.subprocess.run is real_subprocess_run:
+            raise RuntimeError(
+                "Test issued a real gh subprocess call — mock "
+                "directory_resolver._github_repos / _resolve_github_owner / "
+                "ensure_cloned, or patch directory_resolver.subprocess.run, "
+                "instead of letting a unit test reach real gh."
+            )
+        return original_run_gh(cmd, timeout=timeout)
+
+    monkeypatch.setattr(directory_resolver, "_run_gh", guarded_run_gh)
+
+
 def pytest_runtest_setup(item):
     """Hand the active test item to the guard so it can check markers."""
     _install_anthropic_request_guard._current_node = item

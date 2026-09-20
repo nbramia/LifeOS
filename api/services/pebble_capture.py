@@ -30,10 +30,13 @@ from croniter import croniter
 
 from api.services.human_queue import add_card
 from api.services.agent_board import AGENT_EXECUTOR_TAGS, AGENT_PICKUP_TAGS, ASSIGNEE_TAGS
-from api.services.journal_filing_policy import classifier_prompt
+from api.services.jev_client import JevClient, JevError, jev_configured
+from api.services.jev_task_routing import judge_task
+from api.services.journal_filing_policy import PEBBLE_DISPOSITION_CRITERIA, classifier_prompt
 from api.services.llm_client import LocalLLMClient, extract_json
 from api.services.scheduler_store import SchedulerStore
 from api.services.task_manager import TaskManager
+from api.services.time_parser import parse_contextual_time
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -44,6 +47,71 @@ _ROUTING_TAGS = frozenset((*_VALID_TASK_ASSIGNEES, *AGENT_PICKUP_TAGS))
 _VALID_KINDS = {"task", "schedule", "human"}
 _EFFECT_LEASE_SECONDS = 60
 _INLINE_AUTHORITY_RE = re.compile(r"\[\s*\w+\s*::|#[\w-]+")
+
+# Single source of truth for executor aliasing: how a spoken/typed phrase
+# resolves to the canonical tag the board and the authority gate use.
+# Speech-to-text commonly renders "Claude" as "clod" and "Claude Code" as
+# "clod code" or "cloud code"; "deepseek"/"fireworks" name the configured
+# remote provider, which the board tags "cloud" (mirrors the
+# `cloud|deepseek|fireworks` group in agent_worker/worker.py) -- never the
+# Anthropic API. Every canonical executor tag also maps to itself so a
+# lookup never needs a separate identity branch.
+EXECUTOR_ALIASES: dict[str, str] = {
+    "clod code": "claude",
+    "claude code": "claude",
+    "cloud code": "claude",
+    "clod": "claude",
+    "deepseek": "cloud",
+    "fireworks": "cloud",
+    **{tag: tag for tag in AGENT_EXECUTOR_TAGS},
+}
+
+# Alternation tried longest-phrase-first, so a multi-word alias like "cloud
+# code" is matched whole before the identity entry for the bare "cloud" tag
+# nested inside it could otherwise fire and leave " code" dangling.
+# ASCII-only word-boundary/case-folding: every alias and canonical tag is
+# plain ASCII, and this keeps an exotic Unicode case fold from producing a
+# matched span that isn't literally one of EXECUTOR_ALIASES' keys.
+_EXECUTOR_ALIAS_RE = re.compile(
+    r"\b(?:" + "|".join(
+        re.escape(phrase) for phrase in sorted(EXECUTOR_ALIASES, key=len, reverse=True)
+    ) + r")\b",
+    re.IGNORECASE | re.ASCII,
+)
+
+
+def normalize_executor(text: str) -> Optional[str]:
+    """Resolve one executor phrase to its canonical tag.
+
+    Case-insensitive and whole-phrase (the caller passes one candidate
+    phrase, not free text -- see `canonicalize_executor_mentions` for
+    scanning a larger transcript). Returns None for anything not in
+    `EXECUTOR_ALIASES`, including an empty or non-string value.
+    """
+    if not isinstance(text, str):
+        return None
+    match = _EXECUTOR_ALIAS_RE.fullmatch(text.strip())
+    if not match:
+        return None
+    return EXECUTOR_ALIASES.get(match.group(0).casefold())
+
+
+def canonicalize_executor_mentions(text: str) -> str:
+    """Replace every alias phrase in free text with its canonical tag.
+
+    Matched longest-phrase-first (see `_EXECUTOR_ALIAS_RE`), so "cloud code"
+    collapses whole to "claude" rather than partially matching the bare
+    "cloud" tag nested inside it. Text outside an alias phrase, including a
+    canonical tag (mapped to itself), is left untouched. Callers that need
+    literal transcript evidence (`_is_unquoted_evidence`,
+    `_explicit_action_evidence`) must keep operating on the original,
+    uncanonicalized text -- evidence is copied verbatim from the transcript.
+    """
+    if not text:
+        return text
+    return _EXECUTOR_ALIAS_RE.sub(
+        lambda match: EXECUTOR_ALIASES.get(match.group(0).casefold(), match.group(0)), text
+    )
 
 
 class PebbleCaptureError(ValueError):
@@ -519,6 +587,10 @@ def _explicit_tags(text: str) -> set[str]:
     """Return only positive tag/delegation instructions, never mentions."""
     result: set[str] = set()
     for clause in _positive_clauses(text):
+        # Collapse a spoken/typed executor alias ("clod code", "deepseek", ...)
+        # to its canonical tag before any tag/assignment regex runs, so an
+        # aliased mention is recognized the same as the tag itself.
+        clause = canonicalize_executor_mentions(clause)
         # Explicit label instructions may retain ordinary non-routing tags.
         for match in re.finditer(
             r"\btag\s+(?:this|it|that|the\s+task)?\s*(?:as|with)?\s*#([\w-]+)\b",
@@ -622,6 +694,9 @@ def _scheduled_executors(text: str) -> set[str]:
         r"\b(?:assign|delegate|route)\s+(?:this|it|that|the\s+task)?\s*to\s+#?([\w-]+)\b",
     )
     for clause in _positive_clauses(text):
+        # See the matching comment in `_explicit_tags`: aliases must
+        # collapse to their canonical tag before the patterns below run.
+        clause = canonicalize_executor_mentions(clause)
         if not temporal.search(clause) or re.search(r"\bremind\s+me\b", clause, re.I):
             continue
         for pattern in patterns:
@@ -909,6 +984,225 @@ class PebbleJournalClassifier:
                 raise PebbleCaptureError("classifier returned no valid action plan") from exc
 
 
+_JEV_SPLIT_RE = re.compile(r",\s*|\s+(?:and|before|but|then|so)\s+|[.;!?]\s+")
+
+# A recurring cadence -- "every morning", "weekly", "on weekdays" -- names
+# more than the single instant `parse_contextual_time` can resolve; filing a
+# schedule anyway would silently collapse a recurrence into one one-time
+# reminder at whatever hour it happened to parse.
+_RECURRENCE_RE = re.compile(
+    r"\b(every|each|daily|weekly|monthly|hourly|nightly|weekdays?|weekends?)\b",
+    re.IGNORECASE,
+)
+
+_JEV_DISPOSITIONS = frozenset({"task", "notify_schedule", "delegated_task", "agent_schedule"})
+
+
+def _segment_transcript(text: str) -> list[str]:
+    """Split a transcript into small candidate fragments.
+
+    Jev names which fragment was actually asked to be filed rather than
+    inventing wording of its own; code owns the segmentation. Falls back to
+    the whole stripped transcript on the rare input that leaves nothing
+    after stripping every fragment.
+    """
+    segments: list[str] = []
+    pos = 0
+    for match in _JEV_SPLIT_RE.finditer(text):
+        segments.append(text[pos:match.start()])
+        pos = match.end()
+    segments.append(text[pos:])
+    fragments = [segment.strip(" .") for segment in segments if segment.strip(" .")]
+    return fragments or [text.strip(" .")]
+
+
+_EXECUTOR_BASE_DESCRIPTIONS: dict[str, str] = {
+    "claude": "Claude Code, the CLI coding agent.",
+    "codex": "The Codex CLI coding agent.",
+    "hermes": "The Hermes Telegram gateway.",
+    "local": "The local llama-server model running on this machine.",
+    "cloud": "The configured remote OpenAI-compatible provider (DeepSeek via "
+             "Fireworks) -- never the Anthropic API.",
+    "cloud-haiku": "An Anthropic Managed Agent running Claude Haiku.",
+    "cloud-sonnet": "An Anthropic Managed Agent running Claude Sonnet.",
+}
+
+
+def _executor_criteria() -> dict[str, str]:
+    """Jev `executor` question options, generated from `EXECUTOR_ALIASES` so
+    the alias table stays the only place aliases are defined."""
+    aliases_by_tag: dict[str, list[str]] = {}
+    for phrase, tag in EXECUTOR_ALIASES.items():
+        if phrase != tag:
+            aliases_by_tag.setdefault(tag, []).append(phrase)
+    criteria: dict[str, str] = {}
+    for tag in AGENT_EXECUTOR_TAGS:
+        description = _EXECUTOR_BASE_DESCRIPTIONS[tag]
+        aliases = aliases_by_tag.get(tag)
+        if aliases:
+            description += " Commonly transcribed as " + ", ".join(f'"{a}"' for a in aliases) + "."
+        criteria[tag] = description
+    criteria["none"] = "No AI agent was asked to do anything."
+    return criteria
+
+
+class JevPebbleClassifier:
+    """Pebble classifier backed by TypeSafe's Jev typed-judgment API.
+
+    Code segments the transcript into fragments and asks Jev, in one call,
+    which disposition applies, which fragment was requested, which fragment
+    is the delegated work, and which executor was named. Same `classify()`
+    interface as `PebbleJournalClassifier`; `_default_pebble_classifier`
+    selects between them via `LIFEOS_PEBBLE_CLASSIFIER`. Every proposed
+    action still passes through `validate_plan` unchanged -- this class only
+    proposes, it never grants execution authority.
+    """
+
+    def __init__(self, client: Optional[JevClient] = None):
+        self._client = client or JevClient()
+        self.last_answers: dict[str, Any] = {}
+
+    async def classify(self, final_text: str, recorded_at: str) -> list[dict[str, Any]]:
+        fragments = _segment_transcript(final_text)
+        item_criteria = {f"s{i}": fragment for i, fragment in enumerate(fragments)}
+        item_criteria["none"] = "No single fragment -- the whole note is the request"
+        work_criteria = {f"s{i}": fragment for i, fragment in enumerate(fragments)}
+        questions = {
+            "disposition": {
+                "type": "choice",
+                "instructions": (
+                    "A voice note was captured from a ring the speaker wears. "
+                    "Decide what, if anything, the speaker actively asked to "
+                    "have filed."
+                ),
+                "criteria": PEBBLE_DISPOSITION_CRITERIA,
+            },
+            "item": {
+                "type": "choice",
+                "instructions": (
+                    "Which fragment of the voice note names the item the "
+                    "speaker actually asked to have filed? If several things "
+                    "follow a request, only the first item asked for counts; "
+                    "the rest is thinking aloud."
+                ),
+                "criteria": item_criteria,
+            },
+            "work": {
+                "type": "choice",
+                "instructions": (
+                    "If the speaker asked an AI agent to do something, which "
+                    "fragment describes the work itself (not the request "
+                    "wording or the agent name)?"
+                ),
+                "criteria": work_criteria,
+            },
+            "executor": {
+                "type": "choice",
+                "instructions": "Which AI agent, if any, did the speaker ask to do the work?",
+                "criteria": _executor_criteria(),
+            },
+        }
+        try:
+            answers = await self._client.aask({"voice_note": final_text}, questions)
+        except JevError:
+            logger.warning("Jev Pebble classification failed; filing log-only")
+            return []
+        self.last_answers = answers
+        try:
+            return _jev_plan_from_answers(answers, final_text, recorded_at, item_criteria, work_criteria)
+        except (KeyError, TypeError, AttributeError, ValueError):
+            logger.warning("Jev Pebble classification returned a malformed answer; filing log-only")
+            return []
+
+
+def _jev_plan_from_answers(
+    answers: dict[str, Any], final_text: str, recorded_at: str,
+    item_criteria: dict[str, str], work_criteria: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Turn one Jev answers dict into a raw action list.
+
+    Log-only (an empty list) below the confidence floor, for a "log_only"
+    or any unrecognized disposition, for a recurring cadence a single-instant
+    time parse can't represent, and for a delegation with no recognized
+    executor -- never a silently reassigned or invented action. Raises
+    `KeyError`/`TypeError`/`AttributeError`/`ValueError` on a malformed
+    answers shape; the caller treats that the same as a failed Jev call.
+    """
+    disposition = answers.get("disposition") or {}
+    confidence = disposition.get("confidence")
+    if not isinstance(confidence, (int, float)) or confidence < 0.5:
+        return []
+    disp = disposition.get("choice")
+    if disp not in _JEV_DISPOSITIONS:
+        return []
+
+    item_choice = (answers.get("item") or {}).get("choice")
+    item = item_criteria.get(item_choice) if item_choice and item_choice != "none" else final_text.strip(" .")
+    work_choice = (answers.get("work") or {}).get("choice")
+    work = work_criteria.get(work_choice) or item
+    executor_choice = (answers.get("executor") or {}).get("choice")
+    executor = executor_choice if executor_choice in AGENT_EXECUTOR_TAGS else None
+    delegation_evidence = final_text.strip(" .")
+
+    if disp == "task":
+        return [{"kind": "task", "index": 0, "title": item, "action_evidence": item}]
+
+    if disp in ("notify_schedule", "agent_schedule") and _RECURRENCE_RE.search(final_text):
+        return []
+
+    if disp == "notify_schedule":
+        recorded_local = _utc(recorded_at).astimezone(ZoneInfo(settings.timezone))
+        when = parse_contextual_time(final_text, recorded_local)
+        if when is None:
+            return [{"kind": "task", "index": 0, "title": item, "action_evidence": item}]
+        return [{
+            "kind": "schedule", "index": 0, "title": item, "schedule_type": "once",
+            "schedule_value": when.isoformat(), "timezone": settings.timezone,
+            "action": "notify", "message": item,
+        }]
+
+    if disp == "delegated_task":
+        if executor is None:
+            return []
+        return [{
+            "kind": "task", "index": 0, "title": work, "action_evidence": work,
+            "tags": [executor], "delegation_evidence": delegation_evidence,
+        }]
+
+    # disp == "agent_schedule"
+    if executor is None:
+        return []
+    recorded_local = _utc(recorded_at).astimezone(ZoneInfo(settings.timezone))
+    when = parse_contextual_time(final_text, recorded_local)
+    if when is None:
+        return [{
+            "kind": "task", "index": 0, "title": work, "action_evidence": work,
+            "tags": [executor], "delegation_evidence": delegation_evidence,
+        }]
+    return [{
+        "kind": "schedule", "index": 0, "title": work, "schedule_type": "once",
+        "schedule_value": when.isoformat(), "timezone": settings.timezone,
+        "action": "agent", "executor": executor, "message": work,
+        "delegation_evidence": delegation_evidence, "action_evidence": work,
+    }]
+
+
+def _default_pebble_classifier() -> Any:
+    """Select the Pebble classifier per `LIFEOS_PEBBLE_CLASSIFIER`.
+
+    'jev' without a configured key falls back to the LLM classifier with a
+    warning rather than failing captures outright.
+    """
+    if settings.pebble_classifier == "jev":
+        if jev_configured():
+            return JevPebbleClassifier()
+        logger.warning(
+            "LIFEOS_PEBBLE_CLASSIFIER=jev but no TypeSafe API key is configured; "
+            "falling back to the LLM Pebble classifier"
+        )
+    return PebbleJournalClassifier()
+
+
 def _validated_classifier_actions(
     response_text: Any, final_text: str, recorded_at: str
 ) -> list[dict[str, Any]]:
@@ -957,13 +1251,55 @@ class PebbleCaptureConsumer:
 
     def __init__(
         self, ledger: CaptureLedger, task_manager: TaskManager, scheduler_store: SchedulerStore,
-        classifier: Optional[PebbleJournalClassifier] = None, *, apply: bool = False,
+        classifier: Optional[Any] = None, *, apply: bool = False,
     ):
         self.ledger = ledger
         self.task_manager = task_manager
         self.scheduler_store = scheduler_store
-        self.classifier = classifier or PebbleJournalClassifier()
+        self.classifier = classifier or _default_pebble_classifier()
         self.apply = apply
+
+    def _software_project_fields(self, title: str, tags: list[str]) -> Optional[dict[str, str]]:
+        """Append the `software` tag (in place, on `tags`) and return a
+        `{"project": ...}` fields dict when Jev judges a filed task's title
+        as software work with high confidence.
+
+        Only asks when the Jev Pebble classifier is actually in use --
+        this never adds a Jev call to the `llm` classifier's path. Any
+        failure (Jev unconfigured, the call raising, a malformed judgment)
+        leaves `tags` untouched and returns no fields; it never blocks
+        filing the task itself.
+        """
+        if not jev_configured() or not isinstance(self.classifier, JevPebbleClassifier):
+            return None
+        try:
+            judgment = judge_task(title)
+            if judgment is None:
+                return None
+            software_work = judgment.software_work
+            if (
+                software_work is None
+                or software_work.noul is None
+                or software_work.noul < 0.7
+            ):
+                return None
+            if "software" not in tags:
+                tags.append("software")
+            location = judgment.location
+            if (
+                location is not None
+                and isinstance(location.choice, str)
+                and location.confidence >= 0.6
+                and location.choice not in {"vault", "home"}
+                and not any(bad in location.choice for bad in ("\n", "\r", "]", "<!--"))
+            ):
+                return {"project": location.choice}
+            return None
+        except Exception as exc:  # noqa: BLE001 - a judgment failure must never block filing
+            logger.warning(
+                "Pebble software/project judgment failed: %s", type(exc).__name__
+            )
+            return None
 
     def _find_effect_object(
         self, action: PlannedAction, operation_key: str, object_id: Optional[str]
@@ -1040,10 +1376,12 @@ class PebbleCaptureConsumer:
                 continue
             key = action.operation_key(identity)
             if action.kind == "task":
+                tags = list(action.tags)
+                fields = self._software_project_fields(action.title, tags)
                 try:
                     task, _ = self.task_manager.create_or_find_by_operation(
                         key, description=action.title, due_date=action.due_date or None,
-                        tags=list(action.tags),
+                        tags=tags, fields=fields,
                     )
                 except Exception:
                     self.ledger.clear_uncommitted_claim(identity, action, generation)
