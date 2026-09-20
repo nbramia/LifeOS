@@ -4,7 +4,7 @@
 
 LifeOS is a self-hosted AI assistant that connects to your Gmail, Google Calendar, Google Docs/Sheets/Drive, iMessage, phone calls, WhatsApp, Slack, Obsidian vault, Granola meeting transcripts, iPhotos, LinkedIn, Apple contacts, Monarch finances, and Apple Health — then makes all of it **available and actionable through natural language.**
 
-**Front doors:** a web chat, Telegram, voice (wake word or push-to-talk, from a browser or an iOS Home Screen app), any MCP client (Claude Desktop, Claude Code), or a [Hermes](docs/specs/technical/client-surfaces.md) gateway that fronts your persona bots and falls back to LifeOS's native pipeline if Hermes is unreachable. It can answer from your data, take action on your behalf (draft email, schedule things, edit files), and hand long tasks to an autonomous agent that works while you don't — and reports back with a pull request when the work touches code.
+**Front doors:** a web chat, Telegram, voice (tap to talk, from a browser or an iOS Home Screen app), any MCP client (Claude Desktop, Claude Code), or a [Hermes](docs/specs/technical/client-surfaces.md) gateway that fronts your persona bots and falls back to LifeOS's native pipeline if Hermes is unreachable. It can answer from your data, take action on your behalf (draft email, schedule things, edit files), and hand long tasks to an autonomous agent that works while you don't — and reports back with a pull request when the work touches code.
 
 All of your data is indexed and stored **locally** — your vault, messages, photos, financial summaries, and health data never leave your machine. By default, orchestration and synthesis call the Claude API (`LIFEOS_LLM_BACKEND=anthropic`, the default), which sends the current query and its retrieved context to Anthropic. For a no-API-key path, `LIFEOS_LLM_BACKEND=local` routes everything through a local llama-server on your own hardware, and `LIFEOS_LLM_BACKEND=remote` points at any OpenAI-compatible hosted provider (e.g. Fireworks) instead. A nightly sync pulls from your data sources, indexes everything for hybrid search (semantic + keyword), and keeps your relationship graph fresh.
 
@@ -14,6 +14,7 @@ All of your data is indexed and stored **locally** — your vault, messages, pho
 
 ## What You Can Do
 
+<a id="chat"></a>
 <details>
 <summary><strong>Chat — ask across every source you're connected to, from one prompt</strong></summary>
 
@@ -35,8 +36,8 @@ It also answers general-knowledge and web questions directly, and routes intelli
 - **therapist** — advice-oriented; draws on your own reflections and inner-circle context, with strict privacy rules.
 - **fitness** — a log-first trainer: *"bench 135x8, then 5x5 squats @185"* is parsed and recorded (optionally mirrored to a Google Sheet), and *"what should I train today?"* answers from recent volume and recovery signals (sleep, resting HR, HRV, body weight) pulled from [Apple Health](docs/guides/apple-health.md).
 - **finance** — a numbers-first planner grounded in your real Monarch portfolio: *"How much did I spend on restaurants last month?"* / *"Am I over budget on groceries?"* / *"What are my current investment holdings?"*
-- **doctor** — repairs LifeOS itself (see [Autonomous agents & the board](#what-you-can-do)).
-- **journal** — a narrow capture surface: a spoken or typed fragment is filed straight into your daily journal log through the same interpreter a [Pebble ring](#what-you-can-do) uses, without the general tool suite.
+- **doctor** — repairs LifeOS itself (see [Autonomous agents & the board](#agents)).
+- **journal** — a narrow capture surface: a spoken or typed fragment is filed straight into your daily journal log through the same interpreter a [Pebble ring](#data) uses, without the general tool suite.
 
 Pick a persona in `/chat`, or message its dedicated Telegram bot — they behave identically. Create your own with a markdown file. See the [Personas Guide](docs/guides/personas.md) and [Chat UI](docs/specs/product/chat-ui.md).
 
@@ -44,19 +45,23 @@ Pick a persona in `/chat`, or message its dedicated Telegram bot — they behave
 
 </details>
 
+<a id="voice"></a>
 <details>
 <summary><strong>Voice — talk to it, hear it back</strong></summary>
 
 <img src="docs/images/chat-voice.png" width="800" alt="Voice mode active inside /chat, showing the listening and live-transcript state">
 
-Tap to talk inside `/chat`, or leave it listening for a wake phrase — same personas, models, and conversations as text, spoken back to you. Setup: [Voice Guide](docs/guides/voice-setup.md).
+Tap to talk inside `/chat` and hear the reply spoken back — same personas, models, and conversations as text. Setup: [Voice Guide](docs/guides/voice-setup.md).
 
 Voice runs through the whisper-relay gateway: mic audio in, speech-to-text, the same orchestrator that answers a typed turn, text-to-speech, spoken reply out — reverse-proxied into `/chat` so the browser only ever talks to LifeOS's own origin. It works from an ordinary browser tab or as an installed iOS Home Screen app, each with its own mic-permission grant.
 
-A voice turn is owned by the server the same way a text turn is: closing the app or losing the network mid-answer doesn't kill it — it keeps generating and the full reply is waiting when you reopen the conversation. Interrupting it is a real, explicit stop ("cancel", "never mind", "scratch that"), not just the phone walking away, so both "hang up without losing the answer" and "actually interrupt it" work at the same time.
+A voice turn is owned by the server the same way a text turn is: closing the app or losing the network mid-answer doesn't kill it — it keeps generating server-side, and the full reply is there when you reopen the conversation. Tapping the dock's cancel button stops an in-flight turn outright, rather than just walking away from it.
+
+A hands-free "Listening" wake-word mode is built into the client and waits on a transcribe endpoint from the voice gateway before it can activate — until that ships, voice is tap-to-talk only.
 
 </details>
 
+<a id="agents"></a>
 <details>
 <summary><strong>Autonomous agents & the board — hand off work, it comes back with a pull request</strong></summary>
 
@@ -71,7 +76,7 @@ Tag a task `#agent` and walk away. For anything that touches code, the session r
 ```
 
 - **Isolated by default.** A coding session never runs in your primary checkout. It's provisioned a deterministic sibling worktree and a conventionally-named branch (`feat/`, `fix/`, `docs/`, …) off the default branch before it starts; if it leaves anything uncommitted when it stops, the worker commits and pushes that too, then opens (or reuses) a pull request against the base branch. A failed push or an unreachable host is reported in plain text, never silently swallowed.
-- **The board is the queue.** Lanes — Unassigned, Assigned, In progress, Human queue, Scheduled, Review, Done, Snoozed — are derived live from your task store, not a separate board file. A Review card shows which engine ran it, its own completion summary, and the branch and PR it opened, with the merge-status badge refreshing roughly every 30 seconds.
+- **The board is the queue.** Lanes — Unassigned, Assigned, In progress, Human queue, Scheduled, Review, Done, Snoozed — are derived live from your task store, not a separate board file. A Review card shows which engine ran it, its own completion summary, and the branch and PR it opened, with the merge-status badge refreshed in the background every few minutes at most — board reads never block on a live GitHub call.
 - **Asks when genuinely stuck, resumes where it left off.** A session that hits a real ambiguity pauses in the Human queue lane instead of guessing. Reply on Telegram — the message is threaded to that card and prefixed with the card's own title so concurrent sessions stay attributable — and the session resumes **in the exact same worktree and branch**, with your note folded onto the next turn. No answer within the configured window (72 hours by default) and the task is parked with a heads-up instead of abandoned.
 - **Snoozed cards wake themselves up.** Push a card's wake time out and it drops out of the active lanes; when that time passes, it returns to its natural lane and sends a Telegram notification naming the card.
 - **Cleanup is automatic.** Each session gets a private scratch directory that's removed the moment it reaches a terminal state; a worktree is removed only once its session is done *and* its PR is merged, its card accepted, or its card cancelled — orphaned worktrees are swept up the same way. Nothing is cleaned up until it's genuinely safe to.
@@ -92,6 +97,7 @@ Set up: [Agent Worker Setup](docs/guides/agent-worker-setup.md). Full reference:
 
 </details>
 
+<a id="tasks"></a>
 <details>
 <summary><strong>Task management — tasks, reminders, and schedules, steerable in plain language</strong></summary>
 
@@ -109,6 +115,7 @@ The system doesn't just wait for you to ask, either — before meetings it pushe
 
 </details>
 
+<a id="crm"></a>
 <details>
 <summary><strong>CRM — turn years of interaction history into relationship insight</strong></summary>
 
@@ -143,6 +150,7 @@ A ranked, searchable directory of everyone you've emailed, texted, or met — wi
 
 </details>
 
+<a id="data"></a>
 <details>
 <summary><strong>Data processing — sources, nightly sync, hybrid search, entity resolution</strong></summary>
 
@@ -170,7 +178,7 @@ Everything above is built on a nightly sync that pulls from every connected sour
 
 - **Entity resolution** links every identifier — an email address, a phone number, "John from the conference" — to one canonical [PersonEntity](docs/specs/product/data-model.md), matching on exact email or phone first and falling back to fuzzy, nickname-aware name matching with relationship-strength-informed disambiguation when two candidates are close. See [Entity Resolution](docs/specs/product/entity-resolution.md).
 - **Hybrid search** fuses ChromaDB vector similarity with SQLite FTS5/BM25 keyword search via Reciprocal Rank Fusion, then re-ranks the fused results with a cross-encoder — while protecting a precise factual match from being displaced by something merely "more semantically similar." See [Search & Indexing](docs/specs/technical/search-indexing.md).
-- **Nightly sync** runs in seven dependency-ordered phases: Collection, Entity Processing, Relationship Building, Vector Store Indexing, Content Sync, Post-Sync Cleanup, and Consistency Verification — see [System architecture](#what-you-can-do) for the diagram and [Data & Sync](docs/specs/technical/data-and-sync.md) for the full pipeline.
+- **Nightly sync** runs in seven dependency-ordered phases: Collection, Entity Processing, Relationship Building, Vector Store Indexing, Content Sync, Post-Sync Cleanup, and Consistency Verification — see [System architecture](#architecture) for the diagram and [Data & Sync](docs/specs/technical/data-and-sync.md) for the full pipeline.
 - **Capture from a Pebble Index ring.** Speak into it and it transcribes on-phone, then posts the fragment straight into LifeOS through the same interpreter a typed journal message goes through — same log file, same task/schedule-extraction judgment. An optional filing pipeline can additionally turn a fragment into a task, a reminder, or a scheduled agent hand-off, but only on explicit, unambiguous delegation language — never from an offhand remark. See the [Journal Ring Ingest Guide](docs/guides/journal-ring-ingest.md) and [Pebble Capture Guide](docs/guides/pebble-capture.md).
 - **Journal trends.** A logging-consistency heatmap, an emotion-vocabulary view of what you never reach for, and mood/stress/sleep correlations — read entirely from your vault, outside the CRM's entity model. See [Journal Analytics](docs/specs/product/journal-analytics.md).
 
@@ -178,6 +186,7 @@ Everything above is built on a nightly sync that pulls from every connected sour
 
 </details>
 
+<a id="architecture"></a>
 <details>
 <summary><strong>System architecture — the diagrams</strong></summary>
 
@@ -223,6 +232,7 @@ How a board card becomes a pull request:
 
 </details>
 
+<a id="privacy"></a>
 <details>
 <summary><strong>Privacy & self-hosting — what stays local, what leaves, and your call on backends</strong></summary>
 
