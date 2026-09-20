@@ -114,6 +114,30 @@ branch, so a PR that edits the topology is gated by whatever topology `main`
 carries, and an edited topology's first real exercise is the first candidate
 built after that edit merges.
 
+## The cached test environment
+
+Each execution part restores its installed environment — a venv holding the
+CPU torch build and `requirements.txt`, plus Playwright's Chromium — from a
+cache keyed on the runner image, the interpreter version, `TORCH_CPU_VERSION`,
+the requirements hash, a schema version, and the ISO week. The week matters
+because most entries in `requirements.txt` are open ranges: a hit skips
+dependency resolution entirely, so a restored environment holds whatever
+those ranges resolved to when its key was first built, not what they would
+resolve to today. The weekly component bounds that staleness to at most one
+week; a release published mid-week is first exercised by the next week's
+build (or sooner by any change to `requirements.txt`). On a miss the install step builds
+it with `--only-binary=:all:` (no source distribution ever executes) and
+records a package fingerprint inside the venv; the save step runs immediately
+after, before any candidate code, and nowhere later. On a hit the install
+step activates the venv, installs Chromium's system packages (never cached),
+and fails unless the fingerprint of what was restored equals the one the miss
+path recorded for that key — a consistency check that the restored venv is
+the one this key built, not an integrity check against the requirements
+file. The torch identity assertions run on both paths.
+Caches written from a `pull_request_target` run are scoped to `main`, so
+every candidate with the same key shares one environment that only wheel
+installation has ever touched.
+
 ## Privacy-audit applicability
 
 `tests/test_fixtures_no_personal_data.py::test_no_fixture_contains_a_real_sensitive_value`
