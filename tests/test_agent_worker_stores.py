@@ -5,6 +5,8 @@ real `data/` is never touched.
 """
 from __future__ import annotations
 
+import os
+import sys
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -118,6 +120,47 @@ def test_session_store_list_non_terminal(tmp_path: Path):
 
     pending = {s.task_id for s in store.list_non_terminal()}
     assert pending == {"t1", "t4"}
+
+
+@pytest.mark.unit
+def test_session_store_connect_does_not_leak_file_descriptors(tmp_path: Path):
+    """`_connect()` must close each connection it opens. The worker tick
+    calls these read/write methods every cycle for the process's whole
+    lifetime, so a per-call leak accumulates into file-descriptor
+    exhaustion."""
+    if sys.platform != "linux":
+        pytest.skip("fd accounting via /proc/self/fd is Linux-only")
+
+    db_path = tmp_path / "sessions.db"
+    store = SessionStore(db_path=db_path)
+    store.create(task_id="t1", status=STATUS_CLAIMED, routing="local")
+
+    def _open_fds_for(path: Path) -> int:
+        target = str(path)
+        count = 0
+        for entry in os.listdir("/proc/self/fd"):
+            try:
+                link = os.readlink(f"/proc/self/fd/{entry}")
+            except OSError:
+                continue
+            if link.startswith(target):
+                count += 1
+        return count
+
+    baseline = _open_fds_for(db_path)
+    for _ in range(50):
+        store.list_yielded_waiting_on_children()
+        store.list_non_terminal()
+        store.due_sleeps()
+        store.get("t1")
+        store.list_sessions()
+        store.update_status("t1", STATUS_RUNNING)
+
+    after = _open_fds_for(db_path)
+    assert after <= baseline, (
+        f"SessionStore._connect() leaked file descriptors on {db_path}: "
+        f"{baseline} open before the loop, {after} after 50 tick iterations"
+    )
 
 
 @pytest.mark.unit

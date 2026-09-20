@@ -7,13 +7,14 @@ intentionally exposes thin CRUD; orchestration lives in `worker.py`.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 
 
 # Anchored to the repo root (this file's own location), NOT the caller's
@@ -713,13 +714,26 @@ class SessionStore:
         self._owned_question_claims: set[int] = set()
         self._inherited_question_claims = self._list_question_claim_ids()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextlib.contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Yield a connection, closing it on the way out.
+
+        Every call site uses this as `with self._connect() as conn:`. The
+        nested `with conn:` preserves sqlite3's own commit-on-success /
+        rollback-on-exception behavior for the block; the `finally` then
+        guarantees the underlying file descriptor is released even though
+        each call opens a fresh connection.
+        """
         conn = sqlite3.connect(str(self.db_path), isolation_level=None, timeout=10.0)
         conn.row_factory = sqlite3.Row
         # WAL allows concurrent readers/writers; safe to re-set.
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init_schema(self) -> None:
         with self._connect() as conn:
