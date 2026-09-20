@@ -55,7 +55,6 @@ _ALLOWLIST_VERIFIED_SAFE = frozenset({
     "api/services/interaction_store.py",
     "api/services/job_queue.py",
     "api/services/journal_ingest_store.py",
-    "api/services/person_entity.py",
     "api/services/person_facts.py",
     "api/services/relationship.py",
     "api/services/relationship_insights.py",
@@ -72,12 +71,18 @@ _ALLOWLIST_VERIFIED_SAFE = frozenset({
 # close leaks the file descriptor. Narrower than the per-call leak
 # `connect_closing`'s call sites had (this only leaks on an error path, not
 # every call), and none of these use the `_connect`-returns-unclosed-bare-
-# connection shape that pattern targets. Listed here rather than fixed as
-# part of the same change that broadened this scan.
+# connection shape that pattern targets. `person_entity.py` is a different
+# shape again: `PersonEntityStore._get_data_version_connection()` lazily
+# opens a single connection and holds it for the life of the store, and the
+# class has no close or teardown method at all, so every instance keeps
+# that connection open until process exit rather than leaking only on an
+# error path. Listed here rather than fixed as part of the same change that
+# broadened this scan.
 _ALLOWLIST_KNOWN_GAP = frozenset({
     "api/routes/crm.py",
     "api/services/aggregate_cache.py",
     "api/services/link_override.py",
+    "api/services/person_entity.py",
     "api/services/person_stats.py",
     "api/services/relationship_discovery.py",
     "api/services/sync_health.py",
