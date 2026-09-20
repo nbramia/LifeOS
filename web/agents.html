@@ -1278,8 +1278,8 @@
      it takes two thirds of the tray and splits that evenly between its
      buttons rather than hugging its labels — a label-width target is hard
      to hit with a dragged card, most of all on a phone. The remaining
-     third leaves room for the tray label, the Done target, and the drop
-     status line. */
+     third leaves room for the tray label, the Done target (first in the
+     row, ahead of the assignees), and the drop status line. */
   #board-assignee-drops {
     display: flex;
     flex: 1 1 auto;
@@ -2020,8 +2020,8 @@
   <div id="board-lanes"></div>
   <div class="board-drop-tray" id="board-drop-tray" aria-label="Board quick actions">
     <span class="board-drop-tray-label">Assign</span>
-    <div id="board-assignee-drops" role="group" aria-label="Filter board by assignee, or drop a card here to assign it"></div>
     <button type="button" class="board-drop-target board-done-drop" id="board-done-drop" title="Done">Done</button>
+    <div id="board-assignee-drops" role="group" aria-label="Filter board by assignee, or drop a card here to assign it"></div>
     <span class="board-drop-status" id="board-drop-status" role="status" aria-live="polite"></span>
   </div>
   <!-- Multi-select bulk action bar — hidden until a card is

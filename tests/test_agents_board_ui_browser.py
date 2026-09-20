@@ -1245,15 +1245,16 @@ class TestBoardLoad:
         page.locator("#board-done-drop").click()
         expect(page.locator("#board-lane-filter-options input[value='done']")).not_to_be_checked()
 
+    def test_done_target_sits_first_in_the_tray_ahead_of_every_assignee(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        done_box = page.locator("#board-done-drop").bounding_box()
+        first_assignee_box = page.locator("#board-assignee-drops .board-assignee-drop").first.bounding_box()
+        assert done_box["x"] + done_box["width"] <= first_assignee_box["x"]
+
     def test_dropping_a_focused_card_on_done_still_moves_it(self, page: Page, agents_base_url):
         lane_calls = []
         _open_board(page, agents_base_url, lane_calls=lane_calls)
-        card_box = page.locator('[data-card-id="t1"]').bounding_box()
-        done_box = page.locator("#board-done-drop").bounding_box()
-        page.mouse.move(card_box["x"] + card_box["width"] / 2, card_box["y"] + card_box["height"] / 2)
-        page.mouse.down()
-        page.mouse.move(done_box["x"] + done_box["width"] / 2, done_box["y"] + done_box["height"] / 2, steps=10)
-        page.mouse.up()
+        _drag_to(page, '[data-card-id="t1"]', "#board-done-drop")
         expect(page.locator(".board-lane[data-lane='unassigned'] [data-card-id='t1']")).to_have_count(0, timeout=5000)
         assert lane_calls == [{"lane": "done"}]
 
