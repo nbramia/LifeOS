@@ -229,8 +229,9 @@ def bot(b):
 
 # ============================ 1. ARCHITECTURE ============================
 def architecture():
-    W, H = 1520, 840
+    W, H = 1560, 840
     bx, by = 930, 410  # brain / orchestrator core
+    surf_base = 1310  # surfaces column x — kept clear of the right edge at W=1560
     s = [svg_open(W, H), defs(), panel(W, H, glow=(bx, by, 430))]
     # soft zone blobs (drawn first, behind everything)
     s.append('<ellipse cx="205" cy="410" rx="150" ry="330" fill="url(#zone-src)"/>')
@@ -238,7 +239,7 @@ def architecture():
     s.append(
         f'<ellipse cx="{bx}" cy="{by}" rx="150" ry="210" fill="url(#zone-brain)"/>'
     )
-    s.append('<ellipse cx="1360" cy="405" rx="150" ry="320" fill="url(#zone-surf)"/>')
+    s.append(f'<ellipse cx="{surf_base}" cy="405" rx="150" ry="320" fill="url(#zone-surf)"/>')
     s.append('<ellipse cx="1010" cy="735" rx="290" ry="120" fill="url(#zone-auto)"/>')
     s.append(
         f"<defs>{marker('aC', '#34d399')}{marker('aB', '#fbbf24')}{marker('aS', '#a78bfa')}{marker('aW', '#38bdf8')}{marker('aA', '#fb7185')}</defs>"
@@ -273,7 +274,7 @@ def architecture():
     ]
     surf_b = []
     for txt, z, y, sub in surfs:
-        x = 1360 + 18 * math.sin((y - 130) / 512 * math.pi)
+        x = surf_base + 18 * math.sin((y - 130) / 512 * math.pi)
         g, b = node(x, y, txt, z, sub=sub)
         surf_b.append((g, b, z))
     worker_g, worker = node(
@@ -416,7 +417,8 @@ def architecture():
     )
     s.extend(E)
 
-    s.append(core(bx, by, 58, ["Agent", "loop"], "Claude · llama · remote"))
+    s.append(core(bx, by, 58, ["Agent", "loop"]))
+    s.append(note(bx, by + 92, "Claude · llama · remote", MUT, anchor="middle", size=11))
     for g, b in src_b:
         s.append(g)
     for g in (sync_g, store_g, resolve_g, vec_g, bm_g):
@@ -430,7 +432,7 @@ def architecture():
     s.append(zlabel(360, 66, "Ingest · store · index — local", ZONES["core"]))
     s.append(zlabel(bx, 120, "Orchestration", ZONES["brain"], anchor="middle"))
     s.append(note(bx, 138, "hybrid search · RRF", MUT, anchor="middle", size=11))
-    s.append(zlabel(1270, 66, "Surfaces", ZONES["surf"]))
+    s.append(zlabel(surf_base - 40, 66, "Surfaces", ZONES["surf"]))
     s.append(zlabel(900, 800, "Autonomous", ZONES["auto"]))
     s.append("</svg>")
     write("architecture.svg", "\n".join(s))
