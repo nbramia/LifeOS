@@ -190,7 +190,7 @@ def sync_phone_calls(
         # Normalize phone
         phone = normalize_phone(address)
         if not phone:
-            # Skip FaceTime email calls for now
+            # FaceTime calls made via email address have no phone number to match; skip them.
             if address and "@" in address:
                 stats['skipped_facetime_email'] += 1
             continue

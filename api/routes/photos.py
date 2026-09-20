@@ -278,7 +278,7 @@ def trigger_photo_sync(
         from api.services.apple_photos_sync import sync_apple_photos
 
         try:
-            # For now, always do full sync (incremental requires tracking state)
+            # Always do a full sync -- there's no per-item tracking state for an incremental sync.
             stats = sync_apple_photos(since=None)
 
             return SyncResponse(

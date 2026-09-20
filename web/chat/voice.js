@@ -1216,11 +1216,12 @@ async function maybeAutoContinue() {
 //
 // `${endpoints.voice}/transcribe` is forwarded by the existing generic
 // `/api/voice/*` reverse proxy (api/routes/voice.py) with no LifeOS-side
-// route change. It does NOT exist in whisper-relay as of this writing --
-// see docs/guides/voice-setup.md. Until the gateway adds it, every wake
-// check 404s (transcribeClip() below treats that as "no match" and returns
-// quietly) and Listening never actually triggers; the toggle, mic hold, and
-// VAD all still work standalone and are ready the moment the route ships.
+// route change; whisper-relay implements it as bare STT (multipart `audio`
+// in, `{"transcript": "..."}` out, no LLM/TTS/persistence) -- see
+// docs/guides/voice-setup.md. If the gateway is unreachable or too old to
+// serve this route, the call 404s (transcribeClip() below treats that as
+// "no match" and returns quietly), so Listening degrades to inert rather
+// than erroring; the toggle, mic hold, and VAD still run either way.
 const WAKE_VAD_RMS_THRESHOLD = 0.02;  // energy floor to call a frame "speech" -- above SILENCE_RMS_THRESHOLD's ambient-noise cutoff
 const WAKE_SILENCE_MS = 600;          // trailing silence that ends a speech burst
 const WAKE_MIN_SPEECH_MS = 250;       // shorter bursts are clicks/pops, not a word -- skipped without an STT round-trip
@@ -1626,7 +1627,7 @@ async function transcribeClip(blob) {
   const form = new FormData();
   form.append('audio', blob, 'wake.wav');
   const res = await fetch(`${endpoints.voice}/transcribe`, { method: 'POST', body: form });
-  if (!res.ok) return '';  // includes 404 -- the relay route doesn't exist yet
+  if (!res.ok) return '';  // includes 404/503 -- gateway unreachable, too old, or its STT engine failed
   const data = await res.json().catch(() => ({}));
   return (data.transcript || '').toString();
 }
@@ -2664,9 +2665,8 @@ export async function submitTurn({ blob, mime, transcript, retryBubble } = {}) {
   // 'auto' so the default turn stays byte-identical; only the lifeos backend
   // honors model picks — deliberately NOT extended to hermes: model
   // selection on that backend belongs to the harness, not to LifeOS.
-  // whisper-relay relays the field to /api/ask/stream (whisper-relay#24) —
-  // until that ships the gateway drops it, degrading gracefully to the
-  // default orchestrator.
+  // whisper-relay's lifeos adapter relays this field through to its call to
+  // /api/ask/stream.
   if (mode === 'lifeos' && config.model && config.model !== 'auto') {
     form.append('model_override', config.model);
   }

@@ -95,9 +95,9 @@ class TelegramBotConfig:
     backend: str = "hermes"
     # Parsed from the persona file's optional YAML frontmatter (see _parse_persona).
     # `voice` rules are consumed on voice turns (the chat route appends them to the
-    # system prompt). `model` is RESERVED — parsed and stored here but not yet read
+    # system prompt). `model` is RESERVED — parsed and stored here but not read
     # by any code path; the orchestrator resolves its model from anthropic_model +
-    # per-turn escalation, so setting a persona `model` is currently a no-op.
+    # per-turn escalation, so setting a persona `model` is a no-op.
     voice: tuple[str, ...] = ()
     model: str = ""
     # The registry's `persona_file` path, kept alongside the already-parsed

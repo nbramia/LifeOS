@@ -790,9 +790,8 @@ def subagent_session_dict(parent: SessionMeta, subagent: dict[str, Any]) -> dict
 
     These don't have their own jsonl — the subagent's response stream is
     embedded in the parent's transcript. The node exists in the graph for
-    relationship clarity; clicking it loads the parent's transcript filtered
-    by the tool_use_id (future work — for MVP the side panel can show the
-    parent's transcript).
+    relationship clarity; clicking it loads the parent's transcript,
+    unfiltered by the tool_use_id.
     """
     tu_id = subagent.get("tool_use_id") or ""
     synthetic_id = f"{parent.session_id}:agent:{tu_id}"

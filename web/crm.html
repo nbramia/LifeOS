@@ -13678,8 +13678,7 @@
                 const stats = await api(`/family/stats?person_ids=${encodeURIComponent(idsParam)}`);
                 document.getElementById('familyStatEmails').textContent = formatCompactNumber(stats.total_emails || 0);
                 document.getElementById('familyStatMessages').textContent = formatCompactNumber(stats.total_messages || 0);
-                // Note: phone and calendar aren't in PersonEntity lifetime counts yet
-                // For now, use 0 or we could add them to the endpoint later
+                // Phone isn't tracked in PersonEntity lifetime counts, so this always shows 0.
                 document.getElementById('familyStatPhone').textContent = '0';
                 document.getElementById('familyStatCalendar').textContent = formatCompactNumber(stats.total_meetings || 0);
                 // Note: Photos stat is updated by loadFamilyHeatMap from sourceTotals
@@ -17054,8 +17053,7 @@
                 return '';
             }
 
-            // For now, show extracted date as source indicator
-            // Could be enhanced to show actual source type if available
+            // The source indicator is the extracted date.
             if (fact.extracted_at) {
                 return `(extracted ${formatRelativeDate(fact.extracted_at)})`;
             }
