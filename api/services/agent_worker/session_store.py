@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator
 
+from api.services.sqlite_connect import connect_closing
 
 # Anchored to the repo root (this file's own location), NOT the caller's
 # cwd. A bare relative `Path("data/agent_sessions.db")`
@@ -718,22 +719,15 @@ class SessionStore:
     def _connect(self) -> Iterator[sqlite3.Connection]:
         """Yield a connection, closing it on the way out.
 
-        Every call site uses this as `with self._connect() as conn:`. The
-        nested `with conn:` preserves sqlite3's own commit-on-success /
-        rollback-on-exception behavior for the block; the `finally` then
-        guarantees the underlying file descriptor is released even though
-        each call opens a fresh connection.
+        Every call site uses this as `with self._connect() as conn:` — see
+        `connect_closing` for how the close is guaranteed.
         """
-        conn = sqlite3.connect(str(self.db_path), isolation_level=None, timeout=10.0)
-        conn.row_factory = sqlite3.Row
-        # WAL allows concurrent readers/writers; safe to re-set.
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA foreign_keys=ON")
-        try:
-            with conn:
-                yield conn
-        finally:
-            conn.close()
+        with connect_closing(str(self.db_path), isolation_level=None, timeout=10.0) as conn:
+            conn.row_factory = sqlite3.Row
+            # WAL allows concurrent readers/writers; safe to re-set.
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            yield conn
 
     def _init_schema(self) -> None:
         with self._connect() as conn:

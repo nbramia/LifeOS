@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Iterator
 
 from api.services.agent_worker.session_store import DEFAULT_DB_PATH
+from api.services.sqlite_connect import connect_closing
 
 
 class SpendTracker:
@@ -36,13 +37,9 @@ class SpendTracker:
         """Yield a connection, closing it on the way out — see
         `SessionStore._connect`, which shares this database and this
         pattern."""
-        conn = sqlite3.connect(str(self.db_path), isolation_level=None, timeout=10.0)
-        conn.execute("PRAGMA journal_mode=WAL")
-        try:
-            with conn:
-                yield conn
-        finally:
-            conn.close()
+        with connect_closing(str(self.db_path), isolation_level=None, timeout=10.0) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            yield conn
 
     def _init_schema(self) -> None:
         # session_store also creates this table; be idempotent so import order

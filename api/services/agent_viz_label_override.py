@@ -18,6 +18,8 @@ import threading
 import time
 from pathlib import Path
 
+from api.services.sqlite_connect import connect_closing
+
 logger = logging.getLogger(__name__)
 
 # Generous cap — node labels render at ~0.95rem and word-break, so a long
@@ -46,7 +48,7 @@ def _resolve_db_path() -> str:
 
 
 def _init_db() -> None:
-    with sqlite3.connect(_resolve_db_path()) as conn:
+    with connect_closing(_resolve_db_path()) as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute(
             """
@@ -65,7 +67,7 @@ def _load() -> dict[str, str]:
     if _cache is None:
         out: dict[str, str] = {}
         try:
-            with sqlite3.connect(_resolve_db_path()) as conn:
+            with connect_closing(_resolve_db_path()) as conn:
                 for sid, label in conn.execute(
                     "SELECT session_id, label FROM agent_viz_label_override"
                 ):
@@ -94,7 +96,7 @@ def set_override(session_id: str, label: str) -> str:
     if not label:
         clear_override(session_id)
         return ""
-    with _DB_LOCK, sqlite3.connect(_resolve_db_path()) as conn:
+    with _DB_LOCK, connect_closing(_resolve_db_path()) as conn:
         conn.execute(
             "INSERT OR REPLACE INTO agent_viz_label_override "
             "(session_id, label, created_at) VALUES (?, ?, ?)",
@@ -108,7 +110,7 @@ def set_override(session_id: str, label: str) -> str:
 def clear_override(session_id: str) -> None:
     """Drop the manual label for a session (revert to auto-naming)."""
     try:
-        with _DB_LOCK, sqlite3.connect(_resolve_db_path()) as conn:
+        with _DB_LOCK, connect_closing(_resolve_db_path()) as conn:
             conn.execute(
                 "DELETE FROM agent_viz_label_override WHERE session_id = ?",
                 (session_id,),

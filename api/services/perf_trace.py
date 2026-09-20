@@ -24,6 +24,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from api.services.sqlite_connect import connect_closing
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -122,7 +123,7 @@ class PerfTraceStore:
         self._init_db()
 
     def _init_db(self):
-        with sqlite3.connect(self.db_path) as conn:
+        with connect_closing(self.db_path) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS traces (
@@ -141,7 +142,7 @@ class PerfTraceStore:
 
     def save_trace(self, trace: Trace):
         span_data = json.dumps([asdict(s) for s in trace.spans])
-        with sqlite3.connect(self.db_path) as conn:
+        with connect_closing(self.db_path) as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO traces (trace_id, conversation_id, question, model_tier, total_ms, created_at, span_data) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (trace.trace_id, trace.conversation_id, trace.question,
@@ -150,7 +151,7 @@ class PerfTraceStore:
             conn.commit()
 
     def get_trace(self, trace_id: str) -> Optional[dict]:
-        with sqlite3.connect(self.db_path) as conn:
+        with connect_closing(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute("SELECT * FROM traces WHERE trace_id = ?", (trace_id,)).fetchone()
             if not row:
@@ -174,7 +175,7 @@ class PerfTraceStore:
         query += " ORDER BY created_at DESC LIMIT ?"
         params.append(limit)
 
-        with sqlite3.connect(self.db_path) as conn:
+        with connect_closing(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(query, params).fetchall()
             return [self._row_to_dict(r) for r in rows]
@@ -189,7 +190,7 @@ class PerfTraceStore:
         query += " ORDER BY created_at DESC LIMIT ?"
         params.append(limit)
 
-        with sqlite3.connect(self.db_path) as conn:
+        with connect_closing(self.db_path) as conn:
             rows = conn.execute(query, params).fetchall()
 
         # Collect durations per stage

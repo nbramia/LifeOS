@@ -28,15 +28,7 @@ _PATTERN = re.compile(r"with\s+(?:_DB_LOCK,\s*)?sqlite3\.connect\(")
 # Files that still open a connection this way without closing it. Remove an
 # entry once its module is migrated to a closing contextmanager; leaving a
 # fixed file listed here fails just as loudly as a new violation would.
-_ALLOWLIST = frozenset({
-    "api/services/agent_viz_label_override.py",
-    "api/services/gsheet_sync.py",
-    "api/services/hermes_persona_thread_store.py",
-    "api/services/hermes_question_thread_store.py",
-    "api/services/job_queue.py",
-    "api/services/perf_trace.py",
-    "api/services/usage_store.py",
-})
+_ALLOWLIST: frozenset[str] = frozenset()
 
 
 def _matching_lines(path: Path) -> list[int]:
