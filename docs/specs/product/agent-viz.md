@@ -132,7 +132,7 @@ The rest of the filters AND-compose on top of whichever lanes are showing: free-
 
 On mobile, the filter disclosure defaults to collapsed to preserve lane space. Its summary reports whether shared or board-local filters are active, and opening it never resets the selected lanes, filter values, or sort choice.
 
-### Out of scope (for now)
+### Out of scope
 
 Manual card reordering within a lane. Display sorting is client-only and does not change vault order.
 

@@ -1238,41 +1238,70 @@ async def ask_stream(request: AskStreamRequest):
 
             # Consume the async generator from the agent loop
             agent_result = None
-            async for event in run_agent_loop(
-                question=effective_question,
-                conversation_history=conversation_history,
-                attachments=attachments_for_api,
-                model_tier=orchestrator_model,
-                max_tool_rounds=5,
-                model=orchestrator_model if escalated else "",
-                persona=persona_preamble,
-                voice_rules=voice_rules,
-                personal_context=personal_context,
-                force_local=force_local,
-                force_remote=force_remote,
-                persona_id=_effective_pid or "",
-                user_message=request.question,
-            ):
-                if event["type"] == "turn_state":
-                    # Live, mutable AgentResult -- see the comment by
-                    # `live_result`'s declaration above.
-                    live_result = event["result"]
-                elif event["type"] == "text":
-                    await _content(event['content'])
-                elif event["type"] == "status":
-                    await turn.emit(f"data: {json.dumps({'type': 'status', 'message': event['message']})}\n\n")
-                elif event["type"] == "self_correction":
-                    # What was streamed so far is superseded by the
-                    # self-corrected retry that follows — mirrors
-                    # ask-stream.js's `fullContent = ''` reset, and matters
-                    # here because `agent_result.full_text` only gains a
-                    # round's text at round end, so it is NOT what the user
-                    # actually saw and isn't safe to persist on a
-                    # cancellation that lands mid-correction.
-                    partial_text = ""
-                    await turn.emit(f"data: {json.dumps({'type': 'self_correction'})}\n\n")
-                elif event["type"] == "result":
-                    agent_result = event["result"]
+            # LIFEOS_JEV_ORCHESTRATOR=shadow pre-turn judgment: started here,
+            # right before run_agent_loop, so it runs concurrent with the
+            # first round rather than serially ahead of it. `_jev_preturn_task`
+            # is None (no call made) whenever shadow mode is off or Jev isn't
+            # configured. Awaited in the `else` clause below — only once the
+            # loop finishes normally — never in run_agent_loop's own
+            # arguments or behavior.
+            from api.services.jev_orchestrator_shadow import cancel_and_forget, start_preturn_task, finish_preturn_span
+            _jev_preturn_task, _jev_preturn_start = start_preturn_task(
+                _effective_pid or "primary", conversation_history, request.question,
+            )
+            try:
+                async for event in run_agent_loop(
+                    question=effective_question,
+                    conversation_history=conversation_history,
+                    attachments=attachments_for_api,
+                    model_tier=orchestrator_model,
+                    max_tool_rounds=5,
+                    model=orchestrator_model if escalated else "",
+                    persona=persona_preamble,
+                    voice_rules=voice_rules,
+                    personal_context=personal_context,
+                    force_local=force_local,
+                    force_remote=force_remote,
+                    persona_id=_effective_pid or "",
+                    user_message=request.question,
+                ):
+                    if event["type"] == "turn_state":
+                        # Live, mutable AgentResult -- see the comment by
+                        # `live_result`'s declaration above.
+                        live_result = event["result"]
+                    elif event["type"] == "text":
+                        await _content(event['content'])
+                    elif event["type"] == "status":
+                        await turn.emit(f"data: {json.dumps({'type': 'status', 'message': event['message']})}\n\n")
+                    elif event["type"] == "self_correction":
+                        # What was streamed so far is superseded by the
+                        # self-corrected retry that follows — mirrors
+                        # ask-stream.js's `fullContent = ''` reset, and matters
+                        # here because `agent_result.full_text` only gains a
+                        # round's text at round end, so it is NOT what the user
+                        # actually saw and isn't safe to persist on a
+                        # cancellation that lands mid-correction.
+                        partial_text = ""
+                        await turn.emit(f"data: {json.dumps({'type': 'self_correction'})}\n\n")
+                    elif event["type"] == "result":
+                        agent_result = event["result"]
+            except BaseException:
+                # Abnormal exit (an exception from the loop, a
+                # cancellation, or the caller closing this async-for early)
+                # -- abandon the pre-turn task rather than awaiting it:
+                # never block turn teardown on Jev, and never let shadow
+                # cleanup mask, delay, or replace the real exception. No
+                # jev_preturn span is recorded for this turn.
+                cancel_and_forget(_jev_preturn_task)
+                raise
+            else:
+                # Recorded here (still before finish_trace() below) rather
+                # than in the outer try/finally, so the jev_preturn span
+                # lands in the same perf trace as the rest of the turn.
+                await finish_preturn_span(
+                    _jev_preturn_task, _jev_preturn_start,
+                    conversation_id=conversation_id, agent_result=agent_result,
+                )
 
             if agent_result is None:
                 await turn.emit(f"data: {json.dumps({'type': 'error', 'message': 'Agent loop returned no result'})}\n\n")

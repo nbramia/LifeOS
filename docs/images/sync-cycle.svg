@@ -26,24 +26,24 @@
 <rect x="1.5" y="1.5" width="1157" height="1007" rx="22" fill="url(#panelBg)" stroke="url(#panelStroke)" stroke-width="1.5"/><rect x="1.5" y="1.5" width="1157" height="1007" rx="22" fill="url(#vignette)"/><circle cx="580" cy="510" r="430" fill="url(#brainGlow)"/>
 <defs><marker id="r0" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0.5 1 L9 5 L0.5 9 Z" fill="#22d3ee"/></marker><marker id="r1" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0.5 1 L9 5 L0.5 9 Z" fill="#34d399"/></marker><marker id="r2" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0.5 1 L9 5 L0.5 9 Z" fill="#fbbf24"/></marker><marker id="r3" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0.5 1 L9 5 L0.5 9 Z" fill="#a78bfa"/></marker><marker id="r4" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0.5 1 L9 5 L0.5 9 Z" fill="#38bdf8"/></marker><marker id="r5" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0.5 1 L9 5 L0.5 9 Z" fill="#fb7185"/></marker><marker id="r6" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0.5 1 L9 5 L0.5 9 Z" fill="#22d3ee"/></marker></defs>
 <circle cx="580" cy="510" r="372" fill="none" stroke="#38bdf8" stroke-opacity="0.12" stroke-width="1.5" stroke-dasharray="2 10" stroke-linecap="round"/>
-<defs><linearGradient id="sg36" x1="731" y1="170" x2="811" y2="219" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#22d3ee"/><stop offset="1" stop-color="#34d399"/></linearGradient></defs>
+<defs><linearGradient id="sg37" x1="731" y1="170" x2="811" y2="219" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#22d3ee"/><stop offset="1" stop-color="#34d399"/></linearGradient></defs>
 <path d="M 731.3 170.2 A 372 372 0 0 1 811.2 218.6" fill="none" stroke="#22d3ee" stroke-opacity="0.13" stroke-width="7" stroke-linecap="round"/>
-<path d="M 731.3 170.2 A 372 372 0 0 1 811.2 218.6" fill="none" stroke="url(#sg36)" stroke-opacity="0.75" stroke-width="2.4" marker-end="url(#r0)"/>
-<defs><linearGradient id="sg37" x1="913" y1="344" x2="952" y2="522" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#34d399"/><stop offset="1" stop-color="#fbbf24"/></linearGradient></defs>
+<path d="M 731.3 170.2 A 372 372 0 0 1 811.2 218.6" fill="none" stroke="url(#sg37)" stroke-opacity="0.75" stroke-width="2.4" marker-end="url(#r0)"/>
+<defs><linearGradient id="sg38" x1="913" y1="344" x2="952" y2="522" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#34d399"/><stop offset="1" stop-color="#fbbf24"/></linearGradient></defs>
 <path d="M 912.7 343.6 A 372 372 0 0 1 951.8 522.1" fill="none" stroke="#34d399" stroke-opacity="0.13" stroke-width="7" stroke-linecap="round"/>
-<path d="M 912.7 343.6 A 372 372 0 0 1 951.8 522.1" fill="none" stroke="url(#sg37)" stroke-opacity="0.75" stroke-width="2.4" marker-end="url(#r1)"/>
-<defs><linearGradient id="sg38" x1="920" y1="660" x2="832" y2="783" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#fbbf24"/><stop offset="1" stop-color="#a78bfa"/></linearGradient></defs>
+<path d="M 912.7 343.6 A 372 372 0 0 1 951.8 522.1" fill="none" stroke="url(#sg38)" stroke-opacity="0.75" stroke-width="2.4" marker-end="url(#r1)"/>
+<defs><linearGradient id="sg39" x1="920" y1="660" x2="832" y2="783" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#fbbf24"/><stop offset="1" stop-color="#a78bfa"/></linearGradient></defs>
 <path d="M 920.2 660.5 A 372 372 0 0 1 832.3 783.3" fill="none" stroke="#fbbf24" stroke-opacity="0.13" stroke-width="7" stroke-linecap="round"/>
-<path d="M 920.2 660.5 A 372 372 0 0 1 832.3 783.3" fill="none" stroke="url(#sg38)" stroke-opacity="0.75" stroke-width="2.4" marker-end="url(#r2)"/>
-<defs><linearGradient id="sg39" x1="603" y1="881" x2="557" y2="881" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#a78bfa"/><stop offset="1" stop-color="#38bdf8"/></linearGradient></defs>
+<path d="M 920.2 660.5 A 372 372 0 0 1 832.3 783.3" fill="none" stroke="url(#sg39)" stroke-opacity="0.75" stroke-width="2.4" marker-end="url(#r2)"/>
+<defs><linearGradient id="sg40" x1="603" y1="881" x2="557" y2="881" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#a78bfa"/><stop offset="1" stop-color="#38bdf8"/></linearGradient></defs>
 <path d="M 602.7 881.3 A 372 372 0 0 1 557.3 881.3" fill="none" stroke="#a78bfa" stroke-opacity="0.13" stroke-width="7" stroke-linecap="round"/>
-<path d="M 602.7 881.3 A 372 372 0 0 1 557.3 881.3" fill="none" stroke="url(#sg39)" stroke-opacity="0.75" stroke-width="2.4" marker-end="url(#r3)"/>
-<defs><linearGradient id="sg40" x1="328" y1="783" x2="240" y2="660" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#38bdf8"/><stop offset="1" stop-color="#fb7185"/></linearGradient></defs>
+<path d="M 602.7 881.3 A 372 372 0 0 1 557.3 881.3" fill="none" stroke="url(#sg40)" stroke-opacity="0.75" stroke-width="2.4" marker-end="url(#r3)"/>
+<defs><linearGradient id="sg41" x1="328" y1="783" x2="240" y2="660" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#38bdf8"/><stop offset="1" stop-color="#fb7185"/></linearGradient></defs>
 <path d="M 327.7 783.3 A 372 372 0 0 1 239.8 660.5" fill="none" stroke="#38bdf8" stroke-opacity="0.13" stroke-width="7" stroke-linecap="round"/>
-<path d="M 327.7 783.3 A 372 372 0 0 1 239.8 660.5" fill="none" stroke="url(#sg40)" stroke-opacity="0.75" stroke-width="2.4" marker-end="url(#r4)"/>
-<defs><linearGradient id="sg41" x1="208" y1="522" x2="247" y2="344" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#fb7185"/><stop offset="1" stop-color="#22d3ee"/></linearGradient></defs>
+<path d="M 327.7 783.3 A 372 372 0 0 1 239.8 660.5" fill="none" stroke="url(#sg41)" stroke-opacity="0.75" stroke-width="2.4" marker-end="url(#r4)"/>
+<defs><linearGradient id="sg42" x1="208" y1="522" x2="247" y2="344" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#fb7185"/><stop offset="1" stop-color="#22d3ee"/></linearGradient></defs>
 <path d="M 208.2 522.1 A 372 372 0 0 1 247.3 343.6" fill="none" stroke="#fb7185" stroke-opacity="0.13" stroke-width="7" stroke-linecap="round"/>
-<path d="M 208.2 522.1 A 372 372 0 0 1 247.3 343.6" fill="none" stroke="url(#sg41)" stroke-opacity="0.75" stroke-width="2.4" marker-end="url(#r5)"/>
+<path d="M 208.2 522.1 A 372 372 0 0 1 247.3 343.6" fill="none" stroke="url(#sg42)" stroke-opacity="0.75" stroke-width="2.4" marker-end="url(#r5)"/>
 <rect x="463.6" y="106.0" width="232.8" height="64" rx="16" fill="#0e1530" fill-opacity="0.92" stroke="#22d3ee" stroke-opacity="0.6" stroke-width="1.4"/>
 <circle cx="493.6" cy="138.0" r="17" fill="url(#dot-src)"/><circle cx="493.6" cy="138.0" r="14" fill="#0b1024" stroke="#22d3ee" stroke-opacity="0.8" stroke-width="1.4"/>
 <text x="493.6" y="143.0" text-anchor="middle" font-size="15" font-weight="800" fill="#22d3ee">1</text>

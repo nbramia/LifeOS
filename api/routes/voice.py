@@ -64,11 +64,11 @@ class _VoiceTurnPersister:
     proxy — confirmed by reading that adapter, not assumed. So
     ``_HermesTurnPersister`` (hermes_proxy.py) never sees a Hermes voice
     turn at all; the direct Hermes route is the current contract. This proxy
-    (`/api/voice/*`) is the one seam every
-    voice turn passes through regardless of backend or which call path the
-    gateway used internally, since the browser only ever talks to
-    ``/api/voice/turn/stream`` — so it's where a backend-agnostic tee has to
-    live.
+    (`/api/voice/*`) is the one seam every voice turn passes through
+    regardless of backend or which call path the gateway used internally,
+    since the browser only ever talks to ``/api/voice/turn/stream`` — so it's
+    where a backend-agnostic tee lives, rather than at a backend-specific
+    seam.
 
     Double-write guard: a ``lifeos``-backend turn IS already persisted, by
     the native orchestrator — the gateway's lifeos adapter
@@ -85,8 +85,8 @@ class _VoiceTurnPersister:
     Persistence trigger: the terminal ``done`` event's ``data``, the turn
     contract's one **authoritative** field (client-surfaces.md, "Voice turn
     contract"). A turn that errors, is cancelled, or whose upstream
-    connection ends before ``done`` arrives — including a future bare-
-    transcribe/wake-check call that never reaches a real answer —
+    connection ends before ``done`` arrives — including a bare-
+    transcribe/wake-check call, which never reaches a real answer —
     never has a ``done`` event observed, so ``finalize()`` writes nothing:
     no junk conversation for a turn that produced no real response.
 

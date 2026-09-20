@@ -1,5 +1,8 @@
 {
   "docs/guides/agent-worker-setup.md": [
     "wraps all of these and is faster than going through cloud-hosted"
+  ],
+  "docs/AGENTS.md": [
+    "> **Backlog lives in GitHub issues.** Future work, deferred features, bugs, and enhancements are tracked as GitHub issues — never as `backlog.md` files in this directory. Plan files are reserved for time-bounded execution notes (migration plans, gap analyses, point-in-time issue-drafting context)."
   ]
 }

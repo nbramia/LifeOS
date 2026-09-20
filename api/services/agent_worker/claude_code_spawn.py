@@ -39,7 +39,19 @@ _PLAN_MODE_KEYWORDS = (
 
 
 def should_use_plan_mode(task: str) -> bool:
-    """Conservative heuristic: plan mode only for complex-sounding tasks."""
+    """Plan mode when the Jev fan-out judgment (`jev_task_routing.
+    judge_task`) rates the task at least moderately difficult with
+    confidence >= 0.6 (`score >= 2.5` on its 5-level scale). Falls back to
+    the conservative keyword heuristic when Jev isn't configured, the call
+    fails, or confidence is too low."""
+    from api.services.jev_task_routing import judge_task
+
+    judgment = judge_task(task)
+    if judgment is not None and judgment.difficulty is not None:
+        difficulty = judgment.difficulty
+        if difficulty.confidence >= 0.6 and difficulty.score is not None:
+            return difficulty.score >= 2.5
+
     t = (task or "").lower()
     return any(kw in t for kw in _PLAN_MODE_KEYWORDS)
 

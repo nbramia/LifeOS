@@ -2,9 +2,9 @@
 
 > **Audience:** Any agent (or human) editing the architecture figures in the top-level README.
 > **Status:** Complete
-> **Last Updated:** 2026-07-10
+> **Last Updated:** 2026-09-20
 
-This directory holds the four architecture diagrams embedded in [`README.md`](../../README.md)
+This directory holds the five architecture diagrams embedded in [`README.md`](../../README.md)
 and the script that generates them. Everything below is what was learned building them — read
 it before touching a diagram so you don't relearn the gotchas the hard way.
 
@@ -12,17 +12,18 @@ it before touching a diagram so you don't relearn the gotchas the hard way.
 
 | File | What it is |
 |------|-----------|
-| `generate_diagrams.py` | **Source of truth.** Emits all four SVGs. Pure stdlib, no deps. |
+| `generate_diagrams.py` | **Source of truth.** Emits all five SVGs. Pure stdlib, no deps. |
 | `architecture.svg` | System map: sources → local core → orchestrator → surfaces + autonomous. |
 | `query-pipeline.svg` | One query's path: input surfaces, intra-query tool loop, model handoff, output. |
 | `sync-cycle.svg` | The nightly 7-phase sync as a circular cycle. |
 | `services.svg` | Service resilience tiers (critical / graceful / external) by failure impact. |
+| `agent-lifecycle.svg` | A board card handed to a coding agent: worktree/branch provisioning, the CLI session, commit/push/PR, the Review and Human-queue lanes, and worktree cleanup. |
 | `*.png` | Screenshots for the README's CRM section — unrelated to the generator. |
 
 ## Regenerating
 
 ```bash
-python3 docs/images/generate_diagrams.py   # rewrites the four .svg files in place
+python3 docs/images/generate_diagrams.py   # rewrites the five .svg files in place
 ```
 
 **Always edit the script, never the SVGs by hand.** The SVGs are build output. Tweak a
@@ -59,7 +60,7 @@ yourself. That trade was worth it here; it won't be for a throwaway flowchart.
 
 ## The design system
 
-One palette and one set of primitives across all four figures so they read as a set. All in
+One palette and one set of primitives across all five figures so they read as a set. All in
 `generate_diagrams.py`:
 
 - **Zones/hues** (`ZONES`): cyan=sources, emerald=core/index/local/tools, amber=orchestrator/
@@ -127,6 +128,6 @@ cycle's angle = time/order). Otherwise use bands/columns.
 
 ## Related Documents
 
-- [`README.md`](../../README.md) — where these four figures are embedded.
+- [`README.md`](../../README.md) — where these five figures are embedded.
 - [`docs/AGENTS.md`](../AGENTS.md) — documentation standards for the repo.
 - [`AGENTS.md`](../../AGENTS.md) — top-level project reference (what the diagrams depict).

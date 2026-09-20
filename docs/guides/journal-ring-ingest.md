@@ -9,10 +9,10 @@ ring, which transcribes speech on-phone and can "route… transcribed text
 directly to your own app via webhook" — feed fragments into the
 [`journal` persona](../../config/personas/journal.md) from outside the tailnet.
 
-**This is our own contract, not the ring's.** The Pebble Index ships March
-2026; its real webhook payload shape is unknown until then. This endpoint
-defines the shape we control and documents it so a device (or a `curl` test)
-can be configured against it now. If a real device's webhook doesn't match,
+**This is our own contract, not the ring's.** The Pebble Index's real webhook
+payload shape isn't documented, so this endpoint defines the shape it
+controls and this guide documents it, so a device (or a `curl` test) can be
+configured against it. If a real device's webhook doesn't match,
 only `_adapt_payload()` in [`api/routes/journal_ingest.py`](../../api/routes/journal_ingest.py)
 needs to change — everything else (auth, idempotency, the capture call) is
 independent of the payload's exact field names.
@@ -148,4 +148,5 @@ Check `LifeOS/Log/Journal/<today>.md` in the vault for the new bullet.
 - [Configuration](configuration.md#journal-ring-ingest) — `LIFEOS_JOURNAL_INGEST_TOKEN` reference.
 - [`api/routes/journal_ingest.py`](../../api/routes/journal_ingest.py) — Implementation; `_adapt_payload()` is the one function to change once a real device's webhook is observed.
 - [`api/services/journal_capture.py`](../../api/services/journal_capture.py) — The deterministic write this endpoint's capture confirmation comes from.
+- [Pebble Capture](pebble-capture.md) — The file-watcher capture path and filing controls; this guide covers the webhook endpoint a ring device posts to.
 - [Apple Health Import](apple-health.md) — The precedent this mirrors: a dedicated bearer-token ingest endpoint for an external capture device.

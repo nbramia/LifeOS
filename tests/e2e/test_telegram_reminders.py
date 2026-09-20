@@ -83,6 +83,34 @@ class TestTimezoneHandling:
             assert result.date() == now.date()  # Same day
             assert result.hour >= 19  # Evening hours
 
+    @pytest.mark.parametrize(
+        ("expression", "expected_date", "expected_hour", "expected_minute"),
+        [
+            # An explicit clock time combined with a day word must win over
+            # that day's implicit default hour, not the other way around.
+            ("Remind me tomorrow at 3 PM about the parcel", (2030, 1, 2), 15, 0),
+            ("Remind me at 4 PM tomorrow to take out the bins.", (2030, 1, 2), 16, 0),
+            ("next Tuesday at noon", (2030, 1, 8), 12, 0),
+            ("at 4 PM tomorrow", (2030, 1, 2), 16, 0),
+            # No explicit time: the day word's own default hour is unchanged.
+            ("tomorrow morning", (2030, 1, 2), 9, 0),
+        ],
+    )
+    def test_explicit_clock_time_wins_over_a_day_words_default_hour(
+        self, expression, expected_date, expected_hour, expected_minute
+    ):
+        from api.services.time_parser import parse_contextual_time
+
+        eastern = ZoneInfo("America/New_York")
+        now = datetime(2030, 1, 1, 10, 0, 0, tzinfo=eastern)  # Tuesday
+
+        result = parse_contextual_time(expression, now)
+
+        assert result is not None
+        assert (result.year, result.month, result.day) == expected_date
+        assert result.hour == expected_hour
+        assert result.minute == expected_minute
+
     def test_cron_expression_for_daily(self):
         """Test cron expression generation for daily reminders."""
         # 6pm daily = 0 18 * * *
