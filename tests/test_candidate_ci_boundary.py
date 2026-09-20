@@ -94,6 +94,7 @@ def test_partitioned_execution_derives_its_part_count_from_the_matrix():
     assert "if: ${{ always() }}" in receipts
     assert "lane-receipts-${{ env.CANDIDATE_SHA }}-part${{ matrix.part }}" in receipts
     assert "lifeos-lane-logs/*.json" in receipts
+    assert "retention-days: 30" in receipts
     lane_logs = workflow[workflow.index("name: Retain the lane log from a failed verification"):]
     lane_logs = lane_logs[:lane_logs.index("name: Retain the lane-execution receipts")]
     assert "if: ${{ failure() }}" in lane_logs
