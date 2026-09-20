@@ -650,6 +650,12 @@ class ProjectTaskService:
                 task, source, operation_id, task.fields.get(HANDOFF_REQUEST_HASH_FIELD) or "",
                 expected_attempt=source_attempt_id, expected_turn=source_turn_id,
             )
+            if self.session_store.is_cancelled(
+                task.id, source_attempt_id, source_turn_id,
+            ):
+                raise ProjectHandoffError(
+                    "cancelled", "source turn cancellation owns this transition",
+                )
             if task.fields.get(CANCEL_OPERATION_FIELD):
                 raise ProjectHandoffError("cancelled", "project cancellation owns this transition")
             request_event = self._handoff_request_event(source_session_id, operation_id)

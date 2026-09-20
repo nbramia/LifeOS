@@ -204,6 +204,34 @@ class TestGetBoard:
         assert card["session"] is None
         assert card["pending_question"] is None
 
+    def test_pending_handoff_card_policy_refuses_ordinary_cancel(self, client, stores):
+        """A pending handoff keeps its scoped cancellation action, not the
+        ordinary card Cancel route that refuses it before teardown."""
+        task_manager, *_ = stores
+        task = task_manager.create("Interrupted synthetic handoff", tags=["codex", "agent-running"])
+        task_manager.update(
+            task.id,
+            fields={"project_handoff_operation_id": "synthetic-handoff"},
+            _project_action=True,
+        )
+
+        board = client.get("/api/agents/board").json()
+        card = next(
+            card
+            for cards in board["lanes"].values()
+            for card in cards
+            if card["id"] == task.id
+        )
+        assert card["is_project"] is False
+        assert card["policy"]["cancel"] == {
+            "allowed": False,
+            "reason": "pending handoffs use the Cancel handoff action",
+        }
+        assert card["policy"]["can_cancel_project"] is True
+        refusal = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert refusal.status_code == 409
+        assert refusal.json()["detail"] == card["policy"]["cancel"]["reason"]
+
     def test_agent_blocked_card_carries_pending_question(self, client, stores):
         task_manager, _sched, session_store, _transcript = stores
         task = task_manager.create("Investigate the outage", tags=["agent-blocked"], status="blocked")

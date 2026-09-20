@@ -130,7 +130,9 @@ is verified stopped. The existing project cancellation operation remains the
 operator escape hatch, and reports pending rather than success until scoped
 teardown is verified. Exact-turn executor return or a positive Managed terminal
 state can satisfy that proof; a terminal row, best-effort CLI stop, or missing
-Managed driver cannot. A returned turn after cancellation retains only its stop
+Managed driver cannot. Hermes additionally requires a positive upstream `done`
+event; a disconnect, deadline, or local cancellation marker is not stop proof.
+A returned turn after cancellation retains only valid route-specific stop
 proof, never activates staged work. This applies even before a staged request
 has created a child, when the source remains an ordinary task.
 

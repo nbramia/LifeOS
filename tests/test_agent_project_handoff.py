@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +19,8 @@ from api.services.agent_worker.execution import (
     ExecutionConstraints,
     ExecutionSpec,
 )
+from api.services.agent_worker.executor_lifecycle import normalize_outcome
+from api.services.agent_worker.hermes_executor import HermesExecutor
 from api.services.agent_worker.inter_agent import (
     Caps,
     InterAgentContext,
@@ -352,6 +356,54 @@ def test_existing_project_uses_plan_and_cannot_handoff(handoff):
     assert result["error"] == "already_project"
 
 
+def test_local_operator_kill_return_reconciliation_keeps_handoff_fenced(
+    handoff, tmp_path: Path,
+):
+    """A direct local Kill cannot be converted into child-release proof."""
+    manager, store, transcripts, source, ctx = handoff
+    staged = dispatch(ctx, "lifeos_agent_project_handoff", _request())
+    teardown_session(
+        store,
+        transcripts,
+        source,
+        transcript_kind="operator_killed",
+        transcript_payload={"reason": "synthetic operator stop"},
+        managed_driver=None,
+    )
+    service = ProjectTaskService(manager, store, transcripts)
+    worker, finalizers = _handoff_worker(
+        tmp_path, manager, store, transcripts, service,
+    )
+    worker._handle_outcome(
+        store.get(source.task_id),
+        _task_payload(manager, source.task_id),
+        ExecutorOutcome(
+            status=STATUS_COMPLETED,
+            session_id=source.session_id,
+            attempt_id=source.attempt_id,
+            turn_id=source.turn_id,
+            executor="local",
+        ),
+    )
+
+    assert finalizers == []
+    assert store.get(source.task_id).status == STATUS_FAILED
+    assert any(
+        event["kind"] == HANDOFF_QUIESCENT_EVENT
+        and event["payload"].get("operation_id") == staged["operation_id"]
+        for event in transcripts.read(source.session_id)
+    )
+    assert worker._reconcile_project_handoffs() == 0
+    assert len(finalizers) == 1
+    assert manager.get(source.task_id).fields[HANDOFF_OPERATION_FIELD] == (
+        staged["operation_id"]
+    )
+    assert all(
+        not manager.can_start_execution(child.id)
+        for child in build_task_hierarchy(manager.list_tasks()).children(source.task_id)
+    )
+
+
 @pytest.mark.asyncio
 async def test_cancellation_wins_then_returned_turn_releases_no_staged_work(
     handoff, tmp_path: Path,
@@ -431,6 +483,15 @@ async def test_cancellation_wins_then_returned_turn_releases_no_staged_work(
         not manager.can_start_execution(child.id)
         for child in build_task_hierarchy(manager.list_tasks()).children(source.task_id)
     )
+    assert worker._reconcile_project_handoffs() == 0
+    assert len(finalizers) == 1
+    assert store.get(source.task_id).status == STATUS_FAILED
+    pending_parent = manager.get(source.task_id)
+    assert pending_parent.fields[HANDOFF_OPERATION_FIELD] == staged["operation_id"]
+    assert all(
+        not manager.can_start_execution(child.id)
+        for child in build_task_hierarchy(manager.list_tasks()).children(source.task_id)
+    )
 
     result = await service.cancel_project(
         source.task_id, operation_id="cancel-synthetic-v1",
@@ -443,6 +504,73 @@ async def test_cancellation_wins_then_returned_turn_releases_no_staged_work(
     assert all(
         child.status == "cancelled"
         for child in build_task_hierarchy(manager.list_tasks()).children(parent.id)
+    )
+
+
+def test_exact_cancellation_guard_blocks_handoff_before_terminal_status(
+    handoff, tmp_path: Path, monkeypatch,
+):
+    """The durable turn fence is authoritative before status terminalization."""
+    manager, store, transcripts, source, ctx = handoff
+    staged = dispatch(ctx, "lifeos_agent_project_handoff", _request())
+    with store._connect() as conn:
+        conn.execute(
+            "INSERT INTO cancellation_guards "
+            "(session_id, task_id, attempt_id, turn_id, reason, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                source.session_id,
+                source.task_id,
+                source.attempt_id,
+                source.turn_id,
+                "synthetic pre-terminal cancellation",
+                int(datetime.now(timezone.utc).timestamp()),
+            ),
+        )
+    assert store.get(source.task_id).status == STATUS_RUNNING
+    assert store.is_cancelled(source.task_id, source.attempt_id, source.turn_id)
+
+    update_status = store.update_status
+
+    def forbid_source_completion(task_id, status, **kwargs):
+        if task_id == source.task_id and status == STATUS_COMPLETED:
+            raise AssertionError("cancelled source completion was attempted")
+        return update_status(task_id, status, **kwargs)
+
+    monkeypatch.setattr(store, "update_status", forbid_source_completion)
+    service = ProjectTaskService(manager, store, transcripts)
+    worker, finalizers = _handoff_worker(
+        tmp_path, manager, store, transcripts, service,
+    )
+    worker._handle_outcome(
+        store.get(source.task_id),
+        _task_payload(manager, source.task_id),
+        ExecutorOutcome(
+            status=STATUS_COMPLETED,
+            session_id=source.session_id,
+            attempt_id=source.attempt_id,
+            turn_id=source.turn_id,
+            executor="local",
+        ),
+    )
+
+    assert finalizers == []
+    assert store.get(source.task_id).status == STATUS_RUNNING
+    assert manager.get(source.task_id).fields[HANDOFF_OPERATION_FIELD] == (
+        staged["operation_id"]
+    )
+    with pytest.raises(ProjectHandoffError) as exc_info:
+        service.finalize_handoff(
+            source.task_id,
+            operation_id=staged["operation_id"],
+            source_session_id=source.session_id,
+            source_attempt_id=source.attempt_id,
+            source_turn_id=source.turn_id,
+        )
+    assert exc_info.value.code == "cancelled"
+    assert all(
+        not manager.can_start_execution(child.id)
+        for child in build_task_hierarchy(manager.list_tasks()).children(source.task_id)
     )
 
 
@@ -837,6 +965,214 @@ def test_board_cancel_refuses_zero_child_handoff_before_teardown(handoff, monkey
     assert parent.fields[HANDOFF_OPERATION_FIELD] == _request()["operation_id"]
 
 
+class _HandoffHermesStream:
+    """Synthetic upstream whose terminal evidence is controlled by the test."""
+
+    def __init__(self, mode: str):
+        self.mode = mode
+        self.opened = threading.Event()
+        self.released = threading.Event()
+        self.closed = threading.Event()
+        self.upstream_finished = False
+
+    def raise_for_status(self):
+        return None
+
+    def iter_bytes(self):
+        yield b'data: {"type":"conversation_id","conversation_id":"conv-synthetic"}\n\n'
+        self.opened.set()
+        if self.mode == "deadline":
+            while not self.closed.is_set():
+                time.sleep(0.005)
+                yield b""
+            return
+        assert self.released.wait(5), "synthetic Hermes stream was never released"
+        if self.mode == "done":
+            self.upstream_finished = True
+            yield b'data: {"type":"content","content":"handoff complete"}\n\n'
+            yield b'data: {"type":"done"}\n\n'
+            return
+        raise httpx.ReadError("synthetic upstream connection dropped")
+
+
+class _HandoffHermesClient:
+    def __init__(self, stream: _HandoffHermesStream):
+        self.stream_response = stream
+
+    def stream(self, *_args, **_kwargs):
+        return self
+
+    def __enter__(self):
+        return self.stream_response
+
+    def __exit__(self, *_args):
+        return False
+
+    def close(self):
+        self.stream_response.closed.set()
+        self.stream_response.released.set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("termination", ["cancelled", "disconnect", "deadline", "done"])
+async def test_hermes_handoff_requires_positive_done_evidence(
+    tmp_path: Path, monkeypatch, termination: str,
+):
+    """Only a real Hermes done event proves that the upstream turn stopped."""
+    from api.routes import hermes_proxy
+    from api.services.conversation_store import ConversationStore
+    from api.services.usage_store import UsageStore
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "hermes_backend_url", "http://hermes.example")
+    monkeypatch.setattr(settings, "hermes_backend_token", "synthetic-backend-token")
+    monkeypatch.setattr(settings, "mcp_bearer_token", "synthetic-turn-secret")
+    monkeypatch.setattr(settings, "claude_timeout_seconds", 3600)
+    conversations = ConversationStore(db_path=str(tmp_path / "conversations.db"))
+    usage = UsageStore(db_path=str(tmp_path / "usage.db"))
+    monkeypatch.setattr(hermes_proxy, "get_store", lambda: conversations)
+    monkeypatch.setattr(hermes_proxy, "get_usage_store", lambda: usage)
+    monkeypatch.setattr(hermes_proxy, "schedule_retitle", lambda _conversation_id: None)
+
+    store = SessionStore(tmp_path / "hermes-sessions.db")
+    transcripts = TranscriptStore(tmp_path / "hermes-transcripts")
+    manager = TaskManager(
+        vault_path=tmp_path / "hermes-vault",
+        index_path=tmp_path / "hermes-index" / "tasks.json",
+        live_session_checker=lambda *_args: False,
+    )
+    parent = manager.create(
+        "Coordinate the synthetic Hermes launch",
+        status="in_progress",
+        tags=["hermes", "agent-running"],
+    )
+    source = store.create(
+        parent.id,
+        status=STATUS_CLAIMED,
+        routing="hermes",
+        budget={"wall_seconds": 0.3} if termination == "deadline" else None,
+        execution_spec=_spec("hermes"),
+    )
+    upstream = _HandoffHermesStream(
+        "done" if termination == "done" else termination,
+    )
+    executor = HermesExecutor(
+        session_store=store,
+        transcript_store=transcripts,
+        http_client_factory=lambda: _HandoffHermesClient(upstream),
+    )
+    outcomes: list[ExecutorOutcome] = []
+    executor_thread = threading.Thread(
+        target=lambda: outcomes.append(
+            executor.execute(
+                source,
+                {"description": "Coordinate synthetic Hermes work"},
+            )
+        ),
+        daemon=True,
+    )
+    executor_thread.start()
+    assert upstream.opened.wait(5)
+    running = store.get(parent.id)
+    assert running.routing == "hermes"
+    assert running.status == STATUS_RUNNING
+    context = InterAgentContext(
+        store,
+        transcripts,
+        running.session_id,
+        Caps(),
+        caller_attempt_id=running.attempt_id,
+        caller_turn_id=running.turn_id,
+        task_manager=manager,
+    )
+    staged = dispatch(context, "lifeos_agent_project_handoff", _request())
+    assert staged["ok"] is True
+
+    def stop_session(session):
+        result = teardown_session(
+            store,
+            transcripts,
+            session,
+            transcript_kind="operator_killed",
+            transcript_payload={"reason": "synthetic project cancellation"},
+            managed_driver=None,
+        )
+        failures = []
+        if result["managed_failure"]:
+            failures.append({
+                "session_id": session.session_id,
+                "reason": result["managed_failure"],
+            })
+        return [session.session_id], failures
+
+    service = ProjectTaskService(
+        manager, store, transcripts, session_teardown=stop_session,
+    )
+    cancel_operation = "cancel-hermes-synthetic"
+    if termination == "cancelled":
+        pending = await service.cancel_project(
+            parent.id, operation_id=cancel_operation,
+        )
+        assert pending["pending"] is True
+        assert pending["failures"]
+    elif termination != "deadline":
+        upstream.released.set()
+
+    executor_thread.join(5)
+    assert outcomes, "Hermes executor did not return"
+    outcome = outcomes[0]
+    assert outcome.executor == "hermes"
+    assert outcome.termination_evidence.get("done_seen") is (termination == "done")
+    worker, finalizers = _handoff_worker(
+        tmp_path, manager, store, transcripts, service,
+    )
+    refreshed = store.get(parent.id)
+    worker._handle_outcome(
+        refreshed,
+        _task_payload(manager, parent.id),
+        normalize_outcome(
+            outcome,
+            refreshed,
+            route="hermes",
+            transcript_store=transcripts,
+        ),
+    )
+    proof = [
+        event
+        for event in transcripts.read(running.session_id)
+        if event["kind"] == HANDOFF_QUIESCENT_EVENT
+        and event["payload"].get("operation_id") == staged["operation_id"]
+    ]
+
+    if termination == "done":
+        assert upstream.upstream_finished is True
+        assert len(proof) == 1
+        assert len(finalizers) == 1
+        assert HANDOFF_OPERATION_FIELD not in manager.get(parent.id).fields
+        assert all(
+            manager.can_start_execution(child.id)
+            for child in build_task_hierarchy(manager.list_tasks()).children(parent.id)
+        )
+        return
+
+    assert upstream.upstream_finished is False
+    assert proof == []
+    assert finalizers == []
+    assert worker._reconcile_project_handoffs() == 0
+    assert len(finalizers) == 1
+    fenced = manager.get(parent.id)
+    assert fenced.fields[HANDOFF_OPERATION_FIELD] == staged["operation_id"]
+    assert all(
+        not manager.can_start_execution(child.id)
+        for child in build_task_hierarchy(manager.list_tasks()).children(parent.id)
+    )
+    pending = await service.cancel_project(
+        parent.id, operation_id=cancel_operation,
+    )
+    assert pending["pending"] is True
+    assert pending["failures"]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("source_state", ["terminal", "absent"])
 async def test_cancel_does_not_treat_terminal_or_absent_source_as_stop_proof(
@@ -877,13 +1213,14 @@ async def test_cancel_does_not_treat_terminal_or_absent_source_as_stop_proof(
 
 
 @pytest.mark.parametrize(
-    "operator_first,remote_status,identity_matches,expected_complete",
+    "operator_first,remote_status,identity_mutation,expected_complete",
     [
-        (True, "cancelled", True, True),
-        (False, "cancelled", True, True),
-        (False, "running", True, False),
-        (False, None, True, False),
-        (False, "cancelled", False, False),
+        (True, "cancelled", None, True),
+        (False, "cancelled", None, True),
+        (False, "running", None, False),
+        (False, None, None, False),
+        (False, "cancelled", "attempt", False),
+        (False, "cancelled", "turn", False),
     ],
 )
 def test_stop_and_cancel_entrypoints_only_accept_positive_managed_proof(
@@ -891,7 +1228,7 @@ def test_stop_and_cancel_entrypoints_only_accept_positive_managed_proof(
     monkeypatch,
     operator_first: bool,
     remote_status: str | None,
-    identity_matches: bool,
+    identity_mutation: str | None,
     expected_complete: bool,
 ):
     """Real stop/cancel routes accept only an exact positive Managed probe."""
@@ -925,10 +1262,16 @@ def test_stop_and_cancel_entrypoints_only_accept_positive_managed_proof(
         operation_id="managed-kill-handoff",
         children=_request()["children"],
     )
-    if not identity_matches:
+    if identity_mutation == "attempt":
         manager.update(
             parent.id,
             fields={HANDOFF_SOURCE_ATTEMPT_FIELD: "attempt-newer-synthetic"},
+            _project_operation="handoff-stage",
+        )
+    elif identity_mutation == "turn":
+        manager.update(
+            parent.id,
+            fields={HANDOFF_SOURCE_TURN_FIELD: "turn-newer-synthetic"},
             _project_operation="handoff-stage",
         )
     driver = _ManagedRecoveryDriver(remote_status) if remote_status is not None else None
@@ -953,6 +1296,23 @@ def test_stop_and_cancel_entrypoints_only_accept_positive_managed_proof(
                 "session_id": source.session_id,
                 "reason": "managed runtime still reports running",
             }]
+        if remote_status == "cancelled" and identity_mutation is None:
+            worker, finalizers = _handoff_worker(
+                tmp_path,
+                manager,
+                store,
+                transcripts,
+                ProjectTaskService(manager, store, transcripts),
+            )
+            assert worker._reconcile_project_handoffs() == 0
+            assert len(finalizers) == 1
+            assert manager.get(parent.id).fields[HANDOFF_OPERATION_FIELD] == (
+                staged["operation_id"]
+            )
+            assert all(
+                not manager.can_start_execution(child.id)
+                for child in build_task_hierarchy(manager.list_tasks()).children(parent.id)
+            )
     cancel_response = client.post(
         f"/api/tasks/{parent.id}/project/cancel",
         json={"confirm": True, "operation_id": "cancel-after-managed-stop"},

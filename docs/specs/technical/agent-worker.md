@@ -608,13 +608,15 @@ request are independent: omitted values are not copied from the source, and
 metered targets must already be in that source turn's permitted provider scope.
 
 The executor observes a successful handoff as a terminal action for its turn.
-Only after the executor return boundary is recorded as a matching quiescence
-event can the worker terminalize that source session without projecting normal
-task completion, clear the handoff fence, and release the coordinator. A
-missing proof, failed finalization, or cancellation race keeps work pending
-and non-runnable. Reconciliation runs before ordinary lifecycle drift repair;
-there is no atomic transaction spanning Markdown, SQLite, and an external
-executor.
+Only after the executor return boundary carries the route's required stop
+evidence and is recorded as a matching quiescence event can the worker
+terminalize that source session without projecting normal task completion,
+clear the handoff fence, and release the coordinator. Hermes requires its
+positive upstream `done` event; a client disconnect or deadline is not upstream
+stop proof. A missing proof, failed finalization, or cancellation race keeps
+work pending and non-runnable. Reconciliation runs before ordinary lifecycle
+drift repair; there is no atomic transaction spanning Markdown, SQLite, and an
+external executor.
 
 ## Inter-agent coordination
 
@@ -763,17 +765,20 @@ served-model provenance remains owned by the usage ledger.
 Project-handoff recovery preserves the source turn fence across process
 restarts. Reconciliation can activate staged children and the bounded
 coordinator only after it verifies the persisted source session, attempt, and
-turn have quiesced. The worker records an exact-turn executor return before its
-cancellation guard; when cancellation already owns that turn, it retains the
-quiescence event but skips source completion, finalization, and child release.
-Operator teardown can record the same evidence only when the existing Managed
-post-kill state probe reports a terminal provider state and the persisted
-session, attempt, and turn still match. A terminal or absent local row,
-best-effort CLI stop, missing Managed driver, or registry cancellation alone is
-not proof. These unknown stops remain pending with an explicit failure, so the
-same scoped cancellation can be retried after evidence arrives. This applies to
-an interrupted stage before any child exists as well as to an already-derived
-project.
+turn have quiesced and the exact source turn is not cancelled. The worker
+records an exact-turn executor return before its cancellation guard; when
+cancellation already owns a local or Managed turn, it retains the quiescence
+event but skips source completion, finalization, and child release. A Hermes
+return records quiescence only with a positive upstream `done` event, including
+after cancellation; a disconnect, deadline, or local cancellation marker alone
+does not prove the upstream turn stopped. Operator teardown can record the same
+evidence only when the existing Managed post-kill state probe reports a terminal
+provider state and the persisted session, attempt, and turn still match. A
+terminal or absent local row, best-effort CLI stop, missing Managed driver, or
+registry cancellation alone is not proof. These unknown stops remain pending
+with an explicit failure, so the same scoped cancellation can be retried after
+evidence arrives. This applies to an interrupted stage before any child exists
+as well as to an already-derived project.
 
 `SessionStore` persists an immutable `attempt_id` and attempt number for each
 deliberate execution, plus a new immutable `turn_id` for every executor start

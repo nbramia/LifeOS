@@ -3167,7 +3167,7 @@ export function initBoard() {
         backdrop.innerHTML = `<div class="modal" role="dialog" aria-label="Cancel ${subject}">
           <h2>Cancel ${subject}?</h2>
           <p>${escapeHtml(cancellationSummary)}</p>
-          <p>Completed children and their history stay intact. Pending-review output is preserved but is not accepted.</p>
+          ${isProject ? '<p>Completed children and their history stay intact. Pending-review output is preserved but is not accepted.</p>' : ''}
           <div class="actions"><button type="button" data-action="cancel">Keep ${subject}</button><button type="button" class="danger" data-action="confirm">Cancel ${subject}</button></div>
         </div>`;
         document.body.appendChild(backdrop);

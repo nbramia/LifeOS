@@ -1078,10 +1078,16 @@ def _card_policy(
         execution_paused=field_truthy(task.fields.get(EXECUTION_PAUSED_FIELD)),
         handoff_pending=bool(task.fields.get(HANDOFF_OPERATION_FIELD)),
     )
+    cancel = _outcome("cancel")
+    if task.fields.get(HANDOFF_OPERATION_FIELD):
+        cancel = {
+            "allowed": False,
+            "reason": "pending handoffs use the Cancel handoff action",
+        }
     return {
         "claimed": agent_board.is_claimed(task.status, task.tags, has_live),
         "agent_owned": agent_board.is_agent_owned(task.tags),
-        "cancel": _outcome("cancel"),
+        "cancel": cancel,
         "assignee": _outcome("assignee_change"),
         "fields": _outcome("field_edit"),
         "lanes": lanes_refused,

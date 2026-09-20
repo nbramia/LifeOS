@@ -6357,6 +6357,12 @@ class Worker:
             or fields.get(HANDOFF_SOURCE_TURN_FIELD) != turn_id
         ):
             return True
+        if (
+            session.routing == ROUTE_HERMES
+            and (getattr(outcome, "termination_evidence", {}) or {}).get("done_seen")
+            is not True
+        ):
+            return True
         if not any(
             event.get("kind") == HANDOFF_QUIESCENT_EVENT
             and (event.get("payload") or {}).get("operation_id") == operation_id
@@ -6371,8 +6377,8 @@ class Worker:
                 "turn_id": turn_id,
                 "executor": getattr(outcome, "executor", None) or session.routing,
             })
-        # The executor has genuinely returned from this exact turn, so retain
-        # that stop evidence even when cancellation won the race.  The guard
+        # The exact turn has returned with the route's required stop evidence,
+        # so retain that proof even when cancellation won the race. The guard
         # still prevents source completion, finalization, and child release.
         if self.session_store.is_cancelled(session.task_id, attempt_id, turn_id):
             return True

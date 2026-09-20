@@ -39,6 +39,7 @@ def agents_base_url():
 def _policy():
     return {
         "assignee": {"allowed": True, "reason": None},
+        "cancel": {"allowed": True, "reason": None},
         "fields": {"allowed": True, "reason": None}, "lanes": {},
         "can_start_project": True, "can_plan_project": True,
         "can_complete_project": True, "can_cancel_project": True,
@@ -191,6 +192,9 @@ def test_project_actions_and_relationship_mutations(page: Page, agents_base_url)
     page.locator('[data-action="project-complete"]').click()
     page.locator('[data-action="project-cancel"]').click()
     expect(page.locator('.modal')).to_contain_text("3 unfinished children")
+    expect(page.locator('.modal')).to_contain_text(
+        "Completed children and their history stay intact. Pending-review output is preserved but is not accepted."
+    )
     page.locator('.modal [data-action="confirm"]').click()
     page.locator('[data-action="project-add-child"]').click()
     page.locator('.modal [data-field="project-prompt"]').fill("New synthetic child")
@@ -341,6 +345,13 @@ def test_zero_child_pending_handoff_uses_existing_cancellation_route(page: Page,
     pending = _card(
         "pending-handoff-1", "Interrupted synthetic handoff",
         fields={"execution_paused": "true", "project_handoff_operation_id": "synthetic-handoff"},
+        policy={
+            **_policy(),
+            "cancel": {
+                "allowed": False,
+                "reason": "pending handoffs use the Cancel handoff action",
+            },
+        },
     )
     state["lanes"]["in_progress"].append(pending)
     _open(page, agents_base_url, state, seen)
@@ -351,6 +362,7 @@ def test_zero_child_pending_handoff_uses_existing_cancellation_route(page: Page,
     )
     expect(page.locator('[data-action="resume-execution"]')).to_have_count(0)
     expect(page.locator('[data-action="project-cancel"]')).to_have_text("Cancel handoff")
+    expect(page.locator('#board-drawer [data-field="actions"] [data-action="cancel"]')).to_have_count(0)
 
     with page.expect_request(lambda request: (
         request.method == "POST"
@@ -363,6 +375,9 @@ def test_zero_child_pending_handoff_uses_existing_cancellation_route(page: Page,
     expect(page.locator('.modal h2')).to_have_text("Cancel task?")
     expect(page.locator('.modal')).to_contain_text(
         "This will cancel the whole task and abandon the pending handoff."
+    )
+    expect(page.locator('.modal')).not_to_contain_text(
+        "Completed children and their history stay intact. Pending-review output is preserved but is not accepted."
     )
     expect(page.locator('.modal [data-action="cancel"]')).to_have_text("Keep task")
     expect(page.locator('.modal [data-action="confirm"]')).to_have_text("Cancel task")
