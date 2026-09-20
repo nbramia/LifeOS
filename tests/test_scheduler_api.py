@@ -77,6 +77,17 @@ class TestSchedulerAPI:
             "host": "server", "working_dir": "/tmp/synthetic",
         }
 
+    def test_create_propagates_budget_dollars_and_wall_seconds(self, client, mock_store):
+        response = client.post("/api/scheduler", json={
+            "name": "Pinned", "schedule_type": "cron", "schedule_value": "0 9 * * *",
+            "action": "agent", "message_content": "Draft the pinned update",
+            "budget_dollars": 2.0, "wall_seconds": 1800,
+        })
+        assert response.status_code == 200
+        kwargs = mock_store.create.call_args.kwargs
+        assert kwargs["budget_dollars"] == 2.0
+        assert kwargs["wall_seconds"] == 1800
+
     def test_create_defaults_action_from_message_type(self, client, mock_store):
         client.post("/api/scheduler", json={
             "name": "Ping", "schedule_type": "cron", "schedule_value": "0 9 * * *",
@@ -490,6 +501,117 @@ class TestActionInputValidation:
         resp = client.put("/api/scheduler/sch-1", json={"endpoint_config": {"method": "GET", "endpoint": "/api/tasks", "params": {"status": "todo"}}})
         assert resp.status_code == 200
         assert mock_store.update.call_args.kwargs["endpoint_config"]["params"] == {"status": "todo"}
+
+
+class TestScheduleBudgetValidation:
+    """`budget_dollars`/`wall_seconds` are accepted only for `action="agent"`,
+    must be finite and non-negative, and are optional — enforced by the
+    shared `validate_action_inputs` on both create and update."""
+
+    @pytest.fixture
+    def client(self):
+        from fastapi.testclient import TestClient
+        from api.main import app
+        return TestClient(app)
+
+    @pytest.fixture
+    def mock_store(self):
+        with patch("api.routes.scheduler.get_scheduler_store") as mock:
+            store = mock.return_value
+            entry = _sample_entry(action="agent", message_content="Draft my weekly review")
+            store.create.return_value = entry
+            store.get.return_value = entry
+            store.update.return_value = entry
+            yield store
+
+    def _create_payload(self, **overrides):
+        payload = {
+            "name": "X", "schedule_type": "cron", "schedule_value": "0 9 * * *",
+        }
+        payload.update(overrides)
+        return payload
+
+    @pytest.mark.parametrize("action", ["notify", "prompt", "endpoint"])
+    def test_create_rejects_budget_dollars_on_a_non_agent_action(self, client, mock_store, action):
+        payload = self._create_payload(action=action, budget_dollars=2.0)
+        if action in ("notify", "prompt"):
+            payload["message_content"] = "hi"
+        if action == "endpoint":
+            payload["endpoint_config"] = {"method": "GET", "endpoint": "/api/tasks"}
+        resp = client.post("/api/scheduler", json=payload)
+        assert resp.status_code == 422
+        assert "budget_dollars" in resp.text
+        mock_store.create.assert_not_called()
+
+    def test_create_rejects_wall_seconds_on_a_non_agent_action(self, client, mock_store):
+        resp = client.post("/api/scheduler", json=self._create_payload(
+            action="notify", message_content="hi", wall_seconds=1800,
+        ))
+        assert resp.status_code == 422
+        assert "wall_seconds" in resp.text
+        mock_store.create.assert_not_called()
+
+    def test_create_accepts_budget_and_wall_on_agent_action(self, client, mock_store):
+        resp = client.post("/api/scheduler", json=self._create_payload(
+            action="agent", message_content="hi", budget_dollars=2.0, wall_seconds=1800,
+        ))
+        assert resp.status_code == 200
+        assert mock_store.create.call_args.kwargs["budget_dollars"] == 2.0
+        assert mock_store.create.call_args.kwargs["wall_seconds"] == 1800
+
+    @pytest.mark.parametrize("bad_value", [-1, -0.01])
+    def test_create_rejects_negative_budget_dollars(self, client, mock_store, bad_value):
+        resp = client.post("/api/scheduler", json=self._create_payload(
+            action="agent", message_content="hi", budget_dollars=bad_value,
+        ))
+        assert resp.status_code == 422
+        assert "budget_dollars" in resp.text
+        mock_store.create.assert_not_called()
+
+    def test_create_rejects_negative_wall_seconds(self, client, mock_store):
+        resp = client.post("/api/scheduler", json=self._create_payload(
+            action="agent", message_content="hi", wall_seconds=-1,
+        ))
+        assert resp.status_code == 422
+        assert "wall_seconds" in resp.text
+        mock_store.create.assert_not_called()
+
+    def test_create_accepts_zero_budget_dollars(self, client, mock_store):
+        resp = client.post("/api/scheduler", json=self._create_payload(
+            action="agent", message_content="hi", budget_dollars=0,
+        ))
+        assert resp.status_code == 200
+        assert mock_store.create.call_args.kwargs["budget_dollars"] == 0
+
+    def test_update_rejects_budget_dollars_against_the_stored_non_agent_action(self, client, mock_store):
+        mock_store.get.return_value = _sample_entry(action="notify", message_content="hi")
+        resp = client.put("/api/scheduler/sch-1", json={"budget_dollars": 2.0})
+        assert resp.status_code == 422
+        assert "budget_dollars" in resp.text
+        mock_store.update.assert_not_called()
+
+    def test_update_accepts_budget_dollars_against_the_stored_agent_action(self, client, mock_store):
+        mock_store.get.return_value = _sample_entry(action="agent", message_content="hi")
+        resp = client.put("/api/scheduler/sch-1", json={"budget_dollars": 2.0})
+        assert resp.status_code == 200
+        assert mock_store.update.call_args.kwargs["budget_dollars"] == 2.0
+
+    def test_update_accepts_wall_seconds_against_the_stored_agent_action(self, client, mock_store):
+        mock_store.get.return_value = _sample_entry(action="agent", message_content="hi")
+        resp = client.put("/api/scheduler/sch-1", json={"wall_seconds": 1800})
+        assert resp.status_code == 200
+        assert mock_store.update.call_args.kwargs["wall_seconds"] == 1800
+
+    def test_update_action_switch_to_notify_rejected_against_an_existing_budget(self, client, mock_store):
+        """Switching an agent schedule that already carries a budget to a
+        non-agent action is rejected in the same PUT."""
+        mock_store.get.return_value = _sample_entry(
+            action="agent", message_content="hi", budget_dollars=2.0,
+        )
+        resp = client.put("/api/scheduler/sch-1", json={"action": "notify", "message_content": "hi"})
+        assert resp.status_code == 422
+        assert "budget_dollars" in resp.text
+        mock_store.update.assert_not_called()
 
 
 class TestScheduleTypeConversionAgainstARealStore:

@@ -631,6 +631,97 @@ class TestRoundTrip:
         assert _format_entry_line(reparsed) == line
 
 
+class TestScheduleBudget:
+    """`[budget:: …]` / `[wall:: …]` — an `action:: agent` schedule's own
+    dollar/wall-clock budget, round-tripped through Markdown."""
+
+    @pytest.mark.parametrize("raw,expected", [("$2", 2.0), ("2", 2.0), ("2.50", 2.5)])
+    def test_budget_field_accepts_dollar_sign_bare_and_decimal(self, raw, expected):
+        line = (
+            f"- [ ] Weekly review [cron:: 0 9 * * 6] [action:: agent] "
+            f"[budget:: {raw}] <!-- id:bud1 -->"
+        )
+        entry = _parse_entry_line(line)
+        assert entry is not None
+        assert entry.budget_dollars == pytest.approx(expected)
+
+    @pytest.mark.parametrize("raw,expected_seconds", [
+        ("30m", 1800), ("2h", 7200), ("90 min", 5400), ("3600s", 3600),
+    ])
+    def test_wall_field_accepts_minutes_hours_and_seconds(self, raw, expected_seconds):
+        line = (
+            f"- [ ] Weekly review [cron:: 0 9 * * 6] [action:: agent] "
+            f"[wall:: {raw}] <!-- id:wal1 -->"
+        )
+        entry = _parse_entry_line(line)
+        assert entry is not None
+        assert entry.wall_seconds == expected_seconds
+
+    def test_missing_budget_and_wall_fields_stay_none(self):
+        line = "- [ ] Weekly review [cron:: 0 9 * * 6] [action:: agent] <!-- id:none1 -->"
+        entry = _parse_entry_line(line)
+        assert entry is not None
+        assert entry.budget_dollars is None
+        assert entry.wall_seconds is None
+
+    def test_malformed_budget_field_leaves_it_none(self, caplog):
+        line = (
+            "- [ ] Weekly review [cron:: 0 9 * * 6] [action:: agent] "
+            "[budget:: not-a-number] <!-- id:bud2 -->"
+        )
+        with caplog.at_level("WARNING"):
+            entry = _parse_entry_line(line)
+        assert entry is not None
+        assert entry.budget_dollars is None
+        assert "bud2" in caplog.text
+
+    def test_malformed_wall_field_leaves_it_none(self, caplog):
+        line = (
+            "- [ ] Weekly review [cron:: 0 9 * * 6] [action:: agent] "
+            "[wall:: not-a-duration] <!-- id:wal2 -->"
+        )
+        with caplog.at_level("WARNING"):
+            entry = _parse_entry_line(line)
+        assert entry is not None
+        assert entry.wall_seconds is None
+        assert "wal2" in caplog.text
+
+    def test_format_emits_budget_and_wall_only_when_set(self):
+        entry = ScheduleEntry(
+            id="bw1", name="Weekly review", schedule_type="cron", schedule_value="0 9 * * 6",
+            action="agent", message_content="Draft it",
+            budget_dollars=2.0, wall_seconds=1800,
+        )
+        line = _format_entry_line(entry)
+        assert "[budget:: $2]" in line
+        assert "[wall:: 30m]" in line
+
+        entry_unset = ScheduleEntry(
+            id="bw2", name="Weekly review", schedule_type="cron", schedule_value="0 9 * * 6",
+            action="agent", message_content="Draft it",
+        )
+        line_unset = _format_entry_line(entry_unset)
+        assert "[budget::" not in line_unset
+        assert "[wall::" not in line_unset
+
+    @pytest.mark.parametrize("budget_dollars,wall_seconds", [
+        (2.0, 1800), (0.5, 90), (2.55, 3600), (None, 1800), (2.0, None), (None, None),
+    ])
+    def test_budget_and_wall_round_trip(self, budget_dollars, wall_seconds):
+        entry = ScheduleEntry(
+            id="rt1", name="Weekly review", schedule_type="cron", schedule_value="0 9 * * 6",
+            action="agent", message_content="Draft it",
+            budget_dollars=budget_dollars, wall_seconds=wall_seconds,
+        )
+        line = _format_entry_line(entry)
+        reparsed = _parse_entry_line(line)
+        assert reparsed.budget_dollars == budget_dollars
+        assert reparsed.wall_seconds == wall_seconds
+        # A second parse -> format round trip is a no-op — the canonical
+        # spelling written back is stable under re-parsing.
+        assert _format_entry_line(reparsed) == line
+
+
 class TestCronComputation:
     def test_cron_next_trigger(self):
         entry = ScheduleEntry(id="t", name="T", schedule_type="cron",
@@ -1184,6 +1275,36 @@ class TestActionDispatch:
         refreshed = scheduler.store.get(entry.id)
         assert refreshed.last_status == "handed-off"
         assert "task42" in refreshed.last_result
+
+    @pytest.mark.asyncio
+    async def test_agent_action_renders_its_own_budget_into_the_task_title(self, scheduler):
+        """A schedule carrying its own `budget_dollars`/`wall_seconds`
+        renders both into the created task's title in the hint grammar the
+        agent worker's preflight parses ("max $X.XX", "Y min"), so the
+        card's budget equals the schedule's on every fire."""
+        entry = scheduler.store.create(
+            name="Weekly review", schedule_type="cron", schedule_value="0 9 * * 6",
+            action="agent", executor="cloud", message_content="Draft my weekly review",
+            budget_dollars=2.0, wall_seconds=1800,
+        )
+        fake_tm = MagicMock()
+        fake_tm.create.return_value = MagicMock(id="task-budget")
+        with patch("api.services.task_manager.get_task_manager", return_value=fake_tm):
+            await scheduler._fire_entry(entry)
+        kwargs = fake_tm.create.call_args.kwargs
+        assert kwargs["description"] == "Draft my weekly review (max $2.00, 30 min)"
+
+    @pytest.mark.asyncio
+    async def test_agent_action_without_budget_leaves_the_task_title_unchanged(self, scheduler):
+        entry = scheduler.store.create(
+            name="Weekly review", schedule_type="cron", schedule_value="0 9 * * 6",
+            action="agent", executor="cloud", message_content="Draft my weekly review",
+        )
+        fake_tm = MagicMock()
+        fake_tm.create.return_value = MagicMock(id="task-no-budget")
+        with patch("api.services.task_manager.get_task_manager", return_value=fake_tm):
+            await scheduler._fire_entry(entry)
+        assert fake_tm.create.call_args.kwargs["description"] == "Draft my weekly review"
 
     @pytest.mark.asyncio
     async def test_agent_action_local_executor_tag(self, scheduler):

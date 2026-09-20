@@ -1875,6 +1875,39 @@ class TestScheduledCardDrawer:
         drawer.locator('[data-action="trigger-now"]').click()
         _wait_for(lambda: trigger_calls == ["s2"], page=page)
 
+    def test_agent_schedule_budget_inputs_appear_and_save(self, page: Page, agents_base_url):
+        """An `action: agent` schedule's drawer shows Budget ($) and Wall
+        (min) inputs inside the execution-context details, and each saves
+        through PUT /api/scheduler/{id} as budget_dollars / wall_seconds
+        (web/agents/schedule_sections.js, web/agents/board.js)."""
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["scheduled"].append({
+            "kind": "schedule", "id": "s3", "name": "Weekly review",
+            "message_content": "Draft my weekly review", "enabled": True,
+            "next_fire_at": "2099-01-01T09:00:00+00:00", "recurring": True,
+            "last_run": None, "schedule_type": "cron", "schedule_value": "0 9 * * 6",
+            "action": "agent", "executor": "cloud",
+            "budget_dollars": None, "wall_seconds": None,
+        })
+        schedule_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, schedule_puts=schedule_puts)
+
+        page.locator('[data-card-id="s3"]').click()
+        drawer = page.locator("#board-drawer")
+        drawer.locator('[data-field="exec-context"] summary').click()  # expand <details>
+        budget = drawer.locator('[data-field="budget-dollars"]')
+        wall = drawer.locator('[data-field="wall-minutes"]')
+        expect(budget).to_be_visible()
+        expect(wall).to_be_visible()
+
+        budget.fill("2")
+        wall.click()  # blur budget
+        _wait_for(lambda: {"budget_dollars": 2} in schedule_puts, page=page)
+
+        wall.fill("30")
+        budget.click()  # blur wall
+        _wait_for(lambda: {"wall_seconds": 1800} in schedule_puts, page=page)
+
 
 class TestLiveUpdates:
     """The SSE live-update path must be

@@ -1295,3 +1295,30 @@ class TestScheduleTriggerTool:
 
         headers = fake.post.call_args.kwargs.get("headers")
         assert not headers
+
+
+# ---------------------------------------------------------------------------
+# lifeos_schedule_create / lifeos_schedule_update — an `action:: agent`
+# schedule's own budget_dollars/wall_seconds.
+# ---------------------------------------------------------------------------
+
+class TestScheduleBudgetToolSchemas:
+    """Checked against the fallback schemas directly (rather than
+    `server.tools`, which is OpenAPI-spec-derived when a live API happens to
+    answer) so this passes regardless of network state."""
+
+    @pytest.mark.unit
+    def test_fallback_schema_for_create_includes_budget_fields(self):
+        module = _load_mcp_module_fresh()
+        server = module.LifeOSMCPServer()
+        schema = server._get_fallback_schema("lifeos_schedule_create")
+        assert schema["properties"]["budget_dollars"]["type"] == "number"
+        assert schema["properties"]["wall_seconds"]["type"] == "integer"
+
+    @pytest.mark.unit
+    def test_fallback_schema_for_update_includes_budget_fields(self):
+        module = _load_mcp_module_fresh()
+        server = module.LifeOSMCPServer()
+        schema = server._get_fallback_schema("lifeos_schedule_update")
+        assert schema["properties"]["budget_dollars"]["type"] == "number"
+        assert schema["properties"]["wall_seconds"]["type"] == "integer"

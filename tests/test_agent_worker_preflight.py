@@ -308,6 +308,21 @@ def test_preflight_title_hint_sets_explicit_token_cap():
     assert result.budget.max_tokens == 50000
 
 
+@pytest.mark.unit
+def test_preflight_parses_a_schedule_rendered_budget_hint():
+    """A schedule with its own `budget_dollars`/`wall_seconds` renders them
+    into the created task's title as "max $2.00" and "30 min"
+    (api/services/scheduler_store.py's `_budget_hint_suffix`) — the exact
+    hint grammar docs/specs/product/agent-worker.md § Budgets documents.
+    The classifier is stubbed with the budget a real Haiku call would parse
+    from that title, and the result carries it through unchanged."""
+    title = "Draft my weekly review (max $2.00, 30 min)"
+    reply = _golden_reply(budget={"wall_seconds": 1800, "max_tokens": None, "max_dollars": 2.0})
+    result = pf.run_preflight(title=title, tags=["agent", "cloud"], caller=_stub(reply))
+    assert result.budget.max_dollars == pytest.approx(2.0)
+    assert result.budget.wall_seconds == 1800
+
+
 # ---------------------------------------------------------------------------
 # Prompt-content tests — verify routing rules visible to Haiku
 # ---------------------------------------------------------------------------

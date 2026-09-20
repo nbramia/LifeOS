@@ -1186,6 +1186,8 @@ def _schedule_card(entry) -> dict[str, Any]:
         "effort": entry.effort,
         "host": entry.host,
         "working_dir": entry.working_dir,
+        "budget_dollars": entry.budget_dollars,
+        "wall_seconds": entry.wall_seconds,
     }
 
 

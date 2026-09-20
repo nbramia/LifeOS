@@ -930,7 +930,9 @@ class LifeOSMCPServer:
                     "endpoint_config": {"type": "object", "description": "For action=endpoint: {endpoint, method, params}"},
                     "executor": {"type": "string", "description": "For action=agent: 'local', 'cloud', 'cloud-haiku', or 'cloud-sonnet'"},
                     "bot": {"type": "string", "description": "For action=notify/prompt: Telegram bot to send from — a name from the registry in config/telegram_bots.json, or 'primary'. Omit for the primary bot."},
-                    "enabled": {"type": "boolean", "description": "Whether the schedule is active", "default": True}
+                    "enabled": {"type": "boolean", "description": "Whether the schedule is active", "default": True},
+                    "budget_dollars": {"type": "number", "description": "For action=agent: dollar budget the created task inherits on every fire, rendered into its title (e.g. 'max $2.00')."},
+                    "wall_seconds": {"type": "integer", "description": "For action=agent: wall-clock seconds the created task inherits on every fire, rendered into its title in minutes."}
                 },
                 "required": ["name", "schedule_type", "action"]
             },
@@ -950,7 +952,9 @@ class LifeOSMCPServer:
                     "executor": {"type": "string", "description": "For action=agent: local | cloud | cloud-haiku | cloud-sonnet"},
                     "bot": {"type": "string", "description": "For action=notify/prompt: Telegram bot to send from — a name from the registry in config/telegram_bots.json, or 'primary'. Omit for the primary bot."},
                     "timezone": {"type": "string", "description": "IANA timezone (e.g., 'America/New_York')"},
-                    "enabled": {"type": "boolean", "description": "Whether the schedule is active"}
+                    "enabled": {"type": "boolean", "description": "Whether the schedule is active"},
+                    "budget_dollars": {"type": "number", "description": "For action=agent: dollar budget the created task inherits on every fire, rendered into its title (e.g. 'max $2.00')."},
+                    "wall_seconds": {"type": "integer", "description": "For action=agent: wall-clock seconds the created task inherits on every fire, rendered into its title in minutes."}
                 },
                 "required": ["schedule_id"]
             },

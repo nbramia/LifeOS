@@ -98,6 +98,13 @@ class ScheduleEntry:
     effort: str = ""
     host: str = ""
     working_dir: str = ""
+    # Optional budget an `action:: agent` schedule hands its created task on
+    # every fire, rendered into the task's title as the hint grammar the
+    # agent worker's preflight parses (see `_hand_off_to_agent`). Round-trip
+    # through Markdown as `[budget:: …]` / `[wall:: …]`; omitted means no
+    # override — the task falls back to the worker's own defaults.
+    budget_dollars: Optional[float] = None
+    wall_seconds: Optional[int] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -244,6 +251,73 @@ _BODY_LINE_RE = re.compile(r'^\s+>\s?(.*)$')
 _BODY_INDENT = "    "
 _PARAMS_B64_PREFIX = "b64:"
 
+# `[budget:: …]` accepts "$2", "2", or "2.50"; `[wall:: …]` accepts "30m",
+# "2h", "90 min", or "3600s". Both are written back in a single canonical
+# spelling (see `_format_budget_dollars`/`_format_wall_seconds`) regardless
+# of which accepted spelling was read, so a second parse → format round trip
+# is always a no-op.
+_BUDGET_DOLLARS_RE = re.compile(r'^\$?\s*(\d+(?:\.\d+)?)$')
+_WALL_DURATION_RE = re.compile(
+    r'^(\d+(?:\.\d+)?)\s*(h|hr|hrs|hour|hours|m|min|mins|minute|minutes|s|sec|secs|second|seconds)$',
+    re.IGNORECASE,
+)
+
+
+def _parse_budget_dollars(raw: str) -> float:
+    """Parse a `[budget:: …]` value ("$2", "2", "2.50") to dollars. Raises
+    ValueError on anything else."""
+    m = _BUDGET_DOLLARS_RE.match(raw.strip())
+    if not m:
+        raise ValueError(f"invalid budget amount: {raw!r}")
+    return float(m.group(1))
+
+
+def _format_budget_dollars(value: float) -> str:
+    """Canonical `[budget:: …]` spelling: no trailing zeros (e.g. 2.0 -> "$2")."""
+    text = f"{value:.2f}".rstrip("0").rstrip(".") or "0"
+    return f"${text}"
+
+
+def _parse_wall_seconds(raw: str) -> int:
+    """Parse a `[wall:: …]` value ("30m", "2h", "90 min", "3600s") to whole
+    seconds. Raises ValueError on anything else."""
+    m = _WALL_DURATION_RE.match(raw.strip())
+    if not m:
+        raise ValueError(f"invalid wall duration: {raw!r}")
+    amount = float(m.group(1))
+    unit = m.group(2).lower()
+    if unit.startswith("h"):
+        seconds = amount * 3600
+    elif unit.startswith("m"):
+        seconds = amount * 60
+    else:
+        seconds = amount
+    return int(round(seconds))
+
+
+def _format_wall_seconds(seconds: int) -> str:
+    """Canonical `[wall:: …]` spelling: the largest unit that divides evenly."""
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600}h"
+    if seconds % 60 == 0:
+        return f"{seconds // 60}m"
+    return f"{seconds}s"
+
+
+def _budget_hint_suffix(entry: ScheduleEntry) -> str:
+    """Render an `action:: agent` schedule's own budget into the hint
+    grammar the agent worker's preflight parses from a task title (see
+    docs/specs/product/agent-worker.md § Budgets: "max $2.00" / "30 min"),
+    so a created task inherits the schedule's budget. Empty when neither
+    field is set.
+    """
+    hints = []
+    if entry.budget_dollars is not None:
+        hints.append(f"max ${entry.budget_dollars:.2f}")
+    if entry.wall_seconds is not None:
+        hints.append(f"{round(entry.wall_seconds / 60)} min")
+    return f" ({', '.join(hints)})" if hints else ""
+
 
 def _encode_params(params: dict) -> str:
     """Compact JSON for the ``[params:: …]`` inline field.
@@ -303,6 +377,10 @@ def _format_entry_line(entry: ScheduleEntry) -> str:
         parts.append(f"[last:: {entry.last_triggered_at}]")
     if entry.operation_key:
         parts.append(f"[operation_key:: {entry.operation_key}]")
+    if entry.budget_dollars is not None:
+        parts.append(f"[budget:: {_format_budget_dollars(entry.budget_dollars)}]")
+    if entry.wall_seconds is not None:
+        parts.append(f"[wall:: {_format_wall_seconds(entry.wall_seconds)}]")
     for key in ("persona_id", "model_id", "effort", "host", "working_dir"):
         value = getattr(entry, key, "")
         if value:
@@ -362,6 +440,20 @@ def _parse_entry_line(line: str) -> Optional[ScheduleEntry]:
                 params = {}
         endpoint_config = {"endpoint": path, "method": method.upper(), "params": params}
 
+    budget_dollars = None
+    if "budget" in fields:
+        try:
+            budget_dollars = _parse_budget_dollars(fields["budget"])
+        except ValueError:
+            logger.warning("Malformed budget field for schedule %s: %r", entry_id, fields["budget"])
+
+    wall_seconds = None
+    if "wall" in fields:
+        try:
+            wall_seconds = _parse_wall_seconds(fields["wall"])
+        except ValueError:
+            logger.warning("Malformed wall field for schedule %s: %r", entry_id, fields["wall"])
+
     entry = ScheduleEntry(
         id=entry_id,
         name=name,
@@ -377,6 +469,8 @@ def _parse_entry_line(line: str) -> Optional[ScheduleEntry]:
         last_triggered_at=fields.get("last") or None,
         timezone=fields.get("tz", ""),
         operation_key=fields.get("operation_key", ""),
+        budget_dollars=budget_dollars,
+        wall_seconds=wall_seconds,
         persona_id=fields.get("persona_id", ""),
         model_id=fields.get("model_id", ""),
         effort=fields.get("effort", ""),
@@ -1290,12 +1384,18 @@ class SchedulerScheduler:
         fire and append its output to one shared note per schedule, rather than
         a new note per fire. One-time (``once``) schedules get no such tag — each
         is a stand-alone task that produces its own note.
+
+        When the schedule carries its own ``budget_dollars``/``wall_seconds``,
+        they're rendered into the created task's description via
+        ``_budget_hint_suffix`` so preflight parses the same budget on every
+        fire.
         """
         from api.services.task_manager import get_task_manager
         executor = (entry.executor or "").lstrip("#").strip()
         tags: list[str] = [executor] if executor else ["agent"]
         if entry.schedule_type == "cron":
             tags.append(f"sched-{entry.id}")
+        description = (entry.message_content or entry.name) + _budget_hint_suffix(entry)
         manager = get_task_manager()
         # Reconcile a crash after the Markdown rename but before the SQLite
         # link by searching the authoritative task files for the key.
@@ -1310,7 +1410,7 @@ class SchedulerScheduler:
             if callable(operation_creator):
                 operation_result = operation_creator(
                     occurrence_key,
-                    description=entry.message_content or entry.name,
+                    description=description,
                     tags=tags,
                     fields=operation_fields,
                 )
@@ -1320,7 +1420,7 @@ class SchedulerScheduler:
                 # Keep compatibility with narrow test/injected task-manager
                 # doubles that predate the durable operation primitive.
                 task = manager.create(
-                    description=entry.message_content or entry.name,
+                    description=description,
                     tags=tags,
                     fields=operation_fields,
                     _log_content=False,
@@ -1338,7 +1438,7 @@ class SchedulerScheduler:
         if entry.working_dir:
             fields["working_dir"] = entry.working_dir
         task = manager.create(
-            description=entry.message_content or entry.name,
+            description=description,
             tags=tags,
             fields=fields,
             _log_content=not bool(entry.operation_key),

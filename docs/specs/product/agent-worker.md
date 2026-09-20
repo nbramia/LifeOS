@@ -98,6 +98,8 @@ If no budget appears in the title, defaults from `.env` apply: `$10.00` and `~4 
 
 There's also a global daily $-cap (`LIFEOS_AGENT_DAILY_CAP_DOLLARS`, default `$100`). When the day's accumulated cost crosses the cap, the worker stops claiming new tasks until the next local midnight. Tasks already running aren't killed.
 
+A [scheduler](../../guides/scheduler.md) entry whose action hands work to the agent worker can carry its own budget (`[budget:: …]` / `[wall:: …]`), rendered into the created task's title in this same hint grammar on every fire.
+
 ---
 
 ## Tag lifecycle

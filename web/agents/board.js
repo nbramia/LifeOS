@@ -91,6 +91,7 @@ const DRAWER_EDITABLE_FIELDS = [
   // Per-action inputs — an endpoint action's call config and an
   // agent action's execution context, all through the same PUT.
   'endpoint_config', 'persona_id', 'model_id', 'effort', 'host', 'working_dir',
+  'budget_dollars', 'wall_seconds',
 ];
 
 // Lane filter — multi-select checkbox dropdown. Hidden lanes are
@@ -1866,6 +1867,7 @@ export function initBoard() {
     const sectionValues = {
       message_content: '', endpoint_config: null, executor: '', bot: '',
       persona_id: '', model_id: '', effort: '', host: '', working_dir: '',
+      budget_dollars: null, wall_seconds: null,
     };
     const sections = renderScheduleActionSections(actionSectionsEl, actionEl.value, sectionValues);
 
@@ -3040,6 +3042,8 @@ export function initBoard() {
       effort: card.effort || '',
       host: card.host || '',
       working_dir: card.working_dir || '',
+      budget_dollars: card.budget_dollars != null ? card.budget_dollars : null,
+      wall_seconds: card.wall_seconds != null ? card.wall_seconds : null,
     };
     const sections = renderScheduleActionSections(actionSectionsEl, card.action, sectionValues);
 
@@ -3056,6 +3060,8 @@ export function initBoard() {
     let lastSavedEffort = sectionValues.effort;
     let lastSavedHost = sectionValues.host;
     let lastSavedWorkingDir = sectionValues.working_dir;
+    let lastSavedBudgetDollars = sectionValues.budget_dollars;
+    let lastSavedWallSeconds = sectionValues.wall_seconds;
 
     // (Re)wires save-on-blur/change for whichever fields the current
     // action's section actually rendered — called once after the initial
@@ -3259,6 +3265,56 @@ export function initBoard() {
           } catch (err) {
             showToast(`Couldn't save working directory: ${err.message}`, true);
             els.workingDir.value = lastSavedWorkingDir;
+          }
+        });
+      }
+
+      // Blank leaves the stored budget alone (there is no way to clear an
+      // already-set budget from the drawer) rather than sending nothing
+      // meaningful — the PUT only ever carries a number here.
+      if (els.budgetDollars) {
+        els.budgetDollars.addEventListener('blur', async () => {
+          const raw = els.budgetDollars.value.trim();
+          if (raw === '') return;
+          const value = Number(raw);
+          if (!Number.isFinite(value) || value < 0) {
+            showToast('Budget must be a non-negative number', true);
+            els.budgetDollars.value = lastSavedBudgetDollars != null ? String(lastSavedBudgetDollars) : '';
+            return;
+          }
+          if (value === lastSavedBudgetDollars) return;
+          try {
+            await putSchedule(card.id, { budget_dollars: value });
+            lastSavedBudgetDollars = value;
+            sectionValues.budget_dollars = value;
+            await fetchBoard();
+          } catch (err) {
+            showToast(`Couldn't save budget: ${err.message}`, true);
+            els.budgetDollars.value = lastSavedBudgetDollars != null ? String(lastSavedBudgetDollars) : '';
+          }
+        });
+      }
+
+      if (els.wallMinutes) {
+        els.wallMinutes.addEventListener('blur', async () => {
+          const raw = els.wallMinutes.value.trim();
+          if (raw === '') return;
+          const minutes = Number(raw);
+          if (!Number.isFinite(minutes) || minutes < 0) {
+            showToast('Wall time must be a non-negative number of minutes', true);
+            els.wallMinutes.value = lastSavedWallSeconds != null ? String(Math.round(lastSavedWallSeconds / 60)) : '';
+            return;
+          }
+          const value = Math.round(minutes * 60);
+          if (value === lastSavedWallSeconds) return;
+          try {
+            await putSchedule(card.id, { wall_seconds: value });
+            lastSavedWallSeconds = value;
+            sectionValues.wall_seconds = value;
+            await fetchBoard();
+          } catch (err) {
+            showToast(`Couldn't save wall time: ${err.message}`, true);
+            els.wallMinutes.value = lastSavedWallSeconds != null ? String(Math.round(lastSavedWallSeconds / 60)) : '';
           }
         });
       }

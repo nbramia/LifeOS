@@ -55,6 +55,15 @@ handoff context and round-trip through Markdown; omitted fields retain the
 worker's legacy defaults. `bot` remains delivery-only and does not select an
 execution persona or provider.
 
+An `action:: agent` schedule may also carry its own budget: `[budget:: $2]`
+(dollars — `$2`, `2`, and `2.50` are all accepted) and `[wall:: 30m]`
+(wall-clock time — `30m`, `2h`, `90 min`, and `3600s` are all accepted).
+Both are optional and rejected on any other action. On every fire, they're
+rendered into the created task's title in the budget hint grammar the agent
+worker's preflight parses (see [agent-worker.md § Budgets](../specs/product/agent-worker.md#budgets)),
+so a recurring task gets a right-sized cap once instead of relying on the
+worker's own defaults every time.
+
 Editing a line in Obsidian (changing the cron, toggling the checkbox) is picked
 up within ~2s by the file watcher. Markdown edits are **not** validated — a
 `[bot:: <name>]` typed here is accepted as-is, and the fire-time routing warning

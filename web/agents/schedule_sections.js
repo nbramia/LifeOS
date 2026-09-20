@@ -163,6 +163,18 @@ function sectionHtml(action, values) {
         </div>
         <label class="drawer-label">Working directory</label>
         <input class="drawer-input" data-field="working-dir" value="${escapeHtml(values.working_dir || '')}" placeholder="/tmp/example-project" />
+        <div class="drawer-row">
+          <div>
+            <label class="drawer-label">Budget ($)</label>
+            <input class="drawer-input" type="number" min="0" step="0.01" data-field="budget-dollars"
+              value="${values.budget_dollars != null ? values.budget_dollars : ''}" placeholder="e.g. 2.00" />
+          </div>
+          <div>
+            <label class="drawer-label">Wall (min)</label>
+            <input class="drawer-input" type="number" min="0" step="1" data-field="wall-minutes"
+              value="${values.wall_seconds != null ? Math.round(values.wall_seconds / 60) : ''}" placeholder="e.g. 30" />
+          </div>
+        </div>
       </details>
     ` : ''}
   `;
@@ -180,7 +192,9 @@ function sectionHtml(action, values) {
  * @param {object} values - the schedule's current values: `message_content`
  *   (string), `endpoint_config` ({method, endpoint, params} or null/undefined),
  *   `executor`, `bot`, `persona_id`, `model_id`, `effort`, `host`,
- *   `working_dir` (all strings, default "").
+ *   `working_dir` (all strings, default ""), and, for the `agent` action's
+ *   own budget, `budget_dollars` (number or null) and `wall_seconds`
+ *   (number or null — rendered as whole minutes).
  * @param {object} [opts]
  * @param {Function} [opts.fetchImpl] - fetch override for the default
  *   bot/model/host catalog loaders, when the loader options below aren't given.
@@ -221,6 +235,8 @@ export function renderScheduleActionSections(container, action, values, opts = {
     els.effort = container.querySelector('[data-field="effort-id"]');
     els.host = container.querySelector('[data-field="host-id"]');
     els.workingDir = container.querySelector('[data-field="working-dir"]');
+    els.budgetDollars = container.querySelector('[data-field="budget-dollars"]');
+    els.wallMinutes = container.querySelector('[data-field="wall-minutes"]');
   }
 
   // Bot select: offers only the names GET /api/scheduler/bots returns
@@ -400,6 +416,20 @@ export function renderScheduleActionSections(container, action, values, opts = {
       if (els.effort) out.effort = els.effort.value;
       if (els.host) out.host = els.host.value;
       if (els.workingDir) out.working_dir = els.workingDir.value.trim();
+      if (els.budgetDollars) {
+        const raw = els.budgetDollars.value.trim();
+        if (raw !== '') {
+          const value = Number(raw);
+          if (Number.isFinite(value)) out.budget_dollars = value;
+        }
+      }
+      if (els.wallMinutes) {
+        const raw = els.wallMinutes.value.trim();
+        if (raw !== '') {
+          const minutes = Number(raw);
+          if (Number.isFinite(minutes)) out.wall_seconds = Math.round(minutes * 60);
+        }
+      }
       return out;
     },
   };

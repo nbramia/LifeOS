@@ -58,6 +58,16 @@ class CreateScheduleRequest(BaseModel):
     effort: Optional[str] = None
     host: Optional[str] = None
     working_dir: Optional[str] = None
+    budget_dollars: Optional[float] = Field(
+        default=None,
+        description="For agent action: dollar budget the created task inherits on every fire "
+                    "(rendered into its title as 'max $X.XX').",
+    )
+    wall_seconds: Optional[int] = Field(
+        default=None,
+        description="For agent action: wall-clock seconds the created task inherits on every "
+                    "fire (rendered into its title in minutes).",
+    )
 
 
 class UpdateScheduleRequest(BaseModel):
@@ -77,6 +87,8 @@ class UpdateScheduleRequest(BaseModel):
     effort: Optional[str] = None
     host: Optional[str] = None
     working_dir: Optional[str] = None
+    budget_dollars: Optional[float] = None
+    wall_seconds: Optional[int] = None
 
 
 class ScheduleResponse(BaseModel):
@@ -101,6 +113,8 @@ class ScheduleResponse(BaseModel):
     effort: str = ""
     host: str = ""
     working_dir: str = ""
+    budget_dollars: Optional[float] = None
+    wall_seconds: Optional[int] = None
 
     @classmethod
     def from_entry(cls, e: ScheduleEntry) -> "ScheduleResponse":
@@ -126,6 +140,8 @@ class ScheduleResponse(BaseModel):
             effort=e.effort,
             host=e.host,
             working_dir=e.working_dir,
+            budget_dollars=e.budget_dollars,
+            wall_seconds=e.wall_seconds,
         )
 
 
@@ -212,6 +228,7 @@ def _validate_schedule_value(schedule_type: str, schedule_value: str) -> None:
 
 def _validate_action_inputs(
     action: str, message_content: str, endpoint_config: Optional[dict],
+    budget_dollars: Optional[float] = None, wall_seconds: Optional[int] = None,
 ) -> Optional[dict]:
     """Validate that a schedule's resulting action has the inputs it needs
     to fire, 422 on failure. Shared by ``create_schedule`` and
@@ -226,7 +243,9 @@ def _validate_action_inputs(
     ``endpoint_config`` unchanged.
     """
     try:
-        return validate_action_inputs(action, message_content, endpoint_config)
+        return validate_action_inputs(
+            action, message_content, endpoint_config, budget_dollars, wall_seconds,
+        )
     except ScheduleActionValidationError as e:
         raise HTTPException(status_code=422, detail=e.detail)
 
@@ -306,7 +325,10 @@ async def create_schedule(request: CreateScheduleRequest):
     if action not in VALID_ACTIONS:
         raise HTTPException(status_code=400, detail=f"action must be one of {VALID_ACTIONS}")
     request.bot = _require_known_bot(request.bot)
-    request.endpoint_config = _validate_action_inputs(action, request.message_content, request.endpoint_config)
+    request.endpoint_config = _validate_action_inputs(
+        action, request.message_content, request.endpoint_config,
+        request.budget_dollars, request.wall_seconds,
+    )
 
     store = get_scheduler_store()
     entry = store.create(
@@ -326,6 +348,8 @@ async def create_schedule(request: CreateScheduleRequest):
         effort=request.effort or "",
         host=request.host or "",
         working_dir=request.working_dir or "",
+        budget_dollars=request.budget_dollars,
+        wall_seconds=request.wall_seconds,
     )
     return ScheduleResponse.from_entry(entry)
 
@@ -408,11 +432,15 @@ async def update_schedule(schedule_id: str, request: UpdateScheduleRequest):
     _validate_update_fields(schedule_id, request, store)
     if request.schedule_type == "manual":
         request.schedule_value = ""
-    # Only when the patch actually touches one of the three action-input
-    # fields — an unrelated patch (e.g. `enabled`) to a pre-existing
-    # invalid entry must still succeed, matching `_validate_update_fields`'s
-    # own "only what's present is checked" rule above.
-    if request.action is not None or request.message_content is not None or request.endpoint_config is not None:
+    # Only when the patch actually touches one of the action-input fields —
+    # an unrelated patch (e.g. `enabled`) to a pre-existing invalid entry
+    # must still succeed, matching `_validate_update_fields`'s own "only
+    # what's present is checked" rule above.
+    if (
+        request.action is not None or request.message_content is not None
+        or request.endpoint_config is not None or request.budget_dollars is not None
+        or request.wall_seconds is not None
+    ):
         entry = store.get(schedule_id)
         if entry is None:
             raise HTTPException(status_code=404, detail="Schedule not found")
@@ -421,7 +449,16 @@ async def update_schedule(schedule_id: str, request: UpdateScheduleRequest):
         resulting_endpoint_config = (
             request.endpoint_config if request.endpoint_config is not None else entry.endpoint_config
         )
-        normalized = _validate_action_inputs(resulting_action, resulting_message, resulting_endpoint_config)
+        resulting_budget_dollars = (
+            request.budget_dollars if request.budget_dollars is not None else entry.budget_dollars
+        )
+        resulting_wall_seconds = (
+            request.wall_seconds if request.wall_seconds is not None else entry.wall_seconds
+        )
+        normalized = _validate_action_inputs(
+            resulting_action, resulting_message, resulting_endpoint_config,
+            resulting_budget_dollars, resulting_wall_seconds,
+        )
         if request.endpoint_config is not None:
             request.endpoint_config = normalized
     updates = {k: v for k, v in request.model_dump().items() if v is not None}
