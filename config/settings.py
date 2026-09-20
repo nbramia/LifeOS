@@ -798,6 +798,25 @@ class Settings(BaseSettings):
                     "has no effect on which engine an #agent task itself is "
                     "dispatched to."
     )
+    agent_jev_destructive_gate: str = Field(
+        default="shadow",
+        alias="LIFEOS_AGENT_JEV_DESTRUCTIVE_GATE",
+        description="Controls the Jev destructiveness judgment that runs "
+                    "alongside preflight's regex-based sanity gate (see "
+                    "`agent_worker/preflight.py`'s `_apply_destructive_judgment`). "
+                    "One of: `off` — no Jev call; `shadow` (default) — the "
+                    "judgment runs and its harm score / irreversible "
+                    "probability are recorded on the preflight result and "
+                    "logged, but never change `sane`/`sane_fatal`; `block` — "
+                    "a harm score >= 2.5 or an irreversible probability >= "
+                    "0.85 parks the task for operator approval (non-fatal "
+                    "`sane=False`), never cancels it. Effectively `off` "
+                    "whenever no TypeSafe key is configured "
+                    "(`typesafe_api_key`/`jev_configured`), regardless of "
+                    "this setting. The regex sanity gate runs unconditionally "
+                    "in every mode. An unrecognized value logs a warning and "
+                    "is treated as `shadow`."
+    )
     agent_managed_model: str = Field(
         default="claude-sonnet-5",
         alias="LIFEOS_AGENT_MANAGED_MODEL",
