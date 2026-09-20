@@ -4,7 +4,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -421,7 +423,8 @@ def test_candidate_workflow_lane_selection_is_the_trusted_runner_script():
     selection = next(s for s in steps if "Select the lanes" in (s.get("name") or ""))
     assert selection["id"] == "select"
     script = selection["run"]
-    assert "git -C candidate diff --name-only --merge-base" in script
+    assert 'git -C candidate fetch --no-tags --depth=1 origin "$TRUSTED_RUNNER_SHA"' in script
+    assert script.index("fetch --no-tags") < script.index("diff --name-only --merge-base")
     assert '|| git -C candidate diff --name-only "$TRUSTED_RUNNER_SHA" "$CANDIDATE_SHA"' in script
     assert "python3 trusted-runner/scripts/candidate_lanes.py" in script
     assert "candidate/scripts" not in script
@@ -465,3 +468,88 @@ def test_lane_command_records_slowest_test_durations():
     source = (ROOT / "scripts/verify_candidate.py").read_text()
     assert '"--durations=25"' in source
     assert '"--durations-min=1.0"' in source
+
+
+
+def _lane_selection_step_run() -> str:
+    import yaml
+
+    workflow = yaml.safe_load((ROOT / ".github/workflows/candidate-verification.yml").read_text())
+    steps = workflow["jobs"]["execute-candidate"]["steps"]
+    return next(s for s in steps if "Select the lanes" in (s.get("name") or ""))["run"]
+
+
+def _git(repo, *args):
+    return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True).stdout.strip()
+
+
+def _two_shallow_checkouts(tmp_path, head_files: dict):
+    """An origin with a base commit and a head commit on top, cloned the way
+    the workflow does: `trusted-runner` at the base, `candidate` at the head,
+    each a separate depth-1 clone sharing no objects."""
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    _git(origin, "init", "-q", "-b", "base")
+    _git(origin, "config", "user.email", "ci@example.invalid")
+    _git(origin, "config", "user.name", "ci")
+    _git(origin, "config", "uploadpack.allowAnySHA1InWant", "true")
+    (origin / "README.md").write_text("base\n")
+    (origin / "api").mkdir()
+    (origin / "api" / "x.py").write_text("X = 1\n")
+    _git(origin, "add", "-A")
+    _git(origin, "commit", "-q", "-m", "base")
+    base_sha = _git(origin, "rev-parse", "HEAD")
+    _git(origin, "checkout", "-q", "-b", "main")
+    for rel, body in head_files.items():
+        path = origin / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body)
+    _git(origin, "add", "-A")
+    _git(origin, "commit", "-q", "-m", "head")
+    head_sha = _git(origin, "rev-parse", "HEAD")
+    work = tmp_path / "work"
+    work.mkdir()
+    subprocess.run(["git", "clone", "-q", "--depth=1", "--branch", "base", f"file://{origin}", str(work / "trusted-runner")], check=True)
+    subprocess.run(["git", "clone", "-q", "--depth=1", "--branch", "main", f"file://{origin}", str(work / "candidate")], check=True)
+    (work / "trusted-runner" / "scripts").mkdir()
+    shutil.copy(ROOT / "scripts" / "candidate_lanes.py", work / "trusted-runner" / "scripts" / "candidate_lanes.py")
+    return work, base_sha, head_sha
+
+
+def _run_lane_selection(tmp_path, head_files: dict) -> dict:
+    work, base_sha, head_sha = _two_shallow_checkouts(tmp_path, head_files)
+    runner_temp = tmp_path / "runner-temp"
+    runner_temp.mkdir()
+    output = tmp_path / "github-output"
+    output.touch()
+    env = {
+        **os.environ,
+        "PATH": f"{Path(sys.executable).parent}{os.pathsep}{os.environ.get('PATH', '')}",
+        "TRUSTED_RUNNER_SHA": base_sha, "CANDIDATE_SHA": head_sha,
+        "RUNNER_TEMP": str(runner_temp), "GITHUB_OUTPUT": str(output), "GITHUB_ENV": str(tmp_path / "github-env"),
+    }
+    result = subprocess.run(["bash", "-eo", "pipefail", "-c", _lane_selection_step_run()], cwd=work, env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    return dict(line.split("=", 1) for line in output.read_text().splitlines() if "=" in line)
+
+
+@pytest.mark.unit
+def test_lane_selection_step_sees_the_real_diff_across_two_shallow_checkouts(tmp_path):
+    """The step diffs two commits that live in different depth-1 clones, so it
+    must fetch the base into the candidate clone first; without that fetch
+    every run degrades to "changed set unavailable" and the docs-only and
+    web/ rules never fire."""
+    outputs = _run_lane_selection(tmp_path, {"docs/guide.md": "docs\n"})
+    assert outputs["mode"] == "docs-only"
+    assert outputs["lanes"] == ""
+    assert "unavailable" not in outputs["reason"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("head_files,lanes", [
+    ({"web/app.js": "1\n"}, "fast-unit,browser-free"),
+    ({"api/x.py": "X = 2\n"}, "fast-unit"),
+], ids=["web_change", "api_change"])
+def test_lane_selection_step_keeps_the_browser_lane_only_for_a_web_change(tmp_path, head_files, lanes):
+    outputs = _run_lane_selection(tmp_path, head_files)
+    assert (outputs["mode"], outputs["lanes"]) == ("executed", lanes)
