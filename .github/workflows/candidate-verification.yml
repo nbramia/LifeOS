@@ -314,10 +314,21 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: lane-receipts-${{ env.CANDIDATE_SHA }}-part${{ matrix.part }}
-          path: |
-            ${{ runner.temp }}/lifeos-lane-logs/*.json
-            ${{ runner.temp }}/lifeos-impact/impact_selection.json
+          path: ${{ runner.temp }}/lifeos-lane-logs/*.json
           if-no-files-found: warn
+          retention-days: 30
+
+      # Its own artifact, not a second path on the receipts one: an artifact
+      # is rooted at the common ancestor of every path it lists, so sharing
+      # would push the receipts a level down and out of reach of the
+      # documented `record-scope-durations` regeneration.
+      - name: Retain the shadow test-impact selection
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: impact-selection-${{ env.CANDIDATE_SHA }}-part${{ matrix.part }}
+          path: ${{ runner.temp }}/lifeos-impact/impact_selection.json
+          if-no-files-found: ignore
           retention-days: 30
 
   publish-aggregate:

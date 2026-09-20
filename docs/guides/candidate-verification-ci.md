@@ -87,7 +87,8 @@ gh run download <run-id> --pattern 'lane-receipts-*' --dir /tmp/lane-receipts
   --lane-log-dir /tmp/lane-receipts/lane-receipts-<sha>-part3
 ```
 
-Alongside the receipts, each part records `impact_selection.json`: what a
+Each part also uploads `impact-selection-<candidate sha>-part<n>`, holding
+`impact_selection.json`: what a
 static import-graph selector (`scripts/test_impact.py`, run from the runner's
 checkout over the candidate tree without importing it) would have run for
 this candidate — its mode (`select`, or `full` when a changed path could
