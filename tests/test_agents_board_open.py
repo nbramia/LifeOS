@@ -269,6 +269,96 @@ def test_open_cloud_card_is_refused(client, manager, session_store):
     assert "assignee" in resp.json()["detail"].lower()
 
 
+def _stub_catalog_defaults(monkeypatch, defaults: dict | None = None, *, raises: bool = False):
+    """Patch the model catalog singleton so `_resolve_open_model` sees a
+    controlled `defaults` map (or a lookup failure) instead of the real,
+    network-backed catalog. Mirrors the stubbing
+    `tests/test_agent_worker_dispatch_assignment.py` uses for the worker's
+    own `model_catalog_defaults_provider` injection point."""
+    from api.services.agent_worker import model_catalog as mc_mod
+
+    if raises:
+        async def _get(self, ttl_seconds=None):
+            raise RuntimeError("catalog boom")
+    else:
+        async def _get(self, ttl_seconds=None):
+            return {"defaults": defaults or {}}
+
+    monkeypatch.setattr(mc_mod.ModelCatalog, "get", _get)
+    # Force a fresh singleton so the patched class method is used cleanly.
+    monkeypatch.setattr(mc_mod, "_catalog", None)
+
+
+def _rendered_inner_command(popen_mock) -> str:
+    argv = popen_mock.call_args.args[0]
+    inner_idx = next(i for i, a in enumerate(argv) if a == "--")
+    return " ".join(argv[inner_idx + 1:])
+
+
+def test_open_card_explicit_model_wins_over_catalog_default(client, manager, session_store, monkeypatch):
+    _stub_catalog_defaults(monkeypatch, {"claude": "claude-opus-5", "codex": "gpt-6-sol"})
+    task = manager.create(
+        description="fix the printer", tags=["claude"],
+        fields={"model": "claude-opus-9"},
+    )
+
+    proc = MagicMock()
+    proc.pid = 7001
+    popen_mock = MagicMock(return_value=proc)
+    monkeypatch.setattr("subprocess.Popen", popen_mock)
+
+    resp = client.post(f"/api/agents/board/cards/{task.id}/open")
+    assert resp.status_code == 200
+    inner = _rendered_inner_command(popen_mock)
+    assert "--model claude-opus-9" in inner
+    assert "claude-opus-5" not in inner
+
+
+def test_open_card_no_model_falls_back_to_catalog_default(client, manager, session_store, monkeypatch):
+    _stub_catalog_defaults(monkeypatch, {"claude": "claude-opus-5", "codex": "gpt-6-sol"})
+    task = manager.create(description="fix the printer", tags=["claude"])
+
+    proc = MagicMock()
+    proc.pid = 7002
+    popen_mock = MagicMock(return_value=proc)
+    monkeypatch.setattr("subprocess.Popen", popen_mock)
+
+    resp = client.post(f"/api/agents/board/cards/{task.id}/open")
+    assert resp.status_code == 200
+    inner = _rendered_inner_command(popen_mock)
+    assert "--model claude-opus-5" in inner
+
+
+def test_open_card_no_model_and_no_default_omits_flag(client, manager, session_store, monkeypatch):
+    _stub_catalog_defaults(monkeypatch, {"claude": None, "codex": None})
+    task = manager.create(description="fix the printer", tags=["codex"])
+
+    proc = MagicMock()
+    proc.pid = 7003
+    popen_mock = MagicMock(return_value=proc)
+    monkeypatch.setattr("subprocess.Popen", popen_mock)
+
+    resp = client.post(f"/api/agents/board/cards/{task.id}/open")
+    assert resp.status_code == 200
+    inner = _rendered_inner_command(popen_mock)
+    assert "--model" not in inner
+
+
+def test_open_card_catalog_failure_omits_flag_but_still_opens(client, manager, session_store, monkeypatch):
+    _stub_catalog_defaults(monkeypatch, raises=True)
+    task = manager.create(description="fix the printer", tags=["claude"])
+
+    proc = MagicMock()
+    proc.pid = 7004
+    popen_mock = MagicMock(return_value=proc)
+    monkeypatch.setattr("subprocess.Popen", popen_mock)
+
+    resp = client.post(f"/api/agents/board/cards/{task.id}/open")
+    assert resp.status_code == 200
+    inner = _rendered_inner_command(popen_mock)
+    assert "--model" not in inner
+
+
 def test_get_models_endpoint_returns_engines_shape(client, monkeypatch):
     from api.services.agent_worker import model_catalog as mc_mod
 

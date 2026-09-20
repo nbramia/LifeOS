@@ -180,7 +180,10 @@ async def open_board_card(card_id: str) -> dict[str, Any]:
     `scripts/lifeos-agent-hook.sh` already forwards that as `task_id` on
     every lifecycle event it posts, and `POST /cli-sessions/events`
     moves the card to `in_progress` the moment that session registers
-    (see `cli_session_event` in `api/routes/agents.py`).
+    (see `cli_session_event` in `api/routes/agents.py`). The spawned CLI
+    receives `--model <id>`: the card's own `model` field when set, else
+    the model catalog's current default for that engine — see
+    `_resolve_open_model`.
 
     `hermes`: no terminal to spawn — returns `open_url` pointing at the
     card's Hermes conversation in `/chat` once one exists (set by
@@ -227,7 +230,7 @@ async def open_board_card(card_id: str) -> dict[str, Any]:
             raise HTTPException(status_code=409, detail="card open is already in progress")
         _opening_card_ids[card_id] = time.monotonic()
         try:
-            return _spawn_interactive_cli(card_id, task, assignee)
+            return await _spawn_interactive_cli(card_id, task, assignee)
         except Exception:
             # Spawn failed (bad launcher config, missing binary, ...) — free
             # the card_id so a retry isn't permanently locked out.
@@ -235,7 +238,24 @@ async def open_board_card(card_id: str) -> dict[str, Any]:
             raise
 
 
-def _spawn_interactive_cli(card_id: str, task, assignee: str) -> dict[str, Any]:
+async def _resolve_open_model(card_id: str, assignment_model: str | None, engine: str) -> str | None:
+    """The model to seed the spawned CLI with: the card's explicit
+    `assignment.model` when set, else the model catalog's current default
+    for `engine` (`"claude"` or `"codex"`, matching the catalog's
+    `defaults` map keys — the worker path applies the same fallback in
+    `Worker._resolve_session_execution`). A catalog failure (or no default
+    for this engine) returns None rather than blocking the open."""
+    if assignment_model:
+        return assignment_model
+    try:
+        catalog = await get_model_catalog().get()
+    except Exception as exc:  # noqa: BLE001 — a catalog failure must not block Open
+        logger.warning("model catalog lookup failed while opening card %s: %s", card_id, exc)
+        return None
+    return (catalog.get("defaults") or {}).get(engine) or None
+
+
+async def _spawn_interactive_cli(card_id: str, task, assignee: str) -> dict[str, Any]:
     """Launch `claude`/`codex` in a terminal (local, or over ssh for a
     registered `host` field) seeded with the card's prompt. Reuses the
     same `cc_resume_cmd`/`codex_resume_cmd` WezTerm launcher templates
@@ -282,7 +302,15 @@ def _spawn_interactive_cli(card_id: str, task, assignee: str) -> dict[str, Any]:
     # links the registered session back to this card. Works identically
     # whether the whole thing runs locally or is later ssh-wrapped, since
     # `env` runs as part of the command itself either way.
-    inner_command = f"env LIFEOS_TASK_ID={shlex.quote(card_id)} {binary} {shlex.quote(prompt)}"
+    #
+    # Same model resolution the worker applies at dispatch time: the
+    # card's own model field wins, else the catalog's current default for
+    # this engine — so an interactive Open matches what a worker claim
+    # would have run. Absent either, no `--model` flag is rendered and the
+    # CLI's own configured default decides.
+    model_id = await _resolve_open_model(card_id, assignment.model, assignee)
+    model_flag = f" --model {shlex.quote(model_id)}" if model_id else ""
+    inner_command = f"env LIFEOS_TASK_ID={shlex.quote(card_id)} {binary}{model_flag} {shlex.quote(prompt)}"
     rendered = template.replace("{cwd}", cwd).replace("{inner_command}", inner_command)
     try:
         argv = shlex.split(rendered)
