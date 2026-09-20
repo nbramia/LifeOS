@@ -4242,9 +4242,42 @@ class TestSnoozePresets:
 
 
 class TestSnoozeCustom:
-    """AC: a custom duration (hours/days) and a custom date-time, both
-    resolved to an absolute `until`; a past custom time is refused
-    client-side with no request sent."""
+    """AC: a custom duration (minutes/hours/days, defaulting to days) and a
+    custom date-time, both resolved to an absolute `until`; a past custom
+    time is refused client-side with no request sent."""
+
+    def test_custom_duration_unit_defaults_to_days(self, browser: Browser, agents_base_url):
+        context = browser.new_context(timezone_id="UTC")
+        page = context.new_page()
+        try:
+            snooze_calls = []
+            _open_board(page, agents_base_url, snooze_calls=snooze_calls)
+            page.clock.pause_at(datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc))
+            _open_snooze_picker(page, "t2")
+            unit = page.locator('#board-drawer [data-field="snooze-duration-unit"]')
+            assert unit.input_value() == "days"
+            page.locator('#board-drawer [data-field="snooze-duration-value"]').fill("3")
+            page.locator('#board-drawer [data-action="snooze-duration-confirm"]').click()
+            _wait_for(lambda: len(snooze_calls) == 1, page=page)
+            assert snooze_calls[0]["body"]["until"] == "2026-01-04T10:00:00+00:00"
+        finally:
+            context.close()
+
+    def test_custom_duration_in_minutes(self, browser: Browser, agents_base_url):
+        context = browser.new_context(timezone_id="UTC")
+        page = context.new_page()
+        try:
+            snooze_calls = []
+            _open_board(page, agents_base_url, snooze_calls=snooze_calls)
+            page.clock.pause_at(datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc))
+            _open_snooze_picker(page, "t2")
+            page.locator('#board-drawer [data-field="snooze-duration-value"]').fill("45")
+            page.locator('#board-drawer [data-field="snooze-duration-unit"]').select_option("minutes")
+            page.locator('#board-drawer [data-action="snooze-duration-confirm"]').click()
+            _wait_for(lambda: len(snooze_calls) == 1, page=page)
+            assert snooze_calls[0]["body"]["until"] == "2026-01-01T10:45:00+00:00"
+        finally:
+            context.close()
 
     def test_custom_duration_in_hours(self, browser: Browser, agents_base_url):
         context = browser.new_context(timezone_id="UTC")

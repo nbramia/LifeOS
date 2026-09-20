@@ -661,18 +661,19 @@ export function nextWeekPreset(now) {
   return new Date(now.getFullYear(), now.getMonth(), now.getDate() + daysAhead, 9, 0, 0, 0);
 }
 
-// Hours are exact elapsed time; days are calendar days (`setDate`, local
-// wall clock) rather than a fixed 24h multiple, so "2 days" lands at the
-// same wall-clock time it started at even across a DST change in between
-// — the same reasoning the presets above already use for "tomorrow" and
-// "next Monday".
+// Minutes and hours are exact elapsed time; days are calendar days
+// (`setDate`, local wall clock) rather than a fixed 24h multiple, so
+// "2 days" lands at the same wall-clock time it started at even across a
+// DST change in between — the same reasoning the presets above already
+// use for "tomorrow" and "next Monday".
 export function customDurationUntil(now, amount, unit) {
   if (unit === 'days') {
     const until = new Date(now);
     until.setDate(until.getDate() + amount);
     return until;
   }
-  return new Date(now.getTime() + amount * 60 * 60 * 1000);
+  const perUnitMs = unit === 'minutes' ? 60 * 1000 : 60 * 60 * 1000;
+  return new Date(now.getTime() + amount * perUnitMs);
 }
 
 // ---------------------------------------------------------------------
@@ -791,8 +792,9 @@ export function renderActionRow(container, opts = {}) {
           <label class="drawer-label" for="snooze-duration-value">Custom duration</label>
           <input type="number" min="1" step="1" class="snooze-duration-value" id="snooze-duration-value" data-field="snooze-duration-value" placeholder="4" />
           <select class="snooze-duration-unit" data-field="snooze-duration-unit">
+            <option value="minutes">minutes</option>
             <option value="hours">hours</option>
-            <option value="days">days</option>
+            <option value="days" selected>days</option>
           </select>
           <button type="button" class="drawer-action" data-action="snooze-duration-confirm">Snooze</button>
         </div>
