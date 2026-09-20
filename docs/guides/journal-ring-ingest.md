@@ -148,4 +148,5 @@ Check `LifeOS/Log/Journal/<today>.md` in the vault for the new bullet.
 - [Configuration](configuration.md#journal-ring-ingest) — `LIFEOS_JOURNAL_INGEST_TOKEN` reference.
 - [`api/routes/journal_ingest.py`](../../api/routes/journal_ingest.py) — Implementation; `_adapt_payload()` is the one function to change once a real device's webhook is observed.
 - [`api/services/journal_capture.py`](../../api/services/journal_capture.py) — The deterministic write this endpoint's capture confirmation comes from.
+- [Pebble Capture](pebble-capture.md) — The file-watcher capture path and filing controls; this guide covers the webhook endpoint a ring device posts to.
 - [Apple Health Import](apple-health.md) — The precedent this mirrors: a dedicated bearer-token ingest endpoint for an external capture device.
