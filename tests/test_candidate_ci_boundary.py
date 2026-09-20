@@ -151,6 +151,8 @@ def test_candidate_workflow_pins_actions_and_proves_cpu_wheel_identity():
         "actions/setup-python": "a26af69be951a213d495a4c3e4e4022e16d87065",
         "actions/create-github-app-token": "5d869da34e18e7287c1daad50e0b8ea0f506ce69",
         "actions/github-script": "60a0d83039c74a4aee543508d2ffcb1c3799cdea",
+        "actions/cache/restore": "0057852bfaa89a56745cba8c7296529d2fc39830",
+        "actions/cache/save": "0057852bfaa89a56745cba8c7296529d2fc39830",
     }
     for action, sha in pinned_actions.items():
         assert f"{action}@{sha}" in workflow
@@ -162,6 +164,40 @@ def test_candidate_workflow_pins_actions_and_proves_cpu_wheel_identity():
     assert "requirements-without-torch" not in workflow
     assert 'assert torch.__version__ == os.environ["TORCH_CPU_VERSION"]' in workflow
     assert "torch.version.cuda is None and torch.version.hip is None" in workflow
+
+
+@pytest.mark.unit
+def test_candidate_workflow_caches_the_test_environment_only_from_wheel_installation():
+    """The cached environment is saved from the install step alone.
+
+    The verify step runs candidate code; a save placed after it would let a
+    candidate shape the environment every later run restores. So the save
+    sits between install and verify, only on a miss, keyed on exactly what
+    determines the environment; a hit still proves the torch identity and
+    the package fingerprint the miss path recorded, and the install stays
+    wheels-only.
+    """
+    workflow = (ROOT / ".github/workflows/candidate-verification.yml").read_text()
+    restore_at = workflow.index("name: Restore the installed CPU test environment")
+    install_at = workflow.index("name: Install the declared CPU test environment")
+    save_at = workflow.index("name: Save the installed CPU test environment")
+    verify_at = workflow.index("name: Verify the retained lanes")
+    assert restore_at < install_at < save_at < verify_at
+    assert "actions/cache/save" not in workflow[verify_at:]
+    assert "actions/cache" not in workflow[workflow.index("publish-aggregate:"):]
+    restore = workflow[restore_at:install_at]
+    assert "key: lifeos-test-env-v1-${{ runner.os }}-py${{ steps.python.outputs.python-version }}-torch${{ env.TORCH_CPU_VERSION }}-${{ hashFiles('candidate/requirements.txt') }}" in restore
+    save = workflow[save_at:verify_at]
+    assert "steps.env-cache.outputs.cache-hit != 'true'" in save
+    assert "key: ${{ steps.env-cache.outputs.cache-primary-key }}" in save
+    install = workflow[install_at:save_at]
+    assert 'if [ "$CACHE_HIT" != "true" ]; then' in install
+    assert "python -m playwright install-deps chromium" in install
+    assert 'test "$(python -m pip freeze --all | LC_ALL=C sort | sha256sum)" = "$(cat "$FINGERPRINT")"' in install
+    assert "--no-binary" not in install
+    assert install.count("--only-binary=:all:") == 2
+    # The identity proof runs on both paths: it sits after the branch closes.
+    assert install.index("          fi\n") < install.index('assert torch.__version__ == os.environ["TORCH_CPU_VERSION"]')
 
 
 @pytest.mark.unit

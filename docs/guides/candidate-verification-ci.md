@@ -114,6 +114,22 @@ branch, so a PR that edits the topology is gated by whatever topology `main`
 carries, and an edited topology's first real exercise is the first candidate
 built after that edit merges.
 
+## The cached test environment
+
+Each execution part restores its installed environment — a venv holding the
+CPU torch build and `requirements.txt`, plus Playwright's Chromium — from a
+cache keyed on the runner image, the interpreter version, `TORCH_CPU_VERSION`,
+the requirements hash, and a schema version. On a miss the install step builds
+it with `--only-binary=:all:` (no source distribution ever executes) and
+records a package fingerprint inside the venv; the save step runs immediately
+after, before any candidate code, and nowhere later. On a hit the install
+step activates the venv, installs Chromium's system packages (never cached),
+and fails unless the fingerprint of what was restored equals the one the miss
+path recorded for that key. The torch identity assertions run on both paths.
+Caches written from a `pull_request_target` run are scoped to `main`, so
+every candidate with the same key shares one environment that only wheel
+installation has ever touched.
+
 ## Privacy-audit applicability
 
 `tests/test_fixtures_no_personal_data.py::test_no_fixture_contains_a_real_sensitive_value`
