@@ -4,7 +4,7 @@
 
 LifeOS is a self-hosted AI assistant that connects to your Gmail, Google Calendar, Google Docs/Sheets/Drive, iMessage, phone calls, WhatsApp, Slack, Obsidian vault, Granola meeting transcripts, iPhotos, LinkedIn, Apple contacts, Monarch finances, and Apple Health — then makes all of it **available and actionable through natural language.**
 
-**Front doors:** a web chat, Telegram, voice (tap to talk, from a browser or an iOS Home Screen app), any MCP client (Claude Desktop, Claude Code), or a [Hermes](docs/specs/technical/client-surfaces.md) gateway that fronts your persona bots and falls back to LifeOS's native pipeline if Hermes is unreachable. It can answer from your data, take action on your behalf (draft email, schedule things, edit files), and hand long tasks to an autonomous agent that works while you don't — and reports back with a pull request when the work touches code.
+**Front doors:** a web chat, Telegram, voice (wake word or push-to-talk, from a browser or an iOS Home Screen app), any MCP client (Claude Desktop, Claude Code), or a [Hermes](docs/specs/technical/client-surfaces.md) gateway that fronts your persona bots and falls back to LifeOS's native pipeline if Hermes is unreachable. It can answer from your data, take action on your behalf (draft email, schedule things, edit files), and hand long tasks to an autonomous agent that works while you don't — and reports back with a pull request when the work touches code.
 
 All of your data is indexed and stored **locally** — your vault, messages, photos, financial summaries, and health data never leave your machine. By default, orchestration and synthesis call the Claude API (`LIFEOS_LLM_BACKEND=anthropic`, the default), which sends the current query and its retrieved context to Anthropic. For a no-API-key path, `LIFEOS_LLM_BACKEND=local` routes everything through a local llama-server on your own hardware, and `LIFEOS_LLM_BACKEND=remote` points at any OpenAI-compatible hosted provider (e.g. Fireworks) instead. A nightly sync pulls from your data sources, indexes everything for hybrid search (semantic + keyword), and keeps your relationship graph fresh.
 
@@ -51,13 +51,11 @@ Pick a persona in `/chat`, or message its dedicated Telegram bot — they behave
 
 <img src="docs/images/chat-voice.png" width="800" alt="Voice mode active inside /chat, showing the listening and live-transcript state">
 
-Tap to talk inside `/chat` and hear the reply spoken back — same personas, models, and conversations as text. Setup: [Voice Guide](docs/guides/voice-setup.md).
+Tap to talk inside `/chat`, or leave it listening for a wake phrase — same personas, models, and conversations as text, spoken back to you. Setup: [Voice Guide](docs/guides/voice-setup.md).
 
 Voice runs through the whisper-relay gateway: mic audio in, speech-to-text, the same orchestrator that answers a typed turn, text-to-speech, spoken reply out — reverse-proxied into `/chat` so the browser only ever talks to LifeOS's own origin. It works from an ordinary browser tab or as an installed iOS Home Screen app, each with its own mic-permission grant.
 
-A voice turn is owned by the server the same way a text turn is: closing the app or losing the network mid-answer doesn't kill it — it keeps generating server-side, and the full reply is there when you reopen the conversation. Tapping the dock's cancel button stops an in-flight turn outright, rather than just walking away from it.
-
-A hands-free "Listening" wake-word mode is built into the client and waits on a transcribe endpoint from the voice gateway before it can activate — until that ships, voice is tap-to-talk only.
+A voice turn is owned by the server the same way a text turn is: closing the app or losing the network mid-answer doesn't kill it — it keeps generating server-side, and the full reply is there when you reopen the conversation. Interrupting it is just as direct: say "cancel," "never mind," or "scratch that," or tap the dock's cancel button, and it stops.
 
 </details>
 
