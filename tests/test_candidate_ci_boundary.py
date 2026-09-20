@@ -58,9 +58,29 @@ def test_candidate_workflow_separates_untrusted_execution_from_status_publisher(
     assert 'git -C candidate cat-file commit "$CANDIDATE_SHA"' in workflow
     assert 'test "$FIRST_PARENT" = "$TRUSTED_RUNNER_SHA"' in workflow
     assert workflow.index("name: Bind dispatched runner") < workflow.index("name: Install the declared CPU test environment")
+
+    # Lane selection is a trusted decision taken before any environment is
+    # built: a docs-only candidate installs and executes nothing, and the
+    # publisher records that mode explicitly rather than inferring success
+    # from an absent job.
+    assert workflow.index("name: Bind dispatched runner") < workflow.index("name: Select the lanes") < workflow.index("actions/setup-python")
+    assert "python3 trusted-runner/scripts/candidate_lanes.py" in workflow
+    assert "verification_mode: ${{ steps.select.outputs.mode }}" in workflow
+    executed = "if: ${{ steps.select.outputs.mode == 'executed' }}"
+    for step in ("actions/setup-python", "name: Install the declared CPU test environment", "name: Verify the retained lanes"):
+        block = workflow[workflow.index(step):]
+        block = block[:block.index("\n      - ")]
+        assert executed in block, step
+    for step in ("name: Prove checkout identity", "name: Bind dispatched runner"):
+        block = workflow[workflow.index(step):]
+        block = block[:block.index("\n      - ")]
+        assert executed not in block, step
     assert "create-github-app-token" in workflow
     assert workflow.index("name: candidate-execution") < workflow.index("name: candidate-verification-publisher")
     publisher = workflow[workflow.index("name: candidate-verification-publisher"):]
+    assert "VERIFICATION_MODE: ${{ needs.execute-candidate.outputs.verification_mode }}" in publisher
+    assert "mode === 'docs-only'" in publisher
+    assert "process.env.RESULT === 'success' && explicit" in publisher
     assert "actions/checkout" not in publisher
     assert "--sha \"$CANDIDATE_SHA\"" in workflow
     assert "candidate-verification-${{ github.event.pull_request.number" in workflow
@@ -384,36 +404,34 @@ def test_environment_audit_accepts_a_policy_naming_exactly_main():
 
 
 @pytest.mark.unit
-def test_candidate_workflow_lane_selection_defaults_to_every_lane_before_narrowing():
-    """Lane selection must fail closed.
+def test_candidate_workflow_lane_selection_is_the_trusted_runner_script():
+    """Lane selection is one trusted decision, taken before anything is built.
 
-    The gate skips the server-free browser lane only when the candidate's diff
-    touches no ``web/`` path. Every other outcome — an unavailable diff, an
-    empty diff, a fetch failure — has to run every retained lane, so the
-    default assignment precedes any narrowing and the narrowing sits inside a
-    guard that requires a successful, non-empty diff.
+    The step feeds the changed set to the runner's own ``candidate_lanes.py``
+    (whose fail-closed rules ``tests/test_candidate_lanes.py`` pins: an empty
+    or unavailable diff runs every retained lane, only a ``web/`` path keeps
+    the browser lane, and only the docs-only rule executes nothing) and the
+    verifier consumes exactly the lanes that script chose. The changed set
+    prefers the merge-base diff and falls back to the two-commit diff, so a
+    computation failure degrades to a superset rather than to nothing.
     """
     import yaml
 
     workflow = yaml.safe_load((ROOT / ".github/workflows/candidate-verification.yml").read_text())
     steps = workflow["jobs"]["execute-candidate"]["steps"]
     selection = next(s for s in steps if "Select the lanes" in (s.get("name") or ""))
+    assert selection["id"] == "select"
     script = selection["run"]
-
-    default_at = script.index("LANES=fast-unit,browser-free")
-    narrow_at = script.index("LANES=fast-unit\n")
-    assert default_at < narrow_at, "the every-lane default must precede any narrowing"
-
-    # The narrowing is reachable only through a successful, non-empty diff.
-    guard = script[:narrow_at]
-    assert "git -C candidate diff --name-only" in guard
-    assert '[ -n "$CHANGED" ]' in guard
-
-    # Anchored, so a path merely containing "web/" cannot suppress the lane.
-    assert "grep -q '^web/'" in script
+    assert "git -C candidate diff --name-only --merge-base" in script
+    assert '|| git -C candidate diff --name-only "$TRUSTED_RUNNER_SHA" "$CANDIDATE_SHA"' in script
+    assert "python3 trusted-runner/scripts/candidate_lanes.py" in script
+    assert "candidate/scripts" not in script
+    assert 'sed -n \'s/^lanes=/LANES=/p\'' in script
+    assert workflow["jobs"]["execute-candidate"]["outputs"] == {"verification_mode": "${{ steps.select.outputs.mode }}"}
 
     verify = next(s for s in steps if "Verify the retained lanes" in (s.get("name") or ""))
     assert '--lanes "$LANES"' in verify["run"], "the verifier must consume the selected lanes"
+    assert verify["if"] == "${{ steps.select.outputs.mode == 'executed' }}"
 
 
 @pytest.mark.unit
@@ -425,7 +443,9 @@ def test_publisher_treats_every_non_success_execution_result_as_a_failed_check()
     every part succeeded. Everything else (a failure, a cancellation at the
     ceiling, a job that never started) has to publish failure, which
     requires the mapping to allow-list `success` rather than deny-list the
-    outcomes anyone happened to think of.
+    outcomes anyone happened to think of. Success additionally requires an
+    explicit verification mode, so a job that passed without ever reaching
+    its selection step cannot publish green.
     """
     import yaml
 
@@ -436,7 +456,8 @@ def test_publisher_treats_every_non_success_execution_result_as_a_failed_check()
     script = next(
         step for step in publisher["steps"] if "github-script" in (step.get("uses") or "")
     )["with"]["script"]
-    assert "process.env.RESULT === 'success' ? 'success' : 'failure'" in script
+    assert "process.env.RESULT === 'success' && explicit ? 'success' : 'failure'" in script
+    assert "const explicit = mode === 'executed' || mode === 'docs-only'" in script
 
 
 @pytest.mark.unit
