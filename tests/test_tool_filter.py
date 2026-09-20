@@ -115,6 +115,25 @@ def test_filter_payload_is_deduplicated_and_sorted():
     assert class_to_tool_filter(PRESET_CLASS_PERSONAL_COMM) == payload
 
 
+def test_every_class_includes_project_hierarchy_and_handoff_tools():
+    """Filtered Managed sessions retain the whole durable-project protocol."""
+    required = {
+        "lifeos_task_children",
+        "lifeos_project_start",
+        "lifeos_project_plan",
+        "lifeos_project_complete",
+        "lifeos_project_cancel",
+        "lifeos_task_resume_execution",
+        "lifeos_agent_project_handoff",
+    }
+    for preset_class in ALL_PRESET_CLASSES:
+        if preset_class == PRESET_CLASS_FULLSTACK:
+            continue
+        payload = class_to_tool_filter(preset_class)
+        assert payload is not None
+        assert required <= set(payload["tools"])
+
+
 def test_all_classes_constant_matches_handled_classes():
     """The ALL_PRESET_CLASSES tuple matches what class_to_tool_filter
     actually handles — drift between the two would silently break the

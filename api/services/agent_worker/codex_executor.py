@@ -42,7 +42,7 @@ from api.services.agent_worker.claude_code_executor import (
     _ALTERNATE_AUTH_ENV_PREFIXES,
     _CLARIFY_RE,
 )
-from api.services.agent_worker.delegation import delegation_preamble
+from api.services.agent_worker.delegation import PROJECT_TASK_GUIDANCE, delegation_preamble
 from api.services.agent_worker.local_executor import ExecutorOutcome
 from api.services.agent_worker.remote_spawn import (
     HostResolutionError,
@@ -83,9 +83,16 @@ def _resolve_codex_binary() -> str:
     return resolve_for_spawn(settings.codex_binary)
 
 
-def _delegation_header(session_id: str) -> str:
+def _delegation_header(
+    session_id: str, attempt_id: str | None = None, turn_id: str | None = None,
+) -> str:
     """Per-session preamble line telling Codex its LifeOS session id and how to
     hand off work it can't do (e.g. browser automation) to another engine."""
+    identity = (
+        f"\nlifeos_session_id={session_id}; lifeos_attempt_id={attempt_id}; "
+        f"lifeos_turn_id={turn_id}."
+        if attempt_id and turn_id else ""
+    )
     return "=== YOUR SESSION ===\n" + delegation_preamble(
         session_id,
         trigger=(
@@ -93,7 +100,7 @@ def _delegation_header(session_id: str) -> str:
             "automation you can't perform headlessly —"
         ),
         model='"claude_code" for the browser-enabled Claude Code CLI',
-    )
+    ) + "\n\n" + PROJECT_TASK_GUIDANCE + identity
 
 
 def _git_discipline_header(working_dir: str) -> str:
@@ -223,7 +230,9 @@ class CodexExecutor:
         # `working_dir` is a worker-provisioned worktree — the git-discipline
         # instructions. Only on the opening turn — resume() reloads the
         # thread, which already carries this from the first prompt.
-        delegation = _delegation_header(session.session_id)
+        delegation = _delegation_header(
+            session.session_id, session.attempt_id, session.turn_id,
+        )
         prompt_working_dir = working_dir
         if prompt_working_dir is None and is_local_host(session.host, _api_host_name()):
             prompt_working_dir = os.getcwd()
@@ -333,7 +342,11 @@ class CodexExecutor:
             )
 
     @staticmethod
-    def _clean_env(session_id: str | None = None) -> dict:
+    def _clean_env(
+        session_id: str | None = None,
+        attempt_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> dict:
         """Strip CODEX_* env vars so the subprocess doesn't inherit the
         operator's interactive Codex context — keep CODEX_HOME so auth
         (`~/.codex/auth.json`) is preserved.
@@ -352,6 +365,10 @@ class CodexExecutor:
         }
         if session_id:
             env["LIFEOS_AGENT_SESSION_ID"] = session_id
+            if attempt_id:
+                env["LIFEOS_AGENT_ATTEMPT_ID"] = attempt_id
+            if turn_id:
+                env["LIFEOS_AGENT_TURN_ID"] = turn_id
             from api.services.agent_worker.session_resources import scratch_env
             env.update(scratch_env(session_id))
         return env
@@ -414,7 +431,9 @@ class CodexExecutor:
                 target=target,
                 unset_env_names=self._remote_unset_env_names(),
                 session_id=sid,
-                env={key: value for key, value in self._clean_env(sid).items() if key in {"TMPDIR", "TMP", "TEMP"}},
+                env={key: value for key, value in self._clean_env(
+                    sid, session.attempt_id, session.turn_id,
+                ).items() if key in {"TMPDIR", "TMP", "TEMP", "LIFEOS_AGENT_ATTEMPT_ID", "LIFEOS_AGENT_TURN_ID"}},
             )
 
         self.transcript_store.append(sid, "codex_spawn", {
@@ -431,7 +450,7 @@ class CodexExecutor:
                 stderr=subprocess.PIPE,
                 cwd=os.getcwd() if is_remote else command_working_dir,
                 text=True,
-                env=self._clean_env(sid),
+                env=self._clean_env(sid, session.attempt_id, session.turn_id),
                 # own process-group leader so the operator kill can
                 # `os.killpg(pgid, ...)` codex + its children without touching
                 # the worker process. Mirrors ClaudeCodeExecutor. For a remote

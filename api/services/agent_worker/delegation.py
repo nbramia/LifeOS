@@ -16,6 +16,45 @@ TRANSCRIPT_READ = "lifeos_agent_transcript_read"
 SEND = "lifeos_agent_send"
 SESSIONS_LIST = "lifeos_agent_sessions_list"
 YIELD_UNTIL = "lifeos_agent_yield_until"
+PROJECT_HANDOFF = "lifeos_agent_project_handoff"
+TASK_CHILDREN = "lifeos_task_children"
+PROJECT_PLAN = "lifeos_project_plan"
+PROJECT_COMPLETE = "lifeos_project_complete"
+PROJECT_CANCEL = "lifeos_project_cancel"
+
+
+# Shared opening-prompt fragment. Executors import this verbatim so every
+# route distinguishes durable board work from ephemeral session delegation.
+PROJECT_TASK_GUIDANCE = f"""\
+<project_tasks>
+LifeOS has two separate delegation mechanisms. `{SPAWN}` creates an ephemeral
+session child in your session lineage; it is not a board task and does not
+create project hierarchy. Durable project children are ordinary LifeOS tasks:
+inspect them with `{TASK_CHILDREN}` and give each an explicit, independent
+assignment and execution request. Never assume a child inherits your route,
+model, host, working directory, or provider consent; omitted assignment stays
+unassigned, and cloud/provider access is allowed only within the already
+authorized lineage scope.
+
+A durable hierarchy has exactly one child level. Use stable child keys and
+inspect the existing children before retrying or creating work. A child cannot
+become a project. For an existing project, use `{PROJECT_PLAN}` to run one
+bounded coordinator session; it is not an always-on monitor and does not wake
+automatically for every child completion.
+
+If you are the current executor of an ordinary live top-level task and need to
+turn that task into a project, call `{PROJECT_HANDOFF}` once with a stable
+operation id and its bounded child plan. This is a terminal action for your
+current turn: do not call regular attach/create-to-parent flows, do not keep
+working afterward, and do not report the original task as completed. The
+worker releases staged children only after it has observed your turn stop.
+Pending handoffs remain pending if that stop cannot be proved.
+
+Projects finish only through `{PROJECT_COMPLETE}` after their children and
+reviews are resolved. Use `{PROJECT_CANCEL}` for project cancellation; it
+cascades only after confirmation and may remain pending while a runtime stop
+is unverified. Cancelling one child does not cancel its parent or siblings.
+</project_tasks>"""
 
 
 def delegation_preamble(session_id: str, *, trigger: str, model: str) -> str:

@@ -34,8 +34,9 @@ The LifeOS MCP server dynamically discovers endpoints from the LifeOS OpenAPI sp
 - Fallback schemas when API unavailable
 
 The source catalog contains 69 curated LifeOS endpoint tools. It also
-registers 9 worker coordination tools (`lifeos_agent_*`), including
-`lifeos_agent_execution_override`, for a 78-tool fallback catalog. When the
+registers 10 worker coordination tools (`lifeos_agent_*`), including
+`lifeos_agent_project_handoff` and `lifeos_agent_execution_override`, for a
+79-tool fallback catalog. When the
 OpenAPI document omits an unavailable endpoint, the live list may be smaller;
 the inter-agent tools remain registered as a separate contract.
 
@@ -102,6 +103,7 @@ Tasks can also be managed via natural language chat. See [Task Management spec](
 | `lifeos_project_plan` | Start or recover an idempotent agent-owner planning/delegation run |
 | `lifeos_project_cancel` | Preview cancellation scope, then confirm a resumable cascading cancellation with a stable operation ID |
 | `lifeos_task_resume_execution` | Resume a paused ordinary task after its final child link is removed |
+| `lifeos_agent_project_handoff` | The current executor turn stages an ordinary top-level task as a one-level durable project and then ends; children remain blocked until that turn has stopped and been verified |
 
 Project classification comes only from incoming `fields.parent_id` references;
 it is unrelated to `lifeos_agent_spawn` session ancestry. Before mutating a
@@ -112,6 +114,17 @@ retry. `lifeos_project_cancel` is intentionally two-step: the preview
 reports unfinished, running, and awaiting-review work; confirmation abandons
 pending-review output without accepting it, and a partial result remains
 pending until retried with the same `operation_id`.
+
+`lifeos_agent_project_handoff` is distinct from ordinary child attachment and
+from `lifeos_agent_spawn`. It accepts an attested current executor turn, a
+stable operation ID, and 1–20 keyed child requests. The server derives the
+source task and session; it rejects a child, an existing project, a stale turn,
+or a caller that tries to broaden provider consent. Each durable child retains
+its own explicit assignment and execution request; omitted assignment remains
+unassigned. A successful staging response tells the caller to stop, and work
+does not become runnable until the worker observes and records that terminal
+turn boundary. If termination cannot be verified, the handoff remains visibly
+pending rather than reporting the parent complete.
 
 ### Human Queue Tools
 
@@ -608,4 +621,4 @@ See `mcp_server.py` for implementation details:
 
 - [API Reference](api-reference.md) -- Full API endpoint contracts
 - [Chat UI](chat-ui.md) -- Chat interface that uses the same tools
-- [Agent Worker](agent-worker.md) -- The `lifeos_agent_*` family extends the MCP catalog for inter-agent coordination (spawn / send / check / yield_until / kill / transcript_read / sessions_list / user_ask)
+- [Agent Worker](agent-worker.md) -- The `lifeos_agent_*` family extends the MCP catalog for durable handoff and inter-agent coordination

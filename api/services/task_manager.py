@@ -351,6 +351,7 @@ class TaskManager:
         notes: Optional[str] = None,
         fields: Optional[dict[str, str]] = None,
         _log_content: bool = True,
+        _project_handoff_operation: Optional[str] = None,
     ) -> Task:
         """Create a new task at the top of its context file, update index.
 
@@ -359,6 +360,43 @@ class TaskManager:
         that would corrupt the task line or hijack another task's id — see
         `_validate_text_fields`.
         """
+        if fields:
+            from api.services.task_projects import (
+                ABANDONED_AT_FIELD,
+                CANCEL_OPERATION_FIELD,
+                CANCEL_REQUESTED_AT_FIELD,
+                COORDINATOR_REQUEST_FIELD,
+                COORDINATOR_SESSION_FIELD,
+                EXECUTION_PAUSED_FIELD,
+                EXECUTION_RESERVATION_FIELD,
+                HANDOFF_ACTIVATED_AT_FIELD,
+                HANDOFF_OPERATION_FIELD,
+                HANDOFF_READY_AT_FIELD,
+                HANDOFF_REQUESTED_AT_FIELD,
+                HANDOFF_REQUEST_HASH_FIELD,
+                HANDOFF_SOURCE_ATTEMPT_FIELD,
+                HANDOFF_SOURCE_SESSION_FIELD,
+                HANDOFF_SOURCE_TURN_FIELD,
+                LAST_ABORTED_HANDOFF_FIELD,
+                LAST_CANCEL_OPERATION_FIELD,
+                LAST_HANDOFF_OPERATION_FIELD,
+                ProjectConflictError,
+            )
+            internal_fields = {
+                EXECUTION_PAUSED_FIELD, EXECUTION_RESERVATION_FIELD,
+                COORDINATOR_SESSION_FIELD, COORDINATOR_REQUEST_FIELD,
+                CANCEL_OPERATION_FIELD, CANCEL_REQUESTED_AT_FIELD,
+                LAST_CANCEL_OPERATION_FIELD, ABANDONED_AT_FIELD,
+                HANDOFF_OPERATION_FIELD, HANDOFF_SOURCE_SESSION_FIELD,
+                HANDOFF_SOURCE_ATTEMPT_FIELD, HANDOFF_SOURCE_TURN_FIELD,
+                HANDOFF_REQUEST_HASH_FIELD, HANDOFF_REQUESTED_AT_FIELD,
+                HANDOFF_READY_AT_FIELD, LAST_HANDOFF_OPERATION_FIELD,
+                HANDOFF_ACTIVATED_AT_FIELD, LAST_ABORTED_HANDOFF_FIELD,
+            }
+            if set(fields) & internal_fields:
+                raise ProjectConflictError(
+                    "use the explicit project lifecycle action for internal fields"
+                )
         if status is not None and status not in VALID_STATUSES:
             raise ValueError(
                 f"Invalid status '{status}'. Must be one of: {', '.join(sorted(VALID_STATUSES))}"
@@ -388,20 +426,40 @@ class TaskManager:
                 self.rebuild_index()
                 from api.services.task_projects import (
                     EXECUTION_PAUSED_FIELD,
+                    ProjectConflictError,
                     build_task_hierarchy,
+                    clean_parent_id,
                     validate_parent_change,
                 )
 
                 existing_hierarchy = build_task_hierarchy(self._tasks.values())
                 hierarchy = build_task_hierarchy([*self._tasks.values(), task])
-                validate_parent_change(
-                    hierarchy,
-                    task.id,
-                    parent_id,
-                    has_live_session=self._project_task_has_live_session,
-                    has_live_coordinator=self._project_task_has_live_coordinator,
-                )
-                if not existing_hierarchy.children(parent_id):
+                if _project_handoff_operation:
+                    from api.services.task_projects import HANDOFF_OPERATION_FIELD
+
+                    parent = self._tasks.get(parent_id)
+                    expected_prefix = (
+                        f"project-handoff:{parent_id}:{_project_handoff_operation}:"
+                    )
+                    if (
+                        parent is None
+                        or parent.fields.get(HANDOFF_OPERATION_FIELD)
+                        != _project_handoff_operation
+                        or not task.fields.get("operation_key", "").startswith(expected_prefix)
+                        or clean_parent_id(parent.fields.get("parent_id"))
+                    ):
+                        raise ProjectConflictError(
+                            "staged child does not match the pending project handoff"
+                        )
+                else:
+                    validate_parent_change(
+                        hierarchy,
+                        task.id,
+                        parent_id,
+                        has_live_session=self._project_task_has_live_session,
+                        has_live_coordinator=self._project_task_has_live_coordinator,
+                    )
+                if not existing_hierarchy.children(parent_id) and not _project_handoff_operation:
                     # The pause is the durable prerequisite for child creation;
                     # an interrupted attachment leaves safe, resumable work.
                     self.update(
@@ -445,6 +503,7 @@ class TaskManager:
         reminder_id: Optional[str] = None,
         notes: Optional[str] = None,
         fields: Optional[dict[str, str]] = None,
+        _project_handoff_operation: Optional[str] = None,
     ) -> tuple[Task, bool]:
         """Atomically find or create a task for a durable source operation.
 
@@ -483,6 +542,7 @@ class TaskManager:
                 notes=notes,
                 fields=merged_fields,
                 _log_content=False,
+                _project_handoff_operation=_project_handoff_operation,
             ), True
 
     def find_by_operation(self, operation_key: str) -> Optional[Task]:
@@ -749,7 +809,11 @@ class TaskManager:
                 return False
 
             from api.services import agent_board
-            from api.services.task_projects import ProjectConflictError
+            from api.services.task_projects import (
+                HANDOFF_OPERATION_FIELD,
+                ProjectConflictError,
+                clean_parent_id,
+            )
 
             lifecycle_tags = {
                 agent_board.RUNNING_TAG,
@@ -761,6 +825,15 @@ class TaskManager:
             to_lower = to_norm.lower()
 
             def guard_lifecycle_transition(task: Task) -> None:
+                parent_id = clean_parent_id(task.fields.get("parent_id"))
+                parent = self._tasks.get(parent_id) if parent_id else None
+                if (
+                    from_norm in lifecycle_tags or to_lower in lifecycle_tags
+                ) and (
+                    task.fields.get(HANDOFF_OPERATION_FIELD)
+                    or (parent and parent.fields.get(HANDOFF_OPERATION_FIELD))
+                ):
+                    raise ProjectConflictError("project handoff is pending")
                 if (
                     to_lower in lifecycle_tags
                     and not self._project_claim_allowed(task)
@@ -903,12 +976,34 @@ class TaskManager:
         the tag is already absent.
         """
         tag_cmp = tag.lstrip("#").lower()
-        with self._lock:
+        with self._lock, exclusive_operation_lock(self.index_path.parent / ".task-operation.lock"):
+            self.rebuild_index()
             current = self._tasks.get(task_id)
             if not current:
                 return False
             if not any(t.lstrip("#").lower() == tag_cmp for t in current.tags):
                 return False
+            from api.services import agent_board
+            from api.services.task_projects import (
+                HANDOFF_OPERATION_FIELD,
+                ProjectConflictError,
+                clean_parent_id,
+            )
+
+            lifecycle_tags = {
+                agent_board.RUNNING_TAG,
+                agent_board.BLOCKED_TAG,
+                agent_board.COMPLETED_TAG,
+                "agent-failed",
+                "agent-budget-exceeded",
+            }
+            parent_id = clean_parent_id(current.fields.get("parent_id"))
+            parent = self._tasks.get(parent_id) if parent_id else None
+            if tag_cmp in lifecycle_tags and (
+                current.fields.get(HANDOFF_OPERATION_FIELD)
+                or (parent and parent.fields.get(HANDOFF_OPERATION_FIELD))
+            ):
+                raise ProjectConflictError("project handoff is pending")
 
             path = Path(current.source_file)
 
@@ -1128,6 +1223,16 @@ class TaskManager:
             EXECUTION_PAUSED_FIELD,
             EXECUTION_RESERVATION_FIELD,
             LAST_CANCEL_OPERATION_FIELD,
+            HANDOFF_ACTIVATED_AT_FIELD,
+            HANDOFF_OPERATION_FIELD,
+            HANDOFF_READY_AT_FIELD,
+            HANDOFF_REQUESTED_AT_FIELD,
+            HANDOFF_REQUEST_HASH_FIELD,
+            HANDOFF_SOURCE_ATTEMPT_FIELD,
+            HANDOFF_SOURCE_SESSION_FIELD,
+            HANDOFF_SOURCE_TURN_FIELD,
+            LAST_ABORTED_HANDOFF_FIELD,
+            LAST_HANDOFF_OPERATION_FIELD,
             ProjectConflictError,
             build_task_hierarchy,
             clean_parent_id,
@@ -1144,6 +1249,16 @@ class TaskManager:
             CANCEL_REQUESTED_AT_FIELD,
             LAST_CANCEL_OPERATION_FIELD,
             ABANDONED_AT_FIELD,
+            HANDOFF_OPERATION_FIELD,
+            HANDOFF_SOURCE_SESSION_FIELD,
+            HANDOFF_SOURCE_ATTEMPT_FIELD,
+            HANDOFF_SOURCE_TURN_FIELD,
+            HANDOFF_REQUEST_HASH_FIELD,
+            HANDOFF_REQUESTED_AT_FIELD,
+            HANDOFF_READY_AT_FIELD,
+            LAST_HANDOFF_OPERATION_FIELD,
+            HANDOFF_ACTIVATED_AT_FIELD,
+            LAST_ABORTED_HANDOFF_FIELD,
         }
         if not project_action and fields_patch and set(fields_patch) & internal_fields:
             raise ProjectConflictError("use the explicit project lifecycle action for internal fields")
@@ -1151,6 +1266,19 @@ class TaskManager:
         parent = self._tasks.get(parent_id) if parent_id else None
         if parent and parent.fields.get(CANCEL_OPERATION_FIELD) and not project_action:
             raise ProjectConflictError("parent project cancellation is pending")
+        if parent and parent.fields.get(HANDOFF_OPERATION_FIELD):
+            if not project_action and (
+                tags_change or "status" in kwargs or set(fields_patch or {})
+                & {"parent_id", "model", "effort", "host", "working_dir", "assigned_by"}
+            ):
+                raise ProjectConflictError("parent project handoff is pending")
+
+        handoff_pending = bool(current.fields.get(HANDOFF_OPERATION_FIELD))
+        if handoff_pending and project_operation not in {
+            "handoff-stage", "handoff-finalize", "cancel",
+        }:
+            if project_action or tags_change or "status" in kwargs or fields_patch:
+                raise ProjectConflictError("project handoff is pending")
 
         if not entry.is_project:
             return
@@ -1199,6 +1327,7 @@ class TaskManager:
     def _guard_project_delete(self, task: Task) -> None:
         from api.services.task_projects import (
             CANCEL_OPERATION_FIELD,
+            HANDOFF_OPERATION_FIELD,
             ProjectConflictError,
             build_task_hierarchy,
             clean_parent_id,
@@ -1210,6 +1339,8 @@ class TaskManager:
             raise ProjectConflictError("detach or reparent project children before deleting the parent")
         if task.fields.get(CANCEL_OPERATION_FIELD):
             raise ProjectConflictError("project cancellation is pending")
+        if task.fields.get(HANDOFF_OPERATION_FIELD):
+            raise ProjectConflictError("project handoff is pending")
         if self._project_task_has_live_coordinator(task):
             raise ProjectConflictError("project coordinator is live")
         if clean_parent_id(task.fields.get("parent_id")):
@@ -1226,6 +1357,7 @@ class TaskManager:
             CANCEL_OPERATION_FIELD,
             EXECUTION_PAUSED_FIELD,
             EXECUTION_RESERVATION_FIELD,
+            HANDOFF_OPERATION_FIELD,
             build_task_hierarchy,
             clean_parent_id,
             field_timestamp_future,
@@ -1244,6 +1376,8 @@ class TaskManager:
         parent_id = clean_parent_id(task.fields.get("parent_id"))
         parent = self._tasks.get(parent_id) if parent_id else None
         if parent and parent.fields.get(CANCEL_OPERATION_FIELD):
+            return False
+        if parent and parent.fields.get(HANDOFF_OPERATION_FIELD):
             return False
         return True
 

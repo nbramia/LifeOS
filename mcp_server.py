@@ -531,7 +531,7 @@ CURATED_ENDPOINTS = {
 }
 
 # Contract count for the source catalog. The live fallback catalog is 69
-# curated tools plus 9 lifeos_agent_* tools = 78.
+# curated tools plus 10 lifeos_agent_* tools = 79.
 CURATED_TOOL_COUNT = 69
 
 
@@ -550,6 +550,8 @@ class LifeOSMCPServer:
         self._trusted_session_id = (
             trusted_session_id or os.environ.get("LIFEOS_AGENT_SESSION_ID") or ""
         ).strip()
+        self._trusted_attempt_id = os.environ.get("LIFEOS_AGENT_ATTEMPT_ID", "").strip()
+        self._trusted_turn_id = os.environ.get("LIFEOS_AGENT_TURN_ID", "").strip()
         self._mcp_transport_secret = ""
         # Per-session tool-result cache. Bypassed when the caller
         # doesn't supply a session id (which is the common case for local-CLI
@@ -1407,6 +1409,31 @@ class LifeOSMCPServer:
                 expected = ""
             if not expected or not hmac.compare_digest(caller_proof, expected):
                 return {"error": "invalid MCP caller proof"}
+        caller_attempt_id = None
+        caller_turn_id = None
+        if tool_name == "lifeos_agent_project_handoff":
+            supplied_attempt = (arguments.pop("caller_attempt_id", None) or "").strip()
+            supplied_turn = (arguments.pop("caller_turn_id", None) or "").strip()
+            turn_proof = (arguments.pop("caller_turn_proof", None) or "").strip()
+            if trusted_session_id:
+                caller_attempt_id = self._trusted_attempt_id
+                caller_turn_id = self._trusted_turn_id
+                if not caller_attempt_id or not caller_turn_id:
+                    return {"error": "trusted MCP turn identity is unavailable"}
+            else:
+                caller_attempt_id = supplied_attempt
+                caller_turn_id = supplied_turn
+                try:
+                    from api.services.agent_worker.inter_agent import (
+                        caller_turn_proof_for_session,
+                    )
+                    expected_turn = caller_turn_proof_for_session(
+                        caller_session_id, caller_attempt_id, caller_turn_id, secret,
+                    )
+                except Exception:
+                    expected_turn = ""
+                if not expected_turn or not hmac.compare_digest(turn_proof, expected_turn):
+                    return {"error": "invalid MCP caller turn proof"}
         try:
             from api.services.agent_worker.inter_agent import (
                 Caps,
@@ -1450,6 +1477,8 @@ class LifeOSMCPServer:
                 max_concurrent_managed=_settings.agent_max_concurrent_managed,
             ),
             managed_driver=managed_driver,
+            caller_attempt_id=caller_attempt_id,
+            caller_turn_id=caller_turn_id,
         )
         return inter_dispatch(ctx, tool_name, arguments)
 

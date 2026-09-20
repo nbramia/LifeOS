@@ -16,6 +16,7 @@ from api.services.agent_worker.transcript_store import TranscriptStore
 from api.services.task_manager import get_task_manager, Task, TaskConflictError, VALID_STATUSES
 from api.services.task_projects import (
     ProjectConflictError,
+    ProjectHandoffError,
     ProjectTaskService,
     TaskHierarchy,
     build_task_hierarchy,
@@ -239,6 +240,7 @@ class TaskResponse(BaseModel):
     hierarchy_valid: bool = True
     hierarchy_error: Optional[str] = None
     parent_cancellation_pending: bool = False
+    parent_handoff_pending: bool = False
     project: Optional[dict] = None
 
     @classmethod
@@ -743,6 +745,13 @@ class CancelProjectRequest(BaseModel):
     operation_id: Optional[str] = Field(default=None, min_length=1, max_length=200)
 
 
+class FinalizeProjectHandoffRequest(BaseModel):
+    operation_id: str = Field(..., min_length=1, max_length=128)
+    source_session_id: str = Field(..., min_length=1, max_length=200)
+    source_attempt_id: str = Field(..., min_length=1, max_length=200)
+    source_turn_id: str = Field(..., min_length=1, max_length=200)
+
+
 @router.post("/{task_id}/project/start", response_model=TaskResponse)
 async def start_project(task_id: str):
     manager = get_task_manager()
@@ -804,6 +813,29 @@ async def cancel_project(task_id: str, body: CancelProjectRequest):
     except TaskConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/{task_id}/project/handoff/finalize")
+async def finalize_project_handoff(
+    task_id: str, body: FinalizeProjectHandoffRequest,
+):
+    """Release one staged handoff after the worker recorded exact-turn quiescence."""
+    try:
+        return _project_service().finalize_handoff(
+            task_id,
+            operation_id=body.operation_id,
+            source_session_id=body.source_session_id,
+            source_attempt_id=body.source_attempt_id,
+            source_turn_id=body.source_turn_id,
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Task not found")
+    except ProjectHandoffError as exc:
+        raise HTTPException(
+            status_code=409, detail={"code": exc.code, "message": str(exc)},
+        ) from exc
+    except (TaskConflictError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 

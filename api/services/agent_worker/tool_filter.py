@@ -53,6 +53,7 @@ CROSS_CUTTING_LIFEOS_TOOLS = (
     "lifeos_agent_transcript_read",
     "lifeos_agent_sessions_list",
     "lifeos_agent_user_ask",
+    "lifeos_agent_project_handoff",
     # General vault search — often the first move on any task
     "lifeos_search",
     "lifeos_ask",
@@ -63,6 +64,12 @@ CROSS_CUTTING_LIFEOS_TOOLS = (
     "lifeos_task_list",
     "lifeos_task_update",
     "lifeos_task_complete",
+    "lifeos_task_children",
+    "lifeos_project_start",
+    "lifeos_project_plan",
+    "lifeos_project_complete",
+    "lifeos_project_cancel",
+    "lifeos_task_resume_execution",
     "lifeos_reminder_create",
     "lifeos_reminder_list",
     # Calendar reads are common across most classes; writes stay class-specific.

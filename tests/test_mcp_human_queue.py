@@ -1,7 +1,7 @@
 """
 Tests that the three Human-queue MCP tools are registered and
 reachable over both the stdio and HTTP transports, and that the total tool
-count (78 = 69 CURATED_ENDPOINTS + 9 lifeos_agent_*) matches AGENTS.md.
+count (79 = 69 CURATED_ENDPOINTS + 10 lifeos_agent_*) matches AGENTS.md.
 """
 import importlib.util
 from pathlib import Path
@@ -148,11 +148,11 @@ class TestHttpTransportRegistration:
         assert _HUMAN_QUEUE_TOOL_NAMES <= names
 
     def test_total_tool_count_matches_agents_md(self):
-        """78 = 69 CURATED_ENDPOINTS + 9 lifeos_agent_* — see AGENTS.md's
+        """79 = 69 CURATED_ENDPOINTS + 10 lifeos_agent_* — see AGENTS.md's
         mcp_server.py row."""
         module = _load_mcp_module()
         server = _server_built_from_live_spec(module)
-        assert len(server.tools) == 78
+        assert len(server.tools) == 79
 
 
 def _server_built_from_fallback(module):

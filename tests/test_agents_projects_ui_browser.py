@@ -127,7 +127,7 @@ def _stub(page: Page, state, seen):
                 )
             ]
             route.fulfill(status=200, content_type="application/json",
-                          body=json.dumps({"tasks": children, "total": 8, "limit": 50, "offset": 0}))
+                          body=json.dumps({"tasks": children, "total": len(children), "limit": 50, "offset": 0}))
         elif url.rstrip("/").endswith("/api/tasks/project-1/project/cancel") and method == "POST" and request.post_data_json["confirm"] is False:
             seen.append((method, url, request.post_data_json))
             route.fulfill(status=200, content_type="application/json", body=json.dumps({
@@ -212,6 +212,54 @@ def test_project_actions_and_relationship_mutations(page: Page, agents_base_url)
     assert calls[("POST", "/tasks")]["fields"] == {"parent_id": "project-1"}
     assert calls[("PUT", "/tasks/existing-child")] == {"fields": {"parent_id": "project-1"}}
     assert calls[("PUT", "/tasks/child-1")] == {"fields": {"parent_id": "next-project"}}
+
+
+def test_project_completion_without_cancelled_children_skips_confirmation(page: Page, agents_base_url):
+    """Test completing a project with no cancelled children posts without a confirmation dialog."""
+    state, seen = _state(), []
+    project = state["lanes"]["assigned"][0]
+    project["child_count"] = 7
+    project["project"]["child_count"] = 7
+    project["project"]["counts"]["cancelled"] = 0
+    state["lanes"]["human_queue"] = [
+        card for card in state["lanes"]["human_queue"] if card["id"] != "child-cancelled"
+    ]
+    dialogs = []
+    page.on("dialog", lambda dialog: (dialogs.append(dialog.message), dialog.dismiss()))
+    _open(page, agents_base_url, state, seen)
+    page.locator('[data-card-id="project-1"]').click()
+
+    with page.expect_request(lambda request: (
+        request.method == "POST"
+        and request.url.rstrip("/").endswith("/api/tasks/project-1/project/complete")
+    )) as request_info:
+        page.locator('[data-action="project-complete"]').click()
+
+    assert request_info.value.post_data_json == {"acknowledge_cancelled_children": False}
+    assert dialogs == []
+
+
+def test_project_completion_declined_for_cancelled_child_keeps_project_open(page: Page, agents_base_url):
+    """Test declining cancelled-child confirmation leaves the project uncompleted without a request."""
+    state, seen = _state(), []
+    dialogs = []
+
+    def dismiss(dialog):
+        dialogs.append(dialog.message)
+        dialog.dismiss()
+
+    page.on("dialog", dismiss)
+    _open(page, agents_base_url, state, seen)
+    page.locator('[data-card-id="project-1"]').click()
+    page.locator('[data-action="project-complete"]').click()
+    expect(page.locator('[data-action="project-complete"]')).to_be_enabled()
+
+    assert dialogs == ["Close this project with 1 cancelled child?"]
+    assert not any(
+        method == "POST" and url.rstrip("/").endswith("/api/tasks/project-1/project/complete")
+        for method, url, _ in seen
+    )
+    expect(page.locator('.board-lane[data-lane="assigned"] [data-card-id="project-1"]')).to_be_visible()
 
 
 def test_pending_project_cancellation_reuses_preview_operation_id(page: Page, agents_base_url):

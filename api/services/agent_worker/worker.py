@@ -118,6 +118,15 @@ from api.services.runtime_identity import (
     heartbeat_runtime_identity,
     publish_runtime_identity,
 )
+from api.services.task_projects import (
+    HANDOFF_OPERATION_FIELD,
+    HANDOFF_QUIESCENT_EVENT,
+    HANDOFF_REQUEST_EVENT,
+    HANDOFF_SOURCE_ATTEMPT_FIELD,
+    HANDOFF_SOURCE_SESSION_FIELD,
+    HANDOFF_SOURCE_TURN_FIELD,
+    LAST_HANDOFF_OPERATION_FIELD,
+)
 from config.settings import settings
 
 
@@ -979,6 +988,7 @@ class Worker:
             logger.info("released %d abandoned answered-question claim(s)", recovered_claims)
         # Reconcile task projections left between the durable marker and the
         # HTTP/Markdown write before dispatching any sessions.
+        self._reconcile_project_handoffs()
         self.lifecycle_projector.replay_pending()
         pending = self.session_store.list_non_terminal()
         # Sessions the detached-restart primitive deliberately killed. Read once
@@ -993,6 +1003,8 @@ class Worker:
         recovered = 0
         for session in pending:
             sid = session.session_id
+            if self._recover_project_handoff_session(session):
+                continue
             # Sleeping sessions are healthy — main loop will wake them.
             if session.status == STATUS_YIELDED:
                 continue
@@ -1104,6 +1116,7 @@ class Worker:
         # worker is paused or near its daily cap.
         self._process_human_queue()
         self._replay_wait_wakeups()
+        self._reconcile_project_handoffs()
         # Heal any vault tag left stranded by a terminal status write that
         # bypassed the projector (e.g. a kill landing on a parked/offline
         # session — see `_reconcile_lifecycle_drift`). Also never gated on
@@ -3270,6 +3283,8 @@ class Worker:
                 task_id = task.get("id")
                 if not task_id:
                     continue
+                if (task.get("fields") or {}).get(HANDOFF_OPERATION_FIELD):
+                    continue
                 session = self.session_store.get(task_id)
                 if session is None:
                     continue
@@ -3732,6 +3747,7 @@ class Worker:
                 task.get("is_project")
                 or task.get("hierarchy_valid") is False
                 or task.get("parent_cancellation_pending")
+                or task.get("parent_handoff_pending")
             ):
                 continue
             if str((task.get("fields") or {}).get("execution_paused", "")).lower() in {
@@ -3804,6 +3820,7 @@ class Worker:
             and not task.get("is_project")
             and task.get("hierarchy_valid") is not False
             and not task.get("parent_cancellation_pending")
+            and not task.get("parent_handoff_pending")
             and str(fields.get("execution_paused", "")).lower() not in {"1", "true", "yes", "on"}
         )
 
@@ -3819,6 +3836,7 @@ class Worker:
             and not task.get("is_project")
             and task.get("hierarchy_valid") is not False
             and not task.get("parent_cancellation_pending")
+            and not task.get("parent_handoff_pending")
             and str(fields.get("execution_paused", "")).lower() not in {"1", "true", "yes", "on"}
         )
 
@@ -3850,6 +3868,7 @@ class Worker:
             or task.get("is_project")
             or task.get("hierarchy_valid") is False
             or task.get("parent_cancellation_pending")
+            or task.get("parent_handoff_pending")
             or str(fields.get("execution_paused", "")).lower() in {"1", "true", "yes", "on"}
         ):
             self._fail_closed_task_resume(session, phase)
@@ -4660,6 +4679,9 @@ class Worker:
             return
         session = current
 
+        if self._maybe_finalize_project_handoff(session, outcome):
+            return
+
         if outcome.status == STATUS_BLOCKED:
             if outcome.reason == REASON_AWAITING_PLAN_APPROVAL:
                 prompt = "Plan ready — reply 'approve' to proceed, 'reject' to cancel, or send feedback to refine."
@@ -5210,6 +5232,9 @@ class Worker:
         if not self._outcome_matches_snapshot(outcome, current):
             return
         session = current
+
+        if self._maybe_finalize_project_handoff(session, outcome):
+            return
 
         if outcome.status == STATUS_BLOCKED and outcome.reason == REASON_AWAITING_CLARIFICATION:
             question_body = (outcome.final_text or "").strip()
@@ -6294,6 +6319,153 @@ class Worker:
     # Outcome handling (shared between fresh dispatch and sleep wake-up)
     # ------------------------------------------------------------------
 
+    def _maybe_finalize_project_handoff(self, session: Session, outcome) -> bool:
+        """Consume an exact post-return handoff without projecting task completion."""
+        attempt_id = getattr(outcome, "attempt_id", None) or session.attempt_id
+        turn_id = getattr(outcome, "turn_id", None) or session.turn_id
+        try:
+            events = self.transcript_store.read(session.session_id)
+        except Exception as exc:
+            logger.warning("handoff transcript read failed for %s: %s", session.session_id, exc)
+            return False
+        request = next((
+            event.get("payload") or {}
+            for event in reversed(events)
+            if event.get("kind") == HANDOFF_REQUEST_EVENT
+            and (event.get("payload") or {}).get("source_attempt_id") == attempt_id
+            and (event.get("payload") or {}).get("source_turn_id") == turn_id
+        ), None)
+        if request is None:
+            return False
+        operation_id = request.get("operation_id")
+        task = self._fetch_task(session.task_id)
+        fields = (task or {}).get("fields") or {}
+        if task is None:
+            self.transcript_store.append(session.session_id, "project_handoff_finalize_deferred", {
+                "operation_id": operation_id, "reason": "task unavailable",
+            })
+            return True
+        if fields.get(LAST_HANDOFF_OPERATION_FIELD) == operation_id:
+            return True
+        if (
+            fields.get(HANDOFF_OPERATION_FIELD) != operation_id
+            or fields.get(HANDOFF_SOURCE_SESSION_FIELD) != session.session_id
+            or fields.get(HANDOFF_SOURCE_ATTEMPT_FIELD) != attempt_id
+            or fields.get(HANDOFF_SOURCE_TURN_FIELD) != turn_id
+        ):
+            return True
+        if self.session_store.is_cancelled(session.task_id, attempt_id, turn_id):
+            return True
+        if not any(
+            event.get("kind") == HANDOFF_QUIESCENT_EVENT
+            and (event.get("payload") or {}).get("operation_id") == operation_id
+            and (event.get("payload") or {}).get("attempt_id") == attempt_id
+            and (event.get("payload") or {}).get("turn_id") == turn_id
+            for event in events
+        ):
+            self.transcript_store.append(session.session_id, HANDOFF_QUIESCENT_EVENT, {
+                "project_id": session.task_id,
+                "operation_id": operation_id,
+                "attempt_id": attempt_id,
+                "turn_id": turn_id,
+                "executor": getattr(outcome, "executor", None) or session.routing,
+            })
+        if not self.session_store.update_status(
+            session.task_id, STATUS_COMPLETED,
+            attempt_id=attempt_id, turn_id=turn_id, project=False,
+        ):
+            return True
+        try:
+            response = self._http.post(
+                f"{self.api_base}/api/tasks/{session.task_id}/project/handoff/finalize",
+                json={
+                    "operation_id": operation_id,
+                    "source_session_id": session.session_id,
+                    "source_attempt_id": attempt_id,
+                    "source_turn_id": turn_id,
+                },
+            )
+            response.raise_for_status()
+        except Exception as exc:
+            logger.warning("project handoff finalize deferred for %s: %s", session.task_id, exc)
+            self.transcript_store.append(session.session_id, "project_handoff_finalize_deferred", {
+                "operation_id": operation_id, "reason": type(exc).__name__,
+            })
+        return True
+
+    def _reconcile_project_handoffs(self) -> int:
+        """Retry quiescent handoff finalizers before ordinary drift projection."""
+        finalized = 0
+        try:
+            response = self._http.get(f"{self.api_base}/api/tasks")
+            response.raise_for_status()
+            tasks = response.json().get("tasks", [])
+        except Exception as exc:
+            logger.warning("handoff reconciliation list failed: %s", exc)
+            return 0
+        for task in tasks:
+            task_id = task.get("id")
+            fields = task.get("fields") or {}
+            operation_id = fields.get(HANDOFF_OPERATION_FIELD)
+            if not task_id or not operation_id:
+                continue
+            source_session_id = fields.get(HANDOFF_SOURCE_SESSION_FIELD)
+            source_attempt_id = fields.get(HANDOFF_SOURCE_ATTEMPT_FIELD)
+            source_turn_id = fields.get(HANDOFF_SOURCE_TURN_FIELD)
+            source = self.session_store.get_by_session_id(source_session_id or "")
+            if (
+                source is None or source.status not in TERMINAL_STATUSES
+                or not source_attempt_id or not source_turn_id
+            ):
+                continue
+            try:
+                response = self._http.post(
+                    f"{self.api_base}/api/tasks/{task_id}/project/handoff/finalize",
+                    json={
+                        "operation_id": operation_id,
+                        "source_session_id": source_session_id,
+                        "source_attempt_id": source_attempt_id,
+                        "source_turn_id": source_turn_id,
+                    },
+                )
+                if response.status_code == 409:
+                    continue
+                response.raise_for_status()
+                finalized += 1
+            except Exception as exc:
+                logger.warning("handoff reconciliation failed for %s: %s", task_id, exc)
+        return finalized
+
+    def _recover_project_handoff_session(self, session: Session) -> bool:
+        """Keep staged handoffs fenced; only in-process restart proves quiescence."""
+        task = self._fetch_task(session.task_id)
+        fields = (task or {}).get("fields") or {}
+        if (
+            not fields.get(HANDOFF_OPERATION_FIELD)
+            or fields.get(HANDOFF_SOURCE_SESSION_FIELD) != session.session_id
+            or fields.get(HANDOFF_SOURCE_ATTEMPT_FIELD) != session.attempt_id
+            or fields.get(HANDOFF_SOURCE_TURN_FIELD) != session.turn_id
+        ):
+            return False
+        if session.routing in {ROUTE_LOCAL, ROUTE_REMOTE}:
+            recovery_outcome = SimpleNamespace(
+                attempt_id=session.attempt_id,
+                turn_id=session.turn_id,
+                executor=session.routing,
+            )
+            self._maybe_finalize_project_handoff(session, recovery_outcome)
+        else:
+            self.transcript_store.append(
+                session.session_id,
+                "project_handoff_recovery_pending",
+                {
+                    "operation_id": fields.get(HANDOFF_OPERATION_FIELD),
+                    "reason": "runtime termination is not yet verified",
+                    "routing": session.routing,
+                },
+            )
+        return True
+
     def _handle_outcome(self, session: Session, task: dict[str, Any], outcome) -> None:
         current = self.session_store.get(session.task_id)
         # Compatibility stubs may omit lifecycle ids, but they are only safe
@@ -6334,6 +6506,8 @@ class Worker:
                 "attempt_id": getattr(outcome, "attempt_id", None),
                 "turn_id": getattr(outcome, "turn_id", None),
             })
+            return
+        if self._maybe_finalize_project_handoff(session, outcome):
             return
         # A backend can deliver a terminal success after the operator's kill
         # raced its final event. Cancellation is terminal for this attempt;

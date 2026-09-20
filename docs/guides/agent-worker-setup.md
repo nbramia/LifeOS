@@ -262,12 +262,21 @@ system: |-
   over polling, no idle billing), `lifeos_agent_kill` (terminate),
   `lifeos_agent_transcript_read`, `lifeos_agent_sessions_list`,
   `lifeos_agent_user_ask`, `lifeos_agent_execution_override` (temporary
-  future-resolution route/model/effort/host selection). Every one of these tools requires
+  future-resolution route/model/effort/host selection), and
+  `lifeos_agent_project_handoff` (terminal conversion of the current ordinary
+  task into a durable project). Every one of these tools requires
   `caller_session_id` and `caller_proof` — pass the `lifeos_session_id` and
   `lifeos_session_proof` values from the task brief above verbatim, on every
   inter-agent call. Stdio MCP derives the identity from its worker process;
   HTTP MCP verifies the proof against the authenticated transport secret, so
   a bare caller-supplied session id cannot impersonate another session.
+
+  Project handoff additionally requires the current `lifeos_attempt_id`,
+  `lifeos_turn_id`, and `lifeos_turn_proof` from the brief. Use it only for a
+  top-level ordinary task, with a stable operation ID and independently
+  assigned keyed children. It is terminal: stop after a successful call.
+  Existing projects use the project Plan action; session children created with
+  `lifeos_agent_spawn` are not durable project children.
   </inter_agent>
 
   <thinking>
@@ -465,33 +474,13 @@ in Claude Code at **user scope** (`/plugin` → add the `benjamcalvin/bootstraps
 marketplace). `scripts/install_codex_skills.py` does not sync them, so a Codex
 machine needs the plugin installed to have them.
 
-### Codex computer use — NOT available to the worker (use delegation)
+### Route capabilities
 
-`codex features list` shows `computer_use` / `browser_use` / `in_app_browser`
-as `stable`+`true`, but those are **capability flags, not runtime availability**.
-Verified empirically (a forced-browser `codex exec` task returns "BROWSER
-UNAVAILABLE") and confirmed against OpenAI's docs — Codex computer use and the
-in-app browser are **Codex *desktop app* features**, not CLI/`exec` features:
-
-- They are documented only under the [Codex **app**](https://developers.openai.com/codex/app/computer-use),
-  and the browser is *in-app* — hosted by the desktop/TUI runtime. Headless
-  `codex exec` (how the worker runs Codex) has no app, so the tool is never
-  registered.
-- Computer use is **macOS/Windows only** — this worker runs on **Linux**, where
-  it isn't offered at all.
-- It also requires a Computer Use **plugin** installed via Codex settings, an
-  active desktop session, and OS screen-recording/accessibility permissions —
-  none of which exist for a background `codex exec` subprocess.
-
-This is an upstream constraint, not a LifeOS misconfiguration — there's no flag
-that makes it work in the worker.
-
-**So browser/GUI work routes to Claude Code instead.** Every `#codex` (and
-`#claude`) agent is told its LifeOS session id and can call `lifeos_agent_spawn`
-with `model="claude_code"` to hand a browser sub-task to the `--chrome`-enabled
-Claude Code CLI (which *does* work headless on Linux), then monitor it with
-`lifeos_agent_check`. This delegation is the supported path for any task that
-needs a real browser.
+The worker's CLI routes have different runtime capabilities and host
+configuration. Verify the capabilities required by a task on the selected
+route; LifeOS does not infer them from a feature flag or silently route work to
+another provider. Session delegation remains available only when the selected
+CLI has its LifeOS MCP server configured.
 
 ## Card assignment: running a card on another machine
 

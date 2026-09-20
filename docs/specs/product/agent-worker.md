@@ -127,6 +127,18 @@ than accepted. A failed or unverifiable stop leaves cancellation pending and
 reports the remaining session so the same operation can be retried. Cancelling
 one child never cancels siblings or its parent.
 
+An ordinary top-level task currently owned by an executor can be converted into
+a project with `lifeos_agent_project_handoff`. This is a terminal action for
+that exact executor turn, not ordinary child attachment: the caller submits a
+stable operation ID and 1–20 uniquely keyed child requests, then stops. The
+worker records the source turn's stop before activating the staged children and
+bounded coordinator. A stop it cannot verify leaves the handoff pending; it
+does not mark the original task complete or release any staged work. Existing
+projects use **Plan and delegate**, not this conversion. Session-agent
+delegation (`lifeos_agent_spawn`) remains separate from durable project
+children. A child never becomes a project, and a coordinator is one bounded
+run rather than an always-on monitor.
+
 ---
 
 ## Routing — local vs cloud

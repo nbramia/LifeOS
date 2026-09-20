@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
 import sqlite3
 from collections import deque
 from dataclasses import dataclass
@@ -17,8 +18,20 @@ from typing import Any, Awaitable, Callable, Iterable, TYPE_CHECKING
 
 from api.services import agent_board
 from api.services.agent_worker.assignment import extract_assignment
-from api.services.agent_worker.execution import ExecutionRequest, parse_legacy_route_alias
-from api.services.agent_worker.session_store import SessionStore, TERMINAL_STATUSES
+from api.services.agent_worker.execution import (
+    Budget,
+    ExecutionConstraints,
+    ExecutionRequest,
+    ExecutionSpec,
+    parse_legacy_route_alias,
+)
+from api.services.agent_worker.session_store import (
+    STATUS_BLOCKED,
+    STATUS_CLAIMED,
+    Session,
+    SessionStore,
+    TERMINAL_STATUSES,
+)
 from api.services.agent_worker.transcript_store import TranscriptStore
 
 if TYPE_CHECKING:
@@ -35,10 +48,31 @@ CANCEL_REQUESTED_AT_FIELD = "project_cancel_requested_at"
 LAST_CANCEL_OPERATION_FIELD = "project_last_cancel_operation_id"
 ABANDONED_AT_FIELD = "project_result_abandoned_at"
 ABANDONED_TAG = "agent-result-abandoned"
+HANDOFF_OPERATION_FIELD = "project_handoff_operation_id"
+HANDOFF_SOURCE_SESSION_FIELD = "project_handoff_source_session_id"
+HANDOFF_SOURCE_ATTEMPT_FIELD = "project_handoff_source_attempt_id"
+HANDOFF_SOURCE_TURN_FIELD = "project_handoff_source_turn_id"
+HANDOFF_REQUEST_HASH_FIELD = "project_handoff_request_hash"
+HANDOFF_REQUESTED_AT_FIELD = "project_handoff_requested_at"
+HANDOFF_READY_AT_FIELD = "project_handoff_ready_at"
+LAST_HANDOFF_OPERATION_FIELD = "project_last_handoff_operation_id"
+HANDOFF_ACTIVATED_AT_FIELD = "project_handoff_activated_at"
+LAST_ABORTED_HANDOFF_FIELD = "project_last_aborted_handoff_operation_id"
+
+HANDOFF_REQUEST_EVENT = "project_handoff_requested"
+HANDOFF_QUIESCENT_EVENT = "project_handoff_quiescent"
 
 
 class ProjectConflictError(ValueError):
     """A project mutation conflicts with current hierarchy/lifecycle state."""
+
+
+class ProjectHandoffError(ProjectConflictError):
+    """Stable machine-readable refusal from the dedicated handoff action."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -165,6 +199,7 @@ class TaskHierarchy:
             "ready_to_close": resolved == sum(counts.values()) and counts["awaiting_review"] == 0,
             "execution_paused": field_truthy(task.fields.get(EXECUTION_PAUSED_FIELD)),
             "cancellation_pending": bool(task.fields.get(CANCEL_OPERATION_FIELD)),
+            "handoff_pending": bool(task.fields.get(HANDOFF_OPERATION_FIELD)),
             "coordinator": coordinator,
         }
 
@@ -180,6 +215,9 @@ class TaskHierarchy:
             "hierarchy_error": entry.error,
             "parent_cancellation_pending": bool(
                 parent and parent.fields.get(CANCEL_OPERATION_FIELD)
+            ),
+            "parent_handoff_pending": bool(
+                parent and parent.fields.get(HANDOFF_OPERATION_FIELD)
             ),
             "project": self.project_summary(task_id, coordinator),
         }
@@ -240,6 +278,8 @@ def validate_parent_change(
         if old_parent:
             if old_parent.fields.get(CANCEL_OPERATION_FIELD):
                 raise ProjectConflictError("cannot change membership while project cancellation is pending")
+            if old_parent.fields.get(HANDOFF_OPERATION_FIELD):
+                raise ProjectConflictError("cannot change membership while project handoff is pending")
         if old_parent and len(old_children) == 1:
             if has_live_coordinator and has_live_coordinator(old_parent):
                 raise ProjectConflictError("cannot remove the last child while the project coordinator is live")
@@ -257,6 +297,8 @@ def validate_parent_change(
         raise ProjectConflictError("reopen the parent before adding or moving child work")
     if parent.fields.get(CANCEL_OPERATION_FIELD):
         raise ProjectConflictError("project cancellation is pending")
+    if parent.fields.get(HANDOFF_OPERATION_FIELD):
+        raise ProjectConflictError("project handoff is pending")
     if agent_board.is_review_pending(parent.tags):
         raise ProjectConflictError("accept or reject the parent review before attaching child work")
     parent_live = bool(has_live_session and has_live_session(parent))
@@ -347,6 +389,8 @@ class ProjectTaskService:
             raise ProjectConflictError("task is not a project")
         if task.fields.get(CANCEL_OPERATION_FIELD):
             raise ProjectConflictError("project cancellation is pending")
+        if task.fields.get(HANDOFF_OPERATION_FIELD):
+            raise ProjectConflictError("project handoff is pending")
         if self._task_coordinator_live(task):
             raise ProjectConflictError("project coordinator is already live")
         if task.status in {"done", "cancelled"}:
@@ -398,6 +442,567 @@ class ProjectTaskService:
             _project_operation="resume",
             _precondition=precondition,
         )
+
+    def stage_handoff(
+        self,
+        source: Session,
+        *,
+        operation_id: str,
+        children: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Stage an ordinary owning turn as a fenced durable project.
+
+        The transcript request is the bounded source payload; Markdown keeps
+        only the identity/hash pointers needed to fail closed and recover.
+        """
+        if self.session_store is None or self.transcript_store is None:
+            raise RuntimeError("session and transcript stores are required for project handoff")
+        operation_id = (operation_id or "").strip()
+        if not operation_id:
+            raise ProjectHandoffError("invalid_arg", "operation_id is required")
+        normalized = {"operation_id": operation_id, "children": children}
+        request_hash = _handoff_request_hash(normalized)
+        with self.manager.project_operation():
+            return self._stage_handoff_locked(
+                source,
+                operation_id=operation_id,
+                normalized=normalized,
+                request_hash=request_hash,
+            )
+
+    def _stage_handoff_locked(
+        self,
+        source: Session,
+        *,
+        operation_id: str,
+        normalized: dict[str, Any],
+        request_hash: str,
+    ) -> dict[str, Any]:
+        task = self.manager.get(source.task_id)
+        if task is None:
+            raise ProjectHandoffError("forbidden", "source task does not exist")
+
+        event = self._handoff_request_event(source.session_id, operation_id)
+        event_hash = ((event or {}).get("payload") or {}).get("request_hash")
+        if event_hash and event_hash != request_hash:
+            raise ProjectHandoffError(
+                "operation_mismatch", "operation_id was already used with different content",
+            )
+
+        last_operation = task.fields.get(LAST_HANDOFF_OPERATION_FIELD)
+        if last_operation == operation_id:
+            if event_hash != request_hash:
+                raise ProjectHandoffError(
+                    "operation_mismatch", "activated handoff request no longer matches its transcript",
+                )
+            return self._handoff_result(task, operation_id, normalized, state="activated")
+
+        pending_operation = task.fields.get(HANDOFF_OPERATION_FIELD)
+        if pending_operation:
+            if pending_operation != operation_id:
+                raise ProjectHandoffError(
+                    "handoff_pending", f"another handoff is pending as {pending_operation}",
+                )
+            if task.fields.get(HANDOFF_REQUEST_HASH_FIELD) != request_hash:
+                raise ProjectHandoffError(
+                    "operation_mismatch", "operation_id was already used with different content",
+                )
+        else:
+            self._validate_handoff_source(task, source)
+            hierarchy = self.hierarchy()
+            if hierarchy.is_project(task.id):
+                raise ProjectHandoffError(
+                    "already_project", "existing projects use the project Plan action",
+                )
+            if event is None:
+                self.transcript_store.append(source.session_id, HANDOFF_REQUEST_EVENT, {
+                    "project_id": task.id,
+                    "operation_id": operation_id,
+                    "source_attempt_id": source.attempt_id,
+                    "source_turn_id": source.turn_id,
+                    "request_hash": request_hash,
+                    "request": normalized,
+                })
+            requested_at = datetime.now(timezone.utc).isoformat()
+
+            def intent_precondition(current: "Task") -> None:
+                self._validate_handoff_source(current, source)
+                if self.hierarchy().is_project(current.id):
+                    raise ProjectHandoffError(
+                        "already_project", "existing projects use the project Plan action",
+                    )
+                if current.fields.get(HANDOFF_OPERATION_FIELD):
+                    raise ProjectHandoffError("handoff_pending", "project handoff is already pending")
+
+            task = self.manager.update(
+                task.id,
+                status="in_progress",
+                fields={
+                    EXECUTION_PAUSED_FIELD: "true",
+                    HANDOFF_OPERATION_FIELD: operation_id,
+                    HANDOFF_SOURCE_SESSION_FIELD: source.session_id,
+                    HANDOFF_SOURCE_ATTEMPT_FIELD: source.attempt_id,
+                    HANDOFF_SOURCE_TURN_FIELD: source.turn_id,
+                    HANDOFF_REQUEST_HASH_FIELD: request_hash,
+                    HANDOFF_REQUESTED_AT_FIELD: requested_at,
+                },
+                _project_operation="handoff-stage",
+                _precondition=intent_precondition,
+            )
+            if task is None:
+                raise ProjectHandoffError("forbidden", "source task disappeared during handoff")
+
+        created_children: list[dict[str, Any]] = []
+        for child in normalized["children"]:
+            fields = {PARENT_ID_FIELD: task.id}
+            execution = child.get("execution") or {}
+            for request_key, field_key in (
+                ("model_id", "model"),
+                ("effort", "effort"),
+                ("host", "host"),
+                ("working_dir", "working_dir"),
+            ):
+                value = execution.get(request_key)
+                if value is not None:
+                    fields[field_key] = value
+            tags = [child["assignee"]] if child.get("assignee") else []
+            operation_key = _handoff_child_operation_key(task.id, operation_id, child["key"])
+            child_task, created = self.manager.create_or_find_by_operation(
+                operation_key,
+                description=child["description"],
+                context="Inbox",
+                status="todo",
+                tags=tags,
+                notes=child.get("notes"),
+                fields=fields,
+                _project_handoff_operation=operation_id,
+            )
+            if (
+                child_task.fields.get(PARENT_ID_FIELD) != task.id
+                or child_task.description != child["description"]
+                or child_task.context != "Inbox"
+                or (child_task.notes or "") != (child.get("notes") or "")
+                or agent_board.normalize_tags(child_task.tags) != agent_board.normalize_tags(tags)
+                or any(child_task.fields.get(key) != value for key, value in fields.items())
+            ):
+                raise ProjectHandoffError(
+                    "corrupt_state", f"staged child {child['key']} does not match its durable request",
+                )
+            created_children.append({
+                "key": child["key"], "task_id": child_task.id, "created": created,
+            })
+
+        coordinator = self._stage_handoff_coordinator(task, source, operation_id, normalized)
+        task = self.manager.update(
+            task.id,
+            fields={
+                COORDINATOR_SESSION_FIELD: coordinator.session_id,
+                COORDINATOR_REQUEST_FIELD: operation_id,
+                HANDOFF_READY_AT_FIELD: datetime.now(timezone.utc).isoformat(),
+            },
+            _project_operation="handoff-stage",
+            _precondition=lambda current: self._require_matching_handoff(
+                current, source, operation_id, request_hash,
+            ),
+        )
+        if task is None:
+            raise ProjectHandoffError("corrupt_state", "handoff parent disappeared")
+        self.transcript_store.append(source.session_id, "project_handoff_staged", {
+            "project_id": task.id,
+            "operation_id": operation_id,
+            "child_task_ids": [item["task_id"] for item in created_children],
+            "coordinator_session_id": coordinator.session_id,
+        })
+        return {
+            "ok": True,
+            "state": "staged",
+            "project_id": task.id,
+            "operation_id": operation_id,
+            "source_session_id": source.session_id,
+            "child_tasks": created_children,
+            "coordinator_session_id": coordinator.session_id,
+            "runnable": False,
+            "stop_now": True,
+        }
+
+    def finalize_handoff(
+        self,
+        task_id: str,
+        *,
+        operation_id: str,
+        source_session_id: str,
+        source_attempt_id: str,
+        source_turn_id: str,
+    ) -> dict[str, Any]:
+        """Release a staged handoff after exact-turn quiescence is durable."""
+        if self.session_store is None or self.transcript_store is None:
+            raise RuntimeError("session and transcript stores are required for project handoff")
+        with self.manager.project_operation():
+            task = self.manager.get(task_id)
+            if task is None:
+                raise KeyError(task_id)
+            if task.fields.get(LAST_HANDOFF_OPERATION_FIELD) == operation_id:
+                return self._repair_activated_handoff(task, operation_id)
+            source = self.session_store.get_by_session_id(source_session_id)
+            if source is None:
+                raise ProjectHandoffError("pending_quiescence", "source session is missing")
+            self._require_matching_handoff(
+                task, source, operation_id, task.fields.get(HANDOFF_REQUEST_HASH_FIELD) or "",
+                expected_attempt=source_attempt_id, expected_turn=source_turn_id,
+            )
+            if task.fields.get(CANCEL_OPERATION_FIELD):
+                raise ProjectHandoffError("cancelled", "project cancellation owns this transition")
+            request_event = self._handoff_request_event(source_session_id, operation_id)
+            request_payload = (request_event or {}).get("payload") or {}
+            normalized = request_payload.get("request")
+            request_hash = request_payload.get("request_hash")
+            if (
+                not isinstance(normalized, dict)
+                or request_hash != task.fields.get(HANDOFF_REQUEST_HASH_FIELD)
+                or _handoff_request_hash(normalized) != request_hash
+            ):
+                raise ProjectHandoffError(
+                    "corrupt_state", "handoff request transcript is missing or corrupt",
+                )
+            if not task.fields.get(HANDOFF_READY_AT_FIELD):
+                raise ProjectHandoffError("not_ready", "handoff staging is incomplete")
+            if source.status not in TERMINAL_STATUSES:
+                raise ProjectHandoffError("pending_quiescence", "source session is not terminal")
+            if not self._has_handoff_quiescence(
+                source_session_id, operation_id, source_attempt_id, source_turn_id,
+            ):
+                raise ProjectHandoffError("pending_quiescence", "source turn has no quiescence proof")
+            staged = self._validate_staged_handoff(task, normalized, operation_id)
+
+            owner = _owner_tag_for_session(source, task)
+
+            def finalized_tags(tags: list[str]) -> list[str]:
+                stripped = {
+                    agent_board.RUNNING_TAG,
+                    agent_board.BLOCKED_TAG,
+                }
+                result = [tag for tag in tags if tag.lstrip("#").lower() not in stripped]
+                normalized_tags = agent_board.normalize_tags(result)
+                if owner and not normalized_tags.intersection(
+                    {*agent_board.AGENT_EXECUTOR_TAGS, "me"}
+                ):
+                    result.append(owner)
+                return result
+
+            cleared = {
+                HANDOFF_OPERATION_FIELD: None,
+                HANDOFF_SOURCE_SESSION_FIELD: None,
+                HANDOFF_SOURCE_ATTEMPT_FIELD: None,
+                HANDOFF_SOURCE_TURN_FIELD: None,
+                HANDOFF_REQUEST_HASH_FIELD: None,
+                HANDOFF_REQUESTED_AT_FIELD: None,
+                HANDOFF_READY_AT_FIELD: None,
+                LAST_HANDOFF_OPERATION_FIELD: operation_id,
+                HANDOFF_ACTIVATED_AT_FIELD: datetime.now(timezone.utc).isoformat(),
+            }
+            task = self.manager.update(
+                task.id,
+                status="in_progress",
+                fields=cleared,
+                _tags_merge=finalized_tags,
+                _project_operation="handoff-finalize",
+                _precondition=lambda current: self._require_matching_handoff(
+                    current, source, operation_id, request_hash,
+                    expected_attempt=source_attempt_id, expected_turn=source_turn_id,
+                ),
+            )
+            if task is None:
+                raise ProjectHandoffError("corrupt_state", "handoff parent disappeared")
+            coordinator = staged["coordinator"]
+            if coordinator.status == STATUS_BLOCKED:
+                changed = self.session_store.update_status(
+                    coordinator.task_id,
+                    STATUS_CLAIMED,
+                    attempt_id=coordinator.attempt_id,
+                    turn_id=coordinator.turn_id,
+                )
+                if not changed:
+                    raise ProjectHandoffError(
+                        "coordinator_unavailable", "coordinator could not be released",
+                    )
+            self.transcript_store.append(source_session_id, "project_handoff_activated", {
+                "project_id": task.id,
+                "operation_id": operation_id,
+                "coordinator_session_id": coordinator.session_id,
+            })
+            return self._handoff_result(task, operation_id, normalized, state="activated")
+
+    def reconcile_handoffs(self) -> dict[str, Any]:
+        """Retry only already-quiescent intents; unproved runtimes stay pending."""
+        activated: list[str] = []
+        pending: list[dict[str, str]] = []
+        for task in self.manager.list_tasks():
+            operation_id = task.fields.get(HANDOFF_OPERATION_FIELD)
+            if not operation_id:
+                continue
+            try:
+                result = self.finalize_handoff(
+                    task.id,
+                    operation_id=operation_id,
+                    source_session_id=task.fields.get(HANDOFF_SOURCE_SESSION_FIELD, ""),
+                    source_attempt_id=task.fields.get(HANDOFF_SOURCE_ATTEMPT_FIELD, ""),
+                    source_turn_id=task.fields.get(HANDOFF_SOURCE_TURN_FIELD, ""),
+                )
+                if result.get("state") == "activated":
+                    activated.append(task.id)
+            except ProjectHandoffError as exc:
+                pending.append({"project_id": task.id, "code": exc.code, "message": str(exc)})
+        return {"activated_project_ids": activated, "pending": pending}
+
+    def _validate_handoff_source(self, task: "Task", source: Session) -> None:
+        hierarchy = self.hierarchy()
+        entry = hierarchy.entry(task.id)
+        tags = agent_board.normalize_tags(task.tags)
+        if entry.parent_id or entry.is_project:
+            code = "already_project" if entry.is_project else "not_ordinary_parent"
+            raise ProjectHandoffError(code, "handoff requires an ordinary top-level task")
+        if not entry.valid or task.status in {"done", "cancelled"}:
+            raise ProjectHandoffError("not_ordinary_parent", "source task is not an active ordinary task")
+        if agent_board.is_review_pending(task.tags) or task.fields.get(CANCEL_OPERATION_FIELD):
+            raise ProjectHandoffError("forbidden", "source task is in review or cancellation")
+        if task.status != "in_progress" or agent_board.RUNNING_TAG not in tags:
+            raise ProjectHandoffError("forbidden", "source task is not owned by a live agent run")
+        if (
+            source.task_id != task.id
+            or source.parent_session_id is not None
+            or (source.root_session_id or source.session_id) != source.session_id
+            or source.origin == "operator"
+            or source.status not in {"running", "claimed"}
+            or not source.attempt_id
+            or not source.turn_id
+            or not self.session_store.is_current_turn(task.id, source.attempt_id, source.turn_id)
+        ):
+            raise ProjectHandoffError("stale_turn", "caller does not own the current source turn")
+
+    def _require_matching_handoff(
+        self,
+        task: "Task",
+        source: Session,
+        operation_id: str,
+        request_hash: str,
+        *,
+        expected_attempt: str | None = None,
+        expected_turn: str | None = None,
+    ) -> None:
+        attempt_id = expected_attempt or source.attempt_id
+        turn_id = expected_turn or source.turn_id
+        expected = {
+            HANDOFF_OPERATION_FIELD: operation_id,
+            HANDOFF_SOURCE_SESSION_FIELD: source.session_id,
+            HANDOFF_SOURCE_ATTEMPT_FIELD: attempt_id,
+            HANDOFF_SOURCE_TURN_FIELD: turn_id,
+            HANDOFF_REQUEST_HASH_FIELD: request_hash,
+        }
+        if any(task.fields.get(key) != value for key, value in expected.items()):
+            raise ProjectHandoffError("stale_turn", "handoff identity no longer matches")
+        current = self.session_store.get_by_session_id(source.session_id)
+        if (
+            current is None
+            or current.task_id != task.id
+            or current.attempt_id != attempt_id
+            or current.turn_id != turn_id
+        ):
+            raise ProjectHandoffError("stale_turn", "source attempt or turn is no longer current")
+
+    def _stage_handoff_coordinator(
+        self,
+        task: "Task",
+        source: Session,
+        operation_id: str,
+        normalized: dict[str, Any],
+    ) -> Session:
+        synthetic_task_id = _coordinator_task_id(task.id, operation_id)
+        session = self.session_store.get(synthetic_task_id)
+        if session is None:
+            from api.services.agent_worker.operator_spawn import create_operator_session
+
+            source_spec = (
+                ExecutionSpec.from_dict(source.execution_spec)
+                if source.execution_spec else None
+            )
+            if source_spec is None:
+                raise ProjectHandoffError(
+                    "missing_execution_snapshot", "source execution snapshot is unavailable",
+                )
+            request = ExecutionRequest(
+                executor=source_spec.executor,
+                model_id=source_spec.model_id,
+                effort=source_spec.effort,
+                host=source_spec.host,
+                working_dir=source_spec.working_dir,
+                constraints=ExecutionConstraints(
+                    allowed_executors=source_spec.constraints.allowed_executors,
+                    required_capabilities=source_spec.constraints.required_capabilities,
+                    allowed_billing=source_spec.constraints.allowed_billing,
+                ),
+            )
+            try:
+                result = create_operator_session(
+                    self.session_store,
+                    self._handoff_coordination_prompt(task, operation_id, normalized),
+                    explicit_routing=source_spec.executor,
+                    execution_request=request,
+                    task_id=synthetic_task_id,
+                    dispatch_ready=False,
+                )
+            except sqlite3.IntegrityError:
+                result = {"ok": True, "session_id": None}
+            if not result.get("ok"):
+                raise ProjectHandoffError(
+                    "coordinator_unavailable",
+                    result.get("error", "could not create handoff coordinator"),
+                )
+            session = self.session_store.get(synthetic_task_id)
+        if session is None:
+            raise ProjectHandoffError("coordinator_unavailable", "coordinator session is missing")
+        if session.execution_spec is None:
+            from dataclasses import asdict, replace
+
+            coordinator_budget = Budget(**(session.budget or {})) if session.budget else None
+            coordinator_spec = replace(
+                source_spec,
+                parent_session_id=None,
+                root_session_id=session.session_id,
+                budget=coordinator_budget,
+            )
+            self.session_store.set_execution_snapshot(
+                session.task_id,
+                request=asdict(request),
+                spec=coordinator_spec.to_dict(),
+            )
+            session = self.session_store.get_by_session_id(session.session_id)
+            if session is None:
+                raise ProjectHandoffError(
+                    "coordinator_unavailable", "coordinator session disappeared",
+                )
+        if session.status != STATUS_BLOCKED:
+            raise ProjectHandoffError("corrupt_state", "coordinator has an invalid staged status")
+        return session
+
+    def _validate_staged_handoff(
+        self, task: "Task", normalized: dict[str, Any], operation_id: str,
+    ) -> dict[str, Any]:
+        hierarchy = self.hierarchy()
+        expected: dict[str, "Task"] = {}
+        for child in normalized.get("children") or []:
+            operation_key = _handoff_child_operation_key(task.id, operation_id, child["key"])
+            found = self.manager.find_by_operation(operation_key)
+            if found is None or clean_parent_id(found.fields.get(PARENT_ID_FIELD)) != task.id:
+                raise ProjectHandoffError("not_ready", f"staged child {child['key']} is missing")
+            expected[found.id] = found
+        actual = hierarchy.children(task.id)
+        if len(actual) != len(expected) or any(child.id not in expected for child in actual):
+            raise ProjectHandoffError("corrupt_state", "staged project membership does not match request")
+        coordinator_id = task.fields.get(COORDINATOR_SESSION_FIELD)
+        coordinator = self.session_store.get_by_session_id(coordinator_id or "")
+        if coordinator is None or coordinator.task_id != _coordinator_task_id(task.id, operation_id):
+            raise ProjectHandoffError("not_ready", "staged coordinator is missing")
+        if coordinator.status != STATUS_BLOCKED:
+            raise ProjectHandoffError("corrupt_state", "staged coordinator status is invalid")
+        return {"children": list(expected.values()), "coordinator": coordinator}
+
+    def _repair_activated_handoff(self, task: "Task", operation_id: str) -> dict[str, Any]:
+        event = self._handoff_request_event(
+            task.fields.get(HANDOFF_SOURCE_SESSION_FIELD, "")
+            or self._source_session_for_operation(task.id, operation_id),
+            operation_id,
+        )
+        normalized = ((event or {}).get("payload") or {}).get("request") or {
+            "operation_id": operation_id, "children": [],
+        }
+        coordinator_id = task.fields.get(COORDINATOR_SESSION_FIELD)
+        coordinator = self.session_store.get_by_session_id(coordinator_id or "")
+        if coordinator is not None and coordinator.status == STATUS_BLOCKED:
+            self.session_store.update_status(
+                coordinator.task_id, STATUS_CLAIMED,
+                attempt_id=coordinator.attempt_id, turn_id=coordinator.turn_id,
+            )
+        return self._handoff_result(task, operation_id, normalized, state="activated")
+
+    def _handoff_result(
+        self, task: "Task", operation_id: str, normalized: dict[str, Any], *, state: str,
+    ) -> dict[str, Any]:
+        child_tasks = []
+        for child in normalized.get("children") or []:
+            found = self.manager.find_by_operation(
+                _handoff_child_operation_key(task.id, operation_id, child["key"]),
+            )
+            if found:
+                child_tasks.append({"key": child["key"], "task_id": found.id, "created": False})
+        return {
+            "ok": True,
+            "state": state,
+            "project_id": task.id,
+            "operation_id": operation_id,
+            "source_session_id": task.fields.get(HANDOFF_SOURCE_SESSION_FIELD)
+            or self._source_session_for_operation(task.id, operation_id),
+            "child_tasks": child_tasks,
+            "coordinator_session_id": task.fields.get(COORDINATOR_SESSION_FIELD),
+            "runnable": state == "activated",
+            "stop_now": True,
+        }
+
+    def _handoff_request_event(self, session_id: str, operation_id: str) -> dict[str, Any] | None:
+        if not session_id:
+            return None
+        for event in reversed(self.transcript_store.read(session_id)):
+            payload = event.get("payload") or {}
+            if event.get("kind") == HANDOFF_REQUEST_EVENT and payload.get("operation_id") == operation_id:
+                return event
+        return None
+
+    def _source_session_for_operation(self, task_id: str, operation_id: str) -> str:
+        for session in self.session_store.list_sessions(limit=None):
+            for event in reversed(self.transcript_store.read(session.session_id)):
+                payload = event.get("payload") or {}
+                if (
+                    event.get("kind") == HANDOFF_REQUEST_EVENT
+                    and payload.get("project_id") == task_id
+                    and payload.get("operation_id") == operation_id
+                ):
+                    return session.session_id
+        return ""
+
+    def _has_handoff_quiescence(
+        self, session_id: str, operation_id: str, attempt_id: str, turn_id: str,
+    ) -> bool:
+        for event in reversed(self.transcript_store.read(session_id)):
+            payload = event.get("payload") or {}
+            if event.get("kind") == HANDOFF_QUIESCENT_EVENT and (
+                payload.get("operation_id") == operation_id
+                and payload.get("attempt_id") == attempt_id
+                and payload.get("turn_id") == turn_id
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _handoff_coordination_prompt(
+        task: "Task", operation_id: str, normalized: dict[str, Any],
+    ) -> str:
+        lines = [
+            "Coordinate this LifeOS project using its already-created durable task children.",
+            f"Project ID: {task.id}",
+            f"Operation ID: {operation_id}",
+            f"Objective: {task.description}",
+            f"Notes/acceptance criteria:\n{(task.notes or '').strip()[:6000] or '(none)'}",
+            "Children:",
+        ]
+        for child in normalized.get("children") or []:
+            lines.append(
+                f"- {child['key']}: {child['description']} | "
+                f"assignee={child.get('assignee') or 'unassigned'}"
+            )
+        lines.append(
+            "This is a bounded coordinator run, not a persistent monitor. Inspect child state, "
+            "help resolve scoped blockers, and use the explicit project completion/cancellation actions."
+        )
+        return "\n".join(lines)
 
     def plan_and_delegate(self, task_id: str, *, operation_id: str) -> dict[str, Any]:
         # Session staging plus parent linkage is one short shared operation.
@@ -586,7 +1191,11 @@ class ProjectTaskService:
             "operation_id": task.fields.get(CANCEL_OPERATION_FIELD),
             "cancellation_pending": bool(task.fields.get(CANCEL_OPERATION_FIELD)),
             "unfinished_count": len(children),
-            "running_count": running_count + int(self._task_coordinator_live(task)),
+            "running_count": (
+                running_count
+                + int(self._task_coordinator_live(task))
+                + int(self._handoff_source_live(task))
+            ),
             "awaiting_review_count": review_count,
             "children": children,
             "confirmation_required": True,
@@ -631,6 +1240,20 @@ class ProjectTaskService:
         cancelled: list[str] = []
         preserved: list[str] = []
         abandoned: list[str] = []
+
+        source_id = parent.fields.get(HANDOFF_SOURCE_SESSION_FIELD)
+        if source_id:
+            source = self.session_store.get_by_session_id(source_id)
+            if source is not None and source.status not in TERMINAL_STATUSES:
+                killed, errors = await self._stop_session(source)
+                stopped.extend(killed)
+                failures.extend(errors)
+                refreshed = self.session_store.get_by_session_id(source_id)
+                if refreshed is not None and refreshed.status not in TERMINAL_STATUSES:
+                    failures.append({
+                        "session_id": source_id,
+                        "reason": "handoff source teardown could not be verified",
+                    })
 
         coordinator_id = parent.fields.get(COORDINATOR_SESSION_FIELD)
         if coordinator_id:
@@ -714,7 +1337,8 @@ class ProjectTaskService:
         ]
         parent = self.manager.get(task_id)
         coordinator_live = bool(parent and self._task_coordinator_live(parent))
-        complete = not unresolved and not coordinator_live and not failures
+        source_live = bool(parent and self._handoff_source_live(parent))
+        complete = not unresolved and not coordinator_live and not source_live and not failures
         if complete:
             parent = self.manager.update(
                 task_id,
@@ -723,6 +1347,16 @@ class ProjectTaskService:
                     CANCEL_OPERATION_FIELD: None,
                     CANCEL_REQUESTED_AT_FIELD: None,
                     LAST_CANCEL_OPERATION_FIELD: operation_id,
+                    HANDOFF_OPERATION_FIELD: None,
+                    HANDOFF_SOURCE_SESSION_FIELD: None,
+                    HANDOFF_SOURCE_ATTEMPT_FIELD: None,
+                    HANDOFF_SOURCE_TURN_FIELD: None,
+                    HANDOFF_REQUEST_HASH_FIELD: None,
+                    HANDOFF_REQUESTED_AT_FIELD: None,
+                    HANDOFF_READY_AT_FIELD: None,
+                    LAST_ABORTED_HANDOFF_FIELD: (
+                        parent.fields.get(HANDOFF_OPERATION_FIELD)
+                    ),
                 },
                 _project_operation="cancel",
             )
@@ -765,6 +1399,10 @@ class ProjectTaskService:
 
     def _task_coordinator_live(self, task: "Task") -> bool:
         session_id = task.fields.get(COORDINATOR_SESSION_FIELD)
+        return bool(session_id and self._session_id_is_live(session_id))
+
+    def _handoff_source_live(self, task: "Task") -> bool:
+        session_id = task.fields.get(HANDOFF_SOURCE_SESSION_FIELD)
         return bool(session_id and self._session_id_is_live(session_id))
 
     def _require_project_current(self, task: "Task") -> None:
@@ -823,3 +1461,37 @@ def _clean_field(fields: dict[str, str], key: str) -> str | None:
 def _coordinator_task_id(project_id: str, operation_id: str) -> str:
     digest = hashlib.sha256(operation_id.encode("utf-8")).hexdigest()[:12]
     return f"project_{project_id}_{digest}"
+
+
+def _handoff_request_hash(request: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        request, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _handoff_child_operation_key(
+    project_id: str, operation_id: str, child_key: str,
+) -> str:
+    return f"project-handoff:{project_id}:{operation_id}:{child_key}"
+
+
+def _owner_tag_for_session(source: Session, task: "Task") -> str | None:
+    existing = agent_board.derive_assignee(task.tags)
+    if existing:
+        return existing
+    executor = None
+    if source.execution_spec:
+        try:
+            executor = ExecutionSpec.from_dict(source.execution_spec).executor
+        except (TypeError, ValueError):
+            executor = None
+    executor = executor or source.routing
+    return {
+        "claude": "cloud",
+        "remote": "cloud",
+        "claude_code": "claude",
+        "codex": "codex",
+        "hermes": "hermes",
+        "local": "local",
+    }.get(executor or "")

@@ -92,7 +92,7 @@ All code lives in `api/services/agent_worker/`:
 | `spend_tracker.py` | Daily $-cap ledger; pause semantics when cap ≤ 0 |
 | `transcript_store.py` | Append-only JSONL per `session_id` at `data/agent_transcripts/` |
 | `tools.py` | `STANDARD_TOOLS` (Read/Write/Edit/Bash/Glob/Grep/WebFetch/WebSearch/sleep) + `ToolRegistry` combining standard + inter-agent + MCP tools |
-| `inter_agent.py` | `lifeos_agent_*` family — spawn, send, check, yield_until, kill, transcript_read, sessions_list, user_ask, execution_override; MCP caller proofs bind remote calls to one session |
+| `inter_agent.py` | `lifeos_agent_*` family — project_handoff, spawn, send, check, yield_until, kill, transcript_read, sessions_list, user_ask, execution_override; MCP caller proofs bind remote calls to one session and handoff calls to one executor turn |
 | `pricing.py` | Per-model $/token table; `MANAGED_SESSION_HOUR_OVERHEAD = $0.08` |
 | `router.py` | Thin local-vs-claude dispatch helper |
 
@@ -596,12 +596,33 @@ fenced as cancellation-pending. A retry with the same operation ID recomputes
 current state and applies only outstanding work; a different operation is
 rejected while the fence remains.
 
+`lifeos_agent_project_handoff` is the only exception to the ordinary
+live-parent attachment guard. It accepts 1–20 complete child requests from an
+ordinary top-level task's exact current session, attempt, and turn; the MCP
+transport attests those identities, so the model cannot select a different
+source task. The service records the normalized request in the source
+transcript, writes small operation/identity/hash pointers on the parent,
+creates deterministic keyed children and a blocked coordinator, and fences all
+of them from normal claim or Open. The child assignment and optional execution
+request are independent: omitted values are not copied from the source, and
+metered targets must already be in that source turn's permitted provider scope.
+
+The executor observes a successful handoff as a terminal action for its turn.
+Only after the executor return boundary is recorded as a matching quiescence
+event can the worker terminalize that source session without projecting normal
+task completion, clear the handoff fence, and release the coordinator. A
+missing proof, failed finalization, or cancellation race keeps work pending
+and non-runnable. Reconciliation runs before ordinary lifecycle drift repair;
+there is no atomic transaction spanning Markdown, SQLite, and an external
+executor.
+
 ## Inter-agent coordination
 
 Local agents can spawn child sessions and coordinate via the `lifeos_agent_*` tool family:
 
 | Tool | Purpose |
 |---|---|
+| `lifeos_agent_project_handoff` | Stage 1–20 uniquely keyed durable children from the exact current ordinary-task turn. It is terminal for that turn; staged work remains fenced until the worker proves quiescence and finalizes it. |
 | `lifeos_agent_spawn` | Create a child on `local`, `remote`, `claude`, `hermes`, `claude_code`, or `codex`. Legacy `model=<executor>` and Claude-Code `tier` remain valid; the strict `execution` object carries canonical route/model/effort/location/budget choices. Omitting the route inherits an active bounded override or the caller route. |
 | `lifeos_agent_send` | Post a message to a child session's queue. Also a lifecycle transition: a direct parent sending to its own COMPLETED `claude_code`/`codex` child with a persisted CLI session id **reopens** it — the message is enqueued as the child's next turn *before* the status flips back to `claimed` (so a dispatch tick can never claim an empty resume prompt), and the spawned-session dispatcher resumes the CLI session via `-r` with full prior context. All other terminal sends still reject. |
 | `lifeos_agent_check` | Poll a child's current state. |
