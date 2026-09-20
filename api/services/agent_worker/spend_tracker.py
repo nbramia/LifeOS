@@ -10,9 +10,11 @@ the date rolls over (it's stored per-date, alongside `total_dollars`).
 """
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 from datetime import date as date_cls
 from pathlib import Path
+from typing import Iterator
 
 from api.services.agent_worker.session_store import DEFAULT_DB_PATH
 
@@ -31,10 +33,18 @@ class SpendTracker:
         self.daily_cap_dollars = daily_cap_dollars
         self._init_schema()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextlib.contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Yield a connection, closing it on the way out — see
+        `SessionStore._connect`, which shares this database and this
+        pattern."""
         conn = sqlite3.connect(str(self.db_path), isolation_level=None, timeout=10.0)
         conn.execute("PRAGMA journal_mode=WAL")
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init_schema(self) -> None:
         # session_store also creates this table; be idempotent so import order

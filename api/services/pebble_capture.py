@@ -10,6 +10,7 @@ the objects it creates.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import ipaddress
 import json
@@ -22,7 +23,7 @@ import unicodedata
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Iterator, Optional
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
@@ -393,10 +394,17 @@ class CaptureLedger:
             if "payload_digest" not in capture_columns:
                 db.execute("ALTER TABLE pebble_captures ADD COLUMN payload_digest TEXT NOT NULL DEFAULT ''")
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextlib.contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Yield a connection, closing it on the way out — see
+        `SessionStore._connect` for the same pattern."""
         db = sqlite3.connect(self.path, timeout=10, isolation_level=None)
         db.row_factory = sqlite3.Row
-        return db
+        try:
+            with db:
+                yield db
+        finally:
+            db.close()
 
     def select_plan(self, identity: CaptureIdentity, revision: str, digest: str, plan: list[PlannedAction]) -> str:
         """Store a first plan once; changed final revisions are held, not replayed."""

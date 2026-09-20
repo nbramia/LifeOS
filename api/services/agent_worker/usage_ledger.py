@@ -11,6 +11,7 @@ evidence; otherwise it remains NULL (the readout renders that as unknown).
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import sqlite3
@@ -18,7 +19,7 @@ import time
 from dataclasses import dataclass
 from datetime import date as date_cls
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from api.services.agent_worker.session_store import DEFAULT_DB_PATH, SessionStore
 
@@ -238,11 +239,19 @@ class UsageLedger:
             if "owner_id" not in reservation_columns:
                 conn.execute("ALTER TABLE usage_reservations ADD COLUMN owner_id TEXT")
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextlib.contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Yield a connection, closing it on the way out — see
+        `SessionStore._connect`, which shares this database and this
+        pattern."""
         conn = sqlite3.connect(str(self.db_path), isolation_level=None, timeout=10.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     @staticmethod
     def _nonnegative(value: int | float | None, name: str) -> int | float | None:

@@ -12,6 +12,7 @@ moved doesn't re-summarize on every panel open or snapshot tick.
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 import sqlite3
@@ -19,7 +20,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from api.services.llm_client import extract_json, generate_text
 
@@ -191,9 +192,25 @@ def _resolve_db_path() -> str:
     return _DB_PATH
 
 
+@contextlib.contextmanager
+def _connect() -> Iterator[sqlite3.Connection]:
+    """Open a connection to the summary cache DB, closing it on exit.
+
+    Nests the original `with conn:` so callers keep sqlite3's
+    commit-on-success / rollback-on-exception behavior for the wrapped
+    block; the `finally` additionally guarantees the file descriptor is
+    released.
+    """
+    conn = sqlite3.connect(_resolve_db_path())
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
+
+
 def _init_db() -> None:
-    path = _resolve_db_path()
-    with sqlite3.connect(path) as conn:
+    with _connect() as conn:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute(
             """
@@ -214,7 +231,7 @@ def _disk_get(session_id: str, last_activity_at: float, status: str = "") -> Sum
     session doesn't get re-summarized on every tick of the prefetch loop.
     """
     try:
-        with sqlite3.connect(_resolve_db_path()) as conn:
+        with _connect() as conn:
             row = conn.execute(
                 "SELECT last_activity_at, short_label, summary, created_at "
                 "FROM agent_viz_summary WHERE session_id = ?",
@@ -234,7 +251,7 @@ def _disk_get(session_id: str, last_activity_at: float, status: str = "") -> Sum
 
 def _disk_put(session_id: str, last_activity_at: float, result: SummaryResult) -> None:
     try:
-        with _DB_LOCK, sqlite3.connect(_resolve_db_path()) as conn:
+        with _DB_LOCK, _connect() as conn:
             conn.execute(
                 "INSERT OR REPLACE INTO agent_viz_summary "
                 "(session_id, last_activity_at, short_label, summary, created_at) "
@@ -256,7 +273,7 @@ def prune_disk_cache(max_age_days: int = 90, max_rows: int = 5000) -> int:
     cutoff = int(time.time()) - max_age_days * 86400
     deleted = 0
     try:
-        with _DB_LOCK, sqlite3.connect(_resolve_db_path()) as conn:
+        with _DB_LOCK, _connect() as conn:
             cur = conn.execute(
                 "DELETE FROM agent_viz_summary WHERE created_at < ?", (cutoff,)
             )
@@ -688,7 +705,7 @@ def search_cached_summaries(query: str, limit: int = 200) -> list[dict[str, str]
     q_lower = q.lower()
     pattern = f"%{_escape_like(q_lower)}%"
     try:
-        with sqlite3.connect(_resolve_db_path()) as conn:
+        with _connect() as conn:
             rows = conn.execute(
                 "SELECT session_id, short_label, summary FROM agent_viz_summary "
                 "WHERE short_label LIKE ? ESCAPE '\\' OR summary LIKE ? ESCAPE '\\' "
