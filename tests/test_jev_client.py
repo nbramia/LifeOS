@@ -110,6 +110,58 @@ def test_ask_missing_answers_field_raises_jev_error():
         client.ask("state", _QUESTIONS)
 
 
+def test_ask_empty_api_key_raises_before_any_request():
+    """The mutation-check witness for the empty-key guard: without it, an
+    empty api_key produces an `Authorization: Bearer ` header, which httpx
+    itself rejects as an illegal header value, so a MockTransport that
+    asserts it's never called catches either failure mode as long as no
+    successful response comes back."""
+    def handler(request):
+        raise AssertionError("must not send a request with no API key")
+
+    client = JevClient(api_key="", transport=httpx.MockTransport(handler))
+    with pytest.raises(JevError, match="not configured"):
+        client.ask("state", _QUESTIONS)
+
+
+@pytest.mark.asyncio
+async def test_aask_empty_api_key_raises_before_any_request():
+    def handler(request):
+        raise AssertionError("must not send a request with no API key")
+
+    client = JevClient(api_key="", transport=httpx.MockTransport(handler))
+    with pytest.raises(JevError, match="not configured"):
+        await client.aask("state", _QUESTIONS)
+
+
+def test_ask_transport_error_raises_jev_error():
+    """Mutation-check witness for the httpx.HTTPError wrapping: remove the
+    try/except around client.post and this test fails with a raw
+    httpx.ConnectTimeout instead of JevError."""
+    def handler(request):
+        raise httpx.ConnectTimeout("connection timed out")
+
+    client = _client(handler)
+    with pytest.raises(JevError) as exc_info:
+        client.ask("state", _QUESTIONS)
+    message = str(exc_info.value)
+    assert "ConnectTimeout" in message
+    assert "connection timed out" not in message
+
+
+@pytest.mark.asyncio
+async def test_aask_transport_error_raises_jev_error():
+    def handler(request):
+        raise httpx.ConnectTimeout("connection timed out")
+
+    client = _client(handler)
+    with pytest.raises(JevError) as exc_info:
+        await client.aask("state", _QUESTIONS)
+    message = str(exc_info.value)
+    assert "ConnectTimeout" in message
+    assert "connection timed out" not in message
+
+
 def test_jev_configured_false_with_empty_key(monkeypatch):
     from config.settings import settings
     monkeypatch.setattr(settings, "typesafe_api_key", "")

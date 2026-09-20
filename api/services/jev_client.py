@@ -2,9 +2,9 @@
 
 Jev answers a batch of typed questions (`choice`/`score`/`noul`) about a
 piece of `state` with calibrated probabilities, in one call, instead of a
-freeform generative completion parsed with regex. This module has no
-callers yet — it's a plain `httpx` wrapper plus the `jev_configured()`
-guard every future caller checks before using it.
+freeform generative completion parsed with regex. It's a plain `httpx`
+wrapper: callers check `jev_configured()` before constructing a client or
+making a Jev-backed judgment.
 
 Nothing in this module logs the `state` or `questions` passed to `ask()`/
 `aask()`, at any log level, in any path including errors.
@@ -106,14 +106,21 @@ class JevClient:
         Retries up to 3 total attempts on a 429 response, honoring
         `retry-after` when present, else exponential backoff. Raises
         `JevError` on any other non-2xx status, on a response body without
-        an `answers` field, or once 429 retries are exhausted.
+        an `answers` field, once 429 retries are exhausted, on a
+        transport-level failure (timeout, connection error), or immediately,
+        without sending a request, if no API key is set.
         """
+        if not self.api_key:
+            raise JevError("Jev is not configured: no API key")
         body = self._body(state, questions, model)
         with httpx.Client(transport=self._transport, timeout=self.timeout) as client:
             for attempt in range(_MAX_ATTEMPTS):
-                response = client.post(
-                    f"{self.base_url}{_ENDPOINT_PATH}", json=body, headers=self._headers()
-                )
+                try:
+                    response = client.post(
+                        f"{self.base_url}{_ENDPOINT_PATH}", json=body, headers=self._headers()
+                    )
+                except httpx.HTTPError as exc:
+                    raise JevError(f"Jev request failed: {type(exc).__name__}") from exc
                 if response.status_code == 429:
                     if attempt < _MAX_ATTEMPTS - 1:
                         logger.warning(
@@ -130,12 +137,17 @@ class JevClient:
 
     async def aask(self, state: Any, questions: dict, *, model: str | None = None) -> dict:
         """Async counterpart to `ask()`. Same retry and error semantics."""
+        if not self.api_key:
+            raise JevError("Jev is not configured: no API key")
         body = self._body(state, questions, model)
         async with httpx.AsyncClient(transport=self._transport, timeout=self.timeout) as client:
             for attempt in range(_MAX_ATTEMPTS):
-                response = await client.post(
-                    f"{self.base_url}{_ENDPOINT_PATH}", json=body, headers=self._headers()
-                )
+                try:
+                    response = await client.post(
+                        f"{self.base_url}{_ENDPOINT_PATH}", json=body, headers=self._headers()
+                    )
+                except httpx.HTTPError as exc:
+                    raise JevError(f"Jev request failed: {type(exc).__name__}") from exc
                 if response.status_code == 429:
                     if attempt < _MAX_ATTEMPTS - 1:
                         logger.warning(
