@@ -152,6 +152,15 @@ def _write_github_cache(cache_file: Path, owner: str, repos: list[tuple[str, str
         pass  # Caching is an optimization; a write failure must not break resolution.
 
 
+def _run_gh(argv: list[str], *, timeout: int) -> subprocess.CompletedProcess:
+    """The single seam every real `gh` subprocess call in this module goes
+    through — `_resolve_github_owner`, `_github_repos`, and `ensure_cloned`
+    all call this instead of `subprocess.run` directly, so a test
+    hermeticity guard (see `tests/conftest.py`) has exactly one place to
+    intercept."""
+    return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+
+
 def _resolve_github_owner(cache_file: Path) -> str:
     """`settings.github_owner` when set; else the cached login from a prior
     `gh api user` call; else a fresh `gh api user -q .login`. Empty string
@@ -162,10 +171,7 @@ def _resolve_github_owner(cache_file: Path) -> str:
     if cached_owner:
         return str(cached_owner)
     try:
-        result = subprocess.run(
-            ["gh", "api", "user", "-q", ".login"],
-            capture_output=True, text=True, timeout=_GH_TIMEOUT_SECONDS,
-        )
+        result = _run_gh(["gh", "api", "user", "-q", ".login"], timeout=_GH_TIMEOUT_SECONDS)
         if result.returncode == 0:
             return result.stdout.strip()
     except Exception:
@@ -191,9 +197,9 @@ def _github_repos() -> list[tuple[str, str, str]]:
         return []
 
     try:
-        result = subprocess.run(
+        result = _run_gh(
             ["gh", "repo", "list", owner, "--json", "name,description", "--limit", "200"],
-            capture_output=True, text=True, timeout=_GH_TIMEOUT_SECONDS,
+            timeout=_GH_TIMEOUT_SECONDS,
         )
         if result.returncode != 0:
             return []
@@ -267,9 +273,9 @@ def ensure_cloned(path: str) -> bool:
     if not owner:
         return False
     try:
-        result = subprocess.run(
+        result = _run_gh(
             ["gh", "repo", "clone", f"{owner}/{name}", str(resolved)],
-            capture_output=True, text=True, timeout=_GH_CLONE_TIMEOUT_SECONDS,
+            timeout=_GH_CLONE_TIMEOUT_SECONDS,
         )
     except Exception:
         return False

@@ -2909,6 +2909,11 @@ def test_clone_on_demand_parks_when_clone_fails(tmp_path: Path, monkeypatch):
     import api.services.directory_resolver as dr
     monkeypatch.setattr(dr, "resolve_working_directory", lambda title, allow_uncloned=True: missing_repo)
     monkeypatch.setattr(dr, "ensure_cloned", lambda path: False)
+    # Clone-on-demand only fires for a missing directory whose name is one
+    # of the operator's known GitHub repos — "MissingRepo" has to be in
+    # that list for this test to exercise the park-on-clone-failure path
+    # rather than the (correct, for an unknown name) fall-through.
+    monkeypatch.setattr(dr, "_github_repos", lambda: [("MissingRepo", "d", missing_repo)])
 
     calls: list = []
 
@@ -2937,6 +2942,49 @@ def test_clone_on_demand_parks_when_clone_fails(tmp_path: Path, monkeypatch):
     assert RUNNING_TAG not in api.tasks["t1"]["tags"]
     sent = w._sent_telegram  # type: ignore[attr-defined]
     assert any("MissingRepo" in s for s in sent)
+
+
+@pytest.mark.unit
+def test_missing_directory_not_a_known_repo_falls_through_unchanged(tmp_path: Path, monkeypatch):
+    """A CLI-routed task whose resolved working directory happens to be
+    missing under code_dir, but isn't one of the operator's known GitHub
+    repos (`_github_repos()` returns `[]` — no `gh`, no key, or simply an
+    unrelated repo name), must never be treated as a clone-on-demand
+    candidate: `ensure_cloned` is never called, and the task is never
+    parked. Regression test for the CI failure mode this gate fixes — a
+    CI runner with no ~/Code/gh made every missing test/keyword-cascade
+    working directory look like a failed clone and park the task."""
+    import os as _os
+
+    from config.settings import settings as _settings
+    code_dir = str(tmp_path / "Code")
+    monkeypatch.setattr(_settings, "code_dir", code_dir, raising=False)
+    missing_dir = _os.path.join(code_dir, "SomeRandomDir")
+
+    import api.services.directory_resolver as dr
+    monkeypatch.setattr(dr, "resolve_working_directory", lambda title, allow_uncloned=True: missing_dir)
+    monkeypatch.setattr(dr, "_github_repos", lambda: [])  # no gh/key on this host, as on CI
+
+    def _fail_if_called(path):
+        raise AssertionError("ensure_cloned must not run for a name outside the known repo list")
+
+    monkeypatch.setattr(dr, "ensure_cloned", _fail_if_called)
+
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "fix the bug", "status": "todo", "tags": ["claude"]},
+    ])
+    pool = _CapturingPool()
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="claude"),
+                     local_executor=None,
+                     claude_code_executor=None,
+                     cli_pool=pool)
+
+    handled = w.tick()
+
+    assert handled == 1
+    assert BLOCKED_TAG not in api.tasks["t1"]["tags"]
+    assert len(pool.submitted) == 1
 
 
 @pytest.mark.unit
