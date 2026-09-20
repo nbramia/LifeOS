@@ -2058,3 +2058,82 @@ def test_destructive_judgment_block_survives_default_route_demotion(monkeypatch)
     assert result.sane_fatal is False
     assert result.destructive_block is True
     assert result.demoted_sanity is None
+
+
+# ---------------------------------------------------------------------------
+# Preset class — Jev fan-out judgment (jev_task_routing.judge_task)
+# ---------------------------------------------------------------------------
+
+def _preset_judgment(choice: str, confidence: float):
+    from api.services.jev_task_routing import JevAnswer, TaskJudgment
+
+    return TaskJudgment(
+        location=None, difficulty=None,
+        preset_class=JevAnswer(choice=choice, confidence=confidence),
+        software_work=None,
+    )
+
+
+@pytest.mark.unit
+def test_preset_class_tag_wins_over_jev_judgment(monkeypatch):
+    """An explicit class tag always wins over the Jev judgment — even a
+    high-confidence one naming a different class. Mutation check: removing
+    the tag-override precedence in `_apply_preset_class` fails this test."""
+    monkeypatch.setattr(
+        "api.services.jev_task_routing.judge_task",
+        lambda title: _preset_judgment("financial", 0.95),
+    )
+    result = pf.run_preflight("any task", tags=["agent", "crm"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.preset_class == "crm"
+
+
+@pytest.mark.unit
+def test_preset_class_jev_high_confidence_sets_class(monkeypatch):
+    """No tag; a Jev judgment at or above the 0.6 confidence floor sets
+    `preset_class` to its choice."""
+    monkeypatch.setattr(
+        "api.services.jev_task_routing.judge_task",
+        lambda title: _preset_judgment("research", 0.75),
+    )
+    result = pf.run_preflight("dig into last quarter's numbers", tags=["agent"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.preset_class == "research"
+
+
+@pytest.mark.unit
+def test_preset_class_jev_confidence_boundary_at_exactly_point_six(monkeypatch):
+    """Exactly 0.6 must be accepted (>=, not >)."""
+    monkeypatch.setattr(
+        "api.services.jev_task_routing.judge_task",
+        lambda title: _preset_judgment("crm", 0.6),
+    )
+    result = pf.run_preflight("any task", tags=["agent"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.preset_class == "crm"
+
+
+@pytest.mark.unit
+def test_preset_class_jev_low_confidence_sets_fullstack(monkeypatch):
+    """Below the 0.6 floor, `preset_class` is explicitly set to
+    `"fullstack"` (today's no-filter default) rather than left unset —
+    distinct from the no-key case, which leaves it None."""
+    monkeypatch.setattr(
+        "api.services.jev_task_routing.judge_task",
+        lambda title: _preset_judgment("crm", 0.59),
+    )
+    result = pf.run_preflight("any task", tags=["agent"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.preset_class == "fullstack"
+
+
+@pytest.mark.unit
+def test_preset_class_no_key_leaves_todays_default(monkeypatch):
+    """Without a Jev judgment at all (unconfigured or failed call, modeled
+    here by `judge_task` returning None), `preset_class` stays unset — the
+    worker's own no-filter default, exactly as it is with no explicit
+    class tag."""
+    monkeypatch.setattr("api.services.jev_task_routing.judge_task", lambda title: None)
+    result = pf.run_preflight("any task", tags=["agent"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.preset_class is None

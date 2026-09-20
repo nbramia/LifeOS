@@ -87,7 +87,7 @@ Only one session runs at a time. Sending `/claude` while a session is active ret
 
 ## Plan mode
 
-Tasks containing words like `refactor`, `implement`, `rewrite`, `overhaul`, `build a`, `set up a`, `add a new`, `create a new`, `remove all`, `delete all`, `migrate`, `replace`, `restructure`, or `integrate` trigger plan mode. Claude presents the plan via Telegram and waits for approval.
+With a TypeSafe key configured (`TYPESAFE_API_KEY`), a typed difficulty judgment decides plan mode: tasks Jev rates at least moderately difficult, with reasonable confidence, trigger it. Without a key — or when the judgment isn't confident enough — tasks containing words like `refactor`, `implement`, `rewrite`, `overhaul`, `build a`, `set up a`, `add a new`, `create a new`, `remove all`, `delete all`, `migrate`, `replace`, `restructure`, or `integrate` trigger plan mode instead. Either way, Claude presents the plan via Telegram and waits for approval.
 
 **Flow:**
 

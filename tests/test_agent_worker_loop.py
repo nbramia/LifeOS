@@ -2808,3 +2808,95 @@ def test_resume_pending_rolls_back_top_level_cli_session_same_as_before(tmp_path
     assert AGENT_TAG in api.tasks["t1"]["tags"]
     assert RUNNING_TAG not in api.tasks["t1"]["tags"]
     assert api.tasks["t1"]["status"] == "todo"
+
+
+@pytest.mark.unit
+def test_clone_on_demand_parks_when_clone_fails(tmp_path: Path, monkeypatch):
+    """A CLI-routed task whose resolved working directory is an uncloned
+    repo under code_dir must park at #agent-blocked (naming the repo) when
+    the automatic `gh repo clone` fails — never spawn into a directory that
+    doesn't exist. Mirrors `test_cloud_tag_parks_when_remote_provider_
+    unconfigured`'s not-configured-parks shape, for the clone-on-demand
+    not-available-parks case."""
+    import os as _os
+
+    from config.settings import settings as _settings
+    code_dir = str(tmp_path / "Code")
+    monkeypatch.setattr(_settings, "code_dir", code_dir, raising=False)
+    missing_repo = _os.path.join(code_dir, "MissingRepo")
+
+    import api.services.directory_resolver as dr
+    monkeypatch.setattr(dr, "resolve_working_directory", lambda title: missing_repo)
+    monkeypatch.setattr(dr, "ensure_cloned", lambda path: False)
+
+    calls: list = []
+
+    class _Executor:
+        def execute(self, session, task):
+            calls.append((session.task_id, task.get("description")))
+            return ExecutorOutcome(status=STATUS_COMPLETED, final_text="done")
+
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "fix the bug in missingrepo", "status": "todo",
+         "tags": ["claude"]},
+    ])
+    pool = _CapturingPool()
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="claude"),
+                     local_executor=None,
+                     claude_code_executor=_Executor(),
+                     cli_pool=pool)
+
+    handled = w.tick()
+
+    assert handled == 1
+    assert calls == []
+    assert pool.submitted == []
+    assert BLOCKED_TAG in api.tasks["t1"]["tags"]
+    assert RUNNING_TAG not in api.tasks["t1"]["tags"]
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    assert any("MissingRepo" in s for s in sent)
+
+
+@pytest.mark.unit
+def test_clone_on_demand_skipped_for_remote_host(tmp_path: Path, monkeypatch):
+    """A session assigned to a remote host (LIFEOS_AGENT_HOSTS) must never
+    attempt a clone on this process — `ensure_cloned` is not this host's to
+    call when the CLI itself will run over ssh on another machine. Drive
+    `_dispatch` directly on an already-claimed, host-assigned card, the
+    same way `test_routing_ask_lands_in_blocked_with_model_question` does."""
+    import os as _os
+
+    from config.settings import settings as _settings
+    code_dir = str(tmp_path / "Code")
+    monkeypatch.setattr(_settings, "code_dir", code_dir, raising=False)
+    monkeypatch.setattr(_settings, "agent_hosts", {"studio": "user@studio"}, raising=False)
+    missing_repo = _os.path.join(code_dir, "MissingRepo")
+
+    import api.services.directory_resolver as dr
+    monkeypatch.setattr(dr, "resolve_working_directory", lambda title: missing_repo)
+
+    def _fail_if_called(path):
+        raise AssertionError("ensure_cloned must not run for a remote-host spawn")
+
+    monkeypatch.setattr(dr, "ensure_cloned", _fail_if_called)
+
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "fix the bug in missingrepo", "status": "in_progress",
+         "tags": [RUNNING_TAG, "claude"], "fields": {"host": "studio"}},
+    ])
+    pool = _CapturingPool()
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="claude"),
+                     local_executor=None,
+                     claude_code_executor=None,
+                     cli_pool=pool)
+    w.session_store.create(task_id="t1", status=STATUS_CLAIMED)
+    w._dispatch(api.tasks["t1"])
+
+    # Never blocked over a clone failure — the guard simply doesn't apply
+    # to a remote-host spawn. The ssh-side executor itself isn't under
+    # test here (no claude_code_executor stub is wired up); only that the
+    # clone guard didn't block the dispatch before reaching that point.
+    assert BLOCKED_TAG not in api.tasks["t1"]["tags"]
+    assert len(pool.submitted) == 1

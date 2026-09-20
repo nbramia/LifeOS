@@ -1271,17 +1271,34 @@ def _apply_default_route(result: PreflightResult, original_routing: str) -> Pref
     return result
 
 
-def _apply_preset_class(result: PreflightResult, tags: list[str]) -> PreflightResult:
-    """Set `result.preset_class` from an explicit `#<class>` tag if present.
+def _apply_preset_class(result: PreflightResult, tags: list[str], title: str = "") -> PreflightResult:
+    """Set `result.preset_class` from an explicit `#<class>` tag if present;
+    else from the Jev fan-out judgment (`jev_task_routing.judge_task`) when
+    configured; else leave it unset (today's default — the worker treats an
+    unset `preset_class` as `fullstack`, no tool filtering).
 
-    LLM-side preset_class emission is a follow-up; this lets operators
-    force a class today via tag while the rest of §3 wiring lands.
+    A tag override always wins over the Jev judgment. With a Jev judgment
+    available, `preset_class` is its `preset_class` choice when confidence
+    is >= 0.6, else explicitly `"fullstack"`. Without a TypeSafe key, or
+    when the Jev call fails, `preset_class` stays unset (None) here — the
+    worker's own no-filter default.
     """
     if result.preset_class:  # honor an LLM/caller pre-set value
         return result
     forced = _detect_preset_class_from_tags(tags)
     if forced:
         result.preset_class = forced
+        return result
+
+    from api.services.jev_task_routing import judge_task
+
+    judgment = judge_task(title)
+    if judgment is not None and judgment.preset_class is not None:
+        answer = judgment.preset_class
+        if answer.confidence >= 0.6 and answer.choice:
+            result.preset_class = answer.choice
+        else:
+            result.preset_class = "fullstack"
     return result
 
 
@@ -1474,7 +1491,7 @@ def _finish(result: PreflightResult, tags_list: list[str], title: str = "") -> P
     result = _apply_tag_overrides(result, tags_list, title)
     result = _apply_route_corroboration(result, original_routing, title, tags_list)
     result = _apply_default_route(result, original_routing)
-    result = _apply_preset_class(result, tags_list)
+    result = _apply_preset_class(result, tags_list, title)
     result = _apply_cost_gates(result)
     return result
 

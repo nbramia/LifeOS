@@ -4748,6 +4748,45 @@ class Worker:
         # top-level #agent task gets the identical off-tick treatment.
         if session.routing in (ROUTE_CLAUDE_CODE, ROUTE_CODEX):
             working_dir = execution.spec.working_dir or resolve_working_directory(title)
+
+            # Clone-on-demand: a Jev-chosen (or keyword-chosen) working
+            # directory may name a repository the operator owns but that
+            # isn't checked out on this host yet. Only attempted when this
+            # process is itself the executing host — a remote spawn
+            # (LIFEOS_AGENT_HOSTS) runs the CLI over ssh on a different
+            # machine, whose filesystem this process can't clone into.
+            from api.services.agent_worker.remote_spawn import (
+                api_host_name as _api_host_name,
+                is_local_host,
+            )
+            code_dir = os.path.expanduser(settings.code_dir)
+            under_code_dir = bool(working_dir) and os.path.abspath(working_dir).startswith(
+                code_dir + os.sep
+            )
+            if (
+                under_code_dir
+                and is_local_host(session.host, _api_host_name())
+                and not os.path.isdir(working_dir)
+            ):
+                from api.services.directory_resolver import ensure_cloned
+
+                if not ensure_cloned(working_dir):
+                    repo_name = os.path.basename(working_dir.rstrip(os.sep))
+                    self._swap_tag(task_id, RUNNING_TAG, BLOCKED_TAG)
+                    self._set_task_status(task_id, "blocked")
+                    self.session_store.update_status(
+                        task_id, STATUS_BLOCKED,
+                        attempt_id=session.attempt_id, turn_id=session.turn_id,
+                    )
+                    self.transcript_store.append(sid, "clone_failed", {"repository": repo_name})
+                    self._notify(
+                        f"⏸ {_worker_label(session.routing)}: task '{title}' needs "
+                        f"repository '{repo_name}', which isn't cloned on this host "
+                        f"and couldn't be cloned automatically. Clone it manually "
+                        f"under {code_dir}, then re-tag with an engine assignee to retry."
+                    )
+                    return
+
             if session.claude_code_session_id:
                 # A compatible reassignment keeps the native CLI thread. Do
                 # not feed the JSON fresh-spawn envelope to resume(); pass a
