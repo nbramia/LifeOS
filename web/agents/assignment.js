@@ -11,9 +11,13 @@
 //   - `PUT /api/tasks/{id}` with `{fields: {...}}` patches inline fields;
 //     a field value of `null` clears it.
 //   - `GET /api/agents/models` returns
-//     `{engines: {claude: [...], codex: [...], local: [...], hermes: [...]},
-//     refreshed_at, stale}`, each entry `{id, label, pricing}` — the
-//     source for the model picker's options.
+//     `{engines: {claude: [...], codex: [...], local: [...], hermes: [...],
+//     remote: [...]}, defaults: {claude, codex, remote}, refreshed_at,
+//     stale}`, each entry `{id, label, pricing}` — the source for the
+//     model picker's options. `defaults` names the id each of
+//     claude/codex/remote currently runs on absent a board model
+//     override — `null` when none is known. The board's `cloud` engine
+//     reads the catalog's `remote` key (see `_catalogEngineKey` below).
 //   - `GET /api/agents/hosts` returns
 //     `{hosts: [{name, ssh_target, online, is_api_host}], refreshed_at}`
 //     — the source for the host picker's options; `online` is
@@ -29,17 +33,27 @@ const ENGINES = ['claude', 'codex', 'local', 'hermes', 'cloud'];
 export const EFFORTS = ['low', 'medium', 'high', 'max'];
 
 // Engines whose executor actually reads a `model` field (claude_code_executor
-// / codex_executor's `--model` flag — see api/services/agent_worker/
-// assignment.py). Local, Hermes, and cloud never take a board model
-// override: local always runs the on-box model, Hermes/cloud report
-// whatever model their provider served rather than accepting a picker value.
-const ENGINES_WITH_MODEL_PICKER = new Set(['claude', 'codex']);
+// / codex_executor's `--model` flag, and the #cloud route's LocalExecutor
+// forced onto the configured remote provider — see api/services/agent_worker/
+// local_executor.py's `session.execution_spec["model_id"]` pin). Local and
+// Hermes never take a board model override: local always runs the on-box
+// model, Hermes reports whatever model its provider served rather than
+// accepting a picker value.
+const ENGINES_WITH_MODEL_PICKER = new Set(['claude', 'codex', 'cloud']);
 // Engines whose executor reads an `effort` field. Hermes/cloud have no
 // effort override (see assignment.py's module docstring).
 const ENGINES_WITH_EFFORT_PICKER = new Set(['claude', 'codex', 'local']);
 // Engines a `host` field can steer over ssh (api/services/agent_worker/
 // remote_spawn.py) — local/Hermes/cloud always run wherever the API process does.
 const ENGINES_WITH_HOST_PICKER = new Set(['claude', 'codex']);
+
+// The board's `cloud` assignee runs on the worker's `remote` route (the
+// `#cloud` tag) — the one place mapping the board engine name to the
+// model catalog's engine key, since the catalog calls it `remote` (see
+// `model_catalog.py`), not `cloud`.
+function _catalogEngineKey(engine) {
+  return engine === 'cloud' ? 'remote' : engine;
+}
 
 function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({
@@ -63,7 +77,7 @@ export function loadModelCatalog(fetchImpl = fetch) {
   if (!_catalogPromise) {
     _catalogPromise = fetchImpl('/api/agents/models')
       .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
-      .catch(() => ({ engines: { claude: [], codex: [], local: [], hermes: [], cloud: [] } }));
+      .catch(() => ({ engines: { claude: [], codex: [], local: [], hermes: [], remote: [] }, defaults: {} }));
   }
   return _catalogPromise;
 }
@@ -290,8 +304,9 @@ export function renderAssignmentPickers(container, card, opts = {}) {
     // engine-ownership decision below has to live here rather than in a
     // change handler on this module's own (board-hidden) engine select.
     const engine = engineEl.value;
+    const catalogEngine = _catalogEngineKey(engine);
     const engines = catalog.engines || {};
-    const models = engines[engine] || [];
+    const models = engines[catalogEngine] || [];
     const current = modelEl.value;
     const known = models.some(m => m.id === current);
     // A live selection absent from the CURRENT engine's catalog but
@@ -301,8 +316,10 @@ export function renderAssignmentPickers(container, card, opts = {}) {
     // selection absent from EVERY engine's catalog is genuinely unknown
     // and stays selected, flagged `data-unknown="true"`.
     const foreign = current && !known && Object.keys(engines)
-      .some(other => other !== engine && (engines[other] || []).some(m => m.id === current));
-    const optionsHtml = ['<option value="">engine default</option>'];
+      .some(other => other !== catalogEngine && (engines[other] || []).some(m => m.id === current));
+    const defaultId = (catalog.defaults || {})[catalogEngine];
+    const defaultLabel = defaultId ? `engine default (${escapeHtml(defaultId)})` : 'engine default';
+    const optionsHtml = [`<option value="">${defaultLabel}</option>`];
     for (const m of models) {
       const selected = !foreign && current === m.id ? 'selected' : '';
       optionsHtml.push(`<option value="${escapeHtml(m.id)}" ${selected}>${escapeHtml(m.label || m.id)}</option>`);

@@ -55,15 +55,18 @@ from api.services.agent_worker.execution import (
     Budget as ExecutionBudget,
     CatalogFacts,
     CatalogState,
+    CLI_EXECUTORS,
     ExecutionContext,
     ExecutionFacts,
     ExecutionLayer,
     ExecutionRequest,
     ExecutionSpec,
     ExecutorFacts,
+    FieldProvenance,
     ReadinessState,
     ResolutionResult,
     ResolutionStatus,
+    Source,
     parse_execution_request,
     resolve_execution,
 )
@@ -628,6 +631,7 @@ class Worker:
         hermes_executor=None, # injectable HermesExecutor for tests
         cli_pool=None,              # injectable dispatch pool; tests pass _SynchronousPool
         execution_facts_provider=None,  # injectable immutable resolver observation
+        model_catalog_defaults_provider=None,  # injectable () -> {"claude":.., "codex":.., "remote":..}
     ) -> None:
         self.api_base = (api_base or os.environ.get("LIFEOS_API_URL", "http://localhost:8000")).rstrip("/")
         self.session_store = session_store or SessionStore()
@@ -690,6 +694,14 @@ class Worker:
         self._codex_executor = codex_executor  # lazily instantiated on first /codex task
         self._hermes_executor = hermes_executor # lazily instantiated on first hermes task
         self._execution_facts_provider = execution_facts_provider
+        # Resolves GET /api/agents/models' `defaults` map for the
+        # claude_code/codex no-model-pin case (see `_catalog_default_model`
+        # below). None (this default) means "no catalog defaults available"
+        # — the same no-op-unless-wired pattern `telegram_send` above uses —
+        # so no test or tool that constructs a bare `Worker()` performs any
+        # I/O here; `main()` wires the real, network-backed provider for
+        # the production process.
+        self._model_catalog_defaults_provider = model_catalog_defaults_provider
         # CLI dispatches (claude_code/codex) and Hermes HTTP turns can be
         # long-running — spawned children/operator root-spawns and top-level
         # #agent tasks go through this bounded pool via their route submitters.
@@ -4983,6 +4995,25 @@ class Worker:
             ),
         )
 
+    # Maps a resolved CLI executor to the model catalog's engine key for
+    # `_catalog_default_model` below — the catalog calls Anthropic's engine
+    # "claude" (the executor is "claude_code"); codex's names already match.
+    _CATALOG_KEY_FOR_EXECUTOR = {"claude_code": "claude", "codex": "codex"}
+
+    def _catalog_default_model(self, executor: str) -> str | None:
+        """The catalog's current default model id for `executor`, or None
+        when no provider is wired (tests, tools), the provider raised, or
+        the catalog itself has no default for this engine yet."""
+        key = self._CATALOG_KEY_FOR_EXECUTOR.get(executor)
+        if key is None or self._model_catalog_defaults_provider is None:
+            return None
+        try:
+            defaults = self._model_catalog_defaults_provider() or {}
+        except Exception as exc:  # noqa: BLE001 — a lookup failure must not fail dispatch
+            logger.warning("model catalog default lookup failed for %s: %s", executor, exc)
+            return None
+        return defaults.get(key) or None
+
     def _resolve_session_execution(
         self,
         session: Session,
@@ -5019,6 +5050,25 @@ class Worker:
             facts=facts,
             temporary_override=override,
         )
+        if (
+            result.ok
+            and result.spec.executor in CLI_EXECUTORS
+            and result.spec.model_id is None
+        ):
+            # No explicit/inherited model pin for this CLI executor — fall
+            # back to the catalog's current default so `--model` still
+            # tracks the newest release in the preferred family, rather
+            # than leaving the CLI's own config to decide silently.
+            default_model = self._catalog_default_model(result.spec.executor)
+            if default_model:
+                spec = dataclasses.replace(
+                    result.spec,
+                    model_id=default_model,
+                    provenance=result.spec.provenance + (
+                        FieldProvenance("model_id", Source.NATIVE, "catalog_default"),
+                    ),
+                )
+                result = ResolutionResult(status=result.status, spec=spec, diagnostics=result.diagnostics)
         if result.ok:
             from dataclasses import asdict
             persisted = self.session_store.set_execution_snapshot(
@@ -6598,9 +6648,20 @@ def main() -> None:
         telegram_send_with_id = send_message_capture_ids
     except Exception as exc:  # pragma: no cover — defensive
         logger.warning("Telegram module not importable; running with no-op senders: %s", exc)
+
+    def _model_catalog_defaults() -> dict:
+        import asyncio
+        from api.services.agent_worker.model_catalog import get_model_catalog
+        try:
+            return asyncio.run(get_model_catalog().get()).get("defaults") or {}
+        except Exception as exc:  # noqa: BLE001 — a lookup failure must not fail dispatch
+            logger.warning("model catalog default lookup failed: %s", exc)
+            return {}
+
     worker = Worker(
         telegram_send=telegram_send,
         telegram_send_with_id=telegram_send_with_id,
+        model_catalog_defaults_provider=_model_catalog_defaults,
     )
 
     def _handle_signal(signum, _frame):

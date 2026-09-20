@@ -93,6 +93,7 @@ A paid OpenAI-compatible endpoint — e.g. Fireworks running DeepSeek or Qwen. R
 | `LIFEOS_REMOTE_LLM_TIMEOUT` | int | `90` | Request timeout, seconds. |
 | `LIFEOS_REMOTE_LLM_INPUT_PRICE_PER_MTOK` | float | — (unset) | USD per million input tokens. Unset (distinct from `0.0`) means the rate isn't known — a turn on this provider records as unpriced rather than a guessed cost. |
 | `LIFEOS_REMOTE_LLM_OUTPUT_PRICE_PER_MTOK` | float | — (unset) | USD per million output tokens. Same unset/`0.0` distinction as the input rate. |
+| `LIFEOS_REMOTE_LLM_MODEL_OPTIONS` | str (comma-separated) | *(empty)* | Additional model ids the provider can serve, beyond `LIFEOS_REMOTE_LLM_MODEL`. Offered as choices on the board's `cloud` assignee's model picker (`GET /api/agents/models`'s `remote` engine list). |
 
 All three of URL, model, and API key must be set for the provider to be considered configured; pricing is independent and can be added later without affecting whether turns run.
 
@@ -276,6 +277,8 @@ See [guides/agent-worker-setup.md § Card assignment](agent-worker-setup.md#card
 | `LIFEOS_AGENT_HOSTS` | JSON object | `{}` | `{name: ssh_target}` — maps a board-facing host name to the ssh target the worker/API connects to for it. Empty disables every remote host: a task naming a host not in this map lands at `#agent-failed`. Invalid JSON logs a warning and is treated as `{}`. Operator configuration — never committed with real values. |
 | `LIFEOS_AGENT_SSH_CONNECT_TIMEOUT` | int (seconds) | `10` | How long ssh may spend establishing a connection to a remote host before giving up. Applies to remote spawn, remote kill, and remote resume/focus alike. |
 | `LIFEOS_AGENT_MODEL_CATALOG_TTL_SECONDS` | int (seconds) | `86400` | How long `GET /api/agents/models` caches each engine's model list before re-querying providers. |
+| `LIFEOS_AGENT_DEFAULT_MODEL_FAMILY_CLAUDE` | str | `opus` | Family segment `GET /api/agents/models`' `defaults.claude` picks: the newest id in the live claude list whose family matches (`claude-<family>-<version...>`). A `claude_code` dispatch that names no model runs on this default. |
+| `LIFEOS_AGENT_DEFAULT_MODEL_FAMILY_CODEX` | str | `sol` | Same, for `defaults.codex` (`gpt-<version...>-<family>`); a `codex` dispatch that names no model runs on this default. |
 | `LIFEOS_CODEX_MODELS_CACHE_PATH` | str | `~/.codex/models_cache.json` | Path to the Codex CLI's own model-catalog cache, read by the model catalog endpoint for the codex engine's picker list. |
 | `LIFEOS_OPENAI_API_KEY` | str | *(empty)* | Optional OpenAI API key, used only as the model-catalog fallback when `LIFEOS_CODEX_MODELS_CACHE_PATH` is missing/unreadable. It never runs turns — Codex sessions are subscription-billed through the CLI itself, never the API. |
 

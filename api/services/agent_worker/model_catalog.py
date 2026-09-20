@@ -22,6 +22,10 @@ Sources, one per engine:
   - **hermes**: `model_readout.get_hermes_models()`'s `hermes_chat` entry —
     observed from the last real turn, never probed (see that module's
     docstring for why Hermes can't be probed for "what it would run").
+  - **remote**: declared, not discovered — the configured
+    `settings.remote_llm_model` plus `settings.remote_llm_model_options`,
+    since the OpenAI-compatible remote provider has no models-list
+    endpoint this catalog can probe.
 
 Cached for `settings.agent_model_catalog_ttl_seconds` (default 24h) so a
 picker open doesn't cost a provider round trip every time. A refresh
@@ -29,6 +33,15 @@ failure (any engine's fetch raising) falls back to the last successful
 catalog with `stale: true` rather than 500ing the picker or discarding
 what's cached — the same "observed beats nothing" instinct as everywhere
 else in this module, applied to failure instead of absence.
+
+The response also carries a top-level `defaults` map (`{claude, codex,
+remote}`): for claude/codex, the newest id in that engine's live list
+whose family segment matches `settings.agent_default_model_family_claude`/
+`_codex` (see `pick_family_default`), or `null` when nothing matches; for
+remote, the configured `remote_llm_model` or `null`. A dispatch that names
+no model for the `claude_code`/`codex` executor resolves against this at
+dispatch time (`Worker._resolve_session_execution`) — a new release in the
+preferred family becomes the default with no operator action.
 """
 from __future__ import annotations
 
@@ -75,6 +88,96 @@ def _entry(model_id: str, label: str | None = None) -> dict:
         "label": label or model_id,
         "pricing": _pricing_for(model_id),
     }
+
+
+def _parse_version(segments: list[str]) -> tuple[int, ...] | None:
+    """Flatten dash/dot-separated numeric segments into a version tuple,
+    or None if any segment isn't a plain integer (e.g. a non-numeric id
+    that doesn't fit the family/version convention at all)."""
+    version: list[int] = []
+    for segment in segments:
+        for piece in segment.split("."):
+            if not piece.isdigit():
+                return None
+            version.append(int(piece))
+    return tuple(version)
+
+
+def _parse_claude_family_version(model_id: str) -> tuple[str, tuple[int, ...]] | None:
+    """`claude-<family>-<version...>`, dated snapshot suffix stripped first
+    (`claude-opus-4-5-20251101` -> family "opus", version (4, 5))."""
+    stripped = _DATED_SNAPSHOT_SUFFIX.sub("", model_id)
+    parts = stripped.split("-")
+    if len(parts) < 3 or parts[0] != "claude":
+        return None
+    version = _parse_version(parts[2:])
+    if version is None:
+        return None
+    return parts[1], version
+
+
+def _parse_codex_family_version(model_id: str) -> tuple[str, tuple[int, ...]] | None:
+    """`gpt-<version...>-<family>` (`gpt-5.6-sol` -> family "sol", version
+    (5, 6)). An id with no version segment between "gpt" and the family
+    (e.g. a bare "gpt-reserve") doesn't fit the convention and is skipped."""
+    parts = model_id.split("-")
+    if len(parts) < 3 or parts[0] != "gpt":
+        return None
+    version = _parse_version(parts[1:-1])
+    if version is None:
+        return None
+    return parts[-1], version
+
+
+_FAMILY_PARSERS: dict[str, Callable[[str], tuple[str, tuple[int, ...]] | None]] = {
+    "claude": _parse_claude_family_version,
+    "codex": _parse_codex_family_version,
+}
+
+
+def pick_family_default(models: list[dict], engine: str, family: str) -> Optional[str]:
+    """The newest catalog id (by parsed version tuple) whose family segment
+    matches `family`, for engines with a known family convention. Ties
+    (equal version tuples) are broken by list order — the first one found
+    keeps the pick. Returns None for an unsupported engine, an empty/absent
+    family, an empty model list, or no match."""
+    parser = _FAMILY_PARSERS.get(engine)
+    if not parser or not models or not family:
+        return None
+    best_id: Optional[str] = None
+    best_version: tuple[int, ...] | None = None
+    for entry in models:
+        model_id = entry.get("id") if isinstance(entry, dict) else None
+        if not model_id:
+            continue
+        parsed = parser(model_id)
+        if parsed is None:
+            continue
+        entry_family, version = parsed
+        if entry_family != family:
+            continue
+        if best_version is None or version > best_version:
+            best_id, best_version = model_id, version
+    return best_id
+
+
+def _remote_model_entries() -> list[dict]:
+    """The configured remote provider's primary model first (labeled from
+    `remote_llm_label` when set), then each `remote_llm_model_options`
+    entry, deduplicated. Declared from settings, not discovered — this
+    provider has no models-list endpoint to probe."""
+    entries: list[dict] = []
+    seen: set[str] = set()
+    primary = (settings.remote_llm_model or "").strip()
+    if primary:
+        entries.append(_entry(primary, settings.remote_llm_label or None))
+        seen.add(primary)
+    for raw in (settings.remote_llm_model_options or "").split(","):
+        option = raw.strip()
+        if option and option not in seen:
+            entries.append(_entry(option))
+            seen.add(option)
+    return entries
 
 
 @dataclass(frozen=True)
@@ -193,12 +296,49 @@ class ModelCatalog:
                 # No provider quota endpoint is consulted by this catalog.
                 "quota": {"state": "unknown", "source": "not_collected"},
             }
+        defaults = {
+            "claude": pick_family_default(
+                states["claude"]["models"], "claude", settings.agent_default_model_family_claude,
+            ),
+            "codex": pick_family_default(
+                states["codex"]["models"], "codex", settings.agent_default_model_family_codex,
+            ),
+            "remote": (settings.remote_llm_model or None),
+        }
+        # `remote` isn't a discovered engine (no models-list endpoint to
+        # probe) — its list is declared from settings, always "loaded"
+        # rather than carrying the discovery/staleness machinery the four
+        # probed engines above do.
+        remote_models = _remote_model_entries()
+        states["remote"] = {
+            "models": remote_models,
+            "state": "loaded" if remote_models else "unconfigured",
+            "observed_at": observed_at,
+            "evidence_at": observed_at,
+            "last_success_at": observed_at if remote_models else None,
+            "stale": False,
+            "reason_code": "configured" if remote_models else "missing_configuration",
+            "staleness_reason": None,
+            "readiness": {
+                "state": "configured" if settings.remote_llm_configured else "unavailable",
+                "source": "remote_configuration",
+                "observed_at": observed_at,
+            },
+            "quota": {"state": "unknown", "source": "not_collected"},
+        }
         return {
             # Legacy aggregate response, retained for existing board clients.
             "engines": {engine: state["models"] for engine, state in states.items()},
             "refreshed_at": observed_at,
             "engine_states": states,
             "readiness": {engine: state["readiness"] for engine, state in states.items()},
+            # Additive: the id GET /api/agents/models's picker should show
+            # as "engine default (<id>)" for claude/codex, and the id the
+            # #cloud route runs on absent a board model override. Recomputed
+            # every refresh, so a newer release in the preferred family (or
+            # a changed LIFEOS_REMOTE_LLM_MODEL) takes over with no operator
+            # action.
+            "defaults": defaults,
         }
 
     # ------------------------------------------------------------------

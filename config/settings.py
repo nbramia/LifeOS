@@ -1087,6 +1087,32 @@ class Settings(BaseSettings):
                     "costs a round trip (Anthropic) or a filesystem read "
                     "(Codex's models_cache.json)."
     )
+    agent_default_model_family_claude: str = Field(
+        default="opus",
+        alias="LIFEOS_AGENT_DEFAULT_MODEL_FAMILY_CLAUDE",
+        description="Model family GET /api/agents/models picks as the "
+                    "claude engine's default: the newest catalog id whose "
+                    "family segment (claude-<family>-<version...>) matches. "
+                    "Tracks new releases automatically — no operator action "
+                    "needed when a newer model in the same family appears."
+    )
+    agent_default_model_family_codex: str = Field(
+        default="sol",
+        alias="LIFEOS_AGENT_DEFAULT_MODEL_FAMILY_CODEX",
+        description="Model family GET /api/agents/models picks as the "
+                    "codex engine's default: the newest catalog id whose "
+                    "family segment (gpt-<version...>-<family>) matches."
+    )
+    remote_llm_model_options: str = Field(
+        default="",
+        alias="LIFEOS_REMOTE_LLM_MODEL_OPTIONS",
+        description="Comma-separated additional model ids the configured "
+                    "remote provider (LIFEOS_REMOTE_LLM_URL) can serve, "
+                    "beyond LIFEOS_REMOTE_LLM_MODEL. Offered as choices on "
+                    "the board's cloud-assignee model picker; the #cloud "
+                    "assignment's execution spec carries whichever one was "
+                    "picked through to the request body's model field."
+    )
     cc_resume_enabled: bool = Field(
         default=False,
         alias="LIFEOS_CC_RESUME_ENABLED",

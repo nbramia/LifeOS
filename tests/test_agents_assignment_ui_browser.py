@@ -1665,3 +1665,95 @@ def test_unknown_saved_host_survives_a_rejected_save_racing_the_hosts_fetch(page
     page.locator("[data-field='effort']").select_option("high")
     calls = page.evaluate("() => window.__lastCalls")
     assert calls[-1]["patch"]["fields"]["host"] == "ghost-box"  # NOT None
+
+
+# ----------------------------------------------------------------------
+# Catalog `defaults` label + the `cloud` engine's model picker (reads the
+# catalog's `remote` key).
+# ----------------------------------------------------------------------
+
+_MODEL_CATALOG_WITH_DEFAULTS = {
+    "engines": {
+        "claude": [
+            {"id": "claude-opus-5", "label": "Claude Opus 5", "pricing": {"input": 5e-6, "output": 25e-6}},
+            {"id": "claude-sonnet-5", "label": "Claude Sonnet 5", "pricing": {"input": 2e-6, "output": 10e-6}},
+        ],
+        "codex": [{"id": "gpt-5.5", "label": "GPT-5.5", "pricing": None}],
+        "local": [],
+        "hermes": [],
+        "remote": [
+            {"id": "accounts/fireworks/models/deepseek-v4-flash", "label": "Fireworks", "pricing": None},
+            {"id": "accounts/fireworks/models/qwen3-a22b", "label": "accounts/fireworks/models/qwen3-a22b", "pricing": None},
+        ],
+    },
+    "defaults": {"claude": "claude-opus-5", "codex": None, "remote": "accounts/fireworks/models/deepseek-v4-flash"},
+    "refreshed_at": "2026-01-01T00:00:00Z",
+    "stale": False,
+}
+
+
+def _with_defaults_catalog(route):
+    if "/api/agents/models" in route.request.url:
+        route.fulfill(status=200, content_type="application/json", body=json.dumps(_MODEL_CATALOG_WITH_DEFAULTS))
+    elif "/api/agents/hosts" in route.request.url:
+        route.fulfill(status=200, content_type="application/json", body=json.dumps(_HOST_CATALOG))
+    elif "/api/tasks/" in route.request.url and route.request.method == "PUT":
+        body = json.loads(route.request.post_data or "{}")
+        route.fulfill(status=200, content_type="application/json", body=json.dumps({"id": "t", **body}))
+    else:
+        route.fulfill(status=200, content_type="application/json", body="{}")
+
+
+def test_default_option_label_shows_resolved_default_id(page: Page, web_base_url):
+    _load_module(page, web_base_url, api_handler=_with_defaults_catalog)
+    _render(page, {"id": "t70", "title": "Fix the printer", "tags": ["claude"], "assignee": "claude", "fields": {}})
+
+    model_select = page.locator("#test-assignment-container [data-field='model']")
+    expect(model_select.locator("option")).to_have_count(3)  # default + 2 claude models
+    assert "claude-opus-5" in model_select.locator("option").first.inner_text()
+
+
+def test_default_option_label_stays_plain_when_no_default_known(page: Page, web_base_url):
+    _load_module(page, web_base_url)  # default _MODEL_CATALOG carries no `defaults` key at all
+    _render(page, {"id": "t71", "title": "Fix the printer", "tags": ["codex"], "assignee": "codex", "fields": {}})
+
+    model_select = page.locator("#test-assignment-container [data-field='model']")
+    expect(model_select.locator("option")).to_have_count(2)  # default + 1 codex model
+    assert model_select.locator("option").first.inner_text() == "engine default"
+
+
+def test_default_option_label_plain_for_engine_with_null_default(page: Page, web_base_url):
+    """`defaults.codex` is explicitly `null` in the catalog above — a known
+    absence, not a missing key — and must render the same plain label."""
+    _load_module(page, web_base_url, api_handler=_with_defaults_catalog)
+    _render(page, {"id": "t74", "title": "Fix the printer", "tags": ["codex"], "assignee": "codex", "fields": {}})
+
+    model_select = page.locator("#test-assignment-container [data-field='model']")
+    expect(model_select.locator("option")).to_have_count(2)
+    assert model_select.locator("option").first.inner_text() == "engine default"
+
+
+def test_cloud_engine_shows_model_picker_from_remote_catalog(page: Page, web_base_url):
+    _load_module(page, web_base_url, api_handler=_with_defaults_catalog)
+    _render(page, {"id": "t72", "title": "Summarize the report", "tags": ["cloud"], "assignee": "cloud", "fields": {}})
+
+    container = page.locator("#test-assignment-container")
+    expect(container.locator("[data-row='model']")).to_be_visible()
+    expect(container.locator("[data-row='effort']")).to_be_hidden()
+    expect(container.locator("[data-row='host']")).to_be_hidden()
+    model_select = container.locator("[data-field='model']")
+    expect(model_select.locator("option")).to_have_count(3)  # default + 2 remote models
+    texts = model_select.locator("option").all_inner_texts()
+    assert any("qwen3-a22b" in t for t in texts)
+    assert "accounts/fireworks/models/deepseek-v4-flash" in texts[0]  # default label names it
+
+
+def test_selecting_cloud_model_saves_field(page: Page, web_base_url):
+    _load_module(page, web_base_url, api_handler=_with_defaults_catalog)
+    _render(page, {"id": "t73", "title": "Summarize the report", "tags": ["cloud"], "assignee": "cloud", "fields": {}})
+
+    model_select = page.locator("#test-assignment-container [data-field='model']")
+    expect(model_select.locator("option")).to_have_count(3)
+    model_select.select_option("accounts/fireworks/models/qwen3-a22b")
+    calls = page.evaluate("() => window.__lastCalls")
+    assert calls[-1]["patch"]["fields"]["model"] == "accounts/fireworks/models/qwen3-a22b"
