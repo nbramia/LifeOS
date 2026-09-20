@@ -199,9 +199,13 @@ runner's own `scripts/candidate_reuse.py`, reuses a
 `candidate-verification-shadow` verdict only when the App published it, its
 conclusion is `success`, its `trusted_runner` and `tree` equal the run's own,
 its `mode` is `executed`, and its `lanes` cover every lane the run selected.
-The check summary then names the reused check. Any mismatch, a missing
-App id, an unreachable head, or a malformed record executes the lanes as
-usual; a shadow run never reuses anything. Reuse only recognises
+The check summary then names the reused check. The App id the runner
+matches against is `vars.LIFEOS_CANDIDATE_APP_ID` read from the execution
+job, which has no environment, so the variable must exist at repository
+scope (an environment-scoped copy on the publisher's environment is invisible
+there and leaves the reuse step skipped). Any mismatch, a missing App id, an
+unreachable head, or a malformed record executes the lanes as usual; a shadow
+run never reuses anything. Reuse only recognises
 verification this runner already performed on identical bytes, so a
 candidate that a rebase changed is verified afresh.
 
