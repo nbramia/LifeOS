@@ -1,8 +1,12 @@
 """Enforces docs/AGENTS.md's "Current behavior only" principle: docs, code
-comments, docstrings, and test docstrings describe the system as it is, not
-its development history. No comparisons to an older state, no review-process
-play-by-play, no issue/PR numbers cited as a timeline -- git history holds
-that narrative.
+comments, docstrings, and test docstrings describe the system as it is --
+bidirectionally. Not its development history: no comparisons to an older
+state, no review-process play-by-play, no issue/PR numbers cited as a
+timeline -- git history holds that narrative. And not its roadmap either: no
+promises about a feature, endpoint, or fix that doesn't exist yet -- a repo
+that says a capability is still to come, rather than either describing it as
+it is or leaving it undescribed, tends to keep saying so long after the gap
+closed. GitHub issues hold that narrative instead.
 
 Scans (comments, docstrings, and any bare string-expression statement --
 never code that runs, and never an ordinary string literal used as a value):
@@ -64,7 +68,21 @@ PATTERN = re.compile(
     r"set out|calls for|called for|specified|specifies)|as of 20|used to be|"
     r'has been (added|moved|changed|removed|replaced|rewritten)|historically|formerly|in the past|'
     r'earlier (version|implementation|code)|round [0-9]|finding [0-9]|review(er)? (round|finding))'
-    r'|(?<![\w#])#\d{3,5}\b',
+    r'|(?<![\w#])#\d{3,5}\b'
+    # Forward-looking counterpart to the backward-narration group above: a
+    # roadmap promise about something that doesn't exist yet, phrased so it
+    # keeps reading as true long after the gap it describes has closed.
+    # Deliberately narrower than a bare "not yet"/"eventually" match -- both
+    # of those also describe an ordinary in-progress runtime state (a value
+    # not yet set on this object, a retry that will eventually succeed) far
+    # more often than they describe a missing feature, and a ratchet this
+    # noisy would defeat its own purpose. Each alternative below instead
+    # pairs the hedge with a verb about the codebase/product itself shipping
+    # or being built, which the runtime-state phrasing never does.
+    r'|\b(not yet (shipped|implemented|built|available|supported|configured|wired up)|'
+    r'coming soon|will be (added|implemented|shipped|available)|'
+    r'once (?:\w+ ){0,3}ships\b|future work|planned for (the )?future|'
+    r'for now[,.]|TODO:?\s*ships?\b|in a future version)',
     re.IGNORECASE,
 )
 
@@ -73,7 +91,17 @@ PATTERN = re.compile(
 # entry masks only its own matched span (replaced with spaces of the same
 # length) before PATTERN runs, never the whole line -- so a line that also
 # carries a real violation elsewhere is still caught.
-ALLOWLIST = re.compile(r"datetime\.now\(|\bnow\s*=|time\.time\(\)")
+#
+# The last two guard the forward-looking group: a setup guide telling the
+# reader to come back to a walkthrough step after a later phase completes
+# (an instruction about reading order, not a roadmap item), and an HTML
+# placeholder comment describing a container a script populates at runtime
+# (an ordinary DOM note, not a promise about unbuilt code).
+ALLOWLIST = re.compile(
+    r"datetime\.now\(|\bnow\s*=|time\.time\(\)"
+    r"|Skip this phase for now\."
+    r"|Contextual content [a-z ]*dynamically"
+)
 
 _HASH_RE = re.compile("#")
 _DOC_EXCLUDED_DIRS = ("adr", "archive", "plans")

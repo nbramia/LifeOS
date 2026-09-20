@@ -113,9 +113,9 @@ async def search(request: SearchRequest) -> SearchResponse:
         if request.filters.note_type and len(request.filters.note_type) == 1:
             chroma_filter["note_type"] = request.filters.note_type[0]
 
-        # Date range filtering would require custom handling
-        # ChromaDB doesn't support range queries directly on strings
-        # For now, we'll filter in post-processing if needed
+        # ChromaDB doesn't support range queries directly on strings, so
+        # date-range filtering happens in post-processing below (see
+        # request.filters.date_from/to).
 
     # Resolve the effective date window: explicit params win; otherwise try to
     # infer one from a bounded relative-time phrase in the query ("last week")

@@ -120,10 +120,11 @@ async def test_audio_clip_forwards_bytes_and_headers(proxy_client):
 
 
 async def test_transcribe_forwards_through_the_generic_proxy(proxy_client):
-    """No LifeOS-side route for this exists yet -- the catch-all `{path:path}`
-    handler already forwards any gateway path, including one whisper-relay
-    doesn't implement yet. Proven here against a stub that does, pinning that
-    the day the real route ships, LifeOS needs no code change to use it."""
+    """LifeOS has no route-specific code for `/api/voice/transcribe` -- the
+    catch-all `{path:path}` handler forwards it, like any other gateway path.
+    Proven here against a stub rather than a live whisper-relay, so this
+    doesn't depend on whisper-relay's real STT engine being available during
+    the test."""
     files = {"audio": ("wake.wav", b"\x00\x01fakepcm", "audio/wav")}
     resp = await proxy_client.post("/api/voice/transcribe", files=files)
 

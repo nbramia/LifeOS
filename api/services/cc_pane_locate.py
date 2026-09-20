@@ -23,7 +23,7 @@ Note: wezterm's JSON output does not expose pane.pid, but does expose
 pane.tty_name reliably across versions, so the probe is keyed on TTY.
 
 macOS would replace step 2 with `ttyname()` via `/dev/fd/0` (no /proc);
-out of scope for now — LifeOS is Linux-targeted on the host running /agents.
+out of scope — LifeOS is Linux-targeted on the host running /agents.
 """
 from __future__ import annotations
 

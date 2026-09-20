@@ -13,12 +13,11 @@ fragment to `LifeOS/Log/Journal/YYYY-MM-DD.md` deterministically, in code,
 and reports back that it did; this endpoint requires that confirmation before
 it calls a delivery captured.
 
-Our own contract (see docs/guides/journal-ring-ingest.md) — the exact shape a
-real Pebble Index webhook sends is unknown until the device ships in March
-2026, so this endpoint is built against a contract we control and adapts
-once the device is in hand. `_adapt_payload` is the ONLY function that knows the
-request body's shape; if a real device's webhook doesn't match, only that
-function should need to change.
+Our own contract (see docs/guides/journal-ring-ingest.md) — this endpoint is
+built against a payload shape LifeOS controls rather than the device's own
+undocumented webhook format. `_adapt_payload` is the ONLY function that knows
+the request body's shape; if a real device's webhook doesn't match it, only
+that function needs to change.
 
 Auth mirrors the existing bearer-token ingest pattern (`api/routes/fitness.py`
 `_check_ingest_auth`, itself modeled on the MCP HTTP transport's

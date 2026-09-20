@@ -52,5 +52,5 @@ export const elements = {};
 export const endpoints = {};
 
 // Integration hooks the shell provides via initChat() — e.g. onAgentThreadReply
-// (the agent-thread reply path, which stays in the shell for now).
+// (the agent-thread reply path, which the shell handles directly).
 export const hooks = {};

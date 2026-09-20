@@ -1,25 +1,9 @@
 """
 CRM API Routes Package.
 
-This package contains the CRM API endpoints organized by domain:
-- models.py: All Pydantic request/response models
-- _utils.py: Shared helper functions (person lookup, category computation, etc.)
-- people.py: Person CRUD endpoints (TODO)
-- facts.py: Person facts endpoints (TODO)
-- timeline.py: Timeline/interaction endpoints (TODO)
-- relationships.py: Relationship endpoints (TODO)
-- sources.py: Source sync + Apple Contacts (TODO)
-- me.py: Me dashboard endpoints (TODO)
-- family.py: Family dashboard endpoints (TODO)
-- health.py: Sync health + review queue (TODO)
-- insights.py: Relationship insights (TODO)
-
-Migration Status:
-- Phase 1: models.py and _utils.py created
-- Phase 2: Endpoint migration in progress (using original crm.py as source)
-
-For now, the original api/routes/crm.py file remains the primary router.
-This package will be fully populated in future refactoring phases.
+Re-exports the CRM Pydantic request/response models (`models.py`) and
+shared helper functions (`_utils.py`, e.g. person lookup, category
+computation) used by `api/routes/crm.py`, which is the CRM router.
 """
 
 # Re-export models for convenience
@@ -204,4 +188,13 @@ __all__ = [
     "source_entity_to_response",
     "relationship_to_response",
     "person_to_detail_response",
+    # Underscore aliases for backward compat
+    "_get_strength_override",
+    "_is_family_member",
+    "_tokenize",
+    "_fuzzy_name_match",
+    "_search_matches",
+    "_source_entity_to_response",
+    "_relationship_to_response",
+    "_person_to_detail_response",
 ]

@@ -79,7 +79,7 @@ Tag precedence (first match wins): `#local` → `#claude` → `#codex` → `#her
 | **Speed** | ~50 tok/s on a workstation GPU; first-token latency dominated by load | ~70+ tok/s sustained, but session-create round-trip + container provisioning |
 | **Cost** | Effectively free (electricity) | Sonnet 4.6: ~$3 / 1M input tokens, $15 / 1M output. Plus $0.08/hour session-hour overhead. |
 | **Tools available** | Bash, Read, Write, Edit, Glob, Grep, WebSearch, WebFetch, sleep + LifeOS MCP + inter-agent tools | Bash, Read, Write, Edit, Glob, Grep, web_search, web_fetch + LifeOS MCP + all your Vault-connected MCPs (cloud productivity, work tools) |
-| **Filesystem reach** | Operator's actual machine — agent can touch your real files | Anthropic-managed ephemeral container by default; self-hosted sandbox planned for future |
+| **Filesystem reach** | Operator's actual machine — agent can touch your real files | Anthropic-managed ephemeral container |
 | **Failure modes** | Model capability limits, GPU OOM | Per-task billing, MCP init failures, Anthropic rate limits |
 
 ---

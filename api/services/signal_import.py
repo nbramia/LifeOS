@@ -270,7 +270,7 @@ def import_signal_export(
     stats["contacts"] = len(export.contacts)
 
     for contact_id, contact in export.contacts.items():
-        # Skip groups for now
+        # Group threads are skipped -- only 1:1 contacts become SourceEntities.
         if contact.is_group:
             stats["skipped_groups"] += 1
             continue
