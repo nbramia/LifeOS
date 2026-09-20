@@ -67,7 +67,7 @@ VAULT_PATH = Path(os.environ["LIFEOS_VAULT_PATH"])
 # window, so the chat/board captures below crop dead space rather than
 # leaving a big blank middle.
 DESKTOP_VIEWPORT = {"width": 1440, "height": 900}
-CHAT_VIEWPORT = {"width": 1440, "height": 760}
+CHAT_VIEWPORT = {"width": 1440, "height": 820}
 BOARD_VIEWPORT = {"width": 2200, "height": 960}
 
 REAL_HOSTNAME = socket.gethostname().split(".")[0]
@@ -477,6 +477,39 @@ def crop_to_content(page, path: Path, *, bottom_locator=None, exclude_locator=No
     crop_and_save(page, path, clip={"x": 0, "y": 0, "width": width, "height": max(height, 100)})
 
 
+def scroll_messages_to_bottom(page) -> None:
+    """Instant (non-smooth) scroll of the message list to its true bottom.
+    addMessage()'s own scrollToBottom() uses `behavior: 'smooth'`, an
+    animated scroll that a fixed short wait_for_timeout can outrace —
+    leaving the last message only partially scrolled into view and cut off
+    by the viewport edge in a clip-based screenshot (no full_page capture
+    can recover it either: #messages is an internally-scrolling region,
+    not page-level overflow, so full_page renders the same viewport-only
+    content). Setting scrollTop directly bypasses the animation entirely.
+    """
+    page.evaluate(
+        "() => { const el = document.getElementById('messages'); "
+        "if (el) el.scrollTop = el.scrollHeight; }"
+    )
+
+
+def _lanes_content_bottom(page, lanes_locator) -> float:
+    """Max bottom-edge y (viewport coords) of any card across the given set
+    of `.board-lane` locators — used to crop a board screenshot to just
+    below the tallest column's actual cards, not the full stretched lane
+    height (`.board-lane` fills the row via flex `align-items: stretch`
+    regardless of card count)."""
+    max_bottom = 0.0
+    for i in range(lanes_locator.count()):
+        cards = lanes_locator.nth(i).locator(".board-card")
+        if cards.count() == 0:
+            continue
+        box = cards.last.bounding_box()
+        if box:
+            max_bottom = max(max_bottom, box["y"] + box["height"])
+    return max_bottom
+
+
 def open_conversation_and_expand_sources(page, title: str) -> None:
     page.click(f"text={title}")
     page.wait_for_selector(".message.assistant")
@@ -485,6 +518,8 @@ def open_conversation_and_expand_sources(page, title: str) -> None:
     if toggles.count() > 0:
         toggles.first.click()
         page.wait_for_timeout(200)
+    scroll_messages_to_bottom(page)
+    page.wait_for_timeout(150)
 
 
 def capture(playwright) -> list[str]:
@@ -530,6 +565,8 @@ def capture(playwright) -> list[str]:
     tasks_chat_page.click("text=Task and reminder setup")
     tasks_chat_page.wait_for_selector(".message.assistant")
     tasks_chat_page.wait_for_timeout(300)
+    scroll_messages_to_bottom(tasks_chat_page)
+    tasks_chat_page.wait_for_timeout(150)
     crop_to_content(
         tasks_chat_page, IMAGES_DIR / "tasks-chat.png",
         bottom_locator=tasks_chat_page.locator(".message").last,
@@ -567,6 +604,7 @@ def capture(playwright) -> list[str]:
             timeout=15000,
         )
         voice_page.wait_for_timeout(200)
+    scroll_messages_to_bottom(voice_page)
     voice_page.wait_for_timeout(300)
     crop_to_content(voice_page, IMAGES_DIR / "chat-voice.png", bottom_locator=voice_page.locator("#voiceDock"))
     produced.append("chat-voice.png")
@@ -586,11 +624,43 @@ def capture(playwright) -> list[str]:
     board_page.mouse.click(100, 700)
     board_page.wait_for_timeout(500)
     redact_hostname_in_dom(board_page)
-    crop_to_content(
-        board_page, IMAGES_DIR / "agents-board.png",
-        exclude_locator=board_page.locator("#board-drop-tray"),
-    )
+    all_lanes = board_page.locator(".board-lane")
+    board_box = all_lanes.first.bounding_box()
+    content_bottom = _lanes_content_bottom(board_page, all_lanes)
+    if board_box and content_bottom:
+        # Ends shortly below the longest column's last card — at 8 lanes
+        # wide, this is necessarily a wide/short overview image; the
+        # detail crop below covers legible close-up reading.
+        crop_and_save(board_page, IMAGES_DIR / "agents-board.png", clip={
+            "x": 0, "y": max(board_box["y"] - 10, 0),
+            "width": BOARD_VIEWPORT["width"],
+            "height": (content_bottom + 24) - max(board_box["y"] - 10, 0),
+        })
+    else:
+        crop_to_content(
+            board_page, IMAGES_DIR / "agents-board.png",
+            exclude_locator=board_page.locator("#board-drop-tray"),
+        )
     produced.append("agents-board.png")
+
+    # --- agents-board-detail.png (Human queue / Scheduled / Review, at a
+    # legible zoom — the full 8-lane board above is necessarily small text
+    # once scaled to README width) ------------------------------------------
+    detail_lanes = board_page.locator(
+        '.board-lane[data-lane="human_queue"], '
+        '.board-lane[data-lane="scheduled"], '
+        '.board-lane[data-lane="review"]'
+    )
+    first_box = board_page.locator('.board-lane[data-lane="human_queue"]').bounding_box()
+    last_box = board_page.locator('.board-lane[data-lane="review"]').bounding_box()
+    detail_bottom = _lanes_content_bottom(board_page, detail_lanes)
+    if first_box and last_box and detail_bottom:
+        crop_and_save(board_page, IMAGES_DIR / "agents-board-detail.png", clip={
+            "x": max(first_box["x"] - 10, 0), "y": max(first_box["y"] - 10, 0),
+            "width": (last_box["x"] + last_box["width"]) - first_box["x"] + 20,
+            "height": (detail_bottom + 24) - max(first_box["y"] - 10, 0),
+        })
+        produced.append("agents-board-detail.png")
 
     # --- agents-schedules.png (the Scheduled lane column) ------------------
     # The Scheduled lane is a column on the same board, not a separate tab.
@@ -623,10 +693,12 @@ def capture(playwright) -> list[str]:
     card_page.wait_for_selector("#board-drawer-backdrop:not([hidden])", timeout=5000)
     card_page.wait_for_timeout(300)
     redact_hostname_in_dom(card_page)
-    crop_to_content(
-        card_page, IMAGES_DIR / "agents-card.png",
-        exclude_locator=card_page.locator("#board-drop-tray"),
-    )
+    # End right after the drawer's action buttons (Rename/Accept/.../Delete)
+    # — below that sits a second panel (the linked session's transcript
+    # summary), which is real UI but reads as a stray half-cut repeat of the
+    # card title when it's only partially in frame.
+    delete_btn = card_page.locator("#board-drawer button", has_text="Delete")
+    crop_to_content(card_page, IMAGES_DIR / "agents-card.png", bottom_locator=delete_btn)
     produced.append("agents-card.png")
     card_page.close()
 
