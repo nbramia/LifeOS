@@ -451,7 +451,7 @@ _DESTRUCTIVE_CONTEXT = (
     "An autonomous agent with full shell, git, email, and calendar access "
     "will execute this task without asking first."
 )
-_DESTRUCTIVE_SAFETY_CONTEXT_MAX_CHARS = 8000
+_DESTRUCTIVE_SAFETY_CONTEXT_MAX_CHARS = 8192
 
 
 def _validate_destructive_answer(value, lo: float, hi: float) -> float:

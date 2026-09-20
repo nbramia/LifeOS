@@ -97,7 +97,9 @@ parent directory or affinity, and finally the ordinary title-based fallback.
 Affinity strings are catalog names, never raw paths. API-host mappings and
 inferred title paths are not copied to a different remote execution host; a
 remote child without an explicit or same-host parent path starts in that
-host's default directory.
+host's default directory. In-process routes accept inferred locations only
+when the directory already exists on the API host; their unset fallback stays
+in effect rather than freezing an uncloned path into the execution snapshot.
 
 An agent-owned project's explicit **Plan and delegate** action starts an
 operator-origin coordination session. That session is separate from task
@@ -108,7 +110,11 @@ delegated scope and provider consent. A stable operation ID makes retries
 recover the same coordination request. Each intended child also carries a
 stable `operation_key` derived from that request and the child's role, so a
 retried create recovers the existing task instead of duplicating child work.
-The coordinator finishing or failing does not finish the project.
+The coordinator finishing or failing does not finish the project. An explicit
+coordinator `working_dir` remains authoritative. Its optional project-affinity
+fallback selects only an existing local directory on the API host; remote CLI
+coordinators start in the remote host's default directory unless they have an
+explicit path.
 
 Project completion is explicit. All children must be done or cancelled, no
 review may remain unaccepted, no coordinator may be live, and no cancellation

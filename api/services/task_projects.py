@@ -447,12 +447,12 @@ class ProjectTaskService:
             and executor in {"local", "remote", "claude_code", "codex"}
         ):
             from api.services.agent_worker.remote_spawn import api_host_name, is_local_host
-            from api.services.directory_resolver import resolve_location_affinity
+            from api.services.directory_resolver import resolve_existing_location_affinity
 
             if executor not in {"claude_code", "codex"} or is_local_host(
                 assignment.host, api_host_name(),
             ):
-                coordinator_working_dir = resolve_location_affinity(
+                coordinator_working_dir = resolve_existing_location_affinity(
                     _clean_field(task.fields, "project")
                 )
 

@@ -5414,15 +5414,30 @@ class Worker:
             parent_working_dir
             and _execution_host(parent_host) == _execution_host(child_execution_host)
         )
+        is_cli_route = pre.routing in (ROUTE_CLAUDE_CODE, ROUTE_CODEX)
+
+        def _usable_inferred_location(value: str | None) -> str | None:
+            if not value:
+                return None
+            if is_cli_route or os.path.isdir(value):
+                return value
+            return None
+
         candidate_working_dir = child_working_dir
         if not candidate_working_dir and not is_remote_cli_spawn:
-            candidate_working_dir = resolve_location_affinity(child_affinity)
+            candidate_working_dir = _usable_inferred_location(
+                resolve_location_affinity(child_affinity)
+            )
         if not candidate_working_dir and parent_path_compatible:
             candidate_working_dir = parent_working_dir
         if not candidate_working_dir and not is_remote_cli_spawn:
-            candidate_working_dir = resolve_location_affinity(parent_affinity)
+            candidate_working_dir = _usable_inferred_location(
+                resolve_location_affinity(parent_affinity)
+            )
         if not candidate_working_dir and not is_remote_cli_spawn:
-            candidate_working_dir = resolve_working_directory(title)
+            candidate_working_dir = _usable_inferred_location(
+                resolve_working_directory(title, allow_uncloned=is_cli_route)
+            )
         if pre.routing in (ROUTE_CLAUDE_CODE, ROUTE_CODEX):
             # Clone-on-demand: a Jev-chosen location may name a repository
             # the operator owns but that isn't checked out on this host

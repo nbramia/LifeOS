@@ -3043,8 +3043,11 @@ def test_clone_on_demand_skipped_for_remote_host(tmp_path: Path, monkeypatch):
 
 
 @pytest.mark.unit
-def test_remote_cli_spawn_does_not_persist_api_host_location(tmp_path: Path, monkeypatch):
-    """An inferred API-host path is never reused as a remote host cwd."""
+@pytest.mark.parametrize("child_affinity", ["widget", None])
+def test_remote_cli_spawn_withholds_recognized_child_and_parent_affinities(
+    tmp_path: Path, monkeypatch, child_affinity: str | None,
+):
+    """Recognized API-host affinities are never reused as a remote host cwd."""
     from config.settings import settings as _settings
     monkeypatch.setattr(_settings, "agent_hosts", {"studio": "user@studio"}, raising=False)
 
@@ -3052,6 +3055,7 @@ def test_remote_cli_spawn_does_not_persist_api_host_location(tmp_path: Path, mon
     from api.services.jev_task_routing import JevAnswer, TaskJudgment
     monkeypatch.setattr(dr, "_location_options", lambda: [
         ("widget", "an uncloned repo", "/code/Widget"),
+        ("parent-widget", "a parent repo", "/code/ParentWidget"),
     ])
     monkeypatch.setattr(
         "api.services.jev_task_routing.judge_task",
@@ -3064,18 +3068,18 @@ def test_remote_cli_spawn_does_not_persist_api_host_location(tmp_path: Path, mon
     api = FakeApi(tasks=[
         {"id": "t1", "description": "do something random", "status": "in_progress",
          "tags": [RUNNING_TAG, "claude"],
-         "fields": {
-             "host": "studio",
-             "parent_id": "parent1",
-             "project": "/api-host/unrecognized-affinity",
-         },
+         "fields": dict(
+             host="studio",
+             parent_id="parent1",
+             **({"project": child_affinity} if child_affinity else {}),
+         ),
          "parent_id": "parent1"},
         {"id": "parent1", "description": "Synthetic parent", "status": "todo",
          "tags": [], "child_count": 1,
          "fields": {
              "host": "different-remote",
              "working_dir": "/different-remote/repository",
-             "project": "widget",
+             "project": "parent-widget",
          }},
     ])
     pool = _CapturingPool()

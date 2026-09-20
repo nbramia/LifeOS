@@ -164,6 +164,8 @@ def test_actual_local_executor_receives_bounded_project_context(tmp_path: Path, 
     assert "Synthetic project objective" in safety_context
     assert "Acceptance: synthetic verification passes" in safety_context
     assert "Child status summary" not in safety_context
+    assert "_preflight_safety_context" not in seen[0]
+    assert "_project_location_context" not in seen[0]
 
 
 def test_child_affinity_precedes_compatible_parent_location(tmp_path: Path, monkeypatch):
@@ -216,6 +218,108 @@ def test_child_affinity_precedes_compatible_parent_location(tmp_path: Path, monk
 
     session = worker.session_store.get(child["id"])
     assert session.execution_spec["working_dir"] == str(child_dir)
+
+
+def test_parent_affinity_precedes_title_fallback_for_local_child(tmp_path: Path, monkeypatch):
+    parent_dir = tmp_path / "parent-repo"
+    parent_dir.mkdir()
+    title_dir = tmp_path / "title-repo"
+    title_dir.mkdir()
+    child = {
+        "id": "child-parent-affinity",
+        "description": "Implement synthetic phase",
+        "status": "in_progress",
+        "tags": ["local", "agent-running"],
+        "fields": {"parent_id": "parent-affinity"},
+        "parent_id": "parent-affinity",
+    }
+    parent = {
+        "id": "parent-affinity",
+        "description": "Synthetic affinity project",
+        "notes": "Acceptance: use the parent repository.",
+        "child_count": 1,
+        "fields": {"project": "parent-repo"},
+    }
+
+    def handler(request: httpx.Request):
+        if request.method == "GET" and request.url.path == "/api/tasks/child-parent-affinity":
+            return httpx.Response(200, json=child)
+        if request.method == "GET" and request.url.path == "/api/tasks/parent-affinity":
+            return httpx.Response(200, json=parent)
+        if request.method == "GET" and request.url.path == "/api/tasks/parent-affinity/children":
+            return httpx.Response(200, json={"tasks": [child], "total": 1})
+        if request.url.path.endswith("/swap-tag"):
+            return httpx.Response(200, json={"swapped": True})
+        return httpx.Response(200, json={})
+
+    monkeypatch.setattr(
+        "api.services.directory_resolver.resolve_location_affinity",
+        lambda affinity: str(parent_dir) if affinity == "parent-repo" else None,
+    )
+    monkeypatch.setattr(
+        "api.services.directory_resolver.resolve_working_directory",
+        lambda _title, **_kwargs: str(title_dir),
+    )
+
+    class CaptureExecutor:
+        def execute(self, _session, _task):
+            return ExecutorOutcome(status=STATUS_COMPLETED, final_text="synthetic done")
+
+    worker = _worker(tmp_path, handler, local_executor=CaptureExecutor())
+    worker.session_store.create(task_id=child["id"], status="claimed", routing="local")
+    worker._dispatch(child)
+
+    session = worker.session_store.get(child["id"])
+    assert session.execution_spec["working_dir"] == str(parent_dir)
+
+
+def test_non_cli_child_skips_missing_inferred_locations(tmp_path: Path, monkeypatch):
+    missing_affinity = tmp_path / "missing-affinity"
+    missing_title = tmp_path / "missing-title"
+    child = {
+        "id": "child-missing-affinity",
+        "description": "Implement synthetic phase",
+        "status": "in_progress",
+        "tags": ["local", "agent-running"],
+        "fields": {"project": "missing-repo"},
+    }
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request):
+        if request.method == "GET" and request.url.path == "/api/tasks/child-missing-affinity":
+            return httpx.Response(200, json=child)
+        if request.url.path.endswith("/swap-tag"):
+            return httpx.Response(200, json={"swapped": True})
+        return httpx.Response(200, json={})
+
+    monkeypatch.setattr(
+        "api.services.directory_resolver.resolve_location_affinity",
+        lambda affinity: str(missing_affinity) if affinity == "missing-repo" else None,
+    )
+    resolver_calls: list[bool] = []
+
+    def resolve_title(_title, *, allow_uncloned=True):
+        resolver_calls.append(allow_uncloned)
+        return str(missing_title)
+
+    monkeypatch.setattr(
+        "api.services.directory_resolver.resolve_working_directory",
+        resolve_title,
+    )
+
+    class CaptureExecutor:
+        def execute(self, _session, task):
+            seen.append(task)
+            return ExecutorOutcome(status=STATUS_COMPLETED, final_text="synthetic done")
+
+    worker = _worker(tmp_path, handler, local_executor=CaptureExecutor())
+    worker.session_store.create(task_id=child["id"], status="claimed", routing="local")
+    worker._dispatch(child)
+
+    session = worker.session_store.get(child["id"])
+    assert resolver_calls == [False]
+    assert session.execution_spec["working_dir"] is None
+    assert seen[0].get("working_dir") is None
 
 
 def test_cancellation_intent_retires_claim_before_executor_side_effect(tmp_path: Path):

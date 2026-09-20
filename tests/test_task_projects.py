@@ -368,7 +368,7 @@ def test_raw_parent_cancel_and_delete_are_guarded(manager: TaskManager):
 
 
 def test_plan_and_delegate_is_idempotent_and_links_before_claim(
-    manager: TaskManager, stores, monkeypatch,
+    manager: TaskManager, stores, monkeypatch, tmp_path: Path,
 ):
     sessions, transcripts = stores
     service = ProjectTaskService(manager, sessions, transcripts)
@@ -383,9 +383,15 @@ def test_plan_and_delegate_is_idempotent_and_links_before_claim(
             "project": "synthetic-release",
         },
     )
+    coordinator_dir = tmp_path / "SyntheticRelease"
+    coordinator_dir.mkdir()
+    monkeypatch.setattr(
+        "api.services.directory_resolver.resolve_existing_location_affinity",
+        lambda affinity: str(coordinator_dir) if affinity == "synthetic-release" else None,
+    )
     monkeypatch.setattr(
         "api.services.directory_resolver.resolve_location_affinity",
-        lambda affinity: "/catalog/SyntheticRelease" if affinity == "synthetic-release" else None,
+        lambda _affinity: pytest.fail("coordinator affinity must not use GitHub catalog lookup"),
     )
     monkeypatch.setattr("api.services.agent_worker.remote_spawn.api_host_name", lambda: "api")
     manager.create("Synthetic implementation", fields={"parent_id": parent.id})
@@ -415,7 +421,7 @@ def test_plan_and_delegate_is_idempotent_and_links_before_claim(
         "model_id": "gpt-synthetic",
         "effort": "high",
         "host": "api",
-        "working_dir": "/catalog/SyntheticRelease",
+        "working_dir": str(coordinator_dir),
         "budget": None,
         "constraints": {
             "allowed_executors": [],
@@ -485,7 +491,7 @@ def test_plan_and_delegate_supports_managed_cloud_aliases(
         },
     )
     monkeypatch.setattr(
-        "api.services.directory_resolver.resolve_location_affinity",
+        "api.services.directory_resolver.resolve_existing_location_affinity",
         lambda _affinity: pytest.fail("Managed aliases do not accept a working directory"),
     )
     manager.create("Synthetic managed child", fields={"parent_id": parent.id})
@@ -499,6 +505,31 @@ def test_plan_and_delegate_supports_managed_cloud_aliases(
     assert session.host == "api"
     assert session.execution_request["executor"] == "claude"
     assert session.execution_request["model_id"] is None
+    assert session.execution_request["working_dir"] is None
+
+
+@pytest.mark.parametrize("owner", ["codex", "claude"])
+def test_remote_cli_project_coordinator_withholds_api_host_affinity(
+    manager: TaskManager, stores, monkeypatch, owner: str,
+):
+    sessions, transcripts = stores
+    service = ProjectTaskService(manager, sessions, transcripts)
+    parent = manager.create(
+        "Synthetic remote coordination",
+        tags=[owner],
+        fields={"host": "studio", "project": "synthetic-repo"},
+    )
+    manager.create("Synthetic remote child", fields={"parent_id": parent.id})
+    monkeypatch.setattr("api.services.agent_worker.remote_spawn.api_host_name", lambda: "api")
+    monkeypatch.setattr(
+        "api.services.directory_resolver.resolve_existing_location_affinity",
+        lambda _affinity: pytest.fail("remote coordinator must not resolve API-host affinity"),
+    )
+
+    result = service.plan_and_delegate(parent.id, operation_id="remote-coordinator")
+
+    session = sessions.get_by_session_id(result["session_id"])
+    assert session.execution_request["host"] == "studio"
     assert session.execution_request["working_dir"] is None
 
 
