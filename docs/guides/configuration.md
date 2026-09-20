@@ -157,6 +157,16 @@ The HTTP MCP transport exposes LifeOS tools to remote agents (primarily Anthropi
 | `LIFEOS_MCP_HTTP_PORT` | int | `8765` | Port. |
 | `LIFEOS_MCP_BEARER_TOKEN` | str | — | Required for any non-loopback request. Generate with `openssl rand -hex 32`. Treat as a secret. |
 | `LIFEOS_MCP_HTTP_URL` | str | — | Public URL Managed Agents uses to reach the MCP server. |
+| `LIFEOS_MCP_ALLOWED_TOOLS` | str | — | Optional, comma-separated tool-name allowlist for this instance. Unset keeps every registered tool callable (this instance's default behavior). |
+
+### Dedicated named HTTP instance (e.g. Instinct)
+
+A second HTTP transport process — its own port, its own credential, a required allowlist — for a client that shouldn't share the default instance's token. See [instinct-mcp-access.md](instinct-mcp-access.md) for the full setup, rotation, revocation, and teardown procedure.
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_MCP_INSTINCT_BEARER_TOKEN` | str | — | Credential for the dedicated Instinct instance, distinct from `LIFEOS_MCP_BEARER_TOKEN`. Required to start it. |
+| `LIFEOS_MCP_INSTINCT_ALLOWED_TOOLS` | str | — | Comma-separated tool-name allowlist for the Instinct instance. Required to start it — unlike the default instance's `LIFEOS_MCP_ALLOWED_TOOLS`, this one is not optional. |
 
 ## Agent Worker — Defaults and Budgets
 
