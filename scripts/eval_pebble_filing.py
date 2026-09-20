@@ -21,7 +21,9 @@ Exits non-zero if the score falls below PASS_THRESHOLD (see below).
 import argparse
 import asyncio
 import sys
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -30,6 +32,7 @@ from api.services.pebble_capture import (  # noqa: E402
     PebbleJournalClassifier,
     validate_plan,
 )
+from config.settings import settings  # noqa: E402
 
 # Chosen so an occasional miss on a genuinely ambiguous case doesn't fail a
 # healthy model, while still catching a model that has lost the log-only
@@ -99,9 +102,10 @@ _HELD_OUT_MULTI_ITEM_CASES = [
     ),
 ]
 
-# transcripts that must file as a notify schedule, not a plain task
+# (transcript, expected local hour) -- must file as a notify schedule, not a
+# plain task, at the stated clock time, not a day word's default hour.
 _HELD_OUT_SCHEDULE_CASES = [
-    "Remind me at 4 PM tomorrow to take out the synthetic bins.",
+    ("Remind me at 4 PM tomorrow to take out the synthetic bins.", 16),
 ]
 
 
@@ -149,7 +153,7 @@ async def _score_multi_item_case(classifier, transcript, expected_phrase):
     return True, f"filed {evidence!r}{suffix}"
 
 
-async def _score_schedule_case(classifier, transcript):
+async def _score_schedule_case(classifier, transcript, expected_hour=None):
     try:
         raw = await classifier.classify(transcript, _RECORDED_AT)
         filed = validate_plan(raw, transcript=transcript, recorded_at=_RECORDED_AT)
@@ -157,11 +161,21 @@ async def _score_schedule_case(classifier, transcript):
         return False, f"error: {exc!r}"
     schedules = [a for a in filed if a.kind == "schedule" and a.action == "notify"]
     tasks = _task_actions(filed)
+    suffix = _confidence_suffix(classifier)
     passed = len(schedules) == 1 and len(tasks) == 0
-    return (
-        passed,
-        f"got {len(schedules)} notify schedule(s), {len(tasks)} task(s){_confidence_suffix(classifier)}",
-    )
+    detail = f"got {len(schedules)} notify schedule(s), {len(tasks)} task(s){suffix}"
+    if not passed or expected_hour is None:
+        return passed, detail
+    # The transcript names a specific clock time, independent of the
+    # classifier: a day word's implicit default hour must not silently
+    # replace it (see api/services/time_parser.parse_contextual_time).
+    parsed = datetime.fromisoformat(schedules[0].schedule_value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=ZoneInfo(schedules[0].timezone or settings.timezone))
+    local = parsed.astimezone(ZoneInfo(settings.timezone))
+    if local.hour != expected_hour:
+        return False, f"{detail}; scheduled for {local.hour:02d}:{local.minute:02d} local, expected {expected_hour:02d}:00"
+    return True, f"{detail}; scheduled for {local.hour:02d}:{local.minute:02d} local"
 
 
 async def _run_cases(classifier):
@@ -187,8 +201,8 @@ async def _run_held_out_cases(classifier):
     for transcript, expected_phrase in _HELD_OUT_MULTI_ITEM_CASES:
         passed, detail = await _score_multi_item_case(classifier, transcript, expected_phrase)
         results.append((passed, "MULTI", transcript, detail))
-    for transcript in _HELD_OUT_SCHEDULE_CASES:
-        passed, detail = await _score_schedule_case(classifier, transcript)
+    for transcript, expected_hour in _HELD_OUT_SCHEDULE_CASES:
+        passed, detail = await _score_schedule_case(classifier, transcript, expected_hour)
         results.append((passed, "SCHED", transcript, detail))
     return results
 
