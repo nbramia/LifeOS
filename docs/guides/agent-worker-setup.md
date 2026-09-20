@@ -372,7 +372,7 @@ To pause new claims without stopping the worker, set `LIFEOS_AGENT_DAILY_CAP_DOL
 
 ### Typed judgments (Jev)
 
-Setting `TYPESAFE_API_KEY` in `.env` enables typed judgments via TypeSafe's Jev (https://docs.typesafe.ai) for surfaces that opt into it. Each surface that can use Jev is independently opt-in on top of the key, and nothing is sent to TypeSafe unless the key is set — an install without it behaves exactly as one without any Jev-backed judgment enabled.
+Setting `TYPESAFE_API_KEY` in `.env` enables typed judgments via TypeSafe's Jev (https://docs.typesafe.ai) for surfaces that opt into it. Each surface that can use Jev is independently opt-in on top of the key, and nothing is sent to TypeSafe unless the key is set — an install without it behaves exactly as one without any Jev-backed judgment enabled. Preflight's destructiveness judgment is one such surface: it runs in `shadow` mode by default once a key is set (`LIFEOS_AGENT_JEV_DESTRUCTIVE_GATE`), logging alongside the regex sanity gate rather than acting on its own — see [agent-worker.md § Preflight](../specs/technical/agent-worker.md#preflight).
 
 ### Security model
 

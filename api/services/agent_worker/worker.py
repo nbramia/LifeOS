@@ -4483,6 +4483,11 @@ class Worker:
             # unparseable — no verdict was obtained (see
             # `preflight.PreflightResult.preflight_error`).
             "preflight_error": pre.preflight_error,
+            # Jev destructiveness judgment (shadow/block gate — see
+            # `preflight.PreflightResult.destructive_score`). Both None when
+            # Jev isn't configured, the gate is off, or the call failed.
+            "destructive_score": pre.destructive_score,
+            "destructive_probability": pre.destructive_probability,
             "budget": {
                 "wall_seconds": pre.budget.wall_seconds,
                 "max_tokens": pre.budget.max_tokens,

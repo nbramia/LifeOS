@@ -1786,3 +1786,275 @@ def test_truncated_json_reply_is_not_fatal():
     assert tagged.sane is True
     assert tagged.sane_fatal is False
     assert tagged.preflight_error
+
+
+# ---------------------------------------------------------------------------
+# Jev destructiveness judgment (`_apply_destructive_judgment` /
+# `LIFEOS_AGENT_JEV_DESTRUCTIVE_GATE`). The Jev call itself is stubbed via
+# monkeypatching `JevClient.ask`; the LLM preflight `caller` stays a normal
+# `_golden_reply()` stub throughout, since these tests exercise the gate
+# layered on top of preflight, not preflight's own JSON parsing.
+# ---------------------------------------------------------------------------
+
+from api.services.jev_client import JevClient, JevError  # noqa: E402
+
+
+def _stub_jev_ask(score: float, probability: float):
+    def _ask(self, state, questions, *, model=None):
+        return {
+            "harm": {"score": score, "confidence": 0.9},
+            "irreversible": {"noul": probability},
+        }
+    return _ask
+
+
+@pytest.mark.unit
+def test_destructive_judgment_no_key_never_constructs_client(monkeypatch):
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "typesafe_api_key", "")
+    monkeypatch.setattr(settings, "agent_jev_destructive_gate", "shadow")
+
+    def _boom_init(self, *a, **kw):
+        raise AssertionError("JevClient must not be constructed with no key configured")
+
+    monkeypatch.setattr(JevClient, "__init__", _boom_init)
+
+    result = pf.run_preflight(title="Fix the login bug", tags=["agent"], caller=_stub(_golden_reply()))
+    assert result.destructive_score is None
+    assert result.destructive_probability is None
+
+
+@pytest.mark.unit
+def test_destructive_judgment_gate_off_with_key_never_constructs_client(monkeypatch):
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "typesafe_api_key", "test-key")
+    monkeypatch.setattr(settings, "agent_jev_destructive_gate", "off")
+
+    def _boom_init(self, *a, **kw):
+        raise AssertionError("JevClient must not be constructed when the gate is off")
+
+    monkeypatch.setattr(JevClient, "__init__", _boom_init)
+
+    result = pf.run_preflight(title="Fix the login bug", tags=["agent"], caller=_stub(_golden_reply()))
+    assert result.destructive_score is None
+    assert result.destructive_probability is None
+
+
+@pytest.mark.unit
+def test_destructive_judgment_shadow_records_fields_without_mutating_sane(monkeypatch):
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "typesafe_api_key", "test-key")
+    monkeypatch.setattr(settings, "agent_jev_destructive_gate", "shadow")
+    monkeypatch.setattr(JevClient, "ask", _stub_jev_ask(score=4.0, probability=0.99))
+
+    result = pf.run_preflight(
+        title="Purge all email older than 2020", tags=["agent"], caller=_stub(_golden_reply()),
+    )
+    assert result.destructive_score == pytest.approx(4.0)
+    assert result.destructive_probability == pytest.approx(0.99)
+    assert result.sane is True
+    assert result.sane_fatal is False
+    assert result.destructive_block is False
+
+
+@pytest.mark.unit
+def test_destructive_judgment_block_score_alone_parks(monkeypatch):
+    """Harm score above threshold, irreversible probability below —
+    the OR must still park. (Mutation check: swapping the gate's OR for an
+    AND makes this test fail.)"""
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "typesafe_api_key", "test-key")
+    monkeypatch.setattr(settings, "agent_jev_destructive_gate", "block")
+    monkeypatch.setattr(JevClient, "ask", _stub_jev_ask(score=3.0, probability=0.1))
+
+    result = pf.run_preflight(
+        title="Nuke the chromadb data dir and start fresh", tags=["agent"], caller=_stub(_golden_reply()),
+    )
+    assert result.sane is False
+    assert result.sane_fatal is False  # non-fatal — parks, never cancels
+    assert result.destructive_block is True
+    assert "Jev destructive judgment" in result.sane_reason
+
+
+@pytest.mark.unit
+def test_destructive_judgment_block_probability_alone_parks(monkeypatch):
+    """Irreversible probability above threshold, harm score below — the OR
+    must still park. (Mutation check: swapping the gate's OR for an AND
+    makes this test fail.)"""
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "typesafe_api_key", "test-key")
+    monkeypatch.setattr(settings, "agent_jev_destructive_gate", "block")
+    monkeypatch.setattr(JevClient, "ask", _stub_jev_ask(score=1.0, probability=0.9))
+
+    result = pf.run_preflight(
+        title="Force-push main and delete the old branches", tags=["agent"], caller=_stub(_golden_reply()),
+    )
+    assert result.sane is False
+    assert result.sane_fatal is False
+    assert result.destructive_block is True
+    assert "Jev destructive judgment" in result.sane_reason
+
+
+@pytest.mark.unit
+def test_destructive_judgment_block_below_both_thresholds_untouched(monkeypatch):
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "typesafe_api_key", "test-key")
+    monkeypatch.setattr(settings, "agent_jev_destructive_gate", "block")
+    monkeypatch.setattr(JevClient, "ask", _stub_jev_ask(score=0.5, probability=0.1))
+
+    result = pf.run_preflight(title="Fix the login bug", tags=["agent"], caller=_stub(_golden_reply()))
+    assert result.destructive_score == pytest.approx(0.5)
+    assert result.destructive_probability == pytest.approx(0.1)
+    assert result.sane is True
+    assert result.sane_fatal is False
+    assert result.destructive_block is False
+
+
+@pytest.mark.unit
+def test_destructive_judgment_block_regex_title_stays_fatal(monkeypatch):
+    """The regex sanity gate runs first and sets sane_fatal=True on a
+    regex-matching title — even a high-confidence Jev verdict must not
+    overwrite it (the regex wins in every gate mode)."""
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "typesafe_api_key", "test-key")
+    monkeypatch.setattr(settings, "agent_jev_destructive_gate", "block")
+    monkeypatch.setattr(JevClient, "ask", _stub_jev_ask(score=4.0, probability=0.99))
+
+    result = pf.run_preflight(title="rm -rf /", tags=["agent"], caller=_stub(_golden_reply()))
+    assert result.sane is False
+    assert result.sane_fatal is True
+    # The judgment still ran and recorded its answer even though it didn't
+    # get to act on it.
+    assert result.destructive_score == pytest.approx(4.0)
+    assert result.destructive_probability == pytest.approx(0.99)
+    assert result.destructive_block is False  # regex verdict, not the Jev gate, set sane=False
+
+
+@pytest.mark.unit
+def test_destructive_judgment_jev_error_leaves_fields_none(monkeypatch, caplog):
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "typesafe_api_key", "test-key")
+    monkeypatch.setattr(settings, "agent_jev_destructive_gate", "block")
+
+    def _boom(self, state, questions, *, model=None):
+        raise JevError("status 500")
+
+    monkeypatch.setattr(JevClient, "ask", _boom)
+
+    with caplog.at_level("WARNING"):
+        result = pf.run_preflight(
+            title="Fix the login bug", tags=["agent"], caller=_stub(_golden_reply()),
+        )
+    assert result.destructive_score is None
+    assert result.destructive_probability is None
+    assert result.sane is True
+    assert result.sane_fatal is False
+    assert result.routing == pf.ROUTE_LOCAL  # golden reply's routing, untouched
+    assert "JevError" in caplog.text
+    # Never the title or transcript in the warning.
+    assert "Fix the login bug" not in caplog.text
+
+
+@pytest.mark.unit
+def test_destructive_judgment_nan_answer_is_invalid(monkeypatch, caplog):
+    """A NaN harm score is a real float (passes the type check) but not a
+    finite in-range number — must be rejected the same as a failed call.
+
+    Mutation check: dropping the `math.isfinite` check from
+    `_validate_destructive_answer` makes this test fail."""
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "typesafe_api_key", "test-key")
+    monkeypatch.setattr(settings, "agent_jev_destructive_gate", "block")
+    monkeypatch.setattr(JevClient, "ask", _stub_jev_ask(score=float("nan"), probability=0.99))
+
+    with caplog.at_level("WARNING"):
+        result = pf.run_preflight(
+            title="Fix the login bug", tags=["agent"], caller=_stub(_golden_reply()),
+        )
+    assert result.destructive_score is None
+    assert result.destructive_probability is None
+    assert result.sane is True
+    assert result.sane_fatal is False
+    assert result.destructive_block is False
+    assert "invalid answer" in caplog.text
+
+
+@pytest.mark.unit
+def test_destructive_judgment_bool_answer_is_invalid(monkeypatch, caplog):
+    """`bool` is an `int` subclass — `float(True) == 1.0` must not be
+    silently accepted as a valid harm score."""
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "typesafe_api_key", "test-key")
+    monkeypatch.setattr(settings, "agent_jev_destructive_gate", "block")
+    monkeypatch.setattr(JevClient, "ask", _stub_jev_ask(score=True, probability=0.99))
+
+    with caplog.at_level("WARNING"):
+        result = pf.run_preflight(
+            title="Fix the login bug", tags=["agent"], caller=_stub(_golden_reply()),
+        )
+    assert result.destructive_score is None
+    assert result.destructive_probability is None
+    assert result.sane is True
+    assert result.sane_fatal is False
+    assert result.destructive_block is False
+    assert "invalid answer" in caplog.text
+
+
+@pytest.mark.unit
+def test_destructive_judgment_unknown_gate_value_behaves_as_shadow(monkeypatch, caplog):
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "typesafe_api_key", "test-key")
+    monkeypatch.setattr(settings, "agent_jev_destructive_gate", "bogus-value")
+    monkeypatch.setattr(JevClient, "ask", _stub_jev_ask(score=4.0, probability=0.99))
+
+    with caplog.at_level("WARNING"):
+        result = pf.run_preflight(
+            title="Purge all email older than 2020", tags=["agent"], caller=_stub(_golden_reply()),
+        )
+    # Shadow behavior: fields recorded, sane untouched even though the
+    # thresholds are crossed — an unknown value must not silently behave
+    # like `block`.
+    assert result.destructive_score == pytest.approx(4.0)
+    assert result.destructive_probability == pytest.approx(0.99)
+    assert result.sane is True
+    assert result.sane_fatal is False
+    assert "LIFEOS_AGENT_JEV_DESTRUCTIVE_GATE" in caplog.text
+
+
+@pytest.mark.unit
+def test_destructive_judgment_block_survives_default_route_demotion(monkeypatch):
+    """`_apply_default_route`'s sanity demotion exists for the classifier's
+    own free-form "not executable" opinion, not a code-thresholded Jev
+    verdict — a `destructive_block` park must stay parked even when a
+    default route is configured, unlike an ordinary non-fatal sanity
+    objection (see `test_default_route_demotes_field_verdict_sanity_and_runs`,
+    which pins that the ordinary case IS still demoted).
+
+    Mutation check: removing the `destructive_block` guard from
+    `_apply_default_route`'s sanity-demotion gate makes this test fail
+    (sane flips back to True and demoted_sanity gets set)."""
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "typesafe_api_key", "test-key")
+    monkeypatch.setattr(settings, "agent_jev_destructive_gate", "block")
+    monkeypatch.setattr(settings, "agent_default_route", "claude_code")
+    monkeypatch.setattr(JevClient, "ask", _stub_jev_ask(score=3.0, probability=0.95))
+
+    result = pf.run_preflight(
+        title="Nuke the chromadb data dir and start fresh", tags=["agent"], caller=_stub(_golden_reply()),
+    )
+    assert result.sane is False
+    assert result.sane_fatal is False
+    assert result.destructive_block is True
+    assert result.demoted_sanity is None
