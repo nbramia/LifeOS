@@ -51,6 +51,47 @@ def test_task_list_summary_is_computed_before_filters(project_api):
     assert by_id[open_child.id]["parent_title"] == "Synthetic project"
 
 
+def test_repository_affinity_is_not_hierarchy_and_survives_child_attachment(project_api):
+    client, manager, _sessions = project_api
+    parent = manager.create(
+        "Synthetic repository work",
+        fields={"project": "synthetic-repository"},
+    )
+
+    affinity_only = client.get(f"/api/tasks/{parent.id}")
+    assert affinity_only.status_code == 200
+    assert affinity_only.json()["fields"]["project"] == "synthetic-repository"
+    assert affinity_only.json()["parent_id"] is None
+    assert affinity_only.json()["is_project"] is False
+    assert affinity_only.json()["child_count"] == 0
+    assert affinity_only.json()["project"] is None
+
+    child = client.post(
+        "/api/tasks",
+        json={
+            "description": "Synthetic repository child",
+            "fields": {
+                "parent_id": parent.id,
+                "project": "synthetic-repository",
+            },
+        },
+    )
+    linked_parent = client.get(f"/api/tasks/{parent.id}")
+
+    assert child.status_code == 200
+    assert child.json()["parent_id"] == parent.id
+    assert child.json()["fields"] == {
+        "parent_id": parent.id,
+        "project": "synthetic-repository",
+    }
+    assert linked_parent.status_code == 200
+    assert linked_parent.json()["fields"]["project"] == "synthetic-repository"
+    assert linked_parent.json()["is_project"] is True
+    assert linked_parent.json()["child_count"] == 1
+    assert linked_parent.json()["project"]["child_count"] == 1
+    assert linked_parent.json()["project"]["counts"]["unassigned"] == 1
+
+
 def test_children_endpoint_returns_terminal_children(project_api):
     client, manager, _sessions = project_api
     parent = manager.create("Synthetic project")

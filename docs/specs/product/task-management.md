@@ -170,6 +170,11 @@ ordinary create/update APIs to attach, move, or detach a child. Hierarchy is
 one level: a child cannot itself be a project, and missing, self, cyclic, or
 nested links are rejected by API writes.
 
+The separate `fields.project` value records repository affinity for software
+work. It does not attach a task to a parent or classify the task as a structural
+project. Only valid incoming `fields.parent_id` links derive `is_project`,
+`child_count`, and the `project` progress summary returned by read APIs.
+
 Creating the first child pauses automatic execution of the parent. Removing
 the final child returns the same parent task to ordinary presentation without
 clearing that pause; use `POST /api/tasks/{id}/resume-execution` when the
@@ -237,6 +242,10 @@ edit made directly in Obsidian (the file watcher debounces external edits
 before reindexing). It is created by TaskManager on initialization if it
 doesn't already exist.
 
+The generated dashboard lists child tasks like ordinary tasks rather than
+grouping them beneath a parent. Their relationship is visible only through
+the task line's `[parent_id:: ...]` inline field.
+
 A Syncthing conflict copy or in-progress temp file in `LifeOS/Tasks/` is
 never shown on the dashboard and never indexed as a task — it's surfaced
 instead via `GET /api/tasks/conflicts` so a client can prompt you to resolve
@@ -246,7 +255,7 @@ it by hand.
 
 | Method | Endpoint | Parameters | Description |
 |--------|----------|------------|-------------|
-| POST | `/api/tasks` | description, context, status, priority, due_date, tags, reminder_id, notes, fields | Create a task |
+| POST | `/api/tasks` | description, context, status, priority, due_date, tags, reminder_id, notes, fields, operation_key | Create a task |
 | GET | `/api/tasks` | status, context, tag, due_before, query | List/filter tasks |
 | GET | `/api/tasks/conflicts` | - | List Syncthing conflict/temp files sitting in the tasks folder |
 | GET | `/api/tasks/{id}` | - | Get specific task |

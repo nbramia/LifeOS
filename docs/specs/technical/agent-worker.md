@@ -555,9 +555,13 @@ Project planning uses `ProjectTaskService.plan_and_delegate`, which creates an
 operator-origin session with a synthetic task ID derived from the project and
 stable operation ID. The service stages that session as non-dispatchable,
 persists the parent-to-session/request link, then makes it claimable. Retries
-recover the same session. The canonical execution request is derived from the
-project owner's route plus its model, effort, host and working-directory
-fields; it does not infer a new cloud authorization. The coordination prompt
+recover the same session. For CLI, local, and remote owners, the canonical
+execution request is derived from the project owner's route plus its model,
+effort, host and working-directory fields. Managed Agents ownership uses the
+explicit consent alias's model and retains configured effort and host, but not
+the configured model or working directory, as described in the
+[task-management product spec](../product/task-management.md#projects-and-subtasks).
+Planning does not infer a new cloud authorization. The coordination prompt
 contains the project objective/acceptance notes and at most 50 current child
 IDs, assignments and states. It instructs child creation to use a stable
 `operation_key` derived from the project ID, planning operation ID, and child

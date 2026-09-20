@@ -799,6 +799,7 @@ def test_turn_context_tool_curated_and_registered(openapi_spec, monkeypatch):
     assert cfg["method"] == "GET"
     assert len(cfg["description"].split()) <= 30
     assert "start of" in cfg["description"].lower()
+    assert "task-hierarchy guidance" in cfg["description"].lower()
 
     class _FakeResp:
         def raise_for_status(self):

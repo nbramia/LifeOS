@@ -391,6 +391,12 @@ observed malformed edge. Malformed direct-vault edits stay indexed and visible;
 they fail worker claim/open instead of being dropped or interpreted as safe
 ordinary work.
 
+`fields.project` is independent repository-affinity metadata and never enters
+the hierarchy maps. An affinity-only task remains an ordinary task;
+`is_project`, `child_count`, and the derived `project` summary depend only on
+valid incoming `fields.parent_id` edges, while both persisted fields continue
+to round-trip in the task's `fields` map.
+
 Relationship creation, mutation, deletion, and atomic worker claim share
 `.task-operation.lock`. The re-entrant wrapper lets a first-child mutation
 pause the parent through the ordinary TaskManager write path while retaining

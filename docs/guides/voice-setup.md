@@ -1,7 +1,7 @@
 # Voice Setup
 
 **Status:** Complete
-**Last Updated:** 2026-08-26
+**Last Updated:** 2026-09-20
 **Audience:** Operators
 
 This guide sets up **voice mode** in LifeOS. Voice is a tap-to-talk input mode *inside* the web `/chat` client — not a separate app or page. It reaches the same orchestrator, the same personas, and the same conversations as text chat. The speech pipeline (STT and TTS) is provided by a **separate** service, **whisper-relay**; LifeOS only reverse-proxies it and adds the browser UI.
