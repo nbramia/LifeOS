@@ -181,7 +181,8 @@ class FakeApi:
 
 def _make_worker(tmp_path: Path, api: FakeApi, *, preflight_caller, local_executor,
                   claude_code_executor=None, codex_executor=None, cli_pool=None,
-                  remote_executor=None, execution_facts_provider=None):
+                  remote_executor=None, execution_facts_provider=None,
+                  daily_cap_dollars=100.0):
     transport = httpx.MockTransport(api.handler)
     client = httpx.Client(transport=transport, base_url="http://api")
     sent: list[str] = []
@@ -198,7 +199,9 @@ def _make_worker(tmp_path: Path, api: FakeApi, *, preflight_caller, local_execut
         api_base="http://api",
         session_store=SessionStore(db_path=tmp_path / "sessions.db"),
         transcript_store=TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
-        spend_tracker=SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=100.0),
+        spend_tracker=SpendTracker(
+            db_path=tmp_path / "sessions.db", daily_cap_dollars=daily_cap_dollars,
+        ),
         poll_seconds=0.01,
         telegram_send=lambda text, chat_id=None: sent.append(text) or True,
         telegram_send_with_id=_fake_send_with_id,
@@ -2801,6 +2804,128 @@ def test_worker_pauses_at_daily_cap(tmp_path: Path):
     )
     assert w.tick() == 0
     assert executor.calls == []
+
+
+@pytest.mark.unit
+def test_daily_cap_crossed_sends_one_replyable_notice(tmp_path: Path):
+    """Crossing the configured daily cap sends exactly one Telegram notice
+    naming today's spend and the cap, telling the operator to reply
+    `raise to $N`. A second tick at the same (still-crossed) cap does not
+    re-notify."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "x", "status": "todo", "tags": ["local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=""))
+    w = _make_worker(tmp_path, api,
+                      preflight_caller=_golden_preflight(routing="local"),
+                      local_executor=executor, daily_cap_dollars=5.0)
+    w.spend_tracker.record(6.0)
+
+    assert w.tick() == 0
+    assert executor.calls == []
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    notices = [s for s in sent if "Daily agent spend cap" in s]
+    assert len(notices) == 1
+    assert "$6.00" in notices[0]
+    assert "$5.00" in notices[0]
+    assert "raise to $150" in notices[0]
+
+    # A second tick at the same cap doesn't send another notice.
+    assert w.tick() == 0
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    assert len([s for s in sent if "Daily agent spend cap" in s]) == 1
+
+
+@pytest.mark.unit
+def test_daily_cap_raise_to_dollar_reply_resumes_claiming(tmp_path: Path):
+    """`raise to $150` sets today's effective cap; claiming resumes on the
+    next poll — the cap-crossing reply is drained before the spend-cap
+    gate, so it doesn't need a second tick to take effect."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "x", "status": "todo", "tags": ["local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=""))
+    w = _make_worker(tmp_path, api,
+                      preflight_caller=_golden_preflight(routing="local"),
+                      local_executor=executor, daily_cap_dollars=5.0)
+    w.spend_tracker.record(6.0)
+    assert w.tick() == 0  # sends the notice, claims nothing
+
+    question_msg_id = w._sent_with_ids[-1][0]  # type: ignore[attr-defined]
+    w.session_store.deposit_answer(question_msg_id, "raise to $150")
+
+    assert w.tick() == 1
+    assert len(executor.calls) == 1
+    assert w.spend_tracker.effective_cap_dollars() == pytest.approx(150.0)
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    assert any("raised to $150.00" in s for s in sent)
+
+
+@pytest.mark.unit
+def test_daily_cap_raise_to_bare_number_reply_also_works(tmp_path: Path):
+    """`raise to 150` (no `$`) parses the same as `raise to $150`."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "x", "status": "todo", "tags": ["local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=""))
+    w = _make_worker(tmp_path, api,
+                      preflight_caller=_golden_preflight(routing="local"),
+                      local_executor=executor, daily_cap_dollars=5.0)
+    w.spend_tracker.record(6.0)
+    w.tick()
+    question_msg_id = w._sent_with_ids[-1][0]  # type: ignore[attr-defined]
+    w.session_store.deposit_answer(question_msg_id, "raise to 150")
+
+    assert w.tick() == 1
+    assert w.spend_tracker.effective_cap_dollars() == pytest.approx(150.0)
+
+
+@pytest.mark.unit
+def test_daily_cap_unparseable_reply_gets_usage_note_and_cap_unchanged(tmp_path: Path):
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "x", "status": "todo", "tags": ["local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=""))
+    w = _make_worker(tmp_path, api,
+                      preflight_caller=_golden_preflight(routing="local"),
+                      local_executor=executor, daily_cap_dollars=5.0)
+    w.spend_tracker.record(6.0)
+    w.tick()
+    question_msg_id = w._sent_with_ids[-1][0]  # type: ignore[attr-defined]
+    w.session_store.deposit_answer(question_msg_id, "maybe later")
+
+    assert w.tick() == 0
+    assert executor.calls == []
+    assert w.spend_tracker.effective_cap_dollars() == pytest.approx(5.0)
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    assert any("couldn't parse" in s.lower() for s in sent)
+
+
+@pytest.mark.unit
+def test_daily_cap_raised_cap_crossed_again_sends_one_more_notice(tmp_path: Path):
+    """Once-per-day is per cap *value* — raising the cap and crossing the
+    new one is a fresh crossing worth exactly one more notice."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "x", "status": "todo", "tags": ["local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=""))
+    w = _make_worker(tmp_path, api,
+                      preflight_caller=_golden_preflight(routing="local"),
+                      local_executor=executor, daily_cap_dollars=5.0)
+    w.spend_tracker.record(6.0)
+    w.tick()  # first notice, cap=$5
+    question_msg_id = w._sent_with_ids[-1][0]  # type: ignore[attr-defined]
+    w.session_store.deposit_answer(question_msg_id, "raise to $20")
+    assert w.tick() == 1  # resumes and claims the one task
+
+    # Push spend past the newly-raised $20 cap.
+    w.spend_tracker.record(15.0)
+    assert w.tick() == 0
+
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    notices = [s for s in sent if "Daily agent spend cap" in s]
+    assert len(notices) == 2
+    assert "$20.00" in notices[1]
 
 
 # ---------------------------------------------------------------------------

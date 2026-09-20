@@ -577,6 +577,24 @@ def _budget_raw_value(unit: str, amount: float) -> float:
     return amount
 
 
+_DAILY_CAP_RAISE_RE = re.compile(
+    r"^\s*raise\s+to\s*\$?\s*([0-9]+(?:\.[0-9]+)?)\s*$", re.IGNORECASE,
+)
+
+
+def _parse_daily_cap_reply(answer: str) -> float | None:
+    """Parse an operator reply to the once-a-day spend-cap notice.
+
+    A sibling of `_parse_budget_reply` for a distinct grammar — `raise to
+    $150` / `raise to 150` — since the daily-cap notice isn't a `yes`/`stop`
+    budget question (there's no session to double a cap on, and "stop"
+    means nothing for a cap that already stopped new claims). Returns the
+    parsed dollar amount, or None for anything else.
+    """
+    m = _DAILY_CAP_RAISE_RE.match(answer or "")
+    return float(m.group(1)) if m else None
+
+
 def _is_readable_tool_result(text: str) -> bool:
     """Heuristic: is this tool result useful to dump inline as the
     operator-facing completion body? Skip raw JSON dumps (list_threads,
@@ -1097,6 +1115,12 @@ class Worker:
         # ungated on the spend cap: it never starts new work, only alerts.
         self._reconcile_stuck_claimed_sessions()
         self._cleanup_session_resources()
+        # Drain a `raise to $150` reply to the daily-cap notice before the
+        # gate below: like the human-queue/lifecycle-drift calls above, it
+        # never starts a new task or spends money, so it must run even
+        # while the worker is paused at its daily cap — otherwise the reply
+        # that's supposed to lift the cap would be stuck behind it.
+        self._process_daily_cap_replies()
 
         # Use the configured per-task default budget as the "can I afford to
         # start the cheapest task right now?" estimate. Calling with 0.0 would
@@ -1104,9 +1128,17 @@ class Worker:
         # for the pause semantics.
         estimate = settings.agent_default_budget_dollars
         if not self.spend_tracker.can_start_task(estimate):
+            cap = self.spend_tracker.effective_cap_dollars()
+            today_total = self.spend_tracker.today_total()
+            # One notice per distinct cap value per day: a plain repeat tick
+            # at the same cap doesn't re-notify, but a later crossing of a
+            # freshly-raised cap does (it's a different value).
+            if self.spend_tracker.notified_cap_dollars() != cap:
+                self._send_daily_cap_notice(cap, today_total)
+                self.spend_tracker.mark_cap_notified(cap)
             logger.info(
                 "daily spend cap reached or paused (cap=$%s, today=$%.2f); skipping poll",
-                self.spend_tracker.daily_cap_dollars, self.spend_tracker.today_total(),
+                cap, today_total,
             )
             return 0
 
@@ -1145,7 +1177,7 @@ class Worker:
             if not self.usage_ledger.reserve(
                 task_id,
                 estimate,
-                daily_cap_dollars=self.spend_tracker.daily_cap_dollars,
+                daily_cap_dollars=self.spend_tracker.effective_cap_dollars(),
                 reservation_id=reservation_id,
                 owner_id=claim_id,
             ):
@@ -1165,7 +1197,7 @@ class Worker:
                 continue
             self.usage_ledger.adopt_reservation(
                 task_id, estimate,
-                daily_cap_dollars=self.spend_tracker.daily_cap_dollars,
+                daily_cap_dollars=self.spend_tracker.effective_cap_dollars(),
                 reservation_id=reservation_id, owner_id=claim_id,
             )
             self._dispatch(task)
@@ -1916,6 +1948,13 @@ class Worker:
         # prevents that stale row from mutating the old session/card.
         for q in answered:
             if not self.session_store.question_claimed(q["id"]):
+                continue
+            if (q.get("kind") or "clarification") == "daily_cap":
+                # No backing session — `session_id`/`task_id` are a synthetic
+                # per-date label (see the pending_questions schema comment),
+                # so this is resolved before the session lookup below rather
+                # than falling into the "stale, session deleted" branch.
+                self._resume_daily_cap(q)
                 continue
             session_id = q["session_id"]
             task_id = q["task_id"]
@@ -3531,6 +3570,77 @@ class Worker:
             # Telegram not configured — fall back to the legacy one-way
             # message so the operator at least sees the question.
             self._notify(body)
+
+    def _daily_cap_question_id(self) -> str:
+        """The synthetic `session_id`/`task_id` a daily-cap notice is
+        recorded under — one per local date, so a stale prior day's row
+        never collides with today's."""
+        return f"daily_cap:{self.spend_tracker.today_key()}"
+
+    def _send_daily_cap_notice(self, cap: float, today_total: float) -> None:
+        """Send the once-a-day notice that today's accumulated spend has
+        crossed the cap, and record a replyable `daily_cap` pending
+        question so a later `raise to $150` routes back here.
+
+        There's no session to anchor a Hermes DM against (this is a
+        worker-level notice, not about any one task), so it always goes out
+        on the primary Telegram bot via `ask_user_via_telegram`'s own
+        session-less fallback — the same plain-send path `budget` falls
+        back to when Hermes isn't configured/anchored. `ask_user_via_telegram`
+        also registers the pending_questions row needed for the reply to be
+        matched back to this notice.
+        """
+        body = (
+            f"💰 Daily agent spend cap reached: ${today_total:.2f} of ${cap:.2f} "
+            "today. New tasks won't be claimed until tomorrow.\n\n"
+            "Reply `raise to $150` to raise today's cap and resume claiming now."
+        )
+        qid = self._daily_cap_question_id()
+        sent_id = self.ask_user_via_telegram(qid, qid, body, kind="daily_cap")
+        if sent_id is None:
+            # Telegram not configured — fall back to the legacy one-way
+            # message so the operator at least sees the notice.
+            self._notify(body)
+
+    def _process_daily_cap_replies(self) -> None:
+        """Drain replies to the once-a-day spend-cap notice before the
+        spend-cap gate in `tick()` runs, so a `raise to $150` reply that
+        lifts today's cap takes effect the same tick instead of being stuck
+        behind the very gate it needs to clear. Scoped to kind="daily_cap"
+        only — the generic multi-kind drain later in `tick()` still handles
+        clarification/goal_approval/followup/budget replies.
+        """
+        answered = self.session_store.claim_answered_unprocessed_questions_by_kind("daily_cap")
+        try:
+            self._process_claimed_answers(answered)
+        finally:
+            for q in answered:
+                if self.session_store.question_claimed(q["id"]):
+                    self.session_store.release_question_claim(q["id"])
+
+    def _resume_daily_cap(self, q: dict) -> None:
+        """Operator replied to the once-a-day spend-cap notice.
+
+        `raise to $150` (or `raise to 150`) sets today's effective cap so
+        claiming resumes on the next poll; anything else gets a short usage
+        reply and leaves the cap untouched. There's no session to
+        revalidate or resume here — only the tracker's per-date cap.
+        """
+        answer = q["answer"] or ""
+        new_cap = _parse_daily_cap_reply(answer)
+        self.session_store.mark_question_processed(q["id"])
+        if new_cap is None:
+            usage = "I couldn't parse that. Reply `raise to $150` to raise today's cap."
+            sent_id = self.ask_user_via_telegram(
+                q["session_id"], q["task_id"], usage, kind="daily_cap",
+            )
+            if sent_id is None:
+                self._notify(usage)
+            return
+        self.spend_tracker.set_cap_override(new_cap)
+        self._notify(
+            f"✅ Today's spend cap raised to ${new_cap:.2f}. Claiming resumes on the next poll."
+        )
 
     def _wake_sleeping_sessions(self) -> None:
         """Resume any sessions whose `sleeps` row has expired."""

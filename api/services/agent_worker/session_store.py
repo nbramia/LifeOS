@@ -484,6 +484,11 @@ CREATE INDEX IF NOT EXISTS idx_pending_msgs_session ON pending_messages(session_
 --                     completion message to continue. Resume reopens the
 --                     COMPLETED session and appends the reply as a new
 --                     user turn so the agent retains full context.
+--   "daily_cap"     — the worker's own once-a-day spend-cap notice, not
+--                     tied to any one task: `session_id`/`task_id` are a
+--                     synthetic per-date label rather than a real session,
+--                     so this is the one kind `worker.py` resolves without
+--                     looking up a session.
 CREATE TABLE IF NOT EXISTS pending_questions (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id        TEXT NOT NULL,
@@ -3472,6 +3477,38 @@ class SessionStore:
                 "SELECT * FROM pending_questions "
                 "WHERE answered_at IS NOT NULL AND processed = 0 "
                 "ORDER BY id ASC",
+            ).fetchall()
+            claimed: list[dict] = []
+            for row in rows:
+                cur = conn.execute(
+                    "UPDATE pending_questions SET processed = 2 "
+                    "WHERE id = ? AND answered_at IS NOT NULL AND processed = 0",
+                    (row["id"],),
+                )
+                if cur.rowcount:
+                    item = dict(row)
+                    item["processed"] = 2
+                    claimed.append(item)
+                    self._owned_question_claims.add(int(row["id"]))
+        return claimed
+
+    def claim_answered_unprocessed_questions_by_kind(self, kind: str) -> list[dict]:
+        """Same atomic claim as `claim_answered_unprocessed_questions`, scoped
+        to one `kind`.
+
+        Used for the `daily_cap` notice: its reply must be drained before the
+        worker's spend-cap gate runs each tick, so a "raise to $N" reply
+        takes effect the same tick instead of being stuck behind the very
+        gate it needs to clear. Scoping to one `kind` keeps that early drain
+        from also claiming (and thereby delaying) unrelated clarification/
+        goal/budget rows the generic multi-kind handler still owns.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM pending_questions "
+                "WHERE answered_at IS NOT NULL AND processed = 0 AND kind = ? "
+                "ORDER BY id ASC",
+                (kind,),
             ).fetchall()
             claimed: list[dict] = []
             for row in rows:

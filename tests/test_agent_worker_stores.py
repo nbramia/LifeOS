@@ -397,3 +397,50 @@ def test_spend_tracker_rejects_negative(tmp_path: Path):
         tr.record(-1.0)
     with pytest.raises(ValueError):
         tr.can_start_task(-0.5)
+
+
+@pytest.mark.unit
+def test_spend_tracker_effective_cap_defaults_to_configured(tmp_path: Path):
+    tr = SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=50.0)
+    assert tr.effective_cap_dollars() == pytest.approx(50.0)
+
+
+@pytest.mark.unit
+def test_spend_tracker_raised_cap_scoped_to_that_day_only(tmp_path: Path):
+    tr = SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=10.0)
+    today = date(2026, 1, 1)
+    tomorrow = today + timedelta(days=1)
+    assert tr.set_cap_override(150.0, today=today) == 150.0
+    assert tr.effective_cap_dollars(today=today) == pytest.approx(150.0)
+    # A different date never sees the override — reverts to the configured cap.
+    assert tr.effective_cap_dollars(today=tomorrow) == pytest.approx(10.0)
+    # The raised cap is what actually gates claiming for that day.
+    tr.record(100.0, today=today)
+    assert tr.can_start_task(40.0, today=today)
+    assert not tr.can_start_task(51.0, today=today)
+
+
+@pytest.mark.unit
+def test_spend_tracker_raised_cap_persists_across_instances(tmp_path: Path):
+    """A worker restart must not lose an operator's `raise to $N` for today."""
+    db_path = tmp_path / "sessions.db"
+    today = date(2026, 1, 1)
+    tr1 = SpendTracker(db_path=db_path, daily_cap_dollars=10.0)
+    tr1.set_cap_override(200.0, today=today)
+    tr2 = SpendTracker(db_path=db_path, daily_cap_dollars=10.0)
+    assert tr2.effective_cap_dollars(today=today) == pytest.approx(200.0)
+
+
+@pytest.mark.unit
+def test_spend_tracker_notified_cap_tracks_per_day_and_per_value(tmp_path: Path):
+    tr = SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=10.0)
+    today = date(2026, 1, 1)
+    tomorrow = today + timedelta(days=1)
+    assert tr.notified_cap_dollars(today=today) is None
+    tr.mark_cap_notified(10.0, today=today)
+    assert tr.notified_cap_dollars(today=today) == pytest.approx(10.0)
+    # A different value (e.g. after a raise) is a fresh crossing to notify.
+    tr.mark_cap_notified(150.0, today=today)
+    assert tr.notified_cap_dollars(today=today) == pytest.approx(150.0)
+    # A new day starts with no notice recorded, regardless of yesterday's.
+    assert tr.notified_cap_dollars(today=tomorrow) is None

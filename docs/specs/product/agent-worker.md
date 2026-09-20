@@ -107,7 +107,7 @@ The board drawer offers **Continue** and **Stop** buttons alongside the free-tex
 
 The **dollar cap is a real backstop only on the cloud Claude (Managed Agents / API) route and the remote-forced route**, the two with marginal per-task cost; on the local (free) and Claude Code / Codex CLI (subscription) routes a `max $…` hint is recorded but never breaches anything, and those two CLI routes carry no wall/token/dollar enforcement at all — no pause-and-ask either.
 
-There's also a global daily $-cap (`LIFEOS_AGENT_DAILY_CAP_DOLLARS`, default `$100`). When the day's accumulated cost crosses the cap, the worker stops claiming new tasks until the next local midnight. Tasks already running aren't killed.
+There's also a global daily $-cap (`LIFEOS_AGENT_DAILY_CAP_DOLLARS`, default `$100`). When the day's accumulated cost first crosses the cap, the worker stops claiming new tasks and sends one Telegram notice naming today's spend and the cap. Tasks already running aren't killed. Reply **`raise to $150`** to raise today's cap and resume claiming immediately — the raise applies to today only and the cap reverts to the configured default the next local day. Crossing a since-raised cap later the same day sends one more notice; repeatedly hitting the same cap value doesn't nag again.
 
 A [scheduler](../../guides/scheduler.md) entry whose action hands work to the agent worker can carry its own budget (`[budget:: …]` / `[wall:: …]`), rendered into the created task's title in this same hint grammar on every fire.
 
