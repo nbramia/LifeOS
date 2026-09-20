@@ -23,20 +23,29 @@ and round cap it would in `off` mode.
     round's tool results are gathered. Questions: `is_repeating`,
     `answered` — identical wording to `scripts/jev_eval/e2_inloop.py`.
 
-Both calls fail open: on any exception or a 500ms-from-start timeout,
-the span records only `{"error": "<ExceptionClassName>"}` and the turn
-is otherwise unaffected. Neither call, nor any span it writes, carries
-message text, tool arguments, or tool results — only calibrated
-probabilities/scores, tool names, bundle ids, and (for the tool span
-`execute_tool_parallel` already writes to) a 300-char result preview.
-Perf traces are local SQLite and never leave the machine — see
+Both calls fail open: on any exception, a 500ms-from-start timeout, or
+the caller abandoning the turn (cancellation, or the caller closing
+`run_agent_loop`'s generator early), the span records only
+`{"error": "<ExceptionClassName>"}` or no span at all, and the turn is
+otherwise unaffected — see `cancel_and_forget()`.
+
+The Jev API call itself carries real content: the pre-turn call sends
+the user's current message and the last two conversation turns; the
+in-loop call sends the message, plus each round's tool names, argument
+summaries, and 300-char result previews. None of that reaches a log line
+or a perf-trace span, though — every span this module writes carries only
+calibrated probabilities/scores, tool names, bundle ids, and (for the
+tool span `execute_tool_parallel` already writes to) a 300-char result
+preview. Perf traces are local SQLite and never leave the machine — see
 `docs/specs/technical/security-privacy.md`'s "What Stays Local" table.
 """
 import asyncio
 import json
 import logging
 import time
+from collections import OrderedDict
 
+from api.services.chat_helpers import role_content
 from api.services.jev_client import JevClient, jev_configured
 from api.services.perf_trace import _current_trace, trace_span
 from config.settings import settings
@@ -143,10 +152,11 @@ BUNDLES: tuple[dict, ...] = (
 )
 
 # Last chosen bundle per conversation, for the cache-thrash signal
-# (`bundle_changed`). Unbounded for the life of the process — a shadow-only
-# observation over a small number of concurrently active conversations, not
-# worth an eviction policy.
-_LAST_BUNDLE_BY_CONVERSATION: dict[str, int | None] = {}
+# (`bundle_changed`). Bounded LRU -- a shadow-only observation, but a
+# long-running server sees many distinct conversation ids over its
+# lifetime, so this must not grow without limit.
+_MAX_TRACKED_CONVERSATIONS = 512
+_LAST_BUNDLE_BY_CONVERSATION: "OrderedDict[str, int | None]" = OrderedDict()
 # Distinguishes "no turn recorded yet for this conversation" from "the
 # recorded turn's bundle_id was itself None" — both would otherwise read as
 # a missing dict entry.
@@ -170,7 +180,11 @@ def shadow_enabled() -> bool:
     """True only when the setting is `shadow` AND a TypeSafe key is
     configured — the single gate every call site in this module checks
     before constructing a `JevClient` or starting a task."""
-    return jev_orchestrator_mode() == "shadow" and jev_configured()
+    try:
+        return jev_orchestrator_mode() == "shadow" and jev_configured()
+    except Exception:
+        logger.warning("shadow_enabled() check failed; treating as off", exc_info=True)
+        return False
 
 
 def choose_bundle(family_answers: dict[str, float], threshold: float = 0.5) -> int | None:
@@ -195,9 +209,13 @@ def bundle_changed(conversation_id: str, bundle_id: int | None) -> bool:
     for this conversation (the cache-thrash signal E3's report flagged as
     unmeasured). False on a conversation's first recorded turn — there is
     nothing yet to have changed from, even when that turn's own bundle_id
-    is None (no bundle needed)."""
+    is None (no bundle needed). Also evicts the least-recently-touched
+    entry once more than `_MAX_TRACKED_CONVERSATIONS` are tracked."""
     prev = _LAST_BUNDLE_BY_CONVERSATION.get(conversation_id, _NO_PRIOR_TURN)
     _LAST_BUNDLE_BY_CONVERSATION[conversation_id] = bundle_id
+    _LAST_BUNDLE_BY_CONVERSATION.move_to_end(conversation_id)
+    while len(_LAST_BUNDLE_BY_CONVERSATION) > _MAX_TRACKED_CONVERSATIONS:
+        _LAST_BUNDLE_BY_CONVERSATION.popitem(last=False)
     if prev is _NO_PRIOR_TURN:
         return False
     return prev != bundle_id
@@ -206,16 +224,37 @@ def bundle_changed(conversation_id: str, bundle_id: int | None) -> bool:
 def build_preturn_state(persona: str, conversation_history: list | None, message: str) -> dict:
     """Same shape as scripts/jev_eval/e1_preturn.py's `build_state`: persona
     id, the last two conversation-history messages (600 chars each), and
-    the current message (1200 chars)."""
+    the current message (1200 chars). `conversation_history` entries may be
+    `Message` objects or plain dicts — see `role_content`."""
     prev = list(conversation_history or [])[-2:]
+    prev_turns = []
+    for m in prev:
+        role, content = role_content(m)
+        prev_turns.append({"role": role, "content": content[:600]})
     return {
         "persona": persona,
-        "prev_turns": [
-            {"role": getattr(m, "role", ""), "content": (getattr(m, "content", "") or "")[:600]}
-            for m in prev
-        ],
+        "prev_turns": prev_turns,
         "message": (message or "")[:1200],
     }
+
+
+def cancel_and_forget(task: "asyncio.Task | None") -> None:
+    """Best-effort cleanup for a shadow task the caller is abandoning — the
+    turn is unwinding via an exception, a cancellation, or the caller
+    closing `run_agent_loop`'s generator early. Cancels the task if it's
+    still running, and attaches a done-callback that retrieves its eventual
+    result/exception (including a `CancelledError`) so it never logs
+    "exception was never retrieved". Never awaits the task, and never
+    raises itself."""
+    if task is None:
+        return
+    if not task.done():
+        task.cancel()
+
+    def _consume(t: "asyncio.Task") -> None:
+        if not t.cancelled():
+            t.exception()  # retrieve and discard -- never re-raised here
+    task.add_done_callback(_consume)
 
 
 def start_preturn_task(
@@ -225,13 +264,21 @@ def start_preturn_task(
     on. Returns `(task, start_monotonic)`, or `(None, None)` when disabled
     (no `JevClient` is constructed in that case). Never awaited here — the
     caller must let `run_agent_loop` start immediately once this returns,
-    then await the task later (see `finish_preturn_span`)."""
+    then await the task later (see `finish_preturn_span`). Client
+    construction and state building happen inside the task's own coroutine
+    so a failure there (e.g. a misconfigured client) surfaces as the
+    task's exception — `finish_preturn_span` records it on the span —
+    rather than raising synchronously out of this function."""
     if not shadow_enabled():
         return None, None
-    client = JevClient()
-    state = build_preturn_state(persona, conversation_history, message)
     start = time.monotonic()
-    task = asyncio.create_task(client.aask(state, PRETURN_QUESTIONS))
+
+    async def _call() -> dict:
+        client = JevClient()
+        state = build_preturn_state(persona, conversation_history, message)
+        return await client.aask(state, PRETURN_QUESTIONS)
+
+    task = asyncio.create_task(_call())
     return task, start
 
 
@@ -256,39 +303,63 @@ def _round1_elapsed_ms(trace) -> float | None:
     return None
 
 
+async def _await_capped(task: asyncio.Task, start: float) -> tuple[dict | None, str | None]:
+    """Wait for `task` up to `_TIMEOUT_S` from `start`. Returns
+    `(answers, None)` on success or `(None, "<ExceptionClassName>")` on a
+    timeout or any exception the task raised. On a timeout the task is
+    cancelled and its eventual result/exception is retrieved via a
+    done-callback rather than awaited further."""
+    remaining = max(0.0, _TIMEOUT_S - (time.monotonic() - start))
+    done, pending = await asyncio.wait({task}, timeout=remaining)
+    if pending:
+        cancel_and_forget(task)
+        return None, "TimeoutError"
+    try:
+        return task.result(), None
+    except Exception as exc:
+        return None, type(exc).__name__
+
+
 async def finish_preturn_span(
     task: asyncio.Task | None, start: float | None, *, conversation_id: str, agent_result,
 ) -> None:
     """Await the pre-turn task (500ms cap from `start`) and record ONE
     `jev_preturn` span. No-op if `task` is None (shadow mode was off, or
     Jev wasn't configured, for this turn). On any exception or timeout the
-    span records only `{"error": "<ExceptionClassName>"}`."""
+    span records only `{"error": "<ExceptionClassName>"}` — this includes
+    everything from decoding the Jev answers through building the bundle
+    metadata, all one fail-open boundary."""
     if task is None:
         return
-    remaining = max(0.0, _TIMEOUT_S - (time.monotonic() - start))
     with trace_span("jev_preturn") as meta:
+        answers, error = await _await_capped(task, start)
+        if error is not None:
+            meta["error"] = error
+            return
         try:
-            answers = await asyncio.wait_for(task, timeout=remaining)
+            latency_ms = round((time.monotonic() - start) * 1000, 1)
+            family_answers = {fam: answers[f"family_{fam}"]["noul"] for fam in FAMILY_TO_TOOLS}
+            families_needed = sorted(fam for fam, val in family_answers.items() if val >= 0.5)
+            bundle_id = choose_bundle(family_answers)
+            trace = _current_trace.get()
+            round1_ms = _round1_elapsed_ms(trace)
+            fields = {
+                "needs_tools": round(answers["needs_tools"]["noul"], 3),
+                **{f"family_{fam}": round(v, 3) for fam, v in family_answers.items()},
+                "difficulty": round(answers["difficulty"]["score"], 3),
+                "is_followup": round(answers["is_followup"]["noul"], 3),
+                "latency_ms": latency_ms,
+                "before_round1": round1_ms is not None and latency_ms <= round1_ms,
+                "families_needed": families_needed,
+                "bundle_id": bundle_id,
+                "bundle_changed": bundle_changed(conversation_id, bundle_id),
+                "tool_count": len(getattr(agent_result, "tool_calls_log", None) or []),
+                "round_count": _round_count(trace),
+            }
         except Exception as exc:
             meta["error"] = type(exc).__name__
             return
-        latency_ms = round((time.monotonic() - start) * 1000, 1)
-        family_answers = {fam: answers[f"family_{fam}"]["noul"] for fam in FAMILY_TO_TOOLS}
-        bundle_id = choose_bundle(family_answers)
-        trace = _current_trace.get()
-        round1_ms = _round1_elapsed_ms(trace)
-        meta.update({
-            "needs_tools": round(answers["needs_tools"]["noul"], 3),
-            **{f"family_{fam}": round(v, 3) for fam, v in family_answers.items()},
-            "difficulty": round(answers["difficulty"]["score"], 3),
-            "is_followup": round(answers["is_followup"]["noul"], 3),
-            "latency_ms": latency_ms,
-            "before_round1": round1_ms is not None and latency_ms <= round1_ms,
-            "bundle_id": bundle_id,
-            "bundle_changed": bundle_changed(conversation_id, bundle_id),
-            "tool_count": len(getattr(agent_result, "tool_calls_log", None) or []),
-            "round_count": _round_count(trace),
-        })
+        meta.update(fields)
 
 
 def _summarize_call(call: dict) -> dict:
@@ -305,19 +376,25 @@ def start_inloop_task(
     """Start an in-loop Jev call covering every round's calls through
     `upto_round`, if shadow mode is on. `calls_by_round[r]` entries are
     `{"tool", "input", "result_preview"}` dicts (see agent_loop.py's
-    `_exec_one`). Returns `(task, start_monotonic)` or `(None, None)`."""
+    `_exec_one`). Returns `(task, start_monotonic)` or `(None, None)`.
+    Client construction and state building happen inside the task's own
+    coroutine — see `start_preturn_task`'s docstring for why."""
     if not shadow_enabled():
         return None, None
-    client = JevClient()
-    state = {
-        "message": (message or "")[:1200],
-        "calls_by_round": {
-            str(r): [_summarize_call(c) for c in calls_by_round.get(r, [])]
-            for r in range(1, upto_round + 1)
-        },
-    }
     start = time.monotonic()
-    task = asyncio.create_task(client.aask(state, INLOOP_QUESTIONS))
+
+    async def _call() -> dict:
+        client = JevClient()
+        state = {
+            "message": (message or "")[:1200],
+            "calls_by_round": {
+                str(r): [_summarize_call(c) for c in calls_by_round.get(r, [])]
+                for r in range(1, upto_round + 1)
+            },
+        }
+        return await client.aask(state, INLOOP_QUESTIONS)
+
+    task = asyncio.create_task(_call())
     return task, start
 
 
@@ -327,15 +404,18 @@ async def finish_inloop_span(task: asyncio.Task | None, start: float | None, *, 
     exception or timeout the span records only `{"error": "<ExceptionClassName>"}`."""
     if task is None:
         return
-    remaining = max(0.0, _TIMEOUT_S - (time.monotonic() - start))
     with trace_span("jev_inloop") as meta:
+        answers, error = await _await_capped(task, start)
+        if error is not None:
+            meta["error"] = error
+            return
         try:
-            answers = await asyncio.wait_for(task, timeout=remaining)
+            fields = {
+                "is_repeating": round(answers["is_repeating"]["noul"], 3),
+                "answered": round(answers["answered"]["noul"], 3),
+                "round_index": round_index,
+            }
         except Exception as exc:
             meta["error"] = type(exc).__name__
             return
-        meta.update({
-            "is_repeating": round(answers["is_repeating"]["noul"], 3),
-            "answered": round(answers["answered"]["noul"], 3),
-            "round_index": round_index,
-        })
+        meta.update(fields)

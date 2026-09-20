@@ -1241,9 +1241,10 @@ async def ask_stream(request: AskStreamRequest):
             # right before run_agent_loop, so it runs concurrent with the
             # first round rather than serially ahead of it. `_jev_preturn_task`
             # is None (no call made) whenever shadow mode is off or Jev isn't
-            # configured. Awaited in the `finally` below — after the loop
-            # finishes — never in run_agent_loop's own arguments or behavior.
-            from api.services.jev_orchestrator_shadow import start_preturn_task, finish_preturn_span
+            # configured. Awaited in the `else` clause below — only once the
+            # loop finishes normally — never in run_agent_loop's own
+            # arguments or behavior.
+            from api.services.jev_orchestrator_shadow import cancel_and_forget, start_preturn_task, finish_preturn_span
             _jev_preturn_task, _jev_preturn_start = start_preturn_task(
                 _effective_pid or "primary", conversation_history, request.question,
             )
@@ -1283,7 +1284,16 @@ async def ask_stream(request: AskStreamRequest):
                         await turn.emit(f"data: {json.dumps({'type': 'self_correction'})}\n\n")
                     elif event["type"] == "result":
                         agent_result = event["result"]
-            finally:
+            except BaseException:
+                # Abnormal exit (an exception from the loop, a
+                # cancellation, or the caller closing this async-for early)
+                # -- abandon the pre-turn task rather than awaiting it:
+                # never block turn teardown on Jev, and never let shadow
+                # cleanup mask, delay, or replace the real exception. No
+                # jev_preturn span is recorded for this turn.
+                cancel_and_forget(_jev_preturn_task)
+                raise
+            else:
                 # Recorded here (still before finish_trace() below) rather
                 # than in the outer try/finally, so the jev_preturn span
                 # lands in the same perf trace as the rest of the turn.
