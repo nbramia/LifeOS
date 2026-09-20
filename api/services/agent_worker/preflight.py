@@ -1274,14 +1274,20 @@ def _apply_default_route(result: PreflightResult, original_routing: str) -> Pref
 def _apply_preset_class(result: PreflightResult, tags: list[str], title: str = "") -> PreflightResult:
     """Set `result.preset_class` from an explicit `#<class>` tag if present;
     else from the Jev fan-out judgment (`jev_task_routing.judge_task`) when
-    configured; else leave it unset (today's default — the worker treats an
-    unset `preset_class` as `fullstack`, no tool filtering).
+    it clears two guards; else leave it unset (today's default — the
+    worker treats an unset `preset_class` as `fullstack`, no tool
+    filtering).
 
-    A tag override always wins over the Jev judgment. With a Jev judgment
-    available, `preset_class` is its `preset_class` choice when confidence
-    is >= 0.6, else explicitly `"fullstack"`. Without a TypeSafe key, or
-    when the Jev call fails, `preset_class` stays unset (None) here — the
-    worker's own no-filter default.
+    A tag override always wins over the Jev judgment. A wrong narrow class
+    is worse than the unfiltered default, since it removes tools from the
+    session — so the Jev class is only honored when BOTH:
+    `preset_class.confidence >= 0.7`, AND `software_work.noul < 0.5` (a
+    task the judgment itself flags as likely software work always keeps
+    the full toolset, no matter how confident the class choice is).
+    Either guard failing, no Jev judgment at all (no TypeSafe key, or the
+    call failed), or a missing `software_work` answer, leaves
+    `preset_class` unset — the same today's-default behavior as a task
+    with no explicit class tag.
     """
     if result.preset_class:  # honor an LLM/caller pre-set value
         return result
@@ -1295,10 +1301,14 @@ def _apply_preset_class(result: PreflightResult, tags: list[str], title: str = "
     judgment = judge_task(title)
     if judgment is not None and judgment.preset_class is not None:
         answer = judgment.preset_class
-        if answer.confidence >= 0.6 and answer.choice:
+        software = judgment.software_work
+        likely_software = (
+            software is not None
+            and software.noul is not None
+            and software.noul >= 0.5
+        )
+        if answer.confidence >= 0.7 and answer.choice and not likely_software:
             result.preset_class = answer.choice
-        else:
-            result.preset_class = "fullstack"
     return result
 
 

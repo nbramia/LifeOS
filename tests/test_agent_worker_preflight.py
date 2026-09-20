@@ -2064,13 +2064,16 @@ def test_destructive_judgment_block_survives_default_route_demotion(monkeypatch)
 # Preset class — Jev fan-out judgment (jev_task_routing.judge_task)
 # ---------------------------------------------------------------------------
 
-def _preset_judgment(choice: str, confidence: float):
+def _preset_judgment(choice: str, confidence: float, software_noul: float = 0.1):
+    """`software_noul` defaults to 0.1 (not software) so tests that aren't
+    specifically about the software_work guard exercise only the
+    confidence axis."""
     from api.services.jev_task_routing import JevAnswer, TaskJudgment
 
     return TaskJudgment(
         location=None, difficulty=None,
         preset_class=JevAnswer(choice=choice, confidence=confidence),
-        software_work=None,
+        software_work=JevAnswer(noul=software_noul),
     )
 
 
@@ -2089,12 +2092,13 @@ def test_preset_class_tag_wins_over_jev_judgment(monkeypatch):
 
 
 @pytest.mark.unit
-def test_preset_class_jev_high_confidence_sets_class(monkeypatch):
-    """No tag; a Jev judgment at or above the 0.6 confidence floor sets
+def test_preset_class_jev_accepts_confident_non_software_class(monkeypatch):
+    """No tag; a Jev judgment at or above the 0.7 confidence floor, on a
+    task the judgment itself doesn't flag as software work, sets
     `preset_class` to its choice."""
     monkeypatch.setattr(
         "api.services.jev_task_routing.judge_task",
-        lambda title: _preset_judgment("research", 0.75),
+        lambda title: _preset_judgment("research", 0.75, software_noul=0.1),
     )
     result = pf.run_preflight("dig into last quarter's numbers", tags=["agent"],
                               caller=_stub_caller(routing="claude"))
@@ -2102,11 +2106,11 @@ def test_preset_class_jev_high_confidence_sets_class(monkeypatch):
 
 
 @pytest.mark.unit
-def test_preset_class_jev_confidence_boundary_at_exactly_point_six(monkeypatch):
-    """Exactly 0.6 must be accepted (>=, not >)."""
+def test_preset_class_jev_confidence_boundary_at_exactly_point_seven(monkeypatch):
+    """Exactly 0.7 must be accepted (>=, not >)."""
     monkeypatch.setattr(
         "api.services.jev_task_routing.judge_task",
-        lambda title: _preset_judgment("crm", 0.6),
+        lambda title: _preset_judgment("crm", 0.7, software_noul=0.1),
     )
     result = pf.run_preflight("any task", tags=["agent"],
                               caller=_stub_caller(routing="claude"))
@@ -2114,17 +2118,60 @@ def test_preset_class_jev_confidence_boundary_at_exactly_point_six(monkeypatch):
 
 
 @pytest.mark.unit
-def test_preset_class_jev_low_confidence_sets_fullstack(monkeypatch):
-    """Below the 0.6 floor, `preset_class` is explicitly set to
-    `"fullstack"` (today's no-filter default) rather than left unset —
-    distinct from the no-key case, which leaves it None."""
+def test_preset_class_jev_low_confidence_leaves_unset(monkeypatch):
+    """Below the 0.7 floor, `preset_class` stays unset (today's default),
+    not the Jev choice."""
     monkeypatch.setattr(
         "api.services.jev_task_routing.judge_task",
-        lambda title: _preset_judgment("crm", 0.59),
+        lambda title: _preset_judgment("crm", 0.69, software_noul=0.1),
     )
     result = pf.run_preflight("any task", tags=["agent"],
                               caller=_stub_caller(routing="claude"))
-    assert result.preset_class == "fullstack"
+    assert result.preset_class is None
+
+
+@pytest.mark.unit
+def test_preset_class_software_work_guard_blocks_even_high_confidence(monkeypatch):
+    """A wrong narrow class is worse than the unfiltered default, since it
+    removes tools from the session — so a task the judgment itself flags
+    as likely software work (noul >= 0.5) never gets narrowed, no matter
+    how confident the class choice is. Mutation check: dropping the
+    software_work guard from `_apply_preset_class` fails this test."""
+    monkeypatch.setattr(
+        "api.services.jev_task_routing.judge_task",
+        lambda title: _preset_judgment("crm", 0.9, software_noul=0.9),
+    )
+    result = pf.run_preflight(
+        "Fix the granola watcher so finance meetings stop landing in Meetings",
+        tags=["agent"], caller=_stub_caller(routing="claude"),
+    )
+    assert result.preset_class is None
+
+
+@pytest.mark.unit
+def test_preset_class_software_work_guard_allows_non_software(monkeypatch):
+    """High confidence and a low software_work probability together set
+    the class."""
+    monkeypatch.setattr(
+        "api.services.jev_task_routing.judge_task",
+        lambda title: _preset_judgment("crm", 0.9, software_noul=0.1),
+    )
+    result = pf.run_preflight("any task", tags=["agent"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.preset_class == "crm"
+
+
+@pytest.mark.unit
+def test_preset_class_software_work_guard_and_low_confidence_both_unset(monkeypatch):
+    """Confidence below the floor leaves the class unset even when the
+    software_work guard alone would have passed."""
+    monkeypatch.setattr(
+        "api.services.jev_task_routing.judge_task",
+        lambda title: _preset_judgment("crm", 0.65, software_noul=0.1),
+    )
+    result = pf.run_preflight("any task", tags=["agent"],
+                              caller=_stub_caller(routing="claude"))
+    assert result.preset_class is None
 
 
 @pytest.mark.unit

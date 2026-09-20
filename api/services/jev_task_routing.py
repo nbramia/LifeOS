@@ -23,8 +23,8 @@ from api.services.jev_client import JevClient, JevError, jev_configured
 
 logger = logging.getLogger(__name__)
 
-# Score question criteria (§ PR 4 acceptance): five difficulty levels, in
-# ascending order so a returned score can be compared numerically.
+# Score question criteria: five difficulty levels, in ascending order so a
+# returned score can be compared numerically.
 _DIFFICULTY_LEVELS = (
     "trivial lookup or one-line change",
     "small change in one file",
@@ -49,12 +49,13 @@ _PRESET_CLASS_CRITERIA: dict[str, str] = {
 @dataclass(frozen=True)
 class JevAnswer:
     """One typed answer from a Jev question. Exactly one of `choice`/
-    `score`/`noul` is populated, matching the question type asked;
-    `confidence` is 0.0 when Jev didn't return one (the `noul` type
-    carries no confidence per the API contract)."""
+    `score`/`noul` is populated, matching the question type asked. `noul`
+    is a probability (0.0-1.0) that the stated proposition holds, not a
+    boolean. `confidence` is 0.0 when Jev didn't return one (the `noul`
+    type carries no confidence per the API contract)."""
     choice: str | None = None
     score: float | None = None
-    noul: bool | None = None
+    noul: float | None = None
     confidence: float = 0.0
 
 
