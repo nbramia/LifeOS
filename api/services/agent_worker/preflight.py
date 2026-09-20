@@ -451,6 +451,7 @@ _DESTRUCTIVE_CONTEXT = (
     "An autonomous agent with full shell, git, email, and calendar access "
     "will execute this task without asking first."
 )
+_DESTRUCTIVE_SAFETY_CONTEXT_MAX_CHARS = 8000
 
 
 def _validate_destructive_answer(value, lo: float, hi: float) -> float:
@@ -472,7 +473,11 @@ def _validate_destructive_answer(value, lo: float, hi: float) -> float:
     return value
 
 
-def _apply_destructive_judgment(result: PreflightResult, title: str) -> PreflightResult:
+def _apply_destructive_judgment(
+    result: PreflightResult,
+    title: str,
+    safety_context: str | None = None,
+) -> PreflightResult:
     """Run the Jev destructiveness judgment and apply `agent_jev_destructive_gate`.
 
     Runs after `_apply_sanity_gate`, so a title the regex already matched
@@ -519,10 +524,12 @@ def _apply_destructive_judgment(result: PreflightResult, title: str) -> Prefligh
             return result
 
         client = JevClient()
-        answers = client.ask(
-            {"task_title": title, "context": _DESTRUCTIVE_CONTEXT},
-            _DESTRUCTIVE_QUESTIONS,
-        )
+        state = {"task_title": title, "context": _DESTRUCTIVE_CONTEXT}
+        if isinstance(safety_context, str) and safety_context.strip():
+            state["execution_instructions"] = safety_context.strip()[
+                :_DESTRUCTIVE_SAFETY_CONTEXT_MAX_CHARS
+            ]
+        answers = client.ask(state, _DESTRUCTIVE_QUESTIONS)
         score = _validate_destructive_answer(answers["harm"]["score"], 0.0, 4.0)
         probability = _validate_destructive_answer(answers["irreversible"]["noul"], 0.0, 1.0)
     except Exception as exc:
@@ -1393,7 +1400,12 @@ def _apply_cost_gates(result: PreflightResult) -> PreflightResult:
     return result
 
 
-def _finish(result: PreflightResult, tags_list: list[str], title: str = "") -> PreflightResult:
+def _finish(
+    result: PreflightResult,
+    tags_list: list[str],
+    title: str = "",
+    safety_context: str | None = None,
+) -> PreflightResult:
     """Shared post-processing pipeline for every `run_preflight` return path:
     sanity gate > Jev destructive judgment > tag overrides > route
     corroboration > default route (which also demotes ambiguity and sanity,
@@ -1498,7 +1510,7 @@ def _finish(result: PreflightResult, tags_list: list[str], title: str = "") -> P
     pre-tag-override value matters to each.
     """
     result = _apply_sanity_gate(result, title)
-    result = _apply_destructive_judgment(result, title)
+    result = _apply_destructive_judgment(result, title, safety_context)
     original_routing = result.routing
     result = _apply_tag_overrides(result, tags_list, title)
     result = _apply_route_corroboration(result, original_routing, title, tags_list)
@@ -1512,13 +1524,15 @@ def run_preflight(
     title: str,
     tags: list[str] | None = None,
     caller: PreflightCaller | None = None,
+    safety_context: str | None = None,
 ) -> PreflightResult:
     """Run the Haiku preflight call. Returns a defensible PreflightResult even
     on errors — a failed or unparseable classifier call routes to `ask` (with
     `preflight_error` set) rather than raising, so the worker can always make
     a decision. An empty title is the one path that still fails closed
     (sane=False, sane_fatal=True) — that's a deterministic finding, not a
-    failed call.
+    failed call. ``safety_context`` is consumed only by the destructive Jev
+    judgment; routing, preset, consent, and the classifier prompt use ``title``.
     """
     tags_list = list(tags or [])
     # Short-circuit: empty title is always unsafe, no need to spend a Haiku call.
@@ -1537,6 +1551,7 @@ def run_preflight(
                 raw={},
             ),
             tags_list,
+            safety_context=safety_context,
         )
 
     call = caller or _default_llm_caller
@@ -1560,6 +1575,7 @@ def run_preflight(
                 raw={},
             ),
             tags_list,
+            safety_context=safety_context,
         )
 
-    return _finish(parse_preflight_response(reply), tags_list, title)
+    return _finish(parse_preflight_response(reply), tags_list, title, safety_context)

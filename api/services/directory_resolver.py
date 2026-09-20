@@ -241,6 +241,18 @@ def _location_options() -> list[tuple[str, str, str]]:
     return list(options.values())
 
 
+def resolve_location_affinity(affinity: object) -> str | None:
+    """Resolve a repository-affinity name through the location catalog.
+
+    Affinity is opaque metadata, not a path. Unknown values therefore return
+    ``None`` instead of being passed through to a filesystem consumer.
+    """
+    if not isinstance(affinity, str) or not affinity.strip():
+        return None
+    key = affinity.strip().lower()
+    return {name.lower(): path for name, _description, path in _location_options()}.get(key)
+
+
 def ensure_cloned(path: str) -> bool:
     """Clone the operator's GitHub repo into `path` if it isn't there yet.
 

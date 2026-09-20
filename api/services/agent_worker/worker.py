@@ -563,6 +563,8 @@ _WIP_BRANCH_RE = re.compile(r"git\s+(?:switch\s+-c|checkout\s+-b)\s+([A-Za-z0-9.
 _TASK_NOTES_MAX_CHARS = 6000
 _OPERATOR_NOTES_MAX_CHARS = 2000
 _HANDOFF_MAX_CHARS = 4000
+_PROJECT_CHILD_INSTRUCTIONS_MAX_CHARS = 4000
+_PROJECT_PARENT_INSTRUCTIONS_MAX_CHARS = 2000
 
 
 class _SynchronousPool:
@@ -4947,10 +4949,13 @@ class Worker:
                 "status": item.get("status"),
                 "assignee": assignee,
             })
+        parent_fields = parent.get("fields") if isinstance(parent.get("fields"), dict) else {}
+        parent_title = str(parent.get("description") or "")
+        parent_notes = str(parent.get("notes") or "")[:_PROJECT_PARENT_INSTRUCTIONS_MAX_CHARS]
         context = {
             "parent_id": parent_id,
-            "parent_title": parent.get("description") or "",
-            "parent_notes": (parent.get("notes") or "")[:2000],
+            "parent_title": parent_title,
+            "parent_notes": parent_notes,
             "children_total": parent.get("child_count") or len(sibling_summary),
             "children": sibling_summary,
             "children_partial": (parent.get("child_count") or 0) > len(sibling_summary),
@@ -4969,12 +4974,25 @@ class Worker:
                     for item in sibling_summary
                 )
             )
-        own_notes = (task.get("notes") or "").strip()[:4000]
-        project_notes = "\n".join(lines)[:2000]
+        own_notes = (task.get("notes") or "").strip()[:_PROJECT_CHILD_INSTRUCTIONS_MAX_CHARS]
+        project_notes = "\n".join(lines)[:_PROJECT_PARENT_INSTRUCTIONS_MAX_CHARS]
+        child_title = str(task.get("description") or task.get("id") or "")[:1000]
+        safety_parts = [f"Child task:\n{child_title}"]
+        if own_notes:
+            safety_parts.append(f"Child instructions:\n{own_notes}")
+        safety_parts.append(f"Parent objective:\n{parent_title[:1000]}")
+        if parent_notes:
+            safety_parts.append(f"Parent instructions/acceptance criteria:\n{parent_notes}")
         return {
             **task,
             "notes": f"{own_notes}\n\n{project_notes}".strip(),
             "project_context": context,
+            "_preflight_safety_context": "\n\n".join(safety_parts),
+            "_project_location_context": {
+                "host": parent_fields.get("host"),
+                "working_dir": parent_fields.get("working_dir"),
+                "project_affinity": parent_fields.get("project"),
+            },
         }
 
     def _last_reassignment(self, session_id: str) -> dict[str, Any] | None:
@@ -5184,6 +5202,7 @@ class Worker:
                 title=title,
                 tags=task.get("tags", []),
                 caller=self._preflight_caller,
+                safety_context=task.get("_preflight_safety_context"),
             )
         except Exception as exc:
             logger.exception("preflight crashed for %s: %s", task_id, exc)
@@ -5268,6 +5287,8 @@ class Worker:
             session = self.session_store.get(task_id) or session
         handoff = self._reassignment_context(session) if reassignment else ""
         dispatch_task = dict(task)
+        dispatch_task.pop("_preflight_safety_context", None)
+        dispatch_task.pop("_project_location_context", None)
         if handoff:
             notes = (dispatch_task.get("notes") or "").strip()
             # This copy is what every executor receives, including local and
@@ -5351,30 +5372,57 @@ class Worker:
         # `session.execution_spec` for this task sees exactly this
         # `working_dir`, so any host-aware adjustment has to happen in this
         # one call, not after the fact.
-        from api.services.directory_resolver import resolve_working_directory
+        from api.services.directory_resolver import (
+            resolve_location_affinity,
+            resolve_working_directory,
+        )
         from api.services.agent_worker.remote_spawn import (
             api_host_name as _api_host_name,
             is_local_host,
         )
         # A CLI route (#claude/#codex) dispatched to a remote
-        # LIFEOS_AGENT_HOSTS host can't be cloned into from this process,
-        # and there's no evidence an uncloned GitHub-only repo exists on
-        # that other machine either — the resolver falls back to the
-        # keyword cascade for that case instead (see
-        # `resolve_working_directory`'s `allow_uncloned`). Every other
-        # route runs in-process on this host regardless of `session.host`,
-        # so it keeps today's behavior.
+        # LIFEOS_AGENT_HOSTS host must not reuse a directory inferred from
+        # this API host's catalog or title keywords. Only an explicit child
+        # directory, or a parent directory explicitly scoped to the same
+        # execution host, is portable to that remote machine. Every other
+        # route runs in-process on this host regardless of `session.host`.
         is_remote_cli_spawn = (
             pre.routing in (ROUTE_CLAUDE_CODE, ROUTE_CODEX)
             and not is_local_host(session.host, _api_host_name())
         )
-        # Scheduled handoffs may carry an explicit canonical working
-        # directory in task fields; otherwise retain the legacy
-        # description-based resolver.
-        candidate_working_dir = (
-            (task.get("fields") or {}).get("working_dir")
-            or resolve_working_directory(title, allow_uncloned=not is_remote_cli_spawn)
+        task_fields = task.get("fields") or {}
+        project_location = task.get("_project_location_context") or {}
+
+        def _clean_location(value: object) -> str | None:
+            cleaned = value.strip() if isinstance(value, str) else ""
+            return cleaned or None
+
+        child_working_dir = _clean_location(task_fields.get("working_dir"))
+        child_affinity = task_fields.get("project")
+        parent_working_dir = _clean_location(project_location.get("working_dir"))
+        parent_host = project_location.get("host")
+        parent_affinity = project_location.get("project_affinity")
+
+        def _execution_host(value: object) -> str:
+            cleaned = value.strip() if isinstance(value, str) else ""
+            return cleaned or _api_host_name()
+
+        child_execution_host = (
+            assignment.host if pre.routing in (ROUTE_CLAUDE_CODE, ROUTE_CODEX) else None
         )
+        parent_path_compatible = (
+            parent_working_dir
+            and _execution_host(parent_host) == _execution_host(child_execution_host)
+        )
+        candidate_working_dir = child_working_dir
+        if not candidate_working_dir and not is_remote_cli_spawn:
+            candidate_working_dir = resolve_location_affinity(child_affinity)
+        if not candidate_working_dir and parent_path_compatible:
+            candidate_working_dir = parent_working_dir
+        if not candidate_working_dir and not is_remote_cli_spawn:
+            candidate_working_dir = resolve_location_affinity(parent_affinity)
+        if not candidate_working_dir and not is_remote_cli_spawn:
+            candidate_working_dir = resolve_working_directory(title)
         if pre.routing in (ROUTE_CLAUDE_CODE, ROUTE_CODEX):
             # Clone-on-demand: a Jev-chosen location may name a repository
             # the operator owns but that isn't checked out on this host
@@ -5447,12 +5495,15 @@ class Worker:
             # directory that isn't a git repository at all is unaffected
             # either way — `ensure_worktree` returns it verbatim.
             from api.services.agent_worker.git_worktree import WorktreeError, ensure_worktree
-            try:
-                provisioned = ensure_worktree(candidate_working_dir, task_id, title, host=assignment.host)
-            except WorktreeError as exc:
-                self._mark_failed(session, task, f"worktree provisioning failed: {exc}")
-                return
-            candidate_working_dir = provisioned.working_dir
+            if candidate_working_dir:
+                try:
+                    provisioned = ensure_worktree(
+                        candidate_working_dir, task_id, title, host=assignment.host,
+                    )
+                except WorktreeError as exc:
+                    self._mark_failed(session, task, f"worktree provisioning failed: {exc}")
+                    return
+                candidate_working_dir = provisioned.working_dir
         execution = self._resolve_session_execution(
             session,
             request=ExecutionRequest(),
@@ -5584,7 +5635,7 @@ class Worker:
         # _cli_inflight machinery spawned sessions already use — so a
         # top-level #agent task gets the identical off-tick treatment.
         if session.routing in (ROUTE_CLAUDE_CODE, ROUTE_CODEX):
-            working_dir = execution.spec.working_dir or resolve_working_directory(title)
+            working_dir = execution.spec.working_dir
 
             # Clone-on-demand: a defensive backstop for the same guard
             # already applied upstream (before `ensure_worktree`, in the

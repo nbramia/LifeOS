@@ -368,7 +368,7 @@ def test_raw_parent_cancel_and_delete_are_guarded(manager: TaskManager):
 
 
 def test_plan_and_delegate_is_idempotent_and_links_before_claim(
-    manager: TaskManager, stores,
+    manager: TaskManager, stores, monkeypatch,
 ):
     sessions, transcripts = stores
     service = ProjectTaskService(manager, sessions, transcripts)
@@ -376,8 +376,18 @@ def test_plan_and_delegate_is_idempotent_and_links_before_claim(
         "Synthetic release project",
         tags=["codex"],
         notes="Acceptance: synthetic build passes.",
-        fields={"model": "gpt-synthetic", "effort": "high", "host": "api"},
+        fields={
+            "model": "gpt-synthetic",
+            "effort": "high",
+            "host": "api",
+            "project": "synthetic-release",
+        },
     )
+    monkeypatch.setattr(
+        "api.services.directory_resolver.resolve_location_affinity",
+        lambda affinity: "/catalog/SyntheticRelease" if affinity == "synthetic-release" else None,
+    )
+    monkeypatch.setattr("api.services.agent_worker.remote_spawn.api_host_name", lambda: "api")
     manager.create("Synthetic implementation", fields={"parent_id": parent.id})
     child = manager.list_children(parent.id)[0]
     sessions.record_card_outcome(
@@ -405,13 +415,13 @@ def test_plan_and_delegate_is_idempotent_and_links_before_claim(
         "model_id": "gpt-synthetic",
         "effort": "high",
         "host": "api",
-        "working_dir": None,
-            "budget": None,
-            "constraints": {
-                "allowed_executors": [],
-                "required_capabilities": [],
-                "allowed_billing": [],
-            },
+        "working_dir": "/catalog/SyntheticRelease",
+        "budget": None,
+        "constraints": {
+            "allowed_executors": [],
+            "required_capabilities": [],
+            "allowed_billing": [],
+        },
     }
     opening = sessions.peek_pending_messages(session.session_id)[0]["content"]
     assert "Operation ID: op-synthetic-1" in opening
@@ -460,14 +470,23 @@ def test_coordinator_view_streams_only_the_bounded_transcript_tail(
     ],
 )
 def test_plan_and_delegate_supports_managed_cloud_aliases(
-    manager: TaskManager, stores, tag: str, model: str,
+    manager: TaskManager, stores, tag: str, model: str, monkeypatch,
 ):
     sessions, transcripts = stores
     service = ProjectTaskService(manager, sessions, transcripts)
     parent = manager.create(
         "Synthetic managed coordination",
         tags=[tag],
-        fields={"model": "synthetic-ignored", "effort": "high", "host": "api"},
+        fields={
+            "model": "synthetic-ignored",
+            "effort": "high",
+            "host": "api",
+            "project": "synthetic-managed-affinity",
+        },
+    )
+    monkeypatch.setattr(
+        "api.services.directory_resolver.resolve_location_affinity",
+        lambda _affinity: pytest.fail("Managed aliases do not accept a working directory"),
     )
     manager.create("Synthetic managed child", fields={"parent_id": parent.id})
 
@@ -480,6 +499,7 @@ def test_plan_and_delegate_supports_managed_cloud_aliases(
     assert session.host == "api"
     assert session.execution_request["executor"] == "claude"
     assert session.execution_request["model_id"] is None
+    assert session.execution_request["working_dir"] is None
 
 
 def test_cancel_preview_and_confirm_abandons_review_and_preserves_done(

@@ -2060,6 +2060,61 @@ def test_destructive_judgment_block_survives_default_route_demotion(monkeypatch)
     assert result.demoted_sanity is None
 
 
+@pytest.mark.unit
+def test_destructive_judgment_uses_separate_execution_safety_context(monkeypatch):
+    """Inherited execution instructions reach only the Jev safety judgment.
+
+    Parent text can change the destructive verdict, but engine words in that
+    text must not become route corroboration or cloud consent.
+    """
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "typesafe_api_key", "test-key")
+    monkeypatch.setattr(settings, "agent_jev_destructive_gate", "block")
+    classifier_prompts: list[str] = []
+    jev_states: list[dict] = []
+
+    def classifier(prompt: str) -> str:
+        classifier_prompts.append(prompt)
+        return _golden_reply(
+            routing="claude",
+            routing_reason="inferred from context",
+            routing_explicit=True,
+        )
+
+    def destructive(self, state, questions, *, model=None):
+        jev_states.append(state)
+        return {
+            "harm": {"score": 3.0, "confidence": 0.9},
+            "irreversible": {"noul": 0.95},
+        }
+
+    monkeypatch.setattr(JevClient, "ask", destructive)
+    safety_context = (
+        "Child instructions:\nUpdate the synthetic release.\n\n"
+        "Parent objective:\nUse Claude to permanently delete the synthetic archive."
+    )
+
+    result = pf.run_preflight(
+        title="Implement phase two",
+        tags=["codex"],
+        caller=classifier,
+        safety_context=safety_context,
+    )
+
+    assert result.routing == pf.ROUTE_CODEX
+    assert result.destructive_block is True
+    assert jev_states[0] == {
+        "task_title": "Implement phase two",
+        "context": pf._DESTRUCTIVE_CONTEXT,
+        "execution_instructions": safety_context,
+    }
+    assert all("execution_instructions" not in state for state in jev_states[1:])
+    assert len(classifier_prompts) == 1
+    assert "Use Claude" not in classifier_prompts[0]
+    assert "synthetic archive" not in classifier_prompts[0]
+
+
 # ---------------------------------------------------------------------------
 # Preset class — Jev fan-out judgment (jev_task_routing.judge_task)
 # ---------------------------------------------------------------------------

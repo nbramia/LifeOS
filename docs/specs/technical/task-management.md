@@ -395,7 +395,10 @@ ordinary work.
 the hierarchy maps. An affinity-only task remains an ordinary task;
 `is_project`, `child_count`, and the derived `project` summary depend only on
 valid incoming `fields.parent_id` edges, while both persisted fields continue
-to round-trip in the task's `fields` map.
+to round-trip in the task's `fields` map. Worker dispatch may resolve the
+affinity through its recognized location catalog, but an unknown string remains
+opaque metadata and never becomes a raw path; hierarchy edits perform no
+affinity migration or rewrite.
 
 Relationship creation, mutation, deletion, and atomic worker claim share
 `.task-operation.lock`. The re-entrant wrapper lets a first-child mutation

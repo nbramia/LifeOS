@@ -101,7 +101,7 @@ def test_child_dispatch_context_is_bounded_to_its_project(tmp_path: Path):
     assert "Acceptance: synthetic verification passes" in enriched["notes"]
 
 
-def test_actual_local_executor_receives_bounded_project_context(tmp_path: Path):
+def test_actual_local_executor_receives_bounded_project_context(tmp_path: Path, monkeypatch):
     child = {
         "id": "child01",
         "description": "Synthetic child",
@@ -118,6 +118,7 @@ def test_actual_local_executor_receives_bounded_project_context(tmp_path: Path):
         "child_count": 1,
     }
     seen: list[dict] = []
+    preflight_calls: list[dict] = []
 
     class CaptureExecutor:
         def execute(self, _session, task):
@@ -136,6 +137,15 @@ def test_actual_local_executor_receives_bounded_project_context(tmp_path: Path):
         return httpx.Response(200, json={})
 
     worker = _worker(tmp_path, handler, local_executor=CaptureExecutor())
+    from api.services.agent_worker import worker as worker_module
+
+    original_preflight = worker_module.run_preflight
+
+    def capture_preflight(**kwargs):
+        preflight_calls.append(kwargs)
+        return original_preflight(**kwargs)
+
+    monkeypatch.setattr(worker_module, "run_preflight", capture_preflight)
     worker.session_store.create(task_id="child01", status="claimed", routing="local")
     worker._dispatch(child)
 
@@ -146,6 +156,66 @@ def test_actual_local_executor_receives_bounded_project_context(tmp_path: Path):
     ]
     assert "Synthetic project objective" in seen[0]["notes"]
     assert "Acceptance: synthetic verification passes" in seen[0]["notes"]
+    assert len(preflight_calls) == 1
+    assert preflight_calls[0]["title"] == "Synthetic child"
+    safety_context = preflight_calls[0]["safety_context"]
+    assert "Synthetic child" in safety_context
+    assert "Child-only instructions" in safety_context
+    assert "Synthetic project objective" in safety_context
+    assert "Acceptance: synthetic verification passes" in safety_context
+    assert "Child status summary" not in safety_context
+
+
+def test_child_affinity_precedes_compatible_parent_location(tmp_path: Path, monkeypatch):
+    child_dir = tmp_path / "child-repo"
+    child_dir.mkdir()
+    parent_dir = tmp_path / "parent-repo"
+    parent_dir.mkdir()
+    child = {
+        "id": "child-location",
+        "description": "Implement synthetic phase",
+        "status": "in_progress",
+        "tags": ["local", "agent-running"],
+        "fields": {"parent_id": "parent-location", "project": "child-affinity"},
+        "parent_id": "parent-location",
+    }
+    parent = {
+        "id": "parent-location",
+        "description": "Synthetic location project",
+        "notes": "Acceptance: use the child repository.",
+        "child_count": 1,
+        "fields": {"working_dir": str(parent_dir), "project": "parent-affinity"},
+    }
+
+    def handler(request: httpx.Request):
+        if request.method == "GET" and request.url.path == "/api/tasks/child-location":
+            return httpx.Response(200, json=child)
+        if request.method == "GET" and request.url.path == "/api/tasks/parent-location":
+            return httpx.Response(200, json=parent)
+        if request.method == "GET" and request.url.path == "/api/tasks/parent-location/children":
+            return httpx.Response(200, json={"tasks": [child], "total": 1})
+        if request.url.path.endswith("/swap-tag"):
+            return httpx.Response(200, json={"swapped": True})
+        return httpx.Response(200, json={})
+
+    monkeypatch.setattr(
+        "api.services.directory_resolver._location_options",
+        lambda: [
+            ("child-affinity", "synthetic child repository", str(child_dir)),
+            ("parent-affinity", "synthetic parent repository", str(parent_dir)),
+        ],
+    )
+
+    class CaptureExecutor:
+        def execute(self, _session, _task):
+            return ExecutorOutcome(status=STATUS_COMPLETED, final_text="synthetic done")
+
+    worker = _worker(tmp_path, handler, local_executor=CaptureExecutor())
+    worker.session_store.create(task_id=child["id"], status="claimed", routing="local")
+    worker._dispatch(child)
+
+    session = worker.session_store.get(child["id"])
+    assert session.execution_spec["working_dir"] == str(child_dir)
 
 
 def test_cancellation_intent_retires_claim_before_executor_side_effect(tmp_path: Path):

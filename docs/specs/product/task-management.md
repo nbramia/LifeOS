@@ -174,6 +174,8 @@ The separate `fields.project` value records repository affinity for software
 work. It does not attach a task to a parent or classify the task as a structural
 project. Only valid incoming `fields.parent_id` links derive `is_project`,
 `child_count`, and the `project` progress summary returned by read APIs.
+Worker location selection treats this value as a catalog name only; an unknown
+value is preserved as metadata and is never interpreted as a filesystem path.
 
 Creating the first child pauses automatic execution of the parent. Removing
 the final child returns the same parent task to ordinary presentation without

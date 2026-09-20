@@ -85,7 +85,19 @@ and review lifecycle. Creating or attaching a child does not inherit the
 parent's engine tags. When the worker starts a child, its bounded execution
 context contains that child's instructions plus the parent ID, title,
 objective/acceptance notes, and a compact sibling-status summary; unrelated
-tasks are not copied into the prompt.
+tasks are not copied into the prompt. When the optional Jev destructive gate
+is enabled, its safety judgment receives the child title/instructions and the
+bounded parent title/objective notes that the child will execute under. The
+ordinary route, model, preset and cloud-consent decisions still see only the
+child title, fields and tags; sibling state is not sent to Jev.
+
+Child location selection keeps an explicit `working_dir` authoritative, then
+uses a recognized `fields.project` repository-affinity mapping, a compatible
+parent directory or affinity, and finally the ordinary title-based fallback.
+Affinity strings are catalog names, never raw paths. API-host mappings and
+inferred title paths are not copied to a different remote execution host; a
+remote child without an explicit or same-host parent path starts in that
+host's default directory.
 
 An agent-owned project's explicit **Plan and delegate** action starts an
 operator-origin coordination session. That session is separate from task
@@ -206,9 +218,9 @@ Default clarification timeout is 72 hours (`LIFEOS_AGENT_CLARIFICATION_TIMEOUT_H
 
 ## Safety model
 
-The agent runs with the operator's full filesystem and shell access — no sandbox. This is intentional and consistent with the rest of LifeOS (you trust it with your data); see the [Design Principles](../../../AGENTS.md#development-principles) section in the project AGENTS doc. Four overlapping protections keep things sane:
+The agent runs with the operator's full filesystem and shell access — no sandbox. This is intentional and consistent with the rest of LifeOS (you trust it with your data); see the [Design Principles](../../../AGENTS.md#development-principles) section in the project AGENTS doc. Overlapping protections keep things sane:
 
-1. **Haiku preflight sanity check** — flags obviously destructive titles (`rm -rf /`, "delete all my data") and parks them at `#agent-failed` before the executor sees them.
+1. **Preflight safety checks** — deterministic destructive-title checks fail closed. When explicitly configured, Jev additionally scores irreversible harm in `shadow` mode or parks threshold-crossing tasks for confirmation in `block` mode; project children are judged against their bounded child-plus-parent execution instructions, without allowing parent text to select an engine or grant cloud consent.
 2. **Daily $-cap** — backstop against runaway loops; pauses all new claims when crossed.
 3. **Per-task budgets** — enforced from outside the agent loop, so the model can't override them.
 4. **Telegram notification on every terminal state** — you find out quickly if something runs that shouldn't have.

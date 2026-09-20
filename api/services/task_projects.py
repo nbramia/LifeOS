@@ -441,6 +441,20 @@ class ProjectTaskService:
         executor = route.request.executor
         assignment = extract_assignment(task.fields)
         managed_consent = owner in agent_board.MANAGED_AGENT_ASSIGNEES
+        coordinator_working_dir = _clean_field(task.fields, "working_dir")
+        if (
+            coordinator_working_dir is None
+            and executor in {"local", "remote", "claude_code", "codex"}
+        ):
+            from api.services.agent_worker.remote_spawn import api_host_name, is_local_host
+            from api.services.directory_resolver import resolve_location_affinity
+
+            if executor not in {"claude_code", "codex"} or is_local_host(
+                assignment.host, api_host_name(),
+            ):
+                coordinator_working_dir = resolve_location_affinity(
+                    _clean_field(task.fields, "project")
+                )
 
         prior_request = task.fields.get(COORDINATOR_REQUEST_FIELD)
         if prior_request and prior_request != operation_id and self._task_coordinator_live(task):
@@ -457,7 +471,7 @@ class ProjectTaskService:
                 model_id=_clean_field(task.fields, "model"),
                 effort=_clean_field(task.fields, "effort"),
                 host=_clean_field(task.fields, "host"),
-                working_dir=_clean_field(task.fields, "working_dir"),
+                working_dir=coordinator_working_dir,
             )
         )
         if session is None:

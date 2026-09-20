@@ -246,6 +246,28 @@ class TestJevLocationResolution:
         assert result == str(existing)
 
 
+class TestLocationAffinityResolution:
+    """Repository affinity is an option key, never an arbitrary path."""
+
+    def test_recognized_affinity_maps_through_catalog(self, monkeypatch):
+        import api.services.directory_resolver as mod
+
+        monkeypatch.setattr(mod, "_location_options", lambda: [
+            ("synthetic-repo", "a synthetic repository", "/catalog/SyntheticRepo"),
+        ])
+
+        assert mod.resolve_location_affinity(" Synthetic-Repo ") == "/catalog/SyntheticRepo"
+
+    def test_unknown_affinity_is_not_treated_as_path(self, monkeypatch):
+        import api.services.directory_resolver as mod
+
+        monkeypatch.setattr(mod, "_location_options", lambda: [
+            ("synthetic-repo", "a synthetic repository", "/catalog/SyntheticRepo"),
+        ])
+
+        assert mod.resolve_location_affinity("/untrusted/arbitrary/path") is None
+
+
 class TestGithubRepoListing:
     """`_github_repos()` and its 24h on-disk cache."""
 
