@@ -61,6 +61,31 @@ def _redirect_agent_output(tmp_path, monkeypatch):
     monkeypatch.setattr(_settings, "vault_path", tmp_path / "vault", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _stub_worktree_provisioning(monkeypatch):
+    """A `claude_code`/`codex`-routed dispatch calls `ensure_worktree` on
+    whatever directory the task title resolves to via
+    `directory_resolver.resolve_working_directory` — a plain-language title
+    with no vault/LifeOS/project keyword resolves to `$HOME` itself — and
+    its completion calls `finalize_worktree_session` on that same
+    directory. None of these poll-loop tests are about worktree
+    provisioning or finalization (covered by
+    tests/test_agent_worker_git_worktree*.py), so stand in passthroughs
+    that never touch git."""
+    from api.services.agent_worker.git_worktree import FinalizeResult, WorktreeResult
+
+    monkeypatch.setattr(
+        "api.services.agent_worker.git_worktree.ensure_worktree",
+        lambda working_dir, task_id, title, host=None: WorktreeResult(
+            working_dir=working_dir, is_git=False,
+        ),
+    )
+    monkeypatch.setattr(
+        "api.services.agent_worker.git_worktree.finalize_worktree_session",
+        lambda working_dir, **kwargs: FinalizeResult(applicable=False),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Fake API
 # ---------------------------------------------------------------------------
@@ -163,7 +188,7 @@ def _make_worker(tmp_path: Path, api: FakeApi, *, preflight_caller, local_execut
     # Capturing sender for clarification questions — records the text and
     # returns a deterministic message_id so reply-threading can be tested.
     sent_with_ids: list[tuple[int, str]] = []
-    def _fake_send_with_id(text):
+    def _fake_send_with_id(text, reply_to_message_id=None):
         # Mirror send_message_capture_ids: return a list of chunk ids.
         sent.append(text)
         msg_id = len(sent_with_ids) + 1000
@@ -222,6 +247,61 @@ class _StubExecutor:
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_session_messages_use_first_anchor_and_escaped_card_title(tmp_path: Path):
+    api = FakeApi(tasks=[
+        {"id": "threaded", "description": "Review *Q4* [draft]", "status": "todo", "tags": ["local"]},
+    ])
+    transport = httpx.MockTransport(api.handler)
+    client = httpx.Client(transport=transport, base_url="http://api")
+    sends: list[tuple[str, int | None]] = []
+
+    def capture(text, reply_to_message_id=None):
+        sends.append((text, reply_to_message_id))
+        return [700 + len(sends)]
+
+    worker = Worker(
+        api_base="http://api",
+        session_store=SessionStore(db_path=tmp_path / "sessions.db"),
+        transcript_store=TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
+        spend_tracker=SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=100.0),
+        telegram_send_with_id=capture,
+        http_client=client,
+    )
+    session = worker.session_store.create(task_id="threaded", routing="claude_code")
+
+    worker._send_session_message(session, "Started")
+    worker._send_session_message(session, "Still working")
+
+    assert sends[0][1] is None
+    assert sends[1][1] == 701
+    assert sends[1][0].startswith(r"📌 Review \*Q4\* \[draft\]")
+
+
+@pytest.mark.unit
+def test_terminal_message_fallback_is_sent_once(tmp_path: Path):
+    api = FakeApi(tasks=[
+        {"id": "fallback", "description": "Synthetic fallback", "status": "todo"},
+    ])
+    plain_sends: list[str] = []
+    worker = Worker(
+        api_base="http://api",
+        session_store=SessionStore(db_path=tmp_path / "sessions.db"),
+        transcript_store=TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
+        spend_tracker=SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=100.0),
+        telegram_send=lambda text, **_kwargs: plain_sends.append(text) or True,
+        telegram_send_with_id=lambda text, **_kwargs: [],
+        http_client=httpx.Client(
+            transport=httpx.MockTransport(api.handler), base_url="http://api",
+        ),
+    )
+    session = worker.session_store.create(task_id="fallback", routing="claude_code")
+
+    worker._notify_terminal(session, "Completed.", "completed")
+
+    assert plain_sends == ["📌 Synthetic fallback\n\nCompleted."]
+
 
 @pytest.mark.unit
 def test_worker_picks_up_urgent_status_tasks_too(tmp_path: Path):

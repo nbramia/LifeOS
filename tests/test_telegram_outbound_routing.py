@@ -109,6 +109,36 @@ class TestResolveBot:
 class TestSendMessageBotParam:
     @patch("api.services.telegram.httpx.post")
     @patch("api.services.telegram.settings")
+    def test_send_message_includes_optional_reply_id(self, mock_settings, mock_post):
+        from api.services.telegram import send_message
+
+        mock_settings.telegram_enabled = True
+        mock_settings.telegram_chat_id = "123"
+        mock_settings.telegram_bot_token = "PRIMARY"
+        mock_settings.telegram_bots = []
+        mock_post.return_value = MagicMock(status_code=200)
+
+        send_message("Update", reply_to_message_id=44)
+
+        assert mock_post.call_args.kwargs["json"]["reply_to_message_id"] == 44
+
+    @patch("api.services.telegram.httpx.post")
+    @patch("api.services.telegram.settings")
+    def test_send_message_omits_reply_id_by_default(self, mock_settings, mock_post):
+        from api.services.telegram import send_message
+
+        mock_settings.telegram_enabled = True
+        mock_settings.telegram_chat_id = "123"
+        mock_settings.telegram_bot_token = "PRIMARY"
+        mock_settings.telegram_bots = []
+        mock_post.return_value = MagicMock(status_code=200)
+
+        send_message("First update")
+
+        assert "reply_to_message_id" not in mock_post.call_args.kwargs["json"]
+
+    @patch("api.services.telegram.httpx.post")
+    @patch("api.services.telegram.settings")
     def test_send_message_uses_named_bot_token(self, mock_settings, mock_post):
         from api.services.telegram import send_message
         from config.settings import TelegramBotConfig
@@ -220,6 +250,70 @@ class TestSendMessageBotParam:
 # ---------------------------------------------------------------------------
 
 class TestSendMessageAsyncBotParam:
+    @pytest.mark.asyncio
+    @patch("api.services.telegram.settings")
+    async def test_async_send_includes_optional_reply_id(self, mock_settings):
+        from api.services.telegram import send_message_async
+
+        mock_settings.telegram_enabled = True
+        mock_settings.telegram_chat_id = "123"
+        mock_settings.telegram_bot_token = "PRIMARY"
+        mock_settings.telegram_bots = []
+        captured_json = []
+
+        class MockResp:
+            status_code = 200
+
+        class MockClient:
+            def __init__(self, **kwargs):
+                pass
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                pass
+            async def post(self, _url, **kwargs):
+                captured_json.append(kwargs["json"])
+                return MockResp()
+
+        with patch("api.services.telegram.httpx.AsyncClient", MockClient):
+            await send_message_async("Update", reply_to_message_id=45)
+
+        assert captured_json[0]["reply_to_message_id"] == 45
+        assert captured_json[0]["allow_sending_without_reply"] is True
+
+    @pytest.mark.asyncio
+    @patch("api.services.telegram.settings")
+    async def test_async_send_retry_can_degrade_without_reply(self, mock_settings):
+        from api.services.telegram import send_message_async
+
+        mock_settings.telegram_enabled = True
+        mock_settings.telegram_chat_id = "123"
+        mock_settings.telegram_bot_token = "PRIMARY"
+        mock_settings.telegram_bots = []
+        captured_json = []
+
+        class MockResp:
+            def __init__(self, status_code):
+                self.status_code = status_code
+                self.text = "Bad Request"
+
+        class MockClient:
+            def __init__(self, **kwargs):
+                self.responses = iter([MockResp(400), MockResp(200)])
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                pass
+            async def post(self, _url, **kwargs):
+                captured_json.append(dict(kwargs["json"]))
+                return next(self.responses)
+
+        with patch("api.services.telegram.httpx.AsyncClient", MockClient):
+            assert await send_message_async("Update", reply_to_message_id=45) is True
+
+        assert captured_json[1]["reply_to_message_id"] == 45
+        assert captured_json[1]["allow_sending_without_reply"] is True
+
     @pytest.mark.asyncio
     @patch("api.services.telegram.settings")
     async def test_async_send_named_bot_token(self, mock_settings):

@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-09-03
+> **Last Updated:** 2026-09-18
 
 LifeOS includes an external **agent worker** that picks up engine-assigned tasks and completes them autonomously — running locally on a self-hosted LLM or on Anthropic's Managed Agents cloud, with budget caps you can specify in the task title and full audit transcripts on every run. When the agent finishes (or gets stuck), it notifies you on Telegram. If it has a question mid-run, it asks via Telegram and waits for your reply.
 
@@ -39,7 +39,7 @@ Within a poll cycle (default 60s), the worker:
 2. Atomically adds `#agent-running` (so two workers can't claim the same task)
 3. Routes the task — to your local Gemma model, a CLI engine, your configured remote provider, or Claude on Managed Agents — from your tags or an explicit request; when it can only *infer* that a cloud connector is needed, it asks you first
 4. Lets the agent execute: tool calls, MCP servers, web search, file I/O, the full kit
-5. On completion: marks the task done in your vault, swaps the tag to `#agent-completed`, writes the full result to an Agent Output note (`LifeOS/Tasks/Agent Output/`), and sends you a one-paragraph Telegram summary with the actual result (linking the note)
+5. On completion: marks the task done in your vault, swaps the tag to `#agent-completed`, writes the full result to an Agent Output note (`LifeOS/Tasks/Agent Output/`), records the run's outcome (the same completion summary, plus a coding session's branch and any pull request it opened) for the board's Review card to show, and sends you a one-paragraph Telegram summary with the actual result (linking the note)
 
 Cost for that task: usually under $0.10 on Claude Sonnet 4.6, free on local Gemma. The full transcript (every tool call, every model turn) lands in `data/agent_transcripts/<session_id>.jsonl` for later review.
 
@@ -134,6 +134,10 @@ The agent worker uses your existing Telegram bot (no second bot needed). Three m
 
 **Replying to a thread.** Every terminal notification — completion, failure, or budget cut-off — is replyable: use Telegram's native reply on it (any chunk of a long message) and the agent reopens that thread as a follow-up turn with full prior context ("actually, also CC Jane"). The reply gesture is the *only* way to continue a thread on Telegram — a plain message is always a normal chat query, so unrelated questions are never mistaken for a thread continuation.
 
+The immediate acknowledgment only ever confirms your note is queued — it never claims the session has already resumed, because a `/claude`/`/codex` session's actual resume happens on the worker's next poll cycle, not synchronously with your reply. A second, separate message confirms once that resumed run actually starts. If a resume doesn't start within a few minutes, a one-time alert names the stuck task/session rather than leaving it silently orphaned — check `#agent-running` on the card and, if it's still not moving, re-trigger it manually.
+
+Every session message begins with the card's short title. After the session's first message, progress updates, questions, completion, failure, and budget notices appear as Telegram replies to that first message, keeping concurrent sessions visibly attributable. A completed Claude Code run sends one coherent final result; an unfinished trailing aside does not replace a summary that was already reported.
+
 **Starting an agent on demand.** You don't have to create a `#agent` task — send `/agent <task>` to spawn one immediately. The model is auto-routed by preflight; force it with `/agent local <task>` or `/agent claude <task>`. If routing is ambiguous — or the cloud route was only inferred — the bot asks which engine before starting. The same `/agent` command works in web chat. The resulting thread notifies and is replyable exactly like a `#agent` task.
 
 Default clarification timeout is 72 hours (`LIFEOS_AGENT_CLARIFICATION_TIMEOUT_HOURS`). After that the task is abandoned permanently and you get a Telegram heads-up. The transcript is preserved.
@@ -168,6 +172,8 @@ The agent runs with the operator's full filesystem and shell access — no sandb
 2. **Daily $-cap** — backstop against runaway loops; pauses all new claims when crossed.
 3. **Per-task budgets** — enforced from outside the agent loop, so the model can't override them.
 4. **Telegram notification on every terminal state** — you find out quickly if something runs that shouldn't have.
+5. **Isolated worktree for coding sessions** — a Claude Code or Codex task that touches a git repository always runs in its own worktree on a fresh branch, off the current `main`, never in your primary checkout — the same working tree the production server runs from — even when the task is pinned to a remote host, where the worktree lives (and gets pushed/opened as a PR) on that host, not silently skipped. The session is told this and expected to commit its work; its completion summary becomes the public pull request description, so it's told that must carry no personal data — the worker also scrubs anything shaped like a bot token, API key, or other credential from it before publishing, as a backstop. When it reports the task fully done, the worker pushes the branch and opens a pull request for you — the completion notification carries its PR link, or says plainly if the push/PR failed or there was nothing to push. When it pauses to ask you something first — Claude Code's own question convention, or Codex's `[CLARIFY]` marker — the worker pushes what's committed so far (no pull request yet), the branch name rides along with the question, and the card moves to your Human queue until you answer. If the session itself leaves anything uncommitted when it stops for any reason, the worker commits and pushes that too, rather than letting it sit lost in a directory you'll never look at.
+6. **Private, short-lived session files** — every board session receives its own private temporary directory instead of sharing a general-purpose temp location with other processes. Files created there, including copied authentication material, are removed when the session completes, fails, exceeds its budget, is killed or cancelled, or times out waiting for clarification. Coding worktrees are removed after their pull request merges or their card is accepted/cancelled. Cleanup commits and pushes any leftover work before removal, never removes the primary checkout or an operator-created worktree, and leaves remote branch deletion to the git host's policy.
 
 Operators should still audit handed-off tasks before they reach the worker (your task list is the queue), keep budgets set, and treat agent-touchable secrets the same as operator-touchable secrets.
 
@@ -184,6 +190,7 @@ All in `.env` — see [`agent-worker-setup.md`](../../guides/agent-worker-setup.
 | `LIFEOS_AGENT_DEFAULT_BUDGET_DOLLARS` | Default per-task $-cap when title doesn't specify | `5.00` |
 | `LIFEOS_AGENT_WORKER_POLL_SECONDS` | Polling interval | `60` |
 | `LIFEOS_AGENT_CLARIFICATION_TIMEOUT_HOURS` | Telegram-clarification wait before abandoning | `72` |
+| `LIFEOS_AGENT_STUCK_SESSION_TIMEOUT_MINUTES` | How long a reopened `/claude`/`/codex` session may sit unresumed before the stuck-session alert fires | `15` |
 | `LIFEOS_AGENT_MANAGED_MODEL` | Informational; actual model lives in the cloud preset | `claude-sonnet-5` |
 
 ---

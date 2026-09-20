@@ -789,6 +789,13 @@ class Settings(BaseSettings):
         description="How long an #agent-blocked task waits for a Telegram reply "
                     "before being abandoned. Used by Issue F."
     )
+    agent_stuck_session_timeout_minutes: int = Field(
+        default=15,
+        alias="LIFEOS_AGENT_STUCK_SESSION_TIMEOUT_MINUTES",
+        description="How long a top-level claude_code/codex session may sit at "
+                    "status=claimed with an undelivered queued message before "
+                    "the stuck-session sweep alerts the operator by name."
+    )
     agent_output_dir: str = Field(
         default="LifeOS/Tasks/Agent Output",
         alias="LIFEOS_AGENT_OUTPUT_DIR",

@@ -118,7 +118,9 @@ def test_codex_completion_sends_final_once_and_registers_anchor(tmp_path: Path):
 
     # Final message sent exactly once, via the id-capturing sender, and never
     # duplicated through the plain sender.
-    assert withid_sends == [final_text]
+    assert len(withid_sends) == 1
+    assert withid_sends[0].startswith("📌 cx-1\n\n")
+    assert final_text in withid_sends[0]
     assert final_text not in plain_sends
 
     # The completion message is registered as a followup anchor keyed on the
@@ -246,7 +248,8 @@ def test_codex_crash_before_init_does_not_reexecute(tmp_path: Path):
     assert worker.session_store.get("cx-crash").status == STATUS_FAILED
     kinds = [e["kind"] for e in worker.transcript_store.read(session.session_id)]
     assert "codex_reexecute_averted" in kinds
-    assert any("already started" in s for s in plain_sends)
+    assert any("already started" in s for s in withid_sends)
+    assert any(s.startswith("📌 cx-crash\n\n") for s in withid_sends)
 
 
 def test_codex_binary_not_found_does_not_trip_guard(tmp_path: Path):
@@ -282,7 +285,7 @@ def test_codex_failed_finalizes_session_row(tmp_path: Path):
 
     assert stub.calls == [("cx-fail", "do a thing")]
     assert worker.session_store.get("cx-fail").status == STATUS_FAILED
-    assert any("failed" in s.lower() for s in plain_sends)
+    assert any("failed" in s.lower() for s in withid_sends)
 
 
 def _seed_codex_child(worker):
@@ -422,7 +425,7 @@ def _mirroring_codex_worker(tmp_path: Path, codex_executor):
         spend_tracker=SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=100.0),
         poll_seconds=0.01,
         telegram_send=lambda text, chat_id=None: True,
-        telegram_send_with_id=lambda text: [777],
+        telegram_send_with_id=lambda text, **kwargs: [777],
         http_client=client,
         codex_executor=codex_executor,
     )
@@ -567,7 +570,7 @@ def test_codex_pr_url_in_final_text_still_completes(tmp_path: Path):
 
     worker._dispatch_codex_session(session, [{"content": "ship it"}])
 
-    assert withid_sends == [final_text]
+    assert len(withid_sends) == 1 and final_text in withid_sends[0]
     kinds = [e["kind"] for e in worker.transcript_store.read(session.session_id)]
     assert "codex_handled_completion" in kinds
 
@@ -584,7 +587,7 @@ def test_codex_summary_like_final_text_still_completes(tmp_path: Path):
 
     worker._dispatch_codex_session(session, [{"content": "ship it"}])
 
-    assert withid_sends == [final_text]
+    assert len(withid_sends) == 1 and final_text in withid_sends[0]
 
 
 def test_codex_interrupted_message_names_discoverable_wip_branch(tmp_path: Path):
@@ -671,7 +674,7 @@ def test_codex_child_session_bypasses_interrupted_gate(tmp_path: Path):
     assert "codex_handled_completion" in kinds
 
 
-def test_codex_session_with_real_executor_reaches_completed_disposition(tmp_path: Path):
+def test_codex_session_with_real_executor_reaches_completed_disposition(tmp_path: Path, monkeypatch):
     """A real ``CodexExecutor`` driving a subprocess through the exact event
     shape a live Codex CLI run produces (`thread.started`, `item.completed`,
     `turn.completed`, returncode 0) ends the worker dispatch at the completed
@@ -679,6 +682,10 @@ def test_codex_session_with_real_executor_reaches_completed_disposition(tmp_path
     operator, `codex_handled_completion` recorded."""
     from api.services.agent_worker.codex_executor import CodexExecutor
 
+    # The dispatched session carries no `working_dir`, so `CodexExecutor.
+    # execute` falls back to `os.getcwd()` -- confine that fallback to this
+    # test's own tmp_path rather than wherever the process happens to run.
+    monkeypatch.chdir(tmp_path)
     session_store = SessionStore(db_path=tmp_path / "sessions.db")
     transcript_store = TranscriptStore(transcripts_dir=tmp_path / "transcripts")
     final_text = "There are **194 Python files** under `api/`."
@@ -716,7 +723,7 @@ def test_codex_session_with_real_executor_reaches_completed_disposition(tmp_path
         spend_tracker=SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=100.0),
         poll_seconds=0.01,
         telegram_send=lambda text, chat_id=None: plain_sends.append(text) or True,
-        telegram_send_with_id=lambda text: withid_sends.append(text) or [777],
+        telegram_send_with_id=lambda text, **kwargs: withid_sends.append(text) or [777],
         http_client=client,
         codex_executor=codex_executor,
     )
@@ -725,7 +732,7 @@ def test_codex_session_with_real_executor_reaches_completed_disposition(tmp_path
     worker._dispatch_codex_session(session, [{"content": "count the Python files"}])
 
     assert worker.session_store.get("cx-real-e2e").status == STATUS_COMPLETED
-    assert withid_sends == [final_text]
+    assert len(withid_sends) == 1 and final_text in withid_sends[0]
     kinds = [e["kind"] for e in worker.transcript_store.read(session.session_id)]
     assert "codex_handled_completion" in kinds
     assert "cli_session_interrupted" not in kinds
@@ -789,4 +796,3 @@ def test_codex_resume_crash_records_dispatch_crashed_event(tmp_path: Path):
     assert len(crashed) == 1
     assert crashed[0]["payload"]["phase"] == "resume"
     assert "boom-resume" in crashed[0]["payload"]["error"]
-

@@ -18,7 +18,10 @@ Run categories:
 """
 import gc
 import os
+import re
 import shutil
+import subprocess
+import tempfile
 import time
 
 import pytest
@@ -313,6 +316,138 @@ def _install_cli_spawn_guard() -> None:
 def _isolate_agent_default_route(monkeypatch):
     from config.settings import settings as _settings
     monkeypatch.setattr(_settings, "agent_default_route", "", raising=False)
+
+
+# ---------------------------------------------------------------------------
+# Git worktree hermeticity guard
+#
+# `git_worktree.ensure_worktree`/`finalize_worktree_session` run real `git`/
+# `gh` subprocesses against whatever directory a dispatch/finalize path hands
+# them. A test that drives `Worker._dispatch` (or calls these functions
+# directly) with a path that resolves to a real checkout -- including one
+# resolved indirectly, e.g. `directory_resolver.resolve_working_directory`
+# mapping an ordinary-sounding task title to the operator's own `~/Code/...`
+# tree -- runs those commands for real: creating sibling worktrees, checking
+# out branches, and (via `finalize_worktree_session`) pushing and opening
+# pull requests against the real repository. Every git/gh subprocess this
+# module issues funnels through the single `_run()` seam (both the default
+# local runner and any host-resolved ssh runner), so patching that one
+# function -- when the runner it ends up using is the real local runner or a
+# real ssh runner `make_ssh_runner` built, never a test's own canned-response
+# stand-in -- makes every call path that could actually touch a real
+# filesystem or network provably hermetic: cwd (and any absolute-path
+# argument, for the handful of calls that carry the path in argv instead of
+# cwd) must resolve under `tempfile.gettempdir()`, and a `git push`/`gh` call
+# is additionally rejected outright unless the repo's configured `origin`
+# remote is itself a local path under that same temp root. A call that
+# supplies neither a cwd nor any absolute-path argument (only the unit tests
+# exercising `_run`'s own timeout/OSError conversion call it that way) has
+# nothing to check and is left alone -- no production call shape omits both.
+# ---------------------------------------------------------------------------
+
+def _is_hermetic_path(path: str) -> bool:
+    """True when ``path`` resolves under the process's temp root -- the
+    only place a test is ever allowed to point a real git/gh subprocess."""
+    if not path:
+        return False
+    try:
+        resolved = os.path.realpath(path)
+    except (OSError, ValueError):
+        return False
+    temp_root = os.path.realpath(tempfile.gettempdir())
+    return resolved == temp_root or resolved.startswith(temp_root + os.sep)
+
+
+_SCP_LIKE_REMOTE_RE = re.compile(r"^[^/\s]+@[^/\s]+:")
+
+
+def _is_local_hermetic_remote(url: str) -> bool:
+    """True when a configured ``origin`` URL is a filesystem path under the
+    temp root, never a network remote (``https://``, ``ssh://``, or the
+    `user@host:path` scp shorthand all read as non-local)."""
+    if not url or "://" in url or _SCP_LIKE_REMOTE_RE.match(url):
+        return False
+    return _is_hermetic_path(url)
+
+
+def _read_remote_origin_url(cwd: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "config", "--get", "remote.origin.url"],
+            cwd=cwd, capture_output=True, text=True, timeout=10,
+        )
+    except OSError:
+        return None
+    value = result.stdout.strip() if result.returncode == 0 else ""
+    return value or None
+
+
+def _assert_hermetic_git_worktree_call(cmd, cwd: str | None) -> None:
+    candidates = [cwd] if cwd else []
+    candidates.extend(arg for arg in cmd if isinstance(arg, str) and arg.startswith("/"))
+    for candidate in candidates:
+        if not _is_hermetic_path(candidate):
+            raise RuntimeError(
+                "Test issued a real git_worktree subprocess call outside a "
+                f"temp directory: cmd={cmd!r} cwd={cwd!r} (path {candidate!r} "
+                f"is not under {tempfile.gettempdir()!r}). Build the test "
+                "against a real tmp_path git repo (see "
+                "test_agent_worker_git_worktree.py's `_init_repo_with_origin`), "
+                "or patch ensure_worktree/finalize_worktree_session/the "
+                "resolved runner so no real git call reaches a real checkout."
+            )
+    if cwd and cmd and (cmd[0] == "gh" or (cmd[0] == "git" and "push" in cmd)):
+        origin = _read_remote_origin_url(cwd)
+        if origin and not _is_local_hermetic_remote(origin):
+            raise RuntimeError(
+                f"Test issued `{' '.join(str(c) for c in cmd)}` in {cwd!r} "
+                f"against a non-local remote {origin!r}. The repo's `origin` "
+                "must point at a local bare repo under a temp directory, "
+                "never a real remote."
+            )
+
+
+@pytest.fixture(autouse=True)
+def _guard_git_worktree_hermeticity(monkeypatch):
+    """Make every `git`/`gh` subprocess `git_worktree.py` issues fail loudly
+    when it isn't confined to a temp directory -- see the module comment
+    above.
+
+    Only enforced when the runner `_run()` ends up using is the real one
+    (the unpatched `_local_runner`, or a closure `make_ssh_runner` actually
+    built) -- a handful of tests inject their own canned-response `runner`
+    that never calls a real subprocess at all (e.g.
+    `test_pull_request_state_uses_injected_remote_runner`'s fake, keyed
+    purely on argv), and a real subprocess call that a test has separately
+    neutralized (`monkeypatch.setattr(git_worktree, "_local_runner", ...)`,
+    or patching `git_worktree.subprocess.run` itself, as the ssh-argv
+    construction tests do) is left to that test's own arrangement -- this
+    guard only has real filesystem/network side effects to prevent in the
+    first place when the real runner is the one about to run.
+    """
+    from api.services.agent_worker import git_worktree
+
+    real_local_runner = git_worktree._local_runner
+    original_make_ssh_runner = git_worktree.make_ssh_runner
+    original_run = git_worktree._run
+
+    def tagged_make_ssh_runner(target, *, connect_timeout=None):
+        real_runner = original_make_ssh_runner(target, connect_timeout=connect_timeout)
+        real_runner._lifeos_real_git_worktree_runner = True
+        return real_runner
+
+    def guarded_run(cmd, *, cwd=None, timeout=git_worktree.DEFAULT_TIMEOUT, runner=None, input=None):
+        effective_runner = runner if runner is not None else git_worktree._local_runner
+        is_real_runner = (
+            effective_runner is real_local_runner
+            or getattr(effective_runner, "_lifeos_real_git_worktree_runner", False)
+        )
+        if is_real_runner:
+            _assert_hermetic_git_worktree_call(cmd, cwd)
+        return original_run(cmd, cwd=cwd, timeout=timeout, runner=runner, input=input)
+
+    monkeypatch.setattr(git_worktree, "make_ssh_runner", tagged_make_ssh_runner)
+    monkeypatch.setattr(git_worktree, "_run", guarded_run)
 
 
 def pytest_runtest_setup(item):

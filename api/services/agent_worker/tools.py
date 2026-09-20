@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -242,6 +243,9 @@ def _tool_bash(args: dict, base_dir: str | None = None) -> ToolResult:
     if not command:
         return ToolResult("Bash requires command", is_error=True)
     try:
+        from api.services.agent_worker.session_resources import active_scratch_env
+        env = os.environ.copy()
+        env.update(active_scratch_env() or {})
         completed = subprocess.run(
             command,
             shell=True,
@@ -253,6 +257,7 @@ def _tool_bash(args: dict, base_dir: str | None = None) -> ToolResult:
             # directory; the command itself can still `cd` elsewhere or
             # touch an absolute path outside it (see module docstring).
             cwd=base_dir,
+            env=env,
         )
     except subprocess.TimeoutExpired:
         return ToolResult(f"command timed out after {timeout}s", is_error=True)
