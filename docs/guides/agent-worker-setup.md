@@ -370,6 +370,10 @@ curl -X POST http://localhost:8000/api/tasks \
 
 To pause new claims without stopping the worker, set `LIFEOS_AGENT_DAILY_CAP_DOLLARS=0` and restart — the worker keeps polling but refuses to claim anything new.
 
+### Typed judgments (Jev)
+
+Setting `TYPESAFE_API_KEY` in `.env` enables typed judgments via TypeSafe's Jev (https://docs.typesafe.ai) for surfaces that opt into it. Each surface that can use Jev is independently opt-in on top of the key, and nothing is sent to TypeSafe unless the key is set — an install without it behaves exactly as one without any Jev-backed judgment enabled.
+
 ### Security model
 
 By design, the local executor runs `Bash`, `Read`, `Write`, `Edit`, and `WebFetch` with **no sandbox** — the agent has the same filesystem and shell access as the operator. This is intentional (see [AGENTS.md § Design Principles](../../AGENTS.md)) and means an agent task can:

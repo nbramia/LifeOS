@@ -635,6 +635,26 @@ class Settings(BaseSettings):
         unpriced (see remote_llm_input_price_per_mtok)."""
         return bool(self.remote_llm_base_url and self.remote_llm_model and self.remote_llm_api_key)
 
+    # TypeSafe's Jev typed-judgment API — an opt-in provider for calibrated
+    # choice/score/noul answers, distinct from the generative LLM providers
+    # above. Empty (default) means no surface that consults it makes a
+    # network call; each caller is independently opt-in on top of this key
+    # being set (see api/services/jev_client.py).
+    typesafe_api_key: str = Field(
+        default="", alias="TYPESAFE_API_KEY",
+        description="Bearer token for TypeSafe's Jev API "
+                    "(https://docs.typesafe.ai). Empty (default) disables "
+                    "every Jev-backed judgment; each surface falls back to "
+                    "its existing behavior."
+    )
+
+    @property
+    def jev_configured(self) -> bool:
+        """True once a TypeSafe API key is set. Mirrors remote_llm_configured's
+        "configured" convention — a key is the only prerequisite, there's no
+        separate URL/model to wire up."""
+        return bool(self.typesafe_api_key)
+
     # Lets the agent worker's `local` route fall back to the remote
     # OpenAI-compatible provider above when the local llama-server isn't
     # reachable. Exists for a real deployment with NO other #agent executor
