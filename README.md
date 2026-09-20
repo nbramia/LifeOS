@@ -18,8 +18,6 @@ All of your data is indexed and stored **locally** — your vault, messages, pho
 <details>
 <summary><strong>Chat — ask across every source you're connected to, from one prompt</strong></summary>
 
-<img src="docs/images/chat-thread.png" width="800" alt="A chat exchange in /chat answering a question by synthesizing across sources, with the persona picker and per-turn model picker visible in the toolbar">
-
 Search and synthesize across notes, email, messages, calendar, docs, photos, and finances from a single question, on whichever surface fits the moment — web, Telegram, voice, or MCP — all sharing one stable [client contract](docs/specs/technical/client-surfaces.md).
 
 - *"When did I last talk to Mom?"* / *"What's the context for my meeting with Acme Corp tomorrow?"* → quick answers and briefs, aggregating vault, calendar, email, and message history around a person or topic.
@@ -40,8 +38,6 @@ It also answers general-knowledge and web questions directly, and routes intelli
 - **journal** — a narrow capture surface: a spoken or typed fragment is filed straight into your daily journal log through the same interpreter a [Pebble ring](#data) uses, without the general tool suite.
 
 Pick a persona in `/chat`, or message its dedicated Telegram bot — they behave identically. Create your own with a markdown file. See the [Personas Guide](docs/guides/personas.md) and [Chat UI](docs/specs/product/chat-ui.md).
-
-<img src="docs/images/chat-personas.png" width="800" alt="Persona picker open in /chat, showing the shipped personas">
 
 </details>
 
@@ -73,6 +69,10 @@ Tag a task `#agent` and walk away. For anything that touches code, the session r
 - [ ] TODO Draft a follow-up to last week's intro with Acme. Budget $0.25 #agent
 ```
 
+A session actively running shows up in its own lane, isolated in its own worktree:
+
+<img src="docs/images/agents-board-detail-1.png" width="800" alt="Close-up of the In progress lane: a card showing its assigned engine and a live-session indicator">
+
 - **Isolated by default.** A coding session never runs in your primary checkout. It's provisioned a deterministic sibling worktree and a conventionally-named branch (`feat/`, `fix/`, `docs/`, …) off the default branch before it starts; if it leaves anything uncommitted when it stops, the worker commits and pushes that too, then opens (or reuses) a pull request against the base branch. A failed push or an unreachable host is reported in plain text, never silently swallowed.
 - **The board is the queue.** Lanes — Unassigned, Assigned, In progress, Human queue, Scheduled, Review, Done, Snoozed — are derived live from your task store, not a separate board file. A Review card shows which engine ran it, its own completion summary, and the branch and PR it opened, with the merge-status badge refreshed in the background every few minutes at most — board reads never block on a live GitHub call.
 - **Asks when genuinely stuck, resumes where it left off.** A session that hits a real ambiguity pauses in the Human queue lane instead of guessing. Reply on Telegram — the message is threaded to that card and prefixed with the card's own title so concurrent sessions stay attributable — and the session resumes **in the exact same worktree and branch**, with your note folded onto the next turn. No answer within the configured window (72 hours by default) and the task is parked with a heads-up instead of abandoned.
@@ -83,13 +83,15 @@ Tag a task `#agent` and walk away. For anything that touches code, the session r
 - **Fully audited and restart-safe.** Every tool call, model turn, and cost delta is captured; a crash mid-task rolls back to `#agent` for retry, or resumes a still-running cloud session where it left off.
 - **Spawns its own teammates.** Agents can spawn child sessions, message them, and yield until they finish — good for fan-out research and parallel pipelines.
 
+A closer look at Review and Human queue — a card's completion summary and PR badge, and one paused on a question:
+
+<img src="docs/images/agents-board-detail-2.png" width="800" alt="Close-up of the Review and Human queue lanes: a Review card's completion summary and PR status badge next to a Human queue card paused on a question">
+
 You can also run terminal, filesystem, and code tasks directly through **Claude Code** or **Codex** — via `/claude` / `/codex` on Telegram, "use claude code" in chat, or the `/chat` model picker (see [Claude Code / Codex orchestration](docs/specs/product/claude-code-orchestration.md)) — with the same escalation ladder available inline: *"escalate to opus"* / *"use sonnet"* runs that turn on the named model, and a wrongly-refused turn you push back on climbs automatically through Claude Code, then Codex — never to a metered API model without you asking for it.
 
 **Hermes** is an external agent harness that can front your Telegram persona bots: it resolves a persona's preamble from LifeOS and runs its own backend model, `@persona`-tags and reply-thread inheritance route a DM to the right assistant, and LifeOS still owns the resulting conversation history and usage/cost even though the model call happened elsewhere. If Hermes is unset or unreachable for a turn, the request falls back to LifeOS's native pipeline and says so, once, in-channel.
 
 **Self-repair: the doctor bot.** When LifeOS itself misbehaves or is missing a capability, you don't file a bug — you tell the **doctor bot**. It talks through the goal with you, gets your one approval, then autonomously files a GitHub issue, ships a tested pull request (branch → review → merge), verifies the deploy landed, and reports back with a one-line revert handle if you want to undo it. See the [Doctor Bot Guide](docs/guides/doctor-bot.md).
-
-<img src="docs/images/agents-card.png" width="800" alt="A Review-lane card drawer showing the agent's completion summary and a live PR status badge">
 
 Set up: [Agent Worker Setup](docs/guides/agent-worker-setup.md). Full reference: [Product](docs/specs/product/agent-worker.md) · [Technical](docs/specs/technical/agent-worker.md) · [Human Queue](docs/guides/human-queue.md).
 
@@ -98,8 +100,6 @@ Set up: [Agent Worker Setup](docs/guides/agent-worker-setup.md). Full reference:
 <a id="tasks"></a>
 <details>
 <summary><strong>Task management — tasks, reminders, and schedules, steerable in plain language</strong></summary>
-
-<img src="docs/images/tasks-view.png" width="800" alt="The task management surface showing a task list with due dates, contexts, and tags">
 
 Tasks and reminders live in your vault as plain markdown, and every recurring or one-off automation runs on one scheduler.
 
@@ -152,8 +152,6 @@ A ranked, searchable directory of everyone you've emailed, texted, or met — wi
 <details>
 <summary><strong>Data processing — sources, nightly sync, hybrid search, entity resolution</strong></summary>
 
-<img src="docs/images/home-dashboard.png" width="800" alt="Home dashboard showing system status and data freshness at a glance">
-
 Everything above is built on a nightly sync that pulls from every connected source, resolves who's who across them, and indexes it all for search that understands both meaning and keywords.
 
 | Source | Method | Data |
@@ -179,8 +177,6 @@ Everything above is built on a nightly sync that pulls from every connected sour
 - **Nightly sync** runs in seven dependency-ordered phases: Collection, Entity Processing, Relationship Building, Vector Store Indexing, Content Sync, Post-Sync Cleanup, and Consistency Verification — see [System architecture](#architecture) for the diagram and [Data & Sync](docs/specs/technical/data-and-sync.md) for the full pipeline.
 - **Capture from a Pebble Index ring.** Speak into it and it transcribes on-phone, then posts the fragment straight into LifeOS through the same interpreter a typed journal message goes through — same log file, same task/schedule-extraction judgment. An optional filing pipeline can additionally turn a fragment into a task, a reminder, or a scheduled agent hand-off, but only on explicit, unambiguous delegation language — never from an offhand remark. See the [Journal Ring Ingest Guide](docs/guides/journal-ring-ingest.md) and [Pebble Capture Guide](docs/guides/pebble-capture.md).
 - **Journal trends.** A logging-consistency heatmap, an emotion-vocabulary view of what you never reach for, and mood/stress/sleep correlations — read entirely from your vault, outside the CRM's entity model. See [Journal Analytics](docs/specs/product/journal-analytics.md).
-
-<img src="docs/images/journal-trends.png" width="800" alt="Journal trend views: a logging-consistency heatmap and mood/stress/sleep correlation charts">
 
 </details>
 
