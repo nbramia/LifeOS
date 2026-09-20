@@ -1857,6 +1857,7 @@ def test_destructive_judgment_shadow_records_fields_without_mutating_sane(monkey
     assert result.destructive_probability == pytest.approx(0.99)
     assert result.sane is True
     assert result.sane_fatal is False
+    assert result.destructive_block is False
 
 
 @pytest.mark.unit
@@ -1875,6 +1876,7 @@ def test_destructive_judgment_block_score_alone_parks(monkeypatch):
     )
     assert result.sane is False
     assert result.sane_fatal is False  # non-fatal — parks, never cancels
+    assert result.destructive_block is True
     assert "Jev destructive judgment" in result.sane_reason
 
 
@@ -1894,6 +1896,7 @@ def test_destructive_judgment_block_probability_alone_parks(monkeypatch):
     )
     assert result.sane is False
     assert result.sane_fatal is False
+    assert result.destructive_block is True
     assert "Jev destructive judgment" in result.sane_reason
 
 
@@ -1910,6 +1913,7 @@ def test_destructive_judgment_block_below_both_thresholds_untouched(monkeypatch)
     assert result.destructive_probability == pytest.approx(0.1)
     assert result.sane is True
     assert result.sane_fatal is False
+    assert result.destructive_block is False
 
 
 @pytest.mark.unit
@@ -1930,6 +1934,7 @@ def test_destructive_judgment_block_regex_title_stays_fatal(monkeypatch):
     # get to act on it.
     assert result.destructive_score == pytest.approx(4.0)
     assert result.destructive_probability == pytest.approx(0.99)
+    assert result.destructive_block is False  # regex verdict, not the Jev gate, set sane=False
 
 
 @pytest.mark.unit
@@ -1978,3 +1983,31 @@ def test_destructive_judgment_unknown_gate_value_behaves_as_shadow(monkeypatch, 
     assert result.sane is True
     assert result.sane_fatal is False
     assert "LIFEOS_AGENT_JEV_DESTRUCTIVE_GATE" in caplog.text
+
+
+@pytest.mark.unit
+def test_destructive_judgment_block_survives_default_route_demotion(monkeypatch):
+    """`_apply_default_route`'s sanity demotion exists for the classifier's
+    own free-form "not executable" opinion, not a code-thresholded Jev
+    verdict — a `destructive_block` park must stay parked even when a
+    default route is configured, unlike an ordinary non-fatal sanity
+    objection (see `test_default_route_demotes_field_verdict_sanity_and_runs`,
+    which pins that the ordinary case IS still demoted).
+
+    Mutation check: removing the `destructive_block` guard from
+    `_apply_default_route`'s sanity-demotion gate makes this test fail
+    (sane flips back to True and demoted_sanity gets set)."""
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "typesafe_api_key", "test-key")
+    monkeypatch.setattr(settings, "agent_jev_destructive_gate", "block")
+    monkeypatch.setattr(settings, "agent_default_route", "claude_code")
+    monkeypatch.setattr(JevClient, "ask", _stub_jev_ask(score=3.0, probability=0.95))
+
+    result = pf.run_preflight(
+        title="Nuke the chromadb data dir and start fresh", tags=["agent"], caller=_stub(_golden_reply()),
+    )
+    assert result.sane is False
+    assert result.sane_fatal is False
+    assert result.destructive_block is True
+    assert result.demoted_sanity is None

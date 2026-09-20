@@ -214,6 +214,17 @@ class PreflightResult:
     # `irreversible` question's `noul` answer. None under the same
     # conditions as `destructive_score`.
     destructive_probability: float | None = None
+    # True only when `agent_jev_destructive_gate=block` and one of the two
+    # measured thresholds was crossed, and this verdict set `sane=False`.
+    # Unlike the model's own inferred sanity opinion, this is a code-
+    # thresholded verdict over a calibrated probability, not a cheap
+    # model's free-form guess — `_apply_default_route`'s sanity demotion
+    # (built for the latter) must not treat it as advisory-only, so that
+    # step's `not result.sane and not result.sane_fatal` gate additionally
+    # requires `not result.destructive_block`. False whenever the block
+    # gate never fired (off/shadow modes, below both thresholds, a failed
+    # Jev call, or a title the regex sanity gate already made fatal).
+    destructive_block: bool = False
     raw: dict = field(default_factory=dict)  # the parsed JSON for debugging
 
 
@@ -399,10 +410,10 @@ def _apply_sanity_gate(result: PreflightResult, title: str) -> PreflightResult:
 
 
 # Thresholds for `_apply_destructive_judgment`'s `block` gate, measured
-# against the Pebble filing eval's destructive-paraphrase set plus 129 real
-# vault task titles: harm score >= 2.5 OR irreversible probability >= 0.85
-# catches 13/15 destructive paraphrases, 1/12 benign phrasings, and 0/129
-# real task titles.
+# against 15 synthetic destructive paraphrases, 12 synthetic benign titles,
+# and 129 real vault task titles: harm score >= 2.5 OR irreversible
+# probability >= 0.85 catches 13/15 destructive paraphrases, 1/12 benign
+# phrasings, and 0/129 real task titles.
 _DESTRUCTIVE_HARM_SCORE_THRESHOLD = 2.5
 _DESTRUCTIVE_IRREVERSIBLE_PROBABILITY_THRESHOLD = 0.85
 
@@ -459,7 +470,12 @@ def _apply_destructive_judgment(result: PreflightResult, title: str) -> Prefligh
     when the harm score or the irreversible probability crosses its
     threshold, and only when `result.sane` was still True: a verdict this
     function's own gate already turned False (i.e. the regex match handled
-    above) is never overwritten.
+    above) is never overwritten. A `block` park also sets
+    `result.destructive_block = True` — a code-thresholded verdict over a
+    calibrated probability, distinct from the model's own free-form sanity
+    opinion, so `_apply_default_route`'s advisory-only demotion (built for
+    that opinion) checks this flag and leaves a `destructive_block` park
+    intact even when a default route is configured.
     """
     gate = (settings.agent_jev_destructive_gate or "shadow").strip().lower()
     if gate not in ("off", "shadow", "block"):
@@ -498,6 +514,7 @@ def _apply_destructive_judgment(result: PreflightResult, title: str) -> Prefligh
         result.sane_reason = (
             f"Jev destructive judgment: harm {score:.2f}, irreversible {probability:.2f}"
         )
+        result.destructive_block = True
 
     return result
 
@@ -1107,14 +1124,20 @@ def _apply_default_route(result: PreflightResult, original_routing: str) -> Pref
        and treating that opinion as authoritative when the operator has
        already told the system to run untagged tasks costs a confirmation
        round-trip on legitimate work. So once the setting is confirmed
-       non-empty and valid, a `sane=False` that is NOT `sane_fatal` is
-       demoted the same way ambiguity is: `sane_reason` is stashed on
-       `result.demoted_sanity` and `result.sane` is set back to True.
-       `sane_fatal` verdicts — the empty-title short-circuit and the
-       deterministic destructive-title regex (`_apply_sanity_gate`) — are
-       code-established, not the model's opinion, and this check's `not
-       result.sane_fatal` guard leaves them completely untouched: they
-       still fail closed in the worker regardless of this setting. A failed
+       non-empty and valid, a `sane=False` that is NOT `sane_fatal` and NOT
+       `destructive_block` is demoted the same way ambiguity is:
+       `sane_reason` is stashed on `result.demoted_sanity` and
+       `result.sane` is set back to True. `sane_fatal` verdicts — the
+       empty-title short-circuit and the deterministic destructive-title
+       regex (`_apply_sanity_gate`) — are code-established, not the
+       model's opinion, and this check's `not result.sane_fatal` guard
+       leaves them completely untouched: they still fail closed in the
+       worker regardless of this setting. `destructive_block` verdicts
+       (`_apply_destructive_judgment`'s `block` gate) are excluded the same
+       way, for the same reason: a code-thresholded Jev verdict over a
+       calibrated probability, not the classifier's own free-form opinion
+       this demotion exists to unblock — a `destructive_block` park stays
+       parked regardless of this setting. A failed
        or unparseable preflight call sets `sane=True`/`sane_fatal=False`
        already (see `preflight_error`), so it has nothing left for this
        step to demote. Demoting sanity here (rather than only
@@ -1189,7 +1212,11 @@ def _apply_default_route(result: PreflightResult, original_routing: str) -> Pref
         result.demoted_ambiguity = result.ambiguity.question
         result.ambiguity = None
 
-    if not result.sane and not result.sane_fatal:
+    # `destructive_block` is excluded from this demotion: it's a code-
+    # thresholded Jev verdict over a calibrated probability, not the cheap
+    # classifier's own free-form "not executable" opinion this demotion
+    # exists to unblock — see `_apply_destructive_judgment`.
+    if not result.sane and not result.sane_fatal and not result.destructive_block:
         logger.info(
             "preflight sanity objection demoted to advisory (LIFEOS_AGENT_DEFAULT_ROUTE=%s "
             "configured): %r", default_route, result.sane_reason,
@@ -1338,11 +1365,13 @@ def _finish(result: PreflightResult, tags_list: list[str], title: str = "") -> P
          immediately after the sanity gate, so a regex-matched title's
          `sane_fatal=True` is already in place and is never overwritten by
          this step (it only acts when `result.sane` is still True). In
-         `block` mode, a threshold crossing sets the same kind of non-fatal
-         `sane=False` the model's own inferred opinion sets — it is
-         therefore eligible for the same step-4 demotion when a default
-         route is configured, exactly like any other non-fatal sanity
-         objection.
+         `block` mode, a threshold crossing sets a non-fatal `sane=False`
+         with `result.destructive_block=True` — the same shape a non-fatal
+         sanity opinion carries, but marked as a code-thresholded verdict
+         rather than the classifier's own opinion. Step 4's sanity
+         demotion checks that flag and leaves a `destructive_block` park in
+         place even when a default route is configured, unlike an ordinary
+         non-fatal sanity objection.
       2. **Tags** (`_apply_tag_overrides`) — the operator retagging a task
          is the most direct, most recent signal available; always wins,
          over both the model's routing and `_apply_route_corroboration`.
