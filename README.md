@@ -221,7 +221,7 @@ Services are categorized by criticality and fallback behavior:
 How a board card becomes a pull request:
 
 <p align="center">
-  <img src="docs/images/agent-lifecycle.svg" width="940" alt="Agent card lifecycle: a board card is assigned, provisioned into an isolated git worktree and branch, the session runs and commits as it goes, a worker safety-net commits and pushes anything left uncommitted, then opens or reuses a pull request and the card lands in Review with a live PR status badge; a question mid-session instead pauses the card in Human queue and resumes in the same worktree from a threaded Telegram reply; cleanup removes the scratch directory and worktree once the session is terminal and the PR is merged or the card is resolved.">
+  <img src="docs/images/agent-lifecycle.svg" width="940" alt="Agent card lifecycle: a board card is assigned, provisioned into an isolated git worktree and branch, the session runs and commits as it goes, a worker safety-net commits and pushes anything left uncommitted, then opens or reuses a pull request and the card lands in Review with a live PR status badge; a question mid-session instead pauses the card in Human queue and resumes in the same worktree from a threaded Telegram reply; cleanup removes the scratch directory and worktree once the session is terminal and its pull request is merged or the card is resolved.">
 </p>
 
 </details>

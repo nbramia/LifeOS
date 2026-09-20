@@ -530,7 +530,7 @@ def scroll_messages_to_bottom(page) -> None:
 
 def _lanes_content_bottom(page, lanes_locator) -> float:
     """Max bottom-edge y (viewport coords) of any card across the given set
-    of `.board-lane` locators — used to crop a board screenshot to just
+    of `.board-lane` locators, which crops a board screenshot to just
     below the tallest column's actual cards, not the full stretched lane
     height (`.board-lane` fills the row via flex `align-items: stretch`
     regardless of card count)."""
