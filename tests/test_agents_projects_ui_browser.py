@@ -61,11 +61,11 @@ def _card(card_id, title, **extra):
 
 
 def _state():
-    parent = _card("project-1", "Release synthetic project", is_project=True, child_count=7,
+    parent = _card("project-1", "Release synthetic project", is_project=True, child_count=8,
                    project={
-                       "child_count": 7, "resolved_count": 1, "ready_to_close": False,
+                       "child_count": 8, "resolved_count": 2, "ready_to_close": False,
                        "execution_paused": True, "cancellation_pending": False,
-                       "counts": {"done": 1, "awaiting_review": 1, "cancelled": 0,
+                       "counts": {"done": 1, "awaiting_review": 1, "cancelled": 1,
                                   "blocked": 4, "running": 1, "unassigned": 0, "assigned": 0},
                        "coordinator": {"session_id": "coord-1", "status": "running", "live": True,
                                        "result": "Created a synthetic plan."},
@@ -73,9 +73,13 @@ def _state():
     child = _card("child-1", "Implement synthetic child", assignee="codex", tags=["codex"],
                   parent_id="project-1", parent_title="Release synthetic project")
     done_child = _card("child-2", "Accepted synthetic child", status="done",
+                       tags=["human", "agent-wait-provider", "agent-running", "agent-blocked"],
                        parent_id="project-1", parent_title="Release synthetic project")
-    review_child = _card("child-3", "Review synthetic child", tags=["agent-completed"],
+    review_child = _card("child-3", "Review synthetic child", status="done", tags=["agent-completed"],
                          parent_id="project-1", parent_title="Release synthetic project")
+    cancelled_child = _card("child-cancelled", "Cancelled synthetic child", status="cancelled",
+                            tags=["human", "agent-wait-dependency", "agent-running", "agent-blocked"],
+                            parent_id="project-1", parent_title="Release synthetic project")
     blocked_children = [
         _card("child-blocked", "Blocked synthetic child", tags=["agent-blocked"],
               parent_id="project-1", parent_title="Release synthetic project"),
@@ -88,7 +92,7 @@ def _state():
     ]
     return {
         "lanes": {"unassigned": [], "assigned": [parent, child], "in_progress": [],
-                  "human_queue": blocked_children, "scheduled": [], "review": [review_child],
+                  "human_queue": [cancelled_child, *blocked_children], "scheduled": [], "review": [review_child],
                   "done": [done_child], "snoozed": []},
         "generated_at": 0, "api_host": "synthetic-host",
     }
@@ -123,7 +127,7 @@ def _stub(page: Page, state, seen):
                 )
             ]
             route.fulfill(status=200, content_type="application/json",
-                          body=json.dumps({"tasks": children, "total": 7, "limit": 50, "offset": 0}))
+                          body=json.dumps({"tasks": children, "total": 8, "limit": 50, "offset": 0}))
         elif url.rstrip("/").endswith("/api/tasks/project-1/project/cancel") and method == "POST" and request.post_data_json["confirm"] is False:
             seen.append((method, url, request.post_data_json))
             route.fulfill(status=200, content_type="application/json", body=json.dumps({
@@ -147,7 +151,7 @@ def _open(page, base_url, state, seen):
 def test_project_cards_filter_and_navigation(page: Page, agents_base_url):
     state, seen = _state(), []
     _open(page, agents_base_url, state, seen)
-    expect(page.locator('[data-card-id="project-1"] .board-chip-project')).to_have_text("project · 1/7 resolved")
+    expect(page.locator('[data-card-id="project-1"] .board-chip-project')).to_have_text("project · 2/8 resolved")
     page.select_option("#board-filter-project", "projects")
     expect(page.locator('[data-card-id="project-1"]')).to_be_visible()
     expect(page.locator('[data-card-id="child-1"]')).to_have_count(0)
@@ -162,6 +166,15 @@ def test_project_cards_filter_and_navigation(page: Page, agents_base_url):
         expect(page.locator(f'[data-child-id="{child_id}"] .project-child-meta')).to_have_text(
             'unassigned · blocked'
         )
+    expect(page.locator('[data-child-id="child-2"] .project-child-meta')).to_have_text(
+        'unassigned · done'
+    )
+    expect(page.locator('[data-child-id="child-3"] .project-child-meta')).to_have_text(
+        'unassigned · awaiting review'
+    )
+    expect(page.locator('[data-child-id="child-cancelled"] .project-child-meta')).to_have_text(
+        'unassigned · cancelled'
+    )
     page.locator('#board-drawer [data-action="open-child"]').first.click()
     expect(page.locator('#board-drawer [data-field="parent-navigation"]')).to_be_visible()
     page.locator('#board-drawer [data-action="open-parent"]').click()
@@ -174,6 +187,7 @@ def test_project_actions_and_relationship_mutations(page: Page, agents_base_url)
     page.locator('[data-card-id="project-1"]').click()
     page.locator('[data-action="project-start"]').click()
     page.locator('[data-action="project-plan"]').click()
+    page.once("dialog", lambda dialog: dialog.accept())
     page.locator('[data-action="project-complete"]').click()
     page.locator('[data-action="project-cancel"]').click()
     expect(page.locator('.modal')).to_contain_text("3 unfinished children")
@@ -193,7 +207,7 @@ def test_project_actions_and_relationship_mutations(page: Page, agents_base_url)
     calls = {(method, url.split("/api", 1)[-1]): body for method, url, body in seen}
     assert calls[("POST", "/tasks/project-1/project/start")] is None
     assert calls[("POST", "/tasks/project-1/project/plan")]["operation_id"]
-    assert calls[("POST", "/tasks/project-1/project/complete")] == {"acknowledge_cancelled_children": False}
+    assert calls[("POST", "/tasks/project-1/project/complete")] == {"acknowledge_cancelled_children": True}
     assert calls[("POST", "/tasks/project-1/project/cancel")]["confirm"] is True
     assert calls[("POST", "/tasks")]["fields"] == {"parent_id": "project-1"}
     assert calls[("PUT", "/tasks/existing-child")] == {"fields": {"parent_id": "project-1"}}

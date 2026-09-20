@@ -254,7 +254,20 @@ def test_mcp_task_output_discloses_real_filtered_and_paginated_responses(
         server = module.LifeOSMCPServer()
     manager = TaskManager(tmp_path / "vault", tmp_path / "task-index.json")
     parent = manager.create("Synthetic project")
-    for index in range(7):
+    manager.create(
+        "Synthetic accepted child", status="done", tags=["agent-completed", "accepted"],
+        fields={"parent_id": parent.id},
+    )
+    manager.create(
+        "Synthetic review child", tags=["agent-completed"], fields={"parent_id": parent.id},
+    )
+    manager.create(
+        "Synthetic cancelled child", status="cancelled", fields={"parent_id": parent.id},
+    )
+    manager.create(
+        "Synthetic blocked child", tags=["agent-blocked"], fields={"parent_id": parent.id},
+    )
+    for index in range(3):
         manager.create(f"Synthetic child {index}", fields={"parent_id": parent.id})
     manager.create("Synthetic done task", status="done")
     sessions = SessionStore(tmp_path / "sessions.db")
@@ -271,6 +284,7 @@ def test_mcp_task_output_discloses_real_filtered_and_paginated_responses(
     )
     assert "Found 7 child tasks" in children_text
     assert "Showing 2 of 7 children; offset 0" in children_text
+    assert f"Parent: Synthetic project [id:{parent.id}]" in children_text
 
     empty_page = client.get(f"/api/tasks/{parent.id}/children?limit=2&offset=20")
     assert empty_page.status_code == 200
@@ -302,6 +316,9 @@ def test_mcp_task_output_discloses_real_filtered_and_paginated_responses(
         "lifeos_task_list", filtered_response.json(), {"status": "todo"},
     )
     assert "Scope: filtered task list" in filtered_text
+    assert "Project: 7 children" in filtered_text
+    for count in ("1 done", "1 awaiting review", "1 cancelled", "1 blocked"):
+        assert count in filtered_text
 
     server.tools = [{"name": "lifeos_task_list"}]
     server._call_api = MagicMock(return_value=filtered_response.json())
@@ -309,6 +326,20 @@ def test_mcp_task_output_discloses_real_filtered_and_paginated_responses(
         "lifeos_task_list", {"status": "todo"},
     )
     assert "Scope: filtered task list" in worker_filtered.output
+
+
+@pytest.mark.parametrize("data", [
+    {"tasks": [{"id": "task-1", "description": "Synthetic task", "status": "todo"}], "total": 1},
+    {"tasks": [], "total": 0},
+])
+def test_mcp_empty_filter_does_not_claim_a_filtered_task_list(data):
+    module = _load_mcp_module()
+    with patch.object(module.LifeOSMCPServer, "_load_openapi_spec", lambda self: None):
+        server = module.LifeOSMCPServer()
+
+    text = server._format_response("lifeos_task_list", data, {"status": ""})
+
+    assert "filtered task list" not in text
 
 
 def test_mcp_project_cancel_preview_and_partial_result_are_unambiguous():

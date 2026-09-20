@@ -75,7 +75,7 @@ def _format_task_collection(
                 f"offset {data.get('offset', 0)}. Fetch another page before acting on the full project."
             )
         if not children and any(
-            key in {"status", "context", "tag", "due_before", "query"} and value is not None
+            key in {"status", "context", "tag", "due_before", "query"} and value
             for key, value in (arguments or {}).items()
         ):
             return "No tasks found in the filtered task list."
@@ -132,7 +132,7 @@ def _format_task_collection(
     elif not children:
         filters = {
             key: value for key, value in (arguments or {}).items()
-            if key in {"status", "context", "tag", "due_before", "query"} and value is not None
+            if key in {"status", "context", "tag", "due_before", "query"} and value
         }
         if filters:
             text += "\nScope: filtered task list; results include only matching tasks.\n"
