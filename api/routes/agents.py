@@ -1225,7 +1225,9 @@ def _build_board() -> dict[str, Any]:
         ))
 
     for entry in scheduler_store.list_all():
-        bucket = "scheduled" if agent_board.is_schedule_active(entry.enabled, entry.next_trigger_at) else "done"
+        bucket = "scheduled" if agent_board.is_schedule_active(
+            entry.enabled, entry.next_trigger_at, entry.schedule_type,
+        ) else "done"
         lanes[bucket].append(_schedule_card(entry))
 
     return {"lanes": lanes, "generated_at": int(time.time()), "api_host": api_host_name()}

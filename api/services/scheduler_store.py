@@ -1,8 +1,11 @@
 """
 Scheduler Store and Scheduler for LifeOS.
 
-A *schedule* binds a trigger (one-off ``at`` or recurring ``cron``) to an
-**action**. When it fires it can:
+A *schedule* binds a trigger to an **action**. The trigger is a one-off
+``at``, a recurring ``cron``, or ``manual`` — no trigger at all, so it never
+fires on its own and is fired only by ``POST /api/scheduler/{id}/trigger``
+(the board's Trigger-now button, or an agent's ``lifeos_schedule_trigger``/
+``manage_schedules`` call). When a schedule fires it can:
 
 - ``notify``   — send a static message via Telegram (legacy ``static``)
 - ``prompt``   — run a prompt through the full LifeOS chat pipeline and send the result
@@ -71,8 +74,8 @@ class ScheduleEntry:
     """A scheduled trigger bound to an action."""
     id: str
     name: str
-    schedule_type: str  # "once" or "cron"
-    schedule_value: str  # ISO datetime (once) or cron expression (cron)
+    schedule_type: str  # "once", "cron", or "manual" (no trigger — fires only via the trigger endpoint)
+    schedule_value: str  # ISO datetime (once) or cron expression (cron); unused for manual
     action: str = "notify"  # notify / prompt / endpoint / agent
     message_type: str = "static"  # legacy: static / prompt / endpoint
     message_content: str = ""  # static text or natural-language prompt
@@ -274,8 +277,11 @@ def _format_entry_line(entry: ScheduleEntry) -> str:
     symbol = " " if entry.enabled else "x"
     parts = [f"- [{symbol}] {entry.name}"]
 
-    trig_key = "cron" if entry.schedule_type == "cron" else "at"
-    parts.append(f"[{trig_key}:: {entry.schedule_value}]")
+    if entry.schedule_type == "cron":
+        parts.append(f"[cron:: {entry.schedule_value}]")
+    elif entry.schedule_type == "once":
+        parts.append(f"[at:: {entry.schedule_value}]")
+    # manual: no trigger field — it fires only via the trigger endpoint.
     if entry.timezone:
         parts.append(f"[tz:: {entry.timezone}]")
     parts.append(f"[action:: {entry.action}]")
@@ -314,11 +320,15 @@ def _parse_entry_line(line: str) -> Optional[ScheduleEntry]:
 
     fields = {fm.group(1): fm.group(2).strip() for fm in _INLINE_FIELD_RE.finditer(rest)}
 
-    # A schedule line must carry a trigger field.
+    # A schedule line must carry a trigger field, or — for a manual
+    # schedule, which has none — an action field; a bare checkbox line with
+    # neither is not a schedule at all.
     if "cron" in fields:
         schedule_type, schedule_value = "cron", fields["cron"]
     elif "at" in fields:
         schedule_type, schedule_value = "once", fields["at"]
+    elif "action" in fields:
+        schedule_type, schedule_value = "manual", ""
     else:
         return None
 
@@ -654,7 +664,13 @@ class SchedulerStore:
             return False
 
     def mark_triggered(self, entry_id: str):
-        """Mark a schedule as triggered and advance/disable it."""
+        """Mark a schedule as triggered and advance/disable it.
+
+        A ``once`` schedule is consumed (disabled, no next fire). ``cron``
+        advances to its next slot. ``manual`` has no trigger of its own —
+        ``compute_next_trigger`` returns ``None`` for it — so it stays
+        enabled with no next fire and is re-triggerable indefinitely.
+        """
         with self._lock:
             entry = self._entries.get(entry_id)
             if not entry:

@@ -1206,3 +1206,92 @@ class TestWriteEndpointNeverReturnsSuccessShapedFailure:
                 "— remove it from _KNOWN_EXEMPTIONS and its note in "
                 "docs/specs/technical/architecture.md"
             )
+
+
+# ---------------------------------------------------------------------------
+# lifeos_schedule_trigger — fires a schedule (incl. manual) immediately.
+# ---------------------------------------------------------------------------
+
+def _load_mcp_module_fresh():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class TestScheduleTriggerTool:
+    @pytest.mark.unit
+    def test_registered_in_curated_endpoints(self):
+        module = _load_mcp_module_fresh()
+        cfg = next(
+            (c for c in module.CURATED_ENDPOINTS.values() if c["name"] == "lifeos_schedule_trigger"),
+            None,
+        )
+        assert cfg is not None, "lifeos_schedule_trigger missing from CURATED_ENDPOINTS"
+        assert cfg["method"] == "POST"
+        assert cfg.get("path", "").endswith("/api/scheduler/{schedule_id}/trigger")
+
+    @pytest.mark.unit
+    def test_calls_the_trigger_endpoint_with_schedule_id_in_the_path(self):
+        from unittest.mock import MagicMock
+
+        module = _load_mcp_module_fresh()
+        server = module.LifeOSMCPServer()
+        fake = MagicMock()
+        fake_response = MagicMock()
+        fake_response.status_code = 200
+        fake_response.json.return_value = {"status": "triggered", "id": "sch-1"}
+        fake_response.raise_for_status = MagicMock()
+        fake.post.return_value = fake_response
+        server.client = fake
+
+        result = server._call_api("lifeos_schedule_trigger", {"schedule_id": "sch-1"})
+
+        assert result == {"status": "triggered", "id": "sch-1"}
+        called_url = fake.post.call_args[0][0]
+        assert called_url.endswith("/api/scheduler/sch-1/trigger")
+        # schedule_id is consumed as a path parameter, not sent in the body.
+        assert fake.post.call_args.kwargs["json"] == {}
+
+    @pytest.mark.unit
+    def test_request_key_forwards_as_a_header_not_a_body_field(self):
+        from unittest.mock import MagicMock
+
+        module = _load_mcp_module_fresh()
+        server = module.LifeOSMCPServer()
+        fake = MagicMock()
+        fake_response = MagicMock()
+        fake_response.status_code = 200
+        fake_response.json.return_value = {"status": "triggered", "id": "sch-1"}
+        fake_response.raise_for_status = MagicMock()
+        fake.post.return_value = fake_response
+        server.client = fake
+
+        server._call_api(
+            "lifeos_schedule_trigger",
+            {"schedule_id": "sch-1", "request_key": "req-42"},
+        )
+
+        kwargs = fake.post.call_args.kwargs
+        assert kwargs["json"] == {}
+        assert kwargs["headers"]["X-Request-Key"] == "req-42"
+
+    @pytest.mark.unit
+    def test_omitted_request_key_sends_no_header(self):
+        from unittest.mock import MagicMock
+
+        module = _load_mcp_module_fresh()
+        server = module.LifeOSMCPServer()
+        fake = MagicMock()
+        fake_response = MagicMock()
+        fake_response.status_code = 200
+        fake_response.json.return_value = {"status": "triggered", "id": "sch-1"}
+        fake_response.raise_for_status = MagicMock()
+        fake.post.return_value = fake_response
+        server.client = fake
+
+        server._call_api("lifeos_schedule_trigger", {"schedule_id": "sch-1"})
+
+        headers = fake.post.call_args.kwargs.get("headers")
+        assert not headers

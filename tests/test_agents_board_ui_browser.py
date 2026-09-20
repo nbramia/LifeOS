@@ -301,7 +301,7 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
                   kill_failures: "list | None" = None,
                   task_deletes: "list | None" = None, schedule_deletes: "list | None" = None,
                   call_log: "list | None" = None, snooze_calls: "list | None" = None,
-                  task_put_status_code: "list | None" = None):
+                  task_put_status_code: "list | None" = None, trigger_calls: "list | None" = None):
     """Stub d3 (offline CDN) + every /api/ call the page makes.
 
     `snooze_calls`: appended with `{"method": "PUT"|"DELETE", "id", "body"}`
@@ -740,6 +740,16 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
             route.fulfill(status=200, content_type="application/json", body=json.dumps({"status": "deleted", "id": task_id}))
             return
 
+        trigger_match = re.search(r"/api/scheduler/([^/]+)/trigger$", url)
+        if trigger_match and method == "POST":
+            if trigger_calls is not None:
+                trigger_calls.append(trigger_match.group(1))
+            route.fulfill(
+                status=200, content_type="application/json",
+                body=json.dumps({"status": "triggered", "id": trigger_match.group(1)}),
+            )
+            return
+
         schedule_match = re.search(r"/api/scheduler/([^/]+)$", url)
         if schedule_match and method == "PUT":
             try:
@@ -796,7 +806,7 @@ def _open_board(page: Page, base_url, board_state=None, lane_calls=None, task_pu
                  open_calls=None, open_response=None, task_posts=None, cancel_calls=None, cancel_failures=None,
                  kill_calls=None, kill_status_code=None, kill_failures=None,
                  task_deletes=None, schedule_deletes=None, call_log=None, snooze_calls=None,
-                 task_put_status_code=None):
+                 task_put_status_code=None, trigger_calls=None):
     _stub_routes(
         page,
         board_state if board_state is not None else _board_fixture(),
@@ -820,6 +830,7 @@ def _open_board(page: Page, base_url, board_state=None, lane_calls=None, task_pu
         call_log,
         snooze_calls,
         task_put_status_code,
+        trigger_calls,
     )
     page.goto(f"{base_url}/agents")
     page.wait_for_selector('[data-card-id="t1"]')
@@ -1838,6 +1849,31 @@ class TestScheduledCardDrawer:
             {"message_content": "Good evening"},
             {"enabled": False},
         ]
+
+    def test_manual_schedule_card_shows_manual_and_triggers(self, page: Page, agents_base_url):
+        """A manual schedule (schedule_type='manual', no cron/at) renders
+        "Manual" on its card instead of a next-fire time, and its drawer's
+        Trigger now button posts to POST /api/scheduler/{id}/trigger."""
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["scheduled"].append({
+            "kind": "schedule", "id": "s2", "name": "Deploy runbook",
+            "message_content": "ship it", "enabled": True,
+            "next_fire_at": None, "recurring": False,
+            "schedule_type": "manual", "schedule_value": "",
+            "action": "notify", "last_run": None,
+        })
+        trigger_calls = []
+        _open_board(page, agents_base_url, board_state=board_state, trigger_calls=trigger_calls)
+
+        card = page.locator('[data-card-id="s2"]')
+        expect(card).to_contain_text("Manual")
+
+        card.click()
+        drawer = page.locator("#board-drawer")
+        expect(drawer.locator('[data-field="schedule-type"]')).to_have_value("manual")
+        expect(drawer.locator('[data-field="next-fire-preview"]')).to_contain_text("Manual")
+        drawer.locator('[data-action="trigger-now"]').click()
+        _wait_for(lambda: trigger_calls == ["s2"], page=page)
 
 
 class TestLiveUpdates:

@@ -550,22 +550,26 @@ TOOL_DEFINITIONS = [
     {
         "name": "manage_schedules",
         "description": (
-            "Manage schedules: create, list, update, or delete. A schedule binds "
-            "a trigger (once/cron) to an action (notify/prompt/endpoint/agent). Use "
-            "action='agent' to run autonomous work on a schedule. For update/delete, "
-            "pass schedule_id from a prior list; update changes only the fields you supply."
+            "Manage schedules: create, list, update, delete, or trigger. A schedule binds "
+            "a trigger (once/cron/manual) to an action (notify/prompt/endpoint/agent). A "
+            "'manual' schedule has no cron or at value — it never fires on its own and is "
+            "fired only by action='trigger', exactly like the operator's Trigger-now button "
+            "on the /agents board; it stays enabled and can be triggered again afterward. "
+            "Use action='agent' to run autonomous work on a schedule. For update/delete/"
+            "trigger, pass schedule_id from a prior list; update changes only the fields "
+            "you supply."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["create", "list", "update", "delete"],
+                    "enum": ["create", "list", "update", "delete", "trigger"],
                     "description": "Operation to perform.",
                 },
                 "schedule_id": {
                     "type": "string",
-                    "description": "ID of the schedule to update or delete (from action='list').",
+                    "description": "ID of the schedule to update, delete, or trigger (from action='list').",
                 },
                 "name": {
                     "type": "string",
@@ -573,12 +577,19 @@ TOOL_DEFINITIONS = [
                 },
                 "schedule_type": {
                     "type": "string",
-                    "enum": ["once", "cron"],
-                    "description": "'once' for one-time, 'cron' for recurring (for create).",
+                    "enum": ["once", "cron", "manual"],
+                    "description": "'once' for one-time, 'cron' for recurring, 'manual' for a "
+                                   "trigger-only schedule (for create; omit schedule_value for manual).",
                 },
                 "schedule_value": {
                     "type": "string",
-                    "description": "ISO datetime for 'once', or cron expression for 'cron' (for create).",
+                    "description": "ISO datetime for 'once', or cron expression for 'cron' "
+                                   "(for create; omit or leave blank for 'manual').",
+                },
+                "request_key": {
+                    "type": "string",
+                    "description": "Optional idempotency key for action='trigger' — a retry with "
+                                   "the same key resolves to the same fire rather than firing twice.",
                 },
                 "schedule_action": {
                     "type": "string",
@@ -2593,10 +2604,12 @@ def _schedule_create(inp: dict) -> str:
         validate_action_inputs(action, message_content, None)
     except ScheduleActionValidationError as e:
         return f"Error: {e.detail}"
+    schedule_type = inp.get("schedule_type") or "manual"
+    schedule_value = "" if schedule_type == "manual" else (inp.get("schedule_value") or "")
     entry = store.create(
         name=inp["name"],
-        schedule_type=inp["schedule_type"],
-        schedule_value=inp["schedule_value"],
+        schedule_type=schedule_type,
+        schedule_value=schedule_value,
         action=action,
         message_type=inp.get("message_type", "static" if action == "notify" else action),
         message_content=message_content,
@@ -2648,6 +2661,10 @@ def _schedule_update(inp: dict) -> str:
     }
     if inp.get("schedule_action") is not None:
         fields["action"] = inp["schedule_action"]
+    if fields.get("schedule_type") == "manual":
+        # A manual schedule has no trigger of its own — clear any stale
+        # cron/at value it's converting away from.
+        fields["schedule_value"] = ""
     store = get_scheduler_store()
     # Validate the entry's resulting shape once this patch is applied, but
     # only when the patch actually touches a field the resulting action
@@ -2684,6 +2701,25 @@ def _schedule_delete(inp: dict) -> str:
     return f"Error: No schedule found with id '{schedule_id}'."
 
 
+def _schedule_trigger(inp: dict) -> str:
+    """Fire a schedule immediately — the same path the board's Trigger-now
+    button and ``lifeos_schedule_trigger`` (MCP) use. Works on any schedule
+    kind, including 'manual' (its only way to ever fire).
+    """
+    from api.services.scheduler_store import get_scheduler_store, get_scheduler
+    schedule_id = inp.get("schedule_id")
+    if not schedule_id:
+        return "Error: schedule_id is required for trigger (use action='list' to find it)."
+    store = get_scheduler_store()
+    entry = store.get(schedule_id)
+    if entry is None:
+        return f"Error: No schedule found with id '{schedule_id}'."
+    asyncio.run(get_scheduler()._fire_entry(
+        entry, manual=True, request_key=inp.get("request_key"),
+    ))
+    return f"Schedule triggered: \"{entry.name}\" (id: {entry.id})"
+
+
 def _tool_manage_schedules(inp: dict):
     action = inp["action"]
     if action == "create":
@@ -2694,6 +2730,8 @@ def _tool_manage_schedules(inp: dict):
         return _schedule_update(inp)
     elif action == "delete":
         return _schedule_delete(inp)
+    elif action == "trigger":
+        return _schedule_trigger(inp)
     return f"Error: Unknown manage_schedules action '{action}'"
 
 
@@ -3935,6 +3973,7 @@ TOOL_STATUS_MESSAGES = {
     "manage_schedules.list": "Loading schedules...",
     "manage_schedules.update": "Updating schedule...",
     "manage_schedules.delete": "Removing schedule...",
+    "manage_schedules.trigger": "Triggering schedule...",
     "manage_workouts": "Updating workout log...",
     "manage_workouts.log": "Logging workout...",
     "manage_workouts.update": "Correcting log...",

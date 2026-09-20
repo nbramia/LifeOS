@@ -42,8 +42,8 @@ _TYPE_TO_ACTION = {"static": "notify", "prompt": "prompt", "endpoint": "endpoint
 
 class CreateScheduleRequest(BaseModel):
     name: str = Field(..., min_length=1, description="Human-readable name")
-    schedule_type: str = Field(..., description="'once' or 'cron'")
-    schedule_value: str = Field(..., description="ISO datetime (once) or cron expression (cron)")
+    schedule_type: str = Field(..., description="'once', 'cron', or 'manual' (no trigger — fired only via POST .../trigger)")
+    schedule_value: str = Field(default="", description="ISO datetime (once) or cron expression (cron); omit for manual")
     action: Optional[str] = Field(default=None, description="notify | prompt | endpoint | agent")
     message_type: Optional[str] = Field(default=None, description="Legacy: static | prompt | endpoint")
     message_content: str = Field(default="", description="Static text or natural-language prompt")
@@ -249,10 +249,11 @@ def _validate_update_fields(schedule_id: str, request: "UpdateScheduleRequest", 
     it out of rotation instead of ever firing again. A request that
     supplies both fields together converts a schedule in one write: the
     submitted value is validated against the submitted type, regardless of
-    what's currently stored.
+    what's currently stored. ``manual`` has no trigger value to validate —
+    a schedule_value shape check never applies to it.
     """
-    if request.schedule_type is not None and request.schedule_type not in ("once", "cron"):
-        raise HTTPException(status_code=400, detail="schedule_type must be 'once' or 'cron'")
+    if request.schedule_type is not None and request.schedule_type not in ("once", "cron", "manual"):
+        raise HTTPException(status_code=400, detail="schedule_type must be 'once', 'cron', or 'manual'")
     if request.action is not None and request.action not in VALID_ACTIONS:
         raise HTTPException(status_code=400, detail=f"action must be one of {VALID_ACTIONS}")
     if request.timezone is not None:
@@ -261,6 +262,9 @@ def _validate_update_fields(schedule_id: str, request: "UpdateScheduleRequest", 
         except Exception:
             raise HTTPException(status_code=422, detail=f"Unknown timezone '{request.timezone}'")
 
+    if request.schedule_type == "manual":
+        return
+
     if request.schedule_value is not None:
         effective_type = request.schedule_type
         if effective_type is None:
@@ -268,7 +272,8 @@ def _validate_update_fields(schedule_id: str, request: "UpdateScheduleRequest", 
             if entry is None:
                 raise HTTPException(status_code=404, detail="Schedule not found")
             effective_type = entry.schedule_type
-        _validate_schedule_value(effective_type, request.schedule_value)
+        if effective_type != "manual":
+            _validate_schedule_value(effective_type, request.schedule_value)
         return
 
     if request.schedule_type is not None:
@@ -284,14 +289,19 @@ def _validate_update_fields(schedule_id: str, request: "UpdateScheduleRequest", 
 
 @router.post("", response_model=ScheduleResponse)
 async def create_schedule(request: CreateScheduleRequest):
-    """Create a new schedule."""
-    if request.schedule_type not in ("once", "cron"):
-        raise HTTPException(status_code=400, detail="schedule_type must be 'once' or 'cron'")
+    """Create a new schedule. A 'manual' schedule has no trigger of its own —
+    it fires only via ``POST /{schedule_id}/trigger`` — so its schedule_value
+    is ignored and stored blank regardless of what's supplied."""
+    if request.schedule_type not in ("once", "cron", "manual"):
+        raise HTTPException(status_code=400, detail="schedule_type must be 'once', 'cron', or 'manual'")
     try:
         ZoneInfo(request.timezone)
     except Exception:
         raise HTTPException(status_code=422, detail=f"Unknown timezone '{request.timezone}'")
-    _validate_schedule_value(request.schedule_type, request.schedule_value)
+    if request.schedule_type == "manual":
+        request.schedule_value = ""
+    else:
+        _validate_schedule_value(request.schedule_type, request.schedule_value)
     action = _resolve_action(request.action, request.message_type)
     if action not in VALID_ACTIONS:
         raise HTTPException(status_code=400, detail=f"action must be one of {VALID_ACTIONS}")
@@ -391,10 +401,13 @@ async def get_schedule(schedule_id: str):
 
 @router.put("/{schedule_id}", response_model=ScheduleResponse)
 async def update_schedule(schedule_id: str, request: UpdateScheduleRequest):
-    """Update an existing schedule."""
+    """Update an existing schedule. Converting to schedule_type='manual'
+    clears schedule_value — a manual schedule has no trigger of its own."""
     request.bot = _require_known_bot(request.bot)
     store = get_scheduler_store()
     _validate_update_fields(schedule_id, request, store)
+    if request.schedule_type == "manual":
+        request.schedule_value = ""
     # Only when the patch actually touches one of the three action-input
     # fields — an unrelated patch (e.g. `enabled`) to a pre-existing
     # invalid entry must still succeed, matching `_validate_update_fields`'s

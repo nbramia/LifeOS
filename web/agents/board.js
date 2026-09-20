@@ -1011,14 +1011,16 @@ export function initBoard() {
     div.dataset.cardId = card.id;
     div.dataset.lane = card.lane;
     if (card.id === revealedCardId) div.classList.add('reveal-highlight');
+    const isManual = card.schedule_type === 'manual';
     const nextFire = card.next_fire_at ? new Date(card.next_fire_at).toLocaleString() : '—';
     const actionChip = scheduleActionChipText(card);
     div.innerHTML = `
       <div class="board-card-title">${escapeHtml(card.name || '(schedule)')}</div>
       <div class="board-card-chips">
         <span class="board-chip" title="${escapeHtml(actionChip.title)}">${escapeHtml(actionChip.text)}</span>
-        ${card.recurring ? '<span class="board-chip">recurring</span>' : '<span class="board-chip">one-off</span>'}
-        <span class="board-chip">next: ${escapeHtml(nextFire)}</span>
+        ${isManual
+          ? '<span class="board-chip">Manual — trigger only</span>'
+          : `${card.recurring ? '<span class="board-chip">recurring</span>' : '<span class="board-chip">one-off</span>'}<span class="board-chip">next: ${escapeHtml(nextFire)}</span>`}
       </div>
       ${card.last_run ? `<div class="board-card-lastrun">${escapeHtml(card.last_run.outcome || '')} · ${escapeHtml(card.last_run.snippet || '')}</div>` : ''}
     `;
@@ -1712,6 +1714,7 @@ export function initBoard() {
     { id: 'weekdays', label: 'Weekdays' },
     { id: 'custom', label: 'Custom days' },
     { id: 'cron', label: 'Cron' },
+    { id: 'manual', label: 'Manual (trigger only)' },
   ];
   // Sunday-first (index 0 = Sun), matching cron's own day-of-week field.
   const DOW_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -1744,6 +1747,9 @@ export function initBoard() {
   }
 
   function triggerFieldsHtml(state) {
+    if (state.mode === 'manual') {
+      return `<div class="drawer-schedule-info">No trigger — this schedule never fires on its own. Fire it with Trigger now (or an agent's lifeos_schedule_trigger) after creating it.</div>`;
+    }
     if (state.mode === 'once') {
       return `
         <label class="drawer-label">When</label>
@@ -1775,6 +1781,9 @@ export function initBoard() {
   // schedule_value}`, or `null` while it's incomplete — the same shape
   // `POST /api/scheduler` and `POST /api/scheduler/preview` both take.
   function readTrigger(state) {
+    if (state.mode === 'manual') {
+      return { schedule_type: 'manual', schedule_value: '' };
+    }
     if (state.mode === 'once') {
       return state.onceValue ? { schedule_type: 'once', schedule_value: state.onceValue } : null;
     }
@@ -1923,6 +1932,15 @@ export function initBoard() {
       if (!trig) {
         ++previewSeq; // discard any in-flight response from before the trigger was cleared
         previewListEl.innerHTML = '';
+        previewErrorEl.hidden = true;
+        previewErrorEl.textContent = '';
+        return;
+      }
+      if (trig.schedule_type === 'manual') {
+        // Nothing to preview — manual has no trigger, so `/preview` (which
+        // only understands once/cron) is never called for it.
+        ++previewSeq;
+        previewListEl.innerHTML = '<div class="drawer-schedule-info">Manual — trigger only.</div>';
         previewErrorEl.hidden = true;
         previewErrorEl.textContent = '';
         return;
@@ -2205,7 +2223,8 @@ export function initBoard() {
     return r.json();
   }
 
-  function formatNextFire(iso) {
+  function formatNextFire(iso, scheduleType) {
+    if (scheduleType === 'manual') return 'Manual — trigger only.';
     if (!iso) return 'Not scheduled to fire again.';
     const d = new Date(iso);
     if (Number.isNaN(d.getTime())) return 'Not scheduled to fire again.';
@@ -2796,9 +2815,10 @@ export function initBoard() {
           <select class="drawer-select" data-field="schedule-type">
             <option value="cron" ${card.schedule_type === 'cron' ? 'selected' : ''}>cron</option>
             <option value="once" ${card.schedule_type === 'once' ? 'selected' : ''}>once</option>
+            <option value="manual" ${card.schedule_type === 'manual' ? 'selected' : ''}>manual (trigger only)</option>
           </select>
         </div>
-        <div>
+        <div data-field="schedule-value-group" ${card.schedule_type === 'manual' ? 'hidden' : ''}>
           <label class="drawer-label" data-field="schedule-value-label">${card.schedule_type === 'once' ? 'When (ISO datetime)' : 'Cron expression'}</label>
           <input class="drawer-schedule-value" data-field="schedule-value" value="${escapeHtml(card.schedule_value || '')}" placeholder="${card.schedule_type === 'once' ? '2026-06-03T15:05:00' : '0 9 * * *'}" />
           <div class="drawer-field-error" data-field="schedule-value-error" hidden></div>
@@ -3254,13 +3274,14 @@ export function initBoard() {
         // response the same way the type/value/timezone saves do, since
         // updateOpenDrawer skips its own rebuild while this checkbox
         // holds focus.
-        previewEl.textContent = formatNextFire(resp.next_trigger_at);
+        previewEl.textContent = formatNextFire(resp.next_trigger_at, lastSavedType);
         await fetchBoard();
       }
       catch (err) { showToast(`Couldn't update enabled: ${err.message}`, true); enabledEl.checked = !!card.enabled; }
     });
 
     const typeEl = drawerEl.querySelector('[data-field="schedule-type"]');
+    const valueGroupEl = drawerEl.querySelector('[data-field="schedule-value-group"]');
     const valueEl = drawerEl.querySelector('[data-field="schedule-value"]');
     const valueLabelEl = drawerEl.querySelector('[data-field="schedule-value-label"]');
     const valueErrorEl = drawerEl.querySelector('[data-field="schedule-value-error"]');
@@ -3272,7 +3293,7 @@ export function initBoard() {
     const lastRunEl = drawerEl.querySelector('[data-field="last-run-info"]');
     const triggerBtnEl = drawerEl.querySelector('[data-action="trigger-now"]');
 
-    previewEl.textContent = formatNextFire(card.next_fire_at);
+    previewEl.textContent = formatNextFire(card.next_fire_at, card.schedule_type);
     lastRunEl.textContent = formatLastRun(card.last_run);
 
     // What the server last actually accepted for each field — a rejected
@@ -3301,6 +3322,7 @@ export function initBoard() {
     }
 
     function updateValueLabel(type) {
+      valueGroupEl.hidden = type === 'manual';
       if (type === 'once') {
         valueLabelEl.textContent = 'When (ISO datetime)';
         valueEl.placeholder = '2026-06-03T15:05:00';
@@ -3310,16 +3332,37 @@ export function initBoard() {
       }
     }
 
-    typeEl.addEventListener('change', () => {
+    typeEl.addEventListener('change', async () => {
       // Type-only, with no matching value, is unsaveable by construction
-      // (a cron string and an ISO datetime never parse as each other) —
-      // saving it here would either write a type/value pair the server
-      // rejects, or one it accepts but that leaves a live schedule
-      // pointed at the wrong parser. So this only updates the label and
-      // placeholder; the value field's blur handler below carries the
-      // type along with whatever value the operator enters to match it,
-      // so a conversion always reaches the server as one matched pair.
-      updateValueLabel(typeEl.value);
+      // for cron/once (a cron string and an ISO datetime never parse as
+      // each other) — saving it here would either write a type/value pair
+      // the server rejects, or one it accepts but that leaves a live
+      // schedule pointed at the wrong parser. So switching to cron/once
+      // only updates the label, placeholder, and visibility; the value
+      // field's blur handler below carries the type along with whatever
+      // value the operator enters to match it, so a conversion always
+      // reaches the server as one matched pair.
+      //
+      // `manual` has no value to match, so it saves immediately on
+      // selection — there's nothing to wait for a blur on.
+      const target = typeEl.value;
+      updateValueLabel(target);
+      if (target !== 'manual') return;
+      try {
+        const resp = await putSchedule(card.id, { schedule_type: 'manual' });
+        lastSavedType = 'manual';
+        lastSavedValue = '';
+        valueEl.value = '';
+        valueErrorEl.hidden = true;
+        valueErrorEl.textContent = '';
+        previewEl.textContent = formatNextFire(resp.next_trigger_at, 'manual');
+        triggerBtnEl.textContent = 'Trigger now';
+        await fetchBoard();
+      } catch (err) {
+        showToast(`Couldn't convert to manual: ${err.message}`, true);
+        typeEl.value = lastSavedType;
+        updateValueLabel(lastSavedType);
+      }
     });
 
     valueEl.addEventListener('blur', async () => {
@@ -3334,7 +3377,7 @@ export function initBoard() {
         if (typeChanged) lastSavedType = typeEl.value;
         valueErrorEl.hidden = true;
         valueErrorEl.textContent = '';
-        previewEl.textContent = formatNextFire(resp.next_trigger_at);
+        previewEl.textContent = formatNextFire(resp.next_trigger_at, lastSavedType);
         if (typeChanged) {
           triggerBtnEl.textContent = lastSavedType === 'once' ? 'Trigger now (disables this one-off)' : 'Trigger now';
         }
@@ -3358,7 +3401,7 @@ export function initBoard() {
         lastSavedTz = value;
         tzErrorEl.hidden = true;
         tzErrorEl.textContent = '';
-        previewEl.textContent = formatNextFire(resp.next_trigger_at);
+        previewEl.textContent = formatNextFire(resp.next_trigger_at, lastSavedType);
         await fetchBoard();
       } catch (err) {
         tzErrorEl.textContent = err.message;

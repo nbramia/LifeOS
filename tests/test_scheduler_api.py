@@ -7,7 +7,7 @@ path is tested against a real store on a temp vault.
 """
 import pytest
 from datetime import datetime, timezone, timedelta
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock
 from zoneinfo import ZoneInfo
 
 pytestmark = pytest.mark.unit
@@ -560,6 +560,102 @@ class TestScheduleTypeConversionAgainstARealStore:
         assert after.next_trigger_at == before.next_trigger_at
         assert after.next_trigger_at is not None
 
+    def test_create_without_cron_or_at_is_a_manual_schedule(self, client, store):
+        with patch("api.routes.scheduler.get_scheduler_store", return_value=store):
+            resp = client.post("/api/scheduler", json={
+                "name": "Deploy runbook", "schedule_type": "manual",
+                "action": "notify", "message_content": "ship it",
+            })
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["schedule_type"] == "manual"
+        assert data["schedule_value"] == ""
+        assert data["next_trigger_at"] is None
+        created = store.get(data["id"])
+        assert created.enabled is True
+        assert created.next_trigger_at is None
+
+    def test_update_clears_cron_to_manual(self, client, store):
+        entry = store.create(
+            name="Weekly review", schedule_type="cron", schedule_value="0 9 * * 6",
+            action="notify", message_type="static", message_content="hi",
+        )
+        with patch("api.routes.scheduler.get_scheduler_store", return_value=store):
+            resp = client.put(f"/api/scheduler/{entry.id}", json={"schedule_type": "manual"})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["schedule_type"] == "manual"
+        assert data["schedule_value"] == ""
+        assert data["next_trigger_at"] is None
+        refreshed = store.get(entry.id)
+        assert refreshed.enabled is True
+
+
+class TestTriggerRoute:
+    """POST /api/scheduler/{id}/trigger against a real store — the same
+    `_fire_entry(manual=True)` path the board's Trigger-now button uses."""
+
+    @pytest.fixture
+    def client(self):
+        from fastapi.testclient import TestClient
+        from api.main import app
+        return TestClient(app)
+
+    @pytest.fixture
+    def store(self, tmp_path):
+        from api.services.scheduler_store import SchedulerStore
+        return SchedulerStore(vault_path=tmp_path / "vault", index_path=tmp_path / "idx.json")
+
+    @pytest.fixture(autouse=True)
+    def _isolated_scheduler_singleton(self, monkeypatch):
+        """`trigger_schedule` fires through the module-level scheduler
+        singleton (`get_scheduler()`), not a store the test controls
+        directly. Resetting it here — and patching the store-module's own
+        `get_scheduler_store` the singleton's lazy construction reads —
+        makes it build against this test's store on first use, and keeps
+        it from leaking into other tests once this one ends."""
+        import api.services.scheduler_store as scheduler_store_module
+        monkeypatch.setattr(scheduler_store_module, "_scheduler", None)
+
+    def test_manual_schedule_fires_and_stays_enabled_and_repeatable(self, client, store):
+        entry = store.create(
+            name="Deploy runbook", schedule_type="manual", schedule_value="",
+            action="notify", message_type="static", message_content="ship it",
+        )
+        with patch("api.routes.scheduler.get_scheduler_store", return_value=store), \
+             patch("api.services.scheduler_store.get_scheduler_store", return_value=store), \
+             patch("api.services.telegram.send_message_async",
+                   new_callable=AsyncMock, return_value=True) as mock_send:
+            resp = client.post(f"/api/scheduler/{entry.id}/trigger")
+            assert resp.status_code == 200
+            resp2 = client.post(f"/api/scheduler/{entry.id}/trigger")
+            assert resp2.status_code == 200
+        assert mock_send.call_count == 2
+        refreshed = store.get(entry.id)
+        assert refreshed.enabled is True
+        assert refreshed.next_trigger_at is None
+
+    def test_once_schedule_is_consumed_by_trigger(self, client, store):
+        future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        entry = store.create(
+            name="One-off", schedule_type="once", schedule_value=future,
+            action="notify", message_type="static", message_content="hi",
+        )
+        with patch("api.routes.scheduler.get_scheduler_store", return_value=store), \
+             patch("api.services.scheduler_store.get_scheduler_store", return_value=store), \
+             patch("api.services.telegram.send_message_async",
+                   new_callable=AsyncMock, return_value=True):
+            resp = client.post(f"/api/scheduler/{entry.id}/trigger")
+        assert resp.status_code == 200
+        refreshed = store.get(entry.id)
+        assert refreshed.enabled is False
+        assert refreshed.next_trigger_at is None
+
+    def test_unknown_id_returns_404(self, client, store):
+        with patch("api.routes.scheduler.get_scheduler_store", return_value=store):
+            resp = client.post("/api/scheduler/ghost/trigger")
+        assert resp.status_code == 404
+
 
 class TestListBots:
     @pytest.fixture
@@ -973,6 +1069,74 @@ class TestManageSchedulesAgentTool:
         with patch("api.services.scheduler_store.get_scheduler_store", return_value=store):
             out = agent_tools._tool_manage_schedules({
                 "action": "delete", "schedule_id": "ghost"})
+        assert "Error" in out and "ghost" in out
+
+    def test_create_manual_schedule_omits_trigger_fields(self, tmp_path):
+        """schedule_type/schedule_value are optional — omitting both creates
+        a manual (trigger-only) schedule."""
+        from api.services.scheduler_store import SchedulerStore
+        from api.services import agent_tools
+
+        store = SchedulerStore(vault_path=tmp_path / "vault",
+                               index_path=tmp_path / "idx.json")
+        with patch("api.services.scheduler_store.get_scheduler_store", return_value=store):
+            out = agent_tools._tool_manage_schedules({
+                "action": "create", "name": "Deploy runbook",
+                "schedule_action": "notify", "message_content": "ship it",
+            })
+        assert "Schedule created" in out
+        created = store.list_all()[0]
+        assert created.schedule_type == "manual"
+        assert created.next_trigger_at is None
+
+    def test_trigger_action_reaches_the_scheduler_and_fires_the_message(self, tmp_path, monkeypatch):
+        """manage_schedules action='trigger' reaches the real scheduler's
+        firing path — the same one the board's Trigger-now button and
+        lifeos_schedule_trigger (MCP) use."""
+        import api.services.scheduler_store as scheduler_store_module
+        from api.services.scheduler_store import SchedulerStore
+        from api.services import agent_tools
+
+        store = SchedulerStore(vault_path=tmp_path / "vault",
+                               index_path=tmp_path / "idx.json")
+        created = store.create(
+            name="Deploy runbook", schedule_type="manual", schedule_value="",
+            action="notify", message_type="static", message_content="ship it",
+        )
+        # The tool fires through the module-level scheduler singleton
+        # (get_scheduler()) rather than a store the caller controls
+        # directly — reset it so this test's patched store is what
+        # constructs it, and so the singleton doesn't leak into other
+        # tests once this one ends.
+        monkeypatch.setattr(scheduler_store_module, "_scheduler", None)
+        with patch("api.services.scheduler_store.get_scheduler_store", return_value=store), \
+             patch("api.services.telegram.send_message_async",
+                   new_callable=AsyncMock, return_value=True) as mock_send:
+            out = agent_tools._tool_manage_schedules({
+                "action": "trigger", "schedule_id": created.id,
+            })
+        assert "Schedule triggered" in out
+        mock_send.assert_called_once()
+        assert "ship it" in mock_send.call_args[0][0]
+        refreshed = store.get(created.id)
+        # A manual schedule stays enabled and repeatable after firing.
+        assert refreshed.enabled is True
+        assert refreshed.last_triggered_at is not None
+
+    def test_trigger_missing_id_errors(self, tmp_path):
+        from api.services import agent_tools
+        out = agent_tools._tool_manage_schedules({"action": "trigger"})
+        assert "Error" in out and "schedule_id" in out
+
+    def test_trigger_unknown_id_errors(self, tmp_path):
+        from api.services.scheduler_store import SchedulerStore
+        from api.services import agent_tools
+
+        store = SchedulerStore(vault_path=tmp_path / "vault",
+                               index_path=tmp_path / "idx.json")
+        with patch("api.services.scheduler_store.get_scheduler_store", return_value=store):
+            out = agent_tools._tool_manage_schedules({
+                "action": "trigger", "schedule_id": "ghost"})
         assert "Error" in out and "ghost" in out
 
     def test_manage_reminders_alias_still_works(self, tmp_path):

@@ -837,6 +837,120 @@ class TestAutoDisable:
         assert updated.last_triggered_at is not None
 
 
+class TestManualScheduleType:
+    """A manual schedule (no cron/at) never fires on its own and is fired
+    only via the trigger path — it stays enabled and repeatable."""
+
+    def test_parses_trigger_less_line_with_action_field(self):
+        line = "- [ ] Deploy runbook [action:: agent] [mtype:: prompt] #cloud <!-- id:m1a2b3 -->"
+        entry = _parse_entry_line(line)
+        assert entry is not None
+        assert entry.schedule_type == "manual"
+        assert entry.schedule_value == ""
+        assert entry.action == "agent"
+        assert entry.executor == "cloud"
+
+    def test_format_emits_no_trigger_field(self):
+        entry = ScheduleEntry(
+            id="m1", name="Deploy runbook", schedule_type="manual", schedule_value="",
+            action="agent", message_type="prompt", executor="cloud",
+            created_at="2026-05-28T12:00:00+00:00",
+        )
+        line = _format_entry_line(entry)
+        assert "[cron::" not in line
+        assert "[at::" not in line
+        reparsed = _parse_entry_line(line)
+        assert reparsed.schedule_type == "manual"
+        assert _format_entry_line(reparsed) == line
+
+    def test_create_via_store_has_no_next_fire(self, store):
+        entry = store.create(
+            name="Deploy runbook", schedule_type="manual", schedule_value="",
+            action="notify", message_type="static", message_content="go",
+        )
+        assert entry.schedule_type == "manual"
+        assert entry.next_trigger_at is None
+        assert entry.enabled is True
+
+    def test_update_clears_cron_to_manual(self, store):
+        entry = store.create(
+            name="Weekly review", schedule_type="cron", schedule_value="0 9 * * 6",
+            action="notify", message_type="static", message_content="go",
+        )
+        assert entry.next_trigger_at is not None
+        updated = store.update(entry.id, schedule_type="manual", schedule_value="")
+        assert updated.schedule_type == "manual"
+        assert updated.next_trigger_at is None
+        assert updated.enabled is True
+        # The markdown line no longer carries a trigger field either.
+        line = next(
+            ln for ln in store._read_inbox_lines() if f"id:{entry.id}" in ln
+        )
+        assert "[cron::" not in line
+        assert "[at::" not in line
+
+    def test_tick_skips_manual(self, store):
+        store.create(
+            name="Deploy runbook", schedule_type="manual", schedule_value="",
+            action="notify", message_type="static", message_content="go",
+        )
+        assert store.get_due_reminders() == []
+
+    def test_rebuild_index_skips_manual_without_error(self, store):
+        store.create(
+            name="Deploy runbook", schedule_type="manual", schedule_value="",
+            action="notify", message_type="static", message_content="go",
+        )
+        store.rebuild_index()
+        entries = store.list_all()
+        assert len(entries) == 1
+        assert entries[0].schedule_type == "manual"
+        assert entries[0].next_trigger_at is None
+
+    @pytest.mark.asyncio
+    async def test_trigger_fires_and_stays_enabled_and_repeatable(self, store):
+        entry = store.create(
+            name="Deploy runbook", schedule_type="manual", schedule_value="",
+            action="notify", message_type="static", message_content="ship it",
+        )
+        scheduler = SchedulerScheduler(store)
+        with patch("api.services.telegram.send_message_async",
+                   new_callable=AsyncMock, return_value=True) as mock_send:
+            await scheduler._fire_entry(entry, manual=True)
+        refreshed = store.get(entry.id)
+        assert refreshed.enabled is True
+        assert refreshed.next_trigger_at is None
+        assert refreshed.last_triggered_at is not None
+        assert mock_send.call_count == 1
+
+        # Triggering again fires a second time — a manual schedule is never
+        # consumed the way a `once` schedule is.
+        with patch("api.services.telegram.send_message_async",
+                   new_callable=AsyncMock, return_value=True) as mock_send2:
+            await scheduler._fire_entry(refreshed, manual=True)
+        refreshed_again = store.get(entry.id)
+        assert refreshed_again.enabled is True
+        assert mock_send2.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_once_schedule_is_still_consumed_by_trigger(self, store):
+        """Existing behavior preserved: triggering a `once` schedule still
+        disables it and clears its next fire, exactly like an unattended
+        fire would."""
+        future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        entry = store.create(
+            name="One-off", schedule_type="once", schedule_value=future,
+            action="notify", message_type="static", message_content="hi",
+        )
+        scheduler = SchedulerScheduler(store)
+        with patch("api.services.telegram.send_message_async",
+                   new_callable=AsyncMock, return_value=True):
+            await scheduler._fire_entry(entry, manual=True)
+        refreshed = store.get(entry.id)
+        assert refreshed.enabled is False
+        assert refreshed.next_trigger_at is None
+
+
 class TestDashboard:
     def test_dashboard_has_three_sections(self, store):
         store.create(name="Recurring one", schedule_type="cron", schedule_value="0 9 * * *",
