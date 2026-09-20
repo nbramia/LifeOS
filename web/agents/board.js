@@ -29,6 +29,7 @@ import { SCHEDULE_ACTIONS, renderScheduleActionSections, actionInputsSatisfied }
 import { LANES, laneColor } from './lanes.js';
 import { routingFilterValue } from './graph_encoding.js';
 import { POINTER_SLOP, pointerCanDrag, pointerIsActive, shouldCancelPointerGesture } from './board_gesture.js';
+import { assignChipHues } from './chip_colors.js';
 import {
   compareSortValues, loadSortSelection as readSortSelection,
   saveSortSelection as writeSortSelection, sortCards,
@@ -160,6 +161,12 @@ export function initBoard() {
   const bulkClearBtn = document.getElementById('board-bulk-clear');
 
   let board = { lanes: Object.fromEntries(LANES.map(l => [l.id, []])) };
+  // Assignee/tag pill colors — assignees first (their fixed order), then
+  // every other distinct tag currently on the board, alphabetically.
+  // Recomputed by `render()` on every pass; the drawer's tag-chip picker
+  // (`mountTagPicker`'s `renderChips`) recomputes its own copy on demand
+  // since it can render without a board `render()` having just run.
+  let chipHueMap = new Map();
   let visibleLanes = new Set(getFilters().lanes);
   let sortMode = loadSortSelection();
   if (sortFilterEl) sortFilterEl.value = sortMode;
@@ -773,6 +780,29 @@ export function initBoard() {
   // Rendering
   // ------------------------------------------------------------------
 
+  // Every distinct tag currently on the board, lowercased, excluding
+  // whichever of ASSIGNEES appear as tags too (those render as the
+  // assignee chip instead — see the tag loop in `cardChips` below).
+  function boardTagNames() {
+    const tags = new Set();
+    for (const card of allCards()) {
+      for (const raw of (card.tags || [])) {
+        const lower = String(raw).toLowerCase();
+        if (!ASSIGNEES.includes(lower)) tags.add(lower);
+      }
+    }
+    return Array.from(tags).sort();
+  }
+
+  function computeChipHueMap() {
+    return assignChipHues([...ASSIGNEES, ...boardTagNames()]);
+  }
+
+  function chipHueStyle(name) {
+    const hue = chipHueMap.get(String(name).toLowerCase());
+    return hue != null ? ` style="--chip-hue:${hue}"` : '';
+  }
+
   function cardChips(card) {
     const chips = [];
     // Snoozed cards show their wake-up time first — the one thing that
@@ -784,7 +814,7 @@ export function initBoard() {
         chips.push(`<span class="board-chip board-chip-snoozed" title="wakes ${escapeAttr(wake.exact)}">⏰ ${escapeHtml(wake.label)}</span>`);
       }
     }
-    if (card.assignee) chips.push(`<span class="board-chip board-chip-assignee">${escapeHtml(card.assignee)}</span>`);
+    if (card.assignee) chips.push(`<span class="board-chip board-chip-assignee"${chipHueStyle(card.assignee)}>${escapeHtml(card.assignee)}</span>`);
     if (card.fields && card.fields.model) chips.push(`<span class="board-chip">${escapeHtml(card.fields.model)}</span>`);
     if (card.fields && card.fields.effort) chips.push(`<span class="board-chip">${escapeHtml(card.fields.effort)}</span>`);
     // Assignment chip: fields.host is where the card WILL run,
@@ -817,11 +847,29 @@ export function initBoard() {
     if (card.session) {
       chips.push(`<span class="board-chip board-chip-session" data-session-id="${escapeHtml(card.session.session_id)}" title="Open in graph">↗ session</span>`);
     }
+    // Clickable — `renderTaskCard` wires each one to toggle the shared
+    // `tag` filter to exactly this tag (see `applyTagFilterFrom` below);
+    // `active` marks whichever chip(s) equal the currently active filter,
+    // using the same case-insensitive, `#`-stripped comparison
+    // `cardMatchesFilters` uses, so a second click reads as "un-apply".
+    const activeTagFilter = (getFilters().tag || '').trim().toLowerCase().replace(/^#/, '');
     for (const t of (card.tags || [])) {
-      if (ASSIGNEES.includes(t.toLowerCase())) continue;  // already shown as the assignee chip
-      chips.push(`<span class="board-chip board-chip-tag">#${escapeHtml(t)}</span>`);
+      const lower = t.toLowerCase();
+      if (ASSIGNEES.includes(lower)) continue;  // already shown as the assignee chip
+      const active = !!activeTagFilter && lower === activeTagFilter;
+      chips.push(`<span class="board-chip board-chip-tag${active ? ' active' : ''}" data-tag="${escapeAttr(t)}"${chipHueStyle(t)}>#${escapeHtml(t)}</span>`);
     }
     return chips.join('');
+  }
+
+  // Shared by the tag chip's click handler (`renderTaskCard`) — toggles
+  // the board's shared `tag` filter to exactly `tag`, or clears it when
+  // `tag` is already the active filter (same normalization as
+  // `cardMatchesFilters`'s tag match, above).
+  function applyTagFilterFrom(tag) {
+    const current = (getFilters().tag || '').trim().toLowerCase().replace(/^#/, '');
+    const normalized = String(tag).toLowerCase().replace(/^#/, '');
+    setFilter('tag', current === normalized ? '' : tag);
   }
 
   // A pull request's compact open/merged/closed label for the card-face
@@ -909,6 +957,12 @@ export function initBoard() {
         activateTab('graph');
       });
     }
+    div.querySelectorAll('.board-chip-tag').forEach(tagChip => {
+      tagChip.addEventListener('click', (e) => {
+        e.stopPropagation();
+        applyTagFilterFrom(tagChip.dataset.tag);
+      });
+    });
     div.addEventListener('pointerdown', (e) => onPointerDown(e, {
       kind: 'card', card, sourceEl: div,
     }));
@@ -973,6 +1027,7 @@ export function initBoard() {
   }
 
   function render() {
+    chipHueMap = computeChipHueMap();
     lanesEl.innerHTML = '';
     if (visibleLanes.size === 0) {
       const hint = document.createElement('div');
@@ -1188,11 +1243,12 @@ export function initBoard() {
     // card's own listener untouched.
     if (source.kind === 'card' && (e.metaKey || e.ctrlKey)) return;
     if (e.target.closest('button, input, select, textarea, a') && source.kind === 'card') return;
-    // A session chip has its own click navigation. Do not let the card's
-    // drag handler capture that pointer on the card, or the browser retargets
-    // the trailing pointerup/click to the card and opens its drawer instead
-    // of running the chip's graph jump.
-    if (source.kind === 'card' && e.target.closest('.board-chip-session')) return;
+    // A session chip has its own click navigation, and a tag chip its own
+    // filter toggle. Do not let the card's drag handler capture that
+    // pointer on the card, or the browser retargets the trailing
+    // pointerup/click to the card and opens its drawer instead of running
+    // the chip's own handler.
+    if (source.kind === 'card' && e.target.closest('.board-chip-session, .board-chip-tag')) return;
     const state = {
       ...source, sourceEl: source.sourceEl || e.currentTarget,
       pointerId: e.pointerId,
@@ -2288,13 +2344,21 @@ export function initBoard() {
     options.addEventListener('pointerdown', markPointerDownInsidePicker);
 
     function renderChips() {
-      chips.innerHTML = selected.map(tag => `
-        <span class="drawer-tag-chip" data-tag="${escapeHtml(tag)}">
+      // Computed fresh rather than read off the outer `chipHueMap` — this
+      // picker can render (e.g. a new-card composer) without a board
+      // `render()` having just run to populate it.
+      const hues = computeChipHueMap();
+      chips.innerHTML = selected.map(tag => {
+        const hue = hues.get(tag.toLowerCase());
+        const style = hue != null ? ` style="--chip-hue:${hue}"` : '';
+        return `
+        <span class="drawer-tag-chip" data-tag="${escapeHtml(tag)}"${style}>
           <span>#${escapeHtml(tag)}</span>
           <button type="button" class="drawer-tag-chip-remove" data-remove-tag="${escapeHtml(tag)}"
                   aria-label="Remove tag ${escapeHtml(tag)}">×</button>
         </span>
-      `).join('');
+      `;
+      }).join('');
       chips.querySelectorAll('[data-remove-tag]').forEach(button => {
         button.addEventListener('click', () => removeTag(button.dataset.removeTag));
       });

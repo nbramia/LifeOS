@@ -2332,6 +2332,60 @@ class TestFilters:
         assert not page.evaluate("() => document.body.classList.contains('board-dragging')")
 
 
+class TestTagChipClickFilter:
+    """Clicking a `.board-chip-tag` on a card toggles the shared `tag`
+    filter to exactly that tag (board.js's `applyTagFilterFrom`) — the same
+    store `#board-filter-tag` writes to (linking.js) — and never opens the
+    card's drawer. Each pill (assignee and tag) also carries its own
+    `--chip-hue` custom property, spread evenly across the hue wheel by
+    web/agents/chip_colors.js."""
+
+    def _board_with_synthetic_tags(self):
+        board_state = copy.deepcopy(_board_fixture())
+        for cards in board_state["lanes"].values():
+            for card in cards:
+                if card.get("id") == "t1":
+                    card["tags"] = ["synthetic-widget"]
+                elif card.get("id") == "t2":
+                    card["tags"] = ["me", "synthetic-gadget"]
+        return board_state
+
+    def test_click_sets_shared_tag_filter_and_hides_non_matching_cards(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url, board_state=self._board_with_synthetic_tags())
+        page.locator('[data-card-id="t1"] .board-chip-tag').click()
+        expect(page.locator("#board-filter-tag")).to_have_value("synthetic-widget")
+        expect(page.locator('[data-card-id="t1"]')).to_be_visible()
+        expect(page.locator('[data-card-id="t2"]')).to_have_count(0)
+
+    def test_click_same_chip_again_clears_the_filter(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url, board_state=self._board_with_synthetic_tags())
+        page.locator('[data-card-id="t1"] .board-chip-tag').click()
+        expect(page.locator("#board-filter-tag")).to_have_value("synthetic-widget")
+        page.locator('[data-card-id="t1"] .board-chip-tag').click()
+        expect(page.locator("#board-filter-tag")).to_have_value("")
+        expect(page.locator('[data-card-id="t1"]')).to_be_visible()
+        expect(page.locator('[data-card-id="t2"]')).to_be_visible()
+
+    def test_click_does_not_open_the_drawer(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url, board_state=self._board_with_synthetic_tags())
+        page.locator('[data-card-id="t1"] .board-chip-tag').click()
+        expect(page.locator("#board-filter-tag")).to_have_value("synthetic-widget")
+        expect(page.locator("#board-drawer-backdrop")).to_be_hidden()
+
+    def test_tag_and_assignee_chips_get_distinct_hues(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url, board_state=self._board_with_synthetic_tags())
+
+        def chip_hue(locator):
+            return locator.evaluate("el => el.style.getPropertyValue('--chip-hue').trim()")
+
+        hue_t1_tag = chip_hue(page.locator('[data-card-id="t1"] .board-chip-tag'))
+        hue_t2_tag = chip_hue(page.locator('[data-card-id="t2"] .board-chip-tag'))
+        hue_t2_assignee = chip_hue(page.locator('[data-card-id="t2"] .board-chip-assignee'))
+        assert hue_t1_tag and hue_t2_tag and hue_t2_assignee
+        assert hue_t1_tag != hue_t2_tag, "two cards with different tags should get different hues"
+        assert hue_t2_tag != hue_t2_assignee, "a tag chip's hue should differ from an assignee chip's"
+
+
 class TestHostAssignmentChipAndFilter:
     """fields.host (the assignment — where a card WILL run, written by the
     drawer's host dropdown) is surfaced as its own chip on the card face,
