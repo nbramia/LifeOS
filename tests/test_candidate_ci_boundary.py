@@ -599,7 +599,7 @@ def _reuse_step_run() -> str:
 @pytest.mark.unit
 def test_reuse_step_reads_the_second_parent_from_commit_headers_not_the_message(tmp_path):
     """The candidate is a two-parent commit whose message carries
-    candidate-authored text (the PR title, closing references). The head the
+    candidate-authored text: its title line and closing references. The head the
     reuse step fetches must come from the commit's header lines, so a message
     line that happens to start with `parent <hex>` can never redirect it."""
     origin = tmp_path / "origin"
