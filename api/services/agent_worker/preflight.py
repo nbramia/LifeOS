@@ -1271,17 +1271,46 @@ def _apply_default_route(result: PreflightResult, original_routing: str) -> Pref
     return result
 
 
-def _apply_preset_class(result: PreflightResult, tags: list[str]) -> PreflightResult:
-    """Set `result.preset_class` from an explicit `#<class>` tag if present.
+def _apply_preset_class(result: PreflightResult, tags: list[str], title: str = "") -> PreflightResult:
+    """Set `result.preset_class` from an explicit `#<class>` tag if present;
+    else from the Jev fan-out judgment (`jev_task_routing.judge_task`) when
+    it clears two guards; else leave it unset (today's default — the
+    worker treats an unset `preset_class` as `fullstack`, no tool
+    filtering).
 
-    LLM-side preset_class emission is a follow-up; this lets operators
-    force a class today via tag while the rest of §3 wiring lands.
+    A tag override always wins outright — checked before even a pre-set
+    `result.preset_class` (an LLM/caller value; no classifier emits one
+    today, but the precedence holds regardless) — and over the Jev
+    judgment. A wrong narrow class is worse than the unfiltered default,
+    since it removes tools from the session — so the Jev class is only
+    honored when BOTH: `preset_class.confidence >= 0.7`, AND
+    `software_work.noul < 0.5` (a task the judgment itself flags as likely
+    software work always keeps the full toolset, no matter how confident
+    the class choice is). Either guard failing, no Jev judgment at all (no
+    TypeSafe key, or the call failed), or a missing `software_work`
+    answer, leaves `preset_class` unset — the same today's-default
+    behavior as a task with no explicit class tag.
     """
-    if result.preset_class:  # honor an LLM/caller pre-set value
-        return result
     forced = _detect_preset_class_from_tags(tags)
     if forced:
         result.preset_class = forced
+        return result
+    if result.preset_class:  # honor an LLM/caller pre-set value
+        return result
+
+    from api.services.jev_task_routing import judge_task
+
+    judgment = judge_task(title)
+    if judgment is not None and judgment.preset_class is not None:
+        answer = judgment.preset_class
+        software = judgment.software_work
+        likely_software = (
+            software is not None
+            and software.noul is not None
+            and software.noul >= 0.5
+        )
+        if answer.confidence >= 0.7 and answer.choice and not likely_software:
+            result.preset_class = answer.choice
     return result
 
 
@@ -1474,7 +1503,7 @@ def _finish(result: PreflightResult, tags_list: list[str], title: str = "") -> P
     result = _apply_tag_overrides(result, tags_list, title)
     result = _apply_route_corroboration(result, original_routing, title, tags_list)
     result = _apply_default_route(result, original_routing)
-    result = _apply_preset_class(result, tags_list)
+    result = _apply_preset_class(result, tags_list, title)
     result = _apply_cost_gates(result)
     return result
 

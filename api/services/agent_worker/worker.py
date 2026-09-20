@@ -4610,8 +4610,29 @@ class Worker:
         # Freeze the execution target before the first executor side effect.
         # Preflight supplies route/budget/working-directory defaults; board
         # model pins are scoped to that resolved route and cannot leak across
-        # a later explicit engine override.
+        # a later explicit engine override. `_resolve_session_execution`
+        # persists this resolution write-once (`set_execution_snapshot`'s
+        # `execution_spec_json IS NULL` guard) — every downstream read of
+        # `session.execution_spec` for this task sees exactly this
+        # `working_dir`, so any host-aware adjustment has to happen in this
+        # one call, not after the fact.
         from api.services.directory_resolver import resolve_working_directory
+        from api.services.agent_worker.remote_spawn import (
+            api_host_name as _api_host_name,
+            is_local_host,
+        )
+        # A CLI route (#claude/#codex) dispatched to a remote
+        # LIFEOS_AGENT_HOSTS host can't be cloned into from this process,
+        # and there's no evidence an uncloned GitHub-only repo exists on
+        # that other machine either — the resolver falls back to the
+        # keyword cascade for that case instead (see
+        # `resolve_working_directory`'s `allow_uncloned`). Every other
+        # route runs in-process on this host regardless of `session.host`,
+        # so it keeps today's behavior.
+        is_remote_cli_spawn = (
+            pre.routing in (ROUTE_CLAUDE_CODE, ROUTE_CODEX)
+            and not is_local_host(session.host, _api_host_name())
+        )
         execution = self._resolve_session_execution(
             session,
             request=ExecutionRequest(),
@@ -4623,7 +4644,7 @@ class Worker:
                 # directory in task fields; otherwise retain the legacy
                 # description-based resolver.
                 working_dir=(task.get("fields") or {}).get("working_dir")
-                or resolve_working_directory(title),
+                or resolve_working_directory(title, allow_uncloned=not is_remote_cli_spawn),
             ),
         )
         if not execution.ok:
@@ -4748,6 +4769,54 @@ class Worker:
         # top-level #agent task gets the identical off-tick treatment.
         if session.routing in (ROUTE_CLAUDE_CODE, ROUTE_CODEX):
             working_dir = execution.spec.working_dir or resolve_working_directory(title)
+
+            # Clone-on-demand: a Jev-chosen (or keyword-chosen) working
+            # directory may name a repository the operator owns but that
+            # isn't checked out on this host yet. Only attempted when this
+            # process is itself the executing host — a remote spawn
+            # (LIFEOS_AGENT_HOSTS) never reaches this point with an
+            # uncloned GitHub-only path in the first place: the earlier
+            # `resolve_working_directory(title, allow_uncloned=...)` call
+            # that froze `execution.spec.working_dir` already excluded
+            # that case for a remote-bound CLI route.
+            from pathlib import Path
+
+            from api.services.agent_worker.remote_spawn import (
+                api_host_name as _api_host_name,
+                is_local_host,
+            )
+            code_root = Path(settings.code_dir).expanduser().resolve()
+            under_code_dir = False
+            if working_dir:
+                try:
+                    under_code_dir = Path(working_dir).resolve().is_relative_to(code_root)
+                except (OSError, RuntimeError, ValueError):
+                    under_code_dir = False
+
+            if (
+                under_code_dir
+                and not os.path.isdir(working_dir)
+                and is_local_host(session.host, _api_host_name())
+            ):
+                from api.services.directory_resolver import ensure_cloned
+
+                if not ensure_cloned(working_dir):
+                    repo_name = Path(working_dir).name
+                    self._swap_tag(task_id, RUNNING_TAG, BLOCKED_TAG)
+                    self._set_task_status(task_id, "blocked")
+                    self.session_store.update_status(
+                        task_id, STATUS_BLOCKED,
+                        attempt_id=session.attempt_id, turn_id=session.turn_id,
+                    )
+                    self.transcript_store.append(sid, "clone_failed", {"repository": repo_name})
+                    self._notify(
+                        f"⏸ {_worker_label(session.routing)}: task '{title}' needs "
+                        f"repository '{repo_name}', which isn't cloned on this host "
+                        f"and couldn't be cloned automatically. Clone it manually "
+                        f"under {code_root}, then re-tag with an engine assignee to retry."
+                    )
+                    return
+
             if session.claude_code_session_id:
                 # A compatible reassignment keeps the native CLI thread. Do
                 # not feed the JSON fresh-spawn envelope to resume(); pass a

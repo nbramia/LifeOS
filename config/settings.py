@@ -655,6 +655,11 @@ class Settings(BaseSettings):
         separate URL/model to wire up."""
         return bool(self.typesafe_api_key)
 
+    # GitHub login whose repos `directory_resolver._github_repos()` lists as
+    # working-directory candidates. Empty (default) resolves it from
+    # `gh api user -q .login` instead, caching the result on disk.
+    github_owner: str = Field(default="", alias="LIFEOS_GITHUB_OWNER")
+
     # Lets the agent worker's `local` route fall back to the remote
     # OpenAI-compatible provider above when the local llama-server isn't
     # reachable. Exists for a real deployment with NO other #agent executor
