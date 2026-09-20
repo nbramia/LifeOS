@@ -24,6 +24,7 @@ from api.services.agent_worker.execution import (
     CatalogState,
     ExecutionFacts,
     ExecutionRequest,
+    ExecutionSpec,
     ExecutorFacts,
     ReadinessState,
 )
@@ -2826,7 +2827,7 @@ def test_clone_on_demand_parks_when_clone_fails(tmp_path: Path, monkeypatch):
     missing_repo = _os.path.join(code_dir, "MissingRepo")
 
     import api.services.directory_resolver as dr
-    monkeypatch.setattr(dr, "resolve_working_directory", lambda title: missing_repo)
+    monkeypatch.setattr(dr, "resolve_working_directory", lambda title, allow_uncloned=True: missing_repo)
     monkeypatch.setattr(dr, "ensure_cloned", lambda path: False)
 
     calls: list = []
@@ -2874,7 +2875,7 @@ def test_clone_on_demand_skipped_for_remote_host(tmp_path: Path, monkeypatch):
     missing_repo = _os.path.join(code_dir, "MissingRepo")
 
     import api.services.directory_resolver as dr
-    monkeypatch.setattr(dr, "resolve_working_directory", lambda title: missing_repo)
+    monkeypatch.setattr(dr, "resolve_working_directory", lambda title, allow_uncloned=True: missing_repo)
 
     def _fail_if_called(path):
         raise AssertionError("ensure_cloned must not run for a remote-host spawn")
@@ -2900,3 +2901,53 @@ def test_clone_on_demand_skipped_for_remote_host(tmp_path: Path, monkeypatch):
     # clone guard didn't block the dispatch before reaching that point.
     assert BLOCKED_TAG not in api.tasks["t1"]["tags"]
     assert len(pool.submitted) == 1
+
+
+@pytest.mark.unit
+def test_remote_cli_spawn_falls_back_to_keyword_cascade_for_uncloned_repo(tmp_path: Path, monkeypatch):
+    """A remote-host CLI spawn whose Jev-judged location is a GitHub-only
+    repo (no local directory) must resolve to the keyword-cascade result
+    instead — this process can neither clone into the remote host nor
+    confirm the repo exists there. Exercises the real
+    `resolve_working_directory`, not a stub, so it proves the
+    `allow_uncloned` plumbing through `_resolve_session_execution`'s
+    write-once persisted spec, not just the clone-on-demand block."""
+    import os as _os
+
+    from config.settings import settings as _settings
+    monkeypatch.setattr(_settings, "agent_hosts", {"studio": "user@studio"}, raising=False)
+
+    import api.services.directory_resolver as dr
+    from api.services.jev_task_routing import JevAnswer, TaskJudgment
+    monkeypatch.setattr(dr, "_location_options", lambda: [
+        ("widget", "an uncloned repo", "/code/Widget"),
+    ])
+    monkeypatch.setattr(
+        "api.services.jev_task_routing.judge_task",
+        lambda title: TaskJudgment(
+            location=JevAnswer(choice="widget", confidence=0.9),
+            difficulty=None, preset_class=None, software_work=None,
+        ),
+    )
+
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "do something random", "status": "in_progress",
+         "tags": [RUNNING_TAG, "claude"], "fields": {"host": "studio"}},
+    ])
+    pool = _CapturingPool()
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="claude"),
+                     local_executor=None,
+                     claude_code_executor=None,
+                     cli_pool=pool)
+    w.session_store.create(task_id="t1", status=STATUS_CLAIMED)
+    w._dispatch(api.tasks["t1"])
+
+    refreshed = w.session_store.get("t1")
+    spec = ExecutionSpec.from_dict(refreshed.execution_spec)
+    # "do something random" matches no keyword cascade phrase, so the
+    # cascade's own default (home) is the expected fallback — proving the
+    # Jev-chosen "/code/Widget" (which doesn't exist on this host) was
+    # rejected, not silently substituted for something else Jev-flavored.
+    assert spec.working_dir == _os.path.expanduser("~")
+    assert BLOCKED_TAG not in api.tasks["t1"]["tags"]

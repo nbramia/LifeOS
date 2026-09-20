@@ -2092,6 +2092,20 @@ def test_preset_class_tag_wins_over_jev_judgment(monkeypatch):
 
 
 @pytest.mark.unit
+def test_preset_class_tag_wins_over_a_pre_populated_result_value():
+    """An explicit class tag beats even an already-populated
+    `result.preset_class` (an LLM/caller pre-set value; no classifier
+    emits one today, but the precedence must hold regardless) — the tag
+    check runs before that early-return, not after it."""
+    result = pf.PreflightResult(
+        budget=pf._defaults(), routing=pf.ROUTE_CLAUDE, routing_reason="test",
+        expected_output="text", preset_class="financial",
+    )
+    result = pf._apply_preset_class(result, tags=["agent", "crm"], title="any task")
+    assert result.preset_class == "crm"
+
+
+@pytest.mark.unit
 def test_preset_class_jev_accepts_confident_non_software_class(monkeypatch):
     """No tag; a Jev judgment at or above the 0.7 confidence floor, on a
     task the judgment itself doesn't flag as software work, sets

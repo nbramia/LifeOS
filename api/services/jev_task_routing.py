@@ -15,13 +15,23 @@ class name on failure.
 """
 from __future__ import annotations
 
-import functools
 import logging
+import math
+from collections import OrderedDict
 from dataclasses import dataclass
 
 from api.services.jev_client import JevClient, JevError, jev_configured
 
 logger = logging.getLogger(__name__)
+
+# Per-title cache of successful judgments only — a title Jev failed to
+# judge (unconfigured, rate-limited, transport error) is never memoized,
+# so a later call for the same title gets a fresh attempt instead of being
+# stuck replaying the earlier failure for the rest of the process's life.
+# A plain `functools.lru_cache` can't express that (it caches every return
+# value, `None` included), hence this small hand-rolled LRU.
+_JUDGE_CACHE_MAXSIZE = 256
+_judge_cache: "OrderedDict[str, TaskJudgment]" = OrderedDict()
 
 # Score question criteria: five difficulty levels, in ascending order so a
 # returned score can be compared numerically.
@@ -80,19 +90,57 @@ def _location_criteria() -> dict[str, str]:
     return {name: description for name, description, _path in _location_options()}
 
 
+def _valid_choice(value: object) -> str | None:
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def _valid_number(value: object, *, lo: float | None = None, hi: float | None = None) -> float | None:
+    """`value` as a finite float within `[lo, hi]`, or `None` — never
+    raises. `bool` is deliberately excluded even though it's an `int`
+    subclass (`float(True) == 1.0` would otherwise silently pass as a
+    score/probability)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if not math.isfinite(number):
+        return None
+    if lo is not None and number < lo:
+        return None
+    if hi is not None and number > hi:
+        return None
+    return number
+
+
 def _parse_answer(raw: object) -> JevAnswer | None:
+    """Validates every field independently — an invalid field becomes
+    `None` on the resulting `JevAnswer`, never an exception. Consumers
+    already treat a `None` field as "no judgment for this field" the same
+    way they treat `judge_task` returning `None` outright."""
     if not isinstance(raw, dict):
         return None
-    confidence = raw.get("confidence")
+    confidence = _valid_number(raw.get("confidence"), lo=0.0, hi=1.0)
     return JevAnswer(
-        choice=raw.get("choice"),
-        score=raw.get("score"),
-        noul=raw.get("noul"),
-        confidence=float(confidence) if confidence is not None else 0.0,
+        choice=_valid_choice(raw.get("choice")),
+        score=_valid_number(raw.get("score")),
+        noul=_valid_number(raw.get("noul"), lo=0.0, hi=1.0),
+        confidence=confidence if confidence is not None else 0.0,
     )
 
 
-@functools.lru_cache(maxsize=256)
+def _cache_get(title: str) -> TaskJudgment | None:
+    judgment = _judge_cache.get(title)
+    if judgment is not None:
+        _judge_cache.move_to_end(title)
+    return judgment
+
+
+def _cache_put(title: str, judgment: TaskJudgment) -> None:
+    _judge_cache[title] = judgment
+    _judge_cache.move_to_end(title)
+    while len(_judge_cache) > _JUDGE_CACHE_MAXSIZE:
+        _judge_cache.popitem(last=False)
+
+
 def judge_task(title: str) -> TaskJudgment | None:
     """Ask Jev about `title`: which project/vault area it belongs to, how
     difficult it is, which preset class fits, and whether it's software
@@ -101,10 +149,15 @@ def judge_task(title: str) -> TaskJudgment | None:
     keyword/tag behavior in that case, so no dispatch ever fails because of
     this judgment.
 
-    Memoized per exact title (`functools.lru_cache`) so the several callers
-    that judge the same task title in one dispatch — working-directory
-    resolution, plan-mode, and preset-class — share a single Jev call.
+    Memoized per exact title so the several callers that judge the same
+    task title in one dispatch — working-directory resolution, plan-mode,
+    and preset-class — share a single Jev call. Only a successful judgment
+    is cached; a failed call is never memoized, so a later call for the
+    same title gets a fresh attempt rather than replaying the failure.
     """
+    cached = _cache_get(title)
+    if cached is not None:
+        return cached
     if not jev_configured():
         return None
     try:
@@ -132,6 +185,12 @@ def judge_task(title: str) -> TaskJudgment | None:
                 },
             },
         )
+        judgment = TaskJudgment(
+            location=_parse_answer(answers.get("location")),
+            difficulty=_parse_answer(answers.get("difficulty")),
+            preset_class=_parse_answer(answers.get("preset_class")),
+            software_work=_parse_answer(answers.get("software_work")),
+        )
     except JevError as exc:
         logger.warning("Jev task-routing judgment failed: %s", type(exc).__name__)
         return None
@@ -139,9 +198,5 @@ def judge_task(title: str) -> TaskJudgment | None:
         logger.warning("Jev task-routing judgment failed unexpectedly: %s", type(exc).__name__)
         return None
 
-    return TaskJudgment(
-        location=_parse_answer(answers.get("location")),
-        difficulty=_parse_answer(answers.get("difficulty")),
-        preset_class=_parse_answer(answers.get("preset_class")),
-        software_work=_parse_answer(answers.get("software_work")),
-    )
+    _cache_put(title, judgment)
+    return judgment

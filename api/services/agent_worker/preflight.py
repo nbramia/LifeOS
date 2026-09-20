@@ -1278,22 +1278,24 @@ def _apply_preset_class(result: PreflightResult, tags: list[str], title: str = "
     worker treats an unset `preset_class` as `fullstack`, no tool
     filtering).
 
-    A tag override always wins over the Jev judgment. A wrong narrow class
-    is worse than the unfiltered default, since it removes tools from the
-    session — so the Jev class is only honored when BOTH:
-    `preset_class.confidence >= 0.7`, AND `software_work.noul < 0.5` (a
-    task the judgment itself flags as likely software work always keeps
-    the full toolset, no matter how confident the class choice is).
-    Either guard failing, no Jev judgment at all (no TypeSafe key, or the
-    call failed), or a missing `software_work` answer, leaves
-    `preset_class` unset — the same today's-default behavior as a task
-    with no explicit class tag.
+    A tag override always wins outright — checked before even a pre-set
+    `result.preset_class` (an LLM/caller value; no classifier emits one
+    today, but the precedence holds regardless) — and over the Jev
+    judgment. A wrong narrow class is worse than the unfiltered default,
+    since it removes tools from the session — so the Jev class is only
+    honored when BOTH: `preset_class.confidence >= 0.7`, AND
+    `software_work.noul < 0.5` (a task the judgment itself flags as likely
+    software work always keeps the full toolset, no matter how confident
+    the class choice is). Either guard failing, no Jev judgment at all (no
+    TypeSafe key, or the call failed), or a missing `software_work`
+    answer, leaves `preset_class` unset — the same today's-default
+    behavior as a task with no explicit class tag.
     """
-    if result.preset_class:  # honor an LLM/caller pre-set value
-        return result
     forced = _detect_preset_class_from_tags(tags)
     if forced:
         result.preset_class = forced
+        return result
+    if result.preset_class:  # honor an LLM/caller pre-set value
         return result
 
     from api.services.jev_task_routing import judge_task
