@@ -130,8 +130,26 @@ checkout/pre-push audit continues to run read-only whenever the `.env` exists.
 The publisher job is separate from candidate execution. It receives
 `checks: write`, does not check out candidate files or consume candidate
 artifacts, and reports the result for the event's exact candidate SHA. A
-missing, cancelled, or failed execution maps to a failed aggregate result; no
-docs-only path skips the aggregate job.
+missing, cancelled, or failed execution maps to a failed aggregate result.
+
+Success is an explicit outcome, never the absence of a job. Before any
+environment is built, the execution job classifies the changed set with
+`scripts/candidate_lanes.py` from the *runner's* checkout and records a
+verification mode as a job output:
+
+| Mode | When | What runs |
+|------|------|-----------|
+| `executed` | Any change outside the docs-only rule | `fast-unit`, plus `browser-free` when a `web/` file changed |
+| `docs-only` | Every changed file is `.md`/`.txt`/`.rst` or under `docs/`, and none is a dependency manifest | Nothing — no install, no lane |
+
+The docs-only rule is the one `scripts/test.sh`'s `decide_plan` applies to
+the local plan, and `tests/test_candidate_lanes.py` holds the two to the same
+answers. The publisher publishes success only when the execution job passed
+*and* recorded one of these modes, and its check summary names the mode. An
+unavailable changed set is classified `executed` with every retained lane.
+The changed set is the diff from the merge base when the checkout can
+compute one, so a branch behind the base is judged on its own changes; when
+it cannot, the two-commit diff stands in as a superset.
 
 GitHub's required-status-check matching identifies a `context` string and a
 reporting `app_id` — never which workflow file or run produced it. A
