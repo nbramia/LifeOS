@@ -25,6 +25,7 @@ instance tears down, so the output directory can't be derived from it.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import pwd
 import socket
@@ -64,9 +65,8 @@ VAULT_PATH = Path(os.environ["LIFEOS_VAULT_PATH"])
 
 # Narrower/shorter than a full desktop viewport, deliberately: these
 # screenshots are meant to read as a system in active use, not a mostly-empty
-# window, so the chat/board captures below crop dead space rather than
-# leaving a big blank middle.
-DESKTOP_VIEWPORT = {"width": 1440, "height": 900}
+# window, so the captures below crop dead space rather than leaving a big
+# blank area.
 CHAT_VIEWPORT = {"width": 1440, "height": 820}
 BOARD_VIEWPORT = {"width": 2200, "height": 960}
 
@@ -109,19 +109,23 @@ def api_post(path: str, payload: dict) -> dict:
 
 
 def seed_tasks() -> dict:
-    """Task cards covering every board lane, several per lane, per the
-    README manifest and the density the board is meant to be shown at."""
+    """Task cards covering every board lane, several per lane, spread across
+    every assignee (me/claude/codex/hermes/local/cloud, plus unassigned) with
+    a believable mix of running/completed/blocked states, due dates, and a
+    couple of longer titles so the lanes don't look uniform."""
     ids: dict[str, list[str]] = {
         "unassigned": [], "assigned": [], "in_progress": [], "review": [],
-        "done": [], "snoozed": [],
+        "done": [], "snoozed": [], "human_queue": [],
     }
 
     unassigned = [
         ("Research standing desk options for the home office", "Home", ["research"], None,
          "Compare a crank-adjustable frame vs. a memory-preset electric one."),
-        ("Compare flight options for the November site visit", "Work", ["research", "travel"], None, None),
+        ("Compare flight options for the November site visit", "Work", ["research", "travel"],
+         "2026-11-10", None),
         ("Draft talking points for the all-hands", "Work", ["work"], None, None),
-        ("Look into a better error-tracking tool", "Work", ["work", "infra"], None, None),
+        ("Audit the CRM's contact de-duplication rules against six months of merge "
+         "conflicts and write up recommendations", "Work", ["work", "infra"], None, None),
     ]
     for description, context, tags, due, notes in unassigned:
         t = api_post("/api/tasks", {
@@ -132,48 +136,63 @@ def seed_tasks() -> dict:
 
     assigned = [
         ("Draft the Q3 offsite agenda for the product team", ["codex"], "2026-09-25",
-         "Dana Whitfield is coordinating; venue is booked, catering and travel are open."),
-        ("Refactor the CRM import script", ["claude"], "2026-09-30", None),
-        ("Write release notes for the mobile app", ["hermes"], None, None),
-        ("Summarize last week's support tickets", ["me"], None, None),
+         "Dana Whitfield is coordinating; venue is booked, catering and travel are open.", None),
+        ("Summarize last week's support tickets", ["me"], "2026-09-21", None, None),
+        ("Write release notes for the mobile app", ["hermes"], "2026-10-02", None, None),
+        ("Triage the backlog of low-priority CRM bugs and propose which five to fix "
+         "this sprint", ["cloud"], None, None, {"effort": "low"}),
+        ("Set up a staging environment for the new billing service", ["local"], "2026-09-28",
+         None, {"model": "gemma-local"}),
     ]
-    for description, tags, due, notes in assigned:
+    for description, tags, due, notes, fields in assigned:
         t = api_post("/api/tasks", {
-            "description": description, "context": "Work", "tags": tags, "due_date": due, "notes": notes,
+            "description": description, "context": "Work", "tags": tags, "due_date": due,
+            "notes": notes, "fields": fields,
         })
         ids["assigned"].append(t["id"])
 
+    # More than one genuinely live session below (see seed_live_sessions) —
+    # two of these are plain claimed-but-not-yet-spawned, matching how a
+    # real board mixes "running" with "claimed, about to start".
     in_progress = [
         ("Fix the flaky import on the finance sync", ["claude", "agent-running"],
-         "Intermittent timeout on the monthly transaction import job."),
-        ("Migrate the search index to the new schema", ["codex", "agent-running"], None),
-        ("Investigate the Slack webhook timeout", ["claude", "agent-running"], None),
+         "Intermittent timeout on the monthly transaction import job.",
+         {"model": "claude-sonnet-5", "effort": "high"}),
+        ("Migrate the search index to the new schema", ["codex", "agent-running"], None, None),
+        ("Investigate the Slack webhook timeout", ["hermes", "agent-running"], None, None),
+        ("Rebuild the Monarch transaction categorizer with the new taxonomy and "
+         "backfill six months of transaction history", ["local", "agent-running"], None,
+         {"model": "gemma-local"}),
     ]
-    for description, tags, notes in in_progress:
+    for description, tags, notes, fields in in_progress:
         t = api_post("/api/tasks", {
-            "description": description, "context": "Work", "status": "in_progress", "tags": tags, "notes": notes,
+            "description": description, "context": "Work", "status": "in_progress",
+            "tags": tags, "notes": notes, "fields": fields,
         })
         ids["in_progress"].append(t["id"])
 
     review = [
-        ("Add a weekly digest of upcoming birthdays to the CRM",),
-        ("Fix pagination bug on the transactions API",),
-        ("Add dark-mode support to the journal wheel",),
+        "Add a weekly digest of upcoming birthdays to the CRM",
+        "Fix pagination bug on the transactions API",
+        "Add dark-mode support to the journal wheel",
     ]
-    for (description,) in review:
+    for description in review:
         t = api_post("/api/tasks", {
             "description": description, "context": "Work", "status": "done", "tags": ["agent-completed"],
         })
         ids["review"].append(t["id"])
 
     done = [
-        "Reply to the plumber about Thursday",
-        "Renew the home wifi router firmware",
-        "Pay the quarterly estimated taxes",
-        "Cancel the unused streaming subscription",
+        ("Reply to the plumber about Thursday", None),
+        ("Renew the home wifi router firmware", None),
+        ("Pay the quarterly estimated taxes", None),
+        ("Cancel the unused streaming subscription", None),
+        ("Auto-migrate the sync watchdog config to the new schema", ["agent-failed"]),
     ]
-    for description in done:
-        t = api_post("/api/tasks", {"description": description, "context": "Home", "status": "done"})
+    for description, tags in done:
+        t = api_post("/api/tasks", {
+            "description": description, "context": "Home", "status": "done", "tags": tags,
+        })
         ids["done"].append(t["id"])
 
     snoozed = [
@@ -188,7 +207,10 @@ def seed_tasks() -> dict:
         })
         ids["snoozed"].append(t["id"])
 
-    # Human queue — agent questions for the operator.
+    # Human queue — a mix of operator-filed agent questions (via the
+    # human-queue endpoint: status blocked, tag human) and a genuinely
+    # agent-blocked card (status blocked, tag agent-blocked) — two different
+    # reasons a card ends up waiting on a human.
     human_queue = [
         ("Confirm the Q3 offsite budget ceiling",
          "Agent question: should the $15k budget include travel, or "
@@ -202,10 +224,16 @@ def seed_tasks() -> dict:
          "Agent question: Inter or Söhne for the new dashboard headings?",
          "readme-shot-font-pick"),
     ]
-    ids["human_queue"] = []
     for title, notes, key in human_queue:
         hq = api_post("/api/tasks/human-queue", {"title": title, "notes": notes, "key": key})
         ids["human_queue"].append(hq["id"])
+
+    t = api_post("/api/tasks", {
+        "description": "Finish the vendor-integration webhook",
+        "context": "Work", "status": "blocked", "tags": ["codex", "agent-blocked"],
+        "notes": "Blocked on missing API credentials for the vendor's sandbox environment.",
+    })
+    ids["human_queue"].append(t["id"])
 
     return ids
 
@@ -238,7 +266,7 @@ def seed_review_outcomes(review_task_ids: list[str]) -> None:
             "fix: correct transactions API pagination cursor", "merged",
         ),
         (
-            "Claude",
+            "Hermes",
             "Added a dark palette for the journal emotion wheel, matching "
             "the rest of the app's dark theme. Verified contrast against "
             "the existing light palette's ratios.",
@@ -255,7 +283,7 @@ def seed_review_outcomes(review_task_ids: list[str]) -> None:
     for i, (task_id, (engine, summary, branch, pr_url, pr_number, pr_title, pr_state)) in enumerate(
         zip(review_task_ids, outcomes),
     ):
-        session_id = f"readme-shot-session-{i + 1}"
+        session_id = f"readme-shot-review-session-{i + 1}"
         store.create(task_id=task_id, session_id=session_id, status="completed")
         store.record_card_outcome(
             task_id, session_id=session_id, engine_label=engine, summary=summary,
@@ -270,6 +298,31 @@ def seed_review_outcomes(review_task_ids: list[str]) -> None:
                 "state=excluded.state, merged_at=excluded.merged_at, checked_at=excluded.checked_at, stale=0",
                 (pr_url, pr_number, pr_title, pr_state, merged_at, int(time.time())),
             )
+
+
+def seed_live_sessions(in_progress_task_ids: list[str]) -> None:
+    """Two genuinely live sessions (status="running", non-terminal) linked
+    to In-progress cards — these are what makes the board card show the
+    pulsing "live" dot and "session" chip, not just the tag. The other two
+    In-progress cards are left claimed-but-unlinked, the realistic mix of
+    "actually running" vs. "just claimed" a live board shows. Budgets are
+    seeded on the sessions for data fidelity (a card drawer would show
+    them), even though the board card face itself never renders a dollar
+    figure — only the linked-session chip and live dot.
+    """
+    sys.path.insert(0, str(REPO_ROOT))
+    from api.services.agent_worker.session_store import SessionStore
+
+    store = SessionStore()
+    live = [
+        (in_progress_task_ids[0], "readme-shot-live-session-1", "claude",
+         {"wall_seconds": 3600, "max_tokens": 200000, "max_dollars": 5.0}),
+        (in_progress_task_ids[1], "readme-shot-live-session-2", "codex",
+         {"wall_seconds": 1800, "max_tokens": 120000, "max_dollars": 2.5}),
+    ]
+    for task_id, session_id, routing, budget in live:
+        store.create(task_id=task_id, session_id=session_id, status="running",
+                     routing=routing, budget=budget)
 
 
 def seed_schedules() -> None:
@@ -290,10 +343,10 @@ def seed_schedules() -> None:
         })
 
 
-def seed_conversations() -> dict:
-    """Seeds chat threads with several exchanges each, plus a dedicated
-    task/reminder-creation conversation captured as tasks-chat.png. Returns
-    the ids of conversations the capture step needs to open by title."""
+def seed_conversations() -> None:
+    """Seeds chat threads with several exchanges each — these populate the
+    conversation sidebar (and the "agent threads" rail, via the Review-lane
+    outcomes seeded separately) behind the voice screenshot."""
     sys.path.insert(0, str(REPO_ROOT))
     from api.services.conversation_store import ConversationStore
 
@@ -316,16 +369,6 @@ def seed_conversations() -> dict:
         conv.id, "assistant",
         "Not yet — that's still one of the open questions on the budget task in the human queue.",
         sources=[{"file_name": "Confirm the Q3 offsite budget ceiling", "source_type": "task"}],
-    )
-    store.add_message(conv.id, "user", "Who's running the product team welcome sync that week?")
-    store.add_message(
-        conv.id, "assistant",
-        "That's the Acme Corp onboarding sync — 9am badge/laptop pickup, then the welcome "
-        "sync with the product team at 11.",
-        sources=[{
-            "file_name": "Acme Corp Onboarding.md", "source_type": "vault",
-            "obsidian_path": "Notes/Acme Corp Onboarding.md",
-        }],
     )
     store.add_message(conv.id, "user", "Good — ping me if the venue booking changes.")
     store.add_message(conv.id, "assistant", "Will do.")
@@ -357,17 +400,6 @@ def seed_conversations() -> dict:
     store.add_message(conv3.id, "user", "Remind me to revisit it next month.")
     store.add_message(conv3.id, "assistant", "Done — snoozed the task until early October.")
 
-    voice_conv = store.create_conversation(title="Voice: offsite budget check", persona_id="primary")
-    store.add_message(voice_conv.id, "user", "What's the offsite budget looking like?")
-    store.add_message(
-        voice_conv.id, "assistant",
-        "Fifteen thousand dollars total, and it's not yet clear whether that includes travel.",
-    )
-    store.add_message(voice_conv.id, "user", "Has Dana confirmed the venue yet?")
-    store.add_message(
-        voice_conv.id, "assistant", "Yes — the venue's booked for the third week of September.",
-    )
-
     tasks_conv = store.create_conversation(title="Task and reminder setup", persona_id="primary")
     store.add_message(tasks_conv.id, "user", "Next Wednesday I need to pull down my 1099 from Schwab.")
     store.add_message(
@@ -380,14 +412,19 @@ def seed_conversations() -> dict:
         "Done — a reminder is set for Tuesday, Sept 22 to follow up with Dana.",
     )
 
-    return {"tasks_conv_title": "Task and reminder setup"}
 
-
+# The live voice exchange captured in chat-voice.png — this IS the seeded
+# "Voice: offsite budget check" conversation's storyline, played out live
+# through the real voice turn pipeline (stubbed only at the network edge —
+# see VOICE_TURN_STREAM_BODY) rather than pre-written into the store, so the
+# recording indicator and message rendering are genuinely driven by the UI.
 VOICE_TURNS = [
     ("What's the offsite budget looking like?",
      "Fifteen thousand dollars total, and it's not yet clear whether that includes travel."),
     ("Has Dana confirmed the venue yet?",
      "Yes — the venue's booked for the third week of September."),
+    ("Who's coordinating catering?",
+     "Dana Whitfield is — she's waiting on a headcount before she can confirm."),
     ("Remind me to check on catering Friday.",
      "Done — I'll remind you Friday to check on catering."),
 ]
@@ -401,8 +438,6 @@ _GET_USER_MEDIA_STUB = """
 
 
 def _voice_turn_stream_body(transcript: str, response_text: str) -> str:
-    import json as _json
-
     done = {
         "conversation_id": "readme-shot-voice-live",
         "transcript": transcript,
@@ -411,9 +446,9 @@ def _voice_turn_stream_body(transcript: str, response_text: str) -> str:
         "status_audio_urls": [],
     }
     return (
-        f'data: {_json.dumps({"type": "started", "turn_id": "readme-shot-turn"})}\n'
-        f'data: {_json.dumps({"type": "transcript", "text": transcript})}\n'
-        f'data: {_json.dumps({"type": "done", "data": done})}\n\n'
+        f'data: {json.dumps({"type": "started", "turn_id": "readme-shot-turn"})}\n'
+        f'data: {json.dumps({"type": "transcript", "text": transcript})}\n'
+        f'data: {json.dumps({"type": "done", "data": done})}\n\n'
     )
 
 
@@ -510,16 +545,23 @@ def _lanes_content_bottom(page, lanes_locator) -> float:
     return max_bottom
 
 
-def open_conversation_and_expand_sources(page, title: str) -> None:
-    page.click(f"text={title}")
-    page.wait_for_selector(".message.assistant")
-    page.wait_for_timeout(300)
-    toggles = page.locator(".sources-toggle")
-    if toggles.count() > 0:
-        toggles.first.click()
-        page.wait_for_timeout(200)
-    scroll_messages_to_bottom(page)
-    page.wait_for_timeout(150)
+def _crop_lane_range(page, path: Path, lane_ids: list[str], produced: list[str], label: str) -> None:
+    """Crop a contiguous run of lane columns (by `data-lane` id, in board
+    order) to their actual content height, at the board's normal capture
+    resolution — a legible close-up, unlike the necessarily-small-text full
+    8-lane overview."""
+    selector = ", ".join(f'.board-lane[data-lane="{lane_id}"]' for lane_id in lane_ids)
+    lanes = page.locator(selector)
+    first_box = page.locator(f'.board-lane[data-lane="{lane_ids[0]}"]').bounding_box()
+    last_box = page.locator(f'.board-lane[data-lane="{lane_ids[-1]}"]').bounding_box()
+    bottom = _lanes_content_bottom(page, lanes)
+    if first_box and last_box and bottom:
+        crop_and_save(page, path, clip={
+            "x": max(first_box["x"] - 10, 0), "y": max(first_box["y"] - 10, 0),
+            "width": (last_box["x"] + last_box["width"]) - first_box["x"] + 20,
+            "height": (bottom + 24) - max(first_box["y"] - 10, 0),
+        })
+        produced.append(label)
 
 
 def capture(playwright) -> list[str]:
@@ -528,53 +570,7 @@ def capture(playwright) -> list[str]:
     context = browser.new_context(device_scale_factor=2, color_scheme="dark")
     context.route("**/api/agents/board", _redact_real_hostname)
 
-    # --- chat-thread.png ---------------------------------------------------
-    page = context.new_page()
-    page.set_viewport_size(CHAT_VIEWPORT)
-    page.goto(f"{BASE_URL}/chat", wait_until="networkidle")
-    page.wait_for_selector("#personaPicker option", state="attached", timeout=15000)
-    open_conversation_and_expand_sources(page, "Q3 offsite planning")
-    crop_to_content(page, IMAGES_DIR / "chat-thread.png", bottom_locator=page.locator(".message").last)
-    produced.append("chat-thread.png")
-
-    # --- chat-personas.png ---------------------------------------------------
-    # Force the native <select> open inline (size = option count) so every
-    # shipped persona is visible in one frame — a real click opens an OS
-    # popup Playwright can't capture inside the page image.
-    page.evaluate(
-        "() => { const el = document.getElementById('personaPicker'); "
-        "el.setAttribute('size', el.options.length); el.style.position='absolute'; "
-        "el.style.zIndex = 9999; }"
-    )
-    page.wait_for_timeout(150)
-    picker = page.locator("#personaPicker")
-    box = picker.bounding_box()
-    if box:
-        crop_and_save(page, IMAGES_DIR / "chat-personas.png", clip={
-            "x": max(box["x"] - 10, 0), "y": max(box["y"] - 10, 0),
-            "width": box["width"] + 260, "height": box["height"] + 20,
-        })
-        produced.append("chat-personas.png")
-    page.close()
-
-    # --- tasks-chat.png (task + reminder created conversationally) --------
-    tasks_chat_page = context.new_page()
-    tasks_chat_page.set_viewport_size(CHAT_VIEWPORT)
-    tasks_chat_page.goto(f"{BASE_URL}/chat", wait_until="networkidle")
-    tasks_chat_page.wait_for_selector("#personaPicker option", state="attached", timeout=15000)
-    tasks_chat_page.click("text=Task and reminder setup")
-    tasks_chat_page.wait_for_selector(".message.assistant")
-    tasks_chat_page.wait_for_timeout(300)
-    scroll_messages_to_bottom(tasks_chat_page)
-    tasks_chat_page.wait_for_timeout(150)
-    crop_to_content(
-        tasks_chat_page, IMAGES_DIR / "tasks-chat.png",
-        bottom_locator=tasks_chat_page.locator(".message").last,
-    )
-    produced.append("tasks-chat.png")
-    tasks_chat_page.close()
-
-    # --- chat-voice.png ------------------------------------------------------
+    # --- chat-voice.png — the single chat/voice hero shot ------------------
     voice_page = context.new_page()
     voice_page.set_viewport_size(CHAT_VIEWPORT)
     voice_page.add_init_script(_GET_USER_MEDIA_STUB)
@@ -606,11 +602,15 @@ def capture(playwright) -> list[str]:
         voice_page.wait_for_timeout(200)
     scroll_messages_to_bottom(voice_page)
     voice_page.wait_for_timeout(300)
+    # Voice answers never carry source citations in this UI — submitTurn()'s
+    # `addMessage(data.response_text, 'assistant')` call passes no sources
+    # argument, unlike the text path — so none are shown here; that would be
+    # depicting a capability the real voice turn doesn't have.
     crop_to_content(voice_page, IMAGES_DIR / "chat-voice.png", bottom_locator=voice_page.locator("#voiceDock"))
     produced.append("chat-voice.png")
     voice_page.close()
 
-    # --- agents-board.png ------------------------------------------------------
+    # --- agents-board.png (all 8 lanes) -------------------------------------
     board_page = context.new_page()
     board_page.set_viewport_size(BOARD_VIEWPORT)
     board_page.goto(f"{BASE_URL}/agents", wait_until="domcontentloaded")
@@ -629,8 +629,8 @@ def capture(playwright) -> list[str]:
     content_bottom = _lanes_content_bottom(board_page, all_lanes)
     if board_box and content_bottom:
         # Ends shortly below the longest column's last card — at 8 lanes
-        # wide, this is necessarily a wide/short overview image; the
-        # detail crop below covers legible close-up reading.
+        # wide, this is necessarily a wide/short overview image; the detail
+        # crops below cover legible close-up reading.
         crop_and_save(board_page, IMAGES_DIR / "agents-board.png", clip={
             "x": 0, "y": max(board_box["y"] - 10, 0),
             "width": BOARD_VIEWPORT["width"],
@@ -643,65 +643,19 @@ def capture(playwright) -> list[str]:
         )
     produced.append("agents-board.png")
 
-    # --- agents-board-detail.png (Human queue / Scheduled / Review, at a
-    # legible zoom — the full 8-lane board above is necessarily small text
-    # once scaled to README width) ------------------------------------------
-    detail_lanes = board_page.locator(
-        '.board-lane[data-lane="human_queue"], '
-        '.board-lane[data-lane="scheduled"], '
-        '.board-lane[data-lane="review"]'
+    # --- agents-board-detail-1.png: In progress, with its neighbours -------
+    _crop_lane_range(
+        board_page, IMAGES_DIR / "agents-board-detail-1.png",
+        ["assigned", "in_progress", "human_queue"], produced, "agents-board-detail-1.png",
     )
-    first_box = board_page.locator('.board-lane[data-lane="human_queue"]').bounding_box()
-    last_box = board_page.locator('.board-lane[data-lane="review"]').bounding_box()
-    detail_bottom = _lanes_content_bottom(board_page, detail_lanes)
-    if first_box and last_box and detail_bottom:
-        crop_and_save(board_page, IMAGES_DIR / "agents-board-detail.png", clip={
-            "x": max(first_box["x"] - 10, 0), "y": max(first_box["y"] - 10, 0),
-            "width": (last_box["x"] + last_box["width"]) - first_box["x"] + 20,
-            "height": (detail_bottom + 24) - max(first_box["y"] - 10, 0),
-        })
-        produced.append("agents-board-detail.png")
 
-    # --- agents-schedules.png (the Scheduled lane column) ------------------
-    # The Scheduled lane is a column on the same board, not a separate tab.
-    # `.board-lane` itself stretches (flex align-items: stretch) to the full
-    # row height regardless of card count, so this crops to the last card's
-    # own bottom edge instead — a standalone single-lane image showing the
-    # lane's actual content, not the mostly-empty stretched column.
-    scheduled_lane = board_page.locator('.board-lane[data-lane="scheduled"]')
-    lane_box = scheduled_lane.bounding_box()
-    last_card_box = scheduled_lane.locator(".board-card").last.bounding_box()
-    if lane_box and last_card_box:
-        crop_and_save(board_page, IMAGES_DIR / "agents-schedules.png", clip={
-            "x": max(lane_box["x"] - 10, 0), "y": max(lane_box["y"] - 10, 0),
-            "width": lane_box["width"] + 20,
-            "height": (last_card_box["y"] + last_card_box["height"] + 24) - (lane_box["y"] - 10),
-        })
-        produced.append("agents-schedules.png")
+    # --- agents-board-detail-2.png: Review / Human queue --------------------
+    _crop_lane_range(
+        board_page, IMAGES_DIR / "agents-board-detail-2.png",
+        ["human_queue", "scheduled", "review"], produced, "agents-board-detail-2.png",
+    )
 
     board_page.close()
-
-    # --- agents-card.png (Review-lane card drawer) ------------------------
-    # A normal desktop width, not BOARD_VIEWPORT's wide 8-lane layout — the
-    # drawer is a fixed-width right-side panel, so a wider board behind it
-    # would just add dead dimmed space rather than more content.
-    card_page = context.new_page()
-    card_page.set_viewport_size(DESKTOP_VIEWPORT)
-    card_page.goto(f"{BASE_URL}/agents", wait_until="domcontentloaded")
-    card_page.wait_for_selector(".board-card", timeout=15000)
-    card_page.click("text=Add a weekly digest of upcoming birthdays to the CRM")
-    card_page.wait_for_selector("#board-drawer-backdrop:not([hidden])", timeout=5000)
-    card_page.wait_for_timeout(300)
-    redact_hostname_in_dom(card_page)
-    # End right after the drawer's action buttons (Rename/Accept/.../Delete)
-    # — below that sits a second panel (the linked session's transcript
-    # summary), which is real UI but reads as a stray half-cut repeat of the
-    # card title when it's only partially in frame.
-    delete_btn = card_page.locator("#board-drawer button", has_text="Delete")
-    crop_to_content(card_page, IMAGES_DIR / "agents-card.png", bottom_locator=delete_btn)
-    produced.append("agents-card.png")
-    card_page.close()
-
     browser.close()
     return produced
 
@@ -710,6 +664,7 @@ def main() -> None:
     seed_vault_notes()
     task_ids = seed_tasks()
     seed_review_outcomes(task_ids["review"])
+    seed_live_sessions(task_ids["in_progress"])
     seed_schedules()
     seed_conversations()
 
