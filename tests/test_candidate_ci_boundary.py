@@ -67,8 +67,8 @@ def test_candidate_workflow_separates_untrusted_execution_from_status_publisher(
     # from an absent job.
     assert workflow.index("name: Bind dispatched runner") < workflow.index("name: Select the lanes") < workflow.index("actions/setup-python")
     assert "python3 trusted-runner/scripts/candidate_lanes.py" in workflow
-    assert "verification_mode: ${{ steps.select.outputs.mode }}" in workflow
-    executed = "if: ${{ steps.select.outputs.mode == 'executed' }}"
+    assert "verification_mode: ${{ steps.reuse.outputs.mode || steps.select.outputs.mode }}" in workflow
+    executed = "steps.select.outputs.mode == 'executed'"
     for step in ("actions/setup-python", "name: Install the declared CPU test environment", "name: Verify the retained lanes"):
         block = workflow[workflow.index(step):]
         block = block[:block.index("\n      - ")]
@@ -83,6 +83,26 @@ def test_candidate_workflow_separates_untrusted_execution_from_status_publisher(
     assert "VERIFICATION_MODE: ${{ needs.execute-candidate.outputs.verification_mode }}" in publisher
     assert "mode === 'docs-only'" in publisher
     assert "process.env.RESULT === 'success' && explicit" in publisher
+
+    # A dispatched candidate may reuse its head's shadow verdict, but only via
+    # the runner's own decision script over App-published check data, read
+    # with a read-only token before any environment exists; the shadow run
+    # itself never reuses anything.
+    reuse = workflow[workflow.index("name: Reuse a passing shadow verification"):]
+    reuse = reuse[:reuse.index("\n      - ")]
+    assert "github.event_name == 'workflow_dispatch'" in reuse
+    assert "vars.LIFEOS_CANDIDATE_APP_ID != ''" in reuse
+    assert "python3 trusted-runner/scripts/candidate_reuse.py" in reuse
+    assert 'git -C candidate fetch --quiet --depth=1 origin "$HEAD_SHA"' in reuse
+    assert '[ "$(git -C candidate rev-parse "$HEAD_SHA^{tree}")" != "$TREE" ]' in reuse
+    assert workflow.index("name: Select the lanes") < workflow.index("name: Reuse a passing shadow verification") < workflow.index("actions/setup-python")
+    for step in ("actions/setup-python", "name: Install the declared CPU test environment", "name: Verify the retained lanes"):
+        block = workflow[workflow.index(step):]
+        block = block[:block.index("\n      - ")]
+        assert "steps.reuse.outputs.mode != 'reused'" in block, step
+    assert "mode === 'reused'" in publisher
+    assert "trusted_runner: process.env.TRUSTED_RUNNER_SHA" in publisher
+    assert "tree: process.env.VERIFICATION_TREE" in publisher
     assert "actions/checkout" not in publisher
     assert "--sha \"$CANDIDATE_SHA\"" in workflow
     assert "candidate-verification-${{ github.event.pull_request.number" in workflow
@@ -430,11 +450,15 @@ def test_candidate_workflow_lane_selection_is_the_trusted_runner_script():
     assert "python3 trusted-runner/scripts/candidate_lanes.py" in script
     assert "candidate/scripts" not in script
     assert 'sed -n \'s/^lanes=/LANES=/p\'' in script
-    assert workflow["jobs"]["execute-candidate"]["outputs"] == {"verification_mode": "${{ steps.select.outputs.mode }}"}
+    outputs = workflow["jobs"]["execute-candidate"]["outputs"]
+    assert outputs["verification_mode"] == "${{ steps.reuse.outputs.mode || steps.select.outputs.mode }}"
+    assert outputs["verification_tree"] == "${{ steps.select.outputs.tree }}"
+    assert outputs["verification_lanes"] == "${{ steps.select.outputs.lanes }}"
+    assert workflow["jobs"]["execute-candidate"]["permissions"] == {"contents": "read", "checks": "read"}
 
     verify = next(s for s in steps if "Verify the retained lanes" in (s.get("name") or ""))
     assert '--lanes "$LANES"' in verify["run"], "the verifier must consume the selected lanes"
-    assert verify["if"] == "${{ steps.select.outputs.mode == 'executed' }}"
+    assert verify["if"] == "${{ steps.select.outputs.mode == 'executed' && steps.reuse.outputs.mode != 'reused' }}"
 
 
 @pytest.mark.unit
@@ -460,7 +484,7 @@ def test_publisher_treats_every_non_success_execution_result_as_a_failed_check()
         step for step in publisher["steps"] if "github-script" in (step.get("uses") or "")
     )["with"]["script"]
     assert "process.env.RESULT === 'success' && explicit ? 'success' : 'failure'" in script
-    assert "const explicit = mode === 'executed' || mode === 'docs-only'" in script
+    assert "const explicit = mode === 'executed' || mode === 'docs-only' || mode === 'reused'" in script
 
 
 @pytest.mark.unit
