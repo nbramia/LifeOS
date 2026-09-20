@@ -798,12 +798,13 @@ def test_no_default_route_nonfatal_sanity_still_parks(tmp_path: Path, monkeypatc
 
 @pytest.mark.unit
 def test_budget_breach_yields_and_asks_then_stop_sets_budget_exceeded_tag(tmp_path: Path):
-    """A budget breach no longer ends the session outright — the executor
-    yields (`STATUS_YIELDED` with `termination_evidence["budget_breach"]`)
-    and the worker turns that into a `budget` pending question, moving the
-    card to Human queue (`BLOCKED_TAG`) rather than `#agent-budget-
-    exceeded`. Replying `stop` is what still produces the old terminal
-    behavior — this proves that path survives the contract change."""
+    """A budget breach parks the session instead of ending it outright —
+    the executor yields (`STATUS_YIELDED` with
+    `termination_evidence["budget_breach"]`) and the worker turns that into
+    a `budget` pending question, moving the card to Human queue
+    (`BLOCKED_TAG`) rather than `#agent-budget-exceeded`. Replying `stop`
+    is what produces the terminal `budget_exceeded` outcome — this test
+    proves that path stays reachable."""
     api = FakeApi(tasks=[
         {"id": "t1", "description": "long task", "status": "todo", "tags": ["local"]},
     ])
@@ -842,8 +843,8 @@ def test_budget_breach_yields_and_asks_then_stop_sets_budget_exceeded_tag(tmp_pa
     assert len(questions) == 1
     assert questions[0]["kind"] == "budget"
 
-    # Operator replies `stop` — finalizes exactly as an unattended breach
-    # used to. Deposited by the Telegram message id `ask_user_via_telegram`
+    # Operator replies `stop` — finalizes with the terminal budget_exceeded
+    # outcome. Deposited by the Telegram message id `ask_user_via_telegram`
     # sent it under, matching the real Telegram reply-thread path (unlike
     # `deposit_answer_by_session_id`, which would instead match this
     # session's earlier `status_anchor` routing row).

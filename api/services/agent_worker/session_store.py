@@ -1927,8 +1927,8 @@ class SessionStore:
         turn_id: str | None = None,
     ) -> bool:
         """Rewrite `budget_json` alone — routing/expected_output/preset_class
-        are left untouched, unlike `set_routing_and_budget`. Used to extend
-        a session's cap after a `budget` pending question is answered
+        are left untouched, unlike `set_routing_and_budget`. Extends a
+        session's cap after a `budget` pending question is answered
         `yes` / `yes $N` / `yes N min`; the caller re-fetches the session
         afterward so the executor's next `execute()` call sees the new cap
         rather than the one captured before the breach.

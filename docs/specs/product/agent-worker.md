@@ -100,7 +100,7 @@ On an in-process route (local, the remote-forced route, or Managed Agents), a br
 
 - Reply **`yes`** to double the cap and resume from right where the session left off.
 - Reply **`yes $12`** (or **`yes 90 min`** for a wall-clock breach) to set the cap to a specific value instead of doubling it.
-- Reply **`stop`** to end the task — this is the only way it now lands at `#agent-budget-exceeded`.
+- Reply **`stop`** to end the task at `#agent-budget-exceeded`.
 - No reply at all leaves it parked indefinitely, at zero further cost — nothing re-dispatches it until you answer.
 
 The board drawer offers **Continue** and **Stop** buttons alongside the free-text Answer box for exactly this question, so a reply doesn't require typing.
@@ -143,7 +143,7 @@ The agent worker uses your existing Telegram bot (no second bot needed). Three m
 
 2. **Clarification requests** — if the preflight can't determine routing OR if a task title is genuinely ambiguous (e.g., "reply to Alex" with no email reference), the worker pauses the task at `#agent-blocked` and asks one targeted question on Telegram. Reply by using Telegram's native reply feature (long-press the bot's message, hit Reply). The worker picks up your answer within the next poll cycle and resumes. A budget breach (see Budgets, above) parks the task at the same `#agent-blocked` tag and asks the same way — `yes` / `yes $12` / `yes 90 min` resumes it, `stop` ends it.
 
-3. **Failure notifications** — short message naming the task and the failure reason, plus a transcript path so you can debug. Examples: "task X failed: managed_create_session 4xx" or "task Y hit its budget (max_dollars)" (only ever seen now after you reply `stop` to a budget question — a breach no longer reaches this on its own).
+3. **Failure notifications** — short message naming the task and the failure reason, plus a transcript path so you can debug. Examples: "task X failed: managed_create_session 4xx" or "task Y hit its budget (max_dollars)" (the budget example is seen only after you reply `stop` to a budget question — a breach alone doesn't produce this notification).
 
 **Replying to a thread.** Every terminal notification — completion, failure, or budget cut-off — is replyable: use Telegram's native reply on it (any chunk of a long message) and the agent reopens that thread as a follow-up turn with full prior context ("actually, also CC Jane"). The reply gesture is the *only* way to continue a thread on Telegram — a plain message is always a normal chat query, so unrelated questions are never mistaken for a thread continuation.
 

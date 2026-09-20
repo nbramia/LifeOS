@@ -2846,7 +2846,7 @@ class Worker:
         self, session: Session, task: dict[str, Any] | None, dimension: str,
     ) -> None:
         """Operator replied `stop` to a budget question — end the session
-        exactly as an unattended breach used to, by feeding the same
+        exactly as an unattended breach does, by feeding the same
         ``STATUS_BUDGET_EXCEEDED`` outcome through ``_handle_outcome`` so
         the tag swap, vault status, and cut-off notice stay one code path.
 
@@ -2885,7 +2885,7 @@ class Worker:
         """Operator replied to a `budget` breach question.
 
         `yes` doubles the breached cap, `yes $12` / `yes 90 min` set it,
-        `stop` finalizes exactly as an unattended breach used to, and an
+        `stop` finalizes exactly as an unattended breach does, and an
         unparseable (or wrong-unit) reply gets a short usage note and
         leaves the session parked. A resume never re-seeds the
         conversation — the breach never cleared the session's stored
@@ -2950,7 +2950,7 @@ class Worker:
             return
 
         if not self._extend_budget(session, dimension, reply):
-            # Cap couldn't be written (attempt/turn no longer current, or
+            # Cap couldn't be written (the attempt/turn has moved on, or
             # nothing to double) — leave the question claimed-but-
             # unprocessed so a retry can be attempted.
             self.transcript_store.append(sid, "budget_extend_failed", {"dimension": dimension})
@@ -2978,7 +2978,7 @@ class Worker:
         })
         self.session_store.mark_question_processed(q["id"])
 
-        # Re-fetch: the session now carries the extended budget_json and
+        # Re-fetch: the session carries the extended budget_json and
         # RUNNING status just written above. Every resume path below must
         # see this row, not the pre-extension snapshot passed into this
         # method.

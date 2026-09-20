@@ -973,7 +973,7 @@ class TestManualScheduleType:
         assert updated.schedule_type == "manual"
         assert updated.next_trigger_at is None
         assert updated.enabled is True
-        # The markdown line no longer carries a trigger field either.
+        # The markdown line carries no trigger field either.
         line = next(
             ln for ln in store._read_inbox_lines() if f"id:{entry.id}" in ln
         )

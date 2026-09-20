@@ -266,6 +266,47 @@ def test_spawn_budget_cannot_exceed_parent_remaining(ctx, store, parent):
 
 
 @pytest.mark.unit
+def test_spawn_child_inherits_an_unset_token_cap(store, transcript):
+    """A parent with no token cap (the default since the cap became
+    opt-in) gives its child no token cap either — not the old 500k
+    fallback, and not a crash trying to `int(None)`."""
+    uncapped_parent = store.create(
+        task_id="uncapped", status=STATUS_RUNNING, routing="claude",
+        budget={"wall_seconds": 3600, "max_tokens": None, "max_dollars": 10.0},
+        expected_output="text",
+    )
+    ctx = InterAgentContext(
+        session_store=store, transcript_store=transcript,
+        caller_session_id=uncapped_parent.session_id, caps=Caps(),
+    )
+    result = dispatch(ctx, "lifeos_agent_spawn", {"prompt": "x", "model": "local"})
+    assert result["ok"], result
+    child = store.get_by_session_id(result["child_session_id"])
+    assert child.budget["max_tokens"] is None
+
+
+@pytest.mark.unit
+def test_spawn_explicit_child_token_request_wins_over_an_unset_parent_cap(store, transcript):
+    """An explicit child token request is honored even though the parent
+    has no cap of its own to clamp against."""
+    uncapped_parent = store.create(
+        task_id="uncapped2", status=STATUS_RUNNING, routing="claude",
+        budget={"wall_seconds": 3600, "max_tokens": None, "max_dollars": 10.0},
+        expected_output="text",
+    )
+    ctx = InterAgentContext(
+        session_store=store, transcript_store=transcript,
+        caller_session_id=uncapped_parent.session_id, caps=Caps(),
+    )
+    result = dispatch(ctx, "lifeos_agent_spawn", {
+        "prompt": "x", "model": "local", "max_tokens": 50_000,
+    })
+    assert result["ok"], result
+    child = store.get_by_session_id(result["child_session_id"])
+    assert child.budget["max_tokens"] == 50_000
+
+
+@pytest.mark.unit
 def test_spawn_canonical_execution_persists_exact_child_request(ctx, store):
     result = dispatch(ctx, "lifeos_agent_spawn", {
         "prompt": "synthetic child",
