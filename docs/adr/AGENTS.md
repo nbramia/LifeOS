@@ -26,6 +26,7 @@ This directory contains Architecture Decision Records (ADRs) — immutable recor
 - `022-macos-fda-inheritance-and-restart.md` — corrects 010's `exec`/`run` FDA-inheritance description and documents two macOS restart-safety lessons (amends 010)
 - `024-remote-llm-backend.md` — `LIFEOS_LLM_BACKEND=remote` makes the configured paid OpenAI-compatible provider the standing default engine (supersedes 009)
 - `025-specialist-call-fallback.md` — relationship insights, fact extraction, and CRM tone analysis fall back to local/remote when no Anthropic key is set (amends 009)
+- `026-budget-breach-asks.md` — an in-process budget breach yields and asks the operator instead of failing the session outright
 
 ## Key Principles
 

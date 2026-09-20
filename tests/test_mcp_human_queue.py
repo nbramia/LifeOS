@@ -1,7 +1,7 @@
 """
 Tests that the three Human-queue MCP tools are registered and
 reachable over both the stdio and HTTP transports, and that the total tool
-count (71 = 62 CURATED_ENDPOINTS + 9 lifeos_agent_*) matches AGENTS.md.
+count (72 = 63 CURATED_ENDPOINTS + 9 lifeos_agent_*) matches AGENTS.md.
 """
 import importlib.util
 from pathlib import Path
@@ -43,9 +43,9 @@ def _server_built_from_live_spec(module):
 
 class TestCuratedEndpointsRegistration:
     def test_curated_endpoint_count(self):
-        """59 pre-eero + 3 eero home tools."""
+        """59 pre-eero + 3 eero home + 1 schedule trigger tool."""
         module = _load_mcp_module()
-        assert len(module.CURATED_ENDPOINTS) == 62
+        assert len(module.CURATED_ENDPOINTS) == 63
 
     def test_three_tools_in_curated_endpoints(self):
         module = _load_mcp_module()
@@ -148,11 +148,11 @@ class TestHttpTransportRegistration:
         assert _HUMAN_QUEUE_TOOL_NAMES <= names
 
     def test_total_tool_count_matches_agents_md(self):
-        """71 = 62 CURATED_ENDPOINTS + 9 lifeos_agent_* — see AGENTS.md's
+        """72 = 63 CURATED_ENDPOINTS + 9 lifeos_agent_* — see AGENTS.md's
         mcp_server.py row."""
         module = _load_mcp_module()
         server = _server_built_from_live_spec(module)
-        assert len(server.tools) == 71
+        assert len(server.tools) == 72
 
 
 def _server_built_from_fallback(module):

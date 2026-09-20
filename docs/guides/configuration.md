@@ -93,6 +93,7 @@ A paid OpenAI-compatible endpoint — e.g. Fireworks running DeepSeek or Qwen. R
 | `LIFEOS_REMOTE_LLM_TIMEOUT` | int | `90` | Request timeout, seconds. |
 | `LIFEOS_REMOTE_LLM_INPUT_PRICE_PER_MTOK` | float | — (unset) | USD per million input tokens. Unset (distinct from `0.0`) means the rate isn't known — a turn on this provider records as unpriced rather than a guessed cost. |
 | `LIFEOS_REMOTE_LLM_OUTPUT_PRICE_PER_MTOK` | float | — (unset) | USD per million output tokens. Same unset/`0.0` distinction as the input rate. |
+| `LIFEOS_REMOTE_LLM_MODEL_OPTIONS` | str (comma-separated) | *(empty)* | Additional model ids the provider can serve, beyond `LIFEOS_REMOTE_LLM_MODEL`. Offered as choices on the board's `cloud` assignee's model picker (`GET /api/agents/models`'s `remote` engine list). |
 
 All three of URL, model, and API key must be set for the provider to be considered configured; pricing is independent and can be added later without affecting whether turns run.
 
@@ -167,10 +168,10 @@ Engine-assigned task worker. Product spec: [agent-worker.md](../specs/product/ag
 | `LIFEOS_AGENT_WORKER_AUTOSTART` | bool | `false` | When `true`, the worker starts on boot. Default off to require explicit opt-in. |
 | `LIFEOS_AGENT_WORKER_POLL_SECONDS` | float | `60` | Poll interval for new engine-assigned tasks. |
 | `LIFEOS_HUMAN_QUEUE_POLL_SECONDS` | float | `300` | Poll interval for Human-queue `done_when` checks. See [human-queue.md](human-queue.md). |
-| `LIFEOS_AGENT_DEFAULT_BUDGET_DOLLARS` | float | `5.00` | Per-task $-cap when the task title doesn't specify one. |
+| `LIFEOS_AGENT_DEFAULT_BUDGET_DOLLARS` | float | `10.00` | Per-task $-cap when the task title doesn't specify one — a backstop, not a quota ordinary tasks are expected to approach. |
 | `LIFEOS_AGENT_DEFAULT_WALL_SECONDS` | int | `14400` (4 h) | Per-task wall-time cap when title doesn't specify. |
-| `LIFEOS_AGENT_DEFAULT_MAX_TOKENS` | int | `500000` | Per-task token cap when title doesn't specify. |
-| `LIFEOS_AGENT_DAILY_CAP_DOLLARS` | float | `100.00` | Global daily $-cap. When crossed, the worker stops claiming new tasks until next local midnight. Set to `0` to pause new claims entirely. |
+| `LIFEOS_AGENT_DEFAULT_MAX_TOKENS` | int \| None | `None` | Per-task token cap. Unset (default) means no token cap applies; set only when a title doesn't already name one explicitly (e.g. "50k tokens"). |
+| `LIFEOS_AGENT_DAILY_CAP_DOLLARS` | float | `100.00` | Global daily $-cap. When crossed, the worker stops claiming new tasks and sends one Telegram notice; reply `raise to $150` to raise today's cap and resume claiming (reverts to this configured value the next local day). Set to `0` to pause new claims entirely. |
 | `LIFEOS_AGENT_CLARIFICATION_TIMEOUT_HOURS` | int | `72` | How long to wait for a Telegram clarification before abandoning the task. |
 | `LIFEOS_AGENT_STUCK_SESSION_TIMEOUT_MINUTES` | int | `15` | How long a top-level `claude_code`/`codex` session may sit at `status=claimed` with an undelivered queued message before the stuck-session sweep alerts the operator by name. |
 | `LIFEOS_AGENT_COST_CONFIRM_THRESHOLD_DOLLARS` | float | varies | Threshold above which preflight requires Telegram confirmation before running a task. |
@@ -276,6 +277,8 @@ See [guides/agent-worker-setup.md § Card assignment](agent-worker-setup.md#card
 | `LIFEOS_AGENT_HOSTS` | JSON object | `{}` | `{name: ssh_target}` — maps a board-facing host name to the ssh target the worker/API connects to for it. Empty disables every remote host: a task naming a host not in this map lands at `#agent-failed`. Invalid JSON logs a warning and is treated as `{}`. Operator configuration — never committed with real values. |
 | `LIFEOS_AGENT_SSH_CONNECT_TIMEOUT` | int (seconds) | `10` | How long ssh may spend establishing a connection to a remote host before giving up. Applies to remote spawn, remote kill, and remote resume/focus alike. |
 | `LIFEOS_AGENT_MODEL_CATALOG_TTL_SECONDS` | int (seconds) | `86400` | How long `GET /api/agents/models` caches each engine's model list before re-querying providers. |
+| `LIFEOS_AGENT_DEFAULT_MODEL_FAMILY_CLAUDE` | str | `opus` | Family segment `GET /api/agents/models`' `defaults.claude` picks: the newest id in the live claude list whose family matches (`claude-<family>-<version...>`). A `claude_code` dispatch that names no model runs on this default. |
+| `LIFEOS_AGENT_DEFAULT_MODEL_FAMILY_CODEX` | str | `sol` | Same, for `defaults.codex` (`gpt-<version...>-<family>`); a `codex` dispatch that names no model runs on this default. |
 | `LIFEOS_CODEX_MODELS_CACHE_PATH` | str | `~/.codex/models_cache.json` | Path to the Codex CLI's own model-catalog cache, read by the model catalog endpoint for the codex engine's picker list. |
 | `LIFEOS_OPENAI_API_KEY` | str | *(empty)* | Optional OpenAI API key, used only as the model-catalog fallback when `LIFEOS_CODEX_MODELS_CACHE_PATH` is missing/unreadable. It never runs turns — Codex sessions are subscription-billed through the CLI itself, never the API. |
 

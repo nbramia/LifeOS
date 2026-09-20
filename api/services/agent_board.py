@@ -640,14 +640,19 @@ def plan_lane_move(
     return LaneMovePlan(error=(400, f"lane '{target_lane}' cannot be set directly"))
 
 
-def is_schedule_active(enabled: bool, next_trigger_at: Optional[str]) -> bool:
+def is_schedule_active(enabled: bool, next_trigger_at: Optional[str], schedule_type: str = "") -> bool:
     """True -> Scheduled lane; False -> Done lane.
 
-    A schedule entry is Scheduled while it's enabled and has a future fire.
-    `SchedulerStore` already clears `next_trigger_at` when a recurring entry
-    is disabled and when a one-off fires (see `update()` / trigger recording
-    in `scheduler_store.py`), so `enabled and next_trigger_at is not None` is
-    sufficient — it covers "fired one-off" and "disabled recurring" the same
-    way, so both show in Done.
+    A schedule entry is Scheduled while it's enabled and either has a future
+    fire (cron/once) or is a `manual` schedule — which never has a next fire
+    at all, so an enabled manual entry with `next_trigger_at is None` is its
+    normal, permanent state, not a fired/disabled one. `SchedulerStore`
+    already clears `next_trigger_at` when a recurring entry is disabled and
+    when a one-off fires (see `update()` / trigger recording in
+    `scheduler_store.py`), so for cron/once, `enabled and next_trigger_at is
+    not None` is sufficient — it covers "fired one-off" and "disabled
+    recurring" the same way, so both show in Done.
     """
+    if schedule_type == "manual":
+        return bool(enabled)
     return bool(enabled) and next_trigger_at is not None

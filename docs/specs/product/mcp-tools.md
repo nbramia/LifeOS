@@ -33,9 +33,9 @@ The LifeOS MCP server dynamically discovers endpoints from the LifeOS OpenAPI sp
 - Formatted responses for human readability
 - Fallback schemas when API unavailable
 
-The source catalog contains 62 curated LifeOS endpoint tools. It also
+The source catalog contains 63 curated LifeOS endpoint tools. It also
 registers 9 worker coordination tools (`lifeos_agent_*`), including
-`lifeos_agent_execution_override`, for a 71-tool fallback catalog. When the
+`lifeos_agent_execution_override`, for a 72-tool fallback catalog. When the
 OpenAPI document omits an unavailable endpoint, the live list may be smaller;
 the inter-agent tools remain registered as a separate contract.
 
@@ -113,9 +113,10 @@ Schedules can also be managed via natural language chat. See [Scheduler Guide](.
 
 | Tool | Description |
 |------|-------------|
-| `lifeos_schedule_create` | Create a schedule (cron or one-time; action notify/prompt/endpoint/agent) |
+| `lifeos_schedule_create` | Create a schedule (cron, one-time, or manual/trigger-only; action notify/prompt/endpoint/agent) |
 | `lifeos_schedule_list` | List all schedules |
 | `lifeos_schedule_delete` | Delete a schedule |
+| `lifeos_schedule_trigger` | Fire a schedule immediately, like the operator's Trigger-now button — a manual schedule's only way to fire |
 | `lifeos_telegram_send` | Send an ad-hoc Telegram message |
 
 The legacy `lifeos_reminder_*` tools remain registered as deprecated aliases.

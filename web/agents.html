@@ -1278,8 +1278,8 @@
      it takes two thirds of the tray and splits that evenly between its
      buttons rather than hugging its labels — a label-width target is hard
      to hit with a dragged card, most of all on a phone. The remaining
-     third leaves room for the tray label, the Done target, and the drop
-     status line. */
+     third leaves room for the tray label, the Done target (first in the
+     row, ahead of the assignees), and the drop status line. */
   #board-assignee-drops {
     display: flex;
     flex: 1 1 auto;
@@ -1494,10 +1494,32 @@
     font-size: 0.68rem;
     color: var(--text-secondary);
   }
-  .board-chip-assignee { color: var(--accent); border-color: var(--accent); }
+  /* Assignee and tag pills get their own color, spread evenly around the
+     hue wheel (web/agents/chip_colors.js) via an inline `--chip-hue`
+     custom property set per element; the fallback below only applies if
+     that property is ever missing. */
+  .board-chip-assignee {
+    color: hsl(var(--chip-hue, 231) 70% 68%);
+    border-color: hsl(var(--chip-hue, 231) 70% 68%);
+  }
   .board-chip-host { color: var(--claimed); border-color: var(--claimed); }
   .board-chip-assigned-host { color: var(--yielded); border-color: var(--yielded); border-style: dashed; }
   .board-chip-snoozed { color: var(--yielded); border-color: var(--yielded); }
+  /* Tag chip — clicking it toggles the shared tag filter to exactly this
+     tag (board.js's `applyTagFilterFrom`); `active` marks the chip(s)
+     matching the currently-applied filter with a filled style, so a
+     second click reads as "un-apply". */
+  .board-chip-tag {
+    cursor: pointer;
+    color: hsl(var(--chip-hue, 231) 70% 68%);
+    border-color: hsl(var(--chip-hue, 231) 70% 68%);
+    background: hsl(var(--chip-hue, 231) 70% 68% / 0.12);
+  }
+  .board-chip-tag:hover { filter: brightness(1.15); }
+  .board-chip-tag.active {
+    background: hsl(var(--chip-hue, 231) 70% 68%);
+    color: var(--bg-primary);
+  }
   /* Session chip → graph tab — a clickable chip on a card whose
      session is live, distinct from the plain (non-interactive) chips
      above it. */
@@ -1639,11 +1661,13 @@
     display: inline-flex;
     align-items: center;
     gap: 0.25rem;
-    background: var(--bg-elev);
-    border: 1px solid var(--border);
+    /* Colored per tag, same `--chip-hue` custom property and formula as
+       the card face's `.board-chip-tag` (web/agents/chip_colors.js). */
+    background: hsl(var(--chip-hue, 231) 70% 68% / 0.12);
+    border: 1px solid hsl(var(--chip-hue, 231) 70% 68%);
     border-radius: 999px;
     padding: 0.1rem 0.25rem 0.1rem 0.5rem;
-    color: var(--text-secondary);
+    color: hsl(var(--chip-hue, 231) 70% 68%);
     font-size: 0.75rem;
   }
   .drawer-tag-chip-remove {
@@ -2020,8 +2044,8 @@
   <div id="board-lanes"></div>
   <div class="board-drop-tray" id="board-drop-tray" aria-label="Board quick actions">
     <span class="board-drop-tray-label">Assign</span>
-    <div id="board-assignee-drops" role="group" aria-label="Filter board by assignee, or drop a card here to assign it"></div>
     <button type="button" class="board-drop-target board-done-drop" id="board-done-drop" title="Done">Done</button>
+    <div id="board-assignee-drops" role="group" aria-label="Filter board by assignee, or drop a card here to assign it"></div>
     <span class="board-drop-status" id="board-drop-status" role="status" aria-live="polite"></span>
   </div>
   <!-- Multi-select bulk action bar — hidden until a card is

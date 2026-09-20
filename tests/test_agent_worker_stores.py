@@ -218,6 +218,62 @@ def test_unpriced_migration_is_idempotent_and_preserves_existing_rows(tmp_path: 
 
 
 @pytest.mark.unit
+def test_pending_questions_kind_migration_is_idempotent_and_accepts_budget(tmp_path: Path):
+    """Simulates opening a legacy DB whose `pending_questions` table
+    predates the `kind` column (a real shape this schema has had) with the
+    current code. The migration must add the column — defaulting existing
+    rows to `'clarification'` — without touching other data, running it a
+    second time (a second `SessionStore` against the same file) must be a
+    no-op, and a `'budget'` kind (a plain value in a free-text column, not
+    a new column of its own) must read and write normally afterward."""
+    import sqlite3
+
+    db_path = tmp_path / "legacy_questions.db"
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            """
+            CREATE TABLE pending_questions (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id        TEXT NOT NULL,
+                task_id           TEXT NOT NULL,
+                question          TEXT NOT NULL,
+                sent_message_id   INTEGER NOT NULL,
+                sent_at           INTEGER NOT NULL,
+                answer            TEXT,
+                answered_at       INTEGER,
+                processed         INTEGER NOT NULL DEFAULT 0,
+                timed_out         INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO pending_questions (session_id, task_id, question, "
+            "sent_message_id, sent_at) VALUES (?, ?, ?, ?, ?)",
+            ("sess_legacy", "legacy-1", "old clarification", 42, 1000),
+        )
+
+    # Opening it runs the migration.
+    store = SessionStore(db_path=db_path)
+    rows = store.list_open_questions()
+    assert len(rows) == 1
+    assert rows[0]["kind"] == "clarification"  # backfilled default
+
+    # A fresh 'budget' kind question round-trips normally on the migrated DB.
+    store.create(task_id="t-new", session_id="sess_new")
+    qid = store.create_pending_question(
+        "sess_new", "t-new", "hit its budget", sent_message_id=99, kind="budget",
+    )
+    assert qid
+    budget_rows = [r for r in store.list_open_questions() if r["kind"] == "budget"]
+    assert len(budget_rows) == 1
+
+    # Re-opening (second migration pass) must be a no-op, not an error.
+    store2 = SessionStore(db_path=db_path)
+    rows2 = store2.list_open_questions()
+    assert {r["kind"] for r in rows2} == {"clarification", "budget"}
+
+
+@pytest.mark.unit
 def test_new_session_id_is_unique():
     seen = {new_session_id() for _ in range(100)}
     assert len(seen) == 100
@@ -341,3 +397,50 @@ def test_spend_tracker_rejects_negative(tmp_path: Path):
         tr.record(-1.0)
     with pytest.raises(ValueError):
         tr.can_start_task(-0.5)
+
+
+@pytest.mark.unit
+def test_spend_tracker_effective_cap_defaults_to_configured(tmp_path: Path):
+    tr = SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=50.0)
+    assert tr.effective_cap_dollars() == pytest.approx(50.0)
+
+
+@pytest.mark.unit
+def test_spend_tracker_raised_cap_scoped_to_that_day_only(tmp_path: Path):
+    tr = SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=10.0)
+    today = date(2026, 1, 1)
+    tomorrow = today + timedelta(days=1)
+    assert tr.set_cap_override(150.0, today=today) == 150.0
+    assert tr.effective_cap_dollars(today=today) == pytest.approx(150.0)
+    # A different date never sees the override — reverts to the configured cap.
+    assert tr.effective_cap_dollars(today=tomorrow) == pytest.approx(10.0)
+    # The raised cap is what actually gates claiming for that day.
+    tr.record(100.0, today=today)
+    assert tr.can_start_task(40.0, today=today)
+    assert not tr.can_start_task(51.0, today=today)
+
+
+@pytest.mark.unit
+def test_spend_tracker_raised_cap_persists_across_instances(tmp_path: Path):
+    """A worker restart must not lose an operator's `raise to $N` for today."""
+    db_path = tmp_path / "sessions.db"
+    today = date(2026, 1, 1)
+    tr1 = SpendTracker(db_path=db_path, daily_cap_dollars=10.0)
+    tr1.set_cap_override(200.0, today=today)
+    tr2 = SpendTracker(db_path=db_path, daily_cap_dollars=10.0)
+    assert tr2.effective_cap_dollars(today=today) == pytest.approx(200.0)
+
+
+@pytest.mark.unit
+def test_spend_tracker_notified_cap_tracks_per_day_and_per_value(tmp_path: Path):
+    tr = SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=10.0)
+    today = date(2026, 1, 1)
+    tomorrow = today + timedelta(days=1)
+    assert tr.notified_cap_dollars(today=today) is None
+    tr.mark_cap_notified(10.0, today=today)
+    assert tr.notified_cap_dollars(today=today) == pytest.approx(10.0)
+    # A different value (e.g. after a raise) is a fresh crossing to notify.
+    tr.mark_cap_notified(150.0, today=today)
+    assert tr.notified_cap_dollars(today=today) == pytest.approx(150.0)
+    # A new day starts with no notice recorded, regardless of yesterday's.
+    assert tr.notified_cap_dollars(today=tomorrow) is None

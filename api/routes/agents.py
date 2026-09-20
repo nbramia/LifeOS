@@ -1073,6 +1073,7 @@ def _pending_question_view(pq: dict[str, Any]) -> dict[str, Any]:
         "question": pq["question"],
         "asked_at": pq["sent_at"],
         "bot": pq.get("bot"),
+        "kind": pq.get("kind") or "clarification",
     }
 
 
@@ -1186,6 +1187,8 @@ def _schedule_card(entry) -> dict[str, Any]:
         "effort": entry.effort,
         "host": entry.host,
         "working_dir": entry.working_dir,
+        "budget_dollars": entry.budget_dollars,
+        "wall_seconds": entry.wall_seconds,
     }
 
 
@@ -1225,7 +1228,9 @@ def _build_board() -> dict[str, Any]:
         ))
 
     for entry in scheduler_store.list_all():
-        bucket = "scheduled" if agent_board.is_schedule_active(entry.enabled, entry.next_trigger_at) else "done"
+        bucket = "scheduled" if agent_board.is_schedule_active(
+            entry.enabled, entry.next_trigger_at, entry.schedule_type,
+        ) else "done"
         lanes[bucket].append(_schedule_card(entry))
 
     return {"lanes": lanes, "generated_at": int(time.time()), "api_host": api_host_name()}

@@ -280,9 +280,47 @@ def test_preflight_budget_partial_uses_defaults():
                         "ambiguity": None, "sane": True, "sane_reason": ""})
     result = pf.run_preflight(title="x", tags=["agent", "local"], caller=_stub(reply))
     assert result.budget.wall_seconds == 60
-    # max_tokens / max_dollars come from defaults — strictly positive
-    assert result.budget.max_tokens > 0
+    # max_tokens defaults to None (no cap) — max_dollars still comes from
+    # settings and is strictly positive.
+    assert result.budget.max_tokens is None
     assert result.budget.max_dollars > 0
+
+
+@pytest.mark.unit
+def test_preflight_no_budget_hint_defaults_to_no_token_cap_and_ten_dollars():
+    """No hint in the title: `max_tokens` is None (opt-in only) and
+    `max_dollars` is the settings default ($10.00), a backstop rather than
+    a quota ordinary tasks are expected to approach."""
+    reply = json.dumps({"budget": {}, "routing": "local", "routing_reason": "x",
+                        "expected_output": "text", "ambiguity": None,
+                        "sane": True, "sane_reason": ""})
+    result = pf.run_preflight(title="research dolphins", tags=["agent", "local"], caller=_stub(reply))
+    assert result.budget.max_tokens is None
+    assert result.budget.max_dollars == pytest.approx(10.0)
+
+
+@pytest.mark.unit
+def test_preflight_title_hint_sets_explicit_token_cap():
+    """A title naming a token amount (e.g. '50k tokens') still produces and
+    enforces that explicit `max_tokens` value, overriding the no-cap default."""
+    reply = _golden_reply(budget={"wall_seconds": 14400, "max_tokens": 50000, "max_dollars": 5.0})
+    result = pf.run_preflight(title="summarize the report, 50k tokens", tags=["agent", "local"], caller=_stub(reply))
+    assert result.budget.max_tokens == 50000
+
+
+@pytest.mark.unit
+def test_preflight_parses_a_schedule_rendered_budget_hint():
+    """A schedule with its own `budget_dollars`/`wall_seconds` renders them
+    into the created task's title as "max $2.00" and "30 min"
+    (api/services/scheduler_store.py's `_budget_hint_suffix`) — the exact
+    hint grammar docs/specs/product/agent-worker.md § Budgets documents.
+    The classifier is stubbed with the budget a real Haiku call would parse
+    from that title, and the result carries it through unchanged."""
+    title = "Draft my weekly review (max $2.00, 30 min)"
+    reply = _golden_reply(budget={"wall_seconds": 1800, "max_tokens": None, "max_dollars": 2.0})
+    result = pf.run_preflight(title=title, tags=["agent", "cloud"], caller=_stub(reply))
+    assert result.budget.max_dollars == pytest.approx(2.0)
+    assert result.budget.wall_seconds == 1800
 
 
 # ---------------------------------------------------------------------------

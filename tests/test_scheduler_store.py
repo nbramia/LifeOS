@@ -631,6 +631,97 @@ class TestRoundTrip:
         assert _format_entry_line(reparsed) == line
 
 
+class TestScheduleBudget:
+    """`[budget:: …]` / `[wall:: …]` — an `action:: agent` schedule's own
+    dollar/wall-clock budget, round-tripped through Markdown."""
+
+    @pytest.mark.parametrize("raw,expected", [("$2", 2.0), ("2", 2.0), ("2.50", 2.5)])
+    def test_budget_field_accepts_dollar_sign_bare_and_decimal(self, raw, expected):
+        line = (
+            f"- [ ] Weekly review [cron:: 0 9 * * 6] [action:: agent] "
+            f"[budget:: {raw}] <!-- id:bud1 -->"
+        )
+        entry = _parse_entry_line(line)
+        assert entry is not None
+        assert entry.budget_dollars == pytest.approx(expected)
+
+    @pytest.mark.parametrize("raw,expected_seconds", [
+        ("30m", 1800), ("2h", 7200), ("90 min", 5400), ("3600s", 3600),
+    ])
+    def test_wall_field_accepts_minutes_hours_and_seconds(self, raw, expected_seconds):
+        line = (
+            f"- [ ] Weekly review [cron:: 0 9 * * 6] [action:: agent] "
+            f"[wall:: {raw}] <!-- id:wal1 -->"
+        )
+        entry = _parse_entry_line(line)
+        assert entry is not None
+        assert entry.wall_seconds == expected_seconds
+
+    def test_missing_budget_and_wall_fields_stay_none(self):
+        line = "- [ ] Weekly review [cron:: 0 9 * * 6] [action:: agent] <!-- id:none1 -->"
+        entry = _parse_entry_line(line)
+        assert entry is not None
+        assert entry.budget_dollars is None
+        assert entry.wall_seconds is None
+
+    def test_malformed_budget_field_leaves_it_none(self, caplog):
+        line = (
+            "- [ ] Weekly review [cron:: 0 9 * * 6] [action:: agent] "
+            "[budget:: not-a-number] <!-- id:bud2 -->"
+        )
+        with caplog.at_level("WARNING"):
+            entry = _parse_entry_line(line)
+        assert entry is not None
+        assert entry.budget_dollars is None
+        assert "bud2" in caplog.text
+
+    def test_malformed_wall_field_leaves_it_none(self, caplog):
+        line = (
+            "- [ ] Weekly review [cron:: 0 9 * * 6] [action:: agent] "
+            "[wall:: not-a-duration] <!-- id:wal2 -->"
+        )
+        with caplog.at_level("WARNING"):
+            entry = _parse_entry_line(line)
+        assert entry is not None
+        assert entry.wall_seconds is None
+        assert "wal2" in caplog.text
+
+    def test_format_emits_budget_and_wall_only_when_set(self):
+        entry = ScheduleEntry(
+            id="bw1", name="Weekly review", schedule_type="cron", schedule_value="0 9 * * 6",
+            action="agent", message_content="Draft it",
+            budget_dollars=2.0, wall_seconds=1800,
+        )
+        line = _format_entry_line(entry)
+        assert "[budget:: $2]" in line
+        assert "[wall:: 30m]" in line
+
+        entry_unset = ScheduleEntry(
+            id="bw2", name="Weekly review", schedule_type="cron", schedule_value="0 9 * * 6",
+            action="agent", message_content="Draft it",
+        )
+        line_unset = _format_entry_line(entry_unset)
+        assert "[budget::" not in line_unset
+        assert "[wall::" not in line_unset
+
+    @pytest.mark.parametrize("budget_dollars,wall_seconds", [
+        (2.0, 1800), (0.5, 90), (2.55, 3600), (None, 1800), (2.0, None), (None, None),
+    ])
+    def test_budget_and_wall_round_trip(self, budget_dollars, wall_seconds):
+        entry = ScheduleEntry(
+            id="rt1", name="Weekly review", schedule_type="cron", schedule_value="0 9 * * 6",
+            action="agent", message_content="Draft it",
+            budget_dollars=budget_dollars, wall_seconds=wall_seconds,
+        )
+        line = _format_entry_line(entry)
+        reparsed = _parse_entry_line(line)
+        assert reparsed.budget_dollars == budget_dollars
+        assert reparsed.wall_seconds == wall_seconds
+        # A second parse -> format round trip is a no-op — the canonical
+        # spelling written back is stable under re-parsing.
+        assert _format_entry_line(reparsed) == line
+
+
 class TestCronComputation:
     def test_cron_next_trigger(self):
         entry = ScheduleEntry(id="t", name="T", schedule_type="cron",
@@ -835,6 +926,120 @@ class TestAutoDisable:
         assert updated.enabled is True
         assert updated.next_trigger_at is not None
         assert updated.last_triggered_at is not None
+
+
+class TestManualScheduleType:
+    """A manual schedule (no cron/at) never fires on its own and is fired
+    only via the trigger path — it stays enabled and repeatable."""
+
+    def test_parses_trigger_less_line_with_action_field(self):
+        line = "- [ ] Deploy runbook [action:: agent] [mtype:: prompt] #cloud <!-- id:m1a2b3 -->"
+        entry = _parse_entry_line(line)
+        assert entry is not None
+        assert entry.schedule_type == "manual"
+        assert entry.schedule_value == ""
+        assert entry.action == "agent"
+        assert entry.executor == "cloud"
+
+    def test_format_emits_no_trigger_field(self):
+        entry = ScheduleEntry(
+            id="m1", name="Deploy runbook", schedule_type="manual", schedule_value="",
+            action="agent", message_type="prompt", executor="cloud",
+            created_at="2026-05-28T12:00:00+00:00",
+        )
+        line = _format_entry_line(entry)
+        assert "[cron::" not in line
+        assert "[at::" not in line
+        reparsed = _parse_entry_line(line)
+        assert reparsed.schedule_type == "manual"
+        assert _format_entry_line(reparsed) == line
+
+    def test_create_via_store_has_no_next_fire(self, store):
+        entry = store.create(
+            name="Deploy runbook", schedule_type="manual", schedule_value="",
+            action="notify", message_type="static", message_content="go",
+        )
+        assert entry.schedule_type == "manual"
+        assert entry.next_trigger_at is None
+        assert entry.enabled is True
+
+    def test_update_clears_cron_to_manual(self, store):
+        entry = store.create(
+            name="Weekly review", schedule_type="cron", schedule_value="0 9 * * 6",
+            action="notify", message_type="static", message_content="go",
+        )
+        assert entry.next_trigger_at is not None
+        updated = store.update(entry.id, schedule_type="manual", schedule_value="")
+        assert updated.schedule_type == "manual"
+        assert updated.next_trigger_at is None
+        assert updated.enabled is True
+        # The markdown line carries no trigger field either.
+        line = next(
+            ln for ln in store._read_inbox_lines() if f"id:{entry.id}" in ln
+        )
+        assert "[cron::" not in line
+        assert "[at::" not in line
+
+    def test_tick_skips_manual(self, store):
+        store.create(
+            name="Deploy runbook", schedule_type="manual", schedule_value="",
+            action="notify", message_type="static", message_content="go",
+        )
+        assert store.get_due_reminders() == []
+
+    def test_rebuild_index_skips_manual_without_error(self, store):
+        store.create(
+            name="Deploy runbook", schedule_type="manual", schedule_value="",
+            action="notify", message_type="static", message_content="go",
+        )
+        store.rebuild_index()
+        entries = store.list_all()
+        assert len(entries) == 1
+        assert entries[0].schedule_type == "manual"
+        assert entries[0].next_trigger_at is None
+
+    @pytest.mark.asyncio
+    async def test_trigger_fires_and_stays_enabled_and_repeatable(self, store):
+        entry = store.create(
+            name="Deploy runbook", schedule_type="manual", schedule_value="",
+            action="notify", message_type="static", message_content="ship it",
+        )
+        scheduler = SchedulerScheduler(store)
+        with patch("api.services.telegram.send_message_async",
+                   new_callable=AsyncMock, return_value=True) as mock_send:
+            await scheduler._fire_entry(entry, manual=True)
+        refreshed = store.get(entry.id)
+        assert refreshed.enabled is True
+        assert refreshed.next_trigger_at is None
+        assert refreshed.last_triggered_at is not None
+        assert mock_send.call_count == 1
+
+        # Triggering again fires a second time — a manual schedule is never
+        # consumed the way a `once` schedule is.
+        with patch("api.services.telegram.send_message_async",
+                   new_callable=AsyncMock, return_value=True) as mock_send2:
+            await scheduler._fire_entry(refreshed, manual=True)
+        refreshed_again = store.get(entry.id)
+        assert refreshed_again.enabled is True
+        assert mock_send2.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_once_schedule_is_still_consumed_by_trigger(self, store):
+        """Existing behavior preserved: triggering a `once` schedule still
+        disables it and clears its next fire, exactly like an unattended
+        fire would."""
+        future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        entry = store.create(
+            name="One-off", schedule_type="once", schedule_value=future,
+            action="notify", message_type="static", message_content="hi",
+        )
+        scheduler = SchedulerScheduler(store)
+        with patch("api.services.telegram.send_message_async",
+                   new_callable=AsyncMock, return_value=True):
+            await scheduler._fire_entry(entry, manual=True)
+        refreshed = store.get(entry.id)
+        assert refreshed.enabled is False
+        assert refreshed.next_trigger_at is None
 
 
 class TestDashboard:
@@ -1070,6 +1275,36 @@ class TestActionDispatch:
         refreshed = scheduler.store.get(entry.id)
         assert refreshed.last_status == "handed-off"
         assert "task42" in refreshed.last_result
+
+    @pytest.mark.asyncio
+    async def test_agent_action_renders_its_own_budget_into_the_task_title(self, scheduler):
+        """A schedule carrying its own `budget_dollars`/`wall_seconds`
+        renders both into the created task's title in the hint grammar the
+        agent worker's preflight parses ("max $X.XX", "Y min"), so the
+        card's budget equals the schedule's on every fire."""
+        entry = scheduler.store.create(
+            name="Weekly review", schedule_type="cron", schedule_value="0 9 * * 6",
+            action="agent", executor="cloud", message_content="Draft my weekly review",
+            budget_dollars=2.0, wall_seconds=1800,
+        )
+        fake_tm = MagicMock()
+        fake_tm.create.return_value = MagicMock(id="task-budget")
+        with patch("api.services.task_manager.get_task_manager", return_value=fake_tm):
+            await scheduler._fire_entry(entry)
+        kwargs = fake_tm.create.call_args.kwargs
+        assert kwargs["description"] == "Draft my weekly review (max $2.00, 30 min)"
+
+    @pytest.mark.asyncio
+    async def test_agent_action_without_budget_leaves_the_task_title_unchanged(self, scheduler):
+        entry = scheduler.store.create(
+            name="Weekly review", schedule_type="cron", schedule_value="0 9 * * 6",
+            action="agent", executor="cloud", message_content="Draft my weekly review",
+        )
+        fake_tm = MagicMock()
+        fake_tm.create.return_value = MagicMock(id="task-no-budget")
+        with patch("api.services.task_manager.get_task_manager", return_value=fake_tm):
+            await scheduler._fire_entry(entry)
+        assert fake_tm.create.call_args.kwargs["description"] == "Draft my weekly review"
 
     @pytest.mark.asyncio
     async def test_agent_action_local_executor_tag(self, scheduler):
