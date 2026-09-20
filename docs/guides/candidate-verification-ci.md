@@ -87,6 +87,19 @@ gh run download <run-id> --pattern 'lane-receipts-*' --dir /tmp/lane-receipts
   --lane-log-dir /tmp/lane-receipts/lane-receipts-<sha>-part3
 ```
 
+Each part also uploads `impact-selection-<candidate sha>-part<n>`, holding
+`impact_selection.json`: what a
+static import-graph selector (`scripts/test_impact.py`, run from the runner's
+checkout over the candidate tree without importing it) would have run for
+this candidate — its mode (`select`, or `full` when a changed path could
+reach tests outside the import graph: the conftest or any helper under
+`tests/`, a dependency manifest, the workflow, a verifier input, or an
+unmodeled file type), the selected modules and their share of recorded
+duration, and which failing modules in that part fell outside the selection.
+The same table is appended to the job's step summary. This is measurement
+only; the gate ran every retained lane regardless, and the verifier's
+arguments do not depend on it.
+
 The full lane log (pytest's own output) is uploaded only from a failed part,
 under `lane-logs-<candidate sha>-part<n>`.
 
@@ -186,9 +199,13 @@ runner's own `scripts/candidate_reuse.py`, reuses a
 `candidate-verification-shadow` verdict only when the App published it, its
 conclusion is `success`, its `trusted_runner` and `tree` equal the run's own,
 its `mode` is `executed`, and its `lanes` cover every lane the run selected.
-The check summary then names the reused check. Any mismatch, a missing
-App id, an unreachable head, or a malformed record executes the lanes as
-usual; a shadow run never reuses anything. Reuse only recognises
+The check summary then names the reused check. The App id the runner
+matches against is `vars.LIFEOS_CANDIDATE_APP_ID` read from the execution
+job, which has no environment, so the variable must exist at repository
+scope (an environment-scoped copy on the publisher's environment is invisible
+there and leaves the reuse step skipped). Any mismatch, a missing App id, an
+unreachable head, or a malformed record executes the lanes as usual; a shadow
+run never reuses anything. Reuse only recognises
 verification this runner already performed on identical bytes, so a
 candidate that a rebase changed is verified afresh.
 

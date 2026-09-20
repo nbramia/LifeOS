@@ -134,6 +134,7 @@ jobs:
                  || git -C candidate diff --name-only "$TRUSTED_RUNNER_SHA" "$CANDIDATE_SHA" 2>/dev/null; } \
             || true)"
           echo "changed files:"; printf '%s\n' "$CHANGED" | sed 's/^/  /'
+          printf '%s\n' "$CHANGED" > "$RUNNER_TEMP/lifeos-changed-files"
           printf '%s\n' "$CHANGED" | python3 trusted-runner/scripts/candidate_lanes.py | tee "$RUNNER_TEMP/lifeos-lane-selection"
           cat "$RUNNER_TEMP/lifeos-lane-selection" >> "$GITHUB_OUTPUT"
           echo "tree=$(git -C candidate rev-parse "$CANDIDATE_SHA^{tree}")" >> "$GITHUB_OUTPUT"
@@ -270,6 +271,23 @@ jobs:
             --part-count "${{ strategy.job-total }}" \
             --parallel-browser-free
 
+      # Measurement only: what an import-graph selector would have run for
+      # this candidate, recorded next to what actually ran and whether any
+      # failing module fell outside it. Nothing above reads this; the gate
+      # executed every retained lane regardless. The runner's own script
+      # parses the candidate tree and never imports it.
+      - name: Record the shadow test-impact selection
+        if: ${{ always() && steps.select.outputs.mode == 'executed' && steps.reuse.outputs.mode != 'reused' }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/lifeos-impact"
+          python3 trusted-runner/scripts/test_impact.py \
+            --root candidate \
+            --changed-files "$RUNNER_TEMP/lifeos-changed-files" \
+            --durations trusted-runner/scripts/lane_scope_durations.json \
+            --receipts "$RUNNER_TEMP/lifeos-lane-logs" \
+            --output "$RUNNER_TEMP/lifeos-impact/impact_selection.json" \
+            --summary "$GITHUB_STEP_SUMMARY"
+
       # The step above prints only its summary JSON; pytest's own output goes
       # to the lane log. Without this a failing lane names no test, so the
       # log is retained on failure and nowhere else — a passing lane's log
@@ -298,6 +316,19 @@ jobs:
           name: lane-receipts-${{ env.CANDIDATE_SHA }}-part${{ matrix.part }}
           path: ${{ runner.temp }}/lifeos-lane-logs/*.json
           if-no-files-found: warn
+          retention-days: 30
+
+      # Its own artifact, not a second path on the receipts one: an artifact
+      # is rooted at the common ancestor of every path it lists, so sharing
+      # would push the receipts a level down and out of reach of the
+      # documented `record-scope-durations` regeneration.
+      - name: Retain the shadow test-impact selection
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: impact-selection-${{ env.CANDIDATE_SHA }}-part${{ matrix.part }}
+          path: ${{ runner.temp }}/lifeos-impact/impact_selection.json
+          if-no-files-found: ignore
           retention-days: 30
 
   publish-aggregate:

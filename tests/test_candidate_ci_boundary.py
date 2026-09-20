@@ -132,7 +132,7 @@ def test_partitioned_execution_derives_its_part_count_from_the_matrix():
     # Receipts (outcomes and durations, never test output) are retained from
     # every part whatever its result; the full lane log only from a failure.
     receipts = workflow[workflow.index("name: Retain the lane-execution receipts"):]
-    receipts = receipts[:receipts.index("publish-aggregate:")]
+    receipts = receipts[:receipts.index("\n      - ")]
     assert "if: ${{ always() }}" in receipts
     assert "lane-receipts-${{ env.CANDIDATE_SHA }}-part${{ matrix.part }}" in receipts
     assert "lifeos-lane-logs/*.json" in receipts
@@ -141,6 +141,28 @@ def test_partitioned_execution_derives_its_part_count_from_the_matrix():
     lane_logs = lane_logs[:lane_logs.index("name: Retain the lane-execution receipts")]
     assert "if: ${{ failure() }}" in lane_logs
     assert "download-artifact" not in workflow
+
+    # The shadow test-impact report is recorded after the lanes ran, from the
+    # runner's own script, into a directory the receipts artifact carries but
+    # the duration record never globs; the verifier's arguments are untouched.
+    verify_at = workflow.index("name: Verify the retained lanes")
+    impact_at = workflow.index("name: Record the shadow test-impact selection")
+    assert verify_at < impact_at < workflow.index("name: Retain the lane log from a failed verification")
+    impact = workflow[impact_at:workflow.index("\n      - ", impact_at)]
+    assert "if: ${{ always() && steps.select.outputs.mode == 'executed' && steps.reuse.outputs.mode != 'reused' }}" in impact
+    assert "python3 trusted-runner/scripts/test_impact.py" in impact
+    assert '--output "$RUNNER_TEMP/lifeos-impact/impact_selection.json"' in impact
+    assert "test_impact" not in workflow[verify_at:impact_at]
+    # The receipts artifact lists exactly one path, so its root stays the lane
+    # log directory and the documented regeneration command finds the
+    # receipts at the top level; the report travels in its own artifact.
+    assert "path: ${{ runner.temp }}/lifeos-lane-logs/*.json" in receipts
+    assert "lifeos-impact" not in receipts
+    report = workflow[workflow.index("name: Retain the shadow test-impact selection"):]
+    report = report[:report.index("publish-aggregate:")]
+    assert "impact-selection-${{ env.CANDIDATE_SHA }}-part${{ matrix.part }}" in report
+    assert "path: ${{ runner.temp }}/lifeos-impact/impact_selection.json" in report
+    assert "if: ${{ always() }}" in report
 
 
 @pytest.mark.unit
