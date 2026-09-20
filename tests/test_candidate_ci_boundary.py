@@ -186,7 +186,11 @@ def test_candidate_workflow_caches_the_test_environment_only_from_wheel_installa
     assert "actions/cache/save" not in workflow[verify_at:]
     assert "actions/cache" not in workflow[workflow.index("publish-aggregate:"):]
     restore = workflow[restore_at:install_at]
-    assert "key: lifeos-test-env-v1-${{ runner.os }}-py${{ steps.python.outputs.python-version }}-torch${{ env.TORCH_CPU_VERSION }}-${{ hashFiles('candidate/requirements.txt') }}" in restore
+    assert "key: lifeos-test-env-v1-${{ runner.os }}-py${{ steps.python.outputs.python-version }}-torch${{ env.TORCH_CPU_VERSION }}-${{ hashFiles('candidate/requirements.txt') }}-${{ steps.cache-window.outputs.week }}" in restore
+    # Open requirement ranges resolve at build time, so the key carries the
+    # ISO week to bound how old a restored resolution can be.
+    window = workflow[workflow.index("name: Bound the cached environment's age"):restore_at]
+    assert 'echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"' in window
     save = workflow[save_at:verify_at]
     assert "steps.env-cache.outputs.cache-hit != 'true'" in save
     assert "key: ${{ steps.env-cache.outputs.cache-primary-key }}" in save
@@ -194,6 +198,7 @@ def test_candidate_workflow_caches_the_test_environment_only_from_wheel_installa
     assert 'if [ "$CACHE_HIT" != "true" ]; then' in install
     assert "python -m playwright install-deps chromium" in install
     assert 'test "$(python -m pip freeze --all | LC_ALL=C sort | sha256sum)" = "$(cat "$FINGERPRINT")"' in install
+    assert 'echo "$VENV/bin" >> "$GITHUB_PATH"' in install
     assert "--no-binary" not in install
     assert install.count("--only-binary=:all:") == 2
     # The identity proof runs on both paths: it sits after the branch closes.

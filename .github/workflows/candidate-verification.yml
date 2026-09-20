@@ -173,12 +173,19 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: candidate/requirements.txt
-      # The installed environment is a pure function of the runner image, the
-      # interpreter, the declared torch CPU build, and the requirements file,
-      # so it is restored from a cache keyed on exactly those. It is saved
-      # below only from the install step -- wheels only, `--only-binary`, no
-      # candidate code has run yet -- so what any later run restores is the
-      # product of wheel installation and nothing else.
+      # The installed environment is restored from a cache keyed on what
+      # determines it -- runner image, interpreter, the declared torch CPU
+      # build, the requirements file -- plus the ISO week, because most
+      # requirements are open ranges: a restored environment is whatever
+      # those ranges resolved to when the key was first built, so the week
+      # bounds how stale that resolution can get. It is saved below only from
+      # the install step -- wheels only, `--only-binary`, no candidate code
+      # has run yet -- so what any later run restores is the product of wheel
+      # installation and nothing else.
+      - name: Bound the cached environment's age
+        id: cache-window
+        if: ${{ steps.select.outputs.mode == 'executed' && steps.reuse.outputs.mode != 'reused' }}
+        run: echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"
       - name: Restore the installed CPU test environment
         id: env-cache
         if: ${{ steps.select.outputs.mode == 'executed' && steps.reuse.outputs.mode != 'reused' }}
@@ -187,7 +194,7 @@ jobs:
           path: |
             ${{ runner.temp }}/lifeos-venv
             ~/.cache/ms-playwright
-          key: lifeos-test-env-v1-${{ runner.os }}-py${{ steps.python.outputs.python-version }}-torch${{ env.TORCH_CPU_VERSION }}-${{ hashFiles('candidate/requirements.txt') }}
+          key: lifeos-test-env-v1-${{ runner.os }}-py${{ steps.python.outputs.python-version }}-torch${{ env.TORCH_CPU_VERSION }}-${{ hashFiles('candidate/requirements.txt') }}-${{ steps.cache-window.outputs.week }}
       - name: Install the declared CPU test environment
         if: ${{ steps.select.outputs.mode == 'executed' && steps.reuse.outputs.mode != 'reused' }}
         env:
