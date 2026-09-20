@@ -6357,8 +6357,6 @@ class Worker:
             or fields.get(HANDOFF_SOURCE_TURN_FIELD) != turn_id
         ):
             return True
-        if self.session_store.is_cancelled(session.task_id, attempt_id, turn_id):
-            return True
         if not any(
             event.get("kind") == HANDOFF_QUIESCENT_EVENT
             and (event.get("payload") or {}).get("operation_id") == operation_id
@@ -6373,6 +6371,11 @@ class Worker:
                 "turn_id": turn_id,
                 "executor": getattr(outcome, "executor", None) or session.routing,
             })
+        # The executor has genuinely returned from this exact turn, so retain
+        # that stop evidence even when cancellation won the race.  The guard
+        # still prevents source completion, finalization, and child release.
+        if self.session_store.is_cancelled(session.task_id, attempt_id, turn_id):
+            return True
         if not self.session_store.update_status(
             session.task_id, STATUS_COMPLETED,
             attempt_id=attempt_id, turn_id=turn_id, project=False,
@@ -6541,6 +6544,11 @@ class Worker:
         session = current
         title = task.get("description", session.task_id)
         sid = session.session_id
+        # A matching handoff consumes this returned turn before ordinary
+        # cancellation handling.  Its recorder keeps exact-turn quiescence,
+        # but its own cancellation guard prevents every activation effect.
+        if self._maybe_finalize_project_handoff(session, outcome):
+            return
         # Cancellation is a durable exact-turn decision, not merely a
         # transcript/status hint. Executors may return a clean terminal result
         # after cancellation races their final provider event; check the fence
@@ -6558,8 +6566,6 @@ class Worker:
                 "attempt_id": getattr(outcome, "attempt_id", None),
                 "turn_id": getattr(outcome, "turn_id", None),
             })
-            return
-        if self._maybe_finalize_project_handoff(session, outcome):
             return
         # A backend can deliver a terminal success after the operator's kill
         # raced its final event. Cancellation is terminal for this attempt;

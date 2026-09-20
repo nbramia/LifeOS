@@ -1306,23 +1306,28 @@ def teardown_session(
     session whose `host` names a machine other than the API host — None
     (the default) uses a real `subprocess.run` over ssh.
 
-    Returns `{"managed_failure": <reason or None>}` so the caller can
-    surface partial-success in its response.
+    `managed_stop_verified` is true only after the existing Managed state
+    probe observes a terminal provider state.  A successful-looking kill
+    request, a missing driver, or the local status transition is not proof.
     """
     managed_failure: str | None = None
+    managed_status: str | None = None
+    managed_stop_verified = False
     from api.services.agent_worker.executor_lifecycle import (
         CancelResult, ExecutorCapabilities, ExecutorRegistry,
     )
 
     def cancel_route(session, reason):
-        nonlocal managed_failure
+        nonlocal managed_failure, managed_status, managed_stop_verified
         if session.managed_agent_session_id and managed_driver is not None:
             try:
                 managed_driver.kill_session(session.managed_agent_session_id, reason=reason)
                 remote = managed_driver.get_session_state(session.managed_agent_session_id)
-                if remote.status not in {
+                managed_status = remote.status
+                managed_stop_verified = remote.status in {
                     "idle", "completed", "failed", "cancelled", "budget_exceeded",
-                }:
+                }
+                if not managed_stop_verified:
                     managed_failure = f"managed runtime still reports {remote.status}"
             except Exception as exc:  # noqa: BLE001 — local teardown still proceeds
                 managed_failure = str(exc)
@@ -1354,7 +1359,11 @@ def teardown_session(
     # alone doesn't stop the OS process (the worker's `claude -p` keeps running
     # until the next poll) — this reaps it promptly so an operator kill actually
     # stops compute within seconds.
-    return {"managed_failure": managed_failure}
+    return {
+        "managed_failure": managed_failure,
+        "managed_status": managed_status,
+        "managed_stop_verified": managed_stop_verified,
+    }
 
 
 def kill(ctx: InterAgentContext, args: dict) -> dict:

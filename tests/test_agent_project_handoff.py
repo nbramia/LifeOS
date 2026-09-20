@@ -17,7 +17,12 @@ from api.services.agent_worker.execution import (
     ExecutionConstraints,
     ExecutionSpec,
 )
-from api.services.agent_worker.inter_agent import Caps, InterAgentContext, dispatch
+from api.services.agent_worker.inter_agent import (
+    Caps,
+    InterAgentContext,
+    dispatch,
+    teardown_session,
+)
 from api.services.agent_worker.local_executor import ExecutorOutcome
 from api.services.agent_worker.session_store import (
     STATUS_BLOCKED,
@@ -36,6 +41,7 @@ from api.services.task_projects import (
     HANDOFF_QUIESCENT_EVENT,
     HANDOFF_READY_AT_FIELD,
     HANDOFF_REQUEST_EVENT,
+    HANDOFF_SOURCE_ATTEMPT_FIELD,
     HANDOFF_SOURCE_TURN_FIELD,
     LAST_ABORTED_HANDOFF_FIELD,
     LAST_HANDOFF_OPERATION_FIELD,
@@ -347,32 +353,90 @@ def test_existing_project_uses_plan_and_cannot_handoff(handoff):
 
 
 @pytest.mark.asyncio
-async def test_cancellation_wins_and_releases_no_staged_work(handoff):
+async def test_cancellation_wins_then_returned_turn_releases_no_staged_work(
+    handoff, tmp_path: Path,
+):
+    """A cancelled exact turn retains stop proof without activating work."""
     manager, store, transcripts, source, ctx = handoff
     staged = dispatch(ctx, "lifeos_agent_project_handoff", _request())
     stopped: list[str] = []
 
     async def stop_session(session):
         stopped.append(session.session_id)
-        store.update_status(
-            session.task_id,
-            "failed",
-            attempt_id=session.attempt_id,
-            turn_id=session.turn_id,
-            project=False,
+        result = teardown_session(
+            store,
+            transcripts,
+            session,
+            transcript_kind="operator_killed",
+            transcript_payload={"reason": "project cancellation"},
+            managed_driver=None,
         )
-        return [session.session_id], []
+        failures = []
+        if result["managed_failure"]:
+            failures.append({
+                "session_id": session.session_id,
+                "reason": result["managed_failure"],
+            })
+        return [session.session_id], failures
 
-    result = await ProjectTaskService(
+    service = ProjectTaskService(
         manager,
         store,
         transcripts,
         session_teardown=stop_session,
-    ).cancel_project(source.task_id, operation_id="cancel-synthetic-v1")
+    )
+    first = await service.cancel_project(
+        source.task_id, operation_id="cancel-synthetic-v1",
+    )
 
-    assert result["complete"] is True
+    assert first["complete"] is False
+    assert first["pending"] is True
+    assert first["failures"]
     assert source.session_id in stopped
     assert staged["coordinator_session_id"] in stopped
+    assert manager.get(source.task_id).status != "cancelled"
+    assert all(
+        child.status == "cancelled"
+        for child in build_task_hierarchy(manager.list_tasks()).children(source.task_id)
+    )
+
+    worker, finalizers = _handoff_worker(tmp_path, manager, store, transcripts, service)
+    returned_source = store.get(source.task_id)
+    outcome = ExecutorOutcome(
+        status=STATUS_COMPLETED,
+        session_id=source.session_id,
+        attempt_id=source.attempt_id,
+        turn_id=source.turn_id,
+        executor="local",
+    )
+    worker._handle_outcome(
+        returned_source,
+        _task_payload(manager, source.task_id),
+        outcome,
+    )
+
+    assert finalizers == []
+    assert store.get(source.task_id).status == STATUS_FAILED
+    assert any(
+        event["kind"] == HANDOFF_QUIESCENT_EVENT
+        and event["payload"]["operation_id"] == staged["operation_id"]
+        and event["payload"]["attempt_id"] == source.attempt_id
+        and event["payload"]["turn_id"] == source.turn_id
+        for event in transcripts.read(source.session_id)
+    )
+    pending_parent = manager.get(source.task_id)
+    assert pending_parent.status == "in_progress"
+    assert pending_parent.fields[HANDOFF_OPERATION_FIELD] == staged["operation_id"]
+    assert all(
+        not manager.can_start_execution(child.id)
+        for child in build_task_hierarchy(manager.list_tasks()).children(source.task_id)
+    )
+
+    result = await service.cancel_project(
+        source.task_id, operation_id="cancel-synthetic-v1",
+    )
+
+    assert result["complete"] is True
     parent = manager.get(source.task_id)
     assert parent.status == "cancelled"
     assert HANDOFF_OPERATION_FIELD not in parent.fields
@@ -380,6 +444,64 @@ async def test_cancellation_wins_and_releases_no_staged_work(handoff):
         child.status == "cancelled"
         for child in build_task_hierarchy(manager.list_tasks()).children(parent.id)
     )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_return_with_mismatched_persisted_turn_stays_fenced(
+    handoff, tmp_path: Path,
+):
+    """A returned stale turn cannot attest a newer persisted handoff identity."""
+    manager, store, transcripts, source, ctx = handoff
+    staged = dispatch(ctx, "lifeos_agent_project_handoff", _request())
+
+    def stop_session(session):
+        teardown_session(
+            store,
+            transcripts,
+            session,
+            transcript_kind="operator_killed",
+            transcript_payload={"reason": "project cancellation"},
+            managed_driver=None,
+        )
+        return [session.session_id], []
+
+    service = ProjectTaskService(
+        manager, store, transcripts, session_teardown=stop_session,
+    )
+    first = await service.cancel_project(
+        source.task_id, operation_id="cancel-mismatched-turn",
+    )
+    assert first["pending"] is True
+    manager.update(
+        source.task_id,
+        fields={HANDOFF_SOURCE_TURN_FIELD: "turn-newer-synthetic"},
+        _project_operation="cancel",
+    )
+    worker, finalizers = _handoff_worker(tmp_path, manager, store, transcripts, service)
+
+    worker._handle_outcome(
+        store.get(source.task_id),
+        _task_payload(manager, source.task_id),
+        ExecutorOutcome(
+            status=STATUS_COMPLETED,
+            session_id=source.session_id,
+            attempt_id=source.attempt_id,
+            turn_id=source.turn_id,
+            executor="local",
+        ),
+    )
+
+    assert finalizers == []
+    assert not any(
+        event["kind"] == HANDOFF_QUIESCENT_EVENT
+        and event["payload"].get("operation_id") == staged["operation_id"]
+        for event in transcripts.read(source.session_id)
+    )
+    retry = await service.cancel_project(
+        source.task_id, operation_id="cancel-mismatched-turn",
+    )
+    assert retry["pending"] is True
+    assert retry["failures"]
 
 
 def test_worker_post_return_boundary_attests_and_calls_narrow_finalizer(tmp_path: Path):
@@ -650,18 +772,69 @@ async def test_zero_child_pending_handoff_can_be_cancelled(handoff, monkeypatch)
         manager, store, transcripts, session_teardown=stop_session,
     )
     preview = service.cancel_preview(source.task_id)
-    result = await service.cancel_project(
+    first = await service.cancel_project(
         source.task_id, operation_id="cancel-interrupted-handoff",
     )
 
     assert preview["unfinished_count"] == 0
     assert preview["running_count"] == 1
+    assert first["pending"] is True
+    assert first["failures"]
+    transcripts.append(source.session_id, HANDOFF_QUIESCENT_EVENT, {
+        "project_id": source.task_id,
+        "operation_id": _request()["operation_id"],
+        "attempt_id": source.attempt_id,
+        "turn_id": source.turn_id,
+        "executor": source.routing,
+    })
+    result = await service.cancel_project(
+        source.task_id, operation_id="cancel-interrupted-handoff",
+    )
+
     assert result["complete"] is True
     assert stopped == [source.session_id]
     parent = manager.get(source.task_id)
     assert parent.status == "cancelled"
     assert parent.fields[LAST_ABORTED_HANDOFF_FIELD] == _request()["operation_id"]
     assert HANDOFF_OPERATION_FIELD not in parent.fields
+
+
+def test_board_cancel_refuses_zero_child_handoff_before_teardown(handoff, monkeypatch):
+    """Ordinary Cancel routes a zero-child handoff away before side effects."""
+    from api.routes import agents as agent_routes
+
+    manager, store, transcripts, source, ctx = handoff
+
+    def fail_first_child(*_args, **_kwargs):
+        raise RuntimeError("synthetic interruption before first child")
+
+    monkeypatch.setattr(manager, "create_or_find_by_operation", fail_first_child)
+    assert dispatch(ctx, "lifeos_agent_project_handoff", _request())["ok"] is False
+    assert build_task_hierarchy(manager.list_tasks()).children(source.task_id) == []
+    teardown_calls: list[str] = []
+
+    async def teardown_spy(session, _reason):
+        teardown_calls.append(session.session_id)
+        return [session.session_id], []
+
+    monkeypatch.setattr("api.services.task_manager.get_task_manager", lambda: manager)
+    monkeypatch.setattr(agent_routes, "_session_store", store)
+    monkeypatch.setattr(agent_routes, "_transcript_store", transcripts)
+    monkeypatch.setattr(agent_routes, "_kill_session_subtree", teardown_spy)
+
+    response = TestClient(app).post(
+        f"/api/agents/board/cards/{source.task_id}/cancel",
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "pending handoffs use the Cancel handoff action"
+    )
+    assert teardown_calls == []
+    assert store.get(source.task_id).status == STATUS_RUNNING
+    parent = manager.get(source.task_id)
+    assert parent.status == "in_progress"
+    assert parent.fields[HANDOFF_OPERATION_FIELD] == _request()["operation_id"]
 
 
 @pytest.mark.asyncio
@@ -694,9 +867,115 @@ async def test_cancel_does_not_treat_terminal_or_absent_source_as_stop_proof(
 
     assert result["complete"] is False
     assert result["pending"] is True
+    assert result["failures"] == [{
+        "session_id": source.session_id,
+        "reason": "handoff source stop is not yet verified",
+    }]
     parent = manager.get(source.task_id)
     assert parent.status != "cancelled"
     assert parent.fields[HANDOFF_OPERATION_FIELD] == _request()["operation_id"]
+
+
+@pytest.mark.parametrize(
+    "operator_first,remote_status,identity_matches,expected_complete",
+    [
+        (True, "cancelled", True, True),
+        (False, "cancelled", True, True),
+        (False, "running", True, False),
+        (False, None, True, False),
+        (False, "cancelled", False, False),
+    ],
+)
+def test_stop_and_cancel_entrypoints_only_accept_positive_managed_proof(
+    tmp_path: Path,
+    monkeypatch,
+    operator_first: bool,
+    remote_status: str | None,
+    identity_matches: bool,
+    expected_complete: bool,
+):
+    """Real stop/cancel routes accept only an exact positive Managed probe."""
+    from api.routes import agents as agent_routes
+    from api.routes import tasks as task_routes
+
+    store = SessionStore(tmp_path / "managed-kill.db")
+    transcripts = TranscriptStore(tmp_path / "managed-kill-transcripts")
+    manager = TaskManager(
+        vault_path=tmp_path / "managed-kill-vault",
+        index_path=tmp_path / "managed-kill-index" / "tasks.json",
+        live_session_checker=lambda *_args: False,
+    )
+    parent = manager.create(
+        "Synthetic managed handoff kill",
+        status="in_progress",
+        tags=["cloud-sonnet", "agent-running"],
+    )
+    source = store.create(
+        parent.id,
+        status=STATUS_CLAIMED,
+        routing="claude",
+        execution_spec=_spec("claude"),
+    )
+    source = store.begin_executor_turn(parent.id, "execute", session=source)
+    assert store.mark_executor_turn_running(parent.id, source.attempt_id, source.turn_id)
+    store.set_managed_session_id(parent.id, "managed-kill-synthetic")
+    source = store.get(parent.id)
+    staged = ProjectTaskService(manager, store, transcripts).stage_handoff(
+        source,
+        operation_id="managed-kill-handoff",
+        children=_request()["children"],
+    )
+    if not identity_matches:
+        manager.update(
+            parent.id,
+            fields={HANDOFF_SOURCE_ATTEMPT_FIELD: "attempt-newer-synthetic"},
+            _project_operation="handoff-stage",
+        )
+    driver = _ManagedRecoveryDriver(remote_status) if remote_status is not None else None
+    monkeypatch.setattr("api.services.task_manager.get_task_manager", lambda: manager)
+    monkeypatch.setattr(agent_routes, "_session_store", store)
+    monkeypatch.setattr(agent_routes, "_transcript_store", transcripts)
+    monkeypatch.setattr(agent_routes, "_maybe_managed_driver", lambda: driver)
+    monkeypatch.setattr(task_routes, "get_task_manager", lambda: manager)
+    monkeypatch.setattr(task_routes, "_session_store", store)
+    monkeypatch.setattr(task_routes, "_transcript_store", transcripts)
+    client = TestClient(app)
+
+    if operator_first:
+        response = client.post(
+            f"/api/agents/sessions/{source.session_id}/kill",
+            json={"reason": "synthetic operator stop"},
+        )
+
+        assert response.status_code == 200
+        if remote_status == "running":
+            assert response.json()["failures"] == [{
+                "session_id": source.session_id,
+                "reason": "managed runtime still reports running",
+            }]
+    cancel_response = client.post(
+        f"/api/tasks/{parent.id}/project/cancel",
+        json={"confirm": True, "operation_id": "cancel-after-managed-stop"},
+    )
+
+    assert cancel_response.status_code == 200
+    result = cancel_response.json()
+    events = transcripts.read(source.session_id)
+    matching = [
+        event for event in events
+        if event["kind"] == HANDOFF_QUIESCENT_EVENT
+        and event["payload"].get("operation_id") == staged["operation_id"]
+        and event["payload"].get("attempt_id") == source.attempt_id
+        and event["payload"].get("turn_id") == source.turn_id
+    ]
+    assert bool(matching) is expected_complete
+
+    assert result["complete"] is expected_complete
+    assert result["pending"] is (not expected_complete)
+    assert bool(result["failures"]) is (not expected_complete)
+    current = manager.get(parent.id)
+    assert (current.status == "cancelled") is expected_complete
+    assert (HANDOFF_OPERATION_FIELD not in current.fields) is expected_complete
 
 
 class _ManagedRecoveryDriver:

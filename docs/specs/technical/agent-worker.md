@@ -763,12 +763,17 @@ served-model provenance remains owned by the usage ledger.
 Project-handoff recovery preserves the source turn fence across process
 restarts. Reconciliation can activate staged children and the bounded
 coordinator only after it verifies the persisted source session, attempt, and
-turn have quiesced. A missing, unsupported, or failed executor stop remains a
-pending handoff; recovery neither clears the source pause nor re-arms ordinary
-execution. The existing scoped project cancellation path is also fenced by
-verified teardown, so it may remain pending and be retried without reporting a
-false terminal outcome. This applies to an interrupted stage before any child
-exists as well as to an already-derived project.
+turn have quiesced. The worker records an exact-turn executor return before its
+cancellation guard; when cancellation already owns that turn, it retains the
+quiescence event but skips source completion, finalization, and child release.
+Operator teardown can record the same evidence only when the existing Managed
+post-kill state probe reports a terminal provider state and the persisted
+session, attempt, and turn still match. A terminal or absent local row,
+best-effort CLI stop, missing Managed driver, or registry cancellation alone is
+not proof. These unknown stops remain pending with an explicit failure, so the
+same scoped cancellation can be retried after evidence arrives. This applies to
+an interrupted stage before any child exists as well as to an already-derived
+project.
 
 `SessionStore` persists an immutable `attempt_id` and attempt number for each
 deliberate execution, plus a new immutable `turn_id` for every executor start

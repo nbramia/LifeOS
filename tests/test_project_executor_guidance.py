@@ -319,6 +319,42 @@ def test_local_executor_handoff_overrides_model_identity_and_stops_remaining_wor
     assert len(manager.list_tasks()) == 2
 
 
+def test_tool_registry_handoff_strips_forged_turn_identity_without_bound_context(
+    tmp_path: Path, monkeypatch,
+):
+    """Test an unbound local context cannot forward model-supplied turn identity."""
+    from api.services.agent_worker import inter_agent
+
+    captured = {}
+
+    def dispatch(context, name, arguments):
+        captured.update(context=context, name=name, arguments=arguments)
+        return {"ok": True}
+
+    monkeypatch.setattr(inter_agent, "dispatch", dispatch)
+    registry = ToolRegistry(
+        lifeos_mcp_server=type("MCP", (), {"tools": []})(),
+        inter_agent_context=InterAgentContext(
+            SessionStore(tmp_path / "sessions.db"),
+            TranscriptStore(tmp_path / "transcripts"),
+            "trusted-source-session",
+            Caps(),
+        ),
+    )
+
+    result = registry.dispatch("lifeos_agent_project_handoff", {
+        "caller_session_id": "model-forged-session",
+        "caller_attempt_id": "model-forged-attempt",
+        "caller_turn_id": "model-forged-turn",
+    })
+
+    assert not result.is_error
+    assert captured["name"] == "lifeos_agent_project_handoff"
+    assert captured["arguments"]["caller_session_id"] == "trusted-source-session"
+    assert captured["arguments"]["caller_attempt_id"] is None
+    assert captured["arguments"]["caller_turn_id"] is None
+
+
 def test_hermes_opening_request_carries_guidance_and_current_turn_proof(tmp_path: Path, monkeypatch):
     from api.routes import hermes_proxy
     import api.services.task_manager as task_manager_module

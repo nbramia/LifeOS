@@ -1317,6 +1317,8 @@ def test_teardown_managed_session_skips_local_kill_but_does_managed(
     )
 
     assert result["managed_failure"] is None
+    assert result["managed_stop_verified"] is True
+    assert result["managed_status"] == "cancelled"
     # No local signal attempt at all (routing is not a CLI route).
     assert rec.killpg_calls == []
     # Managed kill still happened.
@@ -1354,6 +1356,35 @@ def test_teardown_does_not_treat_managed_kill_return_as_stop_proof(
     )
 
     assert result["managed_failure"] == "managed runtime still reports running"
+    assert result["managed_stop_verified"] is False
+    assert result["managed_status"] == "running"
+
+
+@pytest.mark.unit
+def test_teardown_missing_managed_driver_is_not_stop_proof(store, transcript, parent):
+    """An unavailable Managed driver cannot prove that the provider stopped."""
+    target = store.create(
+        task_id="managed_without_driver",
+        status=STATUS_RUNNING,
+        routing="claude",
+        parent_session_id=parent.session_id,
+        root_session_id=parent.session_id,
+    )
+    store.set_managed_session_id(target.task_id, "remote_without_driver")
+    target = store.get_by_session_id(target.session_id)
+
+    result = teardown_session(
+        store,
+        transcript,
+        target,
+        transcript_kind="operator_killed",
+        transcript_payload={"reason": "stop"},
+        managed_driver=None,
+    )
+
+    assert result["managed_failure"] is None
+    assert result["managed_stop_verified"] is False
+    assert result["managed_status"] is None
 
 
 # ---------------------------------------------------------------------------

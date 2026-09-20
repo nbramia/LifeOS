@@ -1993,7 +1993,7 @@ async def cancel_board_card(card_id: str) -> dict[str, Any]:
     """
     from api.services import agent_board
     from api.services.task_manager import get_task_manager, TaskConflictError
-    from api.services.task_projects import ProjectConflictError
+    from api.services.task_projects import HANDOFF_OPERATION_FIELD, ProjectConflictError
 
     task_manager = get_task_manager()
     task = task_manager.get(card_id)
@@ -2014,6 +2014,11 @@ async def cancel_board_card(card_id: str) -> dict[str, Any]:
         raise HTTPException(
             status_code=agent_board.CANCEL_NOT_AGENT_OWNED_ERROR[0],
             detail=agent_board.CANCEL_NOT_AGENT_OWNED_ERROR[1],
+        )
+    if task.fields.get(HANDOFF_OPERATION_FIELD):
+        raise HTTPException(
+            status_code=409,
+            detail="pending handoffs use the Cancel handoff action",
         )
 
     session_store = _get_session_store()
@@ -2544,6 +2549,56 @@ class SubtreeTeardownError(Exception):
         self.failures = failures
 
 
+def _record_verified_managed_handoff_stop(
+    transcript_store: TranscriptStore,
+    session: Session,
+    teardown_result: dict[str, Any],
+) -> None:
+    """Retain exact-turn proof from the existing Managed terminal-state probe."""
+    if not teardown_result.get("managed_stop_verified"):
+        return
+    from api.services.task_manager import get_task_manager
+    from api.services.task_projects import (
+        HANDOFF_OPERATION_FIELD,
+        HANDOFF_QUIESCENT_EVENT,
+        HANDOFF_SOURCE_ATTEMPT_FIELD,
+        HANDOFF_SOURCE_SESSION_FIELD,
+        HANDOFF_SOURCE_TURN_FIELD,
+    )
+
+    task = get_task_manager().get(session.task_id)
+    if task is None:
+        return
+    fields = task.fields
+    operation_id = fields.get(HANDOFF_OPERATION_FIELD)
+    attempt_id = fields.get(HANDOFF_SOURCE_ATTEMPT_FIELD)
+    turn_id = fields.get(HANDOFF_SOURCE_TURN_FIELD)
+    if not (
+        operation_id
+        and fields.get(HANDOFF_SOURCE_SESSION_FIELD) == session.session_id
+        and attempt_id == session.attempt_id
+        and turn_id == session.turn_id
+    ):
+        return
+    if any(
+        event.get("kind") == HANDOFF_QUIESCENT_EVENT
+        and (event.get("payload") or {}).get("operation_id") == operation_id
+        and (event.get("payload") or {}).get("attempt_id") == attempt_id
+        and (event.get("payload") or {}).get("turn_id") == turn_id
+        for event in transcript_store.read(session.session_id)
+    ):
+        return
+    transcript_store.append(session.session_id, HANDOFF_QUIESCENT_EVENT, {
+        "project_id": task.id,
+        "operation_id": operation_id,
+        "attempt_id": attempt_id,
+        "turn_id": turn_id,
+        "executor": session.routing,
+        "reason": "verified managed teardown",
+        "managed_status": teardown_result.get("managed_status"),
+    })
+
+
 async def _kill_session_subtree(target: Session, reason: str) -> tuple[list[str], list[dict[str, str]]]:
     """Tear down `target` and every descendant in its subtree. Target gets
     an `operator_killed` transcript event; descendants get `cascade_killed`.
@@ -2596,6 +2651,18 @@ async def _kill_session_subtree(target: Session, reason: str) -> tuple[list[str]
                     raise SubtreeTeardownError(
                         f"teardown failed for session {s.session_id}: {exc}", killed, failures,
                     ) from exc
+                try:
+                    _record_verified_managed_handoff_stop(transcript_store, s, result)
+                except Exception as exc:  # noqa: BLE001 — stop remains durable
+                    logger.warning(
+                        "could not retain verified handoff stop for %s: %s",
+                        s.session_id,
+                        exc,
+                    )
+                    failures.append({
+                        "session_id": s.session_id,
+                        "reason": "verified handoff stop could not be recorded",
+                    })
                 killed.append(s.session_id)
                 if result.get("managed_failure"):
                     failures.append({

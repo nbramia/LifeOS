@@ -48,7 +48,10 @@ the source agent's stop is verified; conflicting project actions are disabled,
 while **Cancel project** remains available. Cancellation is not presented as
 complete until the scoped stop and teardown are verified. A pending handoff
 with no child is still an ordinary card and is surfaced by its pending-handoff
-state rather than being classified as a project.
+state rather than being classified as a project. Its **Cancel handoff** action
+cancels the whole ordinary task through the scoped project-cancellation flow;
+the ordinary card **Cancel** endpoint refuses this state before stopping its
+session.
 
 ### Lanes
 

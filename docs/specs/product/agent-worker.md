@@ -141,12 +141,16 @@ run rather than an always-on monitor.
 
 A pending handoff remains fenced through worker recovery. The source stays
 paused and staged work stays blocked until its matching source turn is known
-to have stopped; recovery never treats a missing or unverifiable stop as a
-successful handoff. An operator can use the existing project cancellation flow
-while a handoff is pending, but cancellation remains pending until its scoped
-stop and teardown are verified. A staged intent with no children is still an
-ordinary task, not a project, and is shown as a pending handoff rather than as
-successful project work.
+to have stopped. Exact-turn executor return and a positive Managed terminal-
+state check are stop proof; a terminal local row, a best-effort CLI stop, or an
+unavailable Managed driver is not. An operator can use the existing project
+cancellation flow while a handoff is pending, but cancellation remains pending
+with a stop-verification failure until proof arrives. Cancellation still wins
+if the source returns afterward: the stop proof is retained without completing
+the source or releasing staged work, and the same cancellation operation can
+then finish. A staged intent with no children is still an ordinary task, not a
+project, and is shown as a pending handoff rather than as successful project
+work.
 
 ---
 

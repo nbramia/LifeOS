@@ -669,9 +669,11 @@ card returns the current state and touches no session. Returns **409**
 only available for agent-assigned cards"` for a card that is neither
 engine-assigned nor claimed (`#me` or unassigned), and **409**
 `"this card is already finished — nothing to cancel"` for a
-card whose status is already `done` (e.g. accepted). Response: `{id, lane,
-status, tags, killed: [session_id, ...], failures: [{session_id, reason},
-...]}`.
+card whose status is already `done` (e.g. accepted). A pending executor
+handoff returns **409** `"pending handoffs use the Cancel handoff action"`
+before any session or CLI teardown; its scoped cancellation uses
+`POST /api/tasks/{id}/project/cancel`. Response: `{id, lane, status, tags,
+killed: [session_id, ...], failures: [{session_id, reason}, ...]}`.
 
 ### GET /api/agents/pending-questions
 

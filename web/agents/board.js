@@ -3157,13 +3157,18 @@ export function initBoard() {
   function openProjectCancellation(card) {
     projectRequest(`/api/tasks/${encodeURIComponent(card.id)}/project/cancel`, { confirm: false, operation_id: null })
       .then(preview => {
+        const isProject = card.is_project;
+        const subject = isProject ? 'project' : 'task';
+        const cancellationSummary = isProject
+          ? `${preview.unfinished_count || 0} unfinished child${preview.unfinished_count === 1 ? '' : 'ren'}, ${preview.running_count || 0} running agent${preview.running_count === 1 ? '' : 's'}, and ${preview.awaiting_review_count || 0} review result${preview.awaiting_review_count === 1 ? '' : 's'} will be cancelled or abandoned.`
+          : 'This will cancel the whole task and abandon the pending handoff. No child tasks have been created.';
         const backdrop = document.createElement('div');
         backdrop.className = 'modal-backdrop';
-        backdrop.innerHTML = `<div class="modal" role="dialog" aria-label="Cancel project">
-          <h2>Cancel project?</h2>
-          <p>${escapeHtml(`${preview.unfinished_count || 0} unfinished child${preview.unfinished_count === 1 ? '' : 'ren'}, ${preview.running_count || 0} running agent${preview.running_count === 1 ? '' : 's'}, and ${preview.awaiting_review_count || 0} review result${preview.awaiting_review_count === 1 ? '' : 's'} will be cancelled or abandoned.`)}</p>
+        backdrop.innerHTML = `<div class="modal" role="dialog" aria-label="Cancel ${subject}">
+          <h2>Cancel ${subject}?</h2>
+          <p>${escapeHtml(cancellationSummary)}</p>
           <p>Completed children and their history stay intact. Pending-review output is preserved but is not accepted.</p>
-          <div class="actions"><button type="button" data-action="cancel">Keep project</button><button type="button" class="danger" data-action="confirm">Cancel project</button></div>
+          <div class="actions"><button type="button" data-action="cancel">Keep ${subject}</button><button type="button" class="danger" data-action="confirm">Cancel ${subject}</button></div>
         </div>`;
         document.body.appendChild(backdrop);
         const close = () => backdrop.remove();

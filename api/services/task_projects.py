@@ -1265,20 +1265,24 @@ class ProjectTaskService:
                         "session_id": source_id,
                         "reason": "handoff source teardown could not be verified",
                     })
-                if (
-                    source_id in killed
-                    and not errors
-                    and refreshed is not None
-                    and refreshed.status in TERMINAL_STATUSES
-                ):
-                    self.transcript_store.append(source_id, HANDOFF_QUIESCENT_EVENT, {
-                        "project_id": parent.id,
-                        "operation_id": parent.fields.get(HANDOFF_OPERATION_FIELD),
-                        "attempt_id": parent.fields.get(HANDOFF_SOURCE_ATTEMPT_FIELD),
-                        "turn_id": parent.fields.get(HANDOFF_SOURCE_TURN_FIELD),
-                        "executor": source.routing,
-                        "reason": "project cancellation",
-                    })
+            handoff_operation = parent.fields.get(HANDOFF_OPERATION_FIELD)
+            handoff_attempt = parent.fields.get(HANDOFF_SOURCE_ATTEMPT_FIELD)
+            handoff_turn = parent.fields.get(HANDOFF_SOURCE_TURN_FIELD)
+            source_quiescent = bool(
+                handoff_operation
+                and handoff_attempt
+                and handoff_turn
+                and self._has_handoff_quiescence(
+                    source_id, handoff_operation, handoff_attempt, handoff_turn,
+                )
+            )
+            if not source_quiescent and not any(
+                failure.get("session_id") == source_id for failure in failures
+            ):
+                failures.append({
+                    "session_id": source_id,
+                    "reason": "handoff source stop is not yet verified",
+                })
 
         coordinator_id = parent.fields.get(COORDINATOR_SESSION_FIELD)
         if coordinator_id:

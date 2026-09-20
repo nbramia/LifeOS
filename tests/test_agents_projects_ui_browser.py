@@ -330,6 +330,9 @@ def test_pending_handoff_is_visible_and_keeps_project_cancellation_available(pag
 
     assert request_info.value.post_data_json == {"confirm": False, "operation_id": None}
     expect(page.locator('.modal')).to_contain_text("3 unfinished children")
+    expect(page.locator('.modal h2')).to_have_text("Cancel project?")
+    expect(page.locator('.modal [data-action="cancel"]')).to_have_text("Keep project")
+    expect(page.locator('.modal [data-action="confirm"]')).to_have_text("Cancel project")
 
 
 def test_zero_child_pending_handoff_uses_existing_cancellation_route(page: Page, agents_base_url):
@@ -356,3 +359,19 @@ def test_zero_child_pending_handoff_uses_existing_cancellation_route(page: Page,
         page.locator('[data-action="project-cancel"]').click()
 
     assert request_info.value.post_data_json == {"confirm": False, "operation_id": None}
+    expect(page.locator('.modal')).to_have_attribute("aria-label", "Cancel task")
+    expect(page.locator('.modal h2')).to_have_text("Cancel task?")
+    expect(page.locator('.modal')).to_contain_text(
+        "This will cancel the whole task and abandon the pending handoff."
+    )
+    expect(page.locator('.modal [data-action="cancel"]')).to_have_text("Keep task")
+    expect(page.locator('.modal [data-action="confirm"]')).to_have_text("Cancel task")
+
+    with page.expect_request(lambda request: (
+        request.method == "POST"
+        and request.url.rstrip("/").endswith("/api/tasks/pending-handoff-1/project/cancel")
+        and request.post_data_json["confirm"] is True
+    )) as confirmation_info:
+        page.locator('.modal [data-action="confirm"]').click()
+
+    assert confirmation_info.value.post_data_json["operation_id"]

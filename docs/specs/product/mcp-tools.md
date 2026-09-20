@@ -128,8 +128,11 @@ pending rather than reporting the parent complete. Recovery retains that fence
 across restarts: it does not release staged work until the matching source turn
 is verified stopped. The existing project cancellation operation remains the
 operator escape hatch, and reports pending rather than success until scoped
-teardown is verified; this applies even before a staged request has created a
-child, when the source remains an ordinary task.
+teardown is verified. Exact-turn executor return or a positive Managed terminal
+state can satisfy that proof; a terminal row, best-effort CLI stop, or missing
+Managed driver cannot. A returned turn after cancellation retains only its stop
+proof, never activates staged work. This applies even before a staged request
+has created a child, when the source remains an ordinary task.
 
 ### Human Queue Tools
 
