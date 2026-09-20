@@ -11,9 +11,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from api.services.jev_client import JevError
 from api.services.pebble_capture import (
     CaptureIdentity,
     CaptureLedger,
+    JevPebbleClassifier,
     PebbleCaptureConsumer,
     PebbleCaptureError,
     PebbleJournalClassifier,
@@ -1326,6 +1328,224 @@ async def test_classifier_rejects_non_loopback_urls_before_client_creation(monke
     with pytest.raises(PebbleCaptureError, match="loopback"):
         await PebbleJournalClassifier().classify("Synthetic note", "2030-01-01T10:00:00Z")
     assert created == []
+
+
+# --------------------------------------------------------------------------
+# JevPebbleClassifier: the transcript is segmented in code, Jev answers
+# disposition/item/work/executor in one call, and every proposed action
+# still passes through the same `validate_plan` authority gate.
+
+
+class _FakeJevClient:
+    """`JevClient.aask` double: returns one canned answers dict."""
+
+    def __init__(self, answers):
+        self.answers = answers
+        self.calls = 0
+
+    async def aask(self, state, questions):
+        self.calls += 1
+        return self.answers
+
+
+def _jev_answers(*, disposition, confidence=0.9, item="none", work="none", executor="none"):
+    return {
+        "disposition": {"choice": disposition, "confidence": confidence},
+        "item": {"choice": item, "confidence": 0.9},
+        "work": {"choice": work, "confidence": 0.9},
+        "executor": {"choice": executor, "confidence": 0.9},
+    }
+
+
+@pytest.mark.asyncio
+async def test_jev_classifier_log_only_disposition_files_nothing():
+    client = _FakeJevClient(_jev_answers(disposition="log_only"))
+    classifier = JevPebbleClassifier(client=client)
+    actions = await classifier.classify(
+        "I noticed a synthetic bird in the garden.", "2030-01-01T10:00:00Z"
+    )
+    assert actions == []
+    assert client.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_jev_classifier_task_disposition_files_the_selected_item_fragment():
+    transcript = "Add a task to buy synthetic milk and feed the cat"
+    client = _FakeJevClient(_jev_answers(disposition="task", item="s0"))
+    [action] = await JevPebbleClassifier(client=client).classify(transcript, "2030-01-01T10:00:00Z")
+    assert action["kind"] == "task"
+    assert action["title"] == "Add a task to buy synthetic milk"
+    assert action["action_evidence"] == action["title"]
+
+
+@pytest.mark.asyncio
+async def test_jev_classifier_selects_the_named_fragment_not_always_the_first():
+    """Multi-item selection: several things follow one request, and only
+    the fragment Jev actually names should file."""
+    transcript = "Add a task to buy synthetic milk and feed the cat"
+    client = _FakeJevClient(_jev_answers(disposition="task", item="s1"))
+    [action] = await JevPebbleClassifier(client=client).classify(transcript, "2030-01-01T10:00:00Z")
+    assert action["title"] == "feed the cat"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("confidence", "expected_len"), [(0.49, 0), (0.5, 1)])
+async def test_jev_classifier_confidence_floor(confidence, expected_len):
+    client = _FakeJevClient(_jev_answers(disposition="task", confidence=confidence, item="s0"))
+    actions = await JevPebbleClassifier(client=client).classify(
+        "Add a task to buy synthetic milk.", "2030-01-01T10:00:00Z"
+    )
+    assert len(actions) == expected_len
+
+
+@pytest.mark.asyncio
+async def test_jev_classifier_notify_schedule_with_parseable_time_files_a_schedule():
+    transcript = "Remind me tomorrow at 3 PM about the synthetic parcel"
+    client = _FakeJevClient(_jev_answers(disposition="notify_schedule", item="s0"))
+    [action] = await JevPebbleClassifier(client=client).classify(transcript, "2030-01-01T10:00:00Z")
+    assert action["kind"] == "schedule"
+    assert action["action"] == "notify"
+    assert action["schedule_type"] == "once"
+
+
+@pytest.mark.asyncio
+async def test_jev_classifier_notify_schedule_without_a_parseable_time_files_a_task():
+    client = _FakeJevClient(_jev_answers(disposition="notify_schedule", item="s0"))
+    [action] = await JevPebbleClassifier(client=client).classify(
+        "Please handle the synthetic filing", "2030-01-01T10:00:00Z"
+    )
+    assert action["kind"] == "task"
+
+
+@pytest.mark.asyncio
+async def test_jev_classifier_delegated_task_files_the_work_fragment_not_the_whole_transcript():
+    transcript = "Have Claude fix the synthetic login bug and let me know when it's done."
+    client = _FakeJevClient(
+        _jev_answers(disposition="delegated_task", work="s0", executor="claude")
+    )
+    [action] = await JevPebbleClassifier(client=client).classify(transcript, "2030-01-01T10:00:00Z")
+    assert action["kind"] == "task"
+    assert action["tags"] == ["claude"]
+    assert action["title"] == "Have Claude fix the synthetic login bug"
+    assert action["title"] != transcript
+    assert action["title"] == action["action_evidence"]
+    assert action["delegation_evidence"] in transcript
+
+
+@pytest.mark.asyncio
+async def test_jev_classifier_delegated_task_with_no_named_executor_files_a_plain_task():
+    client = _FakeJevClient(_jev_answers(disposition="delegated_task", item="s0", executor="none"))
+    [action] = await JevPebbleClassifier(client=client).classify(
+        "Ask someone to fix the synthetic login bug", "2030-01-01T10:00:00Z"
+    )
+    assert action["kind"] == "task"
+    assert "tags" not in action
+
+
+@pytest.mark.asyncio
+async def test_jev_classifier_agent_schedule_without_a_parseable_time_files_a_delegated_task():
+    client = _FakeJevClient(
+        _jev_answers(disposition="agent_schedule", work="s0", executor="claude")
+    )
+    [action] = await JevPebbleClassifier(client=client).classify(
+        "Have Claude review the synthetic report", "2030-01-01T10:00:00Z"
+    )
+    assert action["kind"] == "task"
+    assert action["tags"] == ["claude"]
+
+
+@pytest.mark.asyncio
+async def test_jev_classifier_agent_schedule_with_parseable_time_passes_validate_plan():
+    """The full acceptance path: a Jev `agent_schedule` disposition with a
+    definite time must survive `validate_plan`'s independent authority gate
+    unchanged, producing one schedule with action="agent"."""
+    transcript = "Have cloud-sonnet review the synthetic report tomorrow at 9 AM."
+    client = _FakeJevClient(
+        _jev_answers(disposition="agent_schedule", work="s0", executor="cloud-sonnet")
+    )
+    raw = await JevPebbleClassifier(client=client).classify(transcript, "2030-01-01T10:00:00Z")
+    [action] = validate_plan(raw, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    assert action.kind == "schedule"
+    assert action.action == "agent"
+    assert action.executor == "cloud-sonnet"
+    assert action.action_evidence == raw[0]["action_evidence"]
+
+
+@pytest.mark.asyncio
+async def test_jev_classifier_falls_back_to_log_only_when_jev_fails():
+    class FailingClient:
+        async def aask(self, state, questions):
+            raise JevError("synthetic failure")
+
+    actions = await JevPebbleClassifier(client=FailingClient()).classify(
+        "Add a task to buy synthetic milk.", "2030-01-01T10:00:00Z"
+    )
+    assert actions == []
+
+
+@pytest.mark.parametrize(
+    ("transcript", "action_evidence", "expected_tag"),
+    [
+        ("Have clod code fix the synthetic login bug.", "fix the synthetic login bug", "claude"),
+        (
+            "Ask deepseek to summarize the synthetic report.",
+            "summarize the synthetic report",
+            "cloud",
+        ),
+        # "cloud code" is a transcription of "Claude Code" though it
+        # contains the "cloud" tag word -- it must resolve whole, to
+        # "claude", never partially to the bare "cloud" tag.
+        (
+            "Have cloud code review the synthetic report.",
+            "review the synthetic report",
+            "claude",
+        ),
+    ],
+)
+def test_spoken_executor_aliases_resolve_through_validate_plan(
+    transcript, action_evidence, expected_tag
+):
+    [action] = validate_plan([{
+        "kind": "task", "index": 0, "title": action_evidence, "tags": [expected_tag],
+        "delegation_evidence": transcript, "action_evidence": action_evidence,
+    }], transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    assert action.tags == (expected_tag,)
+    assert action.title == action_evidence
+
+
+def test_consumer_default_classifier_is_llm_when_jev_not_selected(monkeypatch, stores):
+    monkeypatch.setattr(settings, "pebble_classifier", "llm", raising=False)
+
+    class ExplodingJevClient:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("JevClient must not be constructed when 'llm' is selected")
+
+    monkeypatch.setattr("api.services.pebble_capture.JevClient", ExplodingJevClient)
+    ledger, tasks, schedules = stores
+    consumer = PebbleCaptureConsumer(ledger, tasks, schedules)
+    assert isinstance(consumer.classifier, PebbleJournalClassifier)
+
+
+def test_consumer_falls_back_to_llm_classifier_when_jev_selected_without_a_key(monkeypatch, stores):
+    monkeypatch.setattr(settings, "pebble_classifier", "jev", raising=False)
+    monkeypatch.setattr(settings, "typesafe_api_key", "", raising=False)
+
+    class ExplodingJevClient:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("JevClient must not be constructed without a configured key")
+
+    monkeypatch.setattr("api.services.pebble_capture.JevClient", ExplodingJevClient)
+    ledger, tasks, schedules = stores
+    consumer = PebbleCaptureConsumer(ledger, tasks, schedules)
+    assert isinstance(consumer.classifier, PebbleJournalClassifier)
+
+
+def test_consumer_selects_jev_classifier_when_configured(monkeypatch, stores):
+    monkeypatch.setattr(settings, "pebble_classifier", "jev", raising=False)
+    monkeypatch.setattr(settings, "typesafe_api_key", "synthetic-key", raising=False)
+    ledger, tasks, schedules = stores
+    consumer = PebbleCaptureConsumer(ledger, tasks, schedules)
+    assert isinstance(consumer.classifier, JevPebbleClassifier)
 
 
 @pytest.mark.asyncio

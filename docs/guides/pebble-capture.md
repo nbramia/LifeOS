@@ -92,12 +92,23 @@ before apply is held and creates no dead Scheduler entry.
 | `LIFEOS_PEBBLE_CAPTURE_APPLY` | `false` | Permit canonical task/schedule/card writes after dry-run validation. |
 | `LIFEOS_PEBBLE_CAPTURE_DIR` | `LifeOS/Log/Pebble` | Producer-owned archive location; only this directory is accepted. |
 | `LIFEOS_PEBBLE_CAPTURE_SCAN_SECONDS` | `60` | Periodic recovery scan interval (minimum 10). |
+| `LIFEOS_PEBBLE_CLASSIFIER` | `llm` | Which classifier files a capture: `llm` (`PebbleJournalClassifier`, below) or `jev` (`JevPebbleClassifier`, TypeSafe's typed-judgment API; requires `TYPESAFE_API_KEY`). |
 
 `PebbleJournalClassifier` (`api/services/pebble_capture.py`) routes to the
 configured remote provider (`LIFEOS_REMOTE_LLM_URL`/`_MODEL`/`_API_KEY`, see
 [ADR-024](../adr/024-remote-llm-backend.md)) when configured, else the local
 llama-server; a keyless install with no remote provider configured always
 uses the local llama-server, which must be a loopback URL.
+
+With `LIFEOS_PEBBLE_CLASSIFIER=jev` and `TYPESAFE_API_KEY` set,
+`JevPebbleClassifier` segments the transcript in code and asks TypeSafe's
+Jev API which disposition, item, work fragment, and executor apply, in one
+call; its proposed actions pass through the same `validate_plan` authority
+gate as the LLM classifier. This sends the capture's transcript to
+TypeSafe instead of the configured remote provider -- an operator choice,
+made by setting `LIFEOS_PEBBLE_CLASSIFIER=jev` explicitly. A missing key
+falls back to `PebbleJournalClassifier` with a logged warning, never a
+failed capture.
 
 ## Verification Matrix
 

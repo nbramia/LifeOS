@@ -18,13 +18,18 @@ Usage:
 
 Exits non-zero if the score falls below PASS_THRESHOLD (see below).
 """
+import argparse
 import asyncio
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from api.services.pebble_capture import PebbleJournalClassifier, validate_plan  # noqa: E402
+from api.services.pebble_capture import (  # noqa: E402
+    JevPebbleClassifier,
+    PebbleJournalClassifier,
+    validate_plan,
+)
 
 # Chosen so an occasional miss on a genuinely ambiguous case doesn't fail a
 # healthy model, while still catching a model that has lost the log-only
@@ -104,6 +109,17 @@ def _task_actions(filed):
     return [action for action in filed if action.kind == "task"]
 
 
+def _confidence_suffix(classifier) -> str:
+    """Per-case disposition confidence, for a classifier that exposes one
+    (`JevPebbleClassifier.last_answers`). Empty for a classifier that
+    doesn't, so the LLM path's output is unchanged."""
+    last_answers = getattr(classifier, "last_answers", None)
+    if not last_answers:
+        return ""
+    confidence = (last_answers.get("disposition") or {}).get("confidence")
+    return f" [confidence={confidence:.2f}]" if isinstance(confidence, (int, float)) else ""
+
+
 async def _score_case(classifier, transcript, expect_task):
     try:
         raw = await classifier.classify(transcript, _RECORDED_AT)
@@ -114,7 +130,7 @@ async def _score_case(classifier, transcript, expect_task):
     got_task = len(tasks) >= 1
     passed = got_task is expect_task
     label = "task" if got_task else "log-only"
-    return passed, f"got {label} ({len(tasks)} task action(s))"
+    return passed, f"got {label} ({len(tasks)} task action(s)){_confidence_suffix(classifier)}"
 
 
 async def _score_multi_item_case(classifier, transcript, expected_phrase):
@@ -127,9 +143,10 @@ async def _score_multi_item_case(classifier, transcript, expected_phrase):
     if len(tasks) != 1:
         return False, f"expected exactly 1 task, got {len(tasks)}"
     evidence = (tasks[0].action_evidence or tasks[0].title).casefold()
+    suffix = _confidence_suffix(classifier)
     if expected_phrase.casefold() not in evidence:
-        return False, f"filed {evidence!r}, expected it to contain {expected_phrase!r}"
-    return True, f"filed {evidence!r}"
+        return False, f"filed {evidence!r}, expected it to contain {expected_phrase!r}{suffix}"
+    return True, f"filed {evidence!r}{suffix}"
 
 
 async def _score_schedule_case(classifier, transcript):
@@ -141,7 +158,10 @@ async def _score_schedule_case(classifier, transcript):
     schedules = [a for a in filed if a.kind == "schedule" and a.action == "notify"]
     tasks = _task_actions(filed)
     passed = len(schedules) == 1 and len(tasks) == 0
-    return passed, f"got {len(schedules)} notify schedule(s), {len(tasks)} task(s)"
+    return (
+        passed,
+        f"got {len(schedules)} notify schedule(s), {len(tasks)} task(s){_confidence_suffix(classifier)}",
+    )
 
 
 async def _run_cases(classifier):
@@ -186,7 +206,15 @@ def _print_section(title, results):
 
 
 async def main() -> int:
-    classifier = PebbleJournalClassifier()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--classifier", choices=["llm", "jev"], default="llm",
+        help="Classifier to score: 'llm' (default, the configured remote "
+             "provider or local llama-server) or 'jev' (TypeSafe's "
+             "typed-judgment API; requires TYPESAFE_API_KEY).",
+    )
+    args = parser.parse_args()
+    classifier = JevPebbleClassifier() if args.classifier == "jev" else PebbleJournalClassifier()
 
     table_results = await _run_cases(classifier)
     held_out_results = await _run_held_out_cases(classifier)
