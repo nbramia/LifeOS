@@ -1,4 +1,4 @@
-"""E0 -- build the shared per-turn dataset for issue #1158.
+"""E0 -- build the shared per-turn dataset for the Jev orchestrator experiments.
 
 Joins api/services/perf_trace.py's data/perf_traces.db (span-level latency
 and tool-call timing) against data/conversations.db (persisted message
@@ -40,11 +40,11 @@ Data-availability notes (read before trusting a field):
   * The "next user message looked like pushback" field is populated with
     the PRODUCTION regex classifier already shipped in agent_loop.py
     (`_PUSHBACK_PATTERNS`, gated on the assistant reply matching
-    `_REFUSAL_PATTERNS`) rather than a new Jev call: escalation is
-    explicitly out of scope for #1158 (see issue "Out of scope"), no
-    judgment or bar is defined for it, and reusing the shipped regex is
-    free. It's carried through only as a descriptive field for the
-    report, not a Jev judgment.
+    `_REFUSAL_PATTERNS`) rather than a new Jev call: escalation handling is
+    not one of the judgments these experiments measure or gate, so
+    spending Jev budget re-deriving it isn't justified. It's carried
+    through only as a descriptive field for the report, not a Jev
+    judgment.
 
 Join logic: for each conversation, walk messages in arrival order. Each
 user message that is followed (before the next user message) by an
@@ -67,9 +67,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 # data/ is gitignored and lives only in the main checkout, not in this
-# worktree -- the eval writes ONLY here, per the privacy constraint in
-# issue #1158 (never under the worktree, never anywhere that could be
-# committed).
+# worktree -- the eval writes ONLY here, so datasets never land under the
+# worktree or anywhere that could be committed.
 DATA_ROOT = Path("/home/nathanramia/Code/LifeOS/data")
 OUT_DIR = DATA_ROOT / "jev_eval"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -78,7 +77,7 @@ PERF_DB = DATA_ROOT / "perf_traces.db"
 CONV_DB = DATA_ROOT / "conversations.db"
 
 # Mirrors api/services/agent_loop.py's escalation regexes (out of scope for
-# #1158's ship/drop judgments -- see module docstring).
+# the ship/drop judgments computed here -- see module docstring).
 _REFUSAL_PATTERNS = re.compile(
     r"(?i)("
     r"(hasn'?t|has not|haven'?t|have not)\s+(yet\s+)?(been\s+)?"
@@ -145,7 +144,8 @@ def rounds_from_spans(spans: list[dict]) -> tuple[int, dict[int, list[str]], dic
     still use the old name; both are matched here so the whole history
     parses, not just turns since the rename. The `llm_api_round_N` span's
     own duration is the LLM call latency for that round (used by E5 to
-    approximate "round 1 ends" for the shadow-call race simulation).
+    approximate when the first tool round ends, for the shadow-call race
+    simulation).
     """
     round_re = re.compile(r"^(?:llm|claude)_api_round_(\d+)$")
     current_round = 0
@@ -218,7 +218,7 @@ def load_conversation_turns():
             except (json.JSONDecodeError, TypeError):
                 display_sources = []
 
-            # previous 2 turns (role, content) strictly before this user msg
+            # the two turns immediately preceding this user message
             prev = [(msgs[k]["role"], msgs[k]["content"]) for k in range(max(0, i - 4), i)][-4:]
 
             next_user_text = None

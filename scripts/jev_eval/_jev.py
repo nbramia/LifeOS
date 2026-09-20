@@ -1,8 +1,8 @@
 """Minimal Jev (TypeSafe System One) client for the offline orchestrator
-experiments (issue #1158). Vendored from ~/.claude/lifeos-jev/jev.py rather
-than imported from api/services/jev_client.py because that client (#1157
-PR 1) had not landed on this branch when these scripts were written; swap
-to the real client once it does. httpx only, no other project dependency.
+experiments. Vendored from ~/.claude/lifeos-jev/jev.py, separate from
+`api/services/jev_client.py` -- see scripts/jev_eval/README.md's "Vendored
+client vs. the real one" section for why these scripts use this one rather
+than the production client. httpx only, no other project dependency.
 
 Never prints TYPESAFE_API_KEY. Never logs request/response bodies (they
 carry Nathan's message text) -- only aggregate counts/latencies via

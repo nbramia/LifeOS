@@ -1,6 +1,6 @@
 """E4 -- policy simulation. Replays E1/E2/E3's measured answers under each
-candidate policy from issue #1158 and reports, in one table, what each
-would have cost/saved against the historical turns in e0_dataset.jsonl.
+candidate policy listed below and reports, in one table, what each would
+have cost/saved against the historical turns in e0_dataset.jsonl.
 No Jev calls; pure local analysis over already-computed results files
 (e1_results.json, e2_results.json, e3_results.json) and the dataset.
 

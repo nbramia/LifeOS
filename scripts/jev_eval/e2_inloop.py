@@ -49,14 +49,14 @@ structural proxies, not result-aware):
     `is_repeating` judgment itself has. Documented, not hidden.
 
 Hand-labeling: 100 sampled (turn, k) pairs are labeled by this script's
-operator (Claude, the agent running #1158) for `answered@k`, using the
+operator (Claude, running these experiments) for `answered@k`, using the
 message, the calls-so-far summary, AND the actual final assistant reply
 text pulled from e0_dataset.jsonl's `assistant_reply` field -- reading
 the real outcome is the one piece of "result-shaped" signal available
 here, even without seeing intermediate tool output. Reasoning is not
-saved to the gold file (only the label), per the issue's report
-constraints. 30 of the 100 are flagged for Nathan to spot check (turn ids
-only).
+saved to the gold file (only the label), keeping message text out of any
+committed or reported output. 30 of the 100 are flagged for Nathan to
+spot check (turn ids only).
 
 Writes:
   - data/jev_eval/e2_raw.jsonl    -- one line per (turn_id, k) Jev call

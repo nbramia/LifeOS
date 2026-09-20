@@ -1,6 +1,7 @@
-"""E5 -- Jev call latency, and whether it would arrive before round 1 ends
-if wired concurrently (per #1158's constraint: the shadow call runs
-alongside round 1, never before it).
+"""E5 -- Jev call latency, and whether it arrives while the first tool
+round is still running if wired concurrently (the constraint being
+measured against: the shadow call runs alongside that round, not ahead
+of it).
 
 Two measurements:
   1. 500 SEQUENTIAL Jev calls (no concurrency -- isolates per-call latency,

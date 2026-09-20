@@ -2,10 +2,9 @@
 bundles, each carrying the 3-tool floor (search_web, search_vault,
 person_info) mirroring the existing per-class filter pattern in
 api/services/agent_worker/tool_filter.py (cross-cutting tools merged into
-every class; see that module's docstring). Fixed bundles are required by
-#1158's constraints section ("free-form per-turn subsets bust the prompt
-cache on every turn") -- this script produces candidate fixed sets, not a
-per-turn filter.
+every class; see that module's docstring). Fixed bundles are required
+because free-form per-turn subsets would bust the prompt cache on every
+turn -- this script produces candidate fixed sets, not a per-turn filter.
 
 Method: co-occurrence over ACTUAL tool-using turns from e0_dataset.jsonl
 (a turn's "tool set" = the distinct tool names it called, from
@@ -34,8 +33,8 @@ Coverage @ k = % of tool-using turns whose full tool set is a subset of
 bundles have been added.
 
 Token size per bundle = sum of each included tool's TOOL_DEFINITIONS JSON
-size (chars/4, the issue's own approximation) -- also used to verify the
-issue's "~7.3k tokens for all 25 tools" claim.
+size (chars/4, a rough approximation) -- also gives the full 25-tool
+schema's total for comparison (~7.3k tokens).
 
 Writes data/jev_eval/e3_results.json. No Jev calls -- this experiment is
 pure local analysis over e0_dataset.jsonl.
