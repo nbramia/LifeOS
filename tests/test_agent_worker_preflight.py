@@ -1964,6 +1964,53 @@ def test_destructive_judgment_jev_error_leaves_fields_none(monkeypatch, caplog):
 
 
 @pytest.mark.unit
+def test_destructive_judgment_nan_answer_is_invalid(monkeypatch, caplog):
+    """A NaN harm score is a real float (passes the type check) but not a
+    finite in-range number — must be rejected the same as a failed call.
+
+    Mutation check: dropping the `math.isfinite` check from
+    `_validate_destructive_answer` makes this test fail."""
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "typesafe_api_key", "test-key")
+    monkeypatch.setattr(settings, "agent_jev_destructive_gate", "block")
+    monkeypatch.setattr(JevClient, "ask", _stub_jev_ask(score=float("nan"), probability=0.99))
+
+    with caplog.at_level("WARNING"):
+        result = pf.run_preflight(
+            title="Fix the login bug", tags=["agent"], caller=_stub(_golden_reply()),
+        )
+    assert result.destructive_score is None
+    assert result.destructive_probability is None
+    assert result.sane is True
+    assert result.sane_fatal is False
+    assert result.destructive_block is False
+    assert "invalid answer" in caplog.text
+
+
+@pytest.mark.unit
+def test_destructive_judgment_bool_answer_is_invalid(monkeypatch, caplog):
+    """`bool` is an `int` subclass — `float(True) == 1.0` must not be
+    silently accepted as a valid harm score."""
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "typesafe_api_key", "test-key")
+    monkeypatch.setattr(settings, "agent_jev_destructive_gate", "block")
+    monkeypatch.setattr(JevClient, "ask", _stub_jev_ask(score=True, probability=0.99))
+
+    with caplog.at_level("WARNING"):
+        result = pf.run_preflight(
+            title="Fix the login bug", tags=["agent"], caller=_stub(_golden_reply()),
+        )
+    assert result.destructive_score is None
+    assert result.destructive_probability is None
+    assert result.sane is True
+    assert result.sane_fatal is False
+    assert result.destructive_block is False
+    assert "invalid answer" in caplog.text
+
+
+@pytest.mark.unit
 def test_destructive_judgment_unknown_gate_value_behaves_as_shadow(monkeypatch, caplog):
     from config.settings import settings
 

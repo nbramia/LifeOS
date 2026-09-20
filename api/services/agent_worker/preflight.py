@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Callable
@@ -452,16 +453,39 @@ _DESTRUCTIVE_CONTEXT = (
 )
 
 
+def _validate_destructive_answer(value, lo: float, hi: float) -> float:
+    """Coerce a raw Jev numeric answer to a genuine finite float in
+    `[lo, hi]`, raising `ValueError("invalid answer")` for anything else.
+
+    `bool` is rejected explicitly — Python's `bool` is an `int` subclass,
+    so `float(True) == 1.0` would otherwise silently accept it as a valid
+    score. NaN, infinity, a non-numeric type, and an out-of-range value are
+    all rejected the same way; `_apply_destructive_judgment`'s caller
+    catches this alongside a transport failure and treats both identically
+    (fields stay `None`, `result` otherwise untouched).
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("invalid answer")
+    value = float(value)
+    if not math.isfinite(value) or not (lo <= value <= hi):
+        raise ValueError("invalid answer")
+    return value
+
+
 def _apply_destructive_judgment(result: PreflightResult, title: str) -> PreflightResult:
     """Run the Jev destructiveness judgment and apply `agent_jev_destructive_gate`.
 
     Runs after `_apply_sanity_gate`, so a title the regex already matched
     keeps its `sane_fatal=True` verdict regardless of this function's
     outcome — the regex always wins, in every gate mode. No-ops entirely
-    (fields stay None, `result` otherwise untouched) when Jev isn't
-    configured or the gate is `off`; also no-ops, with a warning logged
-    (exception class name only, never the title or transcript), when the
-    Jev call itself fails.
+    (fields stay None, `result` otherwise untouched) when the gate is
+    `off` — checked first, before the `jev_client` import even runs, so an
+    `off` host never imports the client. Also no-ops, with a warning
+    logged (exception class name and message, never the title or
+    transcript), when Jev isn't configured, the import itself fails, the
+    call fails, or the answers don't validate (see
+    `_validate_destructive_answer`) — all of these are caught by the same
+    `try`/`except` and handled identically.
 
     `shadow` (the default once a key is configured) records the two
     answers on `result` and changes nothing else. `block` additionally
@@ -485,21 +509,24 @@ def _apply_destructive_judgment(result: PreflightResult, title: str) -> Prefligh
         )
         gate = "shadow"
 
-    from api.services.jev_client import JevClient, jev_configured
-
-    if gate == "off" or not jev_configured():
+    if gate == "off":
         return result
 
     try:
+        from api.services.jev_client import JevClient, jev_configured
+
+        if not jev_configured():
+            return result
+
         client = JevClient()
         answers = client.ask(
             {"task_title": title, "context": _DESTRUCTIVE_CONTEXT},
             _DESTRUCTIVE_QUESTIONS,
         )
-        score = float(answers["harm"]["score"])
-        probability = float(answers["irreversible"]["noul"])
+        score = _validate_destructive_answer(answers["harm"]["score"], 0.0, 4.0)
+        probability = _validate_destructive_answer(answers["irreversible"]["noul"], 0.0, 1.0)
     except Exception as exc:
-        logger.warning("Jev destructive judgment failed: %s", type(exc).__name__)
+        logger.warning("Jev destructive judgment failed: %s: %s", type(exc).__name__, exc)
         return result
 
     result.destructive_score = score
