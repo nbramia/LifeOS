@@ -107,8 +107,9 @@ class JevClient:
         `retry-after` when present, else exponential backoff. Raises
         `JevError` on any other non-2xx status, on a response body without
         an `answers` field, once 429 retries are exhausted, on a
-        transport-level failure (timeout, connection error), or immediately,
-        without sending a request, if no API key is set.
+        transport-level or request-construction failure (timeout, connection
+        error, an unserializable `state`), or immediately, without sending a
+        request, if no API key is set.
         """
         if not self.api_key:
             raise JevError("Jev is not configured: no API key")
@@ -119,8 +120,8 @@ class JevClient:
                     response = client.post(
                         f"{self.base_url}{_ENDPOINT_PATH}", json=body, headers=self._headers()
                     )
-                except httpx.HTTPError as exc:
-                    raise JevError(f"Jev request failed: {type(exc).__name__}") from exc
+                except (httpx.HTTPError, TypeError, ValueError) as exc:
+                    raise JevError(f"Jev request failed: {type(exc).__name__}") from None
                 if response.status_code == 429:
                     if attempt < _MAX_ATTEMPTS - 1:
                         logger.warning(
@@ -146,8 +147,8 @@ class JevClient:
                     response = await client.post(
                         f"{self.base_url}{_ENDPOINT_PATH}", json=body, headers=self._headers()
                     )
-                except httpx.HTTPError as exc:
-                    raise JevError(f"Jev request failed: {type(exc).__name__}") from exc
+                except (httpx.HTTPError, TypeError, ValueError) as exc:
+                    raise JevError(f"Jev request failed: {type(exc).__name__}") from None
                 if response.status_code == 429:
                     if attempt < _MAX_ATTEMPTS - 1:
                         logger.warning(

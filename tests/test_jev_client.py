@@ -17,12 +17,25 @@ def _client(handler, **kwargs):
     return JevClient(api_key="test-key", transport=httpx.MockTransport(handler), **kwargs)
 
 
+def _async_recorder(sleeps):
+    """An async replacement for asyncio.sleep that records the delay instead
+    of actually waiting."""
+    async def _sleep(seconds):
+        sleeps.append(seconds)
+    return _sleep
+
+
 def test_ask_success_returns_answers_and_records_usage():
+    """Also the mutation-check witness for _body(): hardcoding
+    `"state": None` there instead of forwarding the passed-in state would
+    still return the (unrelated) mocked answers, but this test would catch
+    it via the posted-payload assertion below."""
     def handler(request):
         assert request.url.path == "/v1/systemone"
         body = request.read()
         import json
         payload = json.loads(body)
+        assert payload["state"] == "some state"
         assert payload["questions"] == _QUESTIONS
         return httpx.Response(
             200,
@@ -77,9 +90,15 @@ def test_ask_retries_429_honoring_retry_after_then_succeeds(monkeypatch):
 
 
 def test_ask_exhausts_429_retries_raises_jev_error(monkeypatch):
-    monkeypatch.setattr("api.services.jev_client.time.sleep", lambda s: None)
+    """Mutation-check witness for _MAX_ATTEMPTS: setting it to 1 would make
+    the handler-call and sleep counts below fail (1 call, 0 sleeps instead
+    of 3 and 2)."""
+    calls = {"count": 0}
+    sleeps = []
+    monkeypatch.setattr("api.services.jev_client.time.sleep", lambda s: sleeps.append(s))
 
     def handler(request):
+        calls["count"] += 1
         return httpx.Response(429)
 
     client = _client(handler)
@@ -87,6 +106,48 @@ def test_ask_exhausts_429_retries_raises_jev_error(monkeypatch):
         client.ask("state", _QUESTIONS)
     assert "429" in str(exc_info.value)
     assert "state" not in str(exc_info.value)
+    assert calls["count"] == 3
+    assert len(sleeps) == 2
+
+
+@pytest.mark.asyncio
+async def test_aask_retries_429_honoring_retry_after_then_succeeds(monkeypatch):
+    """Async counterpart to test_ask_retries_429_honoring_retry_after_then_succeeds."""
+    calls = {"count": 0}
+
+    def handler(request):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return httpx.Response(429, headers={"retry-after": "0"})
+        return httpx.Response(200, json={"answers": {"a": {"choice": "ok"}}})
+
+    sleeps = []
+    monkeypatch.setattr("api.services.jev_client.asyncio.sleep", _async_recorder(sleeps))
+
+    client = _client(handler)
+    answers = await client.aask("state", _QUESTIONS)
+    assert answers == {"a": {"choice": "ok"}}
+    assert calls["count"] == 2
+    assert sleeps == [0.0]
+
+
+@pytest.mark.asyncio
+async def test_aask_exhausts_429_retries_raises_jev_error(monkeypatch):
+    calls = {"count": 0}
+    sleeps = []
+    monkeypatch.setattr("api.services.jev_client.asyncio.sleep", _async_recorder(sleeps))
+
+    def handler(request):
+        calls["count"] += 1
+        return httpx.Response(429)
+
+    client = _client(handler)
+    with pytest.raises(JevError) as exc_info:
+        await client.aask("state", _QUESTIONS)
+    assert "429" in str(exc_info.value)
+    assert "state" not in str(exc_info.value)
+    assert calls["count"] == 3
+    assert len(sleeps) == 2
 
 
 def test_ask_401_raises_jev_error_without_state_in_message():
@@ -137,7 +198,10 @@ async def test_aask_empty_api_key_raises_before_any_request():
 def test_ask_transport_error_raises_jev_error():
     """Mutation-check witness for the httpx.HTTPError wrapping: remove the
     try/except around client.post and this test fails with a raw
-    httpx.ConnectTimeout instead of JevError."""
+    httpx.ConnectTimeout instead of JevError. Also asserts `from None`:
+    a chained `__cause__` could carry the original exception's message
+    (and thus request data) into a traceback even when the JevError's own
+    message is sanitized."""
     def handler(request):
         raise httpx.ConnectTimeout("connection timed out")
 
@@ -147,6 +211,7 @@ def test_ask_transport_error_raises_jev_error():
     message = str(exc_info.value)
     assert "ConnectTimeout" in message
     assert "connection timed out" not in message
+    assert exc_info.value.__cause__ is None
 
 
 @pytest.mark.asyncio
@@ -160,6 +225,30 @@ async def test_aask_transport_error_raises_jev_error():
     message = str(exc_info.value)
     assert "ConnectTimeout" in message
     assert "connection timed out" not in message
+    assert exc_info.value.__cause__ is None
+
+
+def test_ask_unserializable_state_raises_jev_error_before_sending():
+    """A `state` that json can't serialize must fail before the MockTransport
+    handler is ever invoked, wrapped as JevError with no chained cause."""
+    def handler(request):
+        raise AssertionError("must not send a request with an unserializable state")
+
+    client = _client(handler)
+    with pytest.raises(JevError) as exc_info:
+        client.ask(object(), _QUESTIONS)
+    assert exc_info.value.__cause__ is None
+
+
+@pytest.mark.asyncio
+async def test_aask_unserializable_state_raises_jev_error_before_sending():
+    def handler(request):
+        raise AssertionError("must not send a request with an unserializable state")
+
+    client = _client(handler)
+    with pytest.raises(JevError) as exc_info:
+        await client.aask(object(), _QUESTIONS)
+    assert exc_info.value.__cause__ is None
 
 
 def test_jev_configured_false_with_empty_key(monkeypatch):
