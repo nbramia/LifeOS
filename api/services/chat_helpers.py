@@ -38,6 +38,18 @@ class TaskIntentType(Enum):
     DELETE = "delete"
 
 
+def role_content(msg) -> tuple[str, str]:
+    """Extract (role, content) from a conversation-history entry that may be
+    either a `Message` object (`.role`/`.content` attributes, the shape
+    `ConversationStore.get_messages` returns) or a plain dict (`role`/
+    `content` keys) — '' for either field when missing."""
+    role = getattr(msg, "role", None) or (msg.get("role") if isinstance(msg, dict) else None)
+    content = getattr(msg, "content", None)
+    if content is None and isinstance(msg, dict):
+        content = msg.get("content")
+    return (role or ""), (content if isinstance(content, str) else "")
+
+
 @dataclasses.dataclass
 class ActionIntent:
     """Unified intent classification result."""

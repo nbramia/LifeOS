@@ -71,15 +71,20 @@ def start_trace(conversation_id: str, question: str, model_tier: str = "") -> Tr
 
 @contextmanager
 def trace_span(name: str, parent: Optional[str] = None, **metadata):
-    """Time a code block and record it as a span on the current trace."""
+    """Time a code block and record it as a span on the current trace.
+
+    Yields the span's metadata dict. Callers that don't pass any
+    `**metadata` may still mutate it during the `with` block (e.g. attach
+    a result only known once the wrapped call returns) via `as`; the
+    mutation is reflected in the span recorded when the block exits."""
     trace = _current_trace.get()
     if trace is None:
-        yield
+        yield metadata
         return
 
     t0 = time.monotonic()
     try:
-        yield
+        yield metadata
     finally:
         duration_ms = (time.monotonic() - t0) * 1000
         trace.spans.append(Span(
