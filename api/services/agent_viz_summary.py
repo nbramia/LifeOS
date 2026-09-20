@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from api.services.llm_client import extract_json, generate_text
+from api.services.sqlite_connect import connect_closing
 
 logger = logging.getLogger(__name__)
 
@@ -194,19 +195,10 @@ def _resolve_db_path() -> str:
 
 @contextlib.contextmanager
 def _connect() -> Iterator[sqlite3.Connection]:
-    """Open a connection to the summary cache DB, closing it on exit.
-
-    Nests the original `with conn:` so callers keep sqlite3's
-    commit-on-success / rollback-on-exception behavior for the wrapped
-    block; the `finally` additionally guarantees the file descriptor is
-    released.
-    """
-    conn = sqlite3.connect(_resolve_db_path())
-    try:
-        with conn:
-            yield conn
-    finally:
-        conn.close()
+    """Open a connection to the summary cache DB, closing it on exit — see
+    `connect_closing` for how the close is guaranteed."""
+    with connect_closing(_resolve_db_path()) as conn:
+        yield conn
 
 
 def _init_db() -> None:
