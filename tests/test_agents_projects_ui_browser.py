@@ -61,12 +61,12 @@ def _card(card_id, title, **extra):
 
 
 def _state():
-    parent = _card("project-1", "Release synthetic project", is_project=True, child_count=3,
+    parent = _card("project-1", "Release synthetic project", is_project=True, child_count=7,
                    project={
-                       "child_count": 3, "resolved_count": 1, "ready_to_close": False,
+                       "child_count": 7, "resolved_count": 1, "ready_to_close": False,
                        "execution_paused": True, "cancellation_pending": False,
                        "counts": {"done": 1, "awaiting_review": 1, "cancelled": 0,
-                                  "blocked": 0, "running": 1, "unassigned": 0, "assigned": 0},
+                                  "blocked": 4, "running": 1, "unassigned": 0, "assigned": 0},
                        "coordinator": {"session_id": "coord-1", "status": "running", "live": True,
                                        "result": "Created a synthetic plan."},
                    })
@@ -76,9 +76,19 @@ def _state():
                        parent_id="project-1", parent_title="Release synthetic project")
     review_child = _card("child-3", "Review synthetic child", tags=["agent-completed"],
                          parent_id="project-1", parent_title="Release synthetic project")
+    blocked_children = [
+        _card("child-blocked", "Blocked synthetic child", tags=["agent-blocked"],
+              parent_id="project-1", parent_title="Release synthetic project"),
+        _card("child-human", "Human synthetic child", tags=["human"],
+              parent_id="project-1", parent_title="Release synthetic project"),
+        _card("child-provider", "Provider synthetic child", tags=["agent-wait-provider"],
+              parent_id="project-1", parent_title="Release synthetic project"),
+        _card("child-dependency", "Dependency synthetic child", tags=["agent-wait-dependency"],
+              parent_id="project-1", parent_title="Release synthetic project"),
+    ]
     return {
         "lanes": {"unassigned": [], "assigned": [parent, child], "in_progress": [],
-                  "human_queue": [], "scheduled": [], "review": [review_child],
+                  "human_queue": blocked_children, "scheduled": [], "review": [review_child],
                   "done": [done_child], "snoozed": []},
         "generated_at": 0, "api_host": "synthetic-host",
     }
@@ -109,10 +119,11 @@ def _stub(page: Page, state, seen):
                     state["lanes"]["assigned"][1],
                     state["lanes"]["review"][0],
                     state["lanes"]["done"][0],
+                    *state["lanes"]["human_queue"],
                 )
             ]
             route.fulfill(status=200, content_type="application/json",
-                          body=json.dumps({"tasks": children, "total": 3, "limit": 50, "offset": 0}))
+                          body=json.dumps({"tasks": children, "total": 7, "limit": 50, "offset": 0}))
         elif url.rstrip("/").endswith("/api/tasks/project-1/project/cancel") and method == "POST" and request.post_data_json["confirm"] is False:
             seen.append((method, url, request.post_data_json))
             route.fulfill(status=200, content_type="application/json", body=json.dumps({
@@ -136,7 +147,7 @@ def _open(page, base_url, state, seen):
 def test_project_cards_filter_and_navigation(page: Page, agents_base_url):
     state, seen = _state(), []
     _open(page, agents_base_url, state, seen)
-    expect(page.locator('[data-card-id="project-1"] .board-chip-project')).to_have_text("project · 1/3 resolved")
+    expect(page.locator('[data-card-id="project-1"] .board-chip-project')).to_have_text("project · 1/7 resolved")
     page.select_option("#board-filter-project", "projects")
     expect(page.locator('[data-card-id="project-1"]')).to_be_visible()
     expect(page.locator('[data-card-id="child-1"]')).to_have_count(0)
@@ -147,6 +158,10 @@ def test_project_cards_filter_and_navigation(page: Page, agents_base_url):
     expect(child_row).to_be_visible()
     expect(child_row.locator('.project-child-meta')).to_have_text('codex · todo')
     expect(child_row.locator('[data-action="assign-child"]')).to_have_value('codex')
+    for child_id in ("child-blocked", "child-human", "child-provider", "child-dependency"):
+        expect(page.locator(f'[data-child-id="{child_id}"] .project-child-meta')).to_have_text(
+            'unassigned · blocked'
+        )
     page.locator('#board-drawer [data-action="open-child"]').first.click()
     expect(page.locator('#board-drawer [data-field="parent-navigation"]')).to_be_visible()
     page.locator('#board-drawer [data-action="open-parent"]').click()

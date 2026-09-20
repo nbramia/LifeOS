@@ -1042,7 +1042,6 @@ def _card_policy(
         error = agent_board.evaluate_card_action(
             task.status, task.tags, action, target_lane, has_live_session=has_live,
             is_project=bool(hierarchy_fields.get("is_project")),
-            execution_paused=field_truthy(task.fields.get(EXECUTION_PAUSED_FIELD)),
             cancellation_pending=bool(
                 (project or {}).get("cancellation_pending")
                 or hierarchy_fields.get("parent_cancellation_pending")
@@ -1082,6 +1081,22 @@ def _card_policy(
         "fields": _outcome("field_edit"),
         "lanes": lanes_refused,
         **project_actions,
+    }
+
+
+def _card_action_hierarchy_facts(task_manager, card_id: str) -> dict[str, bool]:
+    """Read hierarchy facts at the same point a board mutation is admitted."""
+    hierarchy_fields = task_manager.project_read_fields(card_id)
+    project = hierarchy_fields.get("project") or {}
+    coordinator = project.get("coordinator") or {}
+    return {
+        "is_project": bool(hierarchy_fields.get("is_project")),
+        "cancellation_pending": bool(
+            project.get("cancellation_pending")
+            or hierarchy_fields.get("parent_cancellation_pending")
+        ),
+        "has_live_coordinator": bool(coordinator.get("live")),
+        "hierarchy_valid": hierarchy_fields.get("hierarchy_valid", True),
     }
 
 
@@ -1381,6 +1396,7 @@ async def move_board_card(card_id: str, body: LaneMoveRequest) -> dict[str, Any]
     """
     from api.services import agent_board
     from api.services.task_manager import get_task_manager, TaskConflictError
+    from api.services.task_projects import ProjectConflictError
 
     task_manager = get_task_manager()
     task = task_manager.get(card_id)
@@ -1391,6 +1407,7 @@ async def move_board_card(card_id: str, body: LaneMoveRequest) -> dict[str, Any]
     has_live = session_store.has_live_session(card_id, status=task.status, tags=task.tags)
     plan = agent_board.plan_lane_move(
         task.status, task.tags, body.lane, body.assignee, has_live_session=has_live,
+        **_card_action_hierarchy_facts(task_manager, card_id),
     )
     if plan.error is not None:
         status_code, detail = plan.error
@@ -1408,6 +1425,7 @@ async def move_board_card(card_id: str, body: LaneMoveRequest) -> dict[str, Any]
             has_live_session=session_store.has_live_session(
                 card_id, status=current.status, tags=current.tags,
             ),
+            **_card_action_hierarchy_facts(task_manager, card_id),
         )
         if fresh.error is not None:
             raise agent_board.CardDecisionChanged(fresh.error)
@@ -1442,6 +1460,8 @@ async def move_board_card(card_id: str, body: LaneMoveRequest) -> dict[str, Any]
         except agent_board.CardDecisionChanged as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
         except TaskConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ProjectConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -1963,6 +1983,7 @@ async def cancel_board_card(card_id: str) -> dict[str, Any]:
     """
     from api.services import agent_board
     from api.services.task_manager import get_task_manager, TaskConflictError
+    from api.services.task_projects import ProjectConflictError
 
     task_manager = get_task_manager()
     task = task_manager.get(card_id)
@@ -2020,7 +2041,10 @@ async def cancel_board_card(card_id: str) -> dict[str, Any]:
         }
 
     has_live = session_store.has_live_session(card_id, status=task.status, tags=task.tags)
-    error = agent_board.evaluate_card_action(task.status, task.tags, "cancel", has_live_session=has_live)
+    error = agent_board.evaluate_card_action(
+        task.status, task.tags, "cancel", has_live_session=has_live,
+        **_card_action_hierarchy_facts(task_manager, card_id),
+    )
     if error is not None:
         status_code, detail = error
         raise HTTPException(status_code=status_code, detail=detail)
@@ -2075,6 +2099,7 @@ async def cancel_board_card(card_id: str) -> dict[str, Any]:
             has_live_session=session_store.has_live_session(
                 card_id, status=current.status, tags=current.tags,
             ),
+            **_card_action_hierarchy_facts(task_manager, card_id),
         )
         if fresh_error is not None:
             raise agent_board.CardDecisionChanged(fresh_error)
@@ -2098,6 +2123,8 @@ async def cancel_board_card(card_id: str) -> dict[str, Any]:
                 f"({exc}) — retry the cancel to finish it"
             ),
         ) from exc
+    except ProjectConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     if task is None:

@@ -2709,9 +2709,10 @@ export function initBoard() {
   }
 
   function childStatusLabel(child) {
-    const tags = new Set((child.tags || []).map(tag => String(tag).toLowerCase()));
+    const tags = new Set((child.tags || []).map(tag => String(tag).replace(/^#/, '').toLowerCase()));
     if (tags.has('agent-completed') && !tags.has('accepted')) return 'awaiting review';
-    if (tags.has('agent-blocked') || child.status === 'blocked') return 'blocked';
+    if (tags.has('agent-blocked') || tags.has('human') || tags.has('agent-wait-provider') ||
+        tags.has('agent-wait-dependency') || child.status === 'blocked') return 'blocked';
     if (tags.has('agent-running') || child.status === 'in_progress') return 'running';
     return child.status || 'todo';
   }

@@ -402,7 +402,7 @@ class ToolRegistry:
         if name in self._mcp_tool_names:
             try:
                 data = self._mcp._call_api(name, arguments)
-                formatted = self._mcp._format_response(name, data)
+                formatted = self._mcp._format_response(name, data, arguments)
                 # MCP _call_api signals errors by returning a dict with an
                 # "error" key — surface that as an error result.
                 is_error = isinstance(data, dict) and "error" in data

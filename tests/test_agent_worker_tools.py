@@ -139,7 +139,7 @@ class _FakeMCPServer:
     def _call_api(self, name, arguments):
         return self._response
 
-    def _format_response(self, name, data):
+    def _format_response(self, name, data, arguments=None):
         return f"formatted: {data}"
 
 

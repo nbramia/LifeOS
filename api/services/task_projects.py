@@ -10,12 +10,14 @@ from __future__ import annotations
 import hashlib
 import inspect
 import sqlite3
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Iterable, TYPE_CHECKING
 
 from api.services import agent_board
-from api.services.agent_worker.execution import ExecutionRequest
+from api.services.agent_worker.assignment import extract_assignment
+from api.services.agent_worker.execution import ExecutionRequest, parse_legacy_route_alias
 from api.services.agent_worker.session_store import SessionStore, TERMINAL_STATUSES
 from api.services.agent_worker.transcript_store import TranscriptStore
 
@@ -307,8 +309,8 @@ class ProjectTaskService:
             return {"session_id": session_id, "status": "missing", "live": False, "result": None}
         result = None
         if self.transcript_store is not None:
-            events = self.transcript_store.read(session_id)
-            for event in reversed(events[-100:]):
+            events = deque(self.transcript_store.iter_events(session_id), maxlen=100)
+            for event in reversed(events):
                 payload = event.get("payload") or {}
                 candidate = (
                     payload.get("result")
@@ -423,15 +425,22 @@ class ProjectTaskService:
         if task.fields.get(CANCEL_OPERATION_FIELD):
             raise ProjectConflictError("project cancellation is pending")
         owner = agent_board.derive_assignee(task.tags)
-        executor = {
-            "claude": "claude_code",
-            "codex": "codex",
-            "hermes": "hermes",
-            "local": "local",
-            "cloud": "remote",
-        }.get(owner or "")
-        if executor is None:
+        normalized_tags = agent_board.normalize_tags(task.tags)
+        if owner is None:
+            owner = next(
+                (
+                    tag
+                    for tag in agent_board.MANAGED_AGENT_ASSIGNEES
+                    if tag in normalized_tags
+                ),
+                None,
+            )
+        route = parse_legacy_route_alias(f"#{owner}" if owner else "")
+        if not route.recognized:
             raise ProjectConflictError("Plan and delegate requires an agent-owned project")
+        executor = route.request.executor
+        assignment = extract_assignment(task.fields)
+        managed_consent = owner in agent_board.MANAGED_AGENT_ASSIGNEES
 
         prior_request = task.fields.get(COORDINATOR_REQUEST_FIELD)
         if prior_request and prior_request != operation_id and self._task_coordinator_live(task):
@@ -440,12 +449,16 @@ class ProjectTaskService:
         synthetic_task_id = _coordinator_task_id(task_id, operation_id)
         session = self.session_store.get(synthetic_task_id)
         created = session is None
-        request = ExecutionRequest(
-            executor=executor,
-            model_id=_clean_field(task.fields, "model"),
-            effort=_clean_field(task.fields, "effort"),
-            host=_clean_field(task.fields, "host"),
-            working_dir=_clean_field(task.fields, "working_dir"),
+        request = (
+            ExecutionRequest(executor=executor)
+            if managed_consent
+            else ExecutionRequest(
+                executor=executor,
+                model_id=_clean_field(task.fields, "model"),
+                effort=_clean_field(task.fields, "effort"),
+                host=_clean_field(task.fields, "host"),
+                working_dir=_clean_field(task.fields, "working_dir"),
+            )
         )
         if session is None:
             from api.services.agent_worker.operator_spawn import create_operator_session
@@ -471,6 +484,14 @@ class ProjectTaskService:
                 session = self.session_store.get(synthetic_task_id)
         if session is None:
             raise RuntimeError("coordinator session was not persisted")
+        if managed_consent:
+            self.session_store.set_assignment(
+                session.task_id,
+                model=route.request.model_id,
+                effort=assignment.effort,
+                host=assignment.host,
+            )
+            session = self.session_store.get_by_session_id(session.session_id)
 
         # The staged session is BLOCKED and therefore not dispatchable. Link
         # the authoritative parent before flipping it to CLAIMED.

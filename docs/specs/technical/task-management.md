@@ -394,18 +394,22 @@ ordinary work.
 Relationship creation, mutation, deletion, and atomic worker claim share
 `.task-operation.lock`. The re-entrant wrapper lets a first-child mutation
 pause the parent through the ordinary TaskManager write path while retaining
-one outer OS lock. Each process refreshes authoritative Markdown after taking
-that boundary. Therefore a first-child attachment and a worker claim serialize:
-the claim either records its live state first and attachment refuses, or the
-attachment records the pause and child first and claim refuses. Per-file CAS
-still protects the bytes written inside that broader decision boundary.
+one outer OS lock. Every path that needs both locks acquires the instance
+`RLock` and then the process lock. Each process refreshes authoritative
+Markdown after taking that boundary. Therefore a first-child attachment and a
+worker claim serialize: the claim either records its live state first and
+attachment refuses, or the attachment records the pause and child first and
+claim refuses. Per-file CAS still protects the bytes written inside that
+broader decision boundary.
 
 API-mediated first attachment persists `execution_paused=true` before writing
 the child. A valid relationship first observed during watcher/full reindex
 also repairs the pause onto the parent; claim derives `is_project`
 independently, so it fails closed even if that repair loses a CAS and waits for
-the next watcher pass. Removing the final child retains the pause. Invalid
-external relationships are not rewritten automatically.
+the next watcher pass. A repair pass suppresses nested repair entry while its
+bounded CAS retry reindexes competing external edits. Removing the final child
+retains the pause. Invalid external relationships are not rewritten
+automatically.
 
 Interactive Open writes a short `execution_reservation_until` lease under the
 same operation boundary before spawning a CLI. First-child attachment and
@@ -420,7 +424,12 @@ included in hierarchy validation, pause repair, and claim/open guards. This is
 why classification and claim safety never rely on the pause field alone.
 
 `TaskManager` enforces caller-independent guards for create/update/complete/
-delete/claim. `ProjectTaskService` composes the slower explicit actions:
+delete/claim and lifecycle-tag swaps. A swap cannot manufacture worker
+lifecycle state on a task that fails project claim admission, while a card
+that already carries `agent-running` or `agent-blocked` can still complete,
+fail, block, or resume through the worker's atomic transition. The route maps
+an admission conflict to HTTP 409. `ProjectTaskService` composes the slower
+explicit actions:
 
 - start and completion mutate the ordinary parent without forging agent tags;
 - plan/delegate stages a separate operator-origin session as non-dispatchable,
@@ -441,10 +450,15 @@ delete/claim. `ProjectTaskService` composes the slower explicit actions:
 
 The coordinator uses a synthetic task ID derived from project ID plus a hash of
 the caller's stable operation ID. Its canonical execution request comes from
-the parent owner and assignment fields. This gives restart recovery a direct
-lookup and prevents repeated clicks from creating duplicate sessions without a
-new SQL table. Parent fields link coordination directly; capped board snapshots
-and the historical task-backed session keyed by the parent ID are not used for
+the parent owner and assignment fields. The existing legacy-alias adapter maps
+`#cloud-haiku` and `#cloud-sonnet` to the Managed Agents executor and their
+explicit model consent while retaining configured effort and host assignment
+fields. This gives restart recovery a direct lookup and prevents repeated
+clicks from creating duplicate sessions without a new SQL table. Parent fields
+link coordination directly; coordinator summaries scan the transcript through
+its streaming iterator and retain only the latest 100 events in memory. The
+scan remains linear in transcript length and does not add a cache. Capped board
+snapshots and the task-backed session keyed by the parent ID are not used for
 liveness.
 
 ## Related Documents

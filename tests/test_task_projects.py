@@ -6,7 +6,9 @@ import threading
 from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
 
+from api.main import app
 from api.services.agent_worker.session_store import SessionStore, STATUS_CLAIMED
 from api.services.agent_worker.transcript_store import TranscriptStore
 from api.services.task_manager import TaskManager
@@ -107,6 +109,117 @@ def test_observed_direct_vault_attachment_repairs_parent_pause(manager: TaskMana
 
     assert build_task_hierarchy(manager.list_tasks()).is_project(parent.id)
     assert manager.get(parent.id).fields["execution_paused"] == "true"
+
+
+def test_pause_repair_lock_order_and_reentry_stay_bounded(tmp_path: Path, monkeypatch):
+    """Pause repair cannot invert the writer locks or recurse on CAS conflicts."""
+    import api.services.task_manager as task_manager_module
+    from api.services.operation_lock import exclusive_operation_lock
+
+    vault = tmp_path / "vault"
+    seed = TaskManager(
+        vault_path=vault,
+        index_path=tmp_path / "seed-index" / "tasks.json",
+        live_session_checker=lambda *_args: False,
+    )
+    parent = seed.create("Synthetic observed project", tags=["codex"])
+    seed.create("Synthetic observed child", fields={"parent_id": parent.id})
+    source = Path(seed.get(parent.id).source_file)
+
+    manager = TaskManager(
+        vault_path=vault,
+        index_path=tmp_path / "repair-index" / "tasks.json",
+        live_session_checker=lambda *_args: False,
+    )
+    source.write_text(
+        source.read_text(encoding="utf-8").replace("[execution_paused:: true] ", ""),
+        encoding="utf-8",
+    )
+
+    real_mtime = task_manager_module._mtime_or_none
+    probes = {"count": 0}
+
+    def conflicting_mtime(path):
+        probes["count"] += 1
+        value = real_mtime(path)
+        if probes["count"] % 2 == 0:
+            return (value or 0) + probes["count"]
+        return value
+
+    monkeypatch.setattr(task_manager_module, "_mtime_or_none", conflicting_mtime)
+
+    repair_lock_attempted = threading.Event()
+    real_lock = manager._lock
+
+    class ObservedRLock:
+        def __enter__(self):
+            if threading.current_thread().name == "synthetic-rebuilder":
+                repair_lock_attempted.set()
+            real_lock.acquire()
+            return self
+
+        def __exit__(self, *_args):
+            real_lock.release()
+
+    manager._lock = ObservedRLock()
+    holding_lock = threading.Event()
+    release_writer = threading.Event()
+    writer_done = threading.Event()
+    reindex_calls = {"count": 0}
+    real_reindex = manager.reindex_file
+
+    def observed_reindex(path):
+        reindex_calls["count"] += 1
+        return real_reindex(path)
+
+    manager.reindex_file = observed_reindex
+
+    def writer():
+        with manager._lock:
+            holding_lock.set()
+            release_writer.wait(timeout=5)
+            with exclusive_operation_lock(
+                manager.index_path.parent / ".task-operation.lock"
+            ):
+                pass
+        writer_done.set()
+
+    writer_thread = threading.Thread(target=writer, name="synthetic-writer", daemon=True)
+    writer_thread.start()
+    assert holding_lock.wait(timeout=2)
+
+    rebuild_thread = threading.Thread(
+        target=manager.rebuild_index,
+        name="synthetic-rebuilder",
+        daemon=True,
+    )
+    rebuild_thread.start()
+    assert repair_lock_attempted.wait(timeout=2)
+    release_writer.set()
+
+    writer_thread.join(timeout=3)
+    rebuild_thread.join(timeout=3)
+    assert writer_done.is_set()
+    assert not writer_thread.is_alive()
+    assert not rebuild_thread.is_alive()
+    assert reindex_calls["count"] == task_manager_module._CAS_MAX_RETRIES
+
+
+def test_swap_tag_api_refuses_lifecycle_claim_on_project(manager: TaskManager, monkeypatch):
+    from api.routes import tasks as tasks_route
+
+    parent = manager.create("Synthetic guarded project", tags=["codex"])
+    manager.create("Synthetic guarded child", fields={"parent_id": parent.id})
+    monkeypatch.setattr(tasks_route, "get_task_manager", lambda: manager)
+
+    response = TestClient(app).post(
+        f"/api/tasks/{parent.id}/swap-tag",
+        params={"from": "codex", "to": "agent-running"},
+    )
+
+    assert response.status_code == 409
+    assert "lifecycle" in response.json()["detail"]
+    assert manager.get(parent.id).tags == ["codex"]
 
 
 def test_project_and_execution_pause_block_worker_claim(manager: TaskManager):
@@ -313,6 +426,60 @@ def test_plan_and_delegate_is_idempotent_and_links_before_claim(
         {"final_text": "Synthetic coordination result."},
     )
     assert service.coordinator_view(linked)["result"] == "Synthetic coordination result."
+
+
+def test_coordinator_view_streams_only_the_bounded_transcript_tail(
+    manager: TaskManager, stores, monkeypatch,
+):
+    sessions, transcripts = stores
+    service = ProjectTaskService(manager, sessions, transcripts)
+    parent = manager.create("Synthetic bounded-summary project", tags=["codex"])
+    manager.create("Synthetic bounded-summary child", fields={"parent_id": parent.id})
+    result = service.plan_and_delegate(parent.id, operation_id="bounded-summary")
+    linked = manager.get(parent.id)
+
+    transcripts.append(result["session_id"], "old", {"summary": "Too old"})
+    for index in range(100):
+        transcripts.append(result["session_id"], "noise", {"sequence": index})
+    monkeypatch.setattr(
+        transcripts,
+        "read",
+        lambda _session_id: pytest.fail("coordinator summary must use iter_events"),
+    )
+    assert service.coordinator_view(linked)["result"] is None
+
+    transcripts.append(result["session_id"], "latest", {"summary": "Synthetic latest"})
+    assert service.coordinator_view(linked)["result"] == "Synthetic latest"
+
+
+@pytest.mark.parametrize(
+    ("tag", "model"),
+    [
+        ("cloud-haiku", "claude-haiku-4-5"),
+        ("cloud-sonnet", "claude-sonnet-5"),
+    ],
+)
+def test_plan_and_delegate_supports_managed_cloud_aliases(
+    manager: TaskManager, stores, tag: str, model: str,
+):
+    sessions, transcripts = stores
+    service = ProjectTaskService(manager, sessions, transcripts)
+    parent = manager.create(
+        "Synthetic managed coordination",
+        tags=[tag],
+        fields={"model": "synthetic-ignored", "effort": "high", "host": "api"},
+    )
+    manager.create("Synthetic managed child", fields={"parent_id": parent.id})
+
+    result = service.plan_and_delegate(parent.id, operation_id=f"plan-{tag}")
+
+    session = sessions.get_by_session_id(result["session_id"])
+    assert session.routing == "claude"
+    assert session.model == model
+    assert session.effort == "high"
+    assert session.host == "api"
+    assert session.execution_request["executor"] == "claude"
+    assert session.execution_request["model_id"] is None
 
 
 def test_cancel_preview_and_confirm_abandons_review_and_preserves_done(

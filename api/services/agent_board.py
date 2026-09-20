@@ -371,7 +371,6 @@ def evaluate_card_action(
     has_live_session: bool = False,
     *,
     is_project: bool = False,
-    execution_paused: bool = False,
     cancellation_pending: bool = False,
     has_live_coordinator: bool = False,
     hierarchy_valid: bool = True,
@@ -613,6 +612,11 @@ def plan_lane_move(
     target_lane: str,
     assignee: Optional[str] = None,
     has_live_session: bool = False,
+    *,
+    is_project: bool = False,
+    cancellation_pending: bool = False,
+    has_live_coordinator: bool = False,
+    hierarchy_valid: bool = True,
 ) -> LaneMovePlan:
     """Compute the status/tags write for a card dropped into `target_lane`.
 
@@ -626,6 +630,10 @@ def plan_lane_move(
     """
     error = evaluate_card_action(
         current_status, current_tags, "lane_move", target_lane, has_live_session=has_live_session,
+        is_project=is_project,
+        cancellation_pending=cancellation_pending,
+        has_live_coordinator=has_live_coordinator,
+        hierarchy_valid=hierarchy_valid,
     )
     if error is not None:
         return LaneMovePlan(error=error)

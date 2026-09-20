@@ -625,6 +625,8 @@ async def swap_tag(
         return SwapTagResponse(swapped=False, reason="task not found")
     try:
         ok = manager.swap_tag(task_id, from_tag, to_tag)
+    except ProjectConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except TaskConflictError as e:
         raise HTTPException(status_code=409, detail=str(e))
     return SwapTagResponse(swapped=ok, reason=None if ok else f"tag '{from_tag}' not present")

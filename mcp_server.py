@@ -62,10 +62,23 @@ def _task_status_symbol(status: str) -> str:
     }.get(status, "[ ]")
 
 
-def _format_task_collection(data: dict, *, children: bool = False) -> str:
+def _format_task_collection(
+    data: dict, *, children: bool = False, arguments: dict | None = None,
+) -> str:
     """Render enriched task responses without flattening hierarchy semantics."""
     tasks = data.get("tasks", [])
+    total = data.get("total", len(tasks))
     if not tasks:
+        if children and total:
+            return (
+                f"No child tasks on this page. Showing 0 of {total} children; "
+                f"offset {data.get('offset', 0)}. Fetch another page before acting on the full project."
+            )
+        if not children and any(
+            key in {"status", "context", "tag", "due_before", "query"} and value is not None
+            for key, value in (arguments or {}).items()
+        ):
+            return "No tasks found in the filtered task list."
         return "No child tasks found." if children else "No tasks found."
     label = "child tasks" if children else "tasks"
     text = f"Found {data.get('total', len(tasks))} {label}:\n\n"
@@ -111,11 +124,18 @@ def _format_task_collection(data: dict, *, children: bool = False) -> str:
         if task.get("hierarchy_valid") is False:
             text += f"  Hierarchy invalid: {task.get('hierarchy_error') or 'unknown'}\n"
 
-    scope = data.get("hierarchy_scope")
-    if scope == "complete":
-        text += "\nHierarchy summary: complete task set; list filters do not change project counts.\n"
-    elif scope in {"filtered", "partial"} or data.get("hierarchy_complete") is False:
-        text += "\nHierarchy summary: partial/filtered result; fetch the project children before acting.\n"
+    if children and len(tasks) < total:
+        text += (
+            f"\nShowing {len(tasks)} of {total} children; offset {data.get('offset', 0)}. "
+            "Fetch another page before acting on the full project.\n"
+        )
+    elif not children:
+        filters = {
+            key: value for key, value in (arguments or {}).items()
+            if key in {"status", "context", "tag", "due_before", "query"} and value is not None
+        }
+        if filters:
+            text += "\nScope: filtered task list; results include only matching tasks.\n"
     return text
 
 # Curated list of endpoints to expose as tools (path -> tool config)
@@ -1554,7 +1574,9 @@ class LifeOSMCPServer:
         except Exception as e:
             return {"error": f"Unexpected error: {e}"}
 
-    def _format_response(self, tool_name: str, data: dict) -> str:
+    def _format_response(
+        self, tool_name: str, data: dict, arguments: dict | None = None,
+    ) -> str:
         """Format API response for human readability."""
         if "error" in data:
             err = data["error"]
@@ -2210,10 +2232,10 @@ class LifeOSMCPServer:
             return text
 
         elif tool_name == "lifeos_task_list":
-            return _format_task_collection(data)
+            return _format_task_collection(data, arguments=arguments)
 
         elif tool_name == "lifeos_task_children":
-            return _format_task_collection(data, children=True)
+            return _format_task_collection(data, children=True, arguments=arguments)
 
         elif tool_name == "lifeos_task_update":
             text = f"Task updated: **{data.get('description', '')}** (ID: {data.get('id', '')})\nStatus: {data.get('status', '')} | Context: {data.get('context', '')}"
@@ -2361,7 +2383,7 @@ def dispatch(server: "LifeOSMCPServer", request: dict) -> dict | None:
             tool_name = params.get("name")
             arguments = params.get("arguments", {})
             data = server._call_api(tool_name, arguments)
-            formatted = server._format_response(tool_name, data)
+            formatted = server._format_response(tool_name, data, arguments)
             result = {"content": [{"type": "text", "text": formatted}]}
             # Same "error" key convention the agent worker's ToolRegistry
             # already uses to decide is_error (api/services/agent_worker/tools.py)

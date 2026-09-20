@@ -92,11 +92,11 @@ Tasks can also be managed via natural language chat. See [Task Management spec](
 | Tool | Description |
 |------|-------------|
 | `lifeos_task_create` | Create a task; set `fields.parent_id` for a project child and `operation_key` for retry-safe creation |
-| `lifeos_task_list` | List/filter enriched tasks, including parent identity and compact derived project progress |
+| `lifeos_task_list` | List/filter enriched tasks, including parent identity and compact derived project progress; filtered output is labeled as scoped |
 | `lifeos_task_update` | Update a task; set/clear `fields.parent_id` to attach, reparent, or detach a child |
 | `lifeos_task_complete` | Mark an ordinary task as done; project parents use the checked project action |
 | `lifeos_task_delete` | Delete a task |
-| `lifeos_task_children` | Retrieve the actual children of a project by stable parent ID, with pagination |
+| `lifeos_task_children` | Retrieve the actual children of a project by stable parent ID, with pagination; partial pages state their displayed count and offset |
 | `lifeos_project_start` | Mark an open project active without launching the parent as an ordinary worker task |
 | `lifeos_project_complete` | Complete a project after every child and coordination guard passes; cancelled children require explicit reduced-scope acknowledgement |
 | `lifeos_project_plan` | Start or recover an idempotent agent-owner planning/delegation run |

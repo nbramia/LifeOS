@@ -6,8 +6,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 
+from api.main import app
 from api.services import agent_tools
+from api.routes import tasks as task_routes
 from api.services.agent_tools import (
     TOOL_DEFINITIONS,
     _journal_tool_gate,
@@ -15,6 +18,7 @@ from api.services.agent_tools import (
     execute_tool_parallel,
 )
 from api.services.agent_worker.session_store import SessionStore, STATUS_RUNNING
+from api.services.agent_worker.tools import ToolRegistry
 from api.services.agent_worker.transcript_store import TranscriptStore
 from api.services.task_manager import TaskManager
 from api.services.task_projects import (
@@ -242,58 +246,69 @@ def test_live_openapi_mcp_schemas_describe_hierarchy_inputs():
     assert "operation_id" in cancel
 
 
-def test_mcp_task_output_distinguishes_parent_child_and_filtered_summary():
+def test_mcp_task_output_discloses_real_filtered_and_paginated_responses(
+    tmp_path: Path, monkeypatch,
+):
     module = _load_mcp_module()
     with patch.object(module.LifeOSMCPServer, "_load_openapi_spec", lambda self: None):
         server = module.LifeOSMCPServer()
+    manager = TaskManager(tmp_path / "vault", tmp_path / "task-index.json")
+    parent = manager.create("Synthetic project")
+    for index in range(7):
+        manager.create(f"Synthetic child {index}", fields={"parent_id": parent.id})
+    manager.create("Synthetic done task", status="done")
+    sessions = SessionStore(tmp_path / "sessions.db")
+    monkeypatch.setattr(task_routes, "get_task_manager", lambda: manager)
+    monkeypatch.setattr(task_routes, "_session_store", sessions)
+    monkeypatch.setattr(task_routes, "_transcript_store", TranscriptStore(tmp_path / "transcripts"))
+    client = TestClient(app)
 
-    text = server._format_response("lifeos_task_list", {
-        "tasks": [
-            {
-                "id": "project-1",
-                "description": "Synthetic project",
-                "status": "in_progress",
-                "context": "Inbox",
-                "tags": [],
-                "is_project": True,
-                "child_count": 4,
-                "project": {
-                    "counts": {
-                        "done": 1,
-                        "awaiting_review": 1,
-                        "cancelled": 1,
-                        "blocked": 1,
-                        "running": 0,
-                        "unassigned": 0,
-                        "assigned": 0,
-                    },
-                    "ready_to_close": False,
-                    "cancellation_pending": False,
-                },
-            },
-            {
-                "id": "child-1",
-                "description": "Synthetic child",
-                "status": "blocked",
-                "context": "Inbox",
-                "tags": [],
-                "parent_id": "project-1",
-                "parent_title": "Synthetic project",
-                "is_project": False,
-                "child_count": 0,
-            },
-        ],
-        "total": 2,
-        "hierarchy_scope": "complete",
+    children_response = client.get(f"/api/tasks/{parent.id}/children?limit=2&offset=0")
+    assert children_response.status_code == 200
+    children_text = server._format_response(
+        "lifeos_task_children", children_response.json(),
+        {"task_id": parent.id, "limit": 2, "offset": 0},
+    )
+    assert "Found 7 child tasks" in children_text
+    assert "Showing 2 of 7 children; offset 0" in children_text
+
+    empty_page = client.get(f"/api/tasks/{parent.id}/children?limit=2&offset=20")
+    assert empty_page.status_code == 200
+    assert "Showing 0 of 7 children; offset 20" in server._format_response(
+        "lifeos_task_children", empty_page.json(),
+        {"task_id": parent.id, "limit": 2, "offset": 20},
+    )
+
+    server._call_api = MagicMock(return_value=children_response.json())
+    dispatched = module.dispatch(server, {
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {
+            "name": "lifeos_task_children",
+            "arguments": {"task_id": parent.id, "limit": 2, "offset": 0},
+        },
     })
+    assert "Showing 2 of 7 children; offset 0" in dispatched["result"]["content"][0]["text"]
 
-    assert "Project: 4 children" in text
-    assert "1 done" in text
-    assert "1 awaiting review" in text
-    assert "1 cancelled" in text
-    assert "1 blocked" in text
-    assert "Parent: Synthetic project [id:project-1]" in text
-    assert "Hierarchy summary: complete task set" in text
+    server.tools = [{"name": "lifeos_task_children"}]
+    worker_result = ToolRegistry(lifeos_mcp_server=server).dispatch(
+        "lifeos_task_children",
+        {"task_id": parent.id, "limit": 2, "offset": 0},
+    )
+    assert "Showing 2 of 7 children; offset 0" in worker_result.output
+
+    filtered_response = client.get("/api/tasks?status=todo")
+    assert filtered_response.status_code == 200
+    filtered_text = server._format_response(
+        "lifeos_task_list", filtered_response.json(), {"status": "todo"},
+    )
+    assert "Scope: filtered task list" in filtered_text
+
+    server.tools = [{"name": "lifeos_task_list"}]
+    server._call_api = MagicMock(return_value=filtered_response.json())
+    worker_filtered = ToolRegistry(lifeos_mcp_server=server).dispatch(
+        "lifeos_task_list", {"status": "todo"},
+    )
+    assert "Scope: filtered task list" in worker_filtered.output
 
 
 def test_mcp_project_cancel_preview_and_partial_result_are_unambiguous():

@@ -293,6 +293,9 @@ class TaskManager:
         # swap_tag/delete, all lock-held) invokes reindex_file(), which also
         # takes this lock — a plain Lock would self-deadlock on that retry.
         self._lock = threading.RLock()
+        # Pause repair can reindex on a CAS conflict. The nested reindex must
+        # refresh the task snapshot without starting another repair pass.
+        self._repairing_observed_project_pauses = False
         # Injectable for isolated tests. Production lazily consults the
         # existing SessionStore only when a project guard actually needs the
         # answer, keeping ordinary task reads and writes import-cheap.
@@ -399,9 +402,8 @@ class TaskManager:
                     has_live_coordinator=self._project_task_has_live_coordinator,
                 )
                 if not existing_hierarchy.children(parent_id):
-                    # Pause first. A crash after this write but before child
-                    # creation intentionally leaves a visible, resumable
-                    # ordinary task rather than an executable stale assignee.
+                    # The pause is the durable prerequisite for child creation;
+                    # an interrupted attachment leaves safe, resumable work.
                     self.update(
                         parent_id,
                         fields={EXECUTION_PAUSED_FIELD: "true"},
@@ -569,9 +571,8 @@ class TaskManager:
 
             relationship_change = bool(fields_patch is not None and "parent_id" in fields_patch)
             if relationship_change or "status" in kwargs or "tags" in kwargs or fields_patch:
-                # A different process may have attached the first child or
-                # persisted cancellation intent immediately before this
-                # writer acquired the operation lock.
+                # Project guards require the authoritative Markdown snapshot
+                # captured under the shared operation lock.
                 self.rebuild_index()
                 current = self._tasks.get(task_id)
                 if not current:
@@ -747,6 +748,30 @@ class TaskManager:
             if not any(t.lstrip("#").lower() == from_norm for t in current.tags):
                 return False
 
+            from api.services import agent_board
+            from api.services.task_projects import ProjectConflictError
+
+            lifecycle_tags = {
+                agent_board.RUNNING_TAG,
+                agent_board.BLOCKED_TAG,
+                agent_board.COMPLETED_TAG,
+                "agent-failed",
+                "agent-budget-exceeded",
+            }
+            to_lower = to_norm.lower()
+
+            def guard_lifecycle_transition(task: Task) -> None:
+                if (
+                    to_lower in lifecycle_tags
+                    and not self._project_claim_allowed(task)
+                    and not agent_board.is_claimed(task.status, task.tags)
+                ):
+                    raise ProjectConflictError(
+                        "task is not eligible for an agent lifecycle transition"
+                    )
+
+            guard_lifecycle_transition(current)
+
             path = Path(current.source_file)
 
             def compute() -> Task:
@@ -758,6 +783,7 @@ class TaskManager:
                     )
                 except StopIteration:
                     raise _TagAbsentError()
+                guard_lifecycle_transition(t)
                 # Copy first, same reasoning as `update.apply` — `t` is
                 # `self._tasks[task_id]` itself, and this closure runs fresh
                 # on every CAS retry; only the success branch in
@@ -1404,8 +1430,16 @@ class TaskManager:
         Markdown as well as by the independent claim guard. Invalid links stay
         untouched and visible through ``hierarchy_valid=false``.
         """
-        with exclusive_operation_lock(self.index_path.parent / ".task-operation.lock"):
-            self._repair_observed_project_pauses_locked()
+        with self._lock, exclusive_operation_lock(
+            self.index_path.parent / ".task-operation.lock"
+        ):
+            if self._repairing_observed_project_pauses:
+                return
+            self._repairing_observed_project_pauses = True
+            try:
+                self._repair_observed_project_pauses_locked()
+            finally:
+                self._repairing_observed_project_pauses = False
 
     def _repair_observed_project_pauses_locked(self) -> None:
         from api.services.task_projects import (

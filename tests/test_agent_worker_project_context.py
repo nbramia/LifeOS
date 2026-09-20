@@ -6,12 +6,15 @@ from pathlib import Path
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
 
+from api.main import app
 from api.services.agent_worker.local_executor import ExecutorOutcome
 from api.services.agent_worker.session_store import SessionStore
 from api.services.agent_worker.session_store import STATUS_COMPLETED
 from api.services.agent_worker.transcript_store import TranscriptStore
 from api.services.agent_worker.worker import Worker
+from api.services.task_manager import TaskManager
 
 pytestmark = pytest.mark.unit
 
@@ -177,3 +180,40 @@ def test_cancellation_intent_retires_claim_before_executor_side_effect(tmp_path:
         event["kind"] == "claim_retired_before_dispatch"
         for event in worker.transcript_store.read(session.session_id)
     )
+
+
+def test_worker_can_finish_an_already_claimed_project_child(tmp_path: Path, monkeypatch):
+    from api.routes import tasks as tasks_route
+
+    sessions = SessionStore(tmp_path / "api-sessions.db")
+    manager = TaskManager(
+        vault_path=tmp_path / "vault",
+        index_path=tmp_path / "index" / "tasks.json",
+        live_session_checker=lambda task_id, status, tags: sessions.has_live_session(
+            task_id, status=status, tags=tags,
+        ),
+    )
+    parent = manager.create("Synthetic worker project", tags=["local"])
+    child = manager.create(
+        "Synthetic worker child",
+        tags=["local"],
+        fields={"parent_id": parent.id},
+    )
+    assert manager.claim_for_agent(
+        child.id,
+        pickup_tags={"local"},
+        exclusion_tags=set(),
+        eligible_statuses={"todo"},
+    ) == (True, False)
+
+    monkeypatch.setattr(tasks_route, "get_task_manager", lambda: manager)
+    monkeypatch.setattr(tasks_route, "_session_store", sessions)
+    worker = _worker(
+        tmp_path,
+        lambda _request: httpx.Response(404),
+    )
+    worker._http.close()
+    worker._http = TestClient(app)
+
+    assert worker._swap_tag(child.id, "agent-running", "agent-completed") is True
+    assert "agent-completed" in manager.get(child.id).tags
