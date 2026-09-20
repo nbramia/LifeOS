@@ -188,7 +188,14 @@ When Hermes is configured and there's no stored backend preference yet, `/chat` 
 
 An **orchestrating** persona (below) stays selectable on Hermes and works there on both text and voice: Hermes drives its own background Claude Code worker for that persona (`lifeos_agent_spawn`) instead of answering inline, conversing with you as it triages, spawns, and supervises. This is deliberately different from the same persona on the LifeOS backend, where it spawns a fire-and-forget session and reports back later via Telegram/`/agents` with no mid-flight visibility — see [client-surfaces.md](../specs/technical/client-surfaces.md) for why both are kept rather than one replacing the other. The web client's pending-question polling (for a LifeOS-spawned session's `[CLARIFY]`/`[GOAL]`) only ever starts for a LifeOS-backend orchestrating turn — a Hermes-backend one has no LifeOS-linked session to poll for, since Hermes handles the whole exchange itself.
 
-A spoken turn on the Hermes backend is *eventually* meant to route through LifeOS's **own** Hermes proxy (`POST /api/hermes/ask/stream`) rather than the harness directly, exactly as the browser calls it for a typed Hermes turn — that's the seam where persona resolution and the `lifeos_context` envelope live (see [client-surfaces.md](../specs/technical/client-surfaces.md)). As of this writing the gateway doesn't do that yet (`nbramia/whisper-relay#32`, still open): it calls the Hermes harness directly, so a spoken Hermes turn carries no persona context or spoken-style rules today. Conversation persistence doesn't depend on #32 landing, though — `api/routes/voice.py` tees `POST /api/voice/turn/stream` into the conversation store directly, so a Hermes-backend voice conversation still survives a page refresh even without persona context.
+A spoken turn on the Hermes backend routes from whisper-relay directly to the
+Hermes harness, while a typed Hermes turn uses LifeOS's
+`POST /api/hermes/ask/stream` proxy and its `lifeos_context` envelope (see
+[client-surfaces.md](../specs/technical/client-surfaces.md)). The direct voice
+route therefore relies on Hermes's configured LifeOS MCP tools for capability
+and task-action guidance rather than receiving the proxy's prompt-ready turn
+context. `api/routes/voice.py` tees `POST /api/voice/turn/stream` into the
+conversation store, so the voice conversation still survives a page refresh.
 
 Like the voice vars, these live in `config/settings.py` and are not in `.env.example`.
 

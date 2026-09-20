@@ -3220,6 +3220,16 @@ class Worker:
         candidates: list[dict[str, Any]] = []
         for task in all_tasks:
             tags = {str(t).lstrip("#").lower() for t in (task.get("tags") or [])}
+            if (
+                task.get("is_project")
+                or task.get("hierarchy_valid") is False
+                or task.get("parent_cancellation_pending")
+            ):
+                continue
+            if str((task.get("fields") or {}).get("execution_paused", "")).lower() in {
+                "1", "true", "yes", "on",
+            }:
+                continue
             if tags & _CLAIM_EXCLUSION_TAGS:
                 continue
             if _is_snoozed(task.get("fields")):
@@ -3278,14 +3288,30 @@ class Worker:
     def _task_claim_is_current(self, task: dict[str, Any] | None) -> bool:
         """Return whether a fetched task still carries this worker's claim."""
         tags = self._norm_task_tags(task)
-        return bool(task) and RUNNING_TAG in tags and REASSIGNED_TAG not in tags
+        fields = (task or {}).get("fields") or {}
+        return (
+            bool(task)
+            and RUNNING_TAG in tags
+            and REASSIGNED_TAG not in tags
+            and not task.get("is_project")
+            and task.get("hierarchy_valid") is not False
+            and not task.get("parent_cancellation_pending")
+            and str(fields.get("execution_paused", "")).lower() not in {"1", "true", "yes", "on"}
+        )
 
     def _claim_is_current(self, task_id: str, *, allow_reassigned: bool = False) -> bool:
         """Confirm the worker still owns the lifecycle claim before acting."""
         task = self._fetch_task(task_id)
         tags = self._norm_task_tags(task)
-        return bool(task) and RUNNING_TAG in tags and (
-            allow_reassigned or REASSIGNED_TAG not in tags
+        fields = (task or {}).get("fields") or {}
+        return (
+            bool(task)
+            and RUNNING_TAG in tags
+            and (allow_reassigned or REASSIGNED_TAG not in tags)
+            and not task.get("is_project")
+            and task.get("hierarchy_valid") is not False
+            and not task.get("parent_cancellation_pending")
+            and str(fields.get("execution_paused", "")).lower() not in {"1", "true", "yes", "on"}
         )
 
     def _fail_closed_task_resume(self, session, phase: str) -> None:
@@ -3308,7 +3334,16 @@ class Worker:
             logger.warning("resume task fetch %s failed: %s", session.task_id, exc)
             task = None
         tags = self._norm_task_tags(task)
-        if not task or REASSIGNED_TAG in tags or not tags.intersection(resumable_tags):
+        fields = (task or {}).get("fields") or {}
+        if (
+            not task
+            or REASSIGNED_TAG in tags
+            or not tags.intersection(resumable_tags)
+            or task.get("is_project")
+            or task.get("hierarchy_valid") is False
+            or task.get("parent_cancellation_pending")
+            or str(fields.get("execution_paused", "")).lower() in {"1", "true", "yes", "on"}
+        ):
             self._fail_closed_task_resume(session, phase)
             return None
         return task
@@ -4876,6 +4911,72 @@ class Worker:
             logger.warning("fetch_task %s failed: %s", task_id, exc)
             return _TASK_FETCH_FAILED if distinguish_failure else None
 
+    def _with_project_context(self, task: dict[str, Any]) -> dict[str, Any]:
+        """Add bounded parent objective and sibling status to a child dispatch."""
+        parent_id = task.get("parent_id") or (task.get("fields") or {}).get("parent_id")
+        if not isinstance(parent_id, str) or not parent_id.strip():
+            return task
+        parent_id = parent_id.strip()
+        parent = self._fetch_task(parent_id)
+        if not isinstance(parent, dict):
+            return task
+        siblings: list[dict[str, Any]] = []
+        try:
+            response = self._http.get(
+                f"{self.api_base}/api/tasks/{parent_id}/children",
+                params={"limit": 50, "offset": 0},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if isinstance(payload, dict) and isinstance(payload.get("tasks"), list):
+                siblings = payload["tasks"][:50]
+        except Exception as exc:
+            logger.warning("project context children fetch for %s failed: %s", task.get("id"), exc)
+
+        sibling_summary = []
+        for item in siblings:
+            if not isinstance(item, dict):
+                continue
+            item_tags = {str(tag).lstrip("#").lower() for tag in item.get("tags", [])}
+            assignee = next(
+                (candidate for candidate in ("me", *_BOARD_AGENT_ASSIGNEES) if candidate in item_tags),
+                None,
+            )
+            sibling_summary.append({
+                "id": item.get("id"),
+                "status": item.get("status"),
+                "assignee": assignee,
+            })
+        context = {
+            "parent_id": parent_id,
+            "parent_title": parent.get("description") or "",
+            "parent_notes": (parent.get("notes") or "")[:2000],
+            "children_total": parent.get("child_count") or len(sibling_summary),
+            "children": sibling_summary,
+            "children_partial": (parent.get("child_count") or 0) > len(sibling_summary),
+        }
+        lines = [
+            "Project context (task hierarchy, not agent-session ancestry):",
+            f"Parent {parent_id}: {context['parent_title']}",
+        ]
+        if context["parent_notes"]:
+            lines.append("Parent objective/acceptance notes:\n" + context["parent_notes"])
+        if sibling_summary:
+            lines.append(
+                "Child status summary:\n"
+                + "\n".join(
+                    f"- {item['id']}: status={item['status']}, assignee={item['assignee'] or 'unassigned'}"
+                    for item in sibling_summary
+                )
+            )
+        own_notes = (task.get("notes") or "").strip()[:4000]
+        project_notes = "\n".join(lines)[:2000]
+        return {
+            **task,
+            "notes": f"{own_notes}\n\n{project_notes}".strip(),
+            "project_context": context,
+        }
+
     def _last_reassignment(self, session_id: str) -> dict[str, Any] | None:
         """Return the latest board reassign marker, if any."""
         try:
@@ -5074,7 +5175,7 @@ class Worker:
             return
         # Use the revalidated snapshot for title, tags, and executor context;
         # the candidate list may have gone stale while the claim was acquired.
-        task = current_task
+        task = self._with_project_context(current_task)
         title = task.get("description", task_id)
 
         # Preflight: budget, routing, ambiguity, sanity.

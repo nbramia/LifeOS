@@ -192,6 +192,11 @@ async def open_board_card(card_id: str) -> dict[str, Any]:
     task = manager.get(card_id)
     if task is None:
         raise HTTPException(status_code=404, detail=f"card {card_id} not found")
+    if not manager.can_start_execution(card_id):
+        raise HTTPException(
+            status_code=409,
+            detail="card cannot start while it is a project, execution-paused, cancelling, or has invalid hierarchy",
+        )
 
     assignee = _card_assignee(task.tags)
     if assignee is None:
@@ -212,18 +217,26 @@ async def open_board_card(card_id: str) -> dict[str, Any]:
     # not just the spawn — so a double-click can't have both requests pass
     # the checks before either has actually spawned anything.
     with _open_lock:
-        if task.status != "todo":
+        task = manager.reserve_execution_start(card_id)
+        if task is None:
             raise HTTPException(
                 status_code=409,
-                detail=f"card is not in Assigned state (status={task.status!r})",
+                detail="card is no longer in a startable Assigned state",
             )
+        assignee = _card_assignee(task.tags)
+        if assignee not in {"claude", "codex"}:
+            manager.release_execution_start(card_id)
+            raise HTTPException(status_code=409, detail="card assignment changed before it could open")
         existing = session_store.get(card_id)
         if existing is not None and existing.status not in TERMINAL_STATUSES:
+            manager.release_execution_start(card_id)
             raise HTTPException(status_code=409, detail="card already has a running session")
         if _has_running_cli_session(card_id):
+            manager.release_execution_start(card_id)
             raise HTTPException(status_code=409, detail="card already has a running interactive session")
         claimed_at = _opening_card_ids.get(card_id)
         if claimed_at is not None and time.monotonic() - claimed_at < _OPENING_GRACE_SECONDS:
+            manager.release_execution_start(card_id)
             raise HTTPException(status_code=409, detail="card open is already in progress")
         _opening_card_ids[card_id] = time.monotonic()
         try:
@@ -232,6 +245,7 @@ async def open_board_card(card_id: str) -> dict[str, Any]:
             # Spawn failed (bad launcher config, missing binary, ...) — free
             # the card_id so a retry isn't permanently locked out.
             _opening_card_ids.pop(card_id, None)
+            manager.release_execution_start(card_id)
             raise
 
 

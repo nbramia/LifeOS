@@ -73,6 +73,10 @@ const LIFECYCLE_TAGS = new Set([
 // whether an SSE tick needs to rebuild the drawer at all.
 const DRAWER_EDITABLE_FIELDS = [
   'title', 'notes', 'tags', 'assignee', 'lane',
+  // Hierarchy data is derived server-side and can change after an external
+  // vault edit or a child mutation while this drawer is open.
+  'parent_id', 'parent_title', 'is_project', 'child_count',
+  'hierarchy_valid', 'hierarchy_error', 'project',
   // Read-only, but a background refresh can change a PR's merge status
   // after the drawer first opened — without watching it here, an open
   // drawer would show a stale status until the operator closed and
@@ -131,6 +135,7 @@ export function initBoard() {
   const laneFilterAllBtn = document.getElementById('board-lane-filter-all');
   const laneFilterClearBtn = document.getElementById('board-lane-filter-clear');
   const assigneeFilterEl = document.getElementById('board-filter-assignee');
+  const projectFilterEl = document.getElementById('board-filter-project');
   const hostFilterEl = document.getElementById('board-filter-host');
   const engineFilterEl = document.getElementById('board-filter-engine');
   const tagFilterEl = document.getElementById('board-filter-tag');
@@ -162,6 +167,7 @@ export function initBoard() {
   let board = { lanes: Object.fromEntries(LANES.map(l => [l.id, []])) };
   let visibleLanes = new Set(getFilters().lanes);
   let sortMode = loadSortSelection();
+  let projectFilter = 'all';
   if (sortFilterEl) sortFilterEl.value = sortMode;
   // Whether the first GET /api/agents/board (or board/stream tick) has
   // landed — see `drainBoardFocus` below, the same "re-queue if not loaded
@@ -525,6 +531,10 @@ export function initBoard() {
       }
     }
 
+    if (projectFilter === 'projects' && !card.is_project) return false;
+    if (projectFilter === 'children' && !card.parent_id) return false;
+    if (projectFilter === 'ordinary' && (card.is_project || card.parent_id)) return false;
+
     const hostSel = shared.host || 'all';
     if (hostSel !== 'all') {
       // Matches on either the assignment or the observation — a
@@ -773,8 +783,20 @@ export function initBoard() {
   // Rendering
   // ------------------------------------------------------------------
 
+  function projectProgressLabel(project) {
+    if (!project) return 'loading summary';
+    const total = Number(project.child_count) || 0;
+    const resolved = Number(project.resolved_count) || 0;
+    return `${resolved}/${total} resolved`;
+  }
+
   function cardChips(card) {
     const chips = [];
+    if (card.is_project) {
+      chips.push(`<span class="board-chip board-chip-project">project · ${escapeHtml(projectProgressLabel(card.project))}</span>`);
+    } else if (card.parent_id) {
+      chips.push(`<button type="button" class="board-chip board-chip-parent" data-parent-id="${escapeAttr(card.parent_id)}" title="Open project">↖ ${escapeHtml(card.parent_title || 'project')}</button>`);
+    }
     // Snoozed cards show their wake-up time first — the one thing that
     // actually explains why the card is sitting here instead of its
     // natural lane.
@@ -907,6 +929,13 @@ export function initBoard() {
         e.stopPropagation();
         requestGraphFocus(sessionChip.dataset.sessionId);
         activateTab('graph');
+      });
+    }
+    const parentChip = div.querySelector('.board-chip-parent');
+    if (parentChip) {
+      parentChip.addEventListener('click', (e) => {
+        e.stopPropagation();
+        openDrawer(parentChip.dataset.parentId);
       });
     }
     div.addEventListener('pointerdown', (e) => onPointerDown(e, {
@@ -2668,6 +2697,96 @@ export function initBoard() {
     `;
   }
 
+  function projectCountsHtml(project) {
+    const counts = (project && project.counts) || {};
+    const labels = [
+      ['done', 'done'], ['awaiting_review', 'awaiting review'],
+      ['running', 'running'], ['blocked', 'blocked'], ['assigned', 'assigned'],
+      ['unassigned', 'unassigned'], ['cancelled', 'cancelled'],
+    ];
+    return labels.filter(([key]) => counts[key]).map(([key, label]) =>
+      `<span class="board-chip">${escapeHtml(`${counts[key]} ${label}`)}</span>`).join('');
+  }
+
+  function childStatusLabel(child) {
+    const tags = new Set((child.tags || []).map(tag => String(tag).toLowerCase()));
+    if (tags.has('agent-completed') && !tags.has('accepted')) return 'awaiting review';
+    if (tags.has('agent-blocked') || child.status === 'blocked') return 'blocked';
+    if (tags.has('agent-running') || child.status === 'in_progress') return 'running';
+    return child.status || 'todo';
+  }
+
+  function childAssignee(child) {
+    const tags = new Set((child.tags || []).map(tag => String(tag).replace(/^#/, '').toLowerCase()));
+    return ASSIGNEES.find(assignee => tags.has(assignee)) || '';
+  }
+
+  function projectDetailsHtml(card) {
+    if (card.is_project) {
+      const project = card.project || {};
+      const coordinator = project.coordinator;
+      const coordination = coordinator ? `
+        <div class="project-coordination" data-field="project-coordination">
+          Coordination: ${escapeHtml(coordinator.status || 'pending')}
+          ${coordinator.result ? ` — ${escapeHtml(typeof coordinator.result === 'string' ? coordinator.result : JSON.stringify(coordinator.result))}` : ''}
+          ${coordinator.session_id ? `<button type="button" class="project-inline-action" data-action="project-session" data-session-id="${escapeAttr(coordinator.session_id)}">View session</button>` : ''}
+        </div>` : '<div class="project-coordination">No coordination run yet.</div>';
+      return `
+        <div class="drawer-section project-summary" data-field="project-details">
+          <label class="drawer-label">Project progress</label>
+          <strong>${escapeHtml(projectProgressLabel(project))}</strong>
+          ${project.ready_to_close ? '<span class="board-project-ready"> Ready to close</span>' : ''}
+          <div class="project-status-row">${projectCountsHtml(project)}</div>
+          ${project.execution_paused ? '<div class="project-coordination">Parent execution is paused while children own the work.</div>' : ''}
+          ${project.cancellation_pending ? '<div class="project-error">Cancellation is still being reconciled. Retry cancellation after resolving any listed failures.</div>' : ''}
+          ${coordination}
+          <div class="drawer-actions">
+            <button type="button" class="drawer-action" data-action="project-start">Start project</button>
+            <button type="button" class="drawer-action" data-action="project-plan">Plan and delegate</button>
+            <button type="button" class="drawer-action" data-action="project-complete">Complete project</button>
+            <button type="button" class="drawer-action danger" data-action="project-cancel">Cancel project</button>
+            <button type="button" class="drawer-action" data-action="project-add-child">Add child</button>
+            <button type="button" class="drawer-action" data-action="project-attach-child">Attach existing</button>
+          </div>
+          <div class="project-child-list" data-field="project-children" aria-live="polite">Loading children…</div>
+        </div>`;
+    }
+    if (card.parent_id) {
+      return `<div class="drawer-section project-summary" data-field="parent-navigation">
+        <label class="drawer-label">Project</label>
+        <button type="button" class="drawer-action" data-action="open-parent" data-parent-id="${escapeAttr(card.parent_id)}">Open ${escapeHtml(card.parent_title || 'project')}</button>
+      </div>`;
+    }
+    if (card.fields && card.fields.execution_paused) {
+      return `<div class="drawer-section project-summary" data-field="execution-paused">
+        <label class="drawer-label">Execution paused</label>
+        <div class="project-coordination">This former parent will not resume automatically after its final child was removed.</div>
+        <button type="button" class="drawer-action" data-action="resume-execution">Resume execution</button>
+      </div>`;
+    }
+    return '';
+  }
+
+  async function projectRequest(path, body) {
+    const response = await fetch(path, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      try { throw new Error(JSON.parse(text).detail || text); } catch (error) {
+        if (error instanceof SyntaxError) throw new Error(text || `HTTP ${response.status}`);
+        throw error;
+      }
+    }
+    return response.json();
+  }
+
+  function operationId() {
+    return globalThis.crypto && globalThis.crypto.randomUUID
+      ? globalThis.crypto.randomUUID() : `project-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  }
+
   function renderDrawer(card) {
     if (!drawerEl) return;
     cancelTagPickerWrites();
@@ -2686,6 +2805,7 @@ export function initBoard() {
     // `card.policy`.
     const assigneePolicy = (card.policy && card.policy.assignee) || { allowed: true, reason: null };
     const assigneeDisabled = assigneePolicy.allowed === false;
+    drawerEl.classList.toggle('project-drawer', !!card.is_project);
     drawerEl.innerHTML = `
       <div class="drawer-header">
         <button class="panel-close" data-action="drawer-close">×</button>
@@ -2693,12 +2813,13 @@ export function initBoard() {
       </div>
       ${isTask ? `
       <div class="drawer-section drawer-meta" data-field="meta">${cardMetaHtml(card)}</div>
+      ${projectDetailsHtml(card)}
       ${cardOutcomeHtml(card)}
       <div class="drawer-section">
       <label class="drawer-label">Notes</label>
       <textarea class="drawer-notes drawer-notes-autosize" data-field="notes" placeholder="Notes…">${escapeHtml(card.notes || '')}</textarea>
       <div>
-        <label class="drawer-label">Assignee</label>
+        <label class="drawer-label">${card.is_project ? 'Owner' : 'Assignee'}</label>
         <select class="drawer-assignee" data-field="assignee" ${assigneeDisabled ? 'disabled' : ''}>
           <option value="">unassigned</option>
           ${ASSIGNEES.map(a => `<option value="${a}" ${card.assignee === a ? 'selected' : ''}>${a}</option>`).join('')}
@@ -2903,8 +3024,181 @@ export function initBoard() {
       if (engineRow) engineRow.hidden = true;
     }
 
+    renderProjectDrawerFields(card);
     renderDrawerActions(card);
     renderDrawerSession(card);
+  }
+
+  function openProjectPrompt(title, label, onSubmit) {
+    const backdrop = document.createElement('div');
+    backdrop.className = 'modal-backdrop';
+    backdrop.innerHTML = `<div class="modal" role="dialog" aria-label="${escapeAttr(title)}">
+      <h2>${escapeHtml(title)}</h2><label>${escapeHtml(label)}</label>
+      <input class="drawer-input" data-field="project-prompt" />
+      <div class="actions"><button type="button" data-action="cancel">Cancel</button><button type="button" class="danger" data-action="confirm">Confirm</button></div>
+    </div>`;
+    document.body.appendChild(backdrop);
+    const close = () => backdrop.remove();
+    backdrop.addEventListener('click', event => { if (event.target === backdrop) close(); });
+    backdrop.querySelector('[data-action="cancel"]').onclick = close;
+    backdrop.querySelector('[data-action="confirm"]').onclick = async () => {
+      const value = backdrop.querySelector('[data-field="project-prompt"]').value.trim();
+      if (!value) return;
+      try { await onSubmit(value); close(); } catch (error) { showToast(error.message, true); }
+    };
+    backdrop.querySelector('[data-field="project-prompt"]').focus();
+  }
+
+  function openProjectCancellation(card) {
+    projectRequest(`/api/tasks/${encodeURIComponent(card.id)}/project/cancel`, { confirm: false, operation_id: null })
+      .then(preview => {
+        const backdrop = document.createElement('div');
+        backdrop.className = 'modal-backdrop';
+        backdrop.innerHTML = `<div class="modal" role="dialog" aria-label="Cancel project">
+          <h2>Cancel project?</h2>
+          <p>${escapeHtml(`${preview.unfinished_count || 0} unfinished child${preview.unfinished_count === 1 ? '' : 'ren'}, ${preview.running_count || 0} running agent${preview.running_count === 1 ? '' : 's'}, and ${preview.awaiting_review_count || 0} review result${preview.awaiting_review_count === 1 ? '' : 's'} will be cancelled or abandoned.`)}</p>
+          <p>Completed children and their history stay intact. Pending-review output is preserved but is not accepted.</p>
+          <div class="actions"><button type="button" data-action="cancel">Keep project</button><button type="button" class="danger" data-action="confirm">Cancel project</button></div>
+        </div>`;
+        document.body.appendChild(backdrop);
+        const close = () => backdrop.remove();
+        backdrop.querySelector('[data-action="cancel"]').onclick = close;
+        backdrop.querySelector('[data-action="confirm"]').onclick = async () => {
+          const button = backdrop.querySelector('[data-action="confirm"]');
+          button.disabled = true;
+          try {
+            const result = await projectRequest(`/api/tasks/${encodeURIComponent(card.id)}/project/cancel`, {
+              confirm: true, operation_id: preview.operation_id || operationId(),
+            });
+            await fetchBoard();
+            const failures = (result.failures || []).length;
+            showToast(result.complete ? 'Project cancelled.' : `Cancellation is pending${failures ? ` (${failures} remaining failure${failures === 1 ? '' : 's'})` : ''}.`, !result.complete);
+            close();
+          } catch (error) { showToast(`Couldn't cancel project: ${error.message}`, true); button.disabled = false; }
+        };
+      })
+      .catch(error => showToast(`Couldn't preview cancellation: ${error.message}`, true));
+  }
+
+  function renderProjectDrawerFields(card) {
+    const openParent = drawerEl.querySelector('[data-action="open-parent"]');
+    if (openParent) openParent.onclick = () => openDrawer(openParent.dataset.parentId);
+    const resume = drawerEl.querySelector('[data-action="resume-execution"]');
+    if (resume) resume.onclick = async () => {
+      try {
+        await projectRequest(`/api/tasks/${encodeURIComponent(card.id)}/resume-execution`);
+        await fetchBoard();
+        showToast('Execution resumed.', false);
+      } catch (error) { showToast(`Couldn't resume execution: ${error.message}`, true); }
+    };
+    if (!card.is_project) return;
+
+    const actions = {
+      'project-start': async () => projectRequest(`/api/tasks/${encodeURIComponent(card.id)}/project/start`),
+      'project-plan': async () => projectRequest(`/api/tasks/${encodeURIComponent(card.id)}/project/plan`, { operation_id: operationId() }),
+      'project-complete': async () => {
+        const cancelled = Number(card.project?.counts?.cancelled) || 0;
+        if (cancelled && !window.confirm(`Close this project with ${cancelled} cancelled child${cancelled === 1 ? '' : 'ren'}?`)) return null;
+        return projectRequest(`/api/tasks/${encodeURIComponent(card.id)}/project/complete`, { acknowledge_cancelled_children: cancelled > 0 });
+      },
+    };
+    Object.entries(actions).forEach(([action, request]) => {
+      const button = drawerEl.querySelector(`[data-action="${action}"]`);
+      if (!button) return;
+      const policyName = action === 'project-start' ? 'can_start_project'
+        : action === 'project-plan' ? 'can_plan_project' : 'can_complete_project';
+      if (card.policy && card.policy[policyName] === false) button.disabled = true;
+      button.onclick = async () => {
+        button.disabled = true;
+        try {
+          const result = await request();
+          if (result !== null) { await fetchBoard(); showToast(action === 'project-plan' ? 'Coordination started.' : 'Project updated.', false); }
+        } catch (error) { showToast(`Couldn't update project: ${error.message}`, true); }
+        finally { if (button.isConnected) button.disabled = false; }
+      };
+    });
+    const cancel = drawerEl.querySelector('[data-action="project-cancel"]');
+    if (cancel) {
+      if (card.policy && card.policy.can_cancel_project === false) cancel.disabled = true;
+      cancel.onclick = () => { if (!cancel.disabled) openProjectCancellation(card); };
+    }
+    const session = drawerEl.querySelector('[data-action="project-session"]');
+    if (session) session.onclick = () => { requestGraphFocus(session.dataset.sessionId); activateTab('graph'); };
+
+    const add = drawerEl.querySelector('[data-action="project-add-child"]');
+    if (add) add.onclick = () => openProjectPrompt('Add project child', 'Child title', async description => {
+      await fetch('/api/tasks', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ description, fields: { parent_id: card.id } }),
+      }).then(async response => { if (!response.ok) throw new Error((await response.json().catch(() => ({}))).detail || `HTTP ${response.status}`); });
+      await fetchBoard();
+    });
+    const attach = drawerEl.querySelector('[data-action="project-attach-child"]');
+    if (attach) attach.onclick = () => openProjectPrompt('Attach existing task', 'Task ID', async childId => {
+      await putTask(childId, { fields: { parent_id: card.id } });
+      await fetchBoard();
+    });
+    loadProjectChildren(card);
+  }
+
+  async function loadProjectChildren(card) {
+    const list = drawerEl.querySelector('[data-field="project-children"]');
+    if (!list) return;
+    try {
+      const response = await fetch(`/api/tasks/${encodeURIComponent(card.id)}/children?limit=50&offset=0`);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      const children = data.tasks || [];
+      list.innerHTML = children.length ? children.map(child => {
+        const assignee = childAssignee(child);
+        return `
+        <div class="project-child-row" data-child-id="${escapeAttr(child.id)}">
+          <button type="button" class="project-child-open" data-action="open-child" title="${escapeAttr(child.title || child.description || child.id)}">${escapeHtml(child.title || child.description || child.id)}</button>
+          <span class="project-child-meta">${escapeHtml(`${assignee || 'unassigned'} · ${childStatusLabel(child)}`)}</span>
+          <select class="project-inline-action" data-action="assign-child" aria-label="Assign ${escapeAttr(child.title || child.description || child.id)}">
+            <option value="">unassigned</option>${ASSIGNEES.map(option => `<option value="${option}" ${assignee === option ? 'selected' : ''}>${option}</option>`).join('')}
+          </select>
+          <div class="project-child-actions"><button type="button" data-action="detach-child">Detach</button><button type="button" data-action="move-child">Move</button></div>
+        </div>`;
+      }).join('') : '<div class="project-coordination">No children found.</div>';
+      if (children.length && Number(data.total) > children.length) {
+        list.insertAdjacentHTML('beforeend', `<div class="project-coordination">Showing ${children.length} of ${Number(data.total)} children.</div>`);
+      }
+      list.querySelectorAll('[data-action="open-child"]').forEach(button => {
+        button.onclick = () => openDrawer(button.closest('[data-child-id]').dataset.childId);
+      });
+      list.querySelectorAll('[data-action="detach-child"]').forEach(button => {
+        button.onclick = async () => {
+          const childId = button.closest('[data-child-id]').dataset.childId;
+          try { await putTask(childId, { fields: { parent_id: null } }); await fetchBoard(); }
+          catch (error) { showToast(`Couldn't detach child: ${error.message}`, true); }
+        };
+      });
+      list.querySelectorAll('[data-action="assign-child"]').forEach(select => {
+        select.onchange = async () => {
+          const childId = select.closest('[data-child-id]').dataset.childId;
+          try {
+            await moveCard(childId, select.value ? 'assigned' : 'unassigned', select.value || undefined);
+            await loadProjectChildren(card);
+          } catch (error) {
+            showToast(`Couldn't assign child: ${error.message}`, true);
+            const child = children.find(item => item.id === childId);
+            select.value = child ? childAssignee(child) : '';
+          }
+        };
+      });
+      list.querySelectorAll('[data-action="move-child"]').forEach(button => {
+        button.onclick = () => {
+          const childId = button.closest('[data-child-id]').dataset.childId;
+          openProjectPrompt('Move project child', 'New project task ID', async parentId => {
+            await putTask(childId, { fields: { parent_id: parentId } });
+            await fetchBoard();
+          });
+        };
+      });
+    } catch (error) {
+      list.innerHTML = `<div class="project-error">Couldn't load children: ${escapeHtml(error.message)}</div>`;
+    }
   }
 
   // Wires the scheduled-card drawer's editable fields (renderDrawer's
@@ -3878,6 +4172,11 @@ export function initBoard() {
   // matter which control or tab caused it.
   if (searchEl) searchEl.addEventListener('input', () => setFilter('search', searchEl.value));
   if (assigneeFilterEl) assigneeFilterEl.addEventListener('change', () => setFilter('assignee', assigneeFilterEl.value));
+  if (projectFilterEl) projectFilterEl.addEventListener('change', () => {
+    projectFilter = projectFilterEl.value;
+    updateFilterSummary(getFilters());
+    render();
+  });
   if (hostFilterEl) hostFilterEl.addEventListener('change', () => setFilter('host', hostFilterEl.value));
   if (engineFilterEl) engineFilterEl.addEventListener('change', () => setFilter('engine', engineFilterEl.value));
   if (tagFilterEl) tagFilterEl.addEventListener('input', () => setFilter('tag', tagFilterEl.value));
@@ -3893,6 +4192,8 @@ export function initBoard() {
   if (filterClearBtn) filterClearBtn.addEventListener('click', () => {
     resetFilters();
     if (includeDoneEl) includeDoneEl.checked = false;
+    projectFilter = 'all';
+    if (projectFilterEl) projectFilterEl.value = projectFilter;
     sortMode = DEFAULT_SORT;
     if (sortFilterEl) sortFilterEl.value = DEFAULT_SORT;
     saveSortSelection(DEFAULT_SORT);
@@ -3908,6 +4209,7 @@ export function initBoard() {
     if (state.host !== 'all') active.push(`host ${state.host}`);
     if (state.engine !== 'all') active.push(`engine ${state.engine}`);
     if (state.tag) active.push(`#${state.tag.replace(/^#/, '')}`);
+    if (projectFilter !== 'all') active.push(projectFilter);
     if (state.recency != null && state.recency !== 'all') active.push('recent');
     if (visibleLanes.size !== DEFAULT_VISIBLE_LANE_IDS.length
         || DEFAULT_VISIBLE_LANE_IDS.some(id => !visibleLanes.has(id))) active.push('lanes');

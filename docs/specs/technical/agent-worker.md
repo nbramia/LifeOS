@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-09-18
+> **Last Updated:** 2026-09-20
 
 Engineering view of the agent worker — the stand-alone process that consumes engine-assigned tasks and runs them on either a local LLM or Anthropic Managed Agents. For consumer-facing behavior, see [product/agent-worker.md](../product/agent-worker.md). For operator setup, see [guides/agent-worker-setup.md](../../guides/agent-worker-setup.md).
 
@@ -20,15 +20,16 @@ Engineering view of the agent worker — the stand-alone process that consumes e
 8. [Managed executor (Claude path)](#managed-executor-claude-path)
 9. [Card assignment](#card-assignment)
 10. [System prompts](#system-prompts)
-11. [Inter-agent coordination](#inter-agent-coordination)
-12. [Budget enforcement](#budget-enforcement)
-13. [Restart resumability](#restart-resumability)
-14. [Lifecycle drift reconciliation](#lifecycle-drift-reconciliation)
-15. [Telegram clarification flow](#telegram-clarification-flow)
-16. [Transcripts](#transcripts)
-17. [Agent Output notes](#agent-output-notes)
-18. [Configuration surface](#configuration-surface)
-19. [Related Documents](#related-documents)
+11. [Project task context and coordination](#project-task-context-and-coordination)
+12. [Inter-agent coordination](#inter-agent-coordination)
+13. [Budget enforcement](#budget-enforcement)
+14. [Restart resumability](#restart-resumability)
+15. [Lifecycle drift reconciliation](#lifecycle-drift-reconciliation)
+16. [Telegram clarification flow](#telegram-clarification-flow)
+17. [Transcripts](#transcripts)
+18. [Agent Output notes](#agent-output-notes)
+19. [Configuration surface](#configuration-surface)
+20. [Related Documents](#related-documents)
 
 ---
 
@@ -521,6 +522,47 @@ Cache strategy: the local executor's static portion is a module-level constant s
 The cloud preset YAML is mirrored verbatim in [`guides/agent-worker-setup.md`](../../guides/agent-worker-setup.md) for fresh-clone operators.
 
 ---
+
+## Project task context and coordination
+
+Task hierarchy is a vault relationship, not session lineage. A child task
+stores `fields.parent_id`; its worker session still uses the child's own task
+ID, assignment, review state and lifecycle. The HTTP task payload carries
+derived `parent_id`, `parent_title`, `is_project`, `child_count`, hierarchy
+validity and compact project progress. Candidate filtering and the atomic claim
+boundary both reject project parents, invalid observed hierarchy,
+execution-paused tasks, and children whose parent cancellation is pending.
+
+Before dispatching a child, the worker fetches current hierarchy and adds one
+bounded `project_context` object to the execution input. It contains the
+parent's stable ID/title, objective and acceptance notes, plus a compact sibling
+status summary. It does not copy arbitrary sibling notes or unrelated personal
+tasks. This keeps the child independently executable while preserving enough
+parent intent to judge its own output.
+
+Project planning uses `ProjectTaskService.plan_and_delegate`, which creates an
+operator-origin session with a synthetic task ID derived from the project and
+stable operation ID. The service stages that session as non-dispatchable,
+persists the parent-to-session/request link, then makes it claimable. Retries
+recover the same session. The canonical execution request is derived from the
+project owner's route plus its model, effort, host and working-directory
+fields; it does not infer a new cloud authorization. The coordination prompt
+contains the project objective/acceptance notes and at most 50 current child
+IDs, assignments and states. It instructs child creation to use a stable
+`operation_key` derived from the project ID, planning operation ID, and child
+role; the shared task create path recovers the existing task for a repeated
+key. Transcript events supply coordinator state and
+result; its terminal state never projects completion or failure onto the
+parent task.
+
+Project cancellation persists its operation fence before any teardown, then
+uses the existing session cancellation and CLI teardown paths outside the task
+write lock. Done children are preserved, unfinished human/unassigned children
+are cancelled through guarded task writes, and review-pending output is tagged
+abandoned without acceptance. Any failed or unverifiable stop keeps the parent
+fenced as cancellation-pending. A retry with the same operation ID recomputes
+current state and applies only outstanding work; a different operation is
+rejected while the fence remains.
 
 ## Inter-agent coordination
 

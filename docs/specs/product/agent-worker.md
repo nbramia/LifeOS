@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-09-18
+> **Last Updated:** 2026-09-20
 
 LifeOS includes an external **agent worker** that picks up engine-assigned tasks and completes them autonomously — running locally on a self-hosted LLM or on Anthropic's Managed Agents cloud, with budget caps you can specify in the task title and full audit transcripts on every run. When the agent finishes (or gets stuck), it notifies you on Telegram. If it has a question mid-run, it asks via Telegram and waits for your reply.
 
@@ -14,14 +14,15 @@ The point is hands-free task completion for the long tail of small chores that a
 
 1. [Quick example](#quick-example)
 2. [Task conventions](#task-conventions)
-3. [Routing — local vs cloud](#routing--local-vs-cloud)
-4. [Budgets](#budgets)
-5. [Tag lifecycle](#tag-lifecycle)
-6. [Telegram interactions](#telegram-interactions)
-7. [Capability boundaries](#capability-boundaries)
-8. [Safety model](#safety-model)
-9. [Configuration knobs](#configuration-knobs)
-10. [Related Documents](#related-documents)
+3. [Projects and independently assigned children](#projects-and-independently-assigned-children)
+4. [Routing — local vs cloud](#routing--local-vs-cloud)
+5. [Budgets](#budgets)
+6. [Tag lifecycle](#tag-lifecycle)
+7. [Telegram interactions](#telegram-interactions)
+8. [Capability boundaries](#capability-boundaries)
+9. [Safety model](#safety-model)
+10. [Configuration knobs](#configuration-knobs)
+11. [Related Documents](#related-documents)
 
 ---
 
@@ -68,6 +69,45 @@ Without an explicit routing tag, the preflight reads the title. "With local agen
 To skip the question entirely for a task you know needs the remote provider, tag it `#cloud`; for one that needs Anthropic's own cloud connectors, tag it `#cloud-haiku` or `#cloud-sonnet`.
 
 Tag precedence (first match wins): `#local` → `#claude` → `#codex` → `#hermes` → `#cloud-haiku` → `#cloud-sonnet` → `#cloud`. The CLI routes (`#claude`, `#codex`) skip the cost-confirmation gate because they're subscription-billed, and so does `#hermes` (billed however Hermes bills, not a per-token Anthropic charge) and `#cloud` (the remote provider is priced but isn't the confirmation ceremony's Anthropic "expensive exception"); per-session dollar rollups still appear in `/agents` via the rollout ingest (the `cc:` and `cx:` session rows).
+
+## Projects and independently assigned children
+
+A project is an ordinary vault task that has at least one incoming child
+reference. Each child is another ordinary task with `fields.parent_id` set to
+the parent's stable task ID. Completed and cancelled children still make the
+parent a project while their links remain. Removing the final link restores
+ordinary-task presentation without changing the parent's ID, notes, history,
+or independent execution pause.
+
+Projects are never claimed or opened as ordinary worker tasks. Their assignee
+is the owner, while every child keeps its own assignment and normal execution
+and review lifecycle. Creating or attaching a child does not inherit the
+parent's engine tags. When the worker starts a child, its bounded execution
+context contains that child's instructions plus the parent ID, title,
+objective/acceptance notes, and a compact sibling-status summary; unrelated
+tasks are not copied into the prompt.
+
+An agent-owned project's explicit **Plan and delegate** action starts an
+operator-origin coordination session. That session is separate from task
+hierarchy and from any historical task-backed session: it receives the current
+child IDs, assignments, states and outcomes, may create durable children
+through validated task tools, and may assign only within the operator's
+delegated scope and provider consent. A stable operation ID makes retries
+recover the same coordination request. Each intended child also carries a
+stable `operation_key` derived from that request and the child's role, so a
+retried create recovers the existing task instead of duplicating child work.
+The coordinator finishing or failing does not finish the project.
+
+Project completion is explicit. All children must be done or cancelled, no
+review may remain unaccepted, no coordinator may be live, and no cancellation
+may be pending. Cancelled children require acknowledgement of reduced scope;
+they are never counted as successful completion. Cancelling a project is also
+explicit and two-step: the preview names unfinished, running and
+awaiting-review work, then a confirmed operation stops controllable sessions,
+cancels unfinished children, and records review output as abandoned rather
+than accepted. A failed or unverifiable stop leaves cancellation pending and
+reports the remaining session so the same operation can be retried. Cancelling
+one child never cancels siblings or its parent.
 
 ---
 

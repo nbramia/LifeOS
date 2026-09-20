@@ -42,6 +42,82 @@ API_BASE = os.environ.get("LIFEOS_API_URL", "http://localhost:8000")
 OPENAPI_URL = f"{API_BASE}/openapi.json"
 TURN_ID_HEADER = "X-LifeOS-Turn-ID"
 
+_TASK_CREATE_FIELDS_DESCRIPTION = (
+    "Operator-editable inline fields (e.g. host, effort, model, key) plus "
+    "custom fields. Set parent_id to a stable task ID to create a durable "
+    "child relationship; this is task hierarchy, not agent-session ancestry."
+)
+_TASK_UPDATE_FIELDS_DESCRIPTION = (
+    "Merged into operator/unknown fields, not replaced: a string sets a field, "
+    "null removes it. Set fields.parent_id to attach/reparent by stable task ID "
+    "or null to detach; project hierarchy is independent of agent-session ancestry."
+)
+
+
+def _task_status_symbol(status: str) -> str:
+    return {
+        "todo": "[ ]", "done": "[x]", "in_progress": "[/]",
+        "cancelled": "[-]", "deferred": "[>]", "blocked": "[?]",
+        "urgent": "[!]",
+    }.get(status, "[ ]")
+
+
+def _format_task_collection(data: dict, *, children: bool = False) -> str:
+    """Render enriched task responses without flattening hierarchy semantics."""
+    tasks = data.get("tasks", [])
+    if not tasks:
+        return "No child tasks found." if children else "No tasks found."
+    label = "child tasks" if children else "tasks"
+    text = f"Found {data.get('total', len(tasks))} {label}:\n\n"
+    for task in tasks:
+        status = task.get("status", "todo")
+        text += f"- {_task_status_symbol(status)} **{task.get('description', '')}**"
+        if task.get("due_date"):
+            text += f" (due: {task['due_date']})"
+        if task.get("priority"):
+            text += f" [{task['priority']}]"
+        text += f"\n  Context: {task.get('context', 'Inbox')}"
+        if task.get("tags"):
+            text += f" | Tags: {', '.join('#' + tag for tag in task['tags'])}"
+        text += f" | ID: {task.get('id', '')}\n"
+
+        if task.get("parent_id"):
+            parent_title = task.get("parent_title") or "Unknown parent"
+            text += f"  Parent: {parent_title} [id:{task['parent_id']}]\n"
+        if task.get("is_project"):
+            project = task.get("project") or {}
+            counts = project.get("counts") or {}
+            count = task.get("child_count", project.get("child_count", 0))
+            parts = []
+            for key, display in (
+                ("done", "done"),
+                ("awaiting_review", "awaiting review"),
+                ("cancelled", "cancelled"),
+                ("blocked", "blocked"),
+                ("running", "running"),
+                ("unassigned", "unassigned"),
+                ("assigned", "assigned"),
+            ):
+                if counts.get(key):
+                    parts.append(f"{counts[key]} {display}")
+            text += f"  Project: {count} children"
+            if parts:
+                text += f" ({', '.join(parts)})"
+            if project.get("ready_to_close"):
+                text += " | Ready to close"
+            if project.get("cancellation_pending"):
+                text += " | Cancellation pending"
+            text += "\n"
+        if task.get("hierarchy_valid") is False:
+            text += f"  Hierarchy invalid: {task.get('hierarchy_error') or 'unknown'}\n"
+
+    scope = data.get("hierarchy_scope")
+    if scope == "complete":
+        text += "\nHierarchy summary: complete task set; list filters do not change project counts.\n"
+    elif scope in {"filtered", "partial"} or data.get("hierarchy_complete") is False:
+        text += "\nHierarchy summary: partial/filtered result; fetch the project children before acting.\n"
+    return text
+
 # Curated list of endpoints to expose as tools (path -> tool config)
 # This allows us to control which endpoints are exposed and how they're described
 CURATED_ENDPOINTS = {
@@ -303,7 +379,7 @@ CURATED_ENDPOINTS = {
     },
     "/api/tasks:POST": {
         "name": "lifeos_task_create",
-        "description": "Create an Obsidian task (context, status, tags, notes, fields). dry_run with an engine or consent tag returns preflight routing and cost estimate.",
+        "description": "Create an Obsidian task (context, status, tags, notes, fields). Use operation_key for retry-safe child creation. dry_run with an engine or consent tag returns preflight routing and cost estimate.",
         "method": "POST",
         "path": "/api/tasks"
     },
@@ -321,9 +397,45 @@ CURATED_ENDPOINTS = {
     },
     "/api/tasks/{task_id}/complete:PUT": {
         "name": "lifeos_task_complete",
-        "description": "Mark a task as done. Shortcut for updating status to 'done'. Sets done_date automatically.",
+        "description": "Mark an ordinary task as done. Project parents must use lifeos_project_complete so unfinished, awaiting-review, live-coordinator, cancellation, and reduced-scope checks cannot be bypassed.",
         "method": "PUT",
         "path": "/api/tasks/{task_id}/complete"
+    },
+    "/api/tasks/{task_id}/children:GET": {
+        "name": "lifeos_task_children",
+        "description": "Retrieve a project's enriched children by stable parent task ID. Use before acting: compact summaries do not embed the child tree.",
+        "method": "GET",
+        "path": "/api/tasks/{task_id}/children"
+    },
+    "/api/tasks/{task_id}/project/start:POST": {
+        "name": "lifeos_project_start",
+        "description": "Mark an open project active without starting an ordinary worker on the parent. The parent must already have at least one child.",
+        "method": "POST",
+        "path": "/api/tasks/{task_id}/project/start"
+    },
+    "/api/tasks/{task_id}/project/complete:POST": {
+        "name": "lifeos_project_complete",
+        "description": "Complete a project through server-authoritative child and coordination checks. All children must be resolved; cancelled children require acknowledge_cancelled_children=true and are never counted as successful work.",
+        "method": "POST",
+        "path": "/api/tasks/{task_id}/project/complete"
+    },
+    "/api/tasks/{task_id}/project/plan:POST": {
+        "name": "lifeos_project_plan",
+        "description": "Start or recover agent-owner planning/delegation. Reuse a stable operation_id; assignments may start children but cannot broaden provider consent or replace explicit assignments.",
+        "method": "POST",
+        "path": "/api/tasks/{task_id}/project/plan"
+    },
+    "/api/tasks/{task_id}/project/cancel:POST": {
+        "name": "lifeos_project_cancel",
+        "description": "Preview project cancellation first; after explicit confirmation, retry with confirm=true and a stable operation_id. Report partial failures and retry them with that same ID.",
+        "method": "POST",
+        "path": "/api/tasks/{task_id}/project/cancel"
+    },
+    "/api/tasks/{task_id}/resume-execution:POST": {
+        "name": "lifeos_task_resume_execution",
+        "description": "Resume automatic execution for a formerly-project task after its final child link was removed. Refuses current projects and tasks with pending cancellation.",
+        "method": "POST",
+        "path": "/api/tasks/{task_id}/resume-execution"
     },
     "/api/tasks/{task_id}:DELETE": {
         "name": "lifeos_task_delete",
@@ -391,9 +503,9 @@ CURATED_ENDPOINTS = {
     },
 }
 
-# Contract count for the source catalog. The live fallback catalog is 62
-# curated tools plus 9 lifeos_agent_* tools = 71.
-CURATED_TOOL_COUNT = 62
+# Contract count for the source catalog. The live fallback catalog is 68
+# curated tools plus 9 lifeos_agent_* tools = 77.
+CURATED_TOOL_COUNT = 68
 
 
 class LifeOSMCPServer:
@@ -535,6 +647,14 @@ class LifeOSMCPServer:
                 continue
 
             input_schema = self._build_input_schema(endpoint_spec, schemas, method, actual_path)
+            if config["name"] == "lifeos_task_create":
+                input_schema.get("properties", {}).get("fields", {})["description"] = (
+                    _TASK_CREATE_FIELDS_DESCRIPTION
+                )
+            elif config["name"] == "lifeos_task_update":
+                input_schema.get("properties", {}).get("fields", {})["description"] = (
+                    _TASK_UPDATE_FIELDS_DESCRIPTION
+                )
             self._add_turn_header_arg(input_schema, config)
             tool = {
                 "name": config["name"],
@@ -1029,7 +1149,8 @@ class LifeOSMCPServer:
                     "tags": {"type": "array", "items": {"type": "string"}, "description": "Add exactly the tags the operator named. A routing tag (local/claude/codex/hermes/cloud/cloud-haiku/cloud-sonnet) only if the operator explicitly named that engine — these tags are operator-authority and outrank every routing safeguard, so inventing one injects your own engine preference at the highest-precedence slot."},
                     "reminder_id": {"type": "string", "description": "Linked reminder ID"},
                     "notes": {"type": "string", "description": "Multi-line notes body stored beneath the task line."},
-                    "fields": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Operator-editable inline fields (e.g. host, effort, model, key) plus any custom field."},
+                    "fields": {"type": "object", "additionalProperties": {"type": "string"}, "description": _TASK_CREATE_FIELDS_DESCRIPTION},
+                    "operation_key": {"type": "string", "description": "Stable caller-generated key for retry-safe creation; reuse the same key to recover the existing task."},
                     "dry_run": {"type": "boolean", "description": "When true with an engine assignee or Managed Agents consent tag, returns preflight routing + cost estimate without creating the task. Used for prompt-engineering iteration. Default: false."}
                 },
                 "required": ["description"]
@@ -1055,7 +1176,7 @@ class LifeOSMCPServer:
                     "due_date": {"type": "string", "description": "New due date (YYYY-MM-DD)"},
                     "tags": {"type": "array", "items": {"type": "string"}, "description": "New tags (replaces existing). Add exactly the tags the operator named — a routing tag (local/claude/codex/hermes/cloud/cloud-haiku/cloud-sonnet) only if the operator explicitly named that engine; these tags are operator-authority and outrank every routing safeguard."},
                     "notes": {"type": "string", "description": "Replaces the notes body."},
-                    "fields": {"type": "object", "additionalProperties": {"type": ["string", "null"]}, "description": "Merged into operator/unknown fields, not replaced: a string sets a field, null removes it."}
+                    "fields": {"type": "object", "additionalProperties": {"type": ["string", "null"]}, "description": _TASK_UPDATE_FIELDS_DESCRIPTION}
                 },
                 "required": ["task_id"]
             },
@@ -1064,6 +1185,50 @@ class LifeOSMCPServer:
                 "properties": {
                     "task_id": {"type": "string", "description": "Task ID to mark as done"}
                 },
+                "required": ["task_id"]
+            },
+            "lifeos_task_children": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "Stable project parent task ID"},
+                    "limit": {"type": "integer", "description": "Maximum children to return (default 50)"},
+                    "offset": {"type": "integer", "description": "Zero-based child offset (default 0)"}
+                },
+                "required": ["task_id"]
+            },
+            "lifeos_project_start": {
+                "type": "object",
+                "properties": {"task_id": {"type": "string", "description": "Stable project task ID"}},
+                "required": ["task_id"]
+            },
+            "lifeos_project_complete": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "Stable project task ID"},
+                    "acknowledge_cancelled_children": {"type": "boolean", "description": "Explicitly acknowledge reduced scope when any child is cancelled (default false)"}
+                },
+                "required": ["task_id"]
+            },
+            "lifeos_project_plan": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "Stable agent-owned project task ID"},
+                    "operation_id": {"type": "string", "description": "Stable client-generated ID reused for retries"}
+                },
+                "required": ["task_id", "operation_id"]
+            },
+            "lifeos_project_cancel": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "Stable project task ID"},
+                    "confirm": {"type": "boolean", "description": "False for a non-mutating preview; true only after explicit operator confirmation"},
+                    "operation_id": {"type": ["string", "null"], "description": "Stable client-generated ID required for confirmation and reused for partial-operation retries"}
+                },
+                "required": ["task_id"]
+            },
+            "lifeos_task_resume_execution": {
+                "type": "object",
+                "properties": {"task_id": {"type": "string", "description": "Stable ordinary task ID"}},
                 "required": ["task_id"]
             },
             "lifeos_task_delete": {
@@ -2039,31 +2204,89 @@ class LifeOSMCPServer:
             return "Message sent to Telegram."
 
         elif tool_name == "lifeos_task_create":
-            return f"Task created: **{data.get('description', '')}** (ID: {data.get('id', '')})\nContext: {data.get('context', 'Inbox')} | File: {data.get('source_file', '')}"
-
-        elif tool_name == "lifeos_task_list":
-            tasks = data.get("tasks", [])
-            if not tasks:
-                return "No tasks found."
-            text = f"Found {data.get('total', len(tasks))} tasks:\n\n"
-            for t in tasks:
-                symbol = {"todo": "[ ]", "done": "[x]", "in_progress": "[/]", "cancelled": "[-]", "deferred": "[>]", "blocked": "[?]", "urgent": "[!]"}.get(t.get("status", "todo"), "[ ]")
-                text += f"- {symbol} **{t.get('description', '')}**"
-                if t.get("due_date"):
-                    text += f" (due: {t['due_date']})"
-                if t.get("priority"):
-                    text += f" [{t['priority']}]"
-                text += f"\n  Context: {t.get('context', 'Inbox')}"
-                if t.get("tags"):
-                    text += f" | Tags: {', '.join('#' + tag for tag in t['tags'])}"
-                text += f" | ID: {t.get('id', '')}\n"
+            text = f"Task created: **{data.get('description', '')}** (ID: {data.get('id', '')})\nContext: {data.get('context', 'Inbox')} | File: {data.get('source_file', '')}"
+            if data.get("parent_id"):
+                text += f"\nParent: {data.get('parent_title') or 'Unknown parent'} [id:{data['parent_id']}]"
             return text
 
+        elif tool_name == "lifeos_task_list":
+            return _format_task_collection(data)
+
+        elif tool_name == "lifeos_task_children":
+            return _format_task_collection(data, children=True)
+
         elif tool_name == "lifeos_task_update":
-            return f"Task updated: **{data.get('description', '')}** (ID: {data.get('id', '')})\nStatus: {data.get('status', '')} | Context: {data.get('context', '')}"
+            text = f"Task updated: **{data.get('description', '')}** (ID: {data.get('id', '')})\nStatus: {data.get('status', '')} | Context: {data.get('context', '')}"
+            if data.get("parent_id"):
+                text += f"\nParent: {data.get('parent_title') or 'Unknown parent'} [id:{data['parent_id']}]"
+            elif data.get("is_project"):
+                text += f"\nProject: {data.get('child_count', 0)} children"
+            return text
 
         elif tool_name == "lifeos_task_complete":
             return f"Task completed: **{data.get('description', '')}** (ID: {data.get('id', '')})"
+
+        elif tool_name == "lifeos_project_start":
+            return f"Project started: **{data.get('description', '')}** (ID: {data.get('id', '')})"
+
+        elif tool_name == "lifeos_project_complete":
+            return f"Project completed: **{data.get('description', '')}** (ID: {data.get('id', '')})"
+
+        elif tool_name == "lifeos_project_plan":
+            verb = "started" if data.get("created") else "recovered"
+            return (
+                f"Project planning {verb}: project {data.get('project_id', '')} | "
+                f"session {data.get('session_id', '')} | status {data.get('status', '')} | "
+                f"operation_id {data.get('operation_id', '')}"
+            )
+
+        elif tool_name == "lifeos_project_cancel":
+            if data.get("confirmation_required"):
+                pending_operation = data.get("operation_id")
+                retry = (
+                    f" Cancellation is already pending; reuse operation_id {pending_operation!r} for confirmation."
+                    if pending_operation
+                    else " Generate one stable operation_id for confirmation and reuse it on retries."
+                )
+                return (
+                    "Confirmation required before project cancellation: "
+                    f"{data.get('unfinished_count', 0)} unfinished, "
+                    f"{data.get('running_count', 0)} running, "
+                    f"{data.get('awaiting_review_count', 0)} awaiting review. "
+                    "Awaiting-review output will be abandoned, not accepted. Explain this scope "
+                    "to the operator, obtain explicit confirmation, then call again with "
+                    "confirm=true."
+                    + retry
+                )
+            complete = bool(data.get("complete")) and not data.get("pending")
+            text = "Project cancellation complete" if complete else "Cancellation incomplete"
+            text += f" for project {data.get('project_id', '')}"
+            if data.get("operation_id"):
+                text += f" (operation_id {data['operation_id']})"
+            text += "."
+            text += (
+                "\nCancelled children: "
+                + (", ".join(data.get("cancelled_child_ids") or []) or "none")
+                + "; preserved done children: "
+                + (", ".join(data.get("preserved_child_ids") or []) or "none")
+                + "; abandoned review children: "
+                + (", ".join(data.get("abandoned_review_ids") or []) or "none")
+                + "; stopped sessions: "
+                + (", ".join(data.get("stopped_session_ids") or []) or "none")
+                + "."
+            )
+            failures = data.get("failures") or []
+            if failures:
+                text += "\nRemaining failures:"
+                for failure in failures:
+                    identity = failure.get("session_id") or failure.get("child_id") or "unknown"
+                    text += f"\n- {identity}: {failure.get('reason') or failure.get('error') or 'stop failed'}"
+            if not complete:
+                text += "\nCancellation remains pending; retry with the same operation_id after resolving the failures."
+            return text
+
+        elif tool_name == "lifeos_task_resume_execution":
+            return f"Task execution resumed: **{data.get('description', '')}** (ID: {data.get('id', '')})"
 
         elif tool_name == "lifeos_task_delete":
             return f"Task deleted (ID: {data.get('id', data.get('task_id', 'unknown'))})"

@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Platform
-> **Last Updated:** 2026-09-18
+> **Last Updated:** 2026-09-20
 
 LifeOS exposes the orchestrator to **HTTP consumers** — thin clients that submit text and consume SSE without importing LifeOS Python modules. Endpoint and event **shapes** are defined in [api-reference.md](../product/api-reference.md); this doc covers **who consumes them**, **whisper-relay integration**, and **breaking-change policy**.
 
@@ -125,9 +125,9 @@ LifeOS `/chat` is the unified text+voice client. Voice *transport* stays in whis
 - `GET /api/voice/audio/{turn_id}/{clip_id}` — WAV clips (status + main).
 - `POST /api/voice/transcribe` — **bare STT for the "Listening" wake-word dock toggle; whisper-relay does not implement this endpoint.** Multipart `audio` in, `{"transcript": "..."}` out; no LLM call, no TTS, no conversation/turn persistence (a wake check must never look like a turn to anything downstream, including the persistence tee below, which keys off `done` events this route must never emit). `web/chat/voice.js`'s `checkForWakeWord()` calls it on every captured speech burst while Listening is on; a 404 means every wake check misses.
 
-**Topology:** browser → LifeOS `/chat` → (proxy) → gateway → for the `lifeos` backend, the gateway calls back into LifeOS `/api/ask/stream` (the consumer-into-LifeOS direction above); for the `hermes` backend, the gateway's Hermes adapter (`voice_gateway/adapters/hermes_backend.py`) calls the Hermes harness directly, silently — not LifeOS's own Hermes proxy, `POST /api/hermes/ask/stream` — so a Hermes-backend voice turn gets none of that seam's persona resolution, `lifeos_context` envelope, or conversation persistence (see "The `lifeos_context` envelope" below), unlike the text path. `nbramia/whisper-relay#32` tracks routing the gateway through that proxy instead, with `modality: "voice"` set so the persona's spoken-style rules attach exactly like a native spoken turn. Conversation/persona listing is owned by LifeOS, not the gateway; the Persistence tee below is what covers conversation persistence across this gap.
+**Topology:** browser → LifeOS `/chat` → (proxy) → gateway → for the `lifeos` backend, the gateway calls back into LifeOS `/api/ask/stream` (the consumer-into-LifeOS direction above); for the `hermes` backend, the gateway's Hermes adapter (`voice_gateway/adapters/hermes_backend.py`) calls the Hermes harness directly — not LifeOS's own Hermes proxy, `POST /api/hermes/ask/stream`. A Hermes-backend voice turn therefore gets none of that proxy seam's persona resolution or `lifeos_context` envelope, unlike the text path. It still reaches the configured LifeOS MCP server, whose task schemas and server-side guards carry task-hierarchy action semantics. Conversation/persona listing is owned by LifeOS, not the gateway; the Persistence tee below covers conversation persistence for this direct route.
 
-**Persistence tee ([ADR-021](../../adr/021-voice-turn-persistence-tee.md)):** because a Hermes-backend voice turn does not reach `/api/hermes/ask/stream`'s own persister (above), `api/routes/voice.py`'s `_VoiceTurnPersister` tees `POST turn/stream`'s relayed SSE response directly, independent of whichever internal call path the gateway used. Trigger: the terminal `done` event's authoritative `data` — a turn that errors, is cancelled, or disconnects before `done` persists nothing (this is also what keeps a bare-transcribe/wake-check call, `POST /api/voice/transcribe` above, from creating a conversation). Guard: writes only when the turn's `backend` form field was exactly `"hermes"` — a `lifeos`-backend turn is already persisted by the native orchestrator (its `done` arrives only after the gateway's internal `/api/ask/stream` call, and that call's persistence, already completed), and an `agent`-backend turn is never persisted, matching that backend's section below. Writes go through the exact same `ConversationStore` calls `_HermesTurnPersister` uses, so grouping (one conversation per voice session) matches the text path. Extracting `backend` requires buffering `turn/stream`'s multipart body — the one path on this proxy that isn't a pure unbuffered stream; every other `/api/voice/*` path is unchanged. **Known residual gap:** if the gateway's Hermes adapter is changed to route through LifeOS's own Hermes proxy (closing the Topology gap above), a hermes-backend voice turn would then be observed by both `_HermesTurnPersister` (via that proxy call) and this tee, double-appending that turn's messages — this tee does not guard against that; whichever change routes the gateway through the proxy must account for it.
+**Persistence tee ([ADR-021](../../adr/021-voice-turn-persistence-tee.md)):** because a Hermes-backend voice turn does not reach `/api/hermes/ask/stream`'s own persister (above), `api/routes/voice.py`'s `_VoiceTurnPersister` tees `POST turn/stream`'s relayed SSE response directly, independent of whichever internal call path the gateway used. Trigger: the terminal `done` event's authoritative `data` — a turn that errors, is cancelled, or disconnects before `done` persists nothing (this is also what keeps a bare-transcribe/wake-check call, `POST /api/voice/transcribe` above, from creating a conversation). Guard: writes only when the turn's `backend` form field was exactly `"hermes"` — a `lifeos`-backend turn is already persisted by the native orchestrator (its `done` arrives only after the gateway's internal `/api/ask/stream` call, and that call's persistence, already completed), and an `agent`-backend turn is never persisted, matching that backend's section below. Writes go through the exact same `ConversationStore` calls `_HermesTurnPersister` uses, so grouping (one conversation per voice session) matches the text path. Extracting `backend` requires buffering `turn/stream`'s multipart body — the one path on this proxy that isn't a pure unbuffered stream; every other `/api/voice/*` path is unchanged.
 
 **Orchestrating personas have no voice-specific divert.** An orchestrating persona reaches the Hermes proxy on both text and voice turns identically — Hermes drives the persona itself (`lifeos_agent_spawn`) rather than rejecting it. `web/chat/voice.js` still only starts pending-question polling (`startPendingQuestionPolling()`) after a `lifeos`-backend turn, never `hermes` or `agent` — not because Hermes rejects the turn, but because only a `lifeos`-backend spawn ever creates a LifeOS-linked session for this client to poll.
 
@@ -368,6 +368,7 @@ Because Hermes has no way to resolve a LifeOS persona id or the current per-turn
       "personal_context": "",
       "existing_tags": [{ "tag": "ai-agent", "count": 12 }],
       "tags_instruction": "...",
+      "task_hierarchy_instruction": "...",
       "session_cost_usd": 0.0031,
       "session_turn_count": 2,
       "session_input_tokens": 300,
@@ -402,6 +403,7 @@ The `turn` object above — identical in shape to the response body of [`GET /ap
 | `personal_context` | string | always present, often empty | A persona-scoped people block. Non-empty only for the `therapist` persona (and only once the relevant config is set); empty string for every other persona. |
 | `existing_tags` | array of `{tag, count}` | always present, may be empty | Task tags already in use, for reuse when tagging. Empty when there are no tags or the task manager is unreachable — a normal degraded case, not an error. |
 | `tags_instruction` | string | always | Prompt-ready instruction to prefer an existing tag over inventing a near-duplicate; pair with `existing_tags`. |
+| `task_hierarchy_instruction` | string | always | Prompt-ready project safety contract: resolve stable task IDs, distinguish task hierarchy from session ancestry, inspect children, preserve independent assignments/provider consent, and preview plus confirm project cancellation. |
 | `session_cost_usd` | number | always | Session-to-date cost: the verbatim sum of `cost_usd` for every turn already recorded for this request's `conversation_id`, in USD. Excludes the turn currently being built — its own cost isn't recorded until its stream finishes, which is later than when this context is handed out. `0` for a conversation with no recorded usage yet (including a brand-new conversation with no id). Never recomputed from token counts. **Read `session_cost_is_lower_bound` before treating this as exact** — see "Session-to-date cost" below. |
 | `session_turn_count` | integer | always | How many already-recorded turns the sum above covers. `0` for a conversation with no recorded usage yet. |
 | `session_input_tokens` | integer | always | Sum of `input_tokens` across the same already-recorded turns. |
@@ -427,7 +429,33 @@ A Hermes session has no built-in way to answer "what has this cost?" even though
 - **`session_turn_count` gives scale, not certainty.** It's the count of recorded turns the sum covers — useful context for how much a floor might be undercounting — without claiming to know how many of them were free versus unpriced.
 - **Agreement with the UI.** For the same conversation with no page reload, `session_cost_usd` sums the identical `cost_usd` values the UI's own running total accumulates, so the two agree.
 - **Also on `GET /api/chat/turn-context`.** `build_turn_context()` takes an optional `conversation_id`, so the standalone endpoint accepts one too (query param, defaulting to none) and returns the identical fields — one parser handles both sources, per the "Turn-context payload" note above.
-- **Native path unaffected.** `build_system_prompt()` (the native orchestrator's actual system prompt) does not call `build_turn_context()` and was not changed — these fields exist only on the exported JSON surfaces (the envelope and the standalone endpoint), not in the native model's prompt.
+- **Native prompt agreement.** `build_system_prompt()` renders the exact
+  `task_hierarchy_instruction` constant as its own uncached block, while
+  `build_turn_context()` exports it structurally. The native model consumes
+  the wording directly; JSON clients receive the same wording without coupling
+  the two builders' cache and serialization boundaries.
+
+### Task hierarchy across client surfaces
+
+Task hierarchy behavior is concentrated in shared task services and propagated
+through each surface's existing adapter:
+
+| Surface | Reader/writer path | Hierarchy behavior |
+|---|---|---|
+| Native web chat | `agent_tools.manage_tasks` in-process | Enriched parent/project output; child retrieval; guarded create/update/complete plus project start/plan/complete/cancel/resume actions. |
+| Telegram chat and LifeOS voice | The same native chat loop and `agent_tools` catalog/prompt | Inherits the native behavior, including a non-mutating cancellation preview and explicit-confirmation second call. No Telegram- or voice-specific task mutation exists. |
+| Hermes text/personas | `lifeos_context.turn` plus the LifeOS MCP task catalog | The envelope carries `task_hierarchy_instruction`; MCP descriptions and responses expose the same project consequences and HTTP action guards. The current Hermes `lifeos_adapter/envelope.py` parser does not render that additive turn field, so prompt-level consumption is not claimed until that consumer adds it. |
+| Hermes voice | Current whisper-relay `src/voice_gateway/adapters/hermes_backend.py` posts directly to the Hermes harness | The configured LifeOS MCP task tools remain hierarchy-aware and enforce the same server guards. The direct route does not traverse the LifeOS Hermes proxy, so it has tool-schema awareness rather than the proxy's proactive `lifeos_context.turn` instruction. |
+| Direct MCP clients (Claude Code, Codex, managed agents) | `mcp_server.py` → task HTTP endpoints | Reads enriched tasks/children and uses explicit project actions. Project cancellation is preview/confirm and reports durable partial failures. |
+| Board worker/executors | HTTP task payload and worker dispatch | Project parents are not claimable; child execution receives bounded parent objective/acceptance and sibling-state context. |
+| Scheduler, journal capture and other automation producers | Existing TaskManager or task-create adapters | Produce ordinary tasks by default. A task becomes a child only when the producer explicitly supplies a valid `fields.parent_id`; serialization and retry paths preserve that field and shared guards validate it. |
+
+The board/UI may offer a richer confirmation dialog, but it is not the safety
+boundary. Native helpers reach the same manager/service guards as HTTP, and
+MCP uses those HTTP actions; raw parent completion, cancellation, deletion or
+claim writes cannot bypass project rules. List filters never redefine project
+classification or counts: those are derived from the complete task set, while
+the dedicated children read supplies the actual bounded child list.
 
 ### Capability comparison
 
@@ -484,7 +512,7 @@ The sidebar shows a conversation's persona as a subtitle suffix (`· <Persona La
 - [ADR-016: Reverse-Proxy the Voice Gateway Through LifeOS](../../adr/016-voice-gateway-reverse-proxy.md) — the voice proxy's "no voice logic" default this doc's Persistence tee section is the one exception to
 - [ADR-019: A Turn's Lifetime Is Owned by the Server, Not the Connection](../../adr/019-turn-owned-by-server.md) — why a disconnect doesn't stop a turn, the original voice exception, and the tradeoffs
 - [ADR-020: The Voice Detachment Gate Is Lifted](../../adr/020-voice-cancel-gate-lifted.md) — why ADR-019's voice exception was temporary, and what made it safe to remove
-- [ADR-021: Tee Voice Turns Into the Conversation Store at the Proxy Seam](../../adr/021-voice-turn-persistence-tee.md) — the Persistence tee section's full rationale, alternatives, and the known whisper-relay#32 double-append gap
+- [ADR-021: Tee Voice Turns Into the Conversation Store at the Proxy Seam](../../adr/021-voice-turn-persistence-tee.md) — the Persistence tee section's full rationale and alternatives
 
 ### Specifications
 - [API Reference](../product/api-reference.md) — Canonical endpoint and SSE shapes

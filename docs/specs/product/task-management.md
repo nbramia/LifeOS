@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Task Management
-> **Last Updated:** 2026-09-03
+> **Last Updated:** 2026-09-20
 
 LifeOS stores tasks as markdown checkboxes in your vault, in a format the Obsidian Tasks plugin can query and display, and manages them via chat, API, or Obsidian. Any checkbox line in `LifeOS/Tasks/*.md` counts as a task — you don't need to type LifeOS's own conventions by hand, and a plain hand-written checklist item is picked up on the next reindex. LifeOS's non-standard statuses (In Progress, Deferred, Blocked, Urgent — see below) render as generic checkboxes in Obsidian until you add them under the Tasks plugin's own "Custom statuses" settings; the plugin doesn't know about them out of the box.
 
@@ -153,6 +153,53 @@ any field you don't mention is left alone.
 curl -X DELETE http://localhost:8000/api/tasks/{id}
 ```
 
+## Projects and Subtasks
+
+A project is an ordinary task with at least one incoming child reference. A
+child stores its parent's stable task ID in the normal inline fields map:
+
+```markdown
+- [ ] TODO Prepare synthetic launch <!-- id:proj1234 -->
+- [ ] TODO Draft synthetic announcement [parent_id:: proj1234] <!-- id:child567 -->
+```
+
+There is no project flag, separate project file, or nested checkbox format.
+Done and cancelled children keep the parent classified as a project until
+their `parent_id` is removed. Set or clear `fields.parent_id` through the
+ordinary create/update APIs to attach, move, or detach a child. Hierarchy is
+one level: a child cannot itself be a project, and missing, self, cyclic, or
+nested links are rejected by API writes.
+
+Creating the first child pauses automatic execution of the parent. Removing
+the final child returns the same parent task to ordinary presentation without
+clearing that pause; use `POST /api/tasks/{id}/resume-execution` when the
+ordinary task should become executable again. Parent assignment is project
+ownership and does not copy to children. Each child keeps its own assignee and
+normal execution/review lifecycle.
+
+Projects use explicit lifecycle actions:
+
+- **Start** marks the parent active without creating worker lifecycle tags.
+- **Plan and delegate** starts one idempotent, bounded agent-owner coordination
+  run with current child state and the project's configured model, effort,
+  host, and working directory. Each child creation uses a stable
+  `operation_key`, so retrying the same planning step recovers the existing
+  child instead of duplicating it.
+- **Complete project** requires every child to be done or cancelled, every
+  agent result to be accepted, no live coordinator, and no pending
+  cancellation. Closing with cancelled children requires explicit reduced-
+  scope acknowledgement.
+- **Cancel project** previews affected open, running, and review-pending
+  children before confirmation. Confirmation persists intent before stopping
+  sessions, cancels unfinished human work, and abandons review results without
+  accepting them. Partial teardown remains visibly pending and can be retried
+  with the operation ID returned by the next cancellation preview after
+  operator intervention.
+
+Cancelling one child never cancels its siblings or parent. Completing or
+reopening a parent never fabricates child completion or restarts cancelled
+children.
+
 ## Task-Reminder Linking
 
 Create a task with an associated reminder in one command:
@@ -200,16 +247,26 @@ it by hand.
 | GET | `/api/tasks` | status, context, tag, due_before, query | List/filter tasks |
 | GET | `/api/tasks/conflicts` | - | List Syncthing conflict/temp files sitting in the tasks folder |
 | GET | `/api/tasks/{id}` | - | Get specific task |
+| GET | `/api/tasks/{id}/children` | limit, offset | List every child by stable parent ID |
 | PUT | `/api/tasks/{id}` | description, status, context, priority, due_date, tags, notes, fields | Update a task |
 | PUT | `/api/tasks/{id}/complete` | - | Mark as done |
 | DELETE | `/api/tasks/{id}` | - | Delete a task |
+| POST | `/api/tasks/{id}/project/start` | - | Start a project without worker lifecycle tags |
+| POST | `/api/tasks/{id}/project/complete` | acknowledge_cancelled_children | Complete a resolved project |
+| POST | `/api/tasks/{id}/project/plan` | operation_id | Start or recover an idempotent coordinator run |
+| POST | `/api/tasks/{id}/project/cancel` | confirm, operation_id | Preview or execute resumable cascade cancellation |
+| POST | `/api/tasks/{id}/resume-execution` | - | Resume an execution-paused ordinary task |
 | POST | `/api/tasks/human-queue` | title, notes, key, done_when, source_host, source_cwd, source_session | File (or dedupe-update) a Human-queue card |
 | GET | `/api/tasks/human-queue` | - | List open Human-queue cards |
 | PUT | `/api/tasks/human-queue/{id_or_key}/resolve` | note | Resolve a Human-queue card |
 
 A task response also includes `updated_at` (an ISO-8601 timestamp with a UTC
-offset, stamped on every create/update/complete/swap-tag) alongside the
-fields above.
+offset, stamped on every create/update/complete/swap-tag) and additive
+hierarchy fields: `parent_id`, `parent_title`, `is_project`, `child_count`,
+`hierarchy_valid`, `hierarchy_error`, and a compact `project` progress and
+coordination summary. A child also reports `parent_cancellation_pending` so
+clients can freeze writes during a cascade. Summaries are computed from the complete task set before
+list filters, so a filtered response does not undercount hidden children.
 
 ## Technical Details
 

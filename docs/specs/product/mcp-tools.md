@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** API Gateway
-> **Last Updated:** 2026-09-15
+> **Last Updated:** 2026-09-20
 
 MCP (Model Context Protocol) server that exposes LifeOS capabilities to AI assistants like Claude Code.
 
@@ -33,9 +33,9 @@ The LifeOS MCP server dynamically discovers endpoints from the LifeOS OpenAPI sp
 - Formatted responses for human readability
 - Fallback schemas when API unavailable
 
-The source catalog contains 62 curated LifeOS endpoint tools. It also
+The source catalog contains 68 curated LifeOS endpoint tools. It also
 registers 9 worker coordination tools (`lifeos_agent_*`), including
-`lifeos_agent_execution_override`, for a 71-tool fallback catalog. When the
+`lifeos_agent_execution_override`, for a 77-tool fallback catalog. When the
 OpenAPI document omits an unavailable endpoint, the live list may be smaller;
 the inter-agent tools remain registered as a separate contract.
 
@@ -54,7 +54,7 @@ Claude Code  ←→  MCP Protocol  ←→  mcp_server.py  ←→  LifeOS API
 |------|-------------|
 | `lifeos_ask` | Query knowledge base with synthesized answer |
 | `lifeos_search` | Search vault without synthesis (raw results) |
-| `lifeos_turn_context` | Per-turn context (date/time, relative-time guidance, existing task tags) — read at the start of a turn |
+| `lifeos_turn_context` | Per-turn context (date/time, relative-time guidance, existing task tags, task-hierarchy guidance) — read at the start of a turn |
 
 ### Calendar & Meeting Tools
 | Tool | Description |
@@ -91,11 +91,27 @@ Tasks can also be managed via natural language chat. See [Task Management spec](
 
 | Tool | Description |
 |------|-------------|
-| `lifeos_task_create` | Create a task (stored as Obsidian Tasks markdown) |
-| `lifeos_task_list` | List/filter tasks by status, context, tag, due date, or fuzzy query |
-| `lifeos_task_update` | Update a task's description, status, context, priority, due date, or tags |
-| `lifeos_task_complete` | Mark a task as done |
+| `lifeos_task_create` | Create a task; set `fields.parent_id` for a project child and `operation_key` for retry-safe creation |
+| `lifeos_task_list` | List/filter enriched tasks, including parent identity and compact derived project progress |
+| `lifeos_task_update` | Update a task; set/clear `fields.parent_id` to attach, reparent, or detach a child |
+| `lifeos_task_complete` | Mark an ordinary task as done; project parents use the checked project action |
 | `lifeos_task_delete` | Delete a task |
+| `lifeos_task_children` | Retrieve the actual children of a project by stable parent ID, with pagination |
+| `lifeos_project_start` | Mark an open project active without launching the parent as an ordinary worker task |
+| `lifeos_project_complete` | Complete a project after every child and coordination guard passes; cancelled children require explicit reduced-scope acknowledgement |
+| `lifeos_project_plan` | Start or recover an idempotent agent-owner planning/delegation run |
+| `lifeos_project_cancel` | Preview cancellation scope, then confirm a resumable cascading cancellation with a stable operation ID |
+| `lifeos_task_resume_execution` | Resume a paused ordinary task after its final child link is removed |
+
+Project classification comes only from incoming `fields.parent_id` references;
+it is unrelated to `lifeos_agent_spawn` session ancestry. Before mutating a
+project, retrieve its children rather than treating a compact list summary as
+the full tree. Project planning derives one `operation_key` per intended child
+from the project ID, planning operation ID, and child role, then reuses it on
+retry. `lifeos_project_cancel` is intentionally two-step: the preview
+reports unfinished, running, and awaiting-review work; confirmation abandons
+pending-review output without accepting it, and a partial result remains
+pending until retried with the same `operation_id`.
 
 ### Human Queue Tools
 

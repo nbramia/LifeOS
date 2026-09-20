@@ -314,6 +314,7 @@ class TurnContextResponse(BaseModel):
     personal_context: str
     existing_tags: list[TagCount]
     tags_instruction: str
+    task_hierarchy_instruction: str
     session_cost_usd: float
     session_turn_count: int
     session_input_tokens: int

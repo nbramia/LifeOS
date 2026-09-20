@@ -1017,7 +1017,11 @@ def _now() -> datetime:
 _BOARD_STREAM_INTERVAL = 0.5
 
 
-def _card_policy(task, session_store: SessionStore) -> dict[str, Any]:
+def _card_policy(
+    task,
+    session_store: SessionStore,
+    hierarchy_fields: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Server-computed policy block for a task card — the ONLY source of
     truth for which human moves are allowed on this card. The drawer and
     the board both read this instead of re-implementing
@@ -1027,12 +1031,24 @@ def _card_policy(task, session_store: SessionStore) -> dict[str, Any]:
     `PUT /api/tasks/{id}`).
     """
     from api.services import agent_board
+    from api.services.task_projects import EXECUTION_PAUSED_FIELD, field_truthy
 
     has_live = session_store.has_live_session(task.id, status=task.status, tags=task.tags)
+    hierarchy_fields = hierarchy_fields or {}
+    project = hierarchy_fields.get("project")
+    coordinator = (project or {}).get("coordinator") or {}
 
     def _outcome(action: str, target_lane: str | None = None) -> dict[str, Any]:
         error = agent_board.evaluate_card_action(
             task.status, task.tags, action, target_lane, has_live_session=has_live,
+            is_project=bool(hierarchy_fields.get("is_project")),
+            execution_paused=field_truthy(task.fields.get(EXECUTION_PAUSED_FIELD)),
+            cancellation_pending=bool(
+                (project or {}).get("cancellation_pending")
+                or hierarchy_fields.get("parent_cancellation_pending")
+            ),
+            has_live_coordinator=bool(coordinator.get("live")),
+            hierarchy_valid=hierarchy_fields.get("hierarchy_valid", True),
         )
         return {"allowed": error is None, "reason": error[1] if error else None}
 
@@ -1051,6 +1067,13 @@ def _card_policy(task, session_store: SessionStore) -> dict[str, Any]:
         if not (outcome := _outcome("lane_move", lane))["allowed"]
     }
 
+    project_actions = agent_board.project_action_policy(
+        task.status,
+        task.tags,
+        project,
+        hierarchy_valid=hierarchy_fields.get("hierarchy_valid", True),
+        execution_paused=field_truthy(task.fields.get(EXECUTION_PAUSED_FIELD)),
+    )
     return {
         "claimed": agent_board.is_claimed(task.status, task.tags, has_live),
         "agent_owned": agent_board.is_agent_owned(task.tags),
@@ -1058,6 +1081,7 @@ def _card_policy(task, session_store: SessionStore) -> dict[str, Any]:
         "assignee": _outcome("assignee_change"),
         "fields": _outcome("field_edit"),
         "lanes": lanes_refused,
+        **project_actions,
     }
 
 
@@ -1120,12 +1144,14 @@ def _task_card(task, sessions_by_task: dict[str, list[dict[str, Any]]],
                 open_question_by_task: dict[str, dict[str, Any]],
                 session_store: SessionStore,
                 outcomes_by_task: dict[str, dict[str, Any]],
-                pr_status_by_url: dict[str, dict[str, Any]]) -> dict[str, Any]:
+                pr_status_by_url: dict[str, dict[str, Any]],
+                hierarchy_fields: dict[str, Any] | None = None) -> dict[str, Any]:
     from api.services import agent_board
 
     candidates = sessions_by_task.get(task.id) or []
     session = max(candidates, key=lambda s: s.get("last_activity_at") or 0) if candidates else None
     pq = open_question_by_task.get(task.id)
+    hierarchy_fields = hierarchy_fields or {}
     return {
         "kind": "task",
         "id": task.id,
@@ -1147,8 +1173,9 @@ def _task_card(task, sessions_by_task: dict[str, list[dict[str, Any]]],
         "priority": task.priority,
         "session": session,
         "pending_question": _pending_question_view(pq) if pq else None,
-        "policy": _card_policy(task, session_store),
+        "policy": _card_policy(task, session_store, hierarchy_fields),
         "outcome": _card_outcome_view(outcomes_by_task.get(task.id), pr_status_by_url),
+        **hierarchy_fields,
     }
 
 
@@ -1193,12 +1220,17 @@ def _build_board() -> dict[str, Any]:
     from api.services import agent_board
     from api.services.task_manager import get_task_manager
     from api.services.scheduler_store import get_scheduler_store
+    from api.services.task_projects import ProjectTaskService, build_task_hierarchy
 
     task_manager = get_task_manager()
     scheduler_store = get_scheduler_store()
     session_store = _get_session_store()
 
     tasks = task_manager.list_tasks()
+    hierarchy = build_task_hierarchy(tasks)
+    project_service = ProjectTaskService(
+        task_manager, session_store, _get_transcript_store(),
+    )
     now = _now()
 
     sessions_by_task: dict[str, list[dict[str, Any]]] = {}
@@ -1219,9 +1251,14 @@ def _build_board() -> dict[str, Any]:
     lanes: dict[str, list[dict[str, Any]]] = {lane: [] for lane in agent_board.LANES}
     for task in tasks:
         lane = agent_board.derive_lane(task.status, task.tags, task.fields, now)
+        hierarchy_fields = hierarchy.read_fields(
+            task.id,
+            project_service.coordinator_view(task),
+        )
         lanes[lane].append(_task_card(
             task, sessions_by_task, open_question_by_task, session_store,
             outcomes_by_task, pr_status_by_url,
+            hierarchy_fields,
         ))
 
     for entry in scheduler_store.list_all():

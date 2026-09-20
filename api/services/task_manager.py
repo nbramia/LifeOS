@@ -25,6 +25,7 @@ import logging
 import re
 import threading
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
@@ -267,7 +268,13 @@ class TaskManager:
 
     TASKS_FOLDER = "LifeOS/Tasks"
 
-    def __init__(self, vault_path: Optional[Path] = None, index_path: Optional[Path] = None):
+    def __init__(
+        self,
+        vault_path: Optional[Path] = None,
+        index_path: Optional[Path] = None,
+        live_session_checker: Optional[Callable[[str, str, list[str]], bool]] = None,
+        live_coordinator_checker: Optional[Callable[[str], bool]] = None,
+    ):
         self.vault_path = Path(vault_path) if vault_path else Path(settings.vault_path)
         self.index_path = Path(index_path) if index_path else DEFAULT_INDEX_PATH
         self.tasks_dir = self.vault_path / self.TASKS_FOLDER
@@ -286,6 +293,11 @@ class TaskManager:
         # swap_tag/delete, all lock-held) invokes reindex_file(), which also
         # takes this lock — a plain Lock would self-deadlock on that retry.
         self._lock = threading.RLock()
+        # Injectable for isolated tests. Production lazily consults the
+        # existing SessionStore only when a project guard actually needs the
+        # answer, keeping ordinary task reads and writes import-cheap.
+        self._live_session_checker = live_session_checker
+        self._live_coordinator_checker = live_coordinator_checker
 
         self.index_path.parent.mkdir(parents=True, exist_ok=True)
         self.tasks_dir.mkdir(parents=True, exist_ok=True)
@@ -349,7 +361,7 @@ class TaskManager:
                 f"Invalid status '{status}'. Must be one of: {', '.join(sorted(VALID_STATUSES))}"
             )
         _validate_text_fields(description=description, notes=notes, fields=fields)
-        with self._lock:
+        with self._lock, exclusive_operation_lock(self.index_path.parent / ".task-operation.lock"):
             task = Task(
                 id=uuid.uuid4().hex[:8],
                 description=description,
@@ -364,6 +376,37 @@ class TaskManager:
                 notes=notes,
                 fields=dict(fields) if fields else {},
             )
+            parent_id = (task.fields.get("parent_id") or "").strip()
+            if parent_id:
+                # Refresh from Markdown after acquiring the cross-process
+                # boundary. This serializes first-child attachment against an
+                # atomic worker claim even when independent TaskManager
+                # instances are involved.
+                self.rebuild_index()
+                from api.services.task_projects import (
+                    EXECUTION_PAUSED_FIELD,
+                    build_task_hierarchy,
+                    validate_parent_change,
+                )
+
+                existing_hierarchy = build_task_hierarchy(self._tasks.values())
+                hierarchy = build_task_hierarchy([*self._tasks.values(), task])
+                validate_parent_change(
+                    hierarchy,
+                    task.id,
+                    parent_id,
+                    has_live_session=self._project_task_has_live_session,
+                    has_live_coordinator=self._project_task_has_live_coordinator,
+                )
+                if not existing_hierarchy.children(parent_id):
+                    # Pause first. A crash after this write but before child
+                    # creation intentionally leaves a visible, resumable
+                    # ordinary task rather than an executable stale assignee.
+                    self.update(
+                        parent_id,
+                        fields={EXECUTION_PAUSED_FIELD: "true"},
+                        _project_action=True,
+                    )
             if task.status == "done" and not task.done_date:
                 task.done_date = _today()
             if task.status == "cancelled" and not task.cancelled_date:
@@ -397,6 +440,7 @@ class TaskManager:
         priority: str = "",
         due_date: Optional[str] = None,
         tags: Optional[list[str]] = None,
+        reminder_id: Optional[str] = None,
         notes: Optional[str] = None,
         fields: Optional[dict[str, str]] = None,
     ) -> tuple[Task, bool]:
@@ -433,6 +477,7 @@ class TaskManager:
                 priority=priority,
                 due_date=due_date,
                 tags=tags,
+                reminder_id=reminder_id,
                 notes=notes,
                 fields=merged_fields,
                 _log_content=False,
@@ -453,9 +498,18 @@ class TaskManager:
     def get(self, task_id: str) -> Optional[Task]:
         return self._tasks.get(task_id)
 
-    def complete(self, task_id: str) -> Optional[Task]:
-        """Mark a task as done."""
-        return self.update(task_id, status="done")
+    def complete(
+        self,
+        task_id: str,
+        *,
+        acknowledge_cancelled_children: bool = False,
+    ) -> Optional[Task]:
+        """Mark a task done after applying project completion guards."""
+        return self.update(
+            task_id,
+            status="done",
+            _acknowledge_cancelled_children=acknowledge_cancelled_children,
+        )
 
     def update(self, task_id: str, **kwargs) -> Optional[Task]:
         """Update a task. Supports: description, status, context, priority,
@@ -470,6 +524,12 @@ class TaskManager:
         `_validate_text_fields`.
         """
         fields_patch = kwargs.pop("fields", None)
+        skip_project_validation = bool(kwargs.pop("_skip_project_validation", False))
+        project_operation = kwargs.pop("_project_operation", None)
+        project_action = bool(kwargs.pop("_project_action", False) or project_operation)
+        acknowledge_cancelled_children = bool(
+            kwargs.pop("_acknowledge_cancelled_children", False)
+        )
         notes_merge = kwargs.pop("_notes_merge", None)
         expected_updated_at = kwargs.pop("_expected_updated_at", None)
         # Internal board action hook: called with the latest task, before any
@@ -502,10 +562,56 @@ class TaskManager:
         _validate_text_fields(
             description=kwargs.get("description"), notes=kwargs.get("notes"), fields=fields_patch
         )
-        with self._lock:
+        with self._lock, exclusive_operation_lock(self.index_path.parent / ".task-operation.lock"):
             current = self._tasks.get(task_id)
             if not current:
                 return None
+
+            relationship_change = bool(fields_patch is not None and "parent_id" in fields_patch)
+            if relationship_change or "status" in kwargs or "tags" in kwargs or fields_patch:
+                # A different process may have attached the first child or
+                # persisted cancellation intent immediately before this
+                # writer acquired the operation lock.
+                self.rebuild_index()
+                current = self._tasks.get(task_id)
+                if not current:
+                    return None
+
+            if not skip_project_validation:
+                self._guard_project_update(
+                    current,
+                    kwargs=kwargs,
+                    fields_patch=fields_patch,
+                    tags_change=("tags" in kwargs or tags_merge is not None),
+                    project_action=project_action,
+                    project_operation=project_operation,
+                    acknowledge_cancelled_children=acknowledge_cancelled_children,
+                )
+
+            if relationship_change and not skip_project_validation:
+                from api.services.task_projects import (
+                    EXECUTION_PAUSED_FIELD,
+                    build_task_hierarchy,
+                    clean_parent_id,
+                    validate_parent_change,
+                )
+
+                hierarchy = build_task_hierarchy(self._tasks.values())
+                new_parent_id = clean_parent_id(fields_patch.get("parent_id"))
+                validate_parent_change(
+                    hierarchy,
+                    task_id,
+                    new_parent_id,
+                    has_live_session=self._project_task_has_live_session,
+                    has_live_coordinator=self._project_task_has_live_coordinator,
+                )
+                old_parent_id = clean_parent_id(current.fields.get("parent_id"))
+                if new_parent_id and new_parent_id != old_parent_id and not hierarchy.children(new_parent_id):
+                    self.update(
+                        new_parent_id,
+                        fields={EXECUTION_PAUSED_FIELD: "true"},
+                        _project_action=True,
+                    )
 
             old_context = current.context
             new_context = kwargs.get("context", old_context)
@@ -552,6 +658,12 @@ class TaskManager:
                         else:
                             merged[k] = v
                     t.fields = merged
+                # Any explicit lifecycle write supersedes the short lease
+                # between interactive launch and hook registration. The
+                # hook's first in_progress write clears it; a failed/terminal
+                # flow reset to todo clears it as well.
+                if "status" in kwargs:
+                    t.fields.pop("execution_reservation_until", None)
                 _clear_stale_snooze(t)
                 t.updated_at = _now_iso()
                 return t
@@ -627,7 +739,8 @@ class TaskManager:
         """
         from_norm = from_tag.lstrip("#").lower()
         to_norm = to_tag.lstrip("#")  # preserve operator-provided case
-        with self._lock:
+        with self._lock, exclusive_operation_lock(self.index_path.parent / ".task-operation.lock"):
+            self.rebuild_index()
             current = self._tasks.get(task_id)
             if not current:
                 return False
@@ -702,6 +815,8 @@ class TaskManager:
 
         def is_claimable(task: Task) -> bool:
             tags = {tag.lstrip("#").lower() for tag in task.tags}
+            if not self._project_claim_allowed(task):
+                return False
             return (
                 task.status.lower() in statuses
                 and bool(tags & pickup)
@@ -709,7 +824,8 @@ class TaskManager:
                 and not _is_snoozed(task.fields)
             )
 
-        with self._lock:
+        with self._lock, exclusive_operation_lock(self.index_path.parent / ".task-operation.lock"):
+            self.rebuild_index()
             current = self._tasks.get(task_id)
             if not current or not is_claimable(current):
                 return False, False
@@ -805,10 +921,16 @@ class TaskManager:
 
     def delete(self, task_id: str) -> bool:
         """Remove a task (and any notes body) from its file and index."""
-        with self._lock:
+        with self._lock, exclusive_operation_lock(self.index_path.parent / ".task-operation.lock"):
             task = self._tasks.get(task_id)
             if not task:
                 return False
+
+            self.rebuild_index()
+            task = self._tasks.get(task_id)
+            if not task:
+                return False
+            self._guard_project_delete(task)
 
             path = Path(task.source_file)
             self._cas_rewrite(path, task_id, lambda: None)
@@ -845,6 +967,259 @@ class TaskManager:
             results = _fuzzy_filter(results, query)
 
         return results
+
+    def all_tasks_snapshot(self) -> list[Task]:
+        """Return the complete in-memory task set for derived read models."""
+        return list(self._tasks.values())
+
+    def list_children(self, task_id: str) -> list[Task]:
+        """Return every child by stable parent id, including terminal ones."""
+        from api.services.task_projects import build_task_hierarchy
+
+        return build_task_hierarchy(self._tasks.values()).children(task_id)
+
+    def project_read_fields(self, task_id: str) -> dict:
+        """Return additive hierarchy fields for task/API/agent readers."""
+        from api.services.task_projects import ProjectTaskService
+
+        return ProjectTaskService(self).read_fields(task_id)
+
+    @contextmanager
+    def project_operation(self):
+        """Refresh and hold the shared task boundary for a short operation.
+
+        This is for session staging/linkage, not remote execution or teardown.
+        The operation lock is re-entrant, so ordinary TaskManager writes can
+        safely remain the only Markdown mutation path inside the boundary.
+        """
+        with self._lock, exclusive_operation_lock(self.index_path.parent / ".task-operation.lock"):
+            self.rebuild_index()
+            yield
+
+    def can_start_execution(self, task_id: str) -> bool:
+        """Shared Open/claim guard for ordinary task execution."""
+        task = self._tasks.get(task_id)
+        return bool(task and self._project_claim_allowed(task))
+
+    def reserve_execution_start(self, task_id: str, *, seconds: int = 45) -> Optional[Task]:
+        """Atomically reserve an interactive execution start.
+
+        The short durable lease closes the gap between launching an
+        interactive CLI and its lifecycle hook registering the session. It
+        serializes against both first-child attachment and worker claims, and
+        expires automatically if the launcher or API process dies.
+        """
+        from api.services.task_projects import EXECUTION_RESERVATION_FIELD
+
+        with self._lock, exclusive_operation_lock(self.index_path.parent / ".task-operation.lock"):
+            self.rebuild_index()
+            task = self._tasks.get(task_id)
+            if task is None or task.status != "todo" or not self._project_claim_allowed(task):
+                return None
+            return self.update(
+                task_id,
+                fields={
+                    EXECUTION_RESERVATION_FIELD: (
+                        datetime.now(timezone.utc) + timedelta(seconds=max(1, seconds))
+                    ).isoformat(),
+                },
+                _project_action=True,
+            )
+
+    def release_execution_start(self, task_id: str) -> None:
+        """Clear a failed interactive execution reservation."""
+        from api.services.task_projects import EXECUTION_RESERVATION_FIELD
+
+        self.update(
+            task_id,
+            fields={EXECUTION_RESERVATION_FIELD: None},
+            _project_action=True,
+        )
+
+    # ------------------------------------------------------------------
+    # Project mutation guards
+    # ------------------------------------------------------------------
+
+    def _project_task_has_live_session(self, task: Task) -> bool:
+        from api.services.task_projects import EXECUTION_RESERVATION_FIELD, field_timestamp_future
+
+        if field_timestamp_future(task.fields.get(EXECUTION_RESERVATION_FIELD)):
+            return True
+        if self._live_session_checker is not None:
+            return bool(self._live_session_checker(task.id, task.status, list(task.tags)))
+        try:
+            from api.services.agent_worker.session_store import SessionStore, TERMINAL_STATUSES
+
+            store = SessionStore()
+            session = store.get(task.id)
+            if session is not None and session.status not in TERMINAL_STATUSES:
+                return True
+            return any(
+                cli.status != "ended"
+                for cli in store.list_cli_sessions_for_task(task.id)
+            )
+        except Exception:
+            # A session-store outage cannot turn a visibly claimed task into
+            # attachable work; the tag/status-only predicate still fails
+            # closed for the ordinary worker-owned shapes.
+            return False
+
+    def _project_task_has_live_coordinator(self, task: Task) -> bool:
+        from api.services.task_projects import COORDINATOR_SESSION_FIELD
+
+        session_id = task.fields.get(COORDINATOR_SESSION_FIELD)
+        if not session_id:
+            return False
+        if self._live_coordinator_checker is not None:
+            return bool(self._live_coordinator_checker(session_id))
+        try:
+            from api.services.agent_worker.session_store import SessionStore, TERMINAL_STATUSES
+
+            session = SessionStore().get_by_session_id(session_id)
+            return bool(session and session.status not in TERMINAL_STATUSES)
+        except Exception:
+            # Preserve safety when linkage exists but liveness cannot be
+            # verified. A later retry can proceed once the store is healthy.
+            return True
+
+    def _guard_project_update(
+        self,
+        current: Task,
+        *,
+        kwargs: dict,
+        fields_patch: Optional[dict],
+        tags_change: bool,
+        project_action: bool,
+        project_operation: Optional[str],
+        acknowledge_cancelled_children: bool,
+    ) -> None:
+        from api.services.task_projects import (
+            ABANDONED_AT_FIELD,
+            CANCEL_OPERATION_FIELD,
+            CANCEL_REQUESTED_AT_FIELD,
+            COORDINATOR_SESSION_FIELD,
+            COORDINATOR_REQUEST_FIELD,
+            EXECUTION_PAUSED_FIELD,
+            EXECUTION_RESERVATION_FIELD,
+            LAST_CANCEL_OPERATION_FIELD,
+            ProjectConflictError,
+            build_task_hierarchy,
+            clean_parent_id,
+        )
+
+        hierarchy = build_task_hierarchy(self._tasks.values())
+        entry = hierarchy.entry(current.id)
+        internal_fields = {
+            EXECUTION_PAUSED_FIELD,
+            EXECUTION_RESERVATION_FIELD,
+            COORDINATOR_SESSION_FIELD,
+            COORDINATOR_REQUEST_FIELD,
+            CANCEL_OPERATION_FIELD,
+            CANCEL_REQUESTED_AT_FIELD,
+            LAST_CANCEL_OPERATION_FIELD,
+            ABANDONED_AT_FIELD,
+        }
+        if not project_action and fields_patch and set(fields_patch) & internal_fields:
+            raise ProjectConflictError("use the explicit project lifecycle action for internal fields")
+        parent_id = clean_parent_id(current.fields.get("parent_id"))
+        parent = self._tasks.get(parent_id) if parent_id else None
+        if parent and parent.fields.get(CANCEL_OPERATION_FIELD) and not project_action:
+            raise ProjectConflictError("parent project cancellation is pending")
+
+        if not entry.is_project:
+            return
+        cancellation_pending = bool(current.fields.get(CANCEL_OPERATION_FIELD))
+        coordinator_live = self._project_task_has_live_coordinator(current)
+        if cancellation_pending and project_operation != "cancel":
+            raise ProjectConflictError("project cancellation is pending")
+        sensitive_fields = bool(
+            fields_patch
+            and set(fields_patch) & {
+                "model", "effort", "host", "working_dir", "assigned_by",
+                EXECUTION_PAUSED_FIELD, COORDINATOR_SESSION_FIELD,
+            }
+        )
+        if not project_action and (cancellation_pending or coordinator_live):
+            if tags_change or sensitive_fields or "parent_id" in (fields_patch or {}):
+                reason = "project cancellation is pending" if cancellation_pending else "project coordinator is live"
+                raise ProjectConflictError(f"owner or execution fields are locked while {reason}")
+
+        target_status = kwargs.get("status")
+        if target_status == "in_progress" and target_status != current.status and not project_action:
+            raise ProjectConflictError("use the project Start action")
+        if target_status == "cancelled" and not project_action:
+            raise ProjectConflictError("use the project cancel action so unfinished children are cascaded")
+        if target_status != "done":
+            return
+        if cancellation_pending:
+            raise ProjectConflictError("project cancellation is pending")
+        if coordinator_live:
+            raise ProjectConflictError("project coordinator is live")
+        unresolved = [
+            child for child in hierarchy.children(current.id)
+            if hierarchy.child_state(child) not in {"done", "cancelled"}
+        ]
+        if unresolved:
+            raise ProjectConflictError(
+                "project has unresolved children: " + ", ".join(child.id for child in unresolved)
+            )
+        cancelled = [
+            child for child in hierarchy.children(current.id)
+            if hierarchy.child_state(child) == "cancelled"
+        ]
+        if cancelled and not acknowledge_cancelled_children:
+            raise ProjectConflictError("acknowledge cancelled children before completing reduced scope")
+
+    def _guard_project_delete(self, task: Task) -> None:
+        from api.services.task_projects import (
+            CANCEL_OPERATION_FIELD,
+            ProjectConflictError,
+            build_task_hierarchy,
+            clean_parent_id,
+            validate_parent_change,
+        )
+
+        hierarchy = build_task_hierarchy(self._tasks.values())
+        if hierarchy.children(task.id):
+            raise ProjectConflictError("detach or reparent project children before deleting the parent")
+        if task.fields.get(CANCEL_OPERATION_FIELD):
+            raise ProjectConflictError("project cancellation is pending")
+        if self._project_task_has_live_coordinator(task):
+            raise ProjectConflictError("project coordinator is live")
+        if clean_parent_id(task.fields.get("parent_id")):
+            validate_parent_change(
+                hierarchy,
+                task.id,
+                None,
+                has_live_session=self._project_task_has_live_session,
+                has_live_coordinator=self._project_task_has_live_coordinator,
+            )
+
+    def _project_claim_allowed(self, task: Task) -> bool:
+        from api.services.task_projects import (
+            CANCEL_OPERATION_FIELD,
+            EXECUTION_PAUSED_FIELD,
+            EXECUTION_RESERVATION_FIELD,
+            build_task_hierarchy,
+            clean_parent_id,
+            field_timestamp_future,
+            field_truthy,
+        )
+
+        hierarchy = build_task_hierarchy(self._tasks.values())
+        entry = hierarchy.entry(task.id)
+        if (
+            not entry.valid
+            or entry.is_project
+            or field_truthy(task.fields.get(EXECUTION_PAUSED_FIELD))
+            or field_timestamp_future(task.fields.get(EXECUTION_RESERVATION_FIELD))
+        ):
+            return False
+        parent_id = clean_parent_id(task.fields.get("parent_id"))
+        parent = self._tasks.get(parent_id) if parent_id else None
+        if parent and parent.fields.get(CANCEL_OPERATION_FIELD):
+            return False
+        return True
 
     def list_tags(self) -> list[dict]:
         """Return distinct tags across all tasks with usage counts, sorted by count desc then name."""
@@ -972,6 +1347,7 @@ class TaskManager:
                 del self._tasks[tid]
                 self._last_written_line.pop(tid, None)
             self._tasks.update(file_tasks)
+            self._repair_observed_project_pauses()
 
             self._save_index()
             self._write_dashboard()
@@ -1014,9 +1390,55 @@ class TaskManager:
         self._last_written_line = {
             tid: line for tid, line in self._last_written_line.items() if tid in rebuilt
         }
+        self._repair_observed_project_pauses()
         self._save_index()
         self._write_dashboard()
         logger.info(f"Rebuilt task index: {len(self._tasks)} tasks")
+
+    def _repair_observed_project_pauses(self) -> None:
+        """Pause parents created by observed direct-vault relationship edits.
+
+        External editors bypass API validation and cannot participate in the
+        API write transaction. Once their link is visible to a watcher/full
+        rebuild, however, valid derived projects are made non-executable in
+        Markdown as well as by the independent claim guard. Invalid links stay
+        untouched and visible through ``hierarchy_valid=false``.
+        """
+        with exclusive_operation_lock(self.index_path.parent / ".task-operation.lock"):
+            self._repair_observed_project_pauses_locked()
+
+    def _repair_observed_project_pauses_locked(self) -> None:
+        from api.services.task_projects import (
+            EXECUTION_PAUSED_FIELD,
+            build_task_hierarchy,
+            field_truthy,
+        )
+
+        hierarchy = build_task_hierarchy(self._tasks.values())
+        for task_id, task in list(self._tasks.items()):
+            entry = hierarchy.entry(task_id)
+            if not entry.is_project or not entry.valid:
+                continue
+            if field_truthy(task.fields.get(EXECUTION_PAUSED_FIELD)):
+                continue
+            path = Path(task.source_file)
+
+            def compute(task_id=task_id) -> Task:
+                current = self._tasks[task_id]
+                repaired = copy.copy(current)
+                repaired.fields = {**current.fields, EXECUTION_PAUSED_FIELD: "true"}
+                repaired.updated_at = _now_iso()
+                return repaired
+
+            try:
+                found, _ = self._cas_rewrite(path, task_id, compute)
+                if found:
+                    self._reposition_file(path)
+            except TaskConflictError:
+                # A watcher will observe the competing edit and retry. Claim
+                # remains fail-closed immediately because is_project is
+                # derived independently of this repair field.
+                logger.warning("could not persist execution pause for observed project %s", task_id)
 
     def _reparse_lines(
         self,

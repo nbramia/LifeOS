@@ -32,6 +32,11 @@ def server(monkeypatch, tmp_path: Path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(mcp_server, "AGENT_SESSIONS_DB", tmp_path / "data" / "agent_sessions.db")
     monkeypatch.setattr(mcp_server, "AGENT_TRANSCRIPTS_DIR", tmp_path / "data" / "agent_transcripts")
+    monkeypatch.setattr(
+        mcp_server.LifeOSMCPServer,
+        "_load_openapi_spec",
+        lambda self: self._build_tools_fallback(),
+    )
     srv = mcp_server.LifeOSMCPServer()
     return srv
 
@@ -68,7 +73,7 @@ def test_inter_agent_tools_are_registered(server):
 
 @pytest.mark.unit
 def test_mcp_catalog_count_and_inter_agent_schema_contract(server):
-    """The registered fallback catalog is 62 curated + 9 inter-agent tools.
+    """The registered fallback catalog is 68 curated + 9 inter-agent tools.
 
     The ninth inter-agent tool is the canonical execution-override surface;
     keeping this assertion next to the schema checks prevents docs and live
@@ -76,9 +81,9 @@ def test_mcp_catalog_count_and_inter_agent_schema_contract(server):
     """
     from api.services.agent_worker.inter_agent import INTER_AGENT_TOOL_SCHEMAS
 
-    assert len(mcp_server.CURATED_ENDPOINTS) == mcp_server.CURATED_TOOL_COUNT == 62
+    assert len(mcp_server.CURATED_ENDPOINTS) == mcp_server.CURATED_TOOL_COUNT == 68
     assert len(INTER_AGENT_TOOL_SCHEMAS) == 9
-    assert len(server.tools) == 71
+    assert len(server.tools) == 77
     assert len({tool["name"] for tool in server.tools}) == len(server.tools)
 
 

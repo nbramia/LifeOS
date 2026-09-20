@@ -1495,6 +1495,10 @@
     color: var(--text-secondary);
   }
   .board-chip-assignee { color: var(--accent); border-color: var(--accent); }
+  .board-chip-project { color: var(--running); border-color: var(--running); font-weight: 600; }
+  .board-chip-parent { color: var(--yielded); border-color: var(--yielded); cursor: pointer; }
+  .board-project-progress { margin-top: 0.35rem; color: var(--text-secondary); font-size: 0.72rem; }
+  .board-project-ready { color: var(--running); font-weight: 600; }
   .board-chip-host { color: var(--claimed); border-color: var(--claimed); }
   .board-chip-assigned-host { color: var(--yielded); border-color: var(--yielded); border-style: dashed; }
   .board-chip-snoozed { color: var(--yielded); border-color: var(--yielded); }
@@ -1582,6 +1586,17 @@
     overflow-y: auto;
     padding: 1rem;
   }
+  .board-drawer.project-drawer { width: min(720px, 96vw); }
+  .project-summary { background: var(--bg-elev); border: 1px solid var(--border); border-radius: 8px; padding: 0.7rem; }
+  .project-status-row { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-top: 0.35rem; }
+  .project-child-list { display: flex; flex-direction: column; gap: 0.4rem; margin-top: 0.6rem; }
+  .project-child-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; gap: 0.45rem; align-items: center; border: 1px solid var(--border); border-radius: 6px; padding: 0.45rem; }
+  .project-child-open { min-width: 0; background: transparent; color: var(--text-primary); border: 0; text-align: left; cursor: pointer; font: inherit; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .project-child-meta { color: var(--text-secondary); font-size: 0.72rem; white-space: nowrap; }
+  .project-child-actions { display: flex; gap: 0.25rem; }
+  .project-child-actions button, .project-inline-action { font-size: 0.72rem; padding: 0.25rem 0.45rem; }
+  .project-coordination { margin-top: 0.6rem; color: var(--text-secondary); font-size: 0.8rem; }
+  .project-error { color: var(--failed); font-size: 0.75rem; margin-top: 0.35rem; }
   .drawer-header { position: relative; margin-bottom: 0.75rem; }
   .drawer-title {
     display: block;
@@ -1861,6 +1876,8 @@
       z-index: 1;
     }
     .drawer-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+    .project-child-row { grid-template-columns: minmax(0, 1fr) auto; }
+    .project-child-row .project-child-actions { grid-column: 1 / -1; }
     .drawer-row > *,
     .board-drawer select {
       min-width: 0;
@@ -1982,6 +1999,12 @@
       <option value="hermes">hermes</option>
       <option value="local">local</option>
       <option value="cloud">cloud</option>
+    </select>
+    <select id="board-filter-project" title="Project membership">
+      <option value="all">all work</option>
+      <option value="projects">projects</option>
+      <option value="children">project children</option>
+      <option value="ordinary">ordinary tasks</option>
     </select>
     <select id="board-filter-host" title="Host"><option value="all">all hosts</option></select>
     <select id="board-filter-engine" title="Engine">

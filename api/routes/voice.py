@@ -63,14 +63,12 @@ class _VoiceTurnPersister:
     ``/api/ask/stream`` directly, never LifeOS's ``/api/hermes/ask/stream``
     proxy — confirmed by reading that adapter, not assumed. So
     ``_HermesTurnPersister`` (hermes_proxy.py) never sees a Hermes voice
-    turn at all; this repo's client-surfaces.md documents the gateway
-    routing hermes voice turns through LifeOS's Hermes proxy as the *target*
-    cross-repo contract (`nbramia/whisper-relay#32`), not what the deployed
-    gateway does today. This proxy (`/api/voice/*`) is the one seam every
+    turn at all; the direct Hermes route is the current contract. This proxy
+    (`/api/voice/*`) is the one seam every
     voice turn passes through regardless of backend or which call path the
     gateway used internally, since the browser only ever talks to
     ``/api/voice/turn/stream`` — so it's where a backend-agnostic tee has to
-    live until whisper-relay#32 ships.
+    live.
 
     Double-write guard: a ``lifeos``-backend turn IS already persisted, by
     the native orchestrator — the gateway's lifeos adapter
