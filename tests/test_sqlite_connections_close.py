@@ -3,16 +3,17 @@
 sqlite3's own connection context manager only commits or rolls back on
 exit — it never calls `.close()`. A `with sqlite3.connect(...) as conn:` (or
 `with _DB_LOCK, sqlite3.connect(...) as conn:`) call site therefore leaks a
-file descriptor every time it runs. The fix is a small contextmanager that
-opens the connection, nests the original `with conn:` for the same
-commit/rollback behavior, and closes it in a `finally` block (see
-`SessionStore._connect`, `UsageLedger._connect`, `agent_viz_summary._connect`,
-`SpendTracker._connect`, and `CaptureLedger._connect` for the pattern).
+file descriptor every time it runs. `SessionStore._connect`,
+`UsageLedger._connect`, `agent_viz_summary._connect`,
+`SpendTracker._connect`, and `CaptureLedger._connect` instead each open the
+connection through a small contextmanager that nests the original
+`with conn:` for the same commit/rollback behavior and closes it in a
+`finally` block.
 
-This scans every module under `api/` for the raw pattern coming back. A
-shrinking allowlist covers modules not yet migrated: an entry drops out
-once its file no longer matches, and a match outside the allowlist fails
-the scan.
+This scans every module under `api/` for the raw pattern. A shrinking
+allowlist names modules that still use the raw pattern: a file belongs on
+the allowlist exactly as long as one of its lines matches, and a match
+outside the allowlist fails the scan.
 """
 from __future__ import annotations
 
@@ -62,6 +63,6 @@ def test_no_unclosed_sqlite_connect_context_managers_outside_allowlist():
 def test_allowlist_has_no_stale_entries():
     stale = [rel for rel in sorted(_ALLOWLIST) if not _matching_lines(_REPO_ROOT / rel)]
     assert not stale, (
-        "these allowlist entries no longer contain the pattern — remove "
+        "these allowlist entries contain no matching lines — remove "
         "them from _ALLOWLIST:\n" + "\n".join(stale)
     )
