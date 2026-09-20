@@ -186,6 +186,7 @@ Engine-assigned task worker. Product spec: [agent-worker.md](../specs/product/ag
 | `LIFEOS_AGENT_REMOTE_EXECUTOR` | bool | `false` | Opt-in: when the [OpenAI-compatible remote provider](#openai-compatible-remote-provider) is fully configured and the local llama-server is unreachable at session start, the local route runs the session on the remote provider instead of failing. No-op unless the remote provider is fully configured. |
 | `LIFEOS_AGENT_DEFAULT_ROUTE` | str | *(empty)* | Route preflight dispatches to instead of `ask` when a task has no routing cues at all — for a single-executor install there's nothing useful to ask about. Applies only when lack of cues, not a sanity failure, is why preflight would otherwise ask. Tag overrides (`#local`, `#cloud`, etc.) always win. When set to a valid route, also demotes any preflight `ambiguity` to advisory (logged, not blocking) instead of parking the task on the question — see [agent-worker.md](../specs/technical/agent-worker.md#preflight) for the full precedence. |
 | `LIFEOS_LOCAL_AGENT_ENABLE_THINKING` | bool | `false` | Whether `run_agent_loop`'s tool-round and synthesis calls request reasoning/thinking from a **local** model (Anthropic backend ignores this). Default `false`: measured on the real orchestrator with Gemma 4 26B-A4B across 6 multi-step questions — thinking on averaged 233.0s/1032 chars, off 72.6s, with no answer-quality regression. |
+| `LIFEOS_GITHUB_OWNER` | str | *(empty)* | GitHub login whose repositories `directory_resolver._github_repos()` offers as working-directory candidates for task dispatch. Empty (default) resolves it from `gh api user -q .login` instead, caching the result on disk. |
 
 ## Agent Worker — Managed Agents (Cloud)
 
@@ -198,6 +199,17 @@ Anthropic Console artifacts the cloud path needs. See [agent-worker-setup.md](ag
 | `LIFEOS_AGENT_ENVIRONMENT_ID` | str | — | Anthropic Console environment id binding the preset to settings. |
 | `LIFEOS_AGENT_CONNECTORS` | str | — | Comma-separated connector list pulled from the Vault. |
 | `LIFEOS_AGENT_EXTRA_MCP_SERVERS` | str | — | Additional MCP server URLs to attach to Managed Agents sessions (advanced). |
+
+## Typed Judgments (Jev)
+
+TypeSafe's Jev API (https://docs.typesafe.ai) answers calibrated choice/score/noul questions about a piece of state in one call, for surfaces that independently opt into it — see [agent-worker-setup.md § Typed judgments (Jev)](agent-worker-setup.md#typed-judgments-jev). `TYPESAFE_API_KEY` is the single on/off switch: empty disables every judgment below and none of them makes a network call, regardless of its own setting.
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `TYPESAFE_API_KEY` | str | *(empty)* | Bearer token for TypeSafe's Jev API. Empty (default) disables every Jev-backed judgment below; each surface falls back to its existing, non-Jev behavior. |
+| `LIFEOS_JEV_ORCHESTRATOR` | str | `off` | Chat orchestrator's Jev shadow instrumentation (`api/services/jev_orchestrator_shadow.py`). `off` (default) — no call. `shadow` — a pre-turn judgment runs alongside the first round and an in-loop judgment runs after each round from the second on, both recorded as perf-trace spans; neither changes the tool catalog, round cap, or model choice for the turn. Effectively `off` without a key regardless of this setting. An unrecognized value falls back to `off` with a logged warning. In `shadow` mode, the current message, the last two conversation turns, and (for in-loop calls) each round's tool names, argument summaries, and 300-char result previews leave the box to TypeSafe — none of it reaches a log line or a perf-trace span. |
+| `LIFEOS_PEBBLE_CLASSIFIER` | str | `llm` | Which classifier files a Pebble capture: `llm` (default — the configured remote provider, else the local llama-server) or `jev` (TypeSafe's typed-judgment API; requires `TYPESAFE_API_KEY`, falls back to `llm` with a warning if the key is absent). See [pebble-capture.md](pebble-capture.md#configuration) for the disposition/privacy details — selecting `jev` sends the capture's transcript to TypeSafe. |
+| `LIFEOS_AGENT_JEV_DESTRUCTIVE_GATE` | str | `shadow` | Controls the Jev destructiveness judgment that runs alongside preflight's regex-based sanity gate — see [agent-worker.md § Preflight](../specs/technical/agent-worker.md#preflight). `off` — no call. `shadow` (default once a key is set) — the harm score and irreversible probability are recorded on the preflight result and logged, but never change whether the task runs. `block` — a harm score >= 2.5 or an irreversible probability >= 0.85 parks the task for operator approval (non-fatal; never cancels it outright). Effectively `off` without a key regardless of this setting; an unrecognized value falls back to `shadow` with a logged warning. Sends the task title to TypeSafe whenever it runs (`shadow` or `block`). |
 
 ## Claude Code Viz (`/agents` ingest of Claude Code sessions)
 
