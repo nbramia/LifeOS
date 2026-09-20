@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from api.services.jev_client import JevError
+from api.services.jev_task_routing import JevAnswer, TaskJudgment
 from api.services.pebble_capture import (
     CaptureIdentity,
     CaptureLedger,
@@ -1595,6 +1596,138 @@ def test_consumer_selects_jev_classifier_when_configured(monkeypatch, stores):
     ledger, tasks, schedules = stores
     consumer = PebbleCaptureConsumer(ledger, tasks, schedules)
     assert isinstance(consumer.classifier, JevPebbleClassifier)
+
+
+# --------------------------------------------------------------------------
+# PebbleCaptureConsumer._software_project_fields: Jev's software-work/project
+# judgment for a filed task, consulted only when the Jev classifier is in
+# use, never the `llm` classifier's path.
+
+
+def _stub_judge_task(monkeypatch, result):
+    """Replace `judge_task` as `pebble_capture` sees it. `result` is either a
+    `TaskJudgment`/`None` to return, or an `Exception` instance to raise."""
+    calls = []
+
+    def fake(title):
+        calls.append(title)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr("api.services.pebble_capture.judge_task", fake)
+    return calls
+
+
+def _jev_consumer(monkeypatch, stores, *, classifier=None):
+    monkeypatch.setattr(settings, "typesafe_api_key", "synthetic-key", raising=False)
+    ledger, tasks, schedules = stores
+    return PebbleCaptureConsumer(
+        ledger, tasks, schedules, classifier or JevPebbleClassifier(client=_FakeJevClient({})),
+        apply=True,
+    )
+
+
+def test_software_project_fields_high_confidence_sets_tag_and_project(monkeypatch, stores):
+    judgment = TaskJudgment(
+        location=JevAnswer(choice="lifeos", confidence=0.9),
+        difficulty=None, preset_class=None,
+        software_work=JevAnswer(noul=0.8),
+    )
+    calls = _stub_judge_task(monkeypatch, judgment)
+    consumer = _jev_consumer(monkeypatch, stores)
+    tags = ["me"]
+    fields = consumer._software_project_fields("Fix the synthetic login bug", tags)
+    assert tags == ["me", "software"]
+    assert fields == {"project": "lifeos"}
+    assert calls == ["Fix the synthetic login bug"]
+
+
+def test_software_project_fields_at_exactly_the_confidence_floor_sets_the_tag(monkeypatch, stores):
+    """The floor is inclusive: exactly 0.7 must still qualify."""
+    judgment = TaskJudgment(
+        location=JevAnswer(choice="lifeos", confidence=0.9),
+        difficulty=None, preset_class=None,
+        software_work=JevAnswer(noul=0.7),
+    )
+    _stub_judge_task(monkeypatch, judgment)
+    consumer = _jev_consumer(monkeypatch, stores)
+    tags = ["me"]
+    fields = consumer._software_project_fields("Fix the synthetic login bug", tags)
+    assert tags == ["me", "software"]
+    assert fields == {"project": "lifeos"}
+
+
+def test_software_project_fields_below_confidence_floor_sets_neither(monkeypatch, stores):
+    judgment = TaskJudgment(
+        location=JevAnswer(choice="lifeos", confidence=0.9),
+        difficulty=None, preset_class=None,
+        software_work=JevAnswer(noul=0.69),
+    )
+    _stub_judge_task(monkeypatch, judgment)
+    consumer = _jev_consumer(monkeypatch, stores)
+    tags = ["me"]
+    fields = consumer._software_project_fields("Fix the synthetic login bug", tags)
+    assert tags == ["me"]
+    assert fields is None
+
+
+def test_software_project_fields_low_location_confidence_sets_tag_only(monkeypatch, stores):
+    judgment = TaskJudgment(
+        location=JevAnswer(choice="lifeos", confidence=0.5),
+        difficulty=None, preset_class=None,
+        software_work=JevAnswer(noul=0.8),
+    )
+    _stub_judge_task(monkeypatch, judgment)
+    consumer = _jev_consumer(monkeypatch, stores)
+    tags = ["me"]
+    fields = consumer._software_project_fields("Fix the synthetic login bug", tags)
+    assert tags == ["me", "software"]
+    assert fields is None
+
+
+def test_software_project_fields_judge_task_raising_sets_neither(monkeypatch, stores):
+    _stub_judge_task(monkeypatch, RuntimeError("synthetic failure"))
+    consumer = _jev_consumer(monkeypatch, stores)
+    tags = ["me"]
+    fields = consumer._software_project_fields("Fix the synthetic login bug", tags)
+    assert tags == ["me"]
+    assert fields is None
+
+
+def test_software_project_fields_never_calls_judge_task_for_the_llm_classifier(monkeypatch, stores):
+    calls = _stub_judge_task(monkeypatch, None)
+    consumer = _jev_consumer(monkeypatch, stores, classifier=PebbleJournalClassifier())
+    tags = ["me"]
+    fields = consumer._software_project_fields("Fix the synthetic login bug", tags)
+    assert tags == ["me"]
+    assert fields is None
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_jev_classifier_task_filing_applies_the_software_tag_and_project_field(
+    monkeypatch, stores
+):
+    """End-to-end: a task filed through the real consumer pipeline picks up
+    the software tag and project field the same way `_software_project_fields`
+    does in isolation above."""
+    judgment = TaskJudgment(
+        location=JevAnswer(choice="lifeos", confidence=0.9),
+        difficulty=None, preset_class=None,
+        software_work=JevAnswer(noul=0.8),
+    )
+    _stub_judge_task(monkeypatch, judgment)
+    classifier = JevPebbleClassifier(
+        client=_FakeJevClient(_jev_answers(disposition="task", item="none"))
+    )
+    consumer = _jev_consumer(monkeypatch, stores, classifier=classifier)
+    ledger, tasks, schedules = stores
+    payload = {**_payload(), "final_text": "Fix the synthetic login bug."}
+    assert await consumer.process(payload) == "complete"
+    [task] = tasks.list_tasks()
+    assert "software" in task.tags
+    assert task.fields.get("project") == "lifeos"
 
 
 @pytest.mark.asyncio

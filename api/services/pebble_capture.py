@@ -31,6 +31,7 @@ from croniter import croniter
 from api.services.human_queue import add_card
 from api.services.agent_board import AGENT_EXECUTOR_TAGS, AGENT_PICKUP_TAGS, ASSIGNEE_TAGS
 from api.services.jev_client import JevClient, JevError, jev_configured
+from api.services.jev_task_routing import judge_task
 from api.services.journal_filing_policy import PEBBLE_DISPOSITION_CRITERIA, classifier_prompt
 from api.services.llm_client import LocalLLMClient, extract_json
 from api.services.scheduler_store import SchedulerStore
@@ -1258,6 +1259,48 @@ class PebbleCaptureConsumer:
         self.classifier = classifier or _default_pebble_classifier()
         self.apply = apply
 
+    def _software_project_fields(self, title: str, tags: list[str]) -> Optional[dict[str, str]]:
+        """Append the `software` tag (in place, on `tags`) and return a
+        `{"project": ...}` fields dict when Jev judges a filed task's title
+        as software work with high confidence.
+
+        Only asks when the Jev Pebble classifier is actually in use --
+        this never adds a Jev call to the `llm` classifier's path. Any
+        failure (Jev unconfigured, the call raising, a malformed judgment)
+        leaves `tags` untouched and returns no fields; it never blocks
+        filing the task itself.
+        """
+        if not jev_configured() or not isinstance(self.classifier, JevPebbleClassifier):
+            return None
+        try:
+            judgment = judge_task(title)
+            if judgment is None:
+                return None
+            software_work = judgment.software_work
+            if (
+                software_work is None
+                or software_work.noul is None
+                or software_work.noul < 0.7
+            ):
+                return None
+            if "software" not in tags:
+                tags.append("software")
+            location = judgment.location
+            if (
+                location is not None
+                and isinstance(location.choice, str)
+                and location.confidence >= 0.6
+                and location.choice not in {"vault", "home"}
+                and not any(bad in location.choice for bad in ("\n", "\r", "]", "<!--"))
+            ):
+                return {"project": location.choice}
+            return None
+        except Exception as exc:  # noqa: BLE001 - a judgment failure must never block filing
+            logger.warning(
+                "Pebble software/project judgment failed: %s", type(exc).__name__
+            )
+            return None
+
     def _find_effect_object(
         self, action: PlannedAction, operation_key: str, object_id: Optional[str]
     ) -> Optional[Any]:
@@ -1333,10 +1376,12 @@ class PebbleCaptureConsumer:
                 continue
             key = action.operation_key(identity)
             if action.kind == "task":
+                tags = list(action.tags)
+                fields = self._software_project_fields(action.title, tags)
                 try:
                     task, _ = self.task_manager.create_or_find_by_operation(
                         key, description=action.title, due_date=action.due_date or None,
-                        tags=list(action.tags),
+                        tags=tags, fields=fields,
                     )
                 except Exception:
                     self.ledger.clear_uncommitted_claim(identity, action, generation)

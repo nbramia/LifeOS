@@ -118,6 +118,11 @@ at whatever hour happened to parse. `PebbleJournalClassifier` has no such
 limit -- the model emits a `cron` schedule directly, so it still files
 recurring reminders as schedules.
 
+When the Jev classifier files a task, it also asks Jev whether the task is
+software work; at 0.7 confidence or above the task carries the `software`
+tag and, when Jev's location judgment is itself confident (>= 0.6) about a
+concrete project rather than the vault or home, `fields.project` names it.
+
 ## Verification Matrix
 
 | Concern | Evidence |
