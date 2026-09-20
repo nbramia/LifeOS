@@ -141,6 +141,7 @@ verification mode as a job output:
 |------|------|-----------|
 | `executed` | Any change outside the docs-only rule | `fast-unit`, plus `browser-free` when a `web/` file changed |
 | `docs-only` | Every changed file is `.md`/`.txt`/`.rst` or under `docs/`, and none is a dependency manifest | Nothing — no install, no lane |
+| `reused` | A dispatched run whose candidate tree equals its head's tree, and the head carries a passing shadow verdict from this same runner | Nothing — the shadow already executed the lanes |
 
 The docs-only rule is the one `scripts/test.sh`'s `decide_plan` applies to
 the local plan, and `tests/test_candidate_lanes.py` holds the two to the same
@@ -150,6 +151,22 @@ unavailable changed set is classified `executed` with every retained lane.
 The changed set is the diff from the merge base when the checkout can
 compute one, so a branch behind the base is judged on its own changes; when
 it cannot, the two-commit diff stands in as a superset.
+
+Every check the publisher issues carries a structured record in its output
+text — `candidate`, `tree`, `trusted_runner`, `mode`, `lanes`, `conclusion`
+— alongside the summary line. The tree and lanes come from the runner's
+selection step, which runs before any candidate code; the runner commit is
+event data. A dispatched run reads the check runs on its candidate's second
+parent (the pull request head) with a read-only token and, through the
+runner's own `scripts/candidate_reuse.py`, reuses a
+`candidate-verification-shadow` verdict only when the App published it, its
+conclusion is `success`, its `trusted_runner` and `tree` equal the run's own,
+its `mode` is `executed`, and its `lanes` cover every lane the run selected.
+The check summary then names the reused check. Any mismatch, a missing
+App id, an unreachable head, or a malformed record executes the lanes as
+usual; a shadow run never reuses anything. Reuse only recognises
+verification this runner already performed on identical bytes, so a
+candidate that a rebase changed is verified afresh.
 
 GitHub's required-status-check matching identifies a `context` string and a
 reporting `app_id` — never which workflow file or run produced it. A

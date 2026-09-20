@@ -67,8 +67,8 @@ def test_candidate_workflow_separates_untrusted_execution_from_status_publisher(
     # from an absent job.
     assert workflow.index("name: Bind dispatched runner") < workflow.index("name: Select the lanes") < workflow.index("actions/setup-python")
     assert "python3 trusted-runner/scripts/candidate_lanes.py" in workflow
-    assert "verification_mode: ${{ steps.select.outputs.mode }}" in workflow
-    executed = "if: ${{ steps.select.outputs.mode == 'executed' }}"
+    assert "verification_mode: ${{ steps.reuse.outputs.mode || steps.select.outputs.mode }}" in workflow
+    executed = "steps.select.outputs.mode == 'executed'"
     for step in ("actions/setup-python", "name: Install the declared CPU test environment", "name: Verify the retained lanes"):
         block = workflow[workflow.index(step):]
         block = block[:block.index("\n      - ")]
@@ -83,6 +83,26 @@ def test_candidate_workflow_separates_untrusted_execution_from_status_publisher(
     assert "VERIFICATION_MODE: ${{ needs.execute-candidate.outputs.verification_mode }}" in publisher
     assert "mode === 'docs-only'" in publisher
     assert "process.env.RESULT === 'success' && explicit" in publisher
+
+    # A dispatched candidate may reuse its head's shadow verdict, but only via
+    # the runner's own decision script over App-published check data, read
+    # with a read-only token before any environment exists; the shadow run
+    # itself never reuses anything.
+    reuse = workflow[workflow.index("name: Reuse a passing shadow verification"):]
+    reuse = reuse[:reuse.index("\n      - ")]
+    assert "github.event_name == 'workflow_dispatch'" in reuse
+    assert "vars.LIFEOS_CANDIDATE_APP_ID != ''" in reuse
+    assert "python3 trusted-runner/scripts/candidate_reuse.py" in reuse
+    assert 'git -C candidate fetch --quiet --depth=1 origin "$HEAD_SHA"' in reuse
+    assert '[ "$(git -C candidate rev-parse "$HEAD_SHA^{tree}")" != "$TREE" ]' in reuse
+    assert workflow.index("name: Select the lanes") < workflow.index("name: Reuse a passing shadow verification") < workflow.index("actions/setup-python")
+    for step in ("actions/setup-python", "name: Install the declared CPU test environment", "name: Verify the retained lanes"):
+        block = workflow[workflow.index(step):]
+        block = block[:block.index("\n      - ")]
+        assert "steps.reuse.outputs.mode != 'reused'" in block, step
+    assert "mode === 'reused'" in publisher
+    assert "trusted_runner: process.env.TRUSTED_RUNNER_SHA" in publisher
+    assert "tree: process.env.VERIFICATION_TREE" in publisher
     assert "actions/checkout" not in publisher
     assert "--sha \"$CANDIDATE_SHA\"" in workflow
     assert "candidate-verification-${{ github.event.pull_request.number" in workflow
@@ -430,11 +450,23 @@ def test_candidate_workflow_lane_selection_is_the_trusted_runner_script():
     assert "python3 trusted-runner/scripts/candidate_lanes.py" in script
     assert "candidate/scripts" not in script
     assert 'sed -n \'s/^lanes=/LANES=/p\'' in script
-    assert workflow["jobs"]["execute-candidate"]["outputs"] == {"verification_mode": "${{ steps.select.outputs.mode }}"}
+    outputs = workflow["jobs"]["execute-candidate"]["outputs"]
+    assert outputs["verification_mode"] == "${{ steps.reuse.outputs.mode || steps.select.outputs.mode }}"
+    assert outputs["verification_tree"] == "${{ steps.select.outputs.tree }}"
+    assert outputs["verification_lanes"] == "${{ steps.select.outputs.lanes }}"
+    assert outputs["reused_check_id"] == "${{ steps.reuse.outputs.reused_check_id }}"
+    assert outputs["reused_candidate"] == "${{ steps.reuse.outputs.reused_candidate }}"
+    publisher = workflow["jobs"]["publish-aggregate"]
+    script_step = next(s for s in publisher["steps"] if "github-script" in (s.get("uses") or ""))
+    assert script_step["env"]["REUSED_CHECK_ID"] == "${{ needs.execute-candidate.outputs.reused_check_id }}"
+    assert script_step["env"]["REUSED_CANDIDATE"] == "${{ needs.execute-candidate.outputs.reused_candidate }}"
+    assert "process.env.REUSED_CHECK_ID" in script_step["with"]["script"]
+    assert "process.env.REUSED_CANDIDATE" in script_step["with"]["script"]
+    assert workflow["jobs"]["execute-candidate"]["permissions"] == {"contents": "read", "checks": "read"}
 
     verify = next(s for s in steps if "Verify the retained lanes" in (s.get("name") or ""))
     assert '--lanes "$LANES"' in verify["run"], "the verifier must consume the selected lanes"
-    assert verify["if"] == "${{ steps.select.outputs.mode == 'executed' }}"
+    assert verify["if"] == "${{ steps.select.outputs.mode == 'executed' && steps.reuse.outputs.mode != 'reused' }}"
 
 
 @pytest.mark.unit
@@ -460,7 +492,7 @@ def test_publisher_treats_every_non_success_execution_result_as_a_failed_check()
         step for step in publisher["steps"] if "github-script" in (step.get("uses") or "")
     )["with"]["script"]
     assert "process.env.RESULT === 'success' && explicit ? 'success' : 'failure'" in script
-    assert "const explicit = mode === 'executed' || mode === 'docs-only'" in script
+    assert "const explicit = mode === 'executed' || mode === 'docs-only' || mode === 'reused'" in script
 
 
 @pytest.mark.unit
@@ -554,3 +586,49 @@ def test_lane_selection_step_sees_the_real_diff_across_two_shallow_checkouts(tmp
 def test_lane_selection_step_keeps_the_browser_lane_only_for_a_web_change(tmp_path, head_files, lanes):
     outputs = _run_lane_selection(tmp_path, head_files)
     assert (outputs["mode"], outputs["lanes"]) == ("executed", lanes)
+
+
+def _reuse_step_run() -> str:
+    import yaml
+
+    workflow = yaml.safe_load((ROOT / ".github/workflows/candidate-verification.yml").read_text())
+    steps = workflow["jobs"]["execute-candidate"]["steps"]
+    return next(s for s in steps if "Reuse a passing shadow verification" in (s.get("name") or ""))["run"]
+
+
+@pytest.mark.unit
+def test_reuse_step_reads_the_second_parent_from_commit_headers_not_the_message(tmp_path):
+    """The candidate is a two-parent commit whose message carries
+    candidate-authored text: its title line and closing references. The head the
+    reuse step fetches must come from the commit's header lines, so a message
+    line that happens to start with `parent <hex>` can never redirect it."""
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    _git(origin, "init", "-q", "-b", "main")
+    _git(origin, "config", "user.email", "ci@example.invalid")
+    _git(origin, "config", "user.name", "ci")
+    (origin / "a.txt").write_text("base\n")
+    _git(origin, "add", "-A")
+    _git(origin, "commit", "-q", "-m", "base")
+    base_sha = _git(origin, "rev-parse", "HEAD")
+    (origin / "a.txt").write_text("head\n")
+    _git(origin, "add", "-A")
+    _git(origin, "commit", "-q", "-m", "head")
+    head_sha = _git(origin, "rev-parse", "HEAD")
+    forged = "f" * 40
+    message = f"candidate\n\nparent {forged}\nparent {forged}\nCloses #1\n"
+    candidate_sha = subprocess.run(
+        ["git", "-C", str(origin), "commit-tree", f"{head_sha}^{{tree}}", "-p", base_sha, "-p", head_sha, "-m", message],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    work = tmp_path / "work"
+    (work / "candidate").mkdir(parents=True)
+    shutil.copytree(origin / ".git", work / "candidate" / ".git")
+    extraction = _reuse_step_run().split("\n")[0]
+    assert extraction.startswith('HEAD_SHA="$(git -C candidate cat-file commit "$CANDIDATE_SHA"')
+    result = subprocess.run(
+        ["bash", "-e", "-c", extraction + '\nprintf %s "$HEAD_SHA"'], cwd=work,
+        env={**os.environ, "CANDIDATE_SHA": candidate_sha}, capture_output=True, text=True, check=True,
+    )
+    assert result.stdout == head_sha
+    assert forged not in result.stdout
