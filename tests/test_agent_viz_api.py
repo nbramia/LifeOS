@@ -7,6 +7,8 @@ so the real data/ directory is never touched.
 from __future__ import annotations
 
 import json
+import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -761,6 +763,50 @@ def test_search_endpoint_requires_query(client, summary_db):
     # The app maps RequestValidationError to 400 (see api/main.py).
     assert client.get("/api/agents/search").status_code == 400
     assert client.get("/api/agents/search", params={"q": ""}).status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# `agent_viz_summary`'s disk-cache helpers (`_disk_get`/`_disk_put`/
+# `search_cached_summaries`/`prune_disk_cache`) each open their own SQLite
+# connection per call. The prefetch loop and snapshot path call these every
+# tick for the process's whole lifetime, so a connection that isn't closed
+# leaks a file descriptor per call.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_disk_cache_helpers_do_not_leak_file_descriptors(summary_db):
+    from api.services import agent_viz_summary as avs
+
+    if sys.platform != "linux":
+        pytest.skip("fd accounting via /proc/self/fd is Linux-only")
+
+    summary_db("s1", "Fix Login Bug", "Resolved an auth regression.")
+    db_path = avs._DB_PATH
+
+    def _open_fds_for(path: str) -> int:
+        count = 0
+        for entry in os.listdir("/proc/self/fd"):
+            try:
+                link = os.readlink(f"/proc/self/fd/{entry}")
+            except OSError:
+                continue
+            if link.startswith(path):
+                count += 1
+        return count
+
+    baseline = _open_fds_for(db_path)
+    for _ in range(50):
+        avs._disk_get("s1", 1_000_000.0, "completed")
+        avs._disk_put("s1", 1_000_000.0, avs.SummaryResult(short_label="x", summary="y"))
+        avs.search_cached_summaries("login")
+        avs.prune_disk_cache()
+
+    after = _open_fds_for(db_path)
+    assert after <= baseline, (
+        f"agent_viz_summary disk-cache helpers leaked file descriptors on {db_path}: "
+        f"{baseline} open before the loop, {after} after 50 tick iterations"
+    )
 
 
 # ---------------------------------------------------------------------------
