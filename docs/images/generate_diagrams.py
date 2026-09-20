@@ -2,8 +2,9 @@
 """Generate the LifeOS README architecture diagrams as self-contained SVGs.
 
 Run:  python3 docs/images/generate_diagrams.py
-Writes architecture.svg, query-pipeline.svg, sync-cycle.svg, services.svg into
-this directory (the four figures embedded in the top-level README).
+Writes architecture.svg, query-pipeline.svg, sync-cycle.svg, services.svg, and
+agent-lifecycle.svg into this directory (the five figures embedded in the
+top-level README).
 
 No dependencies beyond the Python standard library. Each diagram is a single
 self-contained SVG with its own dark "panel" background, so it renders as an
@@ -22,7 +23,7 @@ OUT = os.path.dirname(os.path.abspath(__file__))
 # ---- palette -------------------------------------------------------------
 TXT = "#e8ecf8"  # primary label text
 MUT = "#8b96b5"  # muted / secondary text
-# Each "zone" of a diagram gets one accent hue. Reused across all four figures
+# Each "zone" of a diagram gets one accent hue. Reused across all five figures
 # so they read as one system.
 ZONES = {
     "src": "#22d3ee",  # cyan   — data sources / inputs
@@ -264,17 +265,21 @@ def architecture():
     bm_g, bm = node(690, 545, "SQLite FTS5 · BM25", "core")
     # surfaces
     surfs = [
-        ("Web /chat — text + voice", "web", 150),
-        ("Telegram bots (personas)", "surf", 300),
-        ("MCP — Desktop / Code", "surf", 455),
-        ("/crm · /agents", "surf", 605),
+        ("Web /chat — text + voice", "web", 130, None),
+        ("Telegram bots (personas)", "surf", 258, "+ journal capture webhook"),
+        ("Hermes gateway", "surf", 386, "front door → falls back to native"),
+        ("MCP — stdio + HTTP", "surf", 514, None),
+        ("/crm · /agents", "surf", 642, None),
     ]
     surf_b = []
-    for txt, z, y in surfs:
-        x = 1360 + 18 * math.sin((y - 150) / 455 * math.pi)
-        g, b = node(x, y, txt, z)
+    for txt, z, y, sub in surfs:
+        x = 1360 + 18 * math.sin((y - 130) / 512 * math.pi)
+        g, b = node(x, y, txt, z, sub=sub)
         surf_b.append((g, b, z))
-    worker_g, worker = node(900, 730, "Agent worker  #agent", "auto")
+    worker_g, worker = node(
+        900, 730, "Agent worker  #agent", "auto",
+        sub="Claude Code · Codex · Gemma → worktree, PR",
+    )
     sched_g, sched = node(1200, 712, "Scheduler", "auto")
 
     E = []
@@ -411,7 +416,7 @@ def architecture():
     )
     s.extend(E)
 
-    s.append(core(bx, by, 58, ["Agent", "loop"], "Claude · llama"))
+    s.append(core(bx, by, 58, ["Agent", "loop"], "Claude · llama · remote"))
     for g, b in src_b:
         s.append(g)
     for g in (sync_g, store_g, resolve_g, vec_g, bm_g):
@@ -433,7 +438,7 @@ def architecture():
 
 # ============================ 2. QUERY PIPELINE ============================
 def query_pipeline():
-    W, H = 1500, 950
+    W, H = 1500, 980
     cx, cy = 730, 372
     s = [svg_open(W, H), defs(), panel(W, H, glow=(cx, cy, 430))]
     # four zones around the core: input(left) tools(top) output(right) models(bottom)
@@ -535,20 +540,27 @@ def query_pipeline():
         )
     )
 
-    # BOTTOM: model handoff — Haiku is the hub; non-Haiku models stacked vertically
-    def mk(mx, myy, txt, z):
-        g, b = node(mx, myy, txt, z)
+    # BOTTOM: model handoff — the base engine is whichever LIFEOS_LLM_BACKEND
+    # names (anthropic default = Haiku, or local, or remote); escalation from
+    # there is two separate mechanisms, never one chain: an automatic climb
+    # that only ever reaches subscription-billed CLI engines (never spends
+    # API credits on its own), and a user-directed pick that can name any
+    # tier, API models included.
+    def mk(mx, myy, txt, z, sub=None):
+        g, b = node(mx, myy, txt, z, sub=sub)
         return {"g": g, "b": b, "z": z}
 
-    local = mk(452, 744, "Local · Gemma", "core")
-    haiku = mk(652, 744, "Haiku", "brain")
-    sx = 920
-    sonnet = mk(sx, 590, "Sonnet", "brain")
-    opus = mk(sx, 678, "Opus", "brain")
-    ccode = mk(sx, 766, "Claude Code", "surf")
-    codex = mk(sx, 854, "Codex", "auto")
+    remote = mk(288, 744, "Remote", "web", sub="OpenAI-compatible")
+    local = mk(488, 744, "Local · Gemma", "core")
+    haiku = mk(688, 744, "Haiku", "brain")
+    sx = 950
+    sonnet = mk(sx, 578, "Sonnet", "brain", sub="on request only")
+    opus = mk(sx, 666, "Opus", "brain", sub="on request only")
+    ccode = mk(sx, 754, "Claude Code", "surf", sub="auto rung 1 · or on request")
+    codex = mk(sx, 842, "Codex", "auto", sub="auto rung 2 · or on request")
     fanout = [(sonnet, "qB"), (opus, "qB"), (ccode, "qS"), (codex, "qR")]
-    # agent loop <-> Haiku (bidirectional); agent loop -> Local
+    # agent loop <-> Haiku (bidirectional); agent loop -> Local / Remote —
+    # exactly one of the three is the standing backend (LIFEOS_LLM_BACKEND).
     E.append(
         flow(
             (cx - 16, cy + 58),
@@ -565,15 +577,28 @@ def query_pipeline():
     )
     E.append(
         flow(
-            (cx - 58, cy + 50),
+            (cx - 64, cy + 48),
             top(local["b"]),
             ZONES["brain"],
             ZONES["core"],
             kind="arc",
-            bow=-0.16,
+            bow=-0.2,
             w=1.9,
             op=0.55,
             arrow="qC",
+        )
+    )
+    E.append(
+        flow(
+            (cx - 88, cy + 40),
+            top(remote["b"]),
+            ZONES["brain"],
+            ZONES["web"],
+            kind="arc",
+            bow=-0.3,
+            w=1.9,
+            op=0.55,
+            arrow="qW",
         )
     )
     for m, amk in fanout:  # Haiku -> each non-Haiku model (enters left edge)
@@ -589,27 +614,20 @@ def query_pipeline():
                 arrow=amk,
             )
         )
-    # escalation chain Sonnet -> Opus -> Claude Code (vertical, enters top edge)
+    # Automatic escalation ladder — on refusal + pushback only, and only
+    # these two subscription-billed CLI rungs, in order (NON_API_RUNGS /
+    # DEFAULT_LADDER): Claude Code first, then Codex if still refused.
+    # Sonnet and Opus are never on this ladder — reaching an API model
+    # always takes an explicit operator request ("escalate to opus").
     E.append(
         flow(
-            bot(sonnet["b"]),
-            top(opus["b"]),
-            ZONES["brain"],
-            ZONES["brain"],
-            w=1.8,
-            op=0.6,
-            arrow="qB",
-        )
-    )
-    E.append(
-        flow(
-            bot(opus["b"]),
-            top(ccode["b"]),
-            ZONES["brain"],
+            bot(ccode["b"]),
+            top(codex["b"]),
             ZONES["surf"],
-            w=1.8,
-            op=0.6,
-            arrow="qS",
+            ZONES["auto"],
+            w=2.0,
+            op=0.7,
+            arrow="qR",
         )
     )
 
@@ -621,7 +639,7 @@ def query_pipeline():
         s.append(g)
     s.append(resp_g)
     s.append(back_g)
-    for m in (local, haiku, sonnet, opus, ccode, codex):
+    for m in (local, haiku, remote, sonnet, opus, ccode, codex):
         s.append(m["g"])
 
     s.append(zlabel(150, 88, "Input surfaces", ZONES["surf"]))
@@ -644,8 +662,28 @@ def query_pipeline():
     s.append(
         note(
             cx,
-            924,
-            "agent loop runs on local Gemma or cloud Haiku · Haiku auto-escalates to Claude Code / Codex · Sonnet / Opus only on request",
+            908,
+            "base engine = LIFEOS_LLM_BACKEND: anthropic (Haiku, default) · local (Gemma) · remote (OpenAI-compatible)",
+            MUT,
+            anchor="middle",
+            size=11.5,
+        )
+    )
+    s.append(
+        note(
+            cx,
+            926,
+            "auto-escalation on refusal never spends API credits (Claude Code → Codex only) · Sonnet / Opus / a named engine require an explicit request",
+            MUT,
+            anchor="middle",
+            size=11.5,
+        )
+    )
+    s.append(
+        note(
+            cx,
+            944,
+            "specialist calls (insights, fact extraction, tone) fall back Anthropic → local → remote on a keyless install, never erroring",
             MUT,
             anchor="middle",
             size=11.5,
@@ -762,7 +800,7 @@ def sync_cycle():
 
 # ============================ 4. SERVICE RESILIENCE (tiered by failure impact) ============================
 def services():
-    W, H = 1280, 660
+    W, H = 1280, 740
     s = [svg_open(W, H), defs(), panel(W, H, glow=(W / 2, H / 2, 460))]
     RED = "#f87171"
     AMB = "#fbbf24"
@@ -780,7 +818,7 @@ def services():
         o += f'<text x="{nx + 34:.1f}" y="{y + 5:.1f}" font-size="14.5" font-weight="600" fill="{TXT}">{esc(text)}</text>'
         return o, tw
 
-    # tier: (colour, word, sub, severity badge, consequence, y-centre)
+    # tier: (colour, word, sub, severity badge, consequence, y-centre, box-height)
     tiers = [
         (
             RED,
@@ -789,6 +827,7 @@ def services():
             "CRITICAL · alerts immediately",
             "if any fail → LifeOS is offline",
             150,
+            150,
         ),
         (
             AMB,
@@ -796,7 +835,8 @@ def services():
             "degrades to a fallback",
             "WARNING · batched nightly",
             "if it fails → auto-fallback, no outage",
-            340,
+            385,
+            230,
         ),
         (
             GRN,
@@ -804,12 +844,12 @@ def services():
             "third-party APIs",
             "WARNING / INFO",
             "if it fails → that feature pauses",
-            530,
+            615,
+            150,
         ),
     ]
     bx0, bx1 = 40, W - 40
-    bh = 150
-    for col, word, sub, sev, cons, yc in tiers:
+    for col, word, sub, sev, cons, yc, bh in tiers:
         s.append(
             f'<rect x="{bx0}" y="{yc - bh / 2:.0f}" width="{bx1 - bx0}" height="{bh}" rx="18" fill="{col}" fill-opacity="0.055" stroke="{col}" stroke-opacity="0.28" stroke-width="1.3"/>'
         )
@@ -839,26 +879,31 @@ def services():
         o, w = schip(x, 150, t, RED)
         s.append(o)
         x += w + 26
-    x = 380  # tier 2: primary -> fallback pairs
+    def fallback_pair(x, y, prim, fb):
+        o, w = schip(x, y, prim, AMB)
+        s.append(o)
+        ax = x + w
+        o2, w2 = schip(ax + 70, y, fb, AMB, muted=True)
+        s.append(
+            f'<path d="M {ax + 8:.0f} {y:.0f} L {ax + 62:.0f} {y:.0f}" fill="none" stroke="{AMB}" stroke-opacity="0.6" stroke-width="1.6" stroke-dasharray="4 4" marker-end="url(#aFb)"/>'
+        )
+        s.append(
+            f'<text x="{ax + 35:.0f}" y="{y - 18:.0f}" text-anchor="middle" font-size="9.5" fill="{MUT}">falls back to</text>'
+        )
+        s.append(o2)
+        return ax + 70 + w2 + 64
+
+    x = 380  # tier 2 row 1: primary -> fallback pairs
     for prim, fb in [
         ("Intent classifier", "Regex patterns"),
         ("BM25 keyword", "Vector-only"),
     ]:
-        o, w = schip(x, 340, prim, AMB)
-        s.append(o)
-        ax = x + w
-        o2, w2 = schip(ax + 70, 340, fb, AMB, muted=True)
-        s.append(
-            f'<path d="M {ax + 8:.0f} 340 L {ax + 62:.0f} 340" fill="none" stroke="{AMB}" stroke-opacity="0.6" stroke-width="1.6" stroke-dasharray="4 4" marker-end="url(#aFb)"/>'
-        )
-        s.append(
-            f'<text x="{ax + 35:.0f}" y="322" text-anchor="middle" font-size="9.5" fill="{MUT}">falls back to</text>'
-        )
-        s.append(o2)
-        x = ax + 70 + w2 + 64
+        x = fallback_pair(x, 345, prim, fb)
+    x = 380  # tier 2 row 2: specialist LLM calls (ADR-025) — keyless install only
+    x = fallback_pair(x, 410, "Specialist calls (insights · facts · tone)", "local → remote")
     x = 380  # tier 3 chips
     for t in ["Google APIs", "Slack", "Monarch", "LLM backend", "whisper-relay :9788"]:
-        o, w = schip(x, 530, t, GRN)
+        o, w = schip(x, 615, t, GRN)
         s.append(o)
         x += w + 20
 
@@ -866,8 +911,105 @@ def services():
     write("services.svg", "\n".join(s))
 
 
+# ============================ 5. AGENT LIFECYCLE (board card -> worktree -> PR) ============================
+def agent_lifecycle():
+    W, H = 1300, 1160
+    mx = 400  # main-path column
+    bxc = 950  # branch (question-pause) column
+    s = [svg_open(W, H), defs(), panel(W, H, glow=(670, 560, 480))]
+    s.append(f'<ellipse cx="{mx}" cy="560" rx="330" ry="560" fill="url(#zone-auto)"/>')
+    s.append(f'<ellipse cx="{bxc}" cy="660" rx="260" ry="330" fill="url(#zone-brain)"/>')
+    s.append('<ellipse cx="670" cy="1000" rx="420" ry="150" fill="url(#zone-core)"/>')
+    s.append(
+        "<defs>"
+        + marker("lB", ZONES["brain"])
+        + marker("lC", ZONES["core"])
+        + marker("lA", ZONES["auto"])
+        + marker("lW", ZONES["web"])
+        + marker("lS", ZONES["surf"])
+        + "</defs>"
+    )
+
+    # ---- main path (left column, top to bottom) ----
+    card_g, card = node(mx, 80, "Board: card assigned", "surf", sub="#claude / #codex tag → Assigned lane")
+    claim_g, claim = node(mx, 208, "Worker claims task", "brain", sub="preflight routes to claude_code / codex")
+    wt_g, wt = node(mx, 336, "ensure_worktree()", "core", sub="branch off origin/<default> · local or ssh host")
+    run_g, run = node(mx, 464, "CLI session runs", "auto", sub="Claude Code or Codex · commits as it works")
+    fin_g, fin = node(mx, 616, "finalize_worktree_session()", "web", sub="open_pr=True — safety-net commit · push · gh pr create")
+    review_g, review = node(mx, 744, "Review lane", "surf", sub="outcome summary + PR badge (open / merged / closed)")
+
+    # ---- question-pause branch (right column) ----
+    block_g, block = node(bxc, 464, "Session pauses", "brain", sub="CLARIFY, plan, or goal approval needed")
+    finb_g, finb = node(bxc, 616, "finalize_worktree_session()", "web", sub="open_pr=False — commit + push, no PR yet")
+    human_g, human = node(bxc, 744, "Human queue lane", "surf", sub="operator replies on Telegram to the anchored message")
+    resume_g, resume = node(bxc, 872, "Resume — same worktree", "auto", sub="_resume_as_followup → Executor.resume(session id)")
+
+    # ---- shared cleanup ----
+    clean_g, clean = node(670, 1030, "Cleanup: remove_worker_worktree()", "core", sub="once the PR merges, or the card is accepted / cancelled — pushes again, then git worktree remove")
+
+    E = []
+    for a, b, z1, z2 in [
+        (card, claim, "surf", "brain"),
+        (claim, wt, "brain", "core"),
+        (wt, run, "core", "auto"),
+        (fin, review, "web", "surf"),
+    ]:
+        E.append(flow(bot(a), top(b), ZONES[z1], ZONES[z2], w=2.1, op=0.65, arrow={"brain": "lB", "core": "lC", "auto": "lA", "web": "lW", "surf": "lS"}[z2]))
+
+    # CLI session completes -> finalize(open_pr=True)
+    E.append(flow(bot(run), top(fin), ZONES["auto"], ZONES["web"], w=2.1, op=0.65, arrow="lW"))
+    # CLI session asks a question -> pauses (branch out)
+    E.append(flow(right(run), left(block), ZONES["auto"], ZONES["brain"], t=0.5, w=2.0, op=0.6, arrow="lB"))
+    s.append(note((mx + bxc) / 2, (top(block)[1] + top(run)[1]) / 2 - 10, "asks a question", MUT, anchor="middle", size=11))
+
+    # pause branch, top to bottom
+    E.append(flow(bot(block), top(finb), ZONES["brain"], ZONES["web"], w=2.0, op=0.6, arrow="lW"))
+    E.append(flow(bot(finb), top(human), ZONES["web"], ZONES["surf"], w=2.0, op=0.6, arrow="lS"))
+    E.append(flow(bot(human), top(resume), ZONES["surf"], ZONES["auto"], w=2.0, op=0.6, arrow="lA"))
+
+    # resume loops back into the SAME CLI session (same worktree — never re-provisioned)
+    E.append(
+        flow(
+            left(resume), (mx + 120, 530), ZONES["auto"], ZONES["auto"],
+            kind="arc", bow=0.3, w=2.0, op=0.55, arrow="lA",
+        )
+    )
+    s.append(note(660, 686, "session resumes,", MUT, size=10.5))
+    s.append(note(660, 702, "same worktree", MUT, size=10.5))
+
+    # convergence into cleanup
+    E.append(
+        flow(bot(review), top(clean), ZONES["surf"], ZONES["core"], kind="arc", bow=0.12, w=2.1, op=0.65, arrow="lC")
+    )
+    s.append(note(mx - 10, 900, "merge / accept", MUT, size=11))
+    E.append(
+        flow(
+            bot(human), top(clean), ZONES["surf"], ZONES["core"],
+            kind="arc", bow=-0.14, w=1.7, op=0.45, arrow="lC",
+        )
+    )
+    s.append(note(bxc + 20, 940, "cancel", MUT, size=11))
+
+    s.extend(E)
+    for g in (card_g, claim_g, wt_g, run_g, fin_g, review_g, block_g, finb_g, human_g, resume_g, clean_g):
+        s.append(g)
+
+    s.append(zlabel(mx, 32, "Main path", ZONES["auto"], anchor="middle"))
+    s.append(zlabel(bxc, 32, "Question-pause branch", ZONES["brain"], anchor="middle"))
+    s.append(
+        note(
+            670, 1128,
+            "the worktree persists across a pause and resume — only cleanup ever removes it (the branch itself is kept)",
+            MUT, anchor="middle", size=11.5,
+        )
+    )
+    s.append("</svg>")
+    write("agent-lifecycle.svg", "\n".join(s))
+
+
 if __name__ == "__main__":
     architecture()
     query_pipeline()
     sync_cycle()
     services()
+    agent_lifecycle()
