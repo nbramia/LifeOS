@@ -152,9 +152,22 @@ You can put a budget in the task title. The preflight parses natural-language hi
 | `max $0.50` / `budget $1.00` | `max_dollars` |
 | `10k tokens` / `50000 tokens` | `max_tokens` |
 
-If no budget appears in the title, defaults from `.env` apply (default `$5.00`, `~4 hours wall`, `500k tokens`). The worker enforces the wall and token caps externally for every route — it kills the session when either is breached and the task lands at `#agent-budget-exceeded`. The **dollar cap is enforced only on the cloud Claude (Managed Agents / API) route**, the only one with marginal per-task cost; on the local (free) and Claude Code / Codex CLI (subscription) routes a `max $…` hint is recorded but never stops the task.
+If no budget appears in the title, defaults from `.env` apply: `$10.00` and `~4 hours wall`, and no token cap — the token cap only applies when a title names one explicitly (e.g. `50k tokens`). These are backstops sized so an ordinary task never approaches them, not quotas.
 
-There's also a global daily $-cap (`LIFEOS_AGENT_DAILY_CAP_DOLLARS`, default `$100`). When the day's accumulated cost crosses the cap, the worker stops claiming new tasks until the next local midnight. Tasks already running aren't killed.
+On an in-process route (local, the remote-forced route, or Managed Agents), a breach of the wall-clock, token, or dollar cap — or of the lineage-aggregate dollar cap a session with descendants shares with its family — **pauses and asks rather than failing the task**. The session yields (its conversation stays exactly as it was, nothing is lost), the card moves to the Human queue lane, and you get a question on Telegram (or Hermes) naming what was spent (dollars to two decimals and active minutes) and the cap:
+
+- Reply **`yes`** to double the cap and resume from right where the session left off.
+- Reply **`yes $12`** (or **`yes 90 min`** for a wall-clock breach) to set the cap to a specific value instead of doubling it.
+- Reply **`stop`** to end the task at `#agent-budget-exceeded`.
+- No reply at all leaves it parked indefinitely, at zero further cost — nothing re-dispatches it until you answer.
+
+The board drawer offers **Continue** and **Stop** buttons alongside the free-text Answer box for exactly this question, so a reply doesn't require typing.
+
+The **dollar cap is a real backstop only on the cloud Claude (Managed Agents / API) route and the remote-forced route**, the two with marginal per-task cost; on the local (free) and Claude Code / Codex CLI (subscription) routes a `max $…` hint is recorded but never breaches anything, and those two CLI routes carry no wall/token/dollar enforcement at all — no pause-and-ask either.
+
+There's also a global daily $-cap (`LIFEOS_AGENT_DAILY_CAP_DOLLARS`, default `$100`). When the day's accumulated cost first crosses the cap, the worker stops claiming new tasks and sends one Telegram notice naming today's spend and the cap. Tasks already running aren't killed. Reply **`raise to $150`** to raise today's cap and resume claiming immediately — the raise applies to today only and the cap reverts to the configured default the next local day. Crossing a since-raised cap later the same day sends one more notice; repeatedly hitting the same cap value doesn't nag again.
+
+A [scheduler](../../guides/scheduler.md) entry whose action hands work to the agent worker can carry its own budget (`[budget:: …]` / `[wall:: …]`), rendered into the created task's title in this same hint grammar on every fire.
 
 ---
 
@@ -186,9 +199,9 @@ The agent worker uses your existing Telegram bot (no second bot needed). Three m
 
 1. **Completion notifications** — one paragraph summarizing what the agent did, the key result, total tokens + cost + active seconds. If a tool failed mid-run, the summary includes a footer listing the affected MCPs.
 
-2. **Clarification requests** — if the preflight can't determine routing OR if a task title is genuinely ambiguous (e.g., "reply to Alex" with no email reference), the worker pauses the task at `#agent-blocked` and asks one targeted question on Telegram. Reply by using Telegram's native reply feature (long-press the bot's message, hit Reply). The worker picks up your answer within the next poll cycle and resumes.
+2. **Clarification requests** — if the preflight can't determine routing OR if a task title is genuinely ambiguous (e.g., "reply to Alex" with no email reference), the worker pauses the task at `#agent-blocked` and asks one targeted question on Telegram. Reply by using Telegram's native reply feature (long-press the bot's message, hit Reply). The worker picks up your answer within the next poll cycle and resumes. A budget breach (see Budgets, above) parks the task at the same `#agent-blocked` tag and asks the same way — `yes` / `yes $12` / `yes 90 min` resumes it, `stop` ends it.
 
-3. **Failure notifications** — short message naming the task and the failure reason, plus a transcript path so you can debug. Examples: "task X failed: managed_create_session 4xx" or "task Y hit its budget (max_dollars)".
+3. **Failure notifications** — short message naming the task and the failure reason, plus a transcript path so you can debug. Examples: "task X failed: managed_create_session 4xx" or "task Y hit its budget (max_dollars)" (the budget example is seen only after you reply `stop` to a budget question — a breach alone doesn't produce this notification).
 
 **Replying to a thread.** Every terminal notification — completion, failure, or budget cut-off — is replyable: use Telegram's native reply on it (any chunk of a long message) and the agent reopens that thread as a follow-up turn with full prior context ("actually, also CC Jane"). The reply gesture is the *only* way to continue a thread on Telegram — a plain message is always a normal chat query, so unrelated questions are never mistaken for a thread continuation.
 
@@ -245,7 +258,7 @@ All in `.env` — see [`agent-worker-setup.md`](../../guides/agent-worker-setup.
 |---|---|---|
 | `LIFEOS_AGENT_WORKER_AUTOSTART` | Enable the worker on boot | `false` |
 | `LIFEOS_AGENT_DAILY_CAP_DOLLARS` | Global daily $-cap (set to 0 to pause new claims) | `100.00` |
-| `LIFEOS_AGENT_DEFAULT_BUDGET_DOLLARS` | Default per-task $-cap when title doesn't specify | `5.00` |
+| `LIFEOS_AGENT_DEFAULT_BUDGET_DOLLARS` | Default per-task $-cap when title doesn't specify | `10.00` |
 | `LIFEOS_AGENT_WORKER_POLL_SECONDS` | Polling interval | `60` |
 | `LIFEOS_AGENT_CLARIFICATION_TIMEOUT_HOURS` | Telegram-clarification wait before abandoning | `72` |
 | `LIFEOS_AGENT_STUCK_SESSION_TIMEOUT_MINUTES` | How long a reopened `/claude`/`/codex` session may sit unresumed before the stuck-session alert fires | `15` |
@@ -256,6 +269,7 @@ All in `.env` — see [`agent-worker-setup.md`](../../guides/agent-worker-setup.
 ## Related Documents
 
 - [ADR-008: Managed Agents Cloud Routing](../../adr/008-managed-agents-cloud-routing.md) — Why local + cloud, how routing is decided, cost model
+- [ADR-026: A Budget Breach Asks; It Does Not Fail](../../adr/026-budget-breach-asks.md) — Why a budget breach pauses and asks instead of ending the task
 - [Agent Worker — Technical](../technical/agent-worker.md) — Architecture, executors, prompts, state machine, restart resumability
 - [Agent Worker — Setup](../../guides/agent-worker-setup.md) — Operator setup (Gemma swap, MCP HTTP transport, Vault provisioning, agent preset)
 - [Claude Code Orchestration (product)](claude-code-orchestration.md) — The other autonomous-work system in LifeOS; triggered from Telegram `/claude` rather than `#agent` tags

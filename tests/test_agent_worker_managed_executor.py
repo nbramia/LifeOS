@@ -19,6 +19,7 @@ from api.services.agent_worker.session_store import (
     STATUS_COMPLETED,
     STATUS_FAILED,
     STATUS_RUNNING,
+    STATUS_YIELDED,
     SessionStore,
 )
 from api.services.agent_worker.transcript_store import TranscriptStore
@@ -755,7 +756,11 @@ def test_poll_records_session_hour_overhead_on_completion(stores):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
-def test_poll_kills_remote_session_on_token_budget_breach(stores):
+def test_poll_yields_remote_session_on_token_budget_breach(stores):
+    """A client-detected breach parks the session (`STATUS_YIELDED`) rather
+    than ending it — the operator gets a `budget` pending question instead
+    of an immediate terminal card. The remote session is left alive
+    (untouched — not killed) so a `yes` reply can genuinely resume it."""
     store, session, transcript = stores
     # Tighten the budget so the first poll exceeds it.
     store.set_routing_and_budget(
@@ -775,11 +780,12 @@ def test_poll_kills_remote_session_on_token_budget_breach(stores):
     ])
     executor = _make_executor(store, transcript, driver)
     outcome = executor.poll(session)
-    assert outcome.status == STATUS_BUDGET_EXCEEDED
+    assert outcome.status == STATUS_YIELDED
     assert "max_tokens" in outcome.reason
-    # Remote session was killed.
-    assert driver.kills, "expected driver.kill_session to be called"
-    assert driver.kills[0][0] == "sess_remote"
+    assert outcome.termination_evidence["budget_breach"] == "max_tokens"
+    # Remote session was NOT killed — it stays alive for a same-route resume.
+    assert not driver.kills
+    assert store.get("t1").status == STATUS_YIELDED
 
 
 @pytest.mark.unit
@@ -898,7 +904,9 @@ def test_poll_computes_cache_token_deltas_against_prior_state(stores):
 
 
 @pytest.mark.unit
-def test_poll_kills_remote_session_on_dollar_budget_breach(stores):
+def test_poll_yields_remote_session_on_dollar_budget_breach(stores):
+    """Same yield-and-ask contract for the dollar dimension — the remote
+    session is left alive, not killed."""
     store, session, transcript = stores
     store.set_routing_and_budget(
         "t1",
@@ -918,9 +926,10 @@ def test_poll_kills_remote_session_on_dollar_budget_breach(stores):
     ])
     executor = _make_executor(store, transcript, driver, model="claude-opus-4-7")
     outcome = executor.poll(session)
-    assert outcome.status == STATUS_BUDGET_EXCEEDED
+    assert outcome.status == STATUS_YIELDED
     assert "max_dollars" in outcome.reason
-    assert driver.kills
+    assert outcome.termination_evidence["budget_breach"] == "max_dollars"
+    assert not driver.kills
 
 
 @pytest.mark.unit
@@ -950,8 +959,9 @@ def test_poll_dollar_breach_fires_from_cache_creation_cost_alone(stores):
     ])
     executor = _make_executor(store, transcript, driver, model="claude-sonnet-4-6")
     outcome = executor.poll(session)
-    assert outcome.status == STATUS_BUDGET_EXCEEDED
+    assert outcome.status == STATUS_YIELDED
     assert "max_dollars" in outcome.reason
+    assert outcome.termination_evidence["budget_breach"] == "max_dollars"
 
 
 @pytest.mark.unit
@@ -978,9 +988,34 @@ def test_poll_dollar_breach_takes_precedence_over_token_breach(stores):
     ])
     executor = _make_executor(store, transcript, driver, model="claude-opus-4-7")
     outcome = executor.poll(session)
-    assert outcome.status == STATUS_BUDGET_EXCEEDED
+    assert outcome.status == STATUS_YIELDED
     assert "max_dollars" in outcome.reason
     assert "max_tokens" not in outcome.reason
+    assert outcome.termination_evidence["budget_breach"] == "max_dollars"
+
+
+@pytest.mark.unit
+def test_poll_skips_remote_call_while_budget_question_open(stores):
+    """A session parked on an open `budget` pending question must not
+    reach the remote provider at all — `poll()`'s entry guard returns the
+    no-op STATUS_RUNNING signal before calling `get_session_state`. Left
+    alive but untouched is what makes a `yes` reply able to genuinely
+    resume the same remote session."""
+    store, session, transcript = stores
+    store.set_managed_session_id("t1", "sess_remote")
+    store.update_status(
+        "t1", STATUS_YIELDED,
+        attempt_id=session.attempt_id, turn_id=session.turn_id,
+    )
+    store.create_pending_question(
+        session.session_id, "t1", "budget question", sent_message_id=1, kind="budget",
+    )
+    session = store.get("t1")
+    driver = _FakeDriver(state_responses=[])  # any call would raise
+    executor = _make_executor(store, transcript, driver)
+    outcome = executor.poll(session)
+    assert outcome.status == STATUS_RUNNING
+    assert not driver.poll_calls
 
 
 # ---------------------------------------------------------------------------

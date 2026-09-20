@@ -514,18 +514,28 @@ def spawn(ctx: InterAgentContext, args: dict) -> dict:
         max_dollars=args.get("max_dollars"),
     )
     parent_wall = int(parent_budget.get("wall_seconds", 14400))
-    parent_tokens = int(parent_budget.get("max_tokens", 500_000))
+    # `max_tokens` is opt-in (None means no cap, the default since PR 1) —
+    # unlike wall/dollars it has no numeric fallback to coerce to `int`.
+    parent_tokens_raw = parent_budget.get("max_tokens")
+    parent_tokens = None if parent_tokens_raw is None else int(parent_tokens_raw)
     wall = parent_wall if requested.wall_seconds is None else requested.wall_seconds
     tokens = parent_tokens if requested.max_tokens is None else requested.max_tokens
     dollars = parent_remaining if requested.max_dollars is None else requested.max_dollars
     if (
         isinstance(wall, bool) or not isinstance(wall, int) or wall < 0
-        or isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0
+        or (
+            tokens is not None
+            and (isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0)
+        )
         or isinstance(dollars, bool) or not isinstance(dollars, (int, float))
         or not math.isfinite(float(dollars)) or dollars < 0
     ):
         return _err("child budget values must be finite and non-negative", code="invalid_budget")
-    if wall > parent_wall or tokens > parent_tokens:
+    # A parent with no token cap has nothing for a child's request to
+    # exceed — only compare when the parent actually has one.
+    if wall > parent_wall or (
+        tokens is not None and parent_tokens is not None and tokens > parent_tokens
+    ):
         return _err("child token/wall budget exceeds parent budget", code="budget_exceeded")
     # Subscription-backed CLI children still inherit the parent's canonical
     # ceiling. A route's billing class may affect pricing, but it must never

@@ -9,6 +9,7 @@ fire path has nothing to work with (e.g. an ``endpoint`` action with no
 endpoint configured produces "No endpoint configuration provided." only
 once it actually fires).
 """
+import math
 from typing import Optional
 
 
@@ -28,14 +29,35 @@ class ScheduleActionValidationError(Exception):
 
 def validate_action_inputs(
     action: str, message_content: str, endpoint_config: Optional[dict],
+    budget_dollars: Optional[float] = None, wall_seconds: Optional[int] = None,
 ) -> Optional[dict]:
     """Validate that a schedule's resulting action has the inputs it needs
     to fire, raising ``ScheduleActionValidationError`` on failure.
+
+    ``budget_dollars``/``wall_seconds`` are the optional budget an
+    ``action:: agent`` schedule hands its created task on every fire — valid
+    only for ``action == "agent"`` and, when present, must be finite and
+    non-negative.
 
     Returns the ``endpoint_config`` to store: for ``endpoint``, the same
     dict with ``method`` normalized to upper case; for every other action,
     ``endpoint_config`` unchanged.
     """
+    if budget_dollars is not None or wall_seconds is not None:
+        if action != "agent":
+            field = "budget_dollars" if budget_dollars is not None else "wall_seconds"
+            raise ScheduleActionValidationError(
+                field, f"{field} is only valid for action='agent', got action={action!r}",
+            )
+        if budget_dollars is not None and (not math.isfinite(budget_dollars) or budget_dollars < 0):
+            raise ScheduleActionValidationError(
+                "budget_dollars", "budget_dollars must be a finite, non-negative number",
+            )
+        if wall_seconds is not None and (not math.isfinite(wall_seconds) or wall_seconds < 0):
+            raise ScheduleActionValidationError(
+                "wall_seconds", "wall_seconds must be a finite, non-negative number",
+            )
+
     if action == "endpoint":
         cfg = endpoint_config if isinstance(endpoint_config, dict) else {}
         method = str(cfg.get("method", "")).strip().upper()

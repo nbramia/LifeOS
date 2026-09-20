@@ -30,7 +30,7 @@ def _codex_budget() -> dict:
     operators don't have to dual-configure."""
     return {
         "wall_seconds": int(settings.claude_timeout_seconds),
-        "max_tokens": int(settings.agent_default_max_tokens),
+        "max_tokens": settings.agent_default_max_tokens,
         "max_dollars": float(settings.claude_max_cost_usd),
     }
 

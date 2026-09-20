@@ -484,6 +484,11 @@ CREATE INDEX IF NOT EXISTS idx_pending_msgs_session ON pending_messages(session_
 --                     completion message to continue. Resume reopens the
 --                     COMPLETED session and appends the reply as a new
 --                     user turn so the agent retains full context.
+--   "daily_cap"     — the worker's own once-a-day spend-cap notice, not
+--                     tied to any one task: `session_id`/`task_id` are a
+--                     synthetic per-date label rather than a real session,
+--                     so this is the one kind `worker.py` resolves without
+--                     looking up a session.
 CREATE TABLE IF NOT EXISTS pending_questions (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id        TEXT NOT NULL,
@@ -1913,6 +1918,29 @@ class SessionStore:
             turn_id=turn_id,
         )
 
+    def update_budget(
+        self,
+        task_id: str,
+        budget: dict,
+        *,
+        attempt_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> bool:
+        """Rewrite `budget_json` alone — routing/expected_output/preset_class
+        are left untouched, unlike `set_routing_and_budget`. Extends a
+        session's cap after a `budget` pending question is answered
+        `yes` / `yes $N` / `yes N min`; the caller re-fetches the session
+        afterward so the executor's next `execute()` call sees the new cap
+        rather than the one captured before the breach.
+        """
+        return self._guarded_update(
+            task_id,
+            "UPDATE sessions SET budget_json = ?, last_activity_at = ? WHERE task_id = ?",
+            (json.dumps(budget) if budget else None, _now()),
+            attempt_id=attempt_id,
+            turn_id=turn_id,
+        )
+
     def record_spend(
         self,
         task_id: str,
@@ -2978,6 +3006,23 @@ class SessionStore:
             )
         return cur.lastrowid
 
+    def has_open_budget_question(self, session_id: str) -> bool:
+        """Whether `session_id` has an unanswered `kind='budget'` pending
+        question. The Managed Agents poll loop uses this to skip a session
+        parked on a budget breach without making a provider call — a
+        breached-and-yielded session's remote handle is deliberately left
+        alive (see `ManagedExecutor.poll`), so without this guard the
+        ordinary poll loop would keep hitting it every tick.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM pending_questions "
+                "WHERE session_id = ? AND kind = 'budget' AND answered_at IS NULL "
+                "LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        return row is not None
+
     def add_reply_anchors(
         self,
         session_id: str,
@@ -3207,9 +3252,10 @@ class SessionStore:
         """List unanswered, unprocessed, not-timed-out questions.
 
         Powers `GET /api/agents/pending-questions` — the board's "waiting on
-        an answer" list. Scoped to `kind IN ('clarification', 'goal_approval')`
-        — the two kinds `worker.py::_process_clarification_answers` treats as
-        real questions awaiting a reply. `status_anchor` rows are routing
+        an answer" list. Scoped to
+        `kind IN ('clarification', 'goal_approval', 'budget')` — the three
+        kinds `worker.py::_process_clarification_answers` treats as real
+        questions awaiting a reply. `status_anchor` rows are routing
         plumbing, and `followup` rows are completion notices (see
         `notify_task_completed`), not questions — a Review card should not
         render a fake pending-question badge for one. Oldest first, so the
@@ -3219,7 +3265,7 @@ class SessionStore:
             rows = conn.execute(
                 "SELECT * FROM pending_questions "
                 "WHERE answered_at IS NULL AND processed = 0 AND timed_out = 0 "
-                "AND kind IN ('clarification', 'goal_approval') "
+                "AND kind IN ('clarification', 'goal_approval', 'budget') "
                 "ORDER BY id ASC",
             ).fetchall()
         return [dict(r) for r in rows]
@@ -3431,6 +3477,38 @@ class SessionStore:
                 "SELECT * FROM pending_questions "
                 "WHERE answered_at IS NOT NULL AND processed = 0 "
                 "ORDER BY id ASC",
+            ).fetchall()
+            claimed: list[dict] = []
+            for row in rows:
+                cur = conn.execute(
+                    "UPDATE pending_questions SET processed = 2 "
+                    "WHERE id = ? AND answered_at IS NOT NULL AND processed = 0",
+                    (row["id"],),
+                )
+                if cur.rowcount:
+                    item = dict(row)
+                    item["processed"] = 2
+                    claimed.append(item)
+                    self._owned_question_claims.add(int(row["id"]))
+        return claimed
+
+    def claim_answered_unprocessed_questions_by_kind(self, kind: str) -> list[dict]:
+        """Same atomic claim as `claim_answered_unprocessed_questions`, scoped
+        to one `kind`.
+
+        Used for the `daily_cap` notice: its reply must be drained before the
+        worker's spend-cap gate runs each tick, so a "raise to $N" reply
+        takes effect the same tick instead of being stuck behind the very
+        gate it needs to clear. Scoping to one `kind` keeps that early drain
+        from also claiming (and thereby delaying) unrelated clarification/
+        goal/budget rows the generic multi-kind handler still owns.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM pending_questions "
+                "WHERE answered_at IS NOT NULL AND processed = 0 AND kind = ? "
+                "ORDER BY id ASC",
+                (kind,),
             ).fetchall()
             claimed: list[dict] = []
             for row in rows:

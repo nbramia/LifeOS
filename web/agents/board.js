@@ -29,6 +29,7 @@ import { SCHEDULE_ACTIONS, renderScheduleActionSections, actionInputsSatisfied }
 import { LANES, laneColor } from './lanes.js';
 import { routingFilterValue } from './graph_encoding.js';
 import { POINTER_SLOP, pointerCanDrag, pointerIsActive, shouldCancelPointerGesture } from './board_gesture.js';
+import { assignChipHues } from './chip_colors.js';
 import {
   compareSortValues, loadSortSelection as readSortSelection,
   saveSortSelection as writeSortSelection, sortCards,
@@ -94,6 +95,7 @@ const DRAWER_EDITABLE_FIELDS = [
   // Per-action inputs — an endpoint action's call config and an
   // agent action's execution context, all through the same PUT.
   'endpoint_config', 'persona_id', 'model_id', 'effort', 'host', 'working_dir',
+  'budget_dollars', 'wall_seconds',
 ];
 
 // Lane filter — multi-select checkbox dropdown. Hidden lanes are
@@ -165,6 +167,12 @@ export function initBoard() {
   const bulkClearBtn = document.getElementById('board-bulk-clear');
 
   let board = { lanes: Object.fromEntries(LANES.map(l => [l.id, []])) };
+  // Assignee/tag pill colors — assignees first (their fixed order), then
+  // every other distinct tag currently on the board, alphabetically.
+  // Recomputed by `render()` on every pass; the drawer's tag-chip picker
+  // (`mountTagPicker`'s `renderChips`) recomputes its own copy on demand
+  // since it can render without a board `render()` having just run.
+  let chipHueMap = new Map();
   let visibleLanes = new Set(getFilters().lanes);
   let sortMode = loadSortSelection();
   let projectFilter = 'all';
@@ -790,6 +798,29 @@ export function initBoard() {
     return `${resolved}/${total} resolved`;
   }
 
+  // Every distinct tag currently on the board, lowercased, excluding
+  // whichever of ASSIGNEES appear as tags too (those render as the
+  // assignee chip instead — see the tag loop in `cardChips` below).
+  function boardTagNames() {
+    const tags = new Set();
+    for (const card of allCards()) {
+      for (const raw of (card.tags || [])) {
+        const lower = String(raw).toLowerCase();
+        if (!ASSIGNEES.includes(lower)) tags.add(lower);
+      }
+    }
+    return Array.from(tags).sort();
+  }
+
+  function computeChipHueMap() {
+    return assignChipHues([...ASSIGNEES, ...boardTagNames()]);
+  }
+
+  function chipHueStyle(name) {
+    const hue = chipHueMap.get(String(name).toLowerCase());
+    return hue != null ? ` style="--chip-hue:${hue}"` : '';
+  }
+
   function cardChips(card) {
     const chips = [];
     if (card.is_project) {
@@ -806,7 +837,7 @@ export function initBoard() {
         chips.push(`<span class="board-chip board-chip-snoozed" title="wakes ${escapeAttr(wake.exact)}">⏰ ${escapeHtml(wake.label)}</span>`);
       }
     }
-    if (card.assignee) chips.push(`<span class="board-chip board-chip-assignee">${escapeHtml(card.assignee)}</span>`);
+    if (card.assignee) chips.push(`<span class="board-chip board-chip-assignee"${chipHueStyle(card.assignee)}>${escapeHtml(card.assignee)}</span>`);
     if (card.fields && card.fields.model) chips.push(`<span class="board-chip">${escapeHtml(card.fields.model)}</span>`);
     if (card.fields && card.fields.effort) chips.push(`<span class="board-chip">${escapeHtml(card.fields.effort)}</span>`);
     // Assignment chip: fields.host is where the card WILL run,
@@ -839,11 +870,29 @@ export function initBoard() {
     if (card.session) {
       chips.push(`<span class="board-chip board-chip-session" data-session-id="${escapeHtml(card.session.session_id)}" title="Open in graph">↗ session</span>`);
     }
+    // Clickable — `renderTaskCard` wires each one to toggle the shared
+    // `tag` filter to exactly this tag (see `applyTagFilterFrom` below);
+    // `active` marks whichever chip(s) equal the currently active filter,
+    // using the same case-insensitive, `#`-stripped comparison
+    // `cardMatchesFilters` uses, so a second click reads as "un-apply".
+    const activeTagFilter = (getFilters().tag || '').trim().toLowerCase().replace(/^#/, '');
     for (const t of (card.tags || [])) {
-      if (ASSIGNEES.includes(t.toLowerCase())) continue;  // already shown as the assignee chip
-      chips.push(`<span class="board-chip board-chip-tag">#${escapeHtml(t)}</span>`);
+      const lower = t.toLowerCase();
+      if (ASSIGNEES.includes(lower)) continue;  // already shown as the assignee chip
+      const active = !!activeTagFilter && lower === activeTagFilter;
+      chips.push(`<span class="board-chip board-chip-tag${active ? ' active' : ''}" data-tag="${escapeAttr(t)}"${chipHueStyle(t)}>#${escapeHtml(t)}</span>`);
     }
     return chips.join('');
+  }
+
+  // Shared by the tag chip's click handler (`renderTaskCard`) — toggles
+  // the board's shared `tag` filter to exactly `tag`, or clears it when
+  // `tag` is already the active filter (same normalization as
+  // `cardMatchesFilters`'s tag match, above).
+  function applyTagFilterFrom(tag) {
+    const current = (getFilters().tag || '').trim().toLowerCase().replace(/^#/, '');
+    const normalized = String(tag).toLowerCase().replace(/^#/, '');
+    setFilter('tag', current === normalized ? '' : tag);
   }
 
   // A pull request's compact open/merged/closed label for the card-face
@@ -938,6 +987,16 @@ export function initBoard() {
         openDrawer(parentChip.dataset.parentId);
       });
     }
+    div.querySelectorAll('.board-chip-tag').forEach(tagChip => {
+      tagChip.addEventListener('click', (e) => {
+        // A modifier click is a selection toggle everywhere on the card
+        // (see the card's own click handler above) — let it bubble there
+        // untouched instead of applying a tag filter.
+        if (e.metaKey || e.ctrlKey) return;
+        e.stopPropagation();
+        applyTagFilterFrom(tagChip.dataset.tag);
+      });
+    });
     div.addEventListener('pointerdown', (e) => onPointerDown(e, {
       kind: 'card', card, sourceEl: div,
     }));
@@ -982,14 +1041,16 @@ export function initBoard() {
     div.dataset.cardId = card.id;
     div.dataset.lane = card.lane;
     if (card.id === revealedCardId) div.classList.add('reveal-highlight');
+    const isManual = card.schedule_type === 'manual';
     const nextFire = card.next_fire_at ? new Date(card.next_fire_at).toLocaleString() : '—';
     const actionChip = scheduleActionChipText(card);
     div.innerHTML = `
       <div class="board-card-title">${escapeHtml(card.name || '(schedule)')}</div>
       <div class="board-card-chips">
         <span class="board-chip" title="${escapeHtml(actionChip.title)}">${escapeHtml(actionChip.text)}</span>
-        ${card.recurring ? '<span class="board-chip">recurring</span>' : '<span class="board-chip">one-off</span>'}
-        <span class="board-chip">next: ${escapeHtml(nextFire)}</span>
+        ${isManual
+          ? '<span class="board-chip">Manual — trigger only</span>'
+          : `${card.recurring ? '<span class="board-chip">recurring</span>' : '<span class="board-chip">one-off</span>'}<span class="board-chip">next: ${escapeHtml(nextFire)}</span>`}
       </div>
       ${card.last_run ? `<div class="board-card-lastrun">${escapeHtml(card.last_run.outcome || '')} · ${escapeHtml(card.last_run.snippet || '')}</div>` : ''}
     `;
@@ -1002,6 +1063,7 @@ export function initBoard() {
   }
 
   function render() {
+    chipHueMap = computeChipHueMap();
     lanesEl.innerHTML = '';
     if (visibleLanes.size === 0) {
       const hint = document.createElement('div');
@@ -1217,11 +1279,12 @@ export function initBoard() {
     // card's own listener untouched.
     if (source.kind === 'card' && (e.metaKey || e.ctrlKey)) return;
     if (e.target.closest('button, input, select, textarea, a') && source.kind === 'card') return;
-    // A session chip has its own click navigation. Do not let the card's
-    // drag handler capture that pointer on the card, or the browser retargets
-    // the trailing pointerup/click to the card and opens its drawer instead
-    // of running the chip's graph jump.
-    if (source.kind === 'card' && e.target.closest('.board-chip-session')) return;
+    // A session chip has its own click navigation, and a tag chip its own
+    // filter toggle. Do not let the card's drag handler capture that
+    // pointer on the card, or the browser retargets the trailing
+    // pointerup/click to the card and opens its drawer instead of running
+    // the chip's own handler.
+    if (source.kind === 'card' && e.target.closest('.board-chip-session, .board-chip-tag')) return;
     const state = {
       ...source, sourceEl: source.sourceEl || e.currentTarget,
       pointerId: e.pointerId,
@@ -1681,6 +1744,7 @@ export function initBoard() {
     { id: 'weekdays', label: 'Weekdays' },
     { id: 'custom', label: 'Custom days' },
     { id: 'cron', label: 'Cron' },
+    { id: 'manual', label: 'Manual (trigger only)' },
   ];
   // Sunday-first (index 0 = Sun), matching cron's own day-of-week field.
   const DOW_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -1713,6 +1777,9 @@ export function initBoard() {
   }
 
   function triggerFieldsHtml(state) {
+    if (state.mode === 'manual') {
+      return `<div class="drawer-schedule-info">No trigger — this schedule never fires on its own. Fire it with Trigger now (or an agent's lifeos_schedule_trigger) after creating it.</div>`;
+    }
     if (state.mode === 'once') {
       return `
         <label class="drawer-label">When</label>
@@ -1744,6 +1811,9 @@ export function initBoard() {
   // schedule_value}`, or `null` while it's incomplete — the same shape
   // `POST /api/scheduler` and `POST /api/scheduler/preview` both take.
   function readTrigger(state) {
+    if (state.mode === 'manual') {
+      return { schedule_type: 'manual', schedule_value: '' };
+    }
     if (state.mode === 'once') {
       return state.onceValue ? { schedule_type: 'once', schedule_value: state.onceValue } : null;
     }
@@ -1826,6 +1896,7 @@ export function initBoard() {
     const sectionValues = {
       message_content: '', endpoint_config: null, executor: '', bot: '',
       persona_id: '', model_id: '', effort: '', host: '', working_dir: '',
+      budget_dollars: null, wall_seconds: null,
     };
     const sections = renderScheduleActionSections(actionSectionsEl, actionEl.value, sectionValues);
 
@@ -1892,6 +1963,15 @@ export function initBoard() {
       if (!trig) {
         ++previewSeq; // discard any in-flight response from before the trigger was cleared
         previewListEl.innerHTML = '';
+        previewErrorEl.hidden = true;
+        previewErrorEl.textContent = '';
+        return;
+      }
+      if (trig.schedule_type === 'manual') {
+        // Nothing to preview — manual has no trigger, so `/preview` (which
+        // only understands once/cron) is never called for it.
+        ++previewSeq;
+        previewListEl.innerHTML = '<div class="drawer-schedule-info">Manual — trigger only.</div>';
         previewErrorEl.hidden = true;
         previewErrorEl.textContent = '';
         return;
@@ -2174,7 +2254,8 @@ export function initBoard() {
     return r.json();
   }
 
-  function formatNextFire(iso) {
+  function formatNextFire(iso, scheduleType) {
+    if (scheduleType === 'manual') return 'Manual — trigger only.';
     if (!iso) return 'Not scheduled to fire again.';
     const d = new Date(iso);
     if (Number.isNaN(d.getTime())) return 'Not scheduled to fire again.';
@@ -2317,13 +2398,21 @@ export function initBoard() {
     options.addEventListener('pointerdown', markPointerDownInsidePicker);
 
     function renderChips() {
-      chips.innerHTML = selected.map(tag => `
-        <span class="drawer-tag-chip" data-tag="${escapeHtml(tag)}">
+      // Computed fresh rather than read off the outer `chipHueMap` — this
+      // picker can render (e.g. a new-card composer) without a board
+      // `render()` having just run to populate it.
+      const hues = computeChipHueMap();
+      chips.innerHTML = selected.map(tag => {
+        const hue = hues.get(tag.toLowerCase());
+        const style = hue != null ? ` style="--chip-hue:${hue}"` : '';
+        return `
+        <span class="drawer-tag-chip" data-tag="${escapeHtml(tag)}"${style}>
           <span>#${escapeHtml(tag)}</span>
           <button type="button" class="drawer-tag-chip-remove" data-remove-tag="${escapeHtml(tag)}"
                   aria-label="Remove tag ${escapeHtml(tag)}">×</button>
         </span>
-      `).join('');
+      `;
+      }).join('');
       chips.querySelectorAll('[data-remove-tag]').forEach(button => {
         button.addEventListener('click', () => removeTag(button.dataset.removeTag));
       });
@@ -2851,9 +2940,10 @@ export function initBoard() {
           <select class="drawer-select" data-field="schedule-type">
             <option value="cron" ${card.schedule_type === 'cron' ? 'selected' : ''}>cron</option>
             <option value="once" ${card.schedule_type === 'once' ? 'selected' : ''}>once</option>
+            <option value="manual" ${card.schedule_type === 'manual' ? 'selected' : ''}>manual (trigger only)</option>
           </select>
         </div>
-        <div>
+        <div data-field="schedule-value-group" ${card.schedule_type === 'manual' ? 'hidden' : ''}>
           <label class="drawer-label" data-field="schedule-value-label">${card.schedule_type === 'once' ? 'When (ISO datetime)' : 'Cron expression'}</label>
           <input class="drawer-schedule-value" data-field="schedule-value" value="${escapeHtml(card.schedule_value || '')}" placeholder="${card.schedule_type === 'once' ? '2026-06-03T15:05:00' : '0 9 * * *'}" />
           <div class="drawer-field-error" data-field="schedule-value-error" hidden></div>
@@ -3248,6 +3338,8 @@ export function initBoard() {
       effort: card.effort || '',
       host: card.host || '',
       working_dir: card.working_dir || '',
+      budget_dollars: card.budget_dollars != null ? card.budget_dollars : null,
+      wall_seconds: card.wall_seconds != null ? card.wall_seconds : null,
     };
     const sections = renderScheduleActionSections(actionSectionsEl, card.action, sectionValues);
 
@@ -3264,6 +3356,8 @@ export function initBoard() {
     let lastSavedEffort = sectionValues.effort;
     let lastSavedHost = sectionValues.host;
     let lastSavedWorkingDir = sectionValues.working_dir;
+    let lastSavedBudgetDollars = sectionValues.budget_dollars;
+    let lastSavedWallSeconds = sectionValues.wall_seconds;
 
     // (Re)wires save-on-blur/change for whichever fields the current
     // action's section actually rendered — called once after the initial
@@ -3470,6 +3564,56 @@ export function initBoard() {
           }
         });
       }
+
+      // Blank leaves the stored budget alone (there is no way to clear an
+      // already-set budget from the drawer) rather than sending nothing
+      // meaningful — the PUT only ever carries a number here.
+      if (els.budgetDollars) {
+        els.budgetDollars.addEventListener('blur', async () => {
+          const raw = els.budgetDollars.value.trim();
+          if (raw === '') return;
+          const value = Number(raw);
+          if (!Number.isFinite(value) || value < 0) {
+            showToast('Budget must be a non-negative number', true);
+            els.budgetDollars.value = lastSavedBudgetDollars != null ? String(lastSavedBudgetDollars) : '';
+            return;
+          }
+          if (value === lastSavedBudgetDollars) return;
+          try {
+            await putSchedule(card.id, { budget_dollars: value });
+            lastSavedBudgetDollars = value;
+            sectionValues.budget_dollars = value;
+            await fetchBoard();
+          } catch (err) {
+            showToast(`Couldn't save budget: ${err.message}`, true);
+            els.budgetDollars.value = lastSavedBudgetDollars != null ? String(lastSavedBudgetDollars) : '';
+          }
+        });
+      }
+
+      if (els.wallMinutes) {
+        els.wallMinutes.addEventListener('blur', async () => {
+          const raw = els.wallMinutes.value.trim();
+          if (raw === '') return;
+          const minutes = Number(raw);
+          if (!Number.isFinite(minutes) || minutes < 0) {
+            showToast('Wall time must be a non-negative number of minutes', true);
+            els.wallMinutes.value = lastSavedWallSeconds != null ? String(Math.round(lastSavedWallSeconds / 60)) : '';
+            return;
+          }
+          const value = Math.round(minutes * 60);
+          if (value === lastSavedWallSeconds) return;
+          try {
+            await putSchedule(card.id, { wall_seconds: value });
+            lastSavedWallSeconds = value;
+            sectionValues.wall_seconds = value;
+            await fetchBoard();
+          } catch (err) {
+            showToast(`Couldn't save wall time: ${err.message}`, true);
+            els.wallMinutes.value = lastSavedWallSeconds != null ? String(Math.round(lastSavedWallSeconds / 60)) : '';
+          }
+        });
+      }
     }
     wireActionSectionFields();
 
@@ -3482,13 +3626,14 @@ export function initBoard() {
         // response the same way the type/value/timezone saves do, since
         // updateOpenDrawer skips its own rebuild while this checkbox
         // holds focus.
-        previewEl.textContent = formatNextFire(resp.next_trigger_at);
+        previewEl.textContent = formatNextFire(resp.next_trigger_at, lastSavedType);
         await fetchBoard();
       }
       catch (err) { showToast(`Couldn't update enabled: ${err.message}`, true); enabledEl.checked = !!card.enabled; }
     });
 
     const typeEl = drawerEl.querySelector('[data-field="schedule-type"]');
+    const valueGroupEl = drawerEl.querySelector('[data-field="schedule-value-group"]');
     const valueEl = drawerEl.querySelector('[data-field="schedule-value"]');
     const valueLabelEl = drawerEl.querySelector('[data-field="schedule-value-label"]');
     const valueErrorEl = drawerEl.querySelector('[data-field="schedule-value-error"]');
@@ -3500,7 +3645,7 @@ export function initBoard() {
     const lastRunEl = drawerEl.querySelector('[data-field="last-run-info"]');
     const triggerBtnEl = drawerEl.querySelector('[data-action="trigger-now"]');
 
-    previewEl.textContent = formatNextFire(card.next_fire_at);
+    previewEl.textContent = formatNextFire(card.next_fire_at, card.schedule_type);
     lastRunEl.textContent = formatLastRun(card.last_run);
 
     // What the server last actually accepted for each field — a rejected
@@ -3529,6 +3674,7 @@ export function initBoard() {
     }
 
     function updateValueLabel(type) {
+      valueGroupEl.hidden = type === 'manual';
       if (type === 'once') {
         valueLabelEl.textContent = 'When (ISO datetime)';
         valueEl.placeholder = '2026-06-03T15:05:00';
@@ -3538,16 +3684,37 @@ export function initBoard() {
       }
     }
 
-    typeEl.addEventListener('change', () => {
+    typeEl.addEventListener('change', async () => {
       // Type-only, with no matching value, is unsaveable by construction
-      // (a cron string and an ISO datetime never parse as each other) —
-      // saving it here would either write a type/value pair the server
-      // rejects, or one it accepts but that leaves a live schedule
-      // pointed at the wrong parser. So this only updates the label and
-      // placeholder; the value field's blur handler below carries the
-      // type along with whatever value the operator enters to match it,
-      // so a conversion always reaches the server as one matched pair.
-      updateValueLabel(typeEl.value);
+      // for cron/once (a cron string and an ISO datetime never parse as
+      // each other) — saving it here would either write a type/value pair
+      // the server rejects, or one it accepts but that leaves a live
+      // schedule pointed at the wrong parser. So switching to cron/once
+      // only updates the label, placeholder, and visibility; the value
+      // field's blur handler below carries the type along with whatever
+      // value the operator enters to match it, so a conversion always
+      // reaches the server as one matched pair.
+      //
+      // `manual` has no value to match, so it saves immediately on
+      // selection — there's nothing to wait for a blur on.
+      const target = typeEl.value;
+      updateValueLabel(target);
+      if (target !== 'manual') return;
+      try {
+        const resp = await putSchedule(card.id, { schedule_type: 'manual' });
+        lastSavedType = 'manual';
+        lastSavedValue = '';
+        valueEl.value = '';
+        valueErrorEl.hidden = true;
+        valueErrorEl.textContent = '';
+        previewEl.textContent = formatNextFire(resp.next_trigger_at, 'manual');
+        triggerBtnEl.textContent = 'Trigger now';
+        await fetchBoard();
+      } catch (err) {
+        showToast(`Couldn't convert to manual: ${err.message}`, true);
+        typeEl.value = lastSavedType;
+        updateValueLabel(lastSavedType);
+      }
     });
 
     valueEl.addEventListener('blur', async () => {
@@ -3562,7 +3729,7 @@ export function initBoard() {
         if (typeChanged) lastSavedType = typeEl.value;
         valueErrorEl.hidden = true;
         valueErrorEl.textContent = '';
-        previewEl.textContent = formatNextFire(resp.next_trigger_at);
+        previewEl.textContent = formatNextFire(resp.next_trigger_at, lastSavedType);
         if (typeChanged) {
           triggerBtnEl.textContent = lastSavedType === 'once' ? 'Trigger now (disables this one-off)' : 'Trigger now';
         }
@@ -3586,7 +3753,7 @@ export function initBoard() {
         lastSavedTz = value;
         tzErrorEl.hidden = true;
         tzErrorEl.textContent = '';
-        previewEl.textContent = formatNextFire(resp.next_trigger_at);
+        previewEl.textContent = formatNextFire(resp.next_trigger_at, lastSavedType);
         await fetchBoard();
       } catch (err) {
         tzErrorEl.textContent = err.message;

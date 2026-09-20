@@ -91,7 +91,7 @@ ALLOWED_MODELS = (MODEL_LOCAL, MODEL_HAIKU, MODEL_SONNET)
 @dataclass
 class PreflightBudget:
     wall_seconds: int
-    max_tokens: int
+    max_tokens: int | None
     max_dollars: float
 
 
@@ -250,7 +250,7 @@ Reply with a single JSON object, no prose, matching this exact schema:
 {{
   "budget": {{
     "wall_seconds": <int>,
-    "max_tokens": <int>,
+    "max_tokens": <int|null>,
     "max_dollars": <float>
   }},
   "routing": "local" | "claude" | "ask",
@@ -263,8 +263,8 @@ Reply with a single JSON object, no prose, matching this exact schema:
 }}
 
 Rules:
-- Default budget if the title doesn't specify one: wall_seconds={default_wall}, max_tokens={default_tokens}, max_dollars={default_dollars}.
-- Parse natural-language budget hints from the title: "5 min" / "30s" / "1h" → wall_seconds; "max $0.50" → max_dollars; "10k tokens" / "50000 tokens" → max_tokens. Be reasonable about unit conversions.
+- Default budget if the title doesn't specify one: wall_seconds={default_wall}, max_tokens={default_tokens}, max_dollars={default_dollars}. No token cap applies unless the title names one explicitly.
+- Parse natural-language budget hints from the title: "5 min" / "30s" / "1h" → wall_seconds; "max $0.50" → max_dollars; "10k tokens" / "50000 tokens" → max_tokens (only set max_tokens when the title names an amount like this — otherwise leave it null). Be reasonable about unit conversions.
 - Routing precedence (apply in order; first match wins):
     1) If the tag list contains "local" → routing="local"; routing_reason="#local tag present".
     2) If the tag list contains "cloud" → routing="claude"; routing_reason="#cloud tag present".
@@ -313,9 +313,10 @@ Tag list and title follow. Return ONLY the JSON.
 
 def build_preflight_prompt(title: str, tags: list[str]) -> str:
     defaults = _defaults()
+    default_tokens_text = "null" if defaults.max_tokens is None else str(defaults.max_tokens)
     instructions = _PREFLIGHT_INSTRUCTIONS.format(
         default_wall=defaults.wall_seconds,
-        default_tokens=defaults.max_tokens,
+        default_tokens=default_tokens_text,
         default_dollars=defaults.max_dollars,
     )
     return f"{instructions}\nTAGS: {tags}\nTITLE: {title.strip()}"
@@ -586,9 +587,10 @@ def parse_preflight_response(text: str) -> PreflightResult:
 
     defaults = _defaults()
     budget_raw = raw.get("budget") or {}
+    max_tokens_raw = budget_raw.get("max_tokens", defaults.max_tokens)
     budget = PreflightBudget(
         wall_seconds=int(budget_raw.get("wall_seconds", defaults.wall_seconds)),
-        max_tokens=int(budget_raw.get("max_tokens", defaults.max_tokens)),
+        max_tokens=int(max_tokens_raw) if max_tokens_raw is not None else None,
         max_dollars=float(budget_raw.get("max_dollars", defaults.max_dollars)),
     )
 

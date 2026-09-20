@@ -162,7 +162,7 @@ class TestCardFacePrBadge:
 class TestDrawerOutcomeSection:
     def test_drawer_shows_engine_summary_branch_and_pr_link(self, page: Page, agents_base_url):
         _open_board(page, agents_base_url)
-        page.locator('[data-card-id="t-merged"]').click()
+        page.locator('[data-card-id="t-merged"] .board-card-title').click()
         outcome = page.locator('[data-field="outcome"]')
         expect(outcome).to_be_visible()
         expect(outcome.locator(".drawer-outcome-engine")).to_have_text("Claude Code")
@@ -180,7 +180,7 @@ class TestDrawerOutcomeSection:
 
     def test_drawer_outcome_section_is_separate_from_the_editable_notes_box(self, page: Page, agents_base_url):
         _open_board(page, agents_base_url)
-        page.locator('[data-card-id="t-merged"]').click()
+        page.locator('[data-card-id="t-merged"] .board-card-title').click()
         outcome = page.locator('[data-field="outcome"]')
         notes = page.locator('[data-field="notes"]')
         expect(outcome).to_be_visible()
@@ -192,6 +192,6 @@ class TestDrawerOutcomeSection:
 
     def test_drawer_has_no_outcome_section_for_a_card_that_never_completed(self, page: Page, agents_base_url):
         _open_board(page, agents_base_url)
-        page.locator('[data-card-id="t-no-outcome"]').click()
+        page.locator('[data-card-id="t-no-outcome"] .board-card-title').click()
         page.wait_for_selector('[data-field="notes"]')
         expect(page.locator('[data-field="outcome"]')).to_have_count(0)

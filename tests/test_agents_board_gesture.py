@@ -129,3 +129,36 @@ def test_undo_failure_refreshes_without_replacing_original_error():
         if (untouched !== 0) throw new Error('null callback invoked');
         """,
     )
+
+
+def test_chip_hues_are_evenly_spaced_with_assignees_first_and_duplicates_collapsed():
+    module = str(Path("web/agents/chip_colors.js"))
+    _import_test(
+        module,
+        """
+        const assignees = ['me', 'claude', 'codex', 'hermes', 'local', 'cloud'];
+        const tags = ['alpha-synthetic', 'beta-synthetic'];
+        const hues = m.assignChipHues([...assignees, ...tags]);
+        if (hues.size !== 8) throw new Error('expected one hue per distinct name, got ' + hues.size);
+        const expectedStep = 360 / 8;
+        [...assignees, ...tags].forEach((name, index) => {
+          const expected = Math.round(expectedStep * index);
+          if (hues.get(name) !== expected) {
+            throw new Error(`${name}: expected hue ${expected}, got ${hues.get(name)}`);
+          }
+        });
+        // Assignees keep their fixed order and land first.
+        if (hues.get('me') !== 0) throw new Error('assignees must start the wheel at 0');
+        if (hues.get('cloud') <= hues.get('local')) throw new Error('assignee order was not preserved');
+        // A repeated name collapses to one entry and does not narrow the
+        // gap between the others.
+        const withDuplicate = m.assignChipHues(['me', 'claude', 'me']);
+        if (withDuplicate.size !== 2) throw new Error('duplicate name was not collapsed');
+        if (withDuplicate.get('me') !== 0 || withDuplicate.get('claude') !== 180) {
+          throw new Error('duplicate collapsing skewed the spacing');
+        }
+        // An empty list returns an empty map, not an error.
+        const empty = m.assignChipHues([]);
+        if (empty.size !== 0) throw new Error('empty input must yield an empty map');
+        """,
+    )

@@ -190,6 +190,21 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+      # The lane-execution receipts — per-test outcomes and per-module
+      # durations, never test output — are retained from every part whatever
+      # its result, so a later reader can regenerate the duration record from
+      # a green run or compare one test's outcome across runs. Like the lane
+      # log this is candidate-produced diagnostic output: the status publisher
+      # never reads it, and nothing consumes it as authorization.
+      - name: Retain the lane-execution receipts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lane-receipts-${{ env.CANDIDATE_SHA }}-part${{ matrix.part }}
+          path: ${{ runner.temp }}/lifeos-lane-logs/*.json
+          if-no-files-found: warn
+          retention-days: 30
+
   publish-aggregate:
     # This job never checks out, runs, or consumes an artifact from the
     # candidate; it only reports the result of the job above for the

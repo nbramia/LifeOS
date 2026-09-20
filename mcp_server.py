@@ -328,7 +328,7 @@ CURATED_ENDPOINTS = {
     },
     "/api/scheduler:POST": {
         "name": "lifeos_schedule_create",
-        "description": "Create a schedule. schedule_type=once|cron; action=notify|prompt|endpoint|agent (agent writes an engine-assigned task, executor=local|cloud|cloud-haiku|cloud-sonnet).",
+        "description": "Create a schedule. schedule_type=once|cron|manual (manual has no cron/at — it only fires via lifeos_schedule_trigger); action=notify|prompt|endpoint|agent (agent writes an engine-assigned task, executor=local|cloud|cloud-haiku|cloud-sonnet).",
         "method": "POST",
         "path": "/api/scheduler"
     },
@@ -340,7 +340,7 @@ CURATED_ENDPOINTS = {
     },
     "/api/scheduler/{schedule_id}:PUT": {
         "name": "lifeos_schedule_update",
-        "description": "Update a schedule by schedule_id (from lifeos_schedule_list). Only provided fields change.",
+        "description": "Update a schedule by schedule_id (from lifeos_schedule_list). Only provided fields change; setting schedule_type=manual clears its cron/at value.",
         "method": "PUT",
         "path": "/api/scheduler/{schedule_id}"
     },
@@ -349,6 +349,13 @@ CURATED_ENDPOINTS = {
         "description": "Delete a schedule by ID. Use lifeos_schedule_list first to find the ID.",
         "method": "DELETE",
         "path": "/api/scheduler/{schedule_id}"
+    },
+    "/api/scheduler/{schedule_id}/trigger": {
+        "name": "lifeos_schedule_trigger",
+        "description": "Fire a schedule immediately, like the operator's Trigger-now button. Manual schedules (no cron/at) only fire this way. 'once' is consumed; manual stays enabled and repeatable.",
+        "method": "POST",
+        "path": "/api/scheduler/{schedule_id}/trigger",
+        "request_key_header_arg": "request_key"
     },
     "/api/reminders/send": {
         "name": "lifeos_telegram_send",
@@ -523,9 +530,9 @@ CURATED_ENDPOINTS = {
     },
 }
 
-# Contract count for the source catalog. The live fallback catalog is 68
-# curated tools plus 9 lifeos_agent_* tools = 77.
-CURATED_TOOL_COUNT = 68
+# Contract count for the source catalog. The live fallback catalog is 69
+# curated tools plus 9 lifeos_agent_* tools = 78.
+CURATED_TOOL_COUNT = 69
 
 
 class LifeOSMCPServer:
@@ -676,6 +683,7 @@ class LifeOSMCPServer:
                     _TASK_UPDATE_FIELDS_DESCRIPTION
                 )
             self._add_turn_header_arg(input_schema, config)
+            self._add_request_key_header_arg(input_schema, config)
             tool = {
                 "name": config["name"],
                 "description": config["description"],
@@ -798,6 +806,17 @@ class LifeOSMCPServer:
         schema.setdefault("properties", {})[arg_name] = {
             "type": "string",
             "description": f"Optional turn identifier forwarded as {TURN_ID_HEADER}.",
+        }
+
+    def _add_request_key_header_arg(self, schema: dict, config: dict) -> None:
+        """Expose an MCP arg that forwards to the scheduler trigger's idempotency header."""
+        arg_name = config.get("request_key_header_arg")
+        if not arg_name:
+            return
+        schema.setdefault("properties", {})[arg_name] = {
+            "type": "string",
+            "description": "Optional idempotency key forwarded as X-Request-Key; a retry with "
+                           "the same key resolves to the same fire rather than firing twice.",
         }
 
     def _fallback_schemas(self) -> dict:
@@ -1044,16 +1063,18 @@ class LifeOSMCPServer:
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Human-readable name for the schedule"},
-                    "schedule_type": {"type": "string", "description": "'once' (ISO datetime) or 'cron' (cron expression)"},
-                    "schedule_value": {"type": "string", "description": "ISO datetime (e.g., 2026-06-03T15:05:00) or cron expression (e.g., 0 9 * * 6)"},
+                    "schedule_type": {"type": "string", "description": "'once' (ISO datetime), 'cron' (cron expression), or 'manual' (no trigger — fires only via lifeos_schedule_trigger)"},
+                    "schedule_value": {"type": "string", "description": "ISO datetime (e.g., 2026-06-03T15:05:00) or cron expression (e.g., 0 9 * * 6); omit for 'manual'"},
                     "action": {"type": "string", "description": "'notify' (static text), 'prompt' (run chat pipeline), 'endpoint' (call API), or 'agent' (hand off to the agent worker)"},
                     "message_content": {"type": "string", "description": "Static text, natural-language prompt, or agent task description"},
                     "endpoint_config": {"type": "object", "description": "For action=endpoint: {endpoint, method, params}"},
                     "executor": {"type": "string", "description": "For action=agent: 'local', 'cloud', 'cloud-haiku', or 'cloud-sonnet'"},
                     "bot": {"type": "string", "description": "For action=notify/prompt: Telegram bot to send from — a name from the registry in config/telegram_bots.json, or 'primary'. Omit for the primary bot."},
-                    "enabled": {"type": "boolean", "description": "Whether the schedule is active", "default": True}
+                    "enabled": {"type": "boolean", "description": "Whether the schedule is active", "default": True},
+                    "budget_dollars": {"type": "number", "description": "For action=agent: dollar budget the created task inherits on every fire, rendered into its title (e.g. 'max $2.00')."},
+                    "wall_seconds": {"type": "integer", "description": "For action=agent: wall-clock seconds the created task inherits on every fire, rendered into its title in minutes."}
                 },
-                "required": ["name", "schedule_type", "schedule_value", "action"]
+                "required": ["name", "schedule_type", "action"]
             },
             "lifeos_schedule_list": {
                 "type": "object",
@@ -1064,14 +1085,16 @@ class LifeOSMCPServer:
                 "properties": {
                     "schedule_id": {"type": "string", "description": "Schedule ID from lifeos_schedule_list"},
                     "name": {"type": "string", "description": "Display name"},
-                    "schedule_type": {"type": "string", "description": "'once' or 'cron'"},
+                    "schedule_type": {"type": "string", "description": "'once', 'cron', or 'manual' (clears schedule_value)"},
                     "schedule_value": {"type": "string", "description": "ISO datetime or cron expression"},
                     "action": {"type": "string", "description": "'notify', 'prompt', 'endpoint', or 'agent'"},
                     "message_content": {"type": "string", "description": "Message text, prompt, or task description"},
                     "executor": {"type": "string", "description": "For action=agent: local | cloud | cloud-haiku | cloud-sonnet"},
                     "bot": {"type": "string", "description": "For action=notify/prompt: Telegram bot to send from — a name from the registry in config/telegram_bots.json, or 'primary'. Omit for the primary bot."},
                     "timezone": {"type": "string", "description": "IANA timezone (e.g., 'America/New_York')"},
-                    "enabled": {"type": "boolean", "description": "Whether the schedule is active"}
+                    "enabled": {"type": "boolean", "description": "Whether the schedule is active"},
+                    "budget_dollars": {"type": "number", "description": "For action=agent: dollar budget the created task inherits on every fire, rendered into its title (e.g. 'max $2.00')."},
+                    "wall_seconds": {"type": "integer", "description": "For action=agent: wall-clock seconds the created task inherits on every fire, rendered into its title in minutes."}
                 },
                 "required": ["schedule_id"]
             },
@@ -1079,6 +1102,14 @@ class LifeOSMCPServer:
                 "type": "object",
                 "properties": {
                     "schedule_id": {"type": "string", "description": "ID of the schedule to delete (from lifeos_schedule_list)"}
+                },
+                "required": ["schedule_id"]
+            },
+            "lifeos_schedule_trigger": {
+                "type": "object",
+                "properties": {
+                    "schedule_id": {"type": "string", "description": "ID of the schedule to fire (from lifeos_schedule_list)"},
+                    "request_key": {"type": "string", "description": "Optional idempotency key forwarded as X-Request-Key; a retry with the same key resolves to the same fire rather than firing twice"}
                 },
                 "required": ["schedule_id"]
             },
@@ -1329,6 +1360,7 @@ class LifeOSMCPServer:
                 {"type": "object", "properties": {}},
             )
             self._add_turn_header_arg(input_schema, config)
+            self._add_request_key_header_arg(input_schema, config)
             tool = {
                 "name": config["name"],
                 "description": config["description"],
@@ -1530,6 +1562,11 @@ class LifeOSMCPServer:
             turn_id = (arguments.pop(turn_header_arg, None) or "").strip()
             if turn_id:
                 headers[TURN_ID_HEADER] = turn_id
+        request_key_header_arg = endpoint_config.get("request_key_header_arg")
+        if request_key_header_arg:
+            request_key = (arguments.pop(request_key_header_arg, None) or "").strip()
+            if request_key:
+                headers["X-Request-Key"] = request_key
 
         # Handle path parameters
         if "{" in endpoint_path:
@@ -2178,6 +2215,9 @@ class LifeOSMCPServer:
 
         elif tool_name == "lifeos_schedule_delete":
             return f"Schedule deleted: {data.get('id', 'unknown')}"
+
+        elif tool_name == "lifeos_schedule_trigger":
+            return f"Schedule triggered: {data.get('id', 'unknown')}"
 
         elif tool_name == "lifeos_schedule_list":
             schedules = data.get("schedules", [])

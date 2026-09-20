@@ -746,19 +746,24 @@ class Settings(BaseSettings):
                     "Off by default — opt-in via setup-systemd.sh."
     )
     agent_default_budget_dollars: float = Field(
-        default=5.0,
+        default=10.0,
         alias="LIFEOS_AGENT_DEFAULT_BUDGET_DOLLARS",
-        description="Default per-task dollar budget when the task title doesn't specify one."
+        description="Default per-task dollar budget when the task title doesn't "
+                    "specify one — a backstop against a runaway, not a quota "
+                    "ordinary tasks are expected to approach."
     )
     agent_default_wall_seconds: int = Field(
         default=14400,
         alias="LIFEOS_AGENT_DEFAULT_WALL_SECONDS",
         description="Default per-task wall-clock budget (seconds); 14400 = 4h."
     )
-    agent_default_max_tokens: int = Field(
-        default=500_000,
+    agent_default_max_tokens: int | None = Field(
+        default=None,
         alias="LIFEOS_AGENT_DEFAULT_MAX_TOKENS",
-        description="Default per-task token budget (input + output combined)."
+        description="Default per-task token budget (input + output combined). "
+                    "None (default) means no token cap applies — the dollar and "
+                    "wall-clock budgets are the real backstops. Set only when a "
+                    "task title names one explicitly (e.g. \"50k tokens\")."
     )
     agent_default_route: str = Field(
         default="",
@@ -1086,6 +1091,32 @@ class Settings(BaseSettings):
                     "model catalogs change rarely and every provider call "
                     "costs a round trip (Anthropic) or a filesystem read "
                     "(Codex's models_cache.json)."
+    )
+    agent_default_model_family_claude: str = Field(
+        default="opus",
+        alias="LIFEOS_AGENT_DEFAULT_MODEL_FAMILY_CLAUDE",
+        description="Model family GET /api/agents/models picks as the "
+                    "claude engine's default: the newest catalog id whose "
+                    "family segment (claude-<family>-<version...>) matches. "
+                    "Tracks new releases automatically — no operator action "
+                    "needed when a newer model in the same family appears."
+    )
+    agent_default_model_family_codex: str = Field(
+        default="sol",
+        alias="LIFEOS_AGENT_DEFAULT_MODEL_FAMILY_CODEX",
+        description="Model family GET /api/agents/models picks as the "
+                    "codex engine's default: the newest catalog id whose "
+                    "family segment (gpt-<version...>-<family>) matches."
+    )
+    remote_llm_model_options: str = Field(
+        default="",
+        alias="LIFEOS_REMOTE_LLM_MODEL_OPTIONS",
+        description="Comma-separated additional model ids the configured "
+                    "remote provider (LIFEOS_REMOTE_LLM_URL) can serve, "
+                    "beyond LIFEOS_REMOTE_LLM_MODEL. Offered as choices on "
+                    "the board's cloud-assignee model picker; the #cloud "
+                    "assignment's execution spec carries whichever one was "
+                    "picked through to the request body's model field."
     )
     cc_resume_enabled: bool = Field(
         default=False,

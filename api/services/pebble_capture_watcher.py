@@ -11,12 +11,21 @@ from typing import Callable, Optional
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
-from api.services.pebble_capture import PebbleCaptureConsumer, parse_framed_blocks, process_sync
+from api.services.pebble_capture import PebbleCaptureConsumer, parse_framed_blocks, process_sync, ready_result
 
 logger = logging.getLogger(__name__)
 
 _DEBOUNCE_SECONDS = 2.0
 _MAX_PENDING_PATHS = 256
+
+
+def _is_ready_result(payload: object) -> bool:
+    """True only for a frame `PebbleCaptureConsumer.process` can act on."""
+    try:
+        ready_result(payload)
+    except Exception:
+        return False
+    return True
 
 
 def _eligible(path: Path, root: Path) -> bool:
@@ -126,6 +135,12 @@ class PebbleCaptureWatcher:
                 with self._condition:
                     if self._stopping:
                         return
+                if not _is_ready_result(payload):
+                    # The producer's own capture frames and its pending,
+                    # uncertain, and failed result frames are permanent
+                    # records, not work: skipping them keeps every scan quiet.
+                    logger.debug("Pebble frame skipped: not a ready result")
+                    continue
                 try:
                     process_sync(self.consumer, payload)
                 except Exception as exc:

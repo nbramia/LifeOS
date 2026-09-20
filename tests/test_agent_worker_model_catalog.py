@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from api.services.agent_worker.model_catalog import ModelCatalog, facts_from_catalog
+from api.services.agent_worker.model_catalog import ModelCatalog, facts_from_catalog, pick_family_default
 
 
 pytestmark = pytest.mark.unit
@@ -416,7 +416,7 @@ async def test_facts_adapter_and_legacy_fields_are_stable(tmp_path, monkeypatch)
         clock=_FrozenClock(10),
     ).get(ttl_seconds=100)
     assert set(("engines", "refreshed_at", "stale")).issubset(result)
-    assert set(result["engines"]) == {"claude", "codex", "local", "hermes"}
+    assert set(result["engines"]) == {"claude", "codex", "local", "hermes", "remote"}
     facts = facts_from_catalog(result)
     assert facts["codex"]["catalog_state"] == "unknown"
     assert facts["codex"]["quota"] == "unknown"
@@ -467,3 +467,157 @@ def test_claude_binary_presence_probe_resolves_via_fallback_search(monkeypatch, 
     facts = facts_from_catalog({})
     assert facts["claude_code"]["readiness"] == "ready"
     assert facts["claude_code"]["readiness_source"] == "claude_binary_presence"
+
+
+# ----------------------------------------------------------------------
+# Family-preference default picker (pick_family_default)
+# ----------------------------------------------------------------------
+
+_CLAUDE_MODELS = [
+    {"id": "claude-fable-5-1"},
+    {"id": "claude-opus-5"},
+    {"id": "claude-opus-4-8"},
+    {"id": "claude-opus-4-7"},
+    {"id": "claude-sonnet-5"},
+    {"id": "claude-sonnet-4-6"},
+    {"id": "claude-opus-4-5-20251101"},
+    {"id": "claude-haiku-4-5-20251001"},
+]
+
+_CODEX_MODELS = [
+    {"id": "gpt-5.6-sol"},
+    {"id": "gpt-5.6-terra"},
+    {"id": "gpt-5.6-luna"},
+    {"id": "gpt-6-astra"},
+    {"id": "gpt-reserve"},
+    {"id": "gpt-5.5"},
+    {"id": "codex-auto-review"},
+]
+
+
+def test_family_default_picks_newest_matching_claude_family():
+    assert pick_family_default(_CLAUDE_MODELS, "claude", "opus") == "claude-opus-5"
+
+
+def test_family_default_hypothetical_dotted_version_beats_bare_version():
+    models = _CLAUDE_MODELS + [{"id": "claude-opus-5-2"}]
+    assert pick_family_default(models, "claude", "opus") == "claude-opus-5-2"
+
+
+def test_family_default_codex_newer_bare_version_beats_dotted():
+    models = _CODEX_MODELS + [{"id": "gpt-6-sol"}]
+    assert pick_family_default(models, "codex", "sol") == "gpt-6-sol"
+
+
+def test_family_default_codex_other_family_not_picked():
+    assert pick_family_default(_CODEX_MODELS, "codex", "sol") == "gpt-5.6-sol"
+    assert pick_family_default(_CODEX_MODELS, "codex", "astra") == "gpt-6-astra"
+    assert "gpt-6-astra" != pick_family_default(_CODEX_MODELS, "codex", "sol")
+
+
+def test_family_default_dated_snapshot_and_bare_alias_parse_to_same_version():
+    # claude-opus-4-5-20251101 and a hypothetical bare claude-opus-4-5 both
+    # parse to family "opus", version (4, 5) — a tie, so list order decides.
+    tied = [{"id": "claude-opus-4-5-20251101"}, {"id": "claude-opus-4-5"}]
+    assert pick_family_default(tied, "claude", "opus") == "claude-opus-4-5-20251101"
+    assert pick_family_default(list(reversed(tied)), "claude", "opus") == "claude-opus-4-5"
+
+
+def test_family_default_empty_list_or_no_match_returns_none():
+    assert pick_family_default([], "claude", "opus") is None
+    assert pick_family_default(_CLAUDE_MODELS, "claude", "nonexistent-family") is None
+    assert pick_family_default(_CLAUDE_MODELS, "unknown_engine", "opus") is None
+    assert pick_family_default(_CODEX_MODELS, "codex", "reserve") is None  # gpt-reserve has no version segment
+
+
+@pytest.mark.asyncio
+async def test_catalog_defaults_key_uses_configured_family_settings(tmp_path, monkeypatch):
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "anthropic_api_key", "sk-test", raising=False)
+    monkeypatch.setattr(settings, "agent_default_model_family_claude", "sonnet", raising=False)
+    fake_client = _FakeAnthropicClient([
+        _FakeAnthropicModel("claude-opus-5"),
+        _FakeAnthropicModel("claude-sonnet-5"),
+    ])
+    _write_codex_cache(tmp_path / "codex_cache.json", [{"slug": "gpt-5.6-sol"}, {"slug": "gpt-6-sol"}])
+    catalog = ModelCatalog(
+        anthropic_client_factory=lambda: fake_client,
+        codex_cache_path=str(tmp_path / "codex_cache.json"),
+        local_probe=_noop_local_probe, hermes_probe=_noop_hermes_probe,
+        clock=_FrozenClock(),
+    )
+    result = await catalog.get(ttl_seconds=86400)
+    # The claude family setting was overridden to "sonnet" above — the
+    # default follows the setting, not the module's own "opus" default.
+    assert result["defaults"]["claude"] == "claude-sonnet-5"
+    # Codex family setting stayed at its "sol" default.
+    assert result["defaults"]["codex"] == "gpt-6-sol"
+
+
+@pytest.mark.asyncio
+async def test_catalog_defaults_null_when_engine_list_empty(tmp_path, monkeypatch):
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "anthropic_api_key", "", raising=False)
+    catalog = ModelCatalog(
+        codex_cache_path=str(tmp_path / "missing.json"),
+        local_probe=_noop_local_probe, hermes_probe=_noop_hermes_probe,
+        clock=_FrozenClock(),
+    )
+    result = await catalog.get(ttl_seconds=86400)
+    assert result["defaults"]["claude"] is None
+    assert result["defaults"]["codex"] is None
+
+
+# ----------------------------------------------------------------------
+# `remote` engine list (LIFEOS_REMOTE_LLM_MODEL_OPTIONS)
+# ----------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_remote_engine_list_from_configured_model_and_options(tmp_path, monkeypatch):
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "anthropic_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_base_url", "https://example.test/v1", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_model", "accounts/fireworks/models/deepseek-v4-flash", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_api_key", "fw_test", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_label", "Fireworks", raising=False)
+    monkeypatch.setattr(
+        settings, "remote_llm_model_options",
+        "accounts/fireworks/models/qwen3-a22b,accounts/fireworks/models/deepseek-v4-flash,accounts/fireworks/models/kimi-k2",
+        raising=False,
+    )
+    catalog = ModelCatalog(
+        codex_cache_path=str(tmp_path / "missing.json"),
+        local_probe=_noop_local_probe, hermes_probe=_noop_hermes_probe,
+        clock=_FrozenClock(),
+    )
+    result = await catalog.get(ttl_seconds=86400)
+    remote = result["engines"]["remote"]
+    assert [m["id"] for m in remote] == [
+        "accounts/fireworks/models/deepseek-v4-flash",  # configured model first
+        "accounts/fireworks/models/qwen3-a22b",
+        "accounts/fireworks/models/kimi-k2",  # deduplicated, options after
+    ]
+    assert remote[0]["label"] == "Fireworks"
+    assert remote[1]["label"] == "accounts/fireworks/models/qwen3-a22b"
+    assert remote[0]["pricing"] is None  # PRICING doesn't know this id
+    assert result["defaults"]["remote"] == "accounts/fireworks/models/deepseek-v4-flash"
+
+
+@pytest.mark.asyncio
+async def test_remote_engine_list_empty_when_unconfigured(tmp_path, monkeypatch):
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "anthropic_api_key", "", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_model", "", raising=False)
+    monkeypatch.setattr(settings, "remote_llm_model_options", "", raising=False)
+    catalog = ModelCatalog(
+        codex_cache_path=str(tmp_path / "missing.json"),
+        local_probe=_noop_local_probe, hermes_probe=_noop_hermes_probe,
+        clock=_FrozenClock(),
+    )
+    result = await catalog.get(ttl_seconds=86400)
+    assert result["engines"]["remote"] == []
+    assert result["defaults"]["remote"] is None

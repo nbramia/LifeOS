@@ -5,10 +5,13 @@
 > **Last Updated:** 2026-09-08
 > **Audience:** Operators
 
-The Scheduler runs work on a timer. A **schedule** binds a **trigger** (one-off
-or recurring) to an **action** (notify, prompt, endpoint, or hand off to the
-agent worker). Schedules are Obsidian-native: the markdown is the source of
-truth, editable in your vault, and reindexed automatically when you change it.
+The Scheduler runs work on a timer. A **schedule** binds a **trigger**
+(one-off, recurring, or manual) to an **action** (notify, prompt, endpoint, or
+hand off to the agent worker). A **manual** schedule has no cron or one-off
+trigger — it never fires on its own and is fired only by the operator's
+Trigger-now button or an agent's `lifeos_schedule_trigger`/`manage_schedules`
+call. Schedules are Obsidian-native: the markdown is the source of truth,
+editable in your vault, and reindexed automatically when you change it.
 
 > The Scheduler replaces the older "reminders" system. The old `/api/reminders`
 > endpoints, `lifeos_reminder_*` MCP tools, and `manage_reminders` chat tool
@@ -25,10 +28,11 @@ source of truth; `data/scheduler_index.json` is a rebuildable cache.
 - [ ] Morning Briefing [cron:: 0 9 * * *] [tz:: America/New_York] [action:: prompt] [mtype:: prompt] <!-- id:a1b2c3 -->
 - [ ] Weekly Review [cron:: 0 9 * * 6] [action:: agent] [mtype:: prompt] #cloud <!-- id:d4e5f6 -->
 - [x] Pay rent [at:: 2026-06-01T09:00:00] [action:: notify] [mtype:: static] <!-- id:0a9b8c -->
+- [ ] Deploy runbook [action:: agent] [mtype:: prompt] #cloud <!-- id:7f6e5d -->
 ```
 
 - **Checkbox** — `[ ]` enabled, `[x]` disabled (toggle it in Obsidian to pause).
-- **Trigger** — `[cron:: <expr>]` for recurring, `[at:: <ISO datetime>]` for one-off.
+- **Trigger** — `[cron:: <expr>]` for recurring, `[at:: <ISO datetime>]` for one-off, or neither for **manual** (no self-fire — trigger it explicitly).
 - **`[tz:: <IANA zone>]`** — interprets the trigger in that timezone (defaults to the configured timezone).
 - **`[action:: …]`** — what fires (see below).
 - **`#executor` tag** — for `action:: agent`, the executor: `#local`, `#cloud`, `#cloud-haiku`, or `#cloud-sonnet`.
@@ -51,6 +55,15 @@ handoff context and round-trip through Markdown; omitted fields retain the
 worker's legacy defaults. `bot` remains delivery-only and does not select an
 execution persona or provider.
 
+An `action:: agent` schedule may also carry its own budget: `[budget:: $2]`
+(dollars — `$2`, `2`, and `2.50` are all accepted) and `[wall:: 30m]`
+(wall-clock time — `30m`, `2h`, `90 min`, and `3600s` are all accepted).
+Both are optional and rejected on any other action. On every fire, they're
+rendered into the created task's title in the budget hint grammar the agent
+worker's preflight parses (see [agent-worker.md § Budgets](../specs/product/agent-worker.md#budgets)),
+so a recurring task gets a right-sized cap once instead of relying on the
+worker's own defaults every time.
+
 Editing a line in Obsidian (changing the cron, toggling the checkbox) is picked
 up within ~2s by the file watcher. Markdown edits are **not** validated — a
 `[bot:: <name>]` typed here is accepted as-is, and the fire-time routing warning
@@ -62,6 +75,7 @@ below is the only safety net.
 |------|-------|---------|-------|
 | Recurring | `[cron:: …]` | `0 9 * * 1-5` | Every weekday at 9am |
 | One-off | `[at:: …]` | `2026-06-03T15:05:00` | Once, then auto-disables |
+| Manual | *(neither field)* | — | Never on its own — only via Trigger now / `lifeos_schedule_trigger` / `manage_schedules` action='trigger'; stays enabled and repeatable |
 
 Cron expressions are interpreted in the schedule's timezone and converted to UTC
 internally, so "daily at 6pm" means 6pm local.
@@ -160,8 +174,12 @@ curl -X POST http://localhost:8000/api/scheduler \
 ### Via MCP Tools
 
 `lifeos_schedule_create` / `lifeos_schedule_list` / `lifeos_schedule_update` /
-`lifeos_schedule_delete` — each accepts the `action` and (for agent schedules)
-`executor` parameters.
+`lifeos_schedule_delete` / `lifeos_schedule_trigger` — create/update each
+accept the `action` and (for agent schedules) `executor` parameters, plus
+`schedule_type: "manual"` to create or convert to a trigger-only schedule.
+`lifeos_schedule_trigger` fires a schedule immediately — the same effect as
+the operator's Trigger-now button — and is a manual schedule's only way to
+ever fire.
 
 ## Managing Schedules
 
@@ -180,7 +198,7 @@ the type and the new value together to convert a schedule.
 - **List:** `GET /api/scheduler`, `lifeos_schedule_list`, or "list my schedules"
 - **Update:** `PUT /api/scheduler/{id}`, or edit the line in Obsidian
 - **Delete:** `DELETE /api/scheduler/{id}`, or "delete the … schedule"
-- **Trigger now:** `POST /api/scheduler/{id}/trigger` — fires immediately; for a `once` schedule this consumes it (disables it and clears its next fire), the same as if it had fired on its own.
+- **Trigger now:** `POST /api/scheduler/{id}/trigger` (also `lifeos_schedule_trigger` and `manage_schedules` action='trigger') — fires immediately; for a `once` schedule this consumes it (disables it and clears its next fire), the same as if it had fired on its own. A `manual` schedule stays enabled and can be triggered again.
 - **Pause all:** set `enabled: false` in `LifeOS/Scheduler/Scheduler.md`
 
 ## Obsidian Dashboard

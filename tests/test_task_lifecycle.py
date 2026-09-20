@@ -842,6 +842,9 @@ def test_tick_runs_the_lifecycle_drift_sweep_even_when_the_spend_cap_blocks(tmp_
         can_start_task=lambda estimate: False,
         daily_cap_dollars=0.0,
         today_total=lambda: 0.0,
+        effective_cap_dollars=lambda: 0.0,
+        notified_cap_dollars=lambda: 0.0,
+        mark_cap_notified=lambda cap: None,
     )
     for step in (
         "_process_human_queue",

@@ -62,9 +62,10 @@ def _claude_code_budget() -> dict:
     return {
         "wall_seconds": int(settings.claude_timeout_seconds),
         # Token cap is informational for the claude_code route — the CLI
-        # manages its own context. Mirror the operator default so budget
-        # reporting in ``/agents`` stays meaningful.
-        "max_tokens": int(settings.agent_default_max_tokens),
+        # manages its own context. Mirror the operator default (None unless
+        # an operator opts in) so budget reporting in ``/agents`` stays
+        # meaningful.
+        "max_tokens": settings.agent_default_max_tokens,
         "max_dollars": float(settings.claude_max_cost_usd),
     }
 

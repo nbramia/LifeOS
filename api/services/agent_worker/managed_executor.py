@@ -32,6 +32,7 @@ from api.services.agent_worker.session_store import (
     STATUS_COMPLETED,
     STATUS_FAILED,
     STATUS_RUNNING,
+    STATUS_YIELDED,
     SessionStore,
 )
 from api.services.agent_worker.transcript_store import TranscriptStore
@@ -137,12 +138,15 @@ def _user_message_for(task: dict, session_id: str, expected_output: str, budget:
     identity = f"lifeos_session_id={session_id}; "
     if proof:
         identity += f"lifeos_session_proof={proof}; "
+    # No token cap is the default (opt-in only via a title hint) — omit the
+    # clause entirely rather than rendering "~None tokens".
+    max_tokens = budget.get("max_tokens")
+    token_clause = f" / ~{max_tokens} tokens" if max_tokens is not None else ""
     parts.append(
         f"today={_today()}; "
         f"{identity}"
         f"expected_output={expected_output}; "
-        f"soft budget ~{budget.get('wall_seconds')}s wall / "
-        f"~{budget.get('max_tokens')} tokens / {dollars_str}."
+        f"soft budget ~{budget.get('wall_seconds')}s wall{token_clause} / {dollars_str}."
     )
     return "\n\n".join(parts)
 
@@ -374,6 +378,7 @@ class ManagedExecutor:
         Returns an ExecutorOutcome reflecting the current state:
         - STATUS_RUNNING — no terminal event yet (worker continues polling)
         - STATUS_COMPLETED / STATUS_FAILED / STATUS_BUDGET_EXCEEDED — terminal
+        - STATUS_YIELDED — parked on an open `budget` question (see below)
         """
         poll_started = time.monotonic()
         if not self._is_current(session):
@@ -382,6 +387,16 @@ class ManagedExecutor:
             return self._with_identity(
                 session, ExecutorOutcome(status=STATUS_FAILED, reason="no managed_agent_session_id")
             )
+        if session.status == STATUS_YIELDED and self.session_store.has_open_budget_question(
+            session.session_id,
+        ):
+            # Parked awaiting the operator's answer — the remote session is
+            # left alive but untouched, so this must not make a provider
+            # call. `_poll_managed_sessions` only stops re-dispatching once
+            # this returns non-terminal, and STATUS_RUNNING is the existing
+            # "nothing to do this poll" no-op signal (see the stale-turn
+            # early-return above).
+            return self._with_identity(session, ExecutorOutcome(status=STATUS_RUNNING))
 
         sid = session.session_id
         remote_id = session.managed_agent_session_id
@@ -542,26 +557,30 @@ class ManagedExecutor:
                 attempt_id=session.attempt_id, turn_id=session.turn_id,
             )
 
-        # 3. Mid-run budget breach: kill the remote session before it racks
-        # up more cost. The check uses the refreshed in-flight totals so the
-        # session-hour delta we just booked is included.
+        # 3. Mid-run budget breach: park the session and ask instead of
+        # killing it outright. The check uses the refreshed in-flight
+        # totals so the session-hour delta we just booked is included. The
+        # remote session is deliberately left alive (idle — nothing more is
+        # posted to it) rather than killed: that's what makes a genuine
+        # same-route resume possible if the operator raises the cap. While
+        # parked, `poll()`'s own entry guard (`has_open_budget_question`)
+        # skips this session so no further provider calls happen.
         budget = session.budget or {}
         refreshed = self.session_store.get(session.task_id)
         if refreshed is None or not self._is_current(session):
             return self._with_identity(session, ExecutorOutcome(status=STATUS_RUNNING))
         breach = self._budget_breach(refreshed, budget)
         if breach:
-            try:
-                self.driver.kill_session(remote_id, reason=f"budget_exceeded:{breach}")
-            except Exception as exc:  # pragma: no cover — best-effort kill
-                logger.warning("kill_session %s failed: %s", remote_id, exc)
             self.session_store.update_status(
-                session.task_id, STATUS_BUDGET_EXCEEDED,
+                session.task_id, STATUS_YIELDED,
                 attempt_id=session.attempt_id, turn_id=session.turn_id,
             )
-            self.transcript_store.append(sid, "budget_exceeded", {"kind": breach, "source": "client"})
+            self.transcript_store.append(sid, "budget_yielded", {"kind": breach, "source": "client"})
             return self._with_identity(
-                session, ExecutorOutcome(status=STATUS_BUDGET_EXCEEDED, reason=f"budget exceeded ({breach})")
+                session, ExecutorOutcome(
+                    status=STATUS_YIELDED, reason=f"budget breach ({breach})",
+                    termination_evidence={"budget_breach": breach},
+                )
             )
 
         if state.last_event_id:

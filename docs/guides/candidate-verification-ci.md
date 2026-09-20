@@ -1,7 +1,7 @@
 # Candidate Verification CI
 
 **Status:** Partial
-**Last Updated:** 2026-09-16
+**Last Updated:** 2026-09-20
 **Audience:** Operators
 
 Candidate verification runs on GitHub-hosted ephemeral runners. The publisher
@@ -71,10 +71,24 @@ of a partitioned run:
   --lane-log-dir /path/to/lane-logs
 ```
 
-The hosted workflow uploads its `--lane-log-dir` as an artifact only on a
-failed execution job (`if: ${{ failure() }}`), so a passing hosted run leaves
-no lane logs to harvest. Refresh the record from a local run's
-`--lane-log-dir` instead.
+The hosted workflow retains the receipts of every execution part, passing or
+failing, as one artifact per part named
+`lane-receipts-<candidate sha>-part<n>` (30-day retention). The receipts hold
+node IDs, outcomes, and durations only — never test output — and the status
+publisher never reads them. To refresh the record from a hosted run, download
+every part's receipts and pass each directory:
+
+```bash
+gh run download <run-id> --pattern 'lane-receipts-*' --dir /tmp/lane-receipts
+~/.venvs/lifeos/bin/python scripts/verify_candidate.py record-scope-durations \
+  --lane-log-dir /tmp/lane-receipts/lane-receipts-<sha>-part0 \
+  --lane-log-dir /tmp/lane-receipts/lane-receipts-<sha>-part1 \
+  --lane-log-dir /tmp/lane-receipts/lane-receipts-<sha>-part2 \
+  --lane-log-dir /tmp/lane-receipts/lane-receipts-<sha>-part3
+```
+
+The full lane log (pytest's own output) is uploaded only from a failed part,
+under `lane-logs-<candidate sha>-part<n>`.
 
 ### The partitioning safety invariant
 

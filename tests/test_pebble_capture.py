@@ -1,4 +1,5 @@
 """Synthetic persistence and authority-boundary tests for Pebble filing."""
+import logging
 import hashlib
 import json
 import multiprocessing
@@ -216,6 +217,35 @@ def test_watcher_processes_only_valid_framed_records_without_rewriting_archive(t
     PebbleCaptureWatcher(archive, consumer).process_file(path)
     assert consumer.payloads == [_payload()]
     assert path.read_text() == original
+
+
+def test_watcher_skips_frames_that_are_not_ready_results_without_warning(tmp_path, caplog):
+    """A capture file carries the producer's own capture frames and its
+    pending/uncertain/failed result frames alongside ready results. Only a
+    ready result is work; every other frame is skipped silently, so a
+    recovery scan over a settled file logs nothing."""
+    class Consumer:
+        def __init__(self):
+            self.payloads = []
+
+        async def process(self, payload):
+            self.payloads.append(payload)
+            return "dry_run"
+
+    archive = tmp_path / "Pebble"
+    archive.mkdir()
+    path = archive / "2030-01-01.md"
+    ready = _payload()
+    capture_frame = {**ready, "kind": "capture", "status": "pending"}
+    pending_result = {**ready, "status": "pending"}
+    uncertain_result = {**ready, "status": "uncertain"}
+    failed_result = {**ready, "status": "failed"}
+    path.write_text("\n".join(_frame(f) for f in (capture_frame, pending_result, uncertain_result, failed_result, ready)))
+    consumer = Consumer()
+    with caplog.at_level(logging.WARNING, logger="api.services.pebble_capture_watcher"):
+        PebbleCaptureWatcher(archive, consumer).process_file(path)
+    assert consumer.payloads == [ready]
+    assert not [r for r in caplog.records if "remains pending" in r.getMessage()]
 
 
 def test_watcher_does_not_normalize_crlf_into_a_valid_producer_frame(tmp_path):

@@ -76,6 +76,17 @@ class TestDeriveLaneTable:
     def test_human_queue_agent_blocked_tag(self):
         assert agent_board.derive_lane("todo", ["agent-blocked"]) == "human_queue"
 
+    def test_human_queue_agent_blocked_tag_from_a_budget_question(self):
+        """A `budget` pending question derives to Human queue exactly as a
+        clarification does — both park the vault task under the same
+        `agent-blocked` tag, and lane derivation is tag-based, not aware
+        of `pending_questions.kind` at all. A `budget`-yielded session's
+        own `session.status` stays `yielded` (never `blocked`), so the
+        card carrying `todo`/`in_progress` alongside the tag proves the
+        lane comes from the tag, not the underlying task status."""
+        assert agent_board.derive_lane("in_progress", ["local", "agent-blocked"]) == "human_queue"
+        assert agent_board.derive_lane("todo", ["local", "agent-blocked"]) == "human_queue"
+
     def test_human_queue_status_blocked_alone(self):
         assert agent_board.derive_lane("blocked", []) == "human_queue"
 

@@ -301,7 +301,7 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
                   kill_failures: "list | None" = None,
                   task_deletes: "list | None" = None, schedule_deletes: "list | None" = None,
                   call_log: "list | None" = None, snooze_calls: "list | None" = None,
-                  task_put_status_code: "list | None" = None):
+                  task_put_status_code: "list | None" = None, trigger_calls: "list | None" = None):
     """Stub d3 (offline CDN) + every /api/ call the page makes.
 
     `snooze_calls`: appended with `{"method": "PUT"|"DELETE", "id", "body"}`
@@ -740,6 +740,16 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
             route.fulfill(status=200, content_type="application/json", body=json.dumps({"status": "deleted", "id": task_id}))
             return
 
+        trigger_match = re.search(r"/api/scheduler/([^/]+)/trigger$", url)
+        if trigger_match and method == "POST":
+            if trigger_calls is not None:
+                trigger_calls.append(trigger_match.group(1))
+            route.fulfill(
+                status=200, content_type="application/json",
+                body=json.dumps({"status": "triggered", "id": trigger_match.group(1)}),
+            )
+            return
+
         schedule_match = re.search(r"/api/scheduler/([^/]+)$", url)
         if schedule_match and method == "PUT":
             try:
@@ -796,7 +806,7 @@ def _open_board(page: Page, base_url, board_state=None, lane_calls=None, task_pu
                  open_calls=None, open_response=None, task_posts=None, cancel_calls=None, cancel_failures=None,
                  kill_calls=None, kill_status_code=None, kill_failures=None,
                  task_deletes=None, schedule_deletes=None, call_log=None, snooze_calls=None,
-                 task_put_status_code=None):
+                 task_put_status_code=None, trigger_calls=None):
     _stub_routes(
         page,
         board_state if board_state is not None else _board_fixture(),
@@ -820,6 +830,7 @@ def _open_board(page: Page, base_url, board_state=None, lane_calls=None, task_pu
         call_log,
         snooze_calls,
         task_put_status_code,
+        trigger_calls,
     )
     page.goto(f"{base_url}/agents")
     page.wait_for_selector('[data-card-id="t1"]')
@@ -1127,6 +1138,55 @@ class TestBoardLoad:
         card = page.locator('[data-card-id="t3"]')
         expect(card.locator(".board-card-question")).to_contain_text("Which environment?")
 
+    def test_budget_question_shows_continue_and_stop_alongside_answer(self, page: Page, agents_base_url):
+        """A `budget` pending question (a task parked on a budget breach)
+        gets Continue/Stop buttons in the drawer alongside the existing
+        free-text Answer — Continue posts `yes`, Stop posts `stop`, both
+        through the same answer endpoint Answer's composer uses, without
+        opening a modal. t3's plain `clarification` question (no `kind`
+        in its fixture — the server default) must NOT get these buttons."""
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["human_queue"].append({
+            "kind": "task", "id": "t-budget", "title": "Long-running task",
+            "notes": "", "status": "blocked", "tags": ["agent-blocked", "local"], "assignee": "local",
+            "fields": {}, "context": "Ops", "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None,
+            "pending_question": {
+                "id": 42, "session_id": "s-budget", "kind": "budget",
+                "question": "Local agent worker: task 'Long-running task' hit its "
+                             "budget (max_dollars) after $5.12 and 38 min (cap $5.00).",
+                "asked_at": 0, "bot": None,
+            },
+        })
+        _open_board(page, agents_base_url, board_state=board_state)
+
+        answer_calls = []
+
+        def answer_handler(route):
+            body = json.loads(route.request.post_data or "{}")
+            answer_calls.append(body.get("answer"))
+            route.fulfill(status=200, content_type="application/json", body="{}")
+
+        page.route(re.compile(r"/api/agents/pending-questions/42/answer$"), answer_handler)
+
+        # t3's ordinary clarification gets Answer only.
+        page.locator('[data-card-id="t3"]').click()
+        expect(page.locator('.drawer-actions [data-action="answer"]')).to_be_visible()
+        expect(page.locator('.drawer-actions [data-action="continue"]')).to_have_count(0)
+        expect(page.locator('.drawer-actions [data-action="stop"]')).to_have_count(0)
+        page.keyboard.press("Escape")
+
+        page.locator('[data-card-id="t-budget"]').click()
+        expect(page.locator('.drawer-actions [data-action="answer"]')).to_be_visible()
+        expect(page.locator('.drawer-actions [data-action="continue"]')).to_be_visible()
+        expect(page.locator('.drawer-actions [data-action="stop"]')).to_be_visible()
+
+        page.locator('.drawer-actions [data-action="continue"]').click()
+        _wait_for(lambda: answer_calls == ["yes"], page=page)
+
+        page.locator('.drawer-actions [data-action="stop"]').click()
+        _wait_for(lambda: answer_calls == ["yes", "stop"], page=page)
+
     def test_lane_headers_carry_the_shared_lane_colour_accent(self, page: Page, agents_base_url):
         """Each lane header's `border-top-color` equals `laneColor(lane.id)`
         (web/agents/lanes.js) — the same palette the graph tab uses for its
@@ -1245,15 +1305,16 @@ class TestBoardLoad:
         page.locator("#board-done-drop").click()
         expect(page.locator("#board-lane-filter-options input[value='done']")).not_to_be_checked()
 
+    def test_done_target_sits_first_in_the_tray_ahead_of_every_assignee(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        done_box = page.locator("#board-done-drop").bounding_box()
+        first_assignee_box = page.locator("#board-assignee-drops .board-assignee-drop").first.bounding_box()
+        assert done_box["x"] + done_box["width"] <= first_assignee_box["x"]
+
     def test_dropping_a_focused_card_on_done_still_moves_it(self, page: Page, agents_base_url):
         lane_calls = []
         _open_board(page, agents_base_url, lane_calls=lane_calls)
-        card_box = page.locator('[data-card-id="t1"]').bounding_box()
-        done_box = page.locator("#board-done-drop").bounding_box()
-        page.mouse.move(card_box["x"] + card_box["width"] / 2, card_box["y"] + card_box["height"] / 2)
-        page.mouse.down()
-        page.mouse.move(done_box["x"] + done_box["width"] / 2, done_box["y"] + done_box["height"] / 2, steps=10)
-        page.mouse.up()
+        _drag_to(page, '[data-card-id="t1"]', "#board-done-drop")
         expect(page.locator(".board-lane[data-lane='unassigned'] [data-card-id='t1']")).to_have_count(0, timeout=5000)
         assert lane_calls == [{"lane": "done"}]
 
@@ -1663,7 +1724,10 @@ class TestDrawerTagsEdit:
         })
         task_puts = []
         _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
-        page.locator('[data-card-id="t-review"]').click()
+        # Clicks the title, not the card body — this card's only tag chip
+        # (`agent-completed`) is clickable, and a bare click on the card can
+        # land on it instead of opening the drawer.
+        page.locator('[data-card-id="t-review"] .board-card-title').click()
         tags = page.locator(".drawer-tags")
 
         # Hold the first atomic request in a browser-side fetch wrapper so the
@@ -1837,6 +1901,64 @@ class TestScheduledCardDrawer:
             {"message_content": "Good evening"},
             {"enabled": False},
         ]
+
+    def test_manual_schedule_card_shows_manual_and_triggers(self, page: Page, agents_base_url):
+        """A manual schedule (schedule_type='manual', no cron/at) renders
+        "Manual" on its card instead of a next-fire time, and its drawer's
+        Trigger now button posts to POST /api/scheduler/{id}/trigger."""
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["scheduled"].append({
+            "kind": "schedule", "id": "s2", "name": "Deploy runbook",
+            "message_content": "ship it", "enabled": True,
+            "next_fire_at": None, "recurring": False,
+            "schedule_type": "manual", "schedule_value": "",
+            "action": "notify", "last_run": None,
+        })
+        trigger_calls = []
+        _open_board(page, agents_base_url, board_state=board_state, trigger_calls=trigger_calls)
+
+        card = page.locator('[data-card-id="s2"]')
+        expect(card).to_contain_text("Manual")
+
+        card.click()
+        drawer = page.locator("#board-drawer")
+        expect(drawer.locator('[data-field="schedule-type"]')).to_have_value("manual")
+        expect(drawer.locator('[data-field="next-fire-preview"]')).to_contain_text("Manual")
+        drawer.locator('[data-action="trigger-now"]').click()
+        _wait_for(lambda: trigger_calls == ["s2"], page=page)
+
+    def test_agent_schedule_budget_inputs_appear_and_save(self, page: Page, agents_base_url):
+        """An `action: agent` schedule's drawer shows Budget ($) and Wall
+        (min) inputs inside the execution-context details, and each saves
+        through PUT /api/scheduler/{id} as budget_dollars / wall_seconds
+        (web/agents/schedule_sections.js, web/agents/board.js)."""
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["scheduled"].append({
+            "kind": "schedule", "id": "s3", "name": "Weekly review",
+            "message_content": "Draft my weekly review", "enabled": True,
+            "next_fire_at": "2099-01-01T09:00:00+00:00", "recurring": True,
+            "last_run": None, "schedule_type": "cron", "schedule_value": "0 9 * * 6",
+            "action": "agent", "executor": "cloud",
+            "budget_dollars": None, "wall_seconds": None,
+        })
+        schedule_puts = []
+        _open_board(page, agents_base_url, board_state=board_state, schedule_puts=schedule_puts)
+
+        page.locator('[data-card-id="s3"]').click()
+        drawer = page.locator("#board-drawer")
+        drawer.locator('[data-field="exec-context"] summary').click()  # expand <details>
+        budget = drawer.locator('[data-field="budget-dollars"]')
+        wall = drawer.locator('[data-field="wall-minutes"]')
+        expect(budget).to_be_visible()
+        expect(wall).to_be_visible()
+
+        budget.fill("2")
+        wall.click()  # blur budget
+        _wait_for(lambda: {"budget_dollars": 2} in schedule_puts, page=page)
+
+        wall.fill("30")
+        budget.click()  # blur wall
+        _wait_for(lambda: {"wall_seconds": 1800} in schedule_puts, page=page)
 
 
 class TestLiveUpdates:
@@ -2291,7 +2413,10 @@ class TestFilters:
             "updated_at": "2026-01-01T00:00:00+00:00", "session": None, "pending_question": None,
         }]
         _open_board(page, agents_base_url, board_state=board_state)
-        page.locator('[data-card-id="tr"]').click()
+        # Click the title, not the card body — this card's only tag chip
+        # (`agent-completed`) is clickable, and a bare card click can land
+        # on it instead of opening the drawer.
+        page.locator('[data-card-id="tr"] .board-card-title').click()
         page.locator('[data-action="accept"]').click()
         expect(page.locator("#board-drawer-backdrop")).to_be_hidden()
         toast = page.locator(".toast").filter(has_text="Accepted.")
@@ -2329,6 +2454,70 @@ class TestFilters:
         assert page.evaluate("() => document.body.classList.contains('board-dragging')")
         page.mouse.up()
         assert not page.evaluate("() => document.body.classList.contains('board-dragging')")
+
+
+class TestTagChipClickFilter:
+    """Clicking a `.board-chip-tag` on a card toggles the shared `tag`
+    filter to exactly that tag (board.js's `applyTagFilterFrom`) — the same
+    store `#board-filter-tag` writes to (linking.js) — and never opens the
+    card's drawer. Each pill (assignee and tag) also carries its own
+    `--chip-hue` custom property, spread evenly across the hue wheel by
+    web/agents/chip_colors.js."""
+
+    def _board_with_synthetic_tags(self):
+        board_state = copy.deepcopy(_board_fixture())
+        for cards in board_state["lanes"].values():
+            for card in cards:
+                if card.get("id") == "t1":
+                    card["tags"] = ["synthetic-widget"]
+                elif card.get("id") == "t2":
+                    card["tags"] = ["me", "synthetic-gadget"]
+        return board_state
+
+    def test_click_sets_shared_tag_filter_and_hides_non_matching_cards(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url, board_state=self._board_with_synthetic_tags())
+        page.locator('[data-card-id="t1"] .board-chip-tag').click()
+        expect(page.locator("#board-filter-tag")).to_have_value("synthetic-widget")
+        expect(page.locator('[data-card-id="t1"]')).to_be_visible()
+        expect(page.locator('[data-card-id="t2"]')).to_have_count(0)
+
+    def test_click_same_chip_again_clears_the_filter(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url, board_state=self._board_with_synthetic_tags())
+        page.locator('[data-card-id="t1"] .board-chip-tag').click()
+        expect(page.locator("#board-filter-tag")).to_have_value("synthetic-widget")
+        page.locator('[data-card-id="t1"] .board-chip-tag').click()
+        expect(page.locator("#board-filter-tag")).to_have_value("")
+        expect(page.locator('[data-card-id="t1"]')).to_be_visible()
+        expect(page.locator('[data-card-id="t2"]')).to_be_visible()
+
+    def test_click_does_not_open_the_drawer(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url, board_state=self._board_with_synthetic_tags())
+        page.locator('[data-card-id="t1"] .board-chip-tag').click()
+        expect(page.locator("#board-filter-tag")).to_have_value("synthetic-widget")
+        expect(page.locator("#board-drawer-backdrop")).to_be_hidden()
+
+    def test_tag_and_assignee_chips_get_distinct_hues(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url, board_state=self._board_with_synthetic_tags())
+
+        def chip_hue(locator):
+            return locator.evaluate("el => el.style.getPropertyValue('--chip-hue').trim()")
+
+        hue_t1_tag = chip_hue(page.locator('[data-card-id="t1"] .board-chip-tag'))
+        hue_t2_tag = chip_hue(page.locator('[data-card-id="t2"] .board-chip-tag'))
+        hue_t2_assignee = chip_hue(page.locator('[data-card-id="t2"] .board-chip-assignee'))
+        assert hue_t1_tag and hue_t2_tag and hue_t2_assignee
+        assert hue_t1_tag != hue_t2_tag, "two cards with different tags should get different hues"
+        assert hue_t2_tag != hue_t2_assignee, "a tag chip's hue should differ from an assignee chip's"
+
+    def test_control_click_on_a_tag_chip_selects_the_card_instead_of_filtering(self, page: Page, agents_base_url):
+        """A modifier click anywhere on a card — including a tag chip — is
+        a selection toggle, never a filter change (mirrors the card's own
+        click handler's `e.metaKey || e.ctrlKey` branch)."""
+        _open_board(page, agents_base_url, board_state=self._board_with_synthetic_tags())
+        page.locator('[data-card-id="t1"] .board-chip-tag').click(modifiers=["Control"])
+        expect(page.locator('[data-card-id="t1"]')).to_have_class(re.compile(r"\bboard-card-selected\b"))
+        expect(page.locator("#board-filter-tag")).to_have_value("")
+        expect(page.locator('[data-card-id="t2"]')).to_be_visible()
 
 
 class TestHostAssignmentChipAndFilter:
@@ -4101,7 +4290,10 @@ class TestSnoozeActionEligibility:
         page.locator("#board-lane-filter-btn").click()
         page.locator("#board-lane-filter-options input[value='review']").check()
         for card_id in ["t1", "t2", "t3", "t-review"]:
-            page.locator(f'[data-card-id="{card_id}"]').click()
+            # Click the title, not the card body — t-review's only tag chip
+            # (`agent-completed`) is clickable, and a bare card click can
+            # land on it instead of opening the drawer.
+            page.locator(f'[data-card-id="{card_id}"] .board-card-title').click()
             expect(page.locator('#board-drawer [data-action="snooze"]')).to_be_visible()
             expect(page.locator('#board-drawer [data-action="unsnooze"]')).to_have_count(0)
             page.locator('[data-action="drawer-close"]').click()
@@ -4242,9 +4434,42 @@ class TestSnoozePresets:
 
 
 class TestSnoozeCustom:
-    """AC: a custom duration (hours/days) and a custom date-time, both
-    resolved to an absolute `until`; a past custom time is refused
-    client-side with no request sent."""
+    """AC: a custom duration (minutes/hours/days, defaulting to days) and a
+    custom date-time, both resolved to an absolute `until`; a past custom
+    time is refused client-side with no request sent."""
+
+    def test_custom_duration_unit_defaults_to_days(self, browser: Browser, agents_base_url):
+        context = browser.new_context(timezone_id="UTC")
+        page = context.new_page()
+        try:
+            snooze_calls = []
+            _open_board(page, agents_base_url, snooze_calls=snooze_calls)
+            page.clock.pause_at(datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc))
+            _open_snooze_picker(page, "t2")
+            unit = page.locator('#board-drawer [data-field="snooze-duration-unit"]')
+            assert unit.input_value() == "days"
+            page.locator('#board-drawer [data-field="snooze-duration-value"]').fill("3")
+            page.locator('#board-drawer [data-action="snooze-duration-confirm"]').click()
+            _wait_for(lambda: len(snooze_calls) == 1, page=page)
+            assert snooze_calls[0]["body"]["until"] == "2026-01-04T10:00:00+00:00"
+        finally:
+            context.close()
+
+    def test_custom_duration_in_minutes(self, browser: Browser, agents_base_url):
+        context = browser.new_context(timezone_id="UTC")
+        page = context.new_page()
+        try:
+            snooze_calls = []
+            _open_board(page, agents_base_url, snooze_calls=snooze_calls)
+            page.clock.pause_at(datetime(2026, 1, 1, 10, 0, 0, tzinfo=timezone.utc))
+            _open_snooze_picker(page, "t2")
+            page.locator('#board-drawer [data-field="snooze-duration-value"]').fill("45")
+            page.locator('#board-drawer [data-field="snooze-duration-unit"]').select_option("minutes")
+            page.locator('#board-drawer [data-action="snooze-duration-confirm"]').click()
+            _wait_for(lambda: len(snooze_calls) == 1, page=page)
+            assert snooze_calls[0]["body"]["until"] == "2026-01-01T10:45:00+00:00"
+        finally:
+            context.close()
 
     def test_custom_duration_in_hours(self, browser: Browser, agents_base_url):
         context = browser.new_context(timezone_id="UTC")
@@ -5457,7 +5682,10 @@ class TestAgentCardMoveRulesAndCancel:
         task_puts = []
         _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
 
-        page.locator('[data-card-id="t10"]').click()
+        # Click the title, not the card body — this card's only tag chip
+        # (`agent-completed`) is clickable, and a bare card click can land
+        # on it instead of opening the drawer.
+        page.locator('[data-card-id="t10"] .board-card-title').click()
         tags = page.locator(".drawer-tags")
         expect(tags).to_be_enabled()
         expect(tags).to_have_value("")  # agent-completed never shows as an editable token
@@ -5630,7 +5858,10 @@ class TestAgentCardMoveRulesAndCancel:
         task_puts = []
         _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
 
-        page.locator('[data-card-id="t13"]').click()
+        # Click the title, not the card body — this card's tag chips
+        # (agent/agent-notes/notes) are clickable, and a bare card click can
+        # land on one instead of opening the drawer.
+        page.locator('[data-card-id="t13"] .board-card-title').click()
         tags = page.locator(".drawer-tags")
         expect(tags).to_be_enabled()
         expect(tags).to_have_value("agent agent-notes notes")
@@ -6045,7 +6276,10 @@ class TestDeleteCard:
         task_deletes = []
         _open_board(page, agents_base_url, board_state=board_state, task_deletes=task_deletes)
 
-        page.locator('[data-card-id="t22"]').click()
+        # Click the title, not the card body — this card's only tag chip
+        # (`agent-completed`) is clickable, and a bare card click can land
+        # on it instead of opening the drawer.
+        page.locator('[data-card-id="t22"] .board-card-title').click()
         page.get_by_role("button", name="Delete", exact=True).click()
         expect(page.locator("#delete-title")).to_be_visible()
         expect(page.locator(".modal .target")).to_contain_text("Awaiting review")

@@ -181,7 +181,8 @@ class FakeApi:
 
 def _make_worker(tmp_path: Path, api: FakeApi, *, preflight_caller, local_executor,
                   claude_code_executor=None, codex_executor=None, cli_pool=None,
-                  remote_executor=None, execution_facts_provider=None):
+                  remote_executor=None, execution_facts_provider=None,
+                  daily_cap_dollars=100.0):
     transport = httpx.MockTransport(api.handler)
     client = httpx.Client(transport=transport, base_url="http://api")
     sent: list[str] = []
@@ -198,7 +199,9 @@ def _make_worker(tmp_path: Path, api: FakeApi, *, preflight_caller, local_execut
         api_base="http://api",
         session_store=SessionStore(db_path=tmp_path / "sessions.db"),
         transcript_store=TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
-        spend_tracker=SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=100.0),
+        spend_tracker=SpendTracker(
+            db_path=tmp_path / "sessions.db", daily_cap_dollars=daily_cap_dollars,
+        ),
         poll_seconds=0.01,
         telegram_send=lambda text, chat_id=None: sent.append(text) or True,
         telegram_send_with_id=_fake_send_with_id,
@@ -794,20 +797,296 @@ def test_no_default_route_nonfatal_sanity_still_parks(tmp_path: Path, monkeypatc
 
 
 @pytest.mark.unit
-def test_executor_budget_exceeded_sets_budget_exceeded_tag(tmp_path: Path):
+def test_budget_breach_yields_and_asks_then_stop_sets_budget_exceeded_tag(tmp_path: Path):
+    """A budget breach parks the session instead of ending it outright —
+    the executor yields (`STATUS_YIELDED` with
+    `termination_evidence["budget_breach"]`) and the worker turns that into
+    a `budget` pending question, moving the card to Human queue
+    (`BLOCKED_TAG`) rather than `#agent-budget-exceeded`. Replying `stop`
+    is what produces the terminal `budget_exceeded` outcome — this test
+    proves that path stays reachable."""
     api = FakeApi(tasks=[
         {"id": "t1", "description": "long task", "status": "todo", "tags": ["local"]},
     ])
-    executor = _StubExecutor(outcome=ExecutorOutcome(
-        status=STATUS_BUDGET_EXCEEDED, reason="budget exceeded (max_tokens)",
+
+    class _YieldingStubExecutor(_StubExecutor):
+        """Also writes STATUS_YIELDED to the row, the way the real
+        LocalExecutor's `_finalize_budget_yielded` does before returning —
+        a bare stub only returns the outcome, it never touches the store."""
+
+        def execute(self, session, task):
+            self.calls.append((session.task_id, task.get("description")))
+            self._session_store.update_status(
+                session.task_id, STATUS_YIELDED,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
+            return self.outcome
+
+    executor = _YieldingStubExecutor(outcome=ExecutorOutcome(
+        status=STATUS_YIELDED, reason="budget breach (max_tokens)",
+        termination_evidence={"budget_breach": "max_tokens"},
     ))
     w = _make_worker(tmp_path, api,
                      preflight_caller=_golden_preflight(routing="local"),
                      local_executor=executor)
+    executor._session_store = w.session_store
     w.tick()
-    assert BUDGET_EXCEEDED_TAG in api.tasks["t1"]["tags"]
+
+    # Yielded and asking — not yet the terminal tag.
+    assert BLOCKED_TAG in api.tasks["t1"]["tags"]
+    assert BUDGET_EXCEEDED_TAG not in api.tasks["t1"]["tags"]
+    session = w.session_store.get("t1")
+    assert session.status == STATUS_YIELDED
     sent = w._sent_telegram  # type: ignore[attr-defined]
-    assert any("hit its budget" in s for s in sent)
+    assert any("hit its budget" in s and "(max_tokens)" in s for s in sent)
+    questions = w.session_store.list_open_questions()
+    assert len(questions) == 1
+    assert questions[0]["kind"] == "budget"
+
+    # Operator replies `stop` — finalizes with the terminal budget_exceeded
+    # outcome. Deposited by the Telegram message id `ask_user_via_telegram`
+    # sent it under, matching the real Telegram reply-thread path (unlike
+    # `deposit_answer_by_session_id`, which would instead match this
+    # session's earlier `status_anchor` routing row).
+    question_msg_id = w._sent_with_ids[-1][0]  # type: ignore[attr-defined]
+    w.session_store.deposit_answer(question_msg_id, "stop")
+    w._process_clarification_answers()
+    assert BUDGET_EXCEEDED_TAG in api.tasks["t1"]["tags"]
+    assert w.session_store.get("t1").status == STATUS_BUDGET_EXCEEDED
+    assert any("hit its budget" in s and "(max_tokens)" in s for s in w._sent_telegram)
+
+
+@pytest.mark.unit
+def test_budget_question_leads_with_dollars_and_minutes(tmp_path: Path):
+    """The question headlines dollars (2dp) and active minutes spent —
+    never a raw token count — so the operator sees real cost, not the (now
+    opt-in) token cap."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "long task", "status": "todo", "tags": ["local"]},
+    ])
+
+    class _SpendingStubExecutor(_StubExecutor):
+        def execute(self, session, task):
+            self.calls.append((session.task_id, task.get("description")))
+            store = getattr(self, "_session_store", None)
+            if store is not None:
+                store.add_session_hour_overhead(session.task_id, 5.123)
+                store.record_active_seconds(session.task_id, 38 * 60 + 20)
+            return self.outcome
+
+    executor = _SpendingStubExecutor(outcome=ExecutorOutcome(
+        status=STATUS_YIELDED, reason="budget breach (max_dollars)",
+        termination_evidence={"budget_breach": "max_dollars"},
+    ))
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=executor)
+    executor._session_store = w.session_store
+    w.tick()
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    notice = next(s for s in sent if "hit its budget" in s)
+    assert "(max_dollars)" in notice
+    assert "$5.12" in notice
+    assert "38 min" in notice
+    assert "500000" not in notice
+    assert "tokens" not in notice
+
+
+@dataclass
+class _SequencedStubExecutor:
+    """Returns one scripted `ExecutorOutcome` per call, in order — for
+    testing a resume that calls `execute()` a second time. Writes
+    STATUS_YIELDED to the row and (for a budget breach) the same
+    `budget_yielded` transcript event before returning a yielded outcome —
+    a bare stub only returns the outcome, it never touches the store or
+    transcript the way the real executor's `_finalize_budget_yielded`
+    does, and `_resume_budget` reads that event to know which dimension
+    breached."""
+
+    outcomes: list
+    session_store: object = None
+    transcript_store: object = None
+    calls: list = None
+
+    def __post_init__(self):
+        self.calls = []
+
+    def execute(self, session, task):
+        self.calls.append((session.task_id, task.get("description")))
+        outcome = self.outcomes[len(self.calls) - 1]
+        if outcome.status == STATUS_YIELDED and self.session_store is not None:
+            self.session_store.update_status(
+                session.task_id, STATUS_YIELDED,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
+            breach = (outcome.termination_evidence or {}).get("budget_breach")
+            if breach and self.transcript_store is not None:
+                self.transcript_store.append(
+                    session.session_id, "budget_yielded", {"kind": breach},
+                )
+        return outcome
+
+
+def _breach_and_ask(tmp_path: Path, dimension: str):
+    """Common setup for the reply tests below: a `#local` task whose first
+    tick yields on `dimension` and gets a `budget` question sent. Returns
+    `(worker, api, question_msg_id)`."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "long task", "status": "todo", "tags": ["local"]},
+    ])
+    executor = _SequencedStubExecutor(outcomes=[
+        ExecutorOutcome(
+            status=STATUS_YIELDED, reason=f"budget breach ({dimension})",
+            termination_evidence={"budget_breach": dimension},
+        ),
+    ])
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=executor)
+    executor.session_store = w.session_store
+    executor.transcript_store = w.transcript_store
+    w.tick()
+    assert BLOCKED_TAG in api.tasks["t1"]["tags"]
+    assert w.session_store.get("t1").status == STATUS_YIELDED
+    question_msg_id = w._sent_with_ids[-1][0]  # type: ignore[attr-defined]
+    return w, api, executor, question_msg_id
+
+
+@pytest.mark.unit
+def test_budget_reply_yes_doubles_the_cap_and_resumes(tmp_path: Path):
+    w, api, executor, question_msg_id = _breach_and_ask(tmp_path, "max_dollars")
+    executor.outcomes.append(ExecutorOutcome(status=STATUS_COMPLETED, final_text="done"))
+
+    w.session_store.deposit_answer(question_msg_id, "yes")
+    w._process_clarification_answers()
+
+    assert w.session_store.get("t1").budget["max_dollars"] == pytest.approx(10.0)
+    assert len(executor.calls) == 2  # resumed — a second execute() call happened
+    assert COMPLETED_TAG in api.tasks["t1"]["tags"]
+    assert BLOCKED_TAG not in api.tasks["t1"]["tags"]
+
+
+@pytest.mark.unit
+def test_budget_reply_yes_dollar_amount_sets_the_cap(tmp_path: Path):
+    w, api, executor, question_msg_id = _breach_and_ask(tmp_path, "max_dollars")
+    executor.outcomes.append(ExecutorOutcome(status=STATUS_COMPLETED, final_text="done"))
+
+    w.session_store.deposit_answer(question_msg_id, "yes $12")
+    w._process_clarification_answers()
+
+    assert w.session_store.get("t1").budget["max_dollars"] == pytest.approx(12.0)
+    assert len(executor.calls) == 2
+
+
+@pytest.mark.unit
+def test_budget_reply_yes_minutes_sets_the_wall_clock_cap(tmp_path: Path):
+    w, api, executor, question_msg_id = _breach_and_ask(tmp_path, "wall_seconds")
+    executor.outcomes.append(ExecutorOutcome(status=STATUS_COMPLETED, final_text="done"))
+
+    w.session_store.deposit_answer(question_msg_id, "yes 90 min")
+    w._process_clarification_answers()
+
+    assert w.session_store.get("t1").budget["wall_seconds"] == 90 * 60
+    assert len(executor.calls) == 2
+
+
+@pytest.mark.unit
+def test_budget_reply_unparseable_gets_usage_note_and_stays_parked(tmp_path: Path):
+    w, api, executor, question_msg_id = _breach_and_ask(tmp_path, "max_dollars")
+
+    w.session_store.deposit_answer(question_msg_id, "maybe later")
+    w._process_clarification_answers()
+
+    # Never resumed — the session is still parked.
+    assert len(executor.calls) == 1
+    assert w.session_store.get("t1").status == STATUS_YIELDED
+    assert BLOCKED_TAG in api.tasks["t1"]["tags"]
+    # A fresh usage-note question was sent (and the old one retired).
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    assert any("couldn't parse" in s.lower() for s in sent)
+    questions = w.session_store.list_open_questions()
+    assert len(questions) == 1
+    assert questions[0]["kind"] == "budget"
+
+
+@pytest.mark.unit
+def test_budget_no_reply_leaves_session_parked_and_resume_pending_skips_it(tmp_path: Path):
+    """An unanswered `budget` question leaves the session `yielded`
+    indefinitely — `resume_pending` (the startup-recovery sweep) must not
+    re-dispatch it, the same way it already skips a sleeping session."""
+    w, api, executor, question_msg_id = _breach_and_ask(tmp_path, "max_dollars")
+
+    recovered = w.resume_pending()
+
+    assert recovered == 0
+    assert len(executor.calls) == 1  # no provider call was made
+    assert w.session_store.get("t1").status == STATUS_YIELDED
+    assert BLOCKED_TAG in api.tasks["t1"]["tags"]
+
+
+@pytest.mark.unit
+def test_budget_ask_again_after_extension_still_over_new_cap(tmp_path: Path):
+    """A resumed session that immediately breaches its new (extended) cap
+    asks again rather than terminating."""
+    w, api, executor, question_msg_id = _breach_and_ask(tmp_path, "max_dollars")
+    executor.outcomes.append(ExecutorOutcome(
+        status=STATUS_YIELDED, reason="budget breach (max_dollars)",
+        termination_evidence={"budget_breach": "max_dollars"},
+    ))
+
+    w.session_store.deposit_answer(question_msg_id, "yes")
+    w._process_clarification_answers()
+
+    assert len(executor.calls) == 2
+    assert w.session_store.get("t1").status == STATUS_YIELDED
+    assert BLOCKED_TAG in api.tasks["t1"]["tags"]
+    questions = w.session_store.list_open_questions()
+    assert len(questions) == 1
+    assert questions[0]["kind"] == "budget"
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    assert sum("hit its budget" in s for s in sent) == 2
+
+
+@pytest.mark.unit
+def test_budget_reply_yes_lineage_extends_the_root_cap(tmp_path: Path):
+    """A `lineage_max_dollars` breach's `yes` doubles the lineage ROOT's own
+    `max_dollars` — the field the executor's lineage check actually reads —
+    not the breaching (descendant) session's own budget, which carries no
+    such key."""
+    api = FakeApi(tasks=[
+        {"id": "child", "description": "child task", "status": "in_progress",
+         "tags": ["local", RUNNING_TAG]},
+    ])
+    executor = _SequencedStubExecutor(outcomes=[
+        ExecutorOutcome(status=STATUS_COMPLETED, final_text="done"),
+    ])
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=executor)
+    executor.session_store = w.session_store
+    w.session_store.create(
+        task_id="root_task", session_id="sess_root", routing="claude",
+        budget={"max_dollars": 2.0}, expected_output="text",
+    )
+    child = w.session_store.create(
+        task_id="child", session_id="sess_child", routing="local",
+        parent_session_id="sess_root", root_session_id="sess_root",
+        budget={"wall_seconds": 3600, "max_tokens": None, "max_dollars": None},
+        expected_output="text", status=STATUS_YIELDED,
+    )
+    w.transcript_store.append(child.session_id, "budget_yielded", {"kind": "lineage_max_dollars"})
+    # `_ask_budget_question` does the tag swap (RUNNING -> BLOCKED) and
+    # sends the question — same path a real breach takes, so the resume's
+    # `_revalidate_task_resume(session, ..., {BLOCKED_TAG})` check passes.
+    w._ask_budget_question(
+        child, {"id": "child", "description": "child task"}, "lineage_max_dollars",
+    )
+    msg_id = w._sent_with_ids[-1][0]  # type: ignore[attr-defined]
+    w.session_store.deposit_answer(msg_id, "yes")
+    w._process_clarification_answers()
+
+    assert w.session_store.get("root_task").budget["max_dollars"] == pytest.approx(4.0)
+    assert len(executor.calls) == 1
 
 
 @pytest.mark.unit
@@ -2526,6 +2805,128 @@ def test_worker_pauses_at_daily_cap(tmp_path: Path):
     )
     assert w.tick() == 0
     assert executor.calls == []
+
+
+@pytest.mark.unit
+def test_daily_cap_crossed_sends_one_replyable_notice(tmp_path: Path):
+    """Crossing the configured daily cap sends exactly one Telegram notice
+    naming today's spend and the cap, telling the operator to reply
+    `raise to $N`. A second tick at the same (still-crossed) cap does not
+    re-notify."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "x", "status": "todo", "tags": ["local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=""))
+    w = _make_worker(tmp_path, api,
+                      preflight_caller=_golden_preflight(routing="local"),
+                      local_executor=executor, daily_cap_dollars=5.0)
+    w.spend_tracker.record(6.0)
+
+    assert w.tick() == 0
+    assert executor.calls == []
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    notices = [s for s in sent if "Daily agent spend cap" in s]
+    assert len(notices) == 1
+    assert "$6.00" in notices[0]
+    assert "$5.00" in notices[0]
+    assert "raise to $150" in notices[0]
+
+    # A second tick at the same cap doesn't send another notice.
+    assert w.tick() == 0
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    assert len([s for s in sent if "Daily agent spend cap" in s]) == 1
+
+
+@pytest.mark.unit
+def test_daily_cap_raise_to_dollar_reply_resumes_claiming(tmp_path: Path):
+    """`raise to $150` sets today's effective cap; claiming resumes on the
+    next poll — the cap-crossing reply is drained before the spend-cap
+    gate, so it doesn't need a second tick to take effect."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "x", "status": "todo", "tags": ["local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=""))
+    w = _make_worker(tmp_path, api,
+                      preflight_caller=_golden_preflight(routing="local"),
+                      local_executor=executor, daily_cap_dollars=5.0)
+    w.spend_tracker.record(6.0)
+    assert w.tick() == 0  # sends the notice, claims nothing
+
+    question_msg_id = w._sent_with_ids[-1][0]  # type: ignore[attr-defined]
+    w.session_store.deposit_answer(question_msg_id, "raise to $150")
+
+    assert w.tick() == 1
+    assert len(executor.calls) == 1
+    assert w.spend_tracker.effective_cap_dollars() == pytest.approx(150.0)
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    assert any("raised to $150.00" in s for s in sent)
+
+
+@pytest.mark.unit
+def test_daily_cap_raise_to_bare_number_reply_also_works(tmp_path: Path):
+    """`raise to 150` (no `$`) parses the same as `raise to $150`."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "x", "status": "todo", "tags": ["local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=""))
+    w = _make_worker(tmp_path, api,
+                      preflight_caller=_golden_preflight(routing="local"),
+                      local_executor=executor, daily_cap_dollars=5.0)
+    w.spend_tracker.record(6.0)
+    w.tick()
+    question_msg_id = w._sent_with_ids[-1][0]  # type: ignore[attr-defined]
+    w.session_store.deposit_answer(question_msg_id, "raise to 150")
+
+    assert w.tick() == 1
+    assert w.spend_tracker.effective_cap_dollars() == pytest.approx(150.0)
+
+
+@pytest.mark.unit
+def test_daily_cap_unparseable_reply_gets_usage_note_and_cap_unchanged(tmp_path: Path):
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "x", "status": "todo", "tags": ["local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=""))
+    w = _make_worker(tmp_path, api,
+                      preflight_caller=_golden_preflight(routing="local"),
+                      local_executor=executor, daily_cap_dollars=5.0)
+    w.spend_tracker.record(6.0)
+    w.tick()
+    question_msg_id = w._sent_with_ids[-1][0]  # type: ignore[attr-defined]
+    w.session_store.deposit_answer(question_msg_id, "maybe later")
+
+    assert w.tick() == 0
+    assert executor.calls == []
+    assert w.spend_tracker.effective_cap_dollars() == pytest.approx(5.0)
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    assert any("couldn't parse" in s.lower() for s in sent)
+
+
+@pytest.mark.unit
+def test_daily_cap_raised_cap_crossed_again_sends_one_more_notice(tmp_path: Path):
+    """Once-per-day is per cap *value* — raising the cap and crossing the
+    new one is a fresh crossing worth exactly one more notice."""
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "x", "status": "todo", "tags": ["local"]},
+    ])
+    executor = _StubExecutor(outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=""))
+    w = _make_worker(tmp_path, api,
+                      preflight_caller=_golden_preflight(routing="local"),
+                      local_executor=executor, daily_cap_dollars=5.0)
+    w.spend_tracker.record(6.0)
+    w.tick()  # first notice, cap=$5
+    question_msg_id = w._sent_with_ids[-1][0]  # type: ignore[attr-defined]
+    w.session_store.deposit_answer(question_msg_id, "raise to $20")
+    assert w.tick() == 1  # resumes and claims the one task
+
+    # Push spend past the newly-raised $20 cap.
+    w.spend_tracker.record(15.0)
+    assert w.tick() == 0
+
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    notices = [s for s in sent if "Daily agent spend cap" in s]
+    assert len(notices) == 2
+    assert "$20.00" in notices[1]
 
 
 # ---------------------------------------------------------------------------
