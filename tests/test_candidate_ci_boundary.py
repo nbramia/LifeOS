@@ -87,6 +87,19 @@ def test_partitioned_execution_derives_its_part_count_from_the_matrix():
     # Each part uploads its own lane log; a shared name collides.
     assert "lane-logs-${{ env.CANDIDATE_SHA }}-part${{ matrix.part }}" in workflow
 
+    # Receipts (outcomes and durations, never test output) are retained from
+    # every part whatever its result; the full lane log only from a failure.
+    receipts = workflow[workflow.index("name: Retain the lane-execution receipts"):]
+    receipts = receipts[:receipts.index("publish-aggregate:")]
+    assert "if: ${{ always() }}" in receipts
+    assert "lane-receipts-${{ env.CANDIDATE_SHA }}-part${{ matrix.part }}" in receipts
+    assert "lifeos-lane-logs/*.json" in receipts
+    assert "retention-days: 30" in receipts
+    lane_logs = workflow[workflow.index("name: Retain the lane log from a failed verification"):]
+    lane_logs = lane_logs[:lane_logs.index("name: Retain the lane-execution receipts")]
+    assert "if: ${{ failure() }}" in lane_logs
+    assert "download-artifact" not in workflow
+
 
 @pytest.mark.unit
 def test_candidate_workflow_pins_actions_and_proves_cpu_wheel_identity():
