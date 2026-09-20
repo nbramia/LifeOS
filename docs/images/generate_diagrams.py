@@ -913,13 +913,14 @@ def services():
 
 # ============================ 5. AGENT LIFECYCLE (board card -> worktree -> PR) ============================
 def agent_lifecycle():
-    W, H = 1300, 1160
-    mx = 400  # main-path column
-    bxc = 950  # branch (question-pause) column
-    s = [svg_open(W, H), defs(), panel(W, H, glow=(670, 560, 480))]
-    s.append(f'<ellipse cx="{mx}" cy="560" rx="330" ry="560" fill="url(#zone-auto)"/>')
-    s.append(f'<ellipse cx="{bxc}" cy="660" rx="260" ry="330" fill="url(#zone-brain)"/>')
-    s.append('<ellipse cx="670" cy="1000" rx="420" ry="150" fill="url(#zone-core)"/>')
+    W, H = 1000, 860
+    mx = 275  # main-path column
+    bxc = 715  # branch (question-pause) column
+    cx_clean = (mx + bxc) / 2
+    s = [svg_open(W, H), defs(), panel(W, H, glow=(cx_clean, 420, 440))]
+    s.append(f'<ellipse cx="{mx}" cy="420" rx="230" ry="410" fill="url(#zone-auto)"/>')
+    s.append(f'<ellipse cx="{bxc}" cy="480" rx="200" ry="260" fill="url(#zone-brain)"/>')
+    s.append(f'<ellipse cx="{cx_clean}" cy="740" rx="360" ry="110" fill="url(#zone-core)"/>')
     s.append(
         "<defs>"
         + marker("lB", ZONES["brain"])
@@ -930,22 +931,23 @@ def agent_lifecycle():
         + "</defs>"
     )
 
-    # ---- main path (left column, top to bottom) ----
-    card_g, card = node(mx, 80, "Board: card assigned", "surf", sub="#claude / #codex tag → Assigned lane")
-    claim_g, claim = node(mx, 208, "Worker claims task", "brain", sub="preflight routes to claude_code / codex")
-    wt_g, wt = node(mx, 336, "ensure_worktree()", "core", sub="branch off origin/<default> · local or ssh host")
-    run_g, run = node(mx, 464, "CLI session runs", "auto", sub="Claude Code or Codex · commits as it works")
-    fin_g, fin = node(mx, 616, "finalize_worktree_session()", "web", sub="open_pr=True — safety-net commit · push · gh pr create")
-    review_g, review = node(mx, 744, "Review lane", "surf", sub="outcome summary + PR badge (open / merged / closed)")
+    # ---- main path (left column, top to bottom) — plain-language labels;
+    # precise mechanics (function names, flags) live only in AGENTS.md / code.
+    card_g, card = node(mx, 56, "Board: card assigned", "surf", sub="#claude or #codex tag → Assigned lane")
+    claim_g, claim = node(mx, 142, "Worker claims the task", "brain", sub="decides Claude Code or Codex → In progress")
+    wt_g, wt = node(mx, 228, "Isolated worktree + branch", "core", sub="off origin/<default> · local or remote host")
+    run_g, run = node(mx, 322, "CLI session runs", "auto", sub="Claude Code or Codex · commits as it works")
+    fin_g, fin = node(mx, 436, "Work pushed, PR opened", "web", sub="commit · push · PR opened (or reused)")
+    review_g, review = node(mx, 522, "Review lane", "surf", sub="outcome summary + PR badge")
 
     # ---- question-pause branch (right column) ----
-    block_g, block = node(bxc, 464, "Session pauses", "brain", sub="CLARIFY, plan, or goal approval needed")
-    finb_g, finb = node(bxc, 616, "finalize_worktree_session()", "web", sub="open_pr=False — commit + push, no PR yet")
-    human_g, human = node(bxc, 744, "Human queue lane", "surf", sub="operator replies on Telegram to the anchored message")
-    resume_g, resume = node(bxc, 872, "Resume — same worktree", "auto", sub="_resume_as_followup → Executor.resume(session id)")
+    block_g, block = node(bxc, 322, "Session pauses", "brain", sub="needs a question, plan, or goal approved")
+    finb_g, finb = node(bxc, 436, "Work pushed — no PR yet", "web", sub="commit · push only")
+    human_g, human = node(bxc, 522, "Human queue lane", "surf", sub="operator replies on Telegram")
+    resume_g, resume = node(bxc, 616, "Session resumes", "auto", sub="same worktree, same session")
 
     # ---- shared cleanup ----
-    clean_g, clean = node(670, 1030, "Cleanup: remove_worker_worktree()", "core", sub="once the PR merges, or the card is accepted / cancelled — pushes again, then git worktree remove")
+    clean_g, clean = node(cx_clean, 706, "Worktree removed", "core", sub="PR merges, or card accepted / cancelled — branch kept")
 
     E = []
     for a, b, z1, z2 in [
@@ -954,53 +956,56 @@ def agent_lifecycle():
         (wt, run, "core", "auto"),
         (fin, review, "web", "surf"),
     ]:
-        E.append(flow(bot(a), top(b), ZONES[z1], ZONES[z2], w=2.1, op=0.65, arrow={"brain": "lB", "core": "lC", "auto": "lA", "web": "lW", "surf": "lS"}[z2]))
+        E.append(flow(bot(a), top(b), ZONES[z1], ZONES[z2], w=2.0, op=0.65, arrow={"brain": "lB", "core": "lC", "auto": "lA", "web": "lW", "surf": "lS"}[z2]))
 
-    # CLI session completes -> finalize(open_pr=True)
-    E.append(flow(bot(run), top(fin), ZONES["auto"], ZONES["web"], w=2.1, op=0.65, arrow="lW"))
+    # CLI session completes -> work pushed, PR opened
+    E.append(flow(bot(run), top(fin), ZONES["auto"], ZONES["web"], w=2.0, op=0.65, arrow="lW"))
     # CLI session asks a question -> pauses (branch out)
-    E.append(flow(right(run), left(block), ZONES["auto"], ZONES["brain"], t=0.5, w=2.0, op=0.6, arrow="lB"))
-    s.append(note((mx + bxc) / 2, (top(block)[1] + top(run)[1]) / 2 - 10, "asks a question", MUT, anchor="middle", size=11))
+    E.append(flow(right(run), left(block), ZONES["auto"], ZONES["brain"], t=0.5, w=1.9, op=0.6, arrow="lB"))
+    s.append(note((mx + bxc) / 2, (top(block)[1] + top(run)[1]) / 2 - 8, "asks a question", MUT, anchor="middle", size=10.5))
 
     # pause branch, top to bottom
-    E.append(flow(bot(block), top(finb), ZONES["brain"], ZONES["web"], w=2.0, op=0.6, arrow="lW"))
-    E.append(flow(bot(finb), top(human), ZONES["web"], ZONES["surf"], w=2.0, op=0.6, arrow="lS"))
-    E.append(flow(bot(human), top(resume), ZONES["surf"], ZONES["auto"], w=2.0, op=0.6, arrow="lA"))
+    E.append(flow(bot(block), top(finb), ZONES["brain"], ZONES["web"], w=1.9, op=0.6, arrow="lW"))
+    E.append(flow(bot(finb), top(human), ZONES["web"], ZONES["surf"], w=1.9, op=0.6, arrow="lS"))
+    E.append(flow(bot(human), top(resume), ZONES["surf"], ZONES["auto"], w=1.9, op=0.6, arrow="lA"))
 
     # resume loops back into the SAME CLI session (same worktree — never re-provisioned)
     E.append(
         flow(
-            left(resume), (mx + 120, 530), ZONES["auto"], ZONES["auto"],
-            kind="arc", bow=0.3, w=2.0, op=0.55, arrow="lA",
+            left(resume), (mx + 78, 372), ZONES["auto"], ZONES["auto"],
+            kind="arc", bow=0.32, w=1.9, op=0.55, arrow="lA",
         )
     )
-    s.append(note(660, 686, "session resumes,", MUT, size=10.5))
-    s.append(note(660, 702, "same worktree", MUT, size=10.5))
+    s.append(note(500, 468, "resumes the", MUT, size=10))
+    s.append(note(500, 481, "same session", MUT, size=10))
 
     # convergence into cleanup
     E.append(
-        flow(bot(review), top(clean), ZONES["surf"], ZONES["core"], kind="arc", bow=0.12, w=2.1, op=0.65, arrow="lC")
+        flow(bot(review), top(clean), ZONES["surf"], ZONES["core"], kind="arc", bow=0.14, w=2.0, op=0.65, arrow="lC")
     )
-    s.append(note(mx - 10, 900, "merge / accept", MUT, size=11))
-    E.append(
-        flow(
-            bot(human), top(clean), ZONES["surf"], ZONES["core"],
-            kind="arc", bow=-0.14, w=1.7, op=0.45, arrow="lC",
-        )
+    s.append(note(mx + 6, 630, "PR merges / card accepted", MUT, size=10.5))
+    # Bows LEFT (away from the "Session resumes" node directly below Human
+    # queue) so the arc clears it instead of cutting through it.
+    cancel_edge = flow(
+        bot(human), top(clean), ZONES["surf"], ZONES["core"],
+        kind="arc", bow=0.32, w=1.7, op=0.5, arrow="lC",
     )
-    s.append(note(bxc + 20, 940, "cancel", MUT, size=11))
+    E.append(cancel_edge)
+    # "cancel" sits directly on its own edge, in the clear space the wider
+    # bow opens up to the left of the "Session resumes" node.
+    s.append(note(560, 600, "cancel", MUT, anchor="middle", size=10.5))
 
     s.extend(E)
     for g in (card_g, claim_g, wt_g, run_g, fin_g, review_g, block_g, finb_g, human_g, resume_g, clean_g):
         s.append(g)
 
-    s.append(zlabel(mx, 32, "Main path", ZONES["auto"], anchor="middle"))
-    s.append(zlabel(bxc, 32, "Question-pause branch", ZONES["brain"], anchor="middle"))
+    s.append(zlabel(mx, 22, "Main path", ZONES["auto"], anchor="middle"))
+    s.append(zlabel(bxc, 22, "Question-pause branch", ZONES["brain"], anchor="middle"))
     s.append(
         note(
-            670, 1128,
+            cx_clean, 800,
             "the worktree persists across a pause and resume — only cleanup ever removes it (the branch itself is kept)",
-            MUT, anchor="middle", size=11.5,
+            MUT, anchor="middle", size=10.5,
         )
     )
     s.append("</svg>")
