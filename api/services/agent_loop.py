@@ -27,6 +27,7 @@ from api.services.perf_trace import trace_span
 from api.services.llm_client import get_local_llm, openai_tool_calls_to_anthropic, LLMUsage, LocalLLMClient
 from api.services.agent_worker.pricing import cost_for, is_known_model
 from api.services.resilience import is_retryable_api_error
+from api.services.jev_orchestrator_shadow import start_inloop_task, finish_inloop_span
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -692,6 +693,16 @@ async def run_agent_loop(
     # Narrowed for the journal persona — see tools_for_persona.
     tools = tools_for_persona(persona_id)
 
+    # Per-round call breakdown (tool, input, result_preview) for the
+    # LIFEOS_JEV_ORCHESTRATOR=shadow in-loop judgment below. Kept local to
+    # this call rather than on `result` -- it exists only to build that
+    # judgment's state and is never part of the AgentResult contract.
+    calls_by_round: dict[int, list[dict]] = {}
+    # (task, start_monotonic, round_num) for every in-loop shadow call
+    # fired this turn -- awaited together, capped, just before the final
+    # "result" event below.
+    pending_inloop: list[tuple] = []
+
     for round_num in range(1, max_tool_rounds + 1):
         print(f"[agent] Round {round_num}/{max_tool_rounds} starting")
 
@@ -816,16 +827,22 @@ async def run_agent_loop(
         async def _exec_one(block):
             name = block.name
             logger.info(f"Executing tool: {name} with input: {block.input}")
-            with trace_span(f"tool_{name}"):
+            with trace_span(f"tool_{name}") as span_meta:
                 tool_result_str = await execute_tool_parallel(
                     name, block.input, persona_id=persona_id, user_message=user_message,
                 )
+                span_meta["result_preview"] = tool_result_str[:300]
             is_error = tool_result_str.startswith("Error:")
             result.tool_calls_log.append({
                 "tool": name,
                 "input": block.input,
                 "result_preview": tool_result_str[:200],
                 "is_error": is_error,
+            })
+            calls_by_round.setdefault(round_num, []).append({
+                "tool": name,
+                "input": block.input,
+                "result_preview": tool_result_str[:300],
             })
             return {
                 "type": "tool_result",
@@ -845,6 +862,17 @@ async def run_agent_loop(
 
         tool_results = await asyncio.gather(*[_exec_one(b) for b in tool_use_blocks])
         print(f"[agent] Round {round_num} tools executed: {[b.name for b in tool_use_blocks]}")
+
+        # LIFEOS_JEV_ORCHESTRATOR=shadow in-loop judgment: fired once this
+        # round's tool results are gathered, starting with the second round
+        # onward (the first round has nothing yet to call repeating).
+        # Fire-and-forget here -- never awaited in the loop's critical
+        # path; every pending call is awaited together, capped, just
+        # before the final "result" event.
+        if round_num >= 2:
+            _inloop_task, _inloop_start = start_inloop_task(user_message, calls_by_round, round_num)
+            if _inloop_task is not None:
+                pending_inloop.append((_inloop_task, _inloop_start, round_num))
 
         # Append tool results as a user message
         messages.append({"role": "user", "content": list(tool_results)})
@@ -918,6 +946,12 @@ async def run_agent_loop(
         result.full_text = fallback
         yield {"type": "text", "content": fallback}
         print(f"[agent] Used fallback response ({len(fallback)}ch)")
+
+    # Await every pending in-loop shadow call (each capped at 500ms from
+    # its own start) and record its span, before the turn's final event —
+    # so the spans land while chat.py's perf trace is still open.
+    for _task, _start, _round_idx in pending_inloop:
+        await finish_inloop_span(_task, _start, round_index=_round_idx)
 
     print(f"[agent] Loop complete: {len(result.tool_calls_log)} tool calls, {len(result.full_text)}ch text")
     # Yield the final result

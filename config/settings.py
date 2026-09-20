@@ -660,6 +660,22 @@ class Settings(BaseSettings):
     # `gh api user -q .login` instead, caching the result on disk.
     github_owner: str = Field(default="", alias="LIFEOS_GITHUB_OWNER")
 
+    jev_orchestrator: str = Field(
+        default="off",
+        alias="LIFEOS_JEV_ORCHESTRATOR",
+        description="Controls the chat orchestrator's Jev shadow instrumentation "
+                    "(see `api/services/jev_orchestrator_shadow.py`, issue #1158's "
+                    "E6). One of: `off` (default) — no Jev call, no `jev_preturn`/"
+                    "`jev_inloop` span; `shadow` — a pre-turn judgment runs "
+                    "concurrently with round 1 and an in-loop judgment runs after "
+                    "each round from the second on, both recorded as perf-trace "
+                    "spans, and neither changes the tool catalog, round cap, or "
+                    "model choice for the turn. Effectively `off` whenever no "
+                    "TypeSafe key is configured (`typesafe_api_key`/`jev_configured`), "
+                    "regardless of this setting. An unrecognized value logs a "
+                    "warning and is treated as `off`."
+    )
+
     # Lets the agent worker's `local` route fall back to the remote
     # OpenAI-compatible provider above when the local llama-server isn't
     # reachable. Exists for a real deployment with NO other #agent executor

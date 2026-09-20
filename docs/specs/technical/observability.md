@@ -33,6 +33,19 @@ Every chat request is automatically traced with per-stage timing. Traces are sto
 | `search_bm25` | hybrid_search.py | `tool_search_vault` |
 | `search_rrf_boost` | hybrid_search.py | `tool_search_vault` |
 | `search_rerank` | hybrid_search.py | `tool_search_vault` |
+| `jev_preturn` | chat.py | — |
+| `jev_inloop` | agent_loop.py | — |
+
+Every `tool_{name}` span also carries a `result_preview` field in its metadata: the first 300 characters of that tool's result string, unconditionally — not gated by `LIFEOS_JEV_ORCHESTRATOR` below.
+
+### Jev Orchestrator Shadow
+
+`LIFEOS_JEV_ORCHESTRATOR` (`off` default / `shadow`, effectively `off` without a TypeSafe key) gates two spans that record Jev typed-judgment answers about a turn without changing the turn itself — the tool catalog, round cap, and model choice are identical in both modes. See `api/services/jev_orchestrator_shadow.py`.
+
+- `jev_preturn` (one per turn) — started right before `run_agent_loop`, so it runs concurrent with the first round rather than serially ahead of it. Metadata: `needs_tools`, one `family_<name>` noul per tool family (comm/calendar/people_crm/vault/finance/tasks/fitness/web/home), `difficulty`, `is_followup`, `latency_ms`, `before_round1` (whether the answer arrived before the first round's LLM call finished), `bundle_id` (which of E3's k=5 tool bundles the family answers would have selected, or `null`), `bundle_changed` (whether that differs from the same conversation's previous turn), `tool_count`, `round_count`.
+- `jev_inloop` (one per round from the second on) — fired right after that round's tool results are gathered. Metadata: `is_repeating`, `answered`, `round_index`.
+
+Both calls are capped at 500ms from their own start; on failure or a timeout the span records only `{"error": "<ExceptionClassName>"}` and the turn is otherwise unaffected. Neither span, nor the call behind it, carries message text, tool arguments, or tool results.
 
 ### Key Files
 
