@@ -454,6 +454,14 @@ def test_candidate_workflow_lane_selection_is_the_trusted_runner_script():
     assert outputs["verification_mode"] == "${{ steps.reuse.outputs.mode || steps.select.outputs.mode }}"
     assert outputs["verification_tree"] == "${{ steps.select.outputs.tree }}"
     assert outputs["verification_lanes"] == "${{ steps.select.outputs.lanes }}"
+    assert outputs["reused_check_id"] == "${{ steps.reuse.outputs.reused_check_id }}"
+    assert outputs["reused_candidate"] == "${{ steps.reuse.outputs.reused_candidate }}"
+    publisher = workflow["jobs"]["publish-aggregate"]
+    script_step = next(s for s in publisher["steps"] if "github-script" in (s.get("uses") or ""))
+    assert script_step["env"]["REUSED_CHECK_ID"] == "${{ needs.execute-candidate.outputs.reused_check_id }}"
+    assert script_step["env"]["REUSED_CANDIDATE"] == "${{ needs.execute-candidate.outputs.reused_candidate }}"
+    assert "process.env.REUSED_CHECK_ID" in script_step["with"]["script"]
+    assert "process.env.REUSED_CANDIDATE" in script_step["with"]["script"]
     assert workflow["jobs"]["execute-candidate"]["permissions"] == {"contents": "read", "checks": "read"}
 
     verify = next(s for s in steps if "Verify the retained lanes" in (s.get("name") or ""))
@@ -578,3 +586,49 @@ def test_lane_selection_step_sees_the_real_diff_across_two_shallow_checkouts(tmp
 def test_lane_selection_step_keeps_the_browser_lane_only_for_a_web_change(tmp_path, head_files, lanes):
     outputs = _run_lane_selection(tmp_path, head_files)
     assert (outputs["mode"], outputs["lanes"]) == ("executed", lanes)
+
+
+def _reuse_step_run() -> str:
+    import yaml
+
+    workflow = yaml.safe_load((ROOT / ".github/workflows/candidate-verification.yml").read_text())
+    steps = workflow["jobs"]["execute-candidate"]["steps"]
+    return next(s for s in steps if "Reuse a passing shadow verification" in (s.get("name") or ""))["run"]
+
+
+@pytest.mark.unit
+def test_reuse_step_reads_the_second_parent_from_commit_headers_not_the_message(tmp_path):
+    """The candidate is a two-parent commit whose message carries
+    candidate-authored text (the PR title, closing references). The head the
+    reuse step fetches must come from the commit's header lines, so a message
+    line that happens to start with `parent <hex>` can never redirect it."""
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    _git(origin, "init", "-q", "-b", "main")
+    _git(origin, "config", "user.email", "ci@example.invalid")
+    _git(origin, "config", "user.name", "ci")
+    (origin / "a.txt").write_text("base\n")
+    _git(origin, "add", "-A")
+    _git(origin, "commit", "-q", "-m", "base")
+    base_sha = _git(origin, "rev-parse", "HEAD")
+    (origin / "a.txt").write_text("head\n")
+    _git(origin, "add", "-A")
+    _git(origin, "commit", "-q", "-m", "head")
+    head_sha = _git(origin, "rev-parse", "HEAD")
+    forged = "f" * 40
+    message = f"candidate\n\nparent {forged}\nparent {forged}\nCloses #1\n"
+    candidate_sha = subprocess.run(
+        ["git", "-C", str(origin), "commit-tree", f"{head_sha}^{{tree}}", "-p", base_sha, "-p", head_sha, "-m", message],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    work = tmp_path / "work"
+    (work / "candidate").mkdir(parents=True)
+    shutil.copytree(origin / ".git", work / "candidate" / ".git")
+    extraction = _reuse_step_run().split("\n")[0]
+    assert extraction.startswith('HEAD_SHA="$(git -C candidate cat-file commit "$CANDIDATE_SHA"')
+    result = subprocess.run(
+        ["bash", "-e", "-c", extraction + '\nprintf %s "$HEAD_SHA"'], cwd=work,
+        env={**os.environ, "CANDIDATE_SHA": candidate_sha}, capture_output=True, text=True, check=True,
+    )
+    assert result.stdout == head_sha
+    assert forged not in result.stdout
