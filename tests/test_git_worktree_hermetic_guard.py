@@ -12,7 +12,9 @@ non-local remote, and that it leaves a genuine tmp-path repo alone.
 """
 from __future__ import annotations
 
+import os
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -30,24 +32,72 @@ def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True)
 
 
+def _is_under(path: str, root: str) -> bool:
+    resolved, root = os.path.realpath(path), os.path.realpath(root)
+    return resolved == root or resolved.startswith(root + os.sep)
+
+
+def _synthetic_outside_temp_path() -> str:
+    """An absolute, deliberately nonexistent path guaranteed to resolve
+    outside the current process's temp root -- unlike a path derived from
+    this file's own location, which is NOT always outside the temp root: a
+    verifier run copies the whole repository into a snapshot directory
+    under `tempfile.gettempdir()` first, so `Path(__file__)` there resolves
+    *inside* the temp root and a check keyed to it would never trip. Tried
+    in order so the pathological case where the temp root sits under
+    `$HOME` (e.g. a `TMPDIR=$HOME/tmp` override) still resolves to a real
+    non-temp candidate rather than a false negative.
+    """
+    temp_root = tempfile.gettempdir()
+    candidates = [
+        str(Path.home() / "Code" / "lifeos-guard-canary-does-not-exist"),
+        "/opt/lifeos-guard-canary-does-not-exist",
+        "/usr/local/lifeos-guard-canary-does-not-exist",
+        "/var/lifeos-guard-canary-does-not-exist",
+    ]
+    for candidate in candidates:
+        if not _is_under(candidate, temp_root):
+            return candidate
+    pytest.skip(f"every candidate canary path resolves under the process's own temp root {temp_root!r}")
+
+
 def test_guard_blocks_a_real_looking_checkout_path():
     """A cwd outside the temp root must never reach the real subprocess --
-    the repository this test file itself lives in is real-looking (a real
-    git worktree, not a throwaway path) and must be rejected."""
-    real_checkout = str(Path(__file__).resolve().parents[1])
+    a synthetic path shaped like a real checkout, deliberately outside the
+    temp root, must be rejected without ever needing to exist."""
+    synthetic_checkout = _synthetic_outside_temp_path()
 
     with pytest.raises(RuntimeError, match=_GUARD_MESSAGE):
-        git_worktree._run(["git", "status"], cwd=real_checkout)
+        git_worktree._run(["git", "status"], cwd=synthetic_checkout)
 
 
 def test_guard_blocks_an_absolute_path_argument_outside_temp():
     """Commands that carry the target path in argv instead of `cwd` (the
     ownership-marker `test -f`/`cat`/`mkdir -p` calls) are checked the same
     way."""
-    real_checkout = str(Path(__file__).resolve().parents[1])
+    synthetic_checkout = _synthetic_outside_temp_path()
 
     with pytest.raises(RuntimeError, match=_GUARD_MESSAGE):
-        git_worktree._run(["test", "-f", f"{real_checkout}/AGENTS.md"])
+        git_worktree._run(["test", "-f", f"{synthetic_checkout}/AGENTS.md"])
+
+
+def test_guard_blocks_the_real_checkout_when_temp_root_is_redirected(tmp_path: Path, monkeypatch):
+    """Environment-independent proof that the guard's rejection logic
+    itself works, regardless of whether this suite happens to be running
+    from the normal checkout or a verifier's temp-snapshot copy: redirect
+    the guard's own notion of the temp root to a freshly-created directory
+    unrelated to either, then confirm the real repository checkout this
+    test file lives in -- necessarily outside that redirected root -- is
+    rejected."""
+    fake_temp_root = tmp_path / "fake-temp-root"
+    fake_temp_root.mkdir()
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(fake_temp_root))
+
+    real_checkout = str(Path(__file__).resolve().parents[1])
+    assert not _is_under(real_checkout, str(fake_temp_root))
+
+    with pytest.raises(RuntimeError, match=_GUARD_MESSAGE):
+        git_worktree._run(["git", "status"], cwd=real_checkout)
 
 
 def test_guard_allows_a_tmp_path_repo(tmp_path: Path):
