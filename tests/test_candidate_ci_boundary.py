@@ -142,6 +142,19 @@ def test_partitioned_execution_derives_its_part_count_from_the_matrix():
     assert "if: ${{ failure() }}" in lane_logs
     assert "download-artifact" not in workflow
 
+    # The shadow test-impact report is recorded after the lanes ran, from the
+    # runner's own script, into a directory the receipts artifact carries but
+    # the duration record never globs; the verifier's arguments are untouched.
+    verify_at = workflow.index("name: Verify the retained lanes")
+    impact_at = workflow.index("name: Record the shadow test-impact selection")
+    assert verify_at < impact_at < workflow.index("name: Retain the lane log from a failed verification")
+    impact = workflow[impact_at:workflow.index("\n      - ", impact_at)]
+    assert "if: ${{ always() && steps.select.outputs.mode == 'executed' && steps.reuse.outputs.mode != 'reused' }}" in impact
+    assert "python3 trusted-runner/scripts/test_impact.py" in impact
+    assert '--output "$RUNNER_TEMP/lifeos-impact/impact_selection.json"' in impact
+    assert "lifeos-impact/impact_selection.json" in receipts
+    assert "test_impact" not in workflow[verify_at:impact_at]
+
 
 @pytest.mark.unit
 def test_candidate_workflow_pins_actions_and_proves_cpu_wheel_identity():
