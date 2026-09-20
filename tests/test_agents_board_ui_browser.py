@@ -1675,7 +1675,10 @@ class TestDrawerTagsEdit:
         })
         task_puts = []
         _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
-        page.locator('[data-card-id="t-review"]').click()
+        # Clicks the title, not the card body — this card's only tag chip
+        # (`agent-completed`) is clickable, and a bare click on the card can
+        # land on it instead of opening the drawer.
+        page.locator('[data-card-id="t-review"] .board-card-title').click()
         tags = page.locator(".drawer-tags")
 
         # Hold the first atomic request in a browser-side fetch wrapper so the
@@ -2361,7 +2364,10 @@ class TestFilters:
             "updated_at": "2026-01-01T00:00:00+00:00", "session": None, "pending_question": None,
         }]
         _open_board(page, agents_base_url, board_state=board_state)
-        page.locator('[data-card-id="tr"]').click()
+        # Click the title, not the card body — this card's only tag chip
+        # (`agent-completed`) is clickable, and a bare card click can land
+        # on it instead of opening the drawer.
+        page.locator('[data-card-id="tr"] .board-card-title').click()
         page.locator('[data-action="accept"]').click()
         expect(page.locator("#board-drawer-backdrop")).to_be_hidden()
         toast = page.locator(".toast").filter(has_text="Accepted.")
@@ -4235,7 +4241,10 @@ class TestSnoozeActionEligibility:
         page.locator("#board-lane-filter-btn").click()
         page.locator("#board-lane-filter-options input[value='review']").check()
         for card_id in ["t1", "t2", "t3", "t-review"]:
-            page.locator(f'[data-card-id="{card_id}"]').click()
+            # Click the title, not the card body — t-review's only tag chip
+            # (`agent-completed`) is clickable, and a bare card click can
+            # land on it instead of opening the drawer.
+            page.locator(f'[data-card-id="{card_id}"] .board-card-title').click()
             expect(page.locator('#board-drawer [data-action="snooze"]')).to_be_visible()
             expect(page.locator('#board-drawer [data-action="unsnooze"]')).to_have_count(0)
             page.locator('[data-action="drawer-close"]').click()
@@ -5624,7 +5633,10 @@ class TestAgentCardMoveRulesAndCancel:
         task_puts = []
         _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
 
-        page.locator('[data-card-id="t10"]').click()
+        # Click the title, not the card body — this card's only tag chip
+        # (`agent-completed`) is clickable, and a bare card click can land
+        # on it instead of opening the drawer.
+        page.locator('[data-card-id="t10"] .board-card-title').click()
         tags = page.locator(".drawer-tags")
         expect(tags).to_be_enabled()
         expect(tags).to_have_value("")  # agent-completed never shows as an editable token
@@ -5797,7 +5809,10 @@ class TestAgentCardMoveRulesAndCancel:
         task_puts = []
         _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
 
-        page.locator('[data-card-id="t13"]').click()
+        # Click the title, not the card body — this card's tag chips
+        # (agent/agent-notes/notes) are clickable, and a bare card click can
+        # land on one instead of opening the drawer.
+        page.locator('[data-card-id="t13"] .board-card-title').click()
         tags = page.locator(".drawer-tags")
         expect(tags).to_be_enabled()
         expect(tags).to_have_value("agent agent-notes notes")
@@ -6212,7 +6227,10 @@ class TestDeleteCard:
         task_deletes = []
         _open_board(page, agents_base_url, board_state=board_state, task_deletes=task_deletes)
 
-        page.locator('[data-card-id="t22"]').click()
+        # Click the title, not the card body — this card's only tag chip
+        # (`agent-completed`) is clickable, and a bare card click can land
+        # on it instead of opening the drawer.
+        page.locator('[data-card-id="t22"] .board-card-title').click()
         page.get_by_role("button", name="Delete", exact=True).click()
         expect(page.locator("#delete-title")).to_be_visible()
         expect(page.locator(".modal .target")).to_contain_text("Awaiting review")
