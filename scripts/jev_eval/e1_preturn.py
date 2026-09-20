@@ -38,7 +38,7 @@ import numpy as np
 from scipy.stats import spearmanr
 from sklearn.metrics import roc_auc_score
 
-REPO_ROOT = Path("/home/nathanramia/Code/LifeOS")
+REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 from api.services.chat_helpers import expand_followup_query  # noqa: E402
 

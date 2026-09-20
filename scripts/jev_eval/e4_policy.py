@@ -26,7 +26,8 @@ import json
 import statistics
 from pathlib import Path
 
-DATA_DIR = Path("/home/nathanramia/Code/LifeOS/data/jev_eval")
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DATA_DIR = REPO_ROOT / "data" / "jev_eval"
 FULL_SCHEMA_TOKENS = 7322  # from e3_results.json
 
 

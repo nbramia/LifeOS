@@ -23,14 +23,15 @@ results for a change with no effect on them.
 
 ## Privacy
 
-All datasets are written to `data/jev_eval/` in the main checkout
-(`/home/nathanramia/Code/LifeOS/data/`, **not** this worktree — `data/` is
-gitignored and doesn't exist in a worktree). Every script hardcodes that
-absolute path rather than resolving it relative to `__file__`, specifically
-so running them from a worktree can't accidentally write personal data
-somewhere it could get committed. Never commit anything under `data/`.
-Never print message text to your own terminal/log beyond what a specific
-hand-labeling step requires.
+All datasets are written to `data/jev_eval/` under the checkout each
+script's own `__file__` resolves to (`Path(__file__).resolve().parents[2]`
+-- no hardcoded path, so this works from any clone). `data/` is gitignored,
+so writing here never lands a dataset somewhere that could get committed.
+Note that `perf_traces.db`/`conversations.db` only exist where LifeOS
+actually runs with real data -- run these scripts from that checkout (a
+fresh worktree's `data/` directory is empty). Never commit anything under
+`data/`. Never print message text to your own terminal/log beyond what a
+specific hand-labeling step requires.
 
 ## Running
 
