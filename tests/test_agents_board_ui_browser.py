@@ -2385,6 +2385,16 @@ class TestTagChipClickFilter:
         assert hue_t1_tag != hue_t2_tag, "two cards with different tags should get different hues"
         assert hue_t2_tag != hue_t2_assignee, "a tag chip's hue should differ from an assignee chip's"
 
+    def test_control_click_on_a_tag_chip_selects_the_card_instead_of_filtering(self, page: Page, agents_base_url):
+        """A modifier click anywhere on a card — including a tag chip — is
+        a selection toggle, never a filter change (mirrors the card's own
+        click handler's `e.metaKey || e.ctrlKey` branch)."""
+        _open_board(page, agents_base_url, board_state=self._board_with_synthetic_tags())
+        page.locator('[data-card-id="t1"] .board-chip-tag').click(modifiers=["Control"])
+        expect(page.locator('[data-card-id="t1"]')).to_have_class(re.compile(r"\bboard-card-selected\b"))
+        expect(page.locator("#board-filter-tag")).to_have_value("")
+        expect(page.locator('[data-card-id="t2"]')).to_be_visible()
+
 
 class TestHostAssignmentChipAndFilter:
     """fields.host (the assignment — where a card WILL run, written by the

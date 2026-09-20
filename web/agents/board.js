@@ -959,6 +959,10 @@ export function initBoard() {
     }
     div.querySelectorAll('.board-chip-tag').forEach(tagChip => {
       tagChip.addEventListener('click', (e) => {
+        // A modifier click is a selection toggle everywhere on the card
+        // (see the card's own click handler above) — let it bubble there
+        // untouched instead of applying a tag filter.
+        if (e.metaKey || e.ctrlKey) return;
         e.stopPropagation();
         applyTagFilterFrom(tagChip.dataset.tag);
       });
