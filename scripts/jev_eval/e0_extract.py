@@ -66,10 +66,14 @@ import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 
-# data/ is gitignored and lives only in the main checkout, not in this
-# worktree -- the eval writes ONLY here, so datasets never land under the
-# worktree or anywhere that could be committed.
-DATA_ROOT = Path("/home/nathanramia/Code/LifeOS/data")
+# data/ is gitignored, so writing here never lands a dataset somewhere
+# that could be committed. Resolved from this script's own location
+# (rather than a hardcoded path) so it works from any checkout of this
+# repo; `perf_traces.db`/`conversations.db` still need to actually exist
+# under it, which is only true on the machine LifeOS runs on -- see
+# README.md.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DATA_ROOT = REPO_ROOT / "data"
 OUT_DIR = DATA_ROOT / "jev_eval"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
