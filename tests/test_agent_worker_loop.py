@@ -2944,6 +2944,17 @@ def test_clone_on_demand_parks_when_clone_fails(tmp_path: Path, monkeypatch):
     assert any("MissingRepo" in s for s in sent)
 
 
+
+class _ReadyCliExecutor:
+    """A CLI executor stub whose mere presence makes the claude_code route
+    READY, so dispatch tests that only care about working-directory
+    handling never depend on a real `claude` binary being installed on
+    the host (it isn't on the hosted verification runner)."""
+
+    def execute(self, session, task):
+        return ExecutorOutcome(status=STATUS_COMPLETED, final_text="stubbed", notifications_sent=1)
+
+
 @pytest.mark.unit
 def test_missing_directory_not_a_known_repo_falls_through_unchanged(tmp_path: Path, monkeypatch):
     """A CLI-routed task whose resolved working directory happens to be
@@ -2977,7 +2988,7 @@ def test_missing_directory_not_a_known_repo_falls_through_unchanged(tmp_path: Pa
     w = _make_worker(tmp_path, api,
                      preflight_caller=_golden_preflight(routing="claude"),
                      local_executor=None,
-                     claude_code_executor=None,
+                     claude_code_executor=_ReadyCliExecutor(),
                      cli_pool=pool)
 
     handled = w.tick()
@@ -3018,7 +3029,7 @@ def test_clone_on_demand_skipped_for_remote_host(tmp_path: Path, monkeypatch):
     w = _make_worker(tmp_path, api,
                      preflight_caller=_golden_preflight(routing="claude"),
                      local_executor=None,
-                     claude_code_executor=None,
+                     claude_code_executor=_ReadyCliExecutor(),
                      cli_pool=pool)
     w.session_store.create(task_id="t1", status=STATUS_CLAIMED)
     w._dispatch(api.tasks["t1"])
@@ -3066,7 +3077,7 @@ def test_remote_cli_spawn_falls_back_to_keyword_cascade_for_uncloned_repo(tmp_pa
     w = _make_worker(tmp_path, api,
                      preflight_caller=_golden_preflight(routing="claude"),
                      local_executor=None,
-                     claude_code_executor=None,
+                     claude_code_executor=_ReadyCliExecutor(),
                      cli_pool=pool)
     w.session_store.create(task_id="t1", status=STATUS_CLAIMED)
     w._dispatch(api.tasks["t1"])
