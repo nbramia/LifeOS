@@ -73,6 +73,11 @@ const LIFECYCLE_TAGS = new Set([
 // whether an SSE tick needs to rebuild the drawer at all.
 const DRAWER_EDITABLE_FIELDS = [
   'title', 'notes', 'tags', 'assignee', 'lane',
+  // Read-only, but a background refresh can change a PR's merge status
+  // after the drawer first opened — without watching it here, an open
+  // drawer would show a stale status until the operator closed and
+  // reopened it.
+  'outcome',
   // The model/effort/host pickers write here. Without it a frame whose only
   // change is a picker value is read as "nothing changed", so a drawer
   // showing a stale picker has no later frame that can converge it.
@@ -819,6 +824,39 @@ export function initBoard() {
     return chips.join('');
   }
 
+  // A pull request's compact open/merged/closed label for the card-face
+  // badge and the drawer's outcome section. `pr.state` is whatever GitHub
+  // last reported (or null when the background refresher hasn't reached
+  // this url yet) — never fabricated as "open" just because it's unknown.
+  function prStateLabel(pr) {
+    const state = String(pr.state || '').toUpperCase();
+    if (state === 'MERGED') return 'merged';
+    if (state === 'OPEN') return 'open';
+    if (state === 'CLOSED') return 'closed';
+    return pr.stale ? 'checking…' : 'unknown';
+  }
+
+  function prStateClass(pr) {
+    const state = String(pr.state || '').toUpperCase();
+    if (state === 'MERGED') return 'board-pr-badge-merged';
+    if (state === 'OPEN') return 'board-pr-badge-open';
+    if (state === 'CLOSED') return 'board-pr-badge-closed';
+    return 'board-pr-badge-unknown';
+  }
+
+  // Compact PR badge shown on a Review-lane card's face — number and
+  // open/merged/closed at a glance, no drawer needed. Only the first PR
+  // (the common case is zero or one per outcome) — the drawer lists every
+  // one.
+  function outcomePrBadge(card) {
+    const prs = card.outcome && card.outcome.prs;
+    if (!prs || !prs.length) return '';
+    const pr = prs[0];
+    const numberLabel = pr.number ? `#${pr.number}` : 'PR';
+    const title = pr.stale ? 'status may be out of date — refreshing in the background' : 'pull request status';
+    return `<span class="board-pr-badge ${prStateClass(pr)}" title="${escapeHtml(title)}">${escapeHtml(numberLabel)} · ${escapeHtml(prStateLabel(pr))}</span>`;
+  }
+
   function renderTaskCard(card) {
     const live = !!(card.session && !TERMINAL.has(card.session.status));
     const div = document.createElement('div');
@@ -838,6 +876,7 @@ export function initBoard() {
     div.innerHTML = `
       <div class="board-card-title">${live ? '<span class="live-dot" title="live"></span>' : ''}${escapeHtml(card.title || '(untitled)')}</div>
       ${card.pending_question ? `<div class="board-card-question">❓ ${escapeHtml(card.pending_question.question)}</div>` : ''}
+      ${showAccept && card.outcome && card.outcome.prs && card.outcome.prs.length ? `<div class="board-card-pr">${outcomePrBadge(card)}</div>` : ''}
       <div class="board-card-chips">${cardChips(card)}</div>
       ${showAccept ? '<button type="button" class="board-card-accept">Accept</button>' : ''}
     `;
@@ -2585,6 +2624,50 @@ export function initBoard() {
     return items.join('');
   }
 
+  // Only a real github.com pull-request URL renders as a clickable link —
+  // everything else (a malformed or tampered value) falls back to plain
+  // escaped text rather than being trusted into an href.
+  const GITHUB_PR_URL_RE = /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+$/;
+
+  function outcomePrRowHtml(pr) {
+    const label = pr.number ? `#${pr.number}` : 'Pull request';
+    const link = GITHUB_PR_URL_RE.test(String(pr.url || ''))
+      ? `<a href="${escapeHtml(pr.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(label)}</a>`
+      : escapeHtml(label);
+    const staleTitle = pr.stale ? ' title="status may be out of date — refreshing in the background"' : '';
+    return `
+      <div class="drawer-outcome-pr">
+        ${link}
+        <span class="board-pr-badge ${prStateClass(pr)}"${staleTitle}>${escapeHtml(prStateLabel(pr))}</span>
+      </div>
+    `;
+  }
+
+  // The read-only "Agent outcome" section: what the agent reported when
+  // its run completed, kept deliberately separate from the editable Notes
+  // textarea below it — this is server-recorded fact about a finished run,
+  // not something the operator edits. Every value here is agent- or
+  // git-host-provided and untrusted, so it's all rendered through
+  // escapeHtml/escapeAttr like the rest of the drawer.
+  function cardOutcomeHtml(card) {
+    const outcome = card.outcome;
+    if (!outcome) return '';
+    const when = formatWakeTime(outcome.created_at);
+    const prs = outcome.prs || [];
+    return `
+      <div class="drawer-section drawer-outcome" data-field="outcome">
+        <label class="drawer-label">Agent outcome</label>
+        <div class="drawer-outcome-meta">
+          <span class="drawer-outcome-engine">${escapeHtml(outcome.engine_label || 'Agent')}</span>
+          ${when ? `<span class="drawer-outcome-when" title="${escapeHtml(when.exact)}">${escapeHtml(when.label)}</span>` : ''}
+        </div>
+        <div class="drawer-outcome-summary">${escapeHtml(outcome.summary || '(the agent left no summary)')}</div>
+        ${outcome.branch ? `<div class="drawer-outcome-branch">Branch: <code>${escapeHtml(outcome.branch)}</code></div>` : ''}
+        ${prs.length ? `<div class="drawer-outcome-prs">${prs.map(outcomePrRowHtml).join('')}</div>` : ''}
+      </div>
+    `;
+  }
+
   function renderDrawer(card) {
     if (!drawerEl) return;
     cancelTagPickerWrites();
@@ -2610,6 +2693,7 @@ export function initBoard() {
       </div>
       ${isTask ? `
       <div class="drawer-section drawer-meta" data-field="meta">${cardMetaHtml(card)}</div>
+      ${cardOutcomeHtml(card)}
       <div class="drawer-section">
       <label class="drawer-label">Notes</label>
       <textarea class="drawer-notes drawer-notes-autosize" data-field="notes" placeholder="Notes…">${escapeHtml(card.notes || '')}</textarea>

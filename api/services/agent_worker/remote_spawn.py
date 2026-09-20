@@ -127,6 +127,7 @@ def build_remote_argv(
     target: str,
     unset_env_names: list[str],
     session_id: str | None = None,
+    env: dict[str, str] | None = None,
     connect_timeout: Optional[int] = None,
 ) -> list[str]:
     """Wrap a local CLI invocation into an ssh call to `target`.
@@ -156,8 +157,12 @@ def build_remote_argv(
         # Keep the whole assignment as one argv token before shlex.join so a
         # synthetic or otherwise unusual id cannot become shell syntax.
         env_assignments.append(f"LIFEOS_AGENT_SESSION_ID={session_id}")
+    for name, value in sorted((env or {}).items()):
+        env_assignments.append(f"{name}={value}")
     inner = shlex.join(["env", *unset_flags, *env_assignments, *argv])
-    remote_command = f"setsid bash -c 'echo \"{PGID_LINE_PREFIX}$$\"; exec \"$@\"' _ {inner}"
+    scratch = (env or {}).get("TMPDIR")
+    prepare = f"mkdir -p {shlex.quote(scratch)} && chmod 700 {shlex.quote(scratch)} && " if scratch else ""
+    remote_command = f"{prepare}setsid bash -c 'echo \"{PGID_LINE_PREFIX}$$\"; exec \"$@\"' _ {inner}"
     return [
         "ssh",
         "-o", "BatchMode=yes",

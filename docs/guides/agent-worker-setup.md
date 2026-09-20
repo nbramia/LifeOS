@@ -342,6 +342,11 @@ LIFEOS_AGENT_WORKER_AUTOSTART=true
 # LIFEOS_AGENT_WORKER_POLL_SECONDS=60
 # LIFEOS_AGENT_DEFAULT_BUDGET_DOLLARS=5.00
 # LIFEOS_AGENT_DAILY_CAP_DOLLARS=100.00
+# LIFEOS_AGENT_CLARIFICATION_TIMEOUT_HOURS=72
+# How long a reopened /claude or /codex session (a Telegram reply on a
+# finished session, or the worker's own mid-run reopen) may sit unresumed
+# before the stuck-session sweep alerts naming the task/session.
+# LIFEOS_AGENT_STUCK_SESSION_TIMEOUT_MINUTES=15
 ```
 
 ```bash
@@ -637,6 +642,12 @@ ungoverned shell always could. Point `working_dir` at a scratch worktree
 you're comfortable with the agent having full shell access inside, the
 same trust model the worker already has everywhere else (see
 [Security model](#security-model)).
+
+### Session scratch lifecycle
+
+The worker creates a mode-`0700` temporary directory for each board session and exports it to subprocesses as `TMPDIR`, `TMP`, and `TEMP`. No setting is needed; the directory lives beneath the operating system's temporary directory and is removed at every terminal outcome. A host-assigned Claude Code or Codex session gets the corresponding directory on that host through its SSH launcher.
+
+Worker-created coding worktrees are reclaimed after pull-request merge, card acceptance/cancellation, or orphan detection. Keep `git` and `gh` authenticated on every registered execution host: cleanup uses the same host runner as provisioning and refuses removal when it cannot first commit and push remaining work. Remote branches are not deleted.
 
 ## Cost-aware iteration
 

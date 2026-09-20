@@ -633,6 +633,41 @@ CREATE TABLE IF NOT EXISTS cli_sessions (
     last_event_at    INTEGER NOT NULL,
     ended_at         INTEGER
 );
+
+-- One row per task: the outcome of that card's most recently *completed*
+-- agent run (see Worker._record_card_outcome). Replaced wholesale on every
+-- completion, including a resumed session's later completion, so a card
+-- never accumulates more than one outcome. Kept out of the vault task's
+-- `notes` field deliberately — the drawer renders this as its own read-only
+-- section rather than markdown stuffed into the editable notes textarea,
+-- and a multi-line report doesn't belong in a vault inline field either.
+CREATE TABLE IF NOT EXISTS card_outcomes (
+    task_id      TEXT PRIMARY KEY,
+    session_id   TEXT NOT NULL,
+    engine_label TEXT NOT NULL,
+    summary      TEXT NOT NULL DEFAULT '',
+    branch       TEXT,
+    pr_urls_json TEXT NOT NULL DEFAULT '[]',
+    created_at   INTEGER NOT NULL
+);
+
+-- Background-refreshed cache of a pull request's merge status, keyed by its
+-- GitHub URL and shared across every card outcome that references it. A
+-- board read (`GET /board`, the board stream) only ever reads this table —
+-- never `gh` directly — so it can't block on the git host. `stale=1` means
+-- the last refresh attempt failed (a timeout, an unreachable host, a `gh`
+-- error): the previously known number/title/state/merged_at are kept
+-- rather than cleared, and the reader shows them as possibly stale instead
+-- of blank. A URL with no row yet has never been refreshed at all.
+CREATE TABLE IF NOT EXISTS pr_status_cache (
+    url        TEXT PRIMARY KEY,
+    number     INTEGER,
+    title      TEXT,
+    state      TEXT,
+    merged_at  TEXT,
+    checked_at INTEGER NOT NULL,
+    stale      INTEGER NOT NULL DEFAULT 1
+);
 """
 
 
@@ -2759,7 +2794,7 @@ class SessionStore:
         status: str | None = None,
         routing: str | None = None,
         parent_session_id: str | None = None,
-        limit: int = 200,
+        limit: int | None = 200,
     ) -> list[Session]:
         """Filtered listing for the `lifeos_agent_sessions_list` tool."""
         conditions = []
@@ -2774,10 +2809,12 @@ class SessionStore:
             conditions.append("parent_session_id = ?")
             params.append(parent_session_id)
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        params.append(int(limit))
+        limit_sql = " LIMIT ?" if limit is not None else ""
+        if limit is not None:
+            params.append(int(limit))
         with self._connect() as conn:
             rows = conn.execute(
-                f"SELECT * FROM sessions {where} ORDER BY started_at DESC LIMIT ?",
+                f"SELECT * FROM sessions {where} ORDER BY started_at DESC{limit_sql}",
                 tuple(params),
             ).fetchall()
         return [self._row_to_session(r) for r in rows]
@@ -2848,6 +2885,37 @@ class SessionStore:
             {"id": r["id"], "sender_id": r["sender_id"], "content": r["content"], "created_at": r["created_at"]}
             for r in rows
         ]
+
+    def peek_pending_messages(self, session_id: str) -> list[dict]:
+        """Return undelivered pending messages WITHOUT marking them delivered.
+
+        Used by a caller that must not lose a message if what comes next
+        fails before it can confirm the message was actually acted on — the
+        caller marks the specific ids delivered itself, via
+        `mark_pending_delivered`, once it has that confirmation.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, sender_id, content, created_at FROM pending_messages "
+                "WHERE session_id = ? AND delivered = 0 ORDER BY id ASC",
+                (session_id,),
+            ).fetchall()
+        return [
+            {"id": r["id"], "sender_id": r["sender_id"], "content": r["content"], "created_at": r["created_at"]}
+            for r in rows
+        ]
+
+    def mark_pending_delivered(self, ids: list[int]) -> None:
+        """Mark specific `pending_messages` rows delivered by id — the
+        confirmation half of `peek_pending_messages`."""
+        if not ids:
+            return
+        placeholders = ",".join("?" for _ in ids)
+        with self._connect() as conn:
+            conn.execute(
+                f"UPDATE pending_messages SET delivered = 1 WHERE id IN ({placeholders})",
+                tuple(ids),
+            )
 
     # ------------------------------------------------------------------
     # Pending clarification questions (Issue F)
@@ -2961,6 +3029,24 @@ class SessionStore:
                     "UPDATE pending_questions SET sent_message_ids = ? WHERE id = ?",
                     (json.dumps(merged), row["id"]),
                 )
+
+    def get_first_reply_anchor(self, session_id: str, *, bot: str | None = None) -> int | None:
+        """Return the earliest Telegram message id recorded for a session on
+        `bot`'s channel (`None` = primary).
+
+        Scoped by `bot` because a message id only means something inside the
+        chat it was sent on: a session that reports through more than one
+        channel (e.g. an Hermes-anchored question, then a later one forced
+        onto the primary bot when Hermes can't be used) must never anchor a
+        reply to a different channel's message id.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT sent_message_id FROM pending_questions "
+                "WHERE session_id = ? AND bot IS ? ORDER BY sent_at ASC, id ASC LIMIT 1",
+                (session_id, bot),
+            ).fetchone()
+        return int(row["sent_message_id"]) if row is not None else None
 
     def has_pending_messages(self, session_id: str) -> bool:
         """True when undelivered pending messages exist for `session_id`."""
@@ -3266,7 +3352,8 @@ class SessionStore:
     def get_question_by_message_id(self, sent_message_id: int) -> dict | None:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT * FROM pending_questions WHERE sent_message_id = ?",
+                "SELECT * FROM pending_questions WHERE sent_message_id = ? "
+                "ORDER BY CASE WHEN kind = 'status_anchor' THEN 1 ELSE 0 END, id ASC",
                 (int(sent_message_id),),
             ).fetchone()
         return dict(row) if row else None
@@ -3317,7 +3404,8 @@ class SessionStore:
                 "AND (sent_message_id = ? OR (sent_message_ids IS NOT NULL "
                 "AND EXISTS (SELECT 1 FROM json_each(sent_message_ids) WHERE value = ?)))"
                 + bot_clause +
-                " ORDER BY id ASC LIMIT 1",
+                " ORDER BY CASE WHEN kind = 'status_anchor' THEN 1 ELSE 0 END, "
+                "id ASC LIMIT 1",
                 (int(sent_message_id), int(sent_message_id), *bot_params),
             ).fetchone()
         return dict(row) if row else None
@@ -4063,6 +4151,177 @@ class SessionStore:
             if cli.status != CLI_STATUS_ENDED:
                 return True
         return False
+
+    # ------------------------------------------------------------------
+    # Card outcomes — what a completed run reports on its Review card
+    # ------------------------------------------------------------------
+
+    def record_card_outcome(
+        self,
+        task_id: str,
+        *,
+        session_id: str,
+        engine_label: str,
+        summary: str,
+        branch: str | None = None,
+        pr_urls: list[str] | None = None,
+    ) -> None:
+        """Replace `task_id`'s outcome record with this run's. Idempotent
+        per call and always a full replace — a resumed session that
+        completes again overwrites the earlier run's record rather than
+        appending to it, so a card carries exactly one outcome."""
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO card_outcomes "
+                "(task_id, session_id, engine_label, summary, branch, pr_urls_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(task_id) DO UPDATE SET "
+                "session_id = excluded.session_id, engine_label = excluded.engine_label, "
+                "summary = excluded.summary, branch = excluded.branch, "
+                "pr_urls_json = excluded.pr_urls_json, created_at = excluded.created_at",
+                (
+                    task_id, session_id, engine_label, summary, branch,
+                    json.dumps(pr_urls or []), _now(),
+                ),
+            )
+
+    @staticmethod
+    def _row_to_card_outcome(row: sqlite3.Row) -> dict:
+        try:
+            pr_urls = json.loads(row["pr_urls_json"] or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pr_urls = []
+        return {
+            "task_id": row["task_id"],
+            "session_id": row["session_id"],
+            "engine_label": row["engine_label"],
+            "summary": row["summary"],
+            "branch": row["branch"],
+            "pr_urls": pr_urls if isinstance(pr_urls, list) else [],
+            "created_at": row["created_at"],
+        }
+
+    def get_card_outcome(self, task_id: str) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM card_outcomes WHERE task_id = ?", (task_id,),
+            ).fetchone()
+        return self._row_to_card_outcome(row) if row is not None else None
+
+    def list_all_card_outcomes(self) -> dict[str, dict]:
+        """Every recorded card outcome, keyed by `task_id`, in one query —
+        the bulk-load a board build uses instead of one `get_card_outcome`
+        call per card (see `api/routes/agents.py`'s `_task_card`)."""
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM card_outcomes").fetchall()
+        return {row["task_id"]: self._row_to_card_outcome(row) for row in rows}
+
+    def list_outcome_pr_urls(self) -> list[str]:
+        """Every distinct PR URL referenced by any recorded card outcome —
+        the working set the background PR-status refresher keeps current."""
+        with self._connect() as conn:
+            rows = conn.execute("SELECT pr_urls_json FROM card_outcomes").fetchall()
+        seen: list[str] = []
+        for row in rows:
+            try:
+                urls = json.loads(row["pr_urls_json"] or "[]")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            for url in urls:
+                if isinstance(url, str) and url and url not in seen:
+                    seen.append(url)
+        return seen
+
+    @staticmethod
+    def _row_to_pr_status(row: sqlite3.Row) -> dict:
+        return {
+            "url": row["url"],
+            "number": row["number"],
+            "title": row["title"],
+            "state": row["state"],
+            "merged_at": row["merged_at"],
+            "checked_at": row["checked_at"],
+            "stale": bool(row["stale"]),
+        }
+
+    def get_pr_status(self, url: str) -> dict | None:
+        """The cached merge status for `url`, or None if it has never been
+        refreshed. `stale=True` means the *last refresh attempt* failed —
+        the other fields are still the last successfully observed values,
+        not necessarily current."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM pr_status_cache WHERE url = ?", (url,),
+            ).fetchone()
+        return self._row_to_pr_status(row) if row is not None else None
+
+    def list_all_pr_statuses(self) -> dict[str, dict]:
+        """Every cached PR status, keyed by url, in one query — the
+        bulk-load a board build uses instead of one `get_pr_status` call
+        per PR (see `api/routes/agents.py`'s `_task_card`)."""
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM pr_status_cache").fetchall()
+        return {row["url"]: self._row_to_pr_status(row) for row in rows}
+
+    def list_stale_pr_urls(self, *, ttl_s: int) -> list[str]:
+        """PR urls referenced by a card outcome whose cache entry is
+        missing or older than `ttl_s`, fairly ordered so a large backlog
+        never starves its tail: a url with no cache row at all sorts
+        first (in `list_outcome_pr_urls` order), then every stale url in
+        ascending `checked_at` (the longest-unrefreshed one first). Every
+        outcome PR starts out missing from `pr_status_cache` entirely, so
+        a freshly completed run's PR is picked up on the refresher's next
+        tick without a special case. Because the caller truncates this to
+        a fixed batch per tick, this ordering — not just "some deadline
+        passed" — is what guarantees every url eventually gets attempted:
+        once a url is refreshed its `checked_at` becomes recent and it
+        sorts behind whatever is still overdue, so the same prefix can
+        never permanently monopolize the batch."""
+        cutoff = _now() - int(ttl_s)
+        urls = self.list_outcome_pr_urls()
+        if not urls:
+            return []
+        with self._connect() as conn:
+            checked_at_by_url = {
+                row["url"]: row["checked_at"]
+                for row in conn.execute("SELECT url, checked_at FROM pr_status_cache")
+            }
+        candidates = [
+            (checked_at_by_url.get(url), url) for url in urls
+            if checked_at_by_url.get(url) is None or checked_at_by_url[url] < cutoff
+        ]
+        candidates.sort(key=lambda pair: (pair[0] is not None, pair[0] or 0))
+        return [url for _, url in candidates]
+
+    def upsert_pr_status(
+        self, url: str, info: dict | None, *, checked_at: int | None = None,
+    ) -> None:
+        """Record one refresh attempt for `url`. `info` (from a successful
+        `gh pr view`) is `{number, title, state, merged_at}`; None marks a
+        failed/timed-out attempt, which keeps any already-cached fields
+        but flips `stale` on rather than clearing them."""
+        ts = checked_at if checked_at is not None else _now()
+        with self._connect() as conn:
+            if info is not None:
+                conn.execute(
+                    "INSERT INTO pr_status_cache "
+                    "(url, number, title, state, merged_at, checked_at, stale) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 0) "
+                    "ON CONFLICT(url) DO UPDATE SET "
+                    "number = excluded.number, title = excluded.title, "
+                    "state = excluded.state, merged_at = excluded.merged_at, "
+                    "checked_at = excluded.checked_at, stale = 0",
+                    (
+                        url, info.get("number"), info.get("title"),
+                        info.get("state"), info.get("merged_at"), ts,
+                    ),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO pr_status_cache (url, checked_at, stale) VALUES (?, ?, 1) "
+                    "ON CONFLICT(url) DO UPDATE SET checked_at = excluded.checked_at, stale = 1",
+                    (url, ts),
+                )
 
     @staticmethod
     def _row_to_cli_session(row: sqlite3.Row) -> CliSession:

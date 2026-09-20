@@ -7,9 +7,14 @@ Surface mirrors :class:`ClaudeCodeExecutor` so the worker can route
   (``thread.started``, ``turn.started``, ``item.completed``,
   ``turn.completed``) instead of Claude's stream-json.
 - The final agent message is captured via ``--output-last-message``.
-- No ``[NOTIFY]/[CLARIFY]`` convention — Codex isn't trained on them.
-  We relay the final message verbatim and skip the plan/clarification
-  blocking paths.
+- No ``[NOTIFY]`` convention — Codex isn't trained on it, so every final
+  message relays verbatim and there's no plan-approval blocking path.
+  ``[CLARIFY]`` is different: a fresh session's briefing (the shared
+  git-discipline text) tells Codex to end its final message with
+  ``[CLARIFY] <question>`` when it needs to ask something before it's
+  done, and the completion path here (reusing Claude Code's own
+  ``_CLARIFY_RE``) treats that the same way Claude Code's live
+  ``[CLARIFY]`` does: a paused, resumable question, not a finished turn.
 - Cost is derived from the last ``turn.completed.usage`` block via the
   ingest module's pricing table.
 - Resume uses ``codex exec resume <session_id> [PROMPT]``.
@@ -35,6 +40,7 @@ from api.services.agent_worker.binary_resolver import resolve_for_spawn
 from api.services.agent_worker.capabilities_preamble import CAPABILITIES_PREAMBLE
 from api.services.agent_worker.claude_code_executor import (
     _ALTERNATE_AUTH_ENV_PREFIXES,
+    _CLARIFY_RE,
 )
 from api.services.agent_worker.delegation import delegation_preamble
 from api.services.agent_worker.local_executor import ExecutorOutcome
@@ -49,6 +55,7 @@ from api.services.agent_worker.remote_spawn import (
 )
 from api.services.agent_worker.remote_spawn import api_host_name as _api_host_name
 from api.services.agent_worker.session_store import (
+    STATUS_BLOCKED,
     STATUS_COMPLETED,
     STATUS_FAILED,
     STATUS_RUNNING,
@@ -56,6 +63,7 @@ from api.services.agent_worker.session_store import (
 )
 from api.services.agent_worker.transcript_store import TranscriptStore
 from api.services.agent_worker.usage_ledger import UsageLedger
+from api.services.secret_redaction import scrub_and_bound
 from api.services.codex.session_ingest import _cost_from_usage
 from config.settings import settings
 
@@ -87,6 +95,16 @@ def _delegation_header(session_id: str) -> str:
     )
 
 
+def _git_discipline_header(working_dir: str) -> str:
+    """Preamble block with the git-discipline instructions when
+    `working_dir` is a worker-provisioned worktree (see
+    `git_worktree.describe_worktree`), else an empty string — a vault- or
+    home-directory session has no worktree and gets nothing prepended."""
+    from api.services.agent_worker.git_worktree import git_discipline_text
+    text = git_discipline_text(working_dir)
+    return f"=== GIT DISCIPLINE ===\n{text}\n\n" if text else ""
+
+
 # Reason codes returned in ``ExecutorOutcome.reason``.
 REASON_TIMEOUT = "timeout"
 REASON_BINARY_NOT_FOUND = "binary_not_found"
@@ -94,6 +112,10 @@ REASON_BINARY_NOT_FOUND = "binary_not_found"
 # FAILED and signals this subprocess; we exit silently under this reason so the
 # worker skips the spurious "session failed" notice.
 REASON_KILLED = "killed"
+# A final message ending in `[CLARIFY] <question>` — parity with
+# ClaudeCodeExecutor's live [CLARIFY] pause, detected post-hoc here since
+# Codex has no mid-turn pause of its own.
+REASON_AWAITING_CLARIFICATION = "awaiting_clarification"
 
 # CODEX_* env vars kept when stripping the subprocess env (see `_clean_env`
 # and `_remote_unset_env_names`) — CODEX_HOME carries `~/.codex/auth.json`.
@@ -117,6 +139,7 @@ class _RunState:
     started_at: float = field(default_factory=time.time)
     last_notify_at: float = field(default_factory=time.time)
     terminal: bool = False
+    last_error: str = ""
 
 
 NotificationCallback = Callable[[str], None]
@@ -138,6 +161,7 @@ class CodexExecutor:
         session_store: SessionStore,
         transcript_store: TranscriptStore,
         notification_callback: Optional[NotificationCallback] = None,
+        operator_send: Optional[Callable[[object, str], None]] = None,
         spawn_fn: Optional[SpawnFn] = None,
         binary_resolver: Optional[Callable[[], str]] = None,
         timeout_seconds: Optional[int] = None,
@@ -146,6 +170,7 @@ class CodexExecutor:
         self.session_store = session_store
         self.transcript_store = transcript_store
         self._notify = notification_callback or (lambda _msg: None)
+        self._operator_send = operator_send
         self._spawn_fn = spawn_fn or subprocess.Popen
         self._binary_resolver = binary_resolver or _resolve_codex_binary
         # Reuse the existing /claude wall-clock knob — operators have one less
@@ -193,14 +218,17 @@ class CodexExecutor:
         # Prepend the LifeOS capabilities briefing so the fresh Codex turn has
         # the same situational awareness as the managed/local routes, plus a
         # per-session delegation header so the agent can hand off work it can't
-        # do (e.g. browser automation → a claude_code child). Only on the
-        # opening turn — resume() reloads the thread, which already carries
-        # this from the first prompt.
+        # do (e.g. browser automation → a claude_code child), and — only when
+        # `working_dir` is a worker-provisioned worktree — the git-discipline
+        # instructions. Only on the opening turn — resume() reloads the
+        # thread, which already carries this from the first prompt.
         delegation = _delegation_header(session.session_id)
-        full_prompt = f"{delegation}\n{CAPABILITIES_PREAMBLE}\n{prompt}"
+        git_discipline = _git_discipline_header(working_dir)
+        full_prompt = f"{delegation}\n{git_discipline}{CAPABILITIES_PREAMBLE}\n{prompt}"
         return self._with_identity(session, self._run(
             session=session,
             prompt=full_prompt,
+            task_title=prompt,
             working_dir=working_dir,
             resume_session_id=None,
         ))
@@ -223,6 +251,7 @@ class CodexExecutor:
         return self._with_identity(session, self._run(
             session=session,
             prompt=message,
+            task_title=session.task_id,
             working_dir=wd,
             resume_session_id=resume_id,
         ))
@@ -317,6 +346,8 @@ class CodexExecutor:
         }
         if session_id:
             env["LIFEOS_AGENT_SESSION_ID"] = session_id
+            from api.services.agent_worker.session_resources import scratch_env
+            env.update(scratch_env(session_id))
         return env
 
     @staticmethod
@@ -334,6 +365,7 @@ class CodexExecutor:
         *,
         session,
         prompt: str,
+        task_title: str,
         working_dir: str,
         resume_session_id: Optional[str],
     ) -> ExecutorOutcome:
@@ -371,6 +403,7 @@ class CodexExecutor:
                 target=target,
                 unset_env_names=self._remote_unset_env_names(),
                 session_id=sid,
+                env={key: value for key, value in self._clean_env(sid).items() if key in {"TMPDIR", "TMP", "TEMP"}},
             )
 
         self.transcript_store.append(sid, "codex_spawn", {
@@ -395,10 +428,21 @@ class CodexExecutor:
                 # remote kill path reaches the real CLI over ssh.
                 start_new_session=True,
             )
-        except FileNotFoundError as exc:
+        except OSError as exc:
+            # Mirrors ClaudeCodeExecutor's matching handler: any spawn-time
+            # OS failure, not just a missing binary, must write the SAME
+            # compensating `codex_binary_not_found` marker the missing-binary
+            # case does, or `_cli_subprocess_launch_count` would miscount an
+            # uncompensated failure as a real launch.
             self.transcript_store.append(sid, "codex_binary_not_found", {"error": str(exc)})
             self._cleanup_tempfile(last_msg_path)
-            return ExecutorOutcome(status=STATUS_FAILED, reason=REASON_BINARY_NOT_FOUND)
+            return ExecutorOutcome(
+                status=STATUS_FAILED,
+                reason=(
+                    REASON_BINARY_NOT_FOUND if isinstance(exc, FileNotFoundError)
+                    else f"codex spawn failed: {exc}"
+                ),
+            )
 
         self.session_store.update_status(
             session.task_id, STATUS_RUNNING,
@@ -471,7 +515,7 @@ class CodexExecutor:
 
         heartbeat_thread = threading.Thread(
             target=self._heartbeat_loop,
-            args=(state, stop_heartbeat),
+            args=(session, state, stop_heartbeat),
             daemon=True,
             name=f"CodexHeartbeat-{sid[:8]}",
         )
@@ -546,6 +590,32 @@ class CodexExecutor:
         # way, so a genuinely-clean run with no `turn.completed` (an
         # interrupted stream that happens to exit 0) is still flagged there.
         if proc.returncode == 0:
+            # A final message ending `[CLARIFY] <question>` is a paused
+            # question, not a finished turn — checked before the completion
+            # write below so it never reaches STATUS_COMPLETED. Reuses
+            # ClaudeCodeExecutor's own `_CLARIFY_RE` so both engines honor
+            # exactly the same marker convention. A spawned child has no
+            # operator to pause for — parity with ClaudeCodeExecutor's
+            # `_CLARIFY_CHILD` convention, its question folds into the
+            # completed turn's text instead so the parent sees it via the
+            # normal completion path.
+            clarify_match = _CLARIFY_RE.search(state.final_text)
+            if clarify_match and not session.parent_session_id:
+                question = clarify_match.group(1).strip()
+                self.session_store.update_status(
+                    session.task_id, STATUS_BLOCKED,
+                    attempt_id=session.attempt_id, turn_id=session.turn_id,
+                )
+                self.transcript_store.append(sid, "codex_awaiting_clarification", {
+                    "question_chars": len(question),
+                })
+                return ExecutorOutcome(
+                    status=STATUS_BLOCKED,
+                    reason=REASON_AWAITING_CLARIFICATION,
+                    final_text=question,
+                )
+            if clarify_match and session.parent_session_id:
+                state.final_text = f"[needs clarification] {clarify_match.group(1).strip()}"
             exit_meta = self._exit_metadata(proc, timed_out, state)
             # `project=False`: a clean exit alone is not an earned completion —
             # the dispatch layer's own check runs on the outcome this call
@@ -604,14 +674,18 @@ class CodexExecutor:
         })
         # Fold the ssh failure's stderr into the
         # reason on the remote path — see ClaudeCodeExecutor._run for why.
-        reason = f"codex exited with code {proc.returncode}"
+        title = task_title or session.task_id
+        detail = last_nonempty_line(stderr_tail) or state.last_error
+        if not detail:
+            detail = "no error output was captured"
+        reason = f"task '{title}': codex exited with code {proc.returncode}: {detail}"
         if is_remote:
             last_line = last_nonempty_line(stderr_tail)
             if last_line:
                 reason = f"ssh to {host} failed (exit {proc.returncode}): {last_line}"
         return ExecutorOutcome(
             status=STATUS_FAILED,
-            reason=reason,
+            reason=scrub_and_bound(reason),
         )
 
     @staticmethod
@@ -702,9 +776,16 @@ class CodexExecutor:
                     self.transcript_store.append(sid, "codex_assistant_text", {
                         "text": text, "chars": len(text),
                     })
-            elif itype in ("command_executed", "local_shell_call", "function_call"):
+            elif itype in (
+                "command_executed", "command_execution", "local_shell_call",
+                "function_call", "mcp_tool_call", "file_change", "web_search",
+            ):
                 state.tool_call_count += 1
-                cmd_preview = str(item.get("command") or item.get("name") or "")
+                changes = item.get("changes") or [{}]
+                cmd_preview = str(
+                    item.get("command") or item.get("name")
+                    or changes[0].get("path") or ""
+                )
                 state.last_activity = f"running {cmd_preview[:40]}" if cmd_preview else "running a tool"
                 self.transcript_store.append(sid, "codex_tool_use", {
                     "type": itype,
@@ -714,6 +795,13 @@ class CodexExecutor:
                 # Drop reasoning text from the transcript — it's verbose
                 # and the cumulative token count gives us the size signal.
                 pass
+            return
+
+        if etype in ("error", "turn.failed"):
+            error = event.get("error") or event.get("message") or {}
+            if isinstance(error, dict):
+                error = error.get("message") or error.get("code") or ""
+            state.last_error = str(error).strip()
             return
 
         if etype == "turn.completed":
@@ -792,7 +880,9 @@ class CodexExecutor:
             except Exception as exc:  # pragma: no cover — defensive
                 logger.warning("watchdog terminate failed: %s", exc)
 
-    def _heartbeat_loop(self, state: _RunState, stop_event: threading.Event) -> None:
+    def _heartbeat_loop(
+        self, session, state: _RunState, stop_event: threading.Event,
+    ) -> None:
         while not stop_event.wait(self._heartbeat_interval):
             if state.terminal:
                 return
@@ -804,7 +894,11 @@ class CodexExecutor:
             activity = f" — {state.last_activity}" if state.last_activity else ""
             cost = f" | ${state.cost_usd:.2f}" if state.cost_usd > 0 else ""
             try:
-                self._notify(f"Still working{activity} ({minutes}m elapsed{cost})")
+                body = f"Still working{activity} ({minutes}m elapsed{cost})"
+                if self._operator_send is not None:
+                    self._operator_send(session, body)
+                else:
+                    self._notify(body)
             except Exception as exc:  # pragma: no cover — defensive
                 logger.warning("heartbeat callback raised: %s", exc)
             state.last_notify_at = now

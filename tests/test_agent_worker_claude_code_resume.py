@@ -63,7 +63,7 @@ def _make_worker(tmp_path: Path, claude_code_executor, monkeypatch=None):
     sent: list[str] = []
     sent_with_ids: list[tuple[int, str]] = []
 
-    def _send_with_id(text):
+    def _send_with_id(text, **_kwargs):
         msg_id = len(sent_with_ids) + 4000
         sent_with_ids.append((msg_id, text))
         return [msg_id]
