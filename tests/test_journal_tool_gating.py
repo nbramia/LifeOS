@@ -15,6 +15,7 @@ import pytest
 from api.services.agent_tools import (
     JOURNAL_EXCLUDED_TOOLS,
     TOOL_DEFINITIONS,
+    _journal_created_task_id,
     execute_tool_parallel,
     tools_for_persona,
 )
@@ -348,3 +349,102 @@ class TestExecuteToolParallelJournalGate:
         unchanged = sched.get(entry.id)
         assert unchanged.message_content == "do work"
         assert unchanged.executor == "claude_code"
+
+
+class TestJournalCreatedTaskIdExtraction:
+    """`_journal_created_task_id` pulls the newly created task's own id out
+    of a `manage_tasks` create result, for `execute_tool_parallel` to add to
+    the per-turn set a same-turn child create can then name as its parent."""
+
+    def test_extracts_the_id_of_a_plain_created_task(self):
+        result = "Task created:\n[ ] Renovate the synthetic garage [id:abcd1234]"
+        assert _journal_created_task_id(result) == "abcd1234"
+
+    def test_picks_the_own_id_not_a_later_parent_line(self):
+        result = (
+            "Task created:\n[ ] Clear the synthetic shelves [id:efgh5678]\n"
+            "  Parent: Renovate the synthetic garage [id:abcd1234]"
+        )
+        assert _journal_created_task_id(result) == "efgh5678"
+
+    def test_a_recovered_task_yields_no_id(self):
+        result = "Task recovered:\n[ ] Renovate the synthetic garage [id:abcd1234]"
+        assert _journal_created_task_id(result) is None
+
+    def test_an_error_result_yields_no_id(self):
+        result = "Error: description is required"
+        assert _journal_created_task_id(result) is None
+
+
+class TestExecuteToolParallelSameTurnParentAttestation:
+    """`execute_tool_parallel`'s `created_task_ids` param, mirroring the
+    per-turn set `run_agent_loop` binds for the journal persona."""
+
+    async def test_a_successful_create_adds_its_own_id_to_the_set(self, tm):
+        created: set = set()
+        out = await execute_tool_parallel(
+            "manage_tasks",
+            {"action": "create", "description": "Renovate the synthetic garage"},
+            persona_id="journal",
+            user_message="Make a project to renovate the synthetic garage",
+            created_task_ids=created,
+        )
+        assert out.startswith("Task created")
+        parent = tm.list_tasks()[0]
+        assert created == {parent.id}
+
+    async def test_a_same_turn_child_create_keeps_the_parents_id(self, tm):
+        created: set = set()
+        await execute_tool_parallel(
+            "manage_tasks",
+            {"action": "create", "description": "Renovate the synthetic garage"},
+            persona_id="journal",
+            user_message="Make a project to renovate the synthetic garage with subtasks clear the shelves",
+            created_task_ids=created,
+        )
+        parent = tm.list_tasks()[0]
+
+        out = await execute_tool_parallel(
+            "manage_tasks",
+            {"action": "create", "description": "Clear the shelves", "parent_id": parent.id},
+            persona_id="journal",
+            user_message="Make a project to renovate the synthetic garage with subtasks clear the shelves",
+            created_task_ids=created,
+        )
+
+        assert out.startswith("Task created")
+        child = next(t for t in tm.list_tasks() if t.description == "Clear the shelves")
+        assert child.fields.get("parent_id") == parent.id
+        assert created == {parent.id, child.id}
+
+    async def test_a_recovered_task_does_not_add_a_duplicate_or_new_id(self, tm):
+        created: set = set()
+        first = await execute_tool_parallel(
+            "manage_tasks",
+            {"action": "create", "description": "x", "operation_key": "op-1"},
+            persona_id="journal", user_message="x", created_task_ids=created,
+        )
+        assert first.startswith("Task created")
+        after_first = set(created)
+
+        second = await execute_tool_parallel(
+            "manage_tasks",
+            {"action": "create", "description": "x", "operation_key": "op-1"},
+            persona_id="journal", user_message="x", created_task_ids=created,
+        )
+
+        assert second.startswith("Task recovered")
+        assert created == after_first
+
+    async def test_no_set_keeps_todays_stripping_behavior(self, tm):
+        # created_task_ids=None (the default) is indistinguishable from the
+        # behavior before this param existed: an unattested parent_id is
+        # always stripped.
+        out = await execute_tool_parallel(
+            "manage_tasks",
+            {"action": "create", "description": "Clear the shelves", "parent_id": "some-parent"},
+            persona_id="journal",
+            user_message="Make a project to renovate the synthetic garage with subtasks clear the shelves",
+        )
+        assert out.startswith("Task created")
+        assert tm.list_tasks()[0].fields.get("parent_id") is None

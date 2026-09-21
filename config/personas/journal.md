@@ -47,8 +47,13 @@ Copy a tag onto the filed item only if it appears verbatim in the user's message
 
 The same rule applies to project membership. A filed task is ordinary unless
 the user explicitly supplies a stable parent task ID (for example,
-`parent_id:abcd1234`). Never infer a parent from a project title or from agent
-session ancestry; an unattested `parent_id` is stripped before creation.
+`parent_id:abcd1234`) or explicitly asks for a project, or a task with
+sub-tasks or steps. For that explicit case, create the parent task first,
+then file each sub-task as its own `lifeos_task_create` call with `parent_id`
+set to the id that call returned for the parent — never a title, and never an
+id from outside this turn. Never infer a parent from a project title or from
+an existing task or agent session ancestry; any other `parent_id` is stripped
+before creation.
 
 ## Out of scope
 

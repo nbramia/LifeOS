@@ -1152,7 +1152,9 @@ def _field_attested(key: str, value: str, low_message: str) -> bool:
     return bool(re.search(rf'["\']{re.escape(value_l)}["\']', low_message))
 
 
-def _journal_filter_task_create_input(tool_input: dict, user_message: str) -> dict:
+def _journal_filter_task_create_input(
+    tool_input: dict, user_message: str, created_task_ids: Optional[set] = None,
+) -> dict:
     """Strip any tag or operator field on a journal-turn `manage_tasks` create
     that the model invented rather than copied from the user's own message:
     journal never assigns or orchestrates, so an item it files stays
@@ -1160,13 +1162,23 @@ def _journal_filter_task_create_input(tool_input: dict, user_message: str) -> di
     themselves. A tag is attested only if its literal `#tag` text appears as
     one of the message's own tags (not merely as a substring of a longer
     tag); a field is attested per `_field_attested` above.
+
+    `parent_id` is also kept, without a spoken attestation, when it names a
+    task `created_task_ids` records — a task this same turn's journal filing
+    already created (see `execute_tool_parallel`). That set only ever holds
+    ids from this one turn, so a project's sub-tasks can name the parent the
+    model just created, while a `parent_id` from a different turn or only
+    appearing in prose is still stripped.
     """
     message = user_message or ""
     low = message.lower()
     message_tags = {t.lower() for t in _MESSAGE_TAG_RE.findall(message)}
     filtered = dict(tool_input)
     parent_id = filtered.get("parent_id")
-    if parent_id and not _field_attested("parent_id", str(parent_id), low):
+    if parent_id and not (
+        _field_attested("parent_id", str(parent_id), low)
+        or (created_task_ids is not None and str(parent_id) in created_task_ids)
+    ):
         filtered.pop("parent_id", None)
     tags = filtered.get("tags")
     if tags:
@@ -1182,7 +1194,9 @@ def _journal_filter_task_create_input(tool_input: dict, user_message: str) -> di
     return filtered
 
 
-def _journal_tool_gate(name: str, tool_input: dict, user_message: str) -> tuple[Optional[dict], Optional[str]]:
+def _journal_tool_gate(
+    name: str, tool_input: dict, user_message: str, created_task_ids: Optional[set] = None,
+) -> tuple[Optional[dict], Optional[str]]:
     """Enforce the journal persona's filing-only boundary at execution time —
     defense in depth behind `tools_for_persona`'s advertised-tool filter, in
     case the model names an excluded tool or a disallowed action
@@ -1205,7 +1219,7 @@ def _journal_tool_gate(name: str, tool_input: dict, user_message: str) -> tuple[
                 "existing tasks or projects."
             )
         if action == "create":
-            return _journal_filter_task_create_input(tool_input, user_message), None
+            return _journal_filter_task_create_input(tool_input, user_message, created_task_ids), None
     if name == "manage_schedules":
         action = tool_input.get("action")
         if action not in ("create", "list"):
@@ -1228,13 +1242,41 @@ def _journal_tool_gate(name: str, tool_input: dict, user_message: str) -> tuple[
     return tool_input, None
 
 
+_TASK_OWN_ID_RE = re.compile(r"\[id:([\w-]+)\]")
+
+
+def _journal_created_task_id(result: str) -> Optional[str]:
+    """The new task's own id from a journal `manage_tasks` create result, or
+    None. Only a result starting with "Task created:" yields an id — "Task
+    recovered:" (an existing task returned by a repeated `operation_key`)
+    and an "Error:" result never do. `_format_native_task`'s own-task line
+    always comes before its `Parent: ... [id:...]` line, so the first match
+    in the result is always the created task's own id, never the parent's.
+    """
+    if not result.startswith("Task created:"):
+        return None
+    match = _TASK_OWN_ID_RE.search(result)
+    return match.group(1) if match else None
+
+
 async def execute_tool_parallel(
     name: str, tool_input: dict, *, persona_id: str = "", user_message: str = "",
+    created_task_ids: Optional[set] = None,
 ) -> str:
-    """Like execute_tool but runs sync handlers in a thread to avoid blocking the event loop."""
+    """Like execute_tool but runs sync handlers in a thread to avoid blocking the event loop.
+
+    created_task_ids: a per-turn set of task IDs created by a journal
+        `manage_tasks` create earlier in this same turn, or None. Only
+        meaningful for the journal persona. `run_agent_loop` binds one fresh
+        `set()` per turn (never persisted, never shared across turns or
+        requests) and passes it on every call this turn; every other caller
+        passes nothing, which keeps today's stripping behavior exactly.
+        Tool calls within one round run in parallel, so a parent created
+        this round is only visible to a child call in a later round.
+    """
     try:
         if persona_id == JOURNAL_PERSONA_ID:
-            tool_input, gate_error = _journal_tool_gate(name, tool_input, user_message)
+            tool_input, gate_error = _journal_tool_gate(name, tool_input, user_message, created_task_ids)
             if gate_error:
                 return gate_error
         handler = _TOOL_HANDLERS.get(name)
@@ -1246,6 +1288,15 @@ async def execute_tool_parallel(
             result = handler(tool_input)
         if asyncio.iscoroutine(result):
             result = await result
+        if (
+            created_task_ids is not None
+            and persona_id == JOURNAL_PERSONA_ID
+            and name == "manage_tasks"
+            and tool_input.get("action") == "create"
+        ):
+            new_id = _journal_created_task_id(result)
+            if new_id:
+                created_task_ids.add(new_id)
         return result
     except Exception as e:
         logger.error(f"Tool '{name}' failed: {e}", exc_info=True)
