@@ -2387,6 +2387,56 @@ def test_validate_plan_rejects_a_child_whose_parent_was_dropped_for_reused_evide
         validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
 
 
+def test_validate_plan_rejects_a_plain_child_under_a_delegated_parent():
+    """A task delegated to an agent executor never becomes a hierarchy
+    parent, even for an otherwise-plain child naming it."""
+    transcript = "Assign the synthetic audit to Codex. Update the synthetic ledger."
+    actions = [
+        {"kind": "task", "index": 0, "title": "Assign the synthetic audit to Codex",
+         "tags": ["codex"], "delegation_evidence": "Assign the synthetic audit to Codex",
+         "action_evidence": "the synthetic audit"},
+        {"kind": "task", "index": 1, "title": "Update the synthetic ledger",
+         "action_evidence": "Update the synthetic ledger", "parent_index": 0},
+    ]
+    with pytest.raises(PebbleCaptureError):
+        validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+
+
+def test_validate_plan_rejects_a_delegated_child_under_a_plain_parent():
+    """A child that is itself delegated to an agent executor can't join the
+    hierarchy, even when the named parent is a plain, undelegated task."""
+    transcript = "Fix the synthetic pipe. Assign the synthetic report to Claude."
+    actions = [
+        {"kind": "task", "index": 0, "title": "Fix the synthetic pipe",
+         "action_evidence": "Fix the synthetic pipe"},
+        {"kind": "task", "index": 1, "title": "Assign the synthetic report to Claude",
+         "tags": ["claude"], "delegation_evidence": "Assign the synthetic report to Claude",
+         "action_evidence": "the synthetic report", "parent_index": 0},
+    ]
+    with pytest.raises(PebbleCaptureError):
+        validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+
+
+def test_validate_plan_links_a_plain_child_to_a_me_tagged_parent():
+    """``#me`` is a valid assignee but not an agent-executor tag, so a
+    ``#me`` task may still be named as a parent."""
+    transcript = (
+        "Charge the synthetic earbuds and assign it to me. "
+        "Plug in the synthetic charger."
+    )
+    actions = [
+        {"kind": "task", "index": 0, "title": "Charge the synthetic earbuds",
+         "tags": ["me"],
+         "delegation_evidence": "Charge the synthetic earbuds and assign it to me",
+         "action_evidence": "charge the synthetic earbuds"},
+        {"kind": "task", "index": 1, "title": "Plug in the synthetic charger",
+         "action_evidence": "Plug in the synthetic charger", "parent_index": 0},
+    ]
+    [parent, child] = validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    assert parent.tags == ("me",)
+    assert child.parent_index == 0
+
+
 # --------------------------------------------------------------------------
 # PebbleCaptureConsumer: ordered parent-then-children application, holding a
 # child whose parent isn't applied yet, and no-op replay.

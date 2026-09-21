@@ -771,11 +771,14 @@ def validate_plan(raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at
     # carries a proven assignee tag) or a filed schedule writes here.
     used_scheduled_delegation_evidence: set[str] = set()
     # Task indexes eligible to be named as a parent by a later child: kept
-    # (not dropped for reusing evidence), and not themselves a child --
-    # hierarchy is one level deep. Populated only once an action has fully
-    # survived validation and been appended to ``result``, so "earlier in
-    # the plan" is enforced structurally: a child can only reference an
-    # index already present here, never a later or dropped one.
+    # (not dropped for reusing evidence), not themselves a child (hierarchy
+    # is one level deep), and not delegated to an agent executor -- a task
+    # handed to `#codex`/`#claude`/etc. never joins the hierarchy, as
+    # either parent or child; `#me` is a valid assignee but not an executor
+    # tag, so a `#me` task may still be a parent. Populated only once an
+    # action has fully survived validation and been appended to ``result``,
+    # so "earlier in the plan" is enforced structurally: a child can only
+    # reference an index already present here, never a later or dropped one.
     available_parents: set[int] = set()
     for raw_action in raw:
         if not isinstance(raw_action, dict):
@@ -828,6 +831,8 @@ def validate_plan(raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at
                 elif tag not in _ROUTING_TAGS and tag in allowed_tags:
                     tags.append(tag)
         normalized_tags = tuple(dict.fromkeys(tags))
+        if parent_index is not None and any(tag in _VALID_EXECUTORS for tag in normalized_tags):
+            raise PebbleCaptureError("a delegated task cannot join the parent/child hierarchy")
         action = PlannedAction(
             kind=kind, title=title, index=index, tags=normalized_tags,
             delegation_evidence=evidence, action_evidence=action_evidence,
@@ -931,7 +936,8 @@ def validate_plan(raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at
                 raise PebbleCaptureError("human action lacks an explicit operator-only decision")
             action = replace(action, human_key=key, decision_evidence=evidence)
         result.append(action)
-        if kind == "task" and parent_index is None:
+        if (kind == "task" and parent_index is None
+                and not any(tag in _VALID_EXECUTORS for tag in normalized_tags)):
             available_parents.add(index)
     return result
 
