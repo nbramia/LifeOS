@@ -1169,6 +1169,13 @@ def _journal_filter_task_create_input(
     ids from this one turn, so a project's sub-tasks can name the parent the
     model just created, while a `parent_id` from a different turn or only
     appearing in prose is still stripped.
+
+    `due_date` is kept only when it is a strict `YYYY-MM-DD` date. The
+    own-task line `_format_native_task` renders (`status [description]
+    (due <due_date>) [id:<id>]`) holds only that status icon, a validated
+    description, an ISO due date, and the id — a `due_date` carrying a
+    newline could otherwise relocate a forged `[id:...]` onto that line
+    and be picked up by `_journal_created_task_id` as the new task's id.
     """
     message = user_message or ""
     low = message.lower()
@@ -1180,6 +1187,18 @@ def _journal_filter_task_create_input(
         or (created_task_ids is not None and str(parent_id) in created_task_ids)
     ):
         filtered.pop("parent_id", None)
+    due_date = filtered.get("due_date")
+    if due_date is not None:
+        from datetime import date
+        valid = False
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(due_date)):
+            try:
+                date.fromisoformat(str(due_date))
+                valid = True
+            except ValueError:
+                valid = False
+        if not valid:
+            filtered.pop("due_date", None)
     tags = filtered.get("tags")
     if tags:
         filtered["tags"] = [
