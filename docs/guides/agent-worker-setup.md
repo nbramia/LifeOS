@@ -431,11 +431,13 @@ args = ["<lifeos-repo>/mcp_server.py"]   # absolute path to mcp_server.py in you
 `mcp_server.py` already serves stdio for CLI agents (the same entry point
 Claude Code uses), so no extra process or port is involved — Codex spawns it
 on demand. Codex only forwards parent env vars listed in a stdio MCP
-server's own `env_vars` config key; once this block is present, a
-worker-launched `#codex` session detects it and supplies that key itself via
-a `-c mcp_servers.lifeos.env_vars=[...]` override on the codex argv, so this
-example block needs no `env_vars` line and the worker's trusted caller
-identity (`LIFEOS_AGENT_SESSION_ID` etc.) still reaches the server.
+server's own `env_vars` config key; once this block is present, a `#codex`
+session the worker launches on its own host detects it and merges its
+trusted caller identity (`LIFEOS_AGENT_SESSION_ID` etc.) into that key
+itself via a `-c mcp_servers.lifeos.env_vars=[...]` override on the codex
+argv — alongside any `env_vars` this block already lists — so this example
+needs no `env_vars` line of its own. A board-assigned remote host gets no
+override; its own Codex config (unknown to the API host) is what governs.
 
 **Verify** the server is registered:
 

@@ -167,6 +167,35 @@ def test_identity_env_vars_forwarded_via_mcp_env_vars_override(tmp_path, monkeyp
     assert parsed["mcp_servers"]["lifeos"]["env_vars"] == list(_IDENTITY_ENV_VARS)
 
 
+def test_pre_existing_operator_env_vars_are_preserved_in_override(tmp_path, monkeypatch):
+    """A bare `-c mcp_servers.lifeos.env_vars=[...]` REPLACES rather than
+    extends an operator's own `env_vars` list (verified: a config with
+    `env_vars = ["SYNTHETIC_FORWARDED_VAR"]` plus the identity-only override
+    left the effective list as only the override). Assert the override
+    instead carries the union — the operator's pre-existing var, then the
+    three identity names — so nothing already forwarded to the lifeos MCP
+    child is silently dropped."""
+    codex_home = tmp_path / "codex_home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text(
+        '[mcp_servers.lifeos]\ncommand = "py"\n'
+        'env_vars = ["SYNTHETIC_FORWARDED_VAR"]\n'
+    )
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    spawn_calls: list = []
+    lines = _lines_for([_THREAD_EVENT, _TURN_COMPLETED, _SESSION_COMPLETED])
+    store, executor = _build(tmp_path, monkeypatch, spawn_calls=spawn_calls, lines=lines)
+    session = store.create(task_id="t1", routing="codex")
+    outcome = executor.execute(session, {"description": "do the thing"})
+    assert outcome.status != STATUS_FAILED
+    cmd = spawn_calls[0][0]
+    override = _mcp_env_vars_override(cmd)
+    assert override is not None, f"no mcp_servers.lifeos.env_vars override found in {cmd}"
+    parsed = tomllib.loads(override)
+    env_vars = parsed["mcp_servers"]["lifeos"]["env_vars"]
+    assert env_vars == ["SYNTHETIC_FORWARDED_VAR", *_IDENTITY_ENV_VARS]
+
+
 def test_no_mcp_env_vars_override_when_lifeos_server_not_configured(tmp_path, monkeypatch):
     """The regression this guards: passing `-c mcp_servers.lifeos.env_vars=
     [...]` when Codex's config has NO `[mcp_servers.lifeos]` server creates a
@@ -265,6 +294,37 @@ def test_remote_host_wraps_argv_in_ssh_and_captures_pgid(tmp_path, monkeypatch):
 
     refreshed = store.get("t1")
     assert refreshed.remote_pgid == 1212
+
+
+def test_remote_target_spawn_omits_mcp_env_vars_override(tmp_path, monkeypatch):
+    """`_build_command`'s config check reads the API host's own
+    config.toml, which says nothing about a board-assigned remote host's
+    own Codex install — that host loads its own config over ssh. Adding
+    the `env_vars` override there risks the same config-loader crash on a
+    remote host with no lifeos server configured. Even with the API host's
+    own config declaring the lifeos server (so a local spawn WOULD get the
+    override — see `test_identity_env_vars_forwarded_via_mcp_env_vars_override`),
+    a remote-target spawn must not."""
+    _write_codex_config_with_lifeos_server(tmp_path, monkeypatch)
+    spawn_calls: list = []
+    lines = _lines_for(
+        [_THREAD_EVENT, _AGENT_MESSAGE_COMPLETED, _TURN_COMPLETED, _SESSION_COMPLETED],
+        pgid_line="PGID:2020\n",
+    )
+    store, executor = _build(
+        tmp_path, monkeypatch, spawn_calls=spawn_calls, lines=lines,
+        agent_hosts={"studio": "user@studio.example"},
+    )
+    session = store.create(task_id="t1", routing="codex", host="studio")
+    outcome = executor.execute(session, {"description": "do the thing"})
+    assert outcome.status != STATUS_FAILED
+    cmd = spawn_calls[0][0]
+    assert cmd[0] == "ssh"
+    remote_command = cmd[-1]
+    assert "mcp_servers.lifeos.env_vars" not in remote_command, (
+        f"override present in a remote-target spawn's argv — the remote "
+        f"host's own Codex config governs, not the API host's: {remote_command}"
+    )
 
 
 def test_remote_host_keeps_explicit_remote_directory_out_of_local_spawn_cwd(

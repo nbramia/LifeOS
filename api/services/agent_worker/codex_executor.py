@@ -134,11 +134,13 @@ _CODEX_ENV_KEEP = {"CODEX_HOME"}
 # `mcp_server.py`'s stdio server can attest the caller for `lifeos_agent_*`
 # tools. Codex does not forward arbitrary parent env vars to a stdio MCP
 # server child — only names listed in that server's own `env_vars` config
-# key — so `_build_command` also passes these names via a `-c
-# mcp_servers.lifeos.env_vars=[...]` override whenever the operator's Codex
-# config already declares an `[mcp_servers.lifeos]` server (see
-# `_lifeos_mcp_server_configured`); it's skipped otherwise, since overriding
-# `env_vars` on a server that doesn't exist breaks Codex's config loader.
+# key — so a *local* spawn's `_build_command` also merges these names into
+# a `-c mcp_servers.lifeos.env_vars=[...]` override (see
+# `_merged_identity_env_vars`) whenever the API host's own Codex config
+# already declares an `[mcp_servers.lifeos]` server; it's skipped otherwise
+# (overriding `env_vars` on a server that doesn't exist breaks Codex's
+# config loader) and for a remote-target spawn (that host's own Codex
+# config is unknown to the API host).
 _IDENTITY_ENV_VARS = (
     "LIFEOS_AGENT_SESSION_ID",
     "LIFEOS_AGENT_ATTEMPT_ID",
@@ -298,6 +300,7 @@ class CodexExecutor:
         last_message_file: str,
         model: Optional[str] = None,
         effort: Optional[str] = None,
+        is_remote: bool = False,
     ) -> list[str]:
         binary = self._binary_resolver()
         # `workspace-write` lets codex edit files inside the working dir
@@ -333,13 +336,26 @@ class CodexExecutor:
         # table with no `command`, which fails Codex's config loader
         # entirely ("invalid transport") — an install with no lifeos MCP
         # server configured must keep working (context-blind, same as
-        # today) rather than hard-failing every `#codex` task.
-        if self._lifeos_mcp_server_configured():
-            common = [
-                "-c",
-                "mcp_servers.lifeos.env_vars=" + json.dumps(list(_IDENTITY_ENV_VARS)),
-                *common,
-            ]
+        # today) rather than hard-failing every `#codex` task. The value is
+        # the ordered union of any `env_vars` the operator's server entry
+        # already declares plus the identity names — a bare override would
+        # otherwise silently replace (not extend) an existing list, e.g. one
+        # forwarding another var into the same MCP child.
+        #
+        # Only checked for a *local* spawn: this reads the API host's own
+        # config.toml, which describes nothing about a board-assigned remote
+        # host's Codex install — Codex loads config from wherever it
+        # actually runs, so a remote-target spawn gets no override at all;
+        # adding it there risks the same config-loader crash on a remote
+        # host with no lifeos server.
+        if not is_remote:
+            merged_env_vars = self._merged_identity_env_vars()
+            if merged_env_vars is not None:
+                common = [
+                    "-c",
+                    "mcp_servers.lifeos.env_vars=" + json.dumps(merged_env_vars),
+                    *common,
+                ]
         if resume_session_id:
             return [binary, "exec", "resume", resume_session_id, *common, prompt]
         return [binary, "exec", *common, prompt]
@@ -347,28 +363,58 @@ class CodexExecutor:
     @staticmethod
     def _codex_config_path() -> str:
         """Path to the Codex CLI's own config file — `$CODEX_HOME/config.toml`
-        when set, else `~/.codex/config.toml`. Shared by
-        `_lifeos_mcp_server_configured` and `_warn_if_mcp_missing`."""
+        when set, else `~/.codex/config.toml`. Used by `_lifeos_mcp_config`
+        and directly by `_warn_if_mcp_missing`'s log message."""
         codex_home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
         return os.path.join(codex_home, "config.toml")
 
     @classmethod
-    def _lifeos_mcp_server_configured(cls) -> bool:
-        """True when the Codex config declares an `[mcp_servers.lifeos]`
-        server. Parsed with `tomllib` (not a substring check) so the
-        `_build_command` gate is accurate: a false positive there would add
-        the `env_vars` override for a server Codex doesn't actually have,
-        which breaks config loading entirely (see `_build_command`).
-        Any read or parse failure reads as "not configured" — the
-        conservative default for that gate. Cheap per-spawn: the file is
-        small and read once per `_build_command` call.
+    def _lifeos_mcp_config(cls) -> Optional[dict]:
+        """The `[mcp_servers.lifeos]` table from the Codex config, or None
+        when it isn't declared or the config can't be read/parsed. Parsed
+        with `tomllib` (not a substring check) so callers get the table's
+        actual contents — e.g. an existing `env_vars` list — not just a
+        yes/no. Any read or parse failure reads as "not configured", the
+        conservative default: a false positive would let `_build_command`
+        add the `env_vars` override for a server Codex doesn't actually
+        have, which breaks config loading entirely. Cheap per-spawn: the
+        file is small and read once per `_build_command` call. Shared by
+        `_lifeos_mcp_server_configured`, `_merged_identity_env_vars`, and
+        `_warn_if_mcp_missing`.
         """
         try:
             with open(cls._codex_config_path(), "rb") as f:
                 cfg = tomllib.load(f)
         except (OSError, tomllib.TOMLDecodeError):
-            return False
-        return "lifeos" in (cfg.get("mcp_servers") or {})
+            return None
+        server_cfg = (cfg.get("mcp_servers") or {}).get("lifeos")
+        return server_cfg if isinstance(server_cfg, dict) else None
+
+    @classmethod
+    def _lifeos_mcp_server_configured(cls) -> bool:
+        """True when the Codex config declares an `[mcp_servers.lifeos]`
+        server — see `_lifeos_mcp_config`."""
+        return cls._lifeos_mcp_config() is not None
+
+    @classmethod
+    def _merged_identity_env_vars(cls) -> Optional[list[str]]:
+        """Ordered, de-duplicated union of any `env_vars` the operator's
+        `[mcp_servers.lifeos]` entry already declares plus
+        `_IDENTITY_ENV_VARS`, or None when that server isn't configured at
+        all (see `_lifeos_mcp_config`). A bare `env_vars=[...]` `-c`
+        override *replaces* the operator's list rather than extending it,
+        so this preserves anything already forwarded (e.g. a var another
+        tool on that server relies on) alongside the identity vars.
+        """
+        server_cfg = cls._lifeos_mcp_config()
+        if server_cfg is None:
+            return None
+        existing = server_cfg.get("env_vars")
+        merged = list(existing) if isinstance(existing, list) else []
+        for name in _IDENTITY_ENV_VARS:
+            if name not in merged:
+                merged.append(name)
+        return merged
 
     def _warn_if_mcp_missing(self) -> None:
         """Best-effort check that Codex has the lifeos MCP server configured.
@@ -476,6 +522,7 @@ class CodexExecutor:
             prompt, command_working_dir, resume_session_id, last_msg_path,
             model=getattr(session, "model", None),
             effort=getattr(session, "effort", None),
+            is_remote=is_remote,
         )
 
         if target is not None:
