@@ -249,6 +249,13 @@ CANCEL_ALREADY_FINISHED_ERROR: tuple[int, str] = (
     409,
     "this card is already finished — nothing to cancel",
 )
+PROJECT_EXPLICIT_ACTION_ERROR: tuple[int, str] = (
+    409,
+    "projects use Start, Complete project, and Cancel project actions",
+)
+PROJECT_COORDINATOR_LIVE_ERROR: tuple[int, str] = (409, "project coordinator is live")
+PROJECT_CANCELLATION_PENDING_ERROR: tuple[int, str] = (409, "project cancellation is pending")
+PROJECT_HIERARCHY_INVALID_ERROR: tuple[int, str] = (409, "task hierarchy is invalid; repair the parent link first")
 SNOOZE_INELIGIBLE_ERROR: tuple[int, str] = (
     409,
     "only Unassigned, Assigned, Human queue, and Review cards can be snoozed",
@@ -362,6 +369,11 @@ def evaluate_card_action(
     action: str,
     target_lane: Optional[str] = None,
     has_live_session: bool = False,
+    *,
+    is_project: bool = False,
+    cancellation_pending: bool = False,
+    has_live_coordinator: bool = False,
+    hierarchy_valid: bool = True,
 ) -> Optional[tuple[int, str]]:
     """The one decision every server write path consults before touching an
     agent-owned card's lane, assignee, or status.
@@ -386,6 +398,15 @@ def evaluate_card_action(
         # at all means a caller bug; fail closed instead of falling through
         # to an implicit allow.
         raise ValueError(f"unknown card action: {action!r}")
+
+    if not hierarchy_valid:
+        return PROJECT_HIERARCHY_INVALID_ERROR
+    if cancellation_pending:
+        return PROJECT_CANCELLATION_PENDING_ERROR
+    if has_live_coordinator and action in {"lane_move", "assignee_change", "field_edit"}:
+        return PROJECT_COORDINATOR_LIVE_ERROR
+    if is_project and action in {"lane_move", "cancel"}:
+        return PROJECT_EXPLICIT_ACTION_ERROR
 
     claimed = is_claimed(current_status, current_tags, has_live_session)
     agent_owned = is_agent_owned(current_tags)
@@ -445,6 +466,50 @@ def evaluate_card_action(
         return None
 
     raise AssertionError(f"unhandled action {action!r} despite CARD_ACTIONS validation above")
+
+
+def project_action_policy(
+    current_status: str,
+    current_tags: Iterable[str],
+    project_summary: Optional[dict],
+    *,
+    hierarchy_valid: bool = True,
+    execution_paused: bool = False,
+    handoff_pending: bool = False,
+) -> dict[str, bool]:
+    """Pure project/paused-task action availability for board consumers."""
+    summary = project_summary or {}
+    coordinator = summary.get("coordinator") or {}
+    live = bool(coordinator.get("live"))
+    pending = bool(summary.get("cancellation_pending"))
+    handoff_pending = bool(handoff_pending or summary.get("handoff_pending"))
+    is_project = bool(project_summary)
+    terminal = (current_status or "").lower() in {"done", "cancelled"}
+    agent_owner = derive_assignee(current_tags) in AGENT_ASSIGNEES
+    return {
+        "can_start_project": bool(
+            is_project and hierarchy_valid and not terminal and not live
+            and not pending and not handoff_pending
+        ),
+        "can_plan_project": bool(
+            is_project and agent_owner and hierarchy_valid and not terminal and not live
+            and not pending and not handoff_pending
+        ),
+        "can_complete_project": bool(
+            is_project and hierarchy_valid and not terminal and not live and not pending
+            and not handoff_pending
+            and summary.get("ready_to_close")
+        ),
+        # Pending cancellation remains actionable: the retry must reuse the
+        # operation ID returned by the preview endpoint.
+        "can_cancel_project": bool(
+            (is_project or handoff_pending) and hierarchy_valid and not terminal
+        ),
+        "can_resume_execution": bool(
+            not is_project and execution_paused and hierarchy_valid and not pending
+            and not handoff_pending
+        ),
+    }
 
 
 # Session statuses that map to a board lane when a session carries no
@@ -559,6 +624,11 @@ def plan_lane_move(
     target_lane: str,
     assignee: Optional[str] = None,
     has_live_session: bool = False,
+    *,
+    is_project: bool = False,
+    cancellation_pending: bool = False,
+    has_live_coordinator: bool = False,
+    hierarchy_valid: bool = True,
 ) -> LaneMovePlan:
     """Compute the status/tags write for a card dropped into `target_lane`.
 
@@ -572,6 +642,10 @@ def plan_lane_move(
     """
     error = evaluate_card_action(
         current_status, current_tags, "lane_move", target_lane, has_live_session=has_live_session,
+        is_project=is_project,
+        cancellation_pending=cancellation_pending,
+        has_live_coordinator=has_live_coordinator,
+        hierarchy_valid=hierarchy_valid,
     )
     if error is not None:
         return LaneMovePlan(error=error)

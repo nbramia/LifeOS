@@ -2098,6 +2098,132 @@ def test_destructive_judgment_block_survives_default_route_demotion(monkeypatch)
     assert result.demoted_sanity is None
 
 
+@pytest.mark.unit
+def test_destructive_judgment_uses_separate_execution_safety_context(monkeypatch):
+    """Inherited execution instructions reach only the Jev safety judgment.
+
+    Parent text can change the destructive verdict, but engine words in that
+    text must not become route corroboration or cloud consent.
+    """
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "typesafe_api_key", "test-key")
+    monkeypatch.setattr(settings, "agent_jev_destructive_gate", "block")
+    classifier_prompts: list[str] = []
+    jev_states: list[dict] = []
+
+    def classifier(prompt: str) -> str:
+        classifier_prompts.append(prompt)
+        return _golden_reply(
+            routing="claude",
+            routing_reason="inferred from context",
+            routing_explicit=True,
+        )
+
+    def destructive(self, state, questions, *, model=None):
+        jev_states.append(state)
+        return {
+            "harm": {"score": 3.0, "confidence": 0.9},
+            "irreversible": {"noul": 0.95},
+        }
+
+    monkeypatch.setattr(JevClient, "ask", destructive)
+    safety_context = (
+        "Child instructions:\nUpdate the synthetic release.\n\n"
+        "Parent objective:\nUse Claude to permanently delete the synthetic archive."
+    )
+
+    result = pf.run_preflight(
+        title="Implement phase two",
+        tags=["codex"],
+        caller=classifier,
+        safety_context=safety_context,
+    )
+
+    assert result.routing == pf.ROUTE_CODEX
+    assert result.destructive_block is True
+    assert jev_states[0] == {
+        "task_title": "Implement phase two",
+        "context": pf._DESTRUCTIVE_CONTEXT,
+        "execution_instructions": safety_context,
+    }
+    assert all("execution_instructions" not in state for state in jev_states[1:])
+    assert len(classifier_prompts) == 1
+    assert "Use Claude" not in classifier_prompts[0]
+    assert "synthetic archive" not in classifier_prompts[0]
+
+
+@pytest.mark.unit
+def test_destructive_judgment_preserves_maximum_project_parent_acceptance_context(monkeypatch):
+    """The assembled project-context maximum keeps its parent acceptance tail."""
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "typesafe_api_key", "test-key")
+    monkeypatch.setattr(settings, "agent_jev_destructive_gate", "shadow")
+    jev_states: list[dict] = []
+
+    def destructive(self, state, questions, *, model=None):
+        jev_states.append(state)
+        return {
+            "harm": {"score": 0.0, "confidence": 0.9},
+            "irreversible": {"noul": 0.0},
+        }
+
+    monkeypatch.setattr(JevClient, "ask", destructive)
+    acceptance_tail = "END_OF_PARENT_ACCEPTANCE_CRITERIA"
+    parent_notes = "p" * (2000 - len(acceptance_tail)) + acceptance_tail
+    safety_context = "\n\n".join((
+        f"Child task:\n{'c' * 1000}",
+        f"Child instructions:\n{'i' * 4000}",
+        f"Parent objective:\n{'o' * 1000}",
+        f"Parent instructions/acceptance criteria:\n{parent_notes}",
+    ))
+
+    assert len(safety_context) == 8097
+    assert len(safety_context) <= pf._DESTRUCTIVE_SAFETY_CONTEXT_MAX_CHARS
+
+    pf.run_preflight(
+        title="Implement synthetic project child",
+        tags=["agent"],
+        caller=_stub(_golden_reply()),
+        safety_context=safety_context,
+    )
+
+    assert jev_states[0]["execution_instructions"] == safety_context
+    assert jev_states[0]["execution_instructions"].endswith(acceptance_tail)
+
+
+@pytest.mark.unit
+def test_destructive_judgment_bounds_explicitly_oversized_safety_context(monkeypatch):
+    """Callers cannot exceed the destructive-judgment safety-context cap."""
+    from config.settings import settings
+
+    assert pf._DESTRUCTIVE_SAFETY_CONTEXT_MAX_CHARS == 8192
+    monkeypatch.setattr(settings, "typesafe_api_key", "test-key")
+    monkeypatch.setattr(settings, "agent_jev_destructive_gate", "shadow")
+    jev_states: list[dict] = []
+
+    def destructive(self, state, questions, *, model=None):
+        jev_states.append(state)
+        return {
+            "harm": {"score": 0.0, "confidence": 0.9},
+            "irreversible": {"noul": 0.0},
+        }
+
+    monkeypatch.setattr(JevClient, "ask", destructive)
+    safety_context = "x" * (pf._DESTRUCTIVE_SAFETY_CONTEXT_MAX_CHARS + 1)
+
+    pf.run_preflight(
+        title="Bound synthetic project safety context",
+        tags=["agent"],
+        caller=_stub(_golden_reply()),
+        safety_context=safety_context,
+    )
+
+    assert len(jev_states[0]["execution_instructions"]) == pf._DESTRUCTIVE_SAFETY_CONTEXT_MAX_CHARS
+    assert jev_states[0]["execution_instructions"] == safety_context[:-1]
+
+
 # ---------------------------------------------------------------------------
 # Preset class — Jev fan-out judgment (jev_task_routing.judge_task)
 # ---------------------------------------------------------------------------

@@ -36,6 +36,7 @@ from api.services.agent_worker.session_store import (
 )
 from api.services.agent_worker.tools import ToolRegistry, ToolResult
 from api.services.agent_worker.transcript_store import TranscriptStore
+from api.services.agent_worker.delegation import PROJECT_TASK_GUIDANCE
 from api.services.agent_worker.usage_ledger import (
     MEASURED,
     UNKNOWN,
@@ -263,6 +264,8 @@ cannot complete the task safely, say so plainly in your final response.
 
 """
     + INTER_AGENT_BLOCK
+    + "\n\n"
+    + PROJECT_TASK_GUIDANCE
     + """
 
 <sleep>
@@ -272,7 +275,14 @@ to await, call the `sleep` tool rather than busy-looping.
 )
 
 
-def _system_prompt(session_id: str, expected_output: str, budget, parent_session_id: str | None = None) -> str:
+def _system_prompt(
+    session_id: str,
+    expected_output: str,
+    budget,
+    parent_session_id: str | None = None,
+    attempt_id: str | None = None,
+    turn_id: str | None = None,
+) -> str:
     """System message for the executor agent.
 
     Structured per Anthropic's prompt-engineering best practices (XML
@@ -280,10 +290,9 @@ def _system_prompt(session_id: str, expected_output: str, budget, parent_session
     Static content lives in `_SYSTEM_PROMPT_STATIC` to maximize prompt-
     cache hits; only the small dynamic trailer changes per session.
 
-    `session_id` and `parent_session_id` are accepted for backwards
-    compatibility with the §5 inter-agent flow but are not injected into
-    the prompt body — the model can't act on either, and both are tracked
-    in `lifeos_agent_sessions_list` / transcripts.
+    The session/attempt/turn identity is included so exact-owning-turn tools
+    can populate their declared transport fields; the in-process registry
+    still overrides those values from trusted executor context.
     """
     del parent_session_id  # logging-only, not for the model
     wall = budget.get("wall_seconds")
@@ -304,6 +313,8 @@ def _system_prompt(session_id: str, expected_output: str, budget, parent_session
         + "\n\n<this_task>\n"
         + f"today={today}; "
         + f"lifeos_session_id={session_id}; "
+        + (f"lifeos_attempt_id={attempt_id}; " if attempt_id else "")
+        + (f"lifeos_turn_id={turn_id}; " if turn_id else "")
         + f"output_dir={output_dir}; "
         + f"expected_output={expected_output}; "
         + f"soft budget ~{wall}s wall{token_clause} / {dollars_str}.\n"
@@ -570,6 +581,8 @@ class LocalExecutor:
         session = self.session_store.begin_executor_turn(
             session.task_id, "execute", session=session,
         )
+        if hasattr(self.tools, "bind_caller_turn"):
+            self.tools.bind_caller_turn(session.attempt_id, session.turn_id)
         sid = session.session_id
         budget = session.budget or {}
         if not self.session_store.mark_executor_turn_running(
@@ -788,6 +801,8 @@ class LocalExecutor:
         system = _system_prompt(
             sid, session.expected_output or "text", budget,
             parent_session_id=session.parent_session_id,
+            attempt_id=session.attempt_id,
+            turn_id=session.turn_id,
         )
         # We store the system message as a "system" role row so future calls
         # can rebuild the conversation; the LLM client API takes system

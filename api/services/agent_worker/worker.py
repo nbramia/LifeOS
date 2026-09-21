@@ -118,6 +118,15 @@ from api.services.runtime_identity import (
     heartbeat_runtime_identity,
     publish_runtime_identity,
 )
+from api.services.task_projects import (
+    HANDOFF_OPERATION_FIELD,
+    HANDOFF_QUIESCENT_EVENT,
+    HANDOFF_REQUEST_EVENT,
+    HANDOFF_SOURCE_ATTEMPT_FIELD,
+    HANDOFF_SOURCE_SESSION_FIELD,
+    HANDOFF_SOURCE_TURN_FIELD,
+    LAST_HANDOFF_OPERATION_FIELD,
+)
 from config.settings import settings
 
 
@@ -186,6 +195,13 @@ _RESOURCE_CLEANUP_INTERVAL_SECONDS = 300
 _RESOURCE_CLEANUP_BATCH_SIZE = 10
 _WORKTREE_RECENT_SECONDS = 24 * 60 * 60
 _TASK_FETCH_FAILED = object()
+
+# Recorded by _maybe_finalize_project_handoff when an executor turn returns
+# with valid stop evidence but the task view fetched over HTTP has not yet
+# picked up the handoff fields staged by another process (MCP server write +
+# file-watcher debounce). _reconcile_project_handoffs looks for this event to
+# retry finalization once the task view catches up.
+PROJECT_HANDOFF_RETURN_PENDING_EVENT = "project_handoff_return_pending"
 
 # A recurring (cron) schedule stamps its handed-off #agent task with a
 # `sched-<id>` tag (see scheduler_store._hand_off_to_agent). The worker reads
@@ -662,6 +678,8 @@ _WIP_BRANCH_RE = re.compile(r"git\s+(?:switch\s+-c|checkout\s+-b)\s+([A-Za-z0-9.
 _TASK_NOTES_MAX_CHARS = 6000
 _OPERATOR_NOTES_MAX_CHARS = 2000
 _HANDOFF_MAX_CHARS = 4000
+_PROJECT_CHILD_INSTRUCTIONS_MAX_CHARS = 4000
+_PROJECT_PARENT_INSTRUCTIONS_MAX_CHARS = 2000
 
 
 class _SynchronousPool:
@@ -975,10 +993,14 @@ class Worker:
         )
         if recovered_claims:
             logger.info("released %d abandoned answered-question claim(s)", recovered_claims)
+        # Snapshot the sessions that existed before reconciliation. A handoff
+        # finalizer may release its blocked coordinator to CLAIMED; that newly
+        # released work is dispatchable, not an orphan from the prior process.
+        pending = self.session_store.list_non_terminal()
         # Reconcile task projections left between the durable marker and the
         # HTTP/Markdown write before dispatching any sessions.
+        self._reconcile_project_handoffs()
         self.lifecycle_projector.replay_pending()
-        pending = self.session_store.list_non_terminal()
         # Sessions the detached-restart primitive deliberately killed. Read once
         # and cleared after the loop so a single marker is honored exactly once.
         self_restart_sids, self_restart_tids = _read_self_restart_marker(
@@ -991,6 +1013,20 @@ class Worker:
         recovered = 0
         for session in pending:
             sid = session.session_id
+            # The reconciliation above can complete this exact turn's handoff
+            # (or otherwise move it) between the pre-reconcile snapshot and
+            # here — re-read the row and skip a snapshot that's now stale
+            # rather than rolling back work reconciliation already finished.
+            current = self.session_store.get_by_session_id(sid)
+            if (
+                current is None
+                or current.status in TERMINAL_STATUSES
+                or current.attempt_id != session.attempt_id
+                or current.turn_id != session.turn_id
+            ):
+                continue
+            if self._recover_project_handoff_session(session):
+                continue
             # Sleeping sessions are healthy — main loop will wake them.
             if session.status == STATUS_YIELDED:
                 continue
@@ -1102,6 +1138,7 @@ class Worker:
         # worker is paused or near its daily cap.
         self._process_human_queue()
         self._replay_wait_wakeups()
+        self._reconcile_project_handoffs()
         # Heal any vault tag left stranded by a terminal status write that
         # bypassed the projector (e.g. a kill landing on a parked/offline
         # session — see `_reconcile_lifecycle_drift`). Also never gated on
@@ -3268,6 +3305,8 @@ class Worker:
                 task_id = task.get("id")
                 if not task_id:
                     continue
+                if (task.get("fields") or {}).get(HANDOFF_OPERATION_FIELD):
+                    continue
                 session = self.session_store.get(task_id)
                 if session is None:
                     continue
@@ -3726,6 +3765,17 @@ class Worker:
         candidates: list[dict[str, Any]] = []
         for task in all_tasks:
             tags = {str(t).lstrip("#").lower() for t in (task.get("tags") or [])}
+            if (
+                task.get("is_project")
+                or task.get("hierarchy_valid") is False
+                or task.get("parent_cancellation_pending")
+                or task.get("parent_handoff_pending")
+            ):
+                continue
+            if str((task.get("fields") or {}).get("execution_paused", "")).lower() in {
+                "1", "true", "yes", "on",
+            }:
+                continue
             if tags & _CLAIM_EXCLUSION_TAGS:
                 continue
             if _is_snoozed(task.get("fields")):
@@ -3784,14 +3834,32 @@ class Worker:
     def _task_claim_is_current(self, task: dict[str, Any] | None) -> bool:
         """Return whether a fetched task still carries this worker's claim."""
         tags = self._norm_task_tags(task)
-        return bool(task) and RUNNING_TAG in tags and REASSIGNED_TAG not in tags
+        fields = (task or {}).get("fields") or {}
+        return (
+            bool(task)
+            and RUNNING_TAG in tags
+            and REASSIGNED_TAG not in tags
+            and not task.get("is_project")
+            and task.get("hierarchy_valid") is not False
+            and not task.get("parent_cancellation_pending")
+            and not task.get("parent_handoff_pending")
+            and str(fields.get("execution_paused", "")).lower() not in {"1", "true", "yes", "on"}
+        )
 
     def _claim_is_current(self, task_id: str, *, allow_reassigned: bool = False) -> bool:
         """Confirm the worker still owns the lifecycle claim before acting."""
         task = self._fetch_task(task_id)
         tags = self._norm_task_tags(task)
-        return bool(task) and RUNNING_TAG in tags and (
-            allow_reassigned or REASSIGNED_TAG not in tags
+        fields = (task or {}).get("fields") or {}
+        return (
+            bool(task)
+            and RUNNING_TAG in tags
+            and (allow_reassigned or REASSIGNED_TAG not in tags)
+            and not task.get("is_project")
+            and task.get("hierarchy_valid") is not False
+            and not task.get("parent_cancellation_pending")
+            and not task.get("parent_handoff_pending")
+            and str(fields.get("execution_paused", "")).lower() not in {"1", "true", "yes", "on"}
         )
 
     def _fail_closed_task_resume(self, session, phase: str) -> None:
@@ -3814,7 +3882,17 @@ class Worker:
             logger.warning("resume task fetch %s failed: %s", session.task_id, exc)
             task = None
         tags = self._norm_task_tags(task)
-        if not task or REASSIGNED_TAG in tags or not tags.intersection(resumable_tags):
+        fields = (task or {}).get("fields") or {}
+        if (
+            not task
+            or REASSIGNED_TAG in tags
+            or not tags.intersection(resumable_tags)
+            or task.get("is_project")
+            or task.get("hierarchy_valid") is False
+            or task.get("parent_cancellation_pending")
+            or task.get("parent_handoff_pending")
+            or str(fields.get("execution_paused", "")).lower() in {"1", "true", "yes", "on"}
+        ):
             self._fail_closed_task_resume(session, phase)
             return None
         return task
@@ -4623,6 +4701,9 @@ class Worker:
             return
         session = current
 
+        if self._maybe_finalize_project_handoff(session, outcome):
+            return
+
         if outcome.status == STATUS_BLOCKED:
             if outcome.reason == REASON_AWAITING_PLAN_APPROVAL:
                 prompt = "Plan ready — reply 'approve' to proceed, 'reject' to cancel, or send feedback to refine."
@@ -5174,6 +5255,9 @@ class Worker:
             return
         session = current
 
+        if self._maybe_finalize_project_handoff(session, outcome):
+            return
+
         if outcome.status == STATUS_BLOCKED and outcome.reason == REASON_AWAITING_CLARIFICATION:
             question_body = (outcome.final_text or "").strip()
             prompt = (
@@ -5391,6 +5475,88 @@ class Worker:
         except Exception as exc:
             logger.warning("fetch_task %s failed: %s", task_id, exc)
             return _TASK_FETCH_FAILED if distinguish_failure else None
+
+    def _with_project_context(self, task: dict[str, Any]) -> dict[str, Any]:
+        """Add bounded parent objective and sibling status to a child dispatch."""
+        parent_id = task.get("parent_id") or (task.get("fields") or {}).get("parent_id")
+        if not isinstance(parent_id, str) or not parent_id.strip():
+            return task
+        parent_id = parent_id.strip()
+        parent = self._fetch_task(parent_id)
+        if not isinstance(parent, dict):
+            return task
+        siblings: list[dict[str, Any]] = []
+        try:
+            response = self._http.get(
+                f"{self.api_base}/api/tasks/{parent_id}/children",
+                params={"limit": 50, "offset": 0},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if isinstance(payload, dict) and isinstance(payload.get("tasks"), list):
+                siblings = payload["tasks"][:50]
+        except Exception as exc:
+            logger.warning("project context children fetch for %s failed: %s", task.get("id"), exc)
+
+        sibling_summary = []
+        for item in siblings:
+            if not isinstance(item, dict):
+                continue
+            item_tags = {str(tag).lstrip("#").lower() for tag in item.get("tags", [])}
+            assignee = next(
+                (candidate for candidate in ("me", *_BOARD_AGENT_ASSIGNEES) if candidate in item_tags),
+                None,
+            )
+            sibling_summary.append({
+                "id": item.get("id"),
+                "status": item.get("status"),
+                "assignee": assignee,
+            })
+        parent_fields = parent.get("fields") if isinstance(parent.get("fields"), dict) else {}
+        parent_title = str(parent.get("description") or "")
+        parent_notes = str(parent.get("notes") or "")[:_PROJECT_PARENT_INSTRUCTIONS_MAX_CHARS]
+        context = {
+            "parent_id": parent_id,
+            "parent_title": parent_title,
+            "parent_notes": parent_notes,
+            "children_total": parent.get("child_count") or len(sibling_summary),
+            "children": sibling_summary,
+            "children_partial": (parent.get("child_count") or 0) > len(sibling_summary),
+        }
+        lines = [
+            "Project context (task hierarchy, not agent-session ancestry):",
+            f"Parent {parent_id}: {context['parent_title']}",
+        ]
+        if context["parent_notes"]:
+            lines.append("Parent objective/acceptance notes:\n" + context["parent_notes"])
+        if sibling_summary:
+            lines.append(
+                "Child status summary:\n"
+                + "\n".join(
+                    f"- {item['id']}: status={item['status']}, assignee={item['assignee'] or 'unassigned'}"
+                    for item in sibling_summary
+                )
+            )
+        own_notes = (task.get("notes") or "").strip()[:_PROJECT_CHILD_INSTRUCTIONS_MAX_CHARS]
+        project_notes = "\n".join(lines)[:_PROJECT_PARENT_INSTRUCTIONS_MAX_CHARS]
+        child_title = str(task.get("description") or task.get("id") or "")[:1000]
+        safety_parts = [f"Child task:\n{child_title}"]
+        if own_notes:
+            safety_parts.append(f"Child instructions:\n{own_notes}")
+        safety_parts.append(f"Parent objective:\n{parent_title[:1000]}")
+        if parent_notes:
+            safety_parts.append(f"Parent instructions/acceptance criteria:\n{parent_notes}")
+        return {
+            **task,
+            "notes": f"{own_notes}\n\n{project_notes}".strip(),
+            "project_context": context,
+            "_preflight_safety_context": "\n\n".join(safety_parts),
+            "_project_location_context": {
+                "host": parent_fields.get("host"),
+                "working_dir": parent_fields.get("working_dir"),
+                "project_affinity": parent_fields.get("project"),
+            },
+        }
 
     def _last_reassignment(self, session_id: str) -> dict[str, Any] | None:
         """Return the latest board reassign marker, if any."""
@@ -5628,7 +5794,7 @@ class Worker:
             return
         # Use the revalidated snapshot for title, tags, and executor context;
         # the candidate list may have gone stale while the claim was acquired.
-        task = current_task
+        task = self._with_project_context(current_task)
         title = task.get("description", task_id)
 
         # Preflight: budget, routing, ambiguity, sanity.
@@ -5637,6 +5803,7 @@ class Worker:
                 title=title,
                 tags=task.get("tags", []),
                 caller=self._preflight_caller,
+                safety_context=task.get("_preflight_safety_context"),
             )
         except Exception as exc:
             logger.exception("preflight crashed for %s: %s", task_id, exc)
@@ -5721,6 +5888,8 @@ class Worker:
             session = self.session_store.get(task_id) or session
         handoff = self._reassignment_context(session) if reassignment else ""
         dispatch_task = dict(task)
+        dispatch_task.pop("_preflight_safety_context", None)
+        dispatch_task.pop("_project_location_context", None)
         if handoff:
             notes = (dispatch_task.get("notes") or "").strip()
             # This copy is what every executor receives, including local and
@@ -5804,30 +5973,72 @@ class Worker:
         # `session.execution_spec` for this task sees exactly this
         # `working_dir`, so any host-aware adjustment has to happen in this
         # one call, not after the fact.
-        from api.services.directory_resolver import resolve_working_directory
+        from api.services.directory_resolver import (
+            resolve_location_affinity,
+            resolve_working_directory,
+        )
         from api.services.agent_worker.remote_spawn import (
             api_host_name as _api_host_name,
             is_local_host,
         )
         # A CLI route (#claude/#codex) dispatched to a remote
-        # LIFEOS_AGENT_HOSTS host can't be cloned into from this process,
-        # and there's no evidence an uncloned GitHub-only repo exists on
-        # that other machine either — the resolver falls back to the
-        # keyword cascade for that case instead (see
-        # `resolve_working_directory`'s `allow_uncloned`). Every other
-        # route runs in-process on this host regardless of `session.host`,
-        # so it keeps today's behavior.
+        # LIFEOS_AGENT_HOSTS host must not reuse a directory inferred from
+        # this API host's catalog or title keywords. Only an explicit child
+        # directory, or a parent directory explicitly scoped to the same
+        # execution host, is portable to that remote machine. Every other
+        # route runs in-process on this host regardless of `session.host`.
         is_remote_cli_spawn = (
             pre.routing in (ROUTE_CLAUDE_CODE, ROUTE_CODEX)
             and not is_local_host(session.host, _api_host_name())
         )
-        # Scheduled handoffs may carry an explicit canonical working
-        # directory in task fields; otherwise retain the legacy
-        # description-based resolver.
-        candidate_working_dir = (
-            (task.get("fields") or {}).get("working_dir")
-            or resolve_working_directory(title, allow_uncloned=not is_remote_cli_spawn)
+        task_fields = task.get("fields") or {}
+        project_location = task.get("_project_location_context") or {}
+
+        def _clean_location(value: object) -> str | None:
+            cleaned = value.strip() if isinstance(value, str) else ""
+            return cleaned or None
+
+        child_working_dir = _clean_location(task_fields.get("working_dir"))
+        child_affinity = task_fields.get("project")
+        parent_working_dir = _clean_location(project_location.get("working_dir"))
+        parent_host = project_location.get("host")
+        parent_affinity = project_location.get("project_affinity")
+
+        def _execution_host(value: object) -> str:
+            cleaned = value.strip() if isinstance(value, str) else ""
+            return cleaned or _api_host_name()
+
+        child_execution_host = (
+            assignment.host if pre.routing in (ROUTE_CLAUDE_CODE, ROUTE_CODEX) else None
         )
+        parent_path_compatible = (
+            parent_working_dir
+            and _execution_host(parent_host) == _execution_host(child_execution_host)
+        )
+        is_cli_route = pre.routing in (ROUTE_CLAUDE_CODE, ROUTE_CODEX)
+
+        def _usable_inferred_location(value: str | None) -> str | None:
+            if not value:
+                return None
+            if is_cli_route or os.path.isdir(value):
+                return value
+            return None
+
+        candidate_working_dir = child_working_dir
+        if not candidate_working_dir and not is_remote_cli_spawn:
+            candidate_working_dir = _usable_inferred_location(
+                resolve_location_affinity(child_affinity)
+            )
+        if not candidate_working_dir and parent_path_compatible:
+            candidate_working_dir = parent_working_dir
+        if not candidate_working_dir and not is_remote_cli_spawn:
+            candidate_working_dir = _usable_inferred_location(
+                resolve_location_affinity(parent_affinity)
+            )
+        if not candidate_working_dir and not is_remote_cli_spawn:
+            candidate_working_dir = _usable_inferred_location(
+                resolve_working_directory(title, allow_uncloned=is_cli_route)
+            )
         if pre.routing in (ROUTE_CLAUDE_CODE, ROUTE_CODEX):
             # Clone-on-demand: a Jev-chosen location may name a repository
             # the operator owns but that isn't checked out on this host
@@ -5900,12 +6111,15 @@ class Worker:
             # directory that isn't a git repository at all is unaffected
             # either way — `ensure_worktree` returns it verbatim.
             from api.services.agent_worker.git_worktree import WorktreeError, ensure_worktree
-            try:
-                provisioned = ensure_worktree(candidate_working_dir, task_id, title, host=assignment.host)
-            except WorktreeError as exc:
-                self._mark_failed(session, task, f"worktree provisioning failed: {exc}")
-                return
-            candidate_working_dir = provisioned.working_dir
+            if candidate_working_dir:
+                try:
+                    provisioned = ensure_worktree(
+                        candidate_working_dir, task_id, title, host=assignment.host,
+                    )
+                except WorktreeError as exc:
+                    self._mark_failed(session, task, f"worktree provisioning failed: {exc}")
+                    return
+                candidate_working_dir = provisioned.working_dir
         execution = self._resolve_session_execution(
             session,
             request=ExecutionRequest(),
@@ -6037,7 +6251,7 @@ class Worker:
         # _cli_inflight machinery spawned sessions already use — so a
         # top-level #agent task gets the identical off-tick treatment.
         if session.routing in (ROUTE_CLAUDE_CODE, ROUTE_CODEX):
-            working_dir = execution.spec.working_dir or resolve_working_directory(title)
+            working_dir = execution.spec.working_dir
 
             # Clone-on-demand: a defensive backstop for the same guard
             # already applied upstream (before `ensure_worktree`, in the
@@ -6127,6 +6341,292 @@ class Worker:
     # Outcome handling (shared between fresh dispatch and sleep wake-up)
     # ------------------------------------------------------------------
 
+    def _record_handoff_quiescence(
+        self, session: Session, events: list[dict[str, Any]], operation_id: str,
+        attempt_id: str, turn_id: str, executor: str | None,
+    ) -> None:
+        """Append proof that this exact turn stopped, deduped per operation/attempt/turn."""
+        if any(
+            event.get("kind") == HANDOFF_QUIESCENT_EVENT
+            and (event.get("payload") or {}).get("operation_id") == operation_id
+            and (event.get("payload") or {}).get("attempt_id") == attempt_id
+            and (event.get("payload") or {}).get("turn_id") == turn_id
+            for event in events
+        ):
+            return
+        self.transcript_store.append(session.session_id, HANDOFF_QUIESCENT_EVENT, {
+            "project_id": session.task_id,
+            "operation_id": operation_id,
+            "attempt_id": attempt_id,
+            "turn_id": turn_id,
+            "executor": executor or session.routing,
+        })
+
+    def _maybe_finalize_project_handoff(self, session: Session, outcome) -> bool:
+        """Consume an exact post-return handoff without projecting task completion."""
+        attempt_id = getattr(outcome, "attempt_id", None) or session.attempt_id
+        turn_id = getattr(outcome, "turn_id", None) or session.turn_id
+        try:
+            events = self.transcript_store.read(session.session_id)
+        except Exception as exc:
+            logger.warning("handoff transcript read failed for %s: %s", session.session_id, exc)
+            return False
+        request = next((
+            event.get("payload") or {}
+            for event in reversed(events)
+            if event.get("kind") == HANDOFF_REQUEST_EVENT
+            and (event.get("payload") or {}).get("source_attempt_id") == attempt_id
+            and (event.get("payload") or {}).get("source_turn_id") == turn_id
+        ), None)
+        if request is None:
+            return False
+        operation_id = request.get("operation_id")
+        task = self._fetch_task(session.task_id)
+        fields = (task or {}).get("fields") or {}
+        if task is None:
+            self.transcript_store.append(session.session_id, "project_handoff_finalize_deferred", {
+                "operation_id": operation_id, "reason": "task unavailable",
+            })
+            return True
+        if fields.get(LAST_HANDOFF_OPERATION_FIELD) == operation_id:
+            return True
+        if (
+            fields.get(HANDOFF_OPERATION_FIELD) != operation_id
+            or fields.get(HANDOFF_SOURCE_SESSION_FIELD) != session.session_id
+            or fields.get(HANDOFF_SOURCE_ATTEMPT_FIELD) != attempt_id
+            or fields.get(HANDOFF_SOURCE_TURN_FIELD) != turn_id
+        ):
+            # The task view fetched here (an index rebuilt by another process
+            # on a debounce) may simply be stale — the MCP server's staging
+            # write hasn't landed in it yet. This operation_id comes from
+            # this exact turn's own request event, and the turn has already
+            # returned with the route's stop evidence — the same proof the
+            # fresh path below records at return for these routes — so it's
+            # recorded here too: proof the source stopped, not activation.
+            # The finalizer still requires matching task fields, a terminal
+            # source, and no cancellation before it does anything with it.
+            # Record a return-pending event so reconciliation can retry once
+            # the view catches up.
+            termination_evidence = getattr(outcome, "termination_evidence", {}) or {}
+            stop_evidence_satisfied = (
+                session.routing != ROUTE_HERMES
+                or termination_evidence.get("done_seen") is True
+            )
+            if stop_evidence_satisfied:
+                executor = getattr(outcome, "executor", None)
+                self._record_handoff_quiescence(
+                    session, events, operation_id, attempt_id, turn_id, executor,
+                )
+                if not any(
+                    event.get("kind") == PROJECT_HANDOFF_RETURN_PENDING_EVENT
+                    and (event.get("payload") or {}).get("operation_id") == operation_id
+                    and (event.get("payload") or {}).get("attempt_id") == attempt_id
+                    and (event.get("payload") or {}).get("turn_id") == turn_id
+                    for event in events
+                ):
+                    self.transcript_store.append(
+                        session.session_id, PROJECT_HANDOFF_RETURN_PENDING_EVENT, {
+                            "operation_id": operation_id,
+                            "attempt_id": attempt_id,
+                            "turn_id": turn_id,
+                            "executor": executor or session.routing,
+                            "termination_evidence": termination_evidence,
+                        },
+                    )
+            return True
+        if (
+            session.routing == ROUTE_HERMES
+            and (getattr(outcome, "termination_evidence", {}) or {}).get("done_seen")
+            is not True
+        ):
+            return True
+        self._record_handoff_quiescence(
+            session, events, operation_id, attempt_id, turn_id,
+            getattr(outcome, "executor", None),
+        )
+        # The exact turn has returned with the route's required stop evidence,
+        # so retain that proof even when cancellation won the race. The guard
+        # still prevents source completion, finalization, and child release.
+        if self.session_store.is_cancelled(session.task_id, attempt_id, turn_id):
+            return True
+        if not self.session_store.update_status(
+            session.task_id, STATUS_COMPLETED,
+            attempt_id=attempt_id, turn_id=turn_id, project=False,
+        ):
+            return True
+        try:
+            response = self._http.post(
+                f"{self.api_base}/api/tasks/{session.task_id}/project/handoff/finalize",
+                json={
+                    "operation_id": operation_id,
+                    "source_session_id": session.session_id,
+                    "source_attempt_id": attempt_id,
+                    "source_turn_id": turn_id,
+                },
+            )
+            response.raise_for_status()
+        except Exception as exc:
+            logger.warning("project handoff finalize deferred for %s: %s", session.task_id, exc)
+            self.transcript_store.append(session.session_id, "project_handoff_finalize_deferred", {
+                "operation_id": operation_id, "reason": type(exc).__name__,
+            })
+        return True
+
+    def _reconcile_project_handoffs(self) -> int:
+        """Retry quiescent handoff finalizers before ordinary drift projection."""
+        finalized = 0
+        try:
+            response = self._http.get(f"{self.api_base}/api/tasks")
+            response.raise_for_status()
+            tasks = response.json().get("tasks", [])
+        except Exception as exc:
+            logger.warning("handoff reconciliation list failed: %s", exc)
+            return 0
+        for task in tasks:
+            task_id = task.get("id")
+            fields = task.get("fields") or {}
+            operation_id = fields.get(HANDOFF_OPERATION_FIELD)
+            if not task_id or not operation_id:
+                continue
+            source_session_id = fields.get(HANDOFF_SOURCE_SESSION_FIELD)
+            source_attempt_id = fields.get(HANDOFF_SOURCE_ATTEMPT_FIELD)
+            source_turn_id = fields.get(HANDOFF_SOURCE_TURN_FIELD)
+            source = self.session_store.get_by_session_id(source_session_id or "")
+            if source is None or not source_attempt_id or not source_turn_id:
+                continue
+            if source.status not in TERMINAL_STATUSES:
+                # A still-running source can't be finalized directly, but an
+                # exact turn that already returned with satisfied stop
+                # evidence (recorded as a return-pending event because the
+                # task view hadn't caught up yet) is safe to re-attempt now
+                # that this call sees a fresh view.
+                if (
+                    source.attempt_id != source_attempt_id
+                    or source.turn_id != source_turn_id
+                ):
+                    continue
+                try:
+                    source_events = self.transcript_store.read(source.session_id)
+                except Exception as exc:
+                    logger.warning(
+                        "handoff return-pending read failed for %s: %s",
+                        source.session_id, exc,
+                    )
+                    continue
+                pending = next((
+                    event.get("payload") or {}
+                    for event in reversed(source_events)
+                    if event.get("kind") == PROJECT_HANDOFF_RETURN_PENDING_EVENT
+                    and (event.get("payload") or {}).get("operation_id") == operation_id
+                    and (event.get("payload") or {}).get("attempt_id") == source_attempt_id
+                    and (event.get("payload") or {}).get("turn_id") == source_turn_id
+                ), None)
+                if pending is None:
+                    continue
+                self._maybe_finalize_project_handoff(source, SimpleNamespace(
+                    attempt_id=source_attempt_id,
+                    turn_id=source_turn_id,
+                    executor=pending.get("executor"),
+                    termination_evidence=pending.get("termination_evidence") or {},
+                ))
+                continue
+            try:
+                response = self._http.post(
+                    f"{self.api_base}/api/tasks/{task_id}/project/handoff/finalize",
+                    json={
+                        "operation_id": operation_id,
+                        "source_session_id": source_session_id,
+                        "source_attempt_id": source_attempt_id,
+                        "source_turn_id": source_turn_id,
+                    },
+                )
+                if response.status_code == 409:
+                    continue
+                response.raise_for_status()
+                finalized += 1
+            except Exception as exc:
+                logger.warning("handoff reconciliation failed for %s: %s", task_id, exc)
+        return finalized
+
+    def _recover_project_handoff_session(self, session: Session) -> bool:
+        """Keep staged handoffs fenced until this restart proves source quiescence."""
+        task = self._fetch_task(session.task_id)
+        fields = (task or {}).get("fields") or {}
+        operation_id = fields.get(HANDOFF_OPERATION_FIELD)
+        if not operation_id:
+            return False
+        exact_source = (
+            fields.get(HANDOFF_SOURCE_SESSION_FIELD) == session.session_id
+            and fields.get(HANDOFF_SOURCE_ATTEMPT_FIELD) == session.attempt_id
+            and fields.get(HANDOFF_SOURCE_TURN_FIELD) == session.turn_id
+        )
+        if not exact_source:
+            self.transcript_store.append(
+                session.session_id,
+                "project_handoff_recovery_pending",
+                {
+                    "operation_id": operation_id,
+                    "reason": "persisted handoff source identity does not match current turn",
+                    "routing": session.routing,
+                },
+            )
+            return True
+        if session.routing in {ROUTE_LOCAL, ROUTE_REMOTE}:
+            recovery_outcome = SimpleNamespace(
+                attempt_id=session.attempt_id,
+                turn_id=session.turn_id,
+                executor=session.routing,
+            )
+            self._maybe_finalize_project_handoff(session, recovery_outcome)
+        elif session.routing == ROUTE_CLAUDE and session.managed_agent_session_id:
+            managed = self._get_managed_executor()
+            verified = False
+            reason = "managed runtime termination could not be verified"
+            if managed is not None and managed.driver is not None:
+                try:
+                    managed.driver.kill_session(
+                        session.managed_agent_session_id,
+                        reason="project_handoff_restart_recovery",
+                    )
+                    remote = managed.driver.get_session_state(
+                        session.managed_agent_session_id,
+                    )
+                    verified = remote.status in {
+                        "idle", "completed", "failed", "cancelled", "budget_exceeded",
+                    }
+                    if not verified:
+                        reason = f"managed runtime still reports {remote.status}"
+                except Exception as exc:
+                    reason = f"managed runtime verification failed: {type(exc).__name__}"
+            if verified:
+                recovery_outcome = SimpleNamespace(
+                    attempt_id=session.attempt_id,
+                    turn_id=session.turn_id,
+                    executor=session.routing,
+                )
+                self._maybe_finalize_project_handoff(session, recovery_outcome)
+            else:
+                self.transcript_store.append(
+                    session.session_id,
+                    "project_handoff_recovery_pending",
+                    {
+                        "operation_id": operation_id,
+                        "reason": reason,
+                        "routing": session.routing,
+                    },
+                )
+        else:
+            self.transcript_store.append(
+                session.session_id,
+                "project_handoff_recovery_pending",
+                {
+                    "operation_id": operation_id,
+                    "reason": "runtime termination is not yet verified",
+                    "routing": session.routing,
+                },
+            )
+        return True
+
     def _handle_outcome(self, session: Session, task: dict[str, Any], outcome) -> None:
         current = self.session_store.get(session.task_id)
         # Compatibility stubs may omit lifecycle ids, but they are only safe
@@ -6150,6 +6650,11 @@ class Worker:
         session = current
         title = task.get("description", session.task_id)
         sid = session.session_id
+        # A matching handoff consumes this returned turn before ordinary
+        # cancellation handling.  Its recorder keeps exact-turn quiescence,
+        # but its own cancellation guard prevents every activation effect.
+        if self._maybe_finalize_project_handoff(session, outcome):
+            return
         # Cancellation is a durable exact-turn decision, not merely a
         # transcript/status hint. Executors may return a clean terminal result
         # after cancellation races their final provider event; check the fence

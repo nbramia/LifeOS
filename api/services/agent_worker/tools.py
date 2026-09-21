@@ -346,6 +346,12 @@ class ToolRegistry:
             return STANDARD_TOOLS + list(INTER_AGENT_TOOL_SCHEMAS) + list(self._mcp.tools)
         return STANDARD_TOOLS + list(self._mcp.tools)
 
+    def bind_caller_turn(self, attempt_id: str, turn_id: str) -> None:
+        """Bind in-process inter-agent calls to the executor turn just begun."""
+        if self._inter_ctx is not None:
+            self._inter_ctx.caller_attempt_id = attempt_id
+            self._inter_ctx.caller_turn_id = turn_id
+
     def dispatch(self, name: str, arguments: dict, base_dir: str | None = None) -> ToolResult:
         """Run one tool call. Returns a ToolResult.
 
@@ -377,12 +383,18 @@ class ToolRegistry:
                 # over MCP HTTP can supply it); for local we override.
                 args = dict(arguments or {})
                 args["caller_session_id"] = self._inter_ctx.caller_session_id
+                if name == "lifeos_agent_project_handoff":
+                    args["caller_attempt_id"] = self._inter_ctx.caller_attempt_id
+                    args["caller_turn_id"] = self._inter_ctx.caller_turn_id
                 payload = inter_agent.dispatch(self._inter_ctx, name, args)
                 # `yield_until` and `lifeos_agent_user_ask` both end the executor
                 # turn — the first waits for child completion, the second for
                 # a Telegram reply.
                 yield_signal = (
-                    name in ("lifeos_agent_yield_until", "lifeos_agent_user_ask")
+                    name in (
+                        "lifeos_agent_yield_until", "lifeos_agent_user_ask",
+                        "lifeos_agent_project_handoff",
+                    )
                     and payload.get("ok")
                 )
                 return ToolResult(
@@ -402,7 +414,7 @@ class ToolRegistry:
         if name in self._mcp_tool_names:
             try:
                 data = self._mcp._call_api(name, arguments)
-                formatted = self._mcp._format_response(name, data)
+                formatted = self._mcp._format_response(name, data, arguments)
                 # MCP _call_api signals errors by returning a dict with an
                 # "error" key — surface that as an error result.
                 is_error = isinstance(data, dict) and "error" in data

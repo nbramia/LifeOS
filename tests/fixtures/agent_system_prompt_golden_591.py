@@ -254,6 +254,20 @@ STATIC_TEXT = ("You are LifeOS, Test User's personal knowledge assistant.\n"
  '- The Obsidian vault contains: daily journals, meeting notes, project docs, people files, task '
  'files.')
 
+HIERARCHY_BLOCK = {
+ 'text': "Projects are ordinary tasks classified only by other tasks' parent references; task "
+         'hierarchy is not agent-session ancestry. Resolve stable task IDs and inspect the parent '
+         'plus its relevant children before acting on a project. When breaking work down, create '
+         "durable children with parent_id and preserve each child's independent assignment; never "
+         "copy the parent's routing tags or choose a cloud provider unless the operator explicitly "
+         'delegated that choice. Completing a project must use the validated project-completion '
+         'path and must not mark unfinished children done. Before cancelling a project, preview '
+         'its unfinished, running, and awaiting-review children, explain that pending review '
+         'output will be abandoned, and obtain explicit confirmation; report partial stop '
+         'failures honestly. Cancelling one child never cancels its parent or siblings.',
+ 'type': 'text',
+}
+
 WITH_PERSONA_TAIL = [{'text': 'FITNESS-PERSONA-MARKER: you are the fitness bot.', 'type': 'text'},
  {'text': 'Current date/time: Wednesday, August 19, 2026 at 09:14 AM EDT\n'
           'Timezone: America/New_York\n'
@@ -265,7 +279,8 @@ WITH_PERSONA_TAIL = [{'text': 'FITNESS-PERSONA-MARKER: you are the fitness bot.'
           'the equivalent after/before on email, message, and calendar tools). Prefer the most '
           "recent matches, and treat results more than a few months old as stale for a 'recent' "
           'query unless nothing newer exists.',
-  'type': 'text'}]
+  'type': 'text'},
+ HIERARCHY_BLOCK]
 
 WITHOUT_PERSONA_TAIL = [{'text': 'Current date/time: Wednesday, August 19, 2026 at 09:14 AM EDT\n'
           'Timezone: America/New_York\n'
@@ -277,7 +292,8 @@ WITHOUT_PERSONA_TAIL = [{'text': 'Current date/time: Wednesday, August 19, 2026 
           'the equivalent after/before on email, message, and calendar tools). Prefer the most '
           "recent matches, and treat results more than a few months old as stale for a 'recent' "
           'query unless nothing newer exists.',
-  'type': 'text'}]
+  'type': 'text'},
+ HIERARCHY_BLOCK]
 
 VOICE_TURN_TAIL = [{'text': '## Spoken response\n'
           '\n'
@@ -295,7 +311,8 @@ VOICE_TURN_TAIL = [{'text': '## Spoken response\n'
           'the equivalent after/before on email, message, and calendar tools). Prefer the most '
           "recent matches, and treat results more than a few months old as stale for a 'recent' "
           'query unless nothing newer exists.',
-  'type': 'text'}]
+  'type': 'text'},
+ HIERARCHY_BLOCK]
 
 WITH_TAGS_TAIL = [{'text': 'Current date/time: Wednesday, August 19, 2026 at 09:14 AM EDT\n'
           'Timezone: America/New_York\n'
@@ -308,6 +325,7 @@ WITH_TAGS_TAIL = [{'text': 'Current date/time: Wednesday, August 19, 2026 at 09:
           "recent matches, and treat results more than a few months old as stale for a 'recent' "
           'query unless nothing newer exists.',
   'type': 'text'},
+ HIERARCHY_BLOCK,
  {'text': 'Existing task tags (with usage counts): work (2), urgent (1).\n'
           'When the user asks to tag a task, prefer an existing tag if it clearly matches the '
           "user's intent semantically — including casing and hyphenation. Only create a new tag "

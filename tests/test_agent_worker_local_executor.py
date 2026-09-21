@@ -69,7 +69,7 @@ class _ScriptedLLM:
 class _FakeMCPServer:
     tools: list[dict] = []
     def _call_api(self, name, args): return {}
-    def _format_response(self, name, data): return ""
+    def _format_response(self, name, data, arguments=None): return ""
 
 
 @pytest.fixture

@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-09-15
+**Last Updated:** 2026-09-20
 
 Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Four adjacent catalogs split out for size:
 
@@ -355,11 +355,18 @@ Create a task. Stored as an Obsidian Tasks-compatible markdown checkbox in the v
   "due_date": "2025-02-10",
   "tags": ["health"],
   "reminder_id": "optional-linked-reminder-uuid",
+  "operation_key": "synthetic-dentist-import-1",
   "notes": "Ask about the Tuesday afternoon slot",
   "fields": {"host": "laptop"}
 }
 ```
-`context`, `status`, `notes`, `fields`, and `reminder_id` are all optional.
+`context`, `status`, `notes`, `fields`, `reminder_id`, and `operation_key` are
+all optional. `operation_key` is a caller-generated retry key: repeating a
+create with the same key returns the task already created for that operation.
+The first committed task for a key wins, so reusing it with a different
+description or parent returns the original task unchanged. Project coordinators
+derive a distinct key for each intended child from the project ID, planning
+operation ID, and child role.
 
 ### GET /api/tasks
 
@@ -371,6 +378,13 @@ List/filter tasks.
 - `tag` (string): Filter by tag
 - `due_before` (string): YYYY-MM-DD, tasks due on or before the given date
 - `query` (string): Fuzzy text search across task descriptions
+
+Every task item includes additive hierarchy fields: `parent_id`,
+`parent_title`, `is_project`, `child_count`, `hierarchy_valid`,
+`hierarchy_error`, `parent_cancellation_pending`, and `project`. `project` is `null` for an ordinary task;
+for a derived project it contains full-set progress counts,
+`ready_to_close`, execution-pause/cancellation state, and the linked
+coordinator status/result. Counts are computed before these query filters.
 
 ### GET /api/tasks/conflicts
 
@@ -415,6 +429,71 @@ Mark a task as done (adds done date automatically).
 ### DELETE /api/tasks/{id}
 
 Delete a task.
+
+Deleting a parent with children, live coordination, or pending cancellation
+returns **409**. Detach or reparent children first.
+
+### GET /api/tasks/{id}/children
+
+List every child by stable parent ID, including done and cancelled children.
+Query parameters are `limit` (1–200, default 50) and `offset` (default 0).
+Returns `{"tasks": [...], "total": N, "limit": 50, "offset": 0}` with the
+same enriched task item shape as `GET /api/tasks`.
+
+### POST /api/tasks/{id}/project/start
+
+Mark an open project `in_progress` without creating agent lifecycle tags.
+Returns the enriched parent task. Returns **409** for an ordinary task, closed
+project, live coordinator, or pending cancellation.
+
+### POST /api/tasks/{id}/project/complete
+
+Complete a project after all children are done or cancelled and no review,
+coordinator, or cancellation remains unresolved.
+
+```json
+{ "acknowledge_cancelled_children": true }
+```
+
+The acknowledgement is required when any child was cancelled. The endpoint
+never changes a child status. Generic complete/status writes enforce the same
+conditions.
+
+### POST /api/tasks/{id}/project/plan
+
+Start or recover the agent owner's bounded coordinator run.
+
+```json
+{ "operation_id": "synthetic-planning-request-1" }
+```
+
+The operation ID is required and provides retry/restart idempotency. Returns
+`project_id`, `operation_id`, `session_id`, `status`, and `created`. The
+coordinator is a separate operator-origin session whose canonical route/model/
+effort/host/working-directory request is derived from the parent assignment;
+the parent is linked before the session becomes dispatchable.
+
+### POST /api/tasks/{id}/project/cancel
+
+With `{"confirm": false}`, return a non-mutating preview containing unfinished,
+running, and review-pending counts plus affected children. The preview's
+`operation_id` is non-null when a cancellation is already pending and must be
+reused for that retry. With confirmation, persist intent and cascade cancellation:
+
+```json
+{ "confirm": true, "operation_id": "synthetic-cancel-request-1" }
+```
+
+The response reports `complete`, `pending`, cancelled/preserved/abandoned child
+IDs, stopped session IDs, and exact failures. A partial result keeps the
+operation pending; retry with the same ID after resolving the reported stop.
+A different ID returns **409** while intent is pending.
+
+### POST /api/tasks/{id}/resume-execution
+
+Clear `execution_paused` after the final child is detached and make an
+`in_progress` former parent claimable as `todo` again. Returns **409** while
+the task is still a project or cancellation is pending.
 
 ### POST /api/tasks/human-queue
 
@@ -590,9 +669,11 @@ card returns the current state and touches no session. Returns **409**
 only available for agent-assigned cards"` for a card that is neither
 engine-assigned nor claimed (`#me` or unassigned), and **409**
 `"this card is already finished — nothing to cancel"` for a
-card whose status is already `done` (e.g. accepted). Response: `{id, lane,
-status, tags, killed: [session_id, ...], failures: [{session_id, reason},
-...]}`.
+card whose status is already `done` (e.g. accepted). A pending executor
+handoff returns **409** `"pending handoffs use the Cancel handoff action"`
+before any session or CLI teardown; its scoped cancellation uses
+`POST /api/tasks/{id}/project/cancel`. Response: `{id, lane, status, tags,
+killed: [session_id, ...], failures: [{session_id, reason}, ...]}`.
 
 ### GET /api/agents/pending-questions
 

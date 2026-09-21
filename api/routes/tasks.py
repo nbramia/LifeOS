@@ -12,7 +12,15 @@ from pydantic import BaseModel, Field
 from api.services import human_queue
 from api.services.agent_board import AGENT_PICKUP_TAGS
 from api.services.agent_worker.session_store import SessionStore
+from api.services.agent_worker.transcript_store import TranscriptStore
 from api.services.task_manager import get_task_manager, Task, TaskConflictError, VALID_STATUSES
+from api.services.task_projects import (
+    ProjectConflictError,
+    ProjectHandoffError,
+    ProjectTaskService,
+    TaskHierarchy,
+    build_task_hierarchy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +42,7 @@ _AGENT_PICKUP_STATUSES = frozenset({"todo", "urgent"})
 # touch a claim tag (see `SessionStore.has_live_session`, called through
 # `_get_session_store()` below).
 _session_store: SessionStore | None = None
+_transcript_store: TranscriptStore | None = None
 
 
 def _get_session_store() -> SessionStore:
@@ -41,6 +50,36 @@ def _get_session_store() -> SessionStore:
     if _session_store is None:
         _session_store = SessionStore()
     return _session_store
+
+
+def _get_transcript_store() -> TranscriptStore:
+    global _transcript_store
+    if _transcript_store is None:
+        _transcript_store = TranscriptStore()
+    return _transcript_store
+
+
+def _project_service(manager=None) -> ProjectTaskService:
+    return ProjectTaskService(
+        manager or get_task_manager(),
+        _get_session_store(),
+        _get_transcript_store(),
+    )
+
+
+def _task_response(
+    manager,
+    task: Task,
+    *,
+    hierarchy: TaskHierarchy | None = None,
+    service: ProjectTaskService | None = None,
+) -> "TaskResponse":
+    hierarchy = hierarchy or build_task_hierarchy(manager.list_tasks())
+    service = service or _project_service(manager)
+    return TaskResponse.from_task(
+        task,
+        hierarchy.read_fields(task.id, service.coordinator_view(task)),
+    )
 
 
 def _require_valid_status(status: Optional[str]) -> None:
@@ -86,6 +125,15 @@ class CreateTaskRequest(BaseModel):
                     "the highest-precedence slot.",
     )
     reminder_id: Optional[str] = Field(default=None, description="Associated reminder ID")
+    operation_key: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        description=(
+            "Stable caller-generated key for retry-safe creation. Reusing the key "
+            "returns the task already created for that operation."
+        ),
+    )
     notes: Optional[str] = Field(
         default=None,
         description="Multi-line notes body, stored as indented '> ' lines beneath the task line.",
@@ -93,8 +141,10 @@ class CreateTaskRequest(BaseModel):
     fields: Optional[dict[str, Optional[str]]] = Field(
         default=None,
         description="Operator-editable inline fields (e.g. host, effort, model, "
-                    "key) plus any custom [key:: value] field. Round-trips "
-                    "untouched through any later rewrite of the task.",
+                    "key) plus any custom [key:: value] field. Set parent_id to "
+                    "an existing stable task ID to create this task as that "
+                    "project's child; child links support one hierarchy level. "
+                    "Round-trips untouched through any later rewrite of the task.",
     )
     dry_run: Optional[bool] = Field(
         default=False,
@@ -150,6 +200,8 @@ class UpdateTaskRequest(BaseModel):
         default=None,
         description="Merged into the task's operator/unknown fields, not replaced: "
                     "a string value sets that field, a null value removes it. "
+                    "Set parent_id to an existing stable task ID to attach or "
+                    "reparent this child; set parent_id to null to detach it. "
                     "Fields not mentioned are left alone.",
     )
     actor: Optional[str] = Field(
@@ -181,9 +233,19 @@ class TaskResponse(BaseModel):
     fields: dict[str, str]
     source_file: str
     line_number: int
+    parent_id: Optional[str] = None
+    parent_title: Optional[str] = None
+    is_project: bool = False
+    child_count: int = 0
+    hierarchy_valid: bool = True
+    hierarchy_error: Optional[str] = None
+    parent_cancellation_pending: bool = False
+    parent_handoff_pending: bool = False
+    project: Optional[dict] = None
 
     @classmethod
-    def from_task(cls, t: Task) -> "TaskResponse":
+    def from_task(cls, t: Task, hierarchy_fields: Optional[dict] = None) -> "TaskResponse":
+        hierarchy_fields = hierarchy_fields or {}
         return cls(
             id=t.id,
             description=t.description,
@@ -201,6 +263,7 @@ class TaskResponse(BaseModel):
             fields=t.fields,
             source_file=t.source_file,
             line_number=t.line_number,
+            **hierarchy_fields,
         )
 
 
@@ -242,22 +305,38 @@ async def create_task(request: CreateTaskRequest):
     manager = get_task_manager()
     fields = {k: v for k, v in (request.fields or {}).items() if v is not None}
     try:
-        task = manager.create(
-            description=request.description,
-            context=request.context or "Inbox",
-            status=request.status or "todo",
-            priority=request.priority or "",
-            due_date=request.due_date,
-            tags=request.tags,
-            reminder_id=request.reminder_id,
-            notes=request.notes,
-            fields=fields,
-        )
+        if request.operation_key:
+            task, _created = manager.create_or_find_by_operation(
+                request.operation_key,
+                description=request.description,
+                context=request.context or "Inbox",
+                status=request.status or "todo",
+                priority=request.priority or "",
+                due_date=request.due_date,
+                tags=request.tags,
+                reminder_id=request.reminder_id,
+                notes=request.notes,
+                fields=fields,
+            )
+        else:
+            task = manager.create(
+                description=request.description,
+                context=request.context or "Inbox",
+                status=request.status or "todo",
+                priority=request.priority or "",
+                due_date=request.due_date,
+                tags=request.tags,
+                reminder_id=request.reminder_id,
+                notes=request.notes,
+                fields=fields,
+            )
+    except ProjectConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except TaskConflictError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
-    return TaskResponse.from_task(task)
+    return _task_response(manager, task)
 
 
 def _has_agent_pickup_tag(tags: Optional[list[str]]) -> bool:
@@ -380,8 +459,17 @@ async def list_tasks(
         due_before=due_before,
         query=query,
     )
+    all_tasks = list(manager.all_tasks_snapshot())
+    hierarchy = build_task_hierarchy(all_tasks or tasks)
+    service = _project_service(manager)
     return TaskListResponse(
-        tasks=[TaskResponse.from_task(t) for t in tasks],
+        tasks=[
+            TaskResponse.from_task(
+                t,
+                hierarchy.read_fields(t.id, service.coordinator_view(t)),
+            )
+            for t in tasks
+        ],
         total=len(tasks),
     )
 
@@ -539,6 +627,8 @@ async def swap_tag(
         return SwapTagResponse(swapped=False, reason="task not found")
     try:
         ok = manager.swap_tag(task_id, from_tag, to_tag)
+    except ProjectConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except TaskConflictError as e:
         raise HTTPException(status_code=409, detail=str(e))
     return SwapTagResponse(swapped=ok, reason=None if ok else f"tag '{from_tag}' not present")
@@ -591,6 +681,8 @@ async def remove_tag(
         return MutateTagResponse(ok=False, reason="task not found")
     try:
         ok = manager.remove_tag_if_present(task_id, tag)
+    except ProjectConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except TaskConflictError as e:
         raise HTTPException(status_code=409, detail=str(e))
     return MutateTagResponse(ok=ok, reason=None if ok else f"tag '{tag}' not present")
@@ -603,7 +695,164 @@ async def get_task(task_id: str):
     task = manager.get(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    return TaskResponse.from_task(task)
+    return _task_response(manager, task)
+
+
+class TaskChildrenResponse(BaseModel):
+    tasks: list[TaskResponse]
+    total: int
+    limit: int
+    offset: int
+
+
+@router.get("/{task_id}/children", response_model=TaskChildrenResponse)
+async def get_task_children(
+    task_id: str,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """Return a project's actual children by stable parent id."""
+    manager = get_task_manager()
+    if manager.get(task_id) is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    all_tasks = manager.list_tasks()
+    hierarchy = build_task_hierarchy(all_tasks)
+    children = hierarchy.children(task_id)
+    page = children[offset:offset + limit]
+    service = _project_service(manager)
+    return TaskChildrenResponse(
+        tasks=[
+            TaskResponse.from_task(
+                child,
+                hierarchy.read_fields(child.id, service.coordinator_view(child)),
+            )
+            for child in page
+        ],
+        total=len(children),
+        limit=limit,
+        offset=offset,
+    )
+
+
+class CompleteProjectRequest(BaseModel):
+    acknowledge_cancelled_children: bool = False
+
+
+class ProjectOperationRequest(BaseModel):
+    operation_id: str = Field(..., min_length=1, max_length=200)
+
+
+class CancelProjectRequest(BaseModel):
+    confirm: bool = False
+    operation_id: Optional[str] = Field(default=None, min_length=1, max_length=200)
+
+
+class FinalizeProjectHandoffRequest(BaseModel):
+    operation_id: str = Field(..., min_length=1, max_length=128)
+    source_session_id: str = Field(..., min_length=1, max_length=200)
+    source_attempt_id: str = Field(..., min_length=1, max_length=200)
+    source_turn_id: str = Field(..., min_length=1, max_length=200)
+
+
+@router.post("/{task_id}/project/start", response_model=TaskResponse)
+async def start_project(task_id: str):
+    manager = get_task_manager()
+    try:
+        task = _project_service(manager).start_project(task_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Task not found")
+    except ProjectConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except TaskConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return _task_response(manager, task)
+
+
+@router.post("/{task_id}/project/complete", response_model=TaskResponse)
+async def complete_project(task_id: str, body: CompleteProjectRequest):
+    manager = get_task_manager()
+    try:
+        task = _project_service(manager).complete_project(
+            task_id,
+            acknowledge_cancelled_children=body.acknowledge_cancelled_children,
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Task not found")
+    except ProjectConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except TaskConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return _task_response(manager, task)
+
+
+@router.post("/{task_id}/project/plan")
+async def plan_project(task_id: str, body: ProjectOperationRequest):
+    try:
+        return _project_service().plan_and_delegate(task_id, operation_id=body.operation_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Task not found")
+    except ProjectConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (TaskConflictError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/{task_id}/project/cancel")
+async def cancel_project(task_id: str, body: CancelProjectRequest):
+    service = _project_service()
+    try:
+        if not body.confirm:
+            return service.cancel_preview(task_id)
+        if not body.operation_id:
+            raise HTTPException(status_code=400, detail="operation_id is required when confirm=true")
+        return await service.cancel_project(task_id, operation_id=body.operation_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Task not found")
+    except ProjectConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except TaskConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/{task_id}/project/handoff/finalize")
+async def finalize_project_handoff(
+    task_id: str, body: FinalizeProjectHandoffRequest,
+):
+    """Release one staged handoff after the worker recorded exact-turn quiescence."""
+    try:
+        return _project_service().finalize_handoff(
+            task_id,
+            operation_id=body.operation_id,
+            source_session_id=body.source_session_id,
+            source_attempt_id=body.source_attempt_id,
+            source_turn_id=body.source_turn_id,
+        )
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Task not found")
+    except ProjectHandoffError as exc:
+        raise HTTPException(
+            status_code=409, detail={"code": exc.code, "message": str(exc)},
+        ) from exc
+    except (TaskConflictError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/{task_id}/resume-execution", response_model=TaskResponse)
+async def resume_task_execution(task_id: str):
+    manager = get_task_manager()
+    try:
+        task = _project_service(manager).resume_execution(task_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Task not found")
+    except ProjectConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except TaskConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return _task_response(manager, task)
 
 
 @router.put("/{task_id}", response_model=TaskResponse)
@@ -778,13 +1027,15 @@ async def update_task(task_id: str, request: UpdateTaskRequest):
         task = manager.update(task_id, _precondition=precondition, **updates)
     except _CardDecisionChanged as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
+    except ProjectConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except TaskConflictError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    return TaskResponse.from_task(task)
+    return _task_response(manager, task)
 
 
 @router.put("/{task_id}/complete", response_model=TaskResponse)
@@ -793,11 +1044,13 @@ async def complete_task(task_id: str):
     manager = get_task_manager()
     try:
         task = manager.complete(task_id)
+    except ProjectConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except TaskConflictError as e:
         raise HTTPException(status_code=409, detail=str(e))
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
-    return TaskResponse.from_task(task)
+    return _task_response(manager, task)
 
 
 @router.delete("/{task_id}")
@@ -806,6 +1059,8 @@ async def delete_task(task_id: str):
     manager = get_task_manager()
     try:
         deleted = manager.delete(task_id)
+    except ProjectConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except TaskConflictError as e:
         raise HTTPException(status_code=409, detail=str(e))
     if not deleted:

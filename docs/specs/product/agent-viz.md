@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-09-18
+> **Last Updated:** 2026-09-20
 
 `/agents` is a Kanban board of the operator's work queue — vault tasks, agent questions, and scheduled work in one place, organized into lanes by status and tag. A **Graph** tab shows a deterministic delegation timeline as a secondary, read-mostly view for watching what's actively running: every LifeOS agent worker task (`#agent`-tagged), local CLI sessions discovered on the filesystem from both Claude Code (`~/.claude/projects/`) and Codex (`~/.codex/sessions/`), and Claude Code / Codex sessions registered from **any other machine** on the tailnet via a lightweight hook script.
 
@@ -13,23 +13,45 @@ The point is one place to see what needs attention: what's waiting on an assignm
 ## Table of Contents
 
 1. [Kanban board](#kanban-board)
-2. [Graph tab — what you see](#graph-tab--what-you-see)
-3. [Two sources, one graph](#two-sources-one-graph)
-4. [Graph tab — Status semantics](#graph-tab--status-semantics)
-5. [Graph tab — Filters and chips](#graph-tab--filters-and-chips)
-6. [Graph tab — Side panel](#graph-tab--side-panel)
-7. [Graph tab — Operator controls — kill](#graph-tab--operator-controls--kill)
-8. [Graph tab — Operator controls — resume and Go To](#graph-tab--operator-controls--resume-and-go-to)
-9. [Linking the board and the graph](#linking-the-board-and-the-graph)
-10. [Privacy and exposure](#privacy-and-exposure)
-11. [Configuration knobs](#configuration-knobs)
-12. [Related Documents](#related-documents)
+2. [Projects](#projects)
+3. [Graph tab — what you see](#graph-tab--what-you-see)
+4. [Two sources, one graph](#two-sources-one-graph)
+5. [Graph tab — Status semantics](#graph-tab--status-semantics)
+6. [Graph tab — Filters and chips](#graph-tab--filters-and-chips)
+7. [Graph tab — Side panel](#graph-tab--side-panel)
+8. [Graph tab — Operator controls — kill](#graph-tab--operator-controls--kill)
+9. [Graph tab — Operator controls — resume and Go To](#graph-tab--operator-controls--resume-and-go-to)
+10. [Linking the board and the graph](#linking-the-board-and-the-graph)
+11. [Privacy and exposure](#privacy-and-exposure)
+12. [Configuration knobs](#configuration-knobs)
+13. [Related Documents](#related-documents)
 
 ---
 
 ## Kanban board
 
 The board is backed by the vault task store (`LifeOS/Tasks/`) — every card is a task, plus one card per upcoming scheduler entry. There is no separate "board" data file: a card's lane is always derived fresh from the task's status and tags, so editing a task from Obsidian, `/chat`, or a Telegram reply moves its card exactly as if it had been dragged.
+
+## Projects
+
+A project is an ordinary task with one or more children whose `parent_id` points at it. It has no stored project type: completed and cancelled children keep it a project, and removing the last child immediately restores the same task to its ordinary-card presentation. A former parent remains execution-paused after that transition until the operator explicitly resumes it, preventing an old assignment from starting unexpectedly.
+
+Project cards show a compact resolved/total count; child cards keep their normal lane and actions while carrying a link back to their parent. The project filter can show projects, children, ordinary tasks, or all work. Counts are calculated before board filters, so hiding a child does not make progress look more complete than it is.
+
+Opening a project uses a wider drawer. Its notes remain the objective and acceptance criteria, while the project section shows progress states, owner, coordination state and result, and an authoritative child list. Each child opens its normal drawer, can be assigned independently, and can be detached or moved to another project; the project drawer can also create a new linked child or attach an existing task by ID. Creating or attaching a child never silently copies the parent's assignment or starts work.
+
+**Start project** marks a project active without pretending its owner executed the child work. **Plan and delegate** starts one bounded coordination run for the assigned owner; the drawer exposes that run's state, result, and session. **Complete project** requires every child to be resolved and any coordinator/cancellation work to be finished; closing with cancelled children asks for an explicit reduced-scope acknowledgement. **Cancel project** first previews unfinished, running, and awaiting-review work, then confirms a cascade that preserves completed work and pending-review output without accepting it. A partial cancellation remains visibly pending until its stop failures can be retried.
+
+A project created by an executor handoff can show **Handoff pending** in this
+same drawer. Its message explains that child execution remains blocked until
+the source agent's stop is verified; conflicting project actions are disabled,
+while **Cancel project** remains available. Cancellation is not presented as
+complete until the scoped stop and teardown are verified. A pending handoff
+with no child is still an ordinary card and is surfaced by its pending-handoff
+state rather than being classified as a project. Its **Cancel handoff** action
+cancels the whole ordinary task through the scoped project-cancellation flow;
+the ordinary card **Cancel** endpoint refuses this state before stopping its
+session.
 
 ### Lanes
 

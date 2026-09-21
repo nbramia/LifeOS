@@ -22,7 +22,7 @@ from typing import Callable, NamedTuple, Optional
 from api.services.agent_worker.assignment import ENGINE_CLAUDE_CODE, map_effort_for_engine
 from api.services.agent_worker.binary_resolver import resolve_for_spawn
 from api.services.agent_worker.completion_signal import looks_like_finished_thought
-from api.services.agent_worker.delegation import delegation_preamble
+from api.services.agent_worker.delegation import PROJECT_TASK_GUIDANCE, delegation_preamble
 from api.services.agent_worker.local_executor import ExecutorOutcome
 from api.services.agent_worker.remote_spawn import (
     HostResolutionError,
@@ -201,6 +201,9 @@ NOTIFICATIONS — use [NOTIFY] for:
 
 DELEGATION:
 You already have a browser (--chrome), filesystem, and shell. {delegation}
+
+{project_guidance}
+{turn_identity}
 """
 
 
@@ -450,6 +453,8 @@ class ClaudeCodeExecutor:
         is_child: bool = False,
         effort: Optional[str] = None,
         git_discipline: str = "",
+        attempt_id: str = "",
+        turn_id: str = "",
     ) -> list[str]:
         platform_desc = (
             "Linux server running Ubuntu"
@@ -481,6 +486,12 @@ class ClaudeCodeExecutor:
                     model='"claude_code" with tier="haiku"/"sonnet"/"opus", '
                           'or "local" for the on-box model',
                 ),
+                project_guidance=PROJECT_TASK_GUIDANCE,
+                turn_identity=(
+                    f"lifeos_session_id={session_id}; lifeos_attempt_id={attempt_id}; "
+                    f"lifeos_turn_id={turn_id}."
+                    if attempt_id and turn_id else ""
+                ),
             ),
         ]
         if model:
@@ -496,7 +507,11 @@ class ClaudeCodeExecutor:
         return cmd
 
     @staticmethod
-    def _clean_env(session_id: str | None = None) -> dict:
+    def _clean_env(
+        session_id: str | None = None,
+        attempt_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> dict:
         """The subprocess environment, with every alternate auth source removed.
 
         Two problems, one mechanism. ``CLAUDE*`` would leak the operator's
@@ -521,6 +536,10 @@ class ClaudeCodeExecutor:
             # mcp_server.py derives stdio caller identity from this process-
             # bound value; the model cannot choose another session id.
             env["LIFEOS_AGENT_SESSION_ID"] = session_id
+            if attempt_id:
+                env["LIFEOS_AGENT_ATTEMPT_ID"] = attempt_id
+            if turn_id:
+                env["LIFEOS_AGENT_TURN_ID"] = turn_id
             from api.services.agent_worker.session_resources import scratch_env
             env.update(scratch_env(session_id))
         return env
@@ -577,6 +596,8 @@ class ClaudeCodeExecutor:
             is_child=bool(session.parent_session_id),
             effort=getattr(session, "effort", None),
             git_discipline=git_discipline,
+            attempt_id=session.attempt_id,
+            turn_id=session.turn_id,
         )
 
         # Board-assigned host: resolve BEFORE any spawn call. An
@@ -596,7 +617,9 @@ class ClaudeCodeExecutor:
                 target=target,
                 unset_env_names=self._remote_unset_env_names(),
                 session_id=sid,
-                env={key: value for key, value in self._clean_env(sid).items() if key in {"TMPDIR", "TMP", "TEMP"}},
+                env={key: value for key, value in self._clean_env(
+                    sid, session.attempt_id, session.turn_id,
+                ).items() if key in {"TMPDIR", "TMP", "TEMP", "LIFEOS_AGENT_ATTEMPT_ID", "LIFEOS_AGENT_TURN_ID"}},
             )
 
         self.transcript_store.append(sid, "claude_code_spawn", {
@@ -614,7 +637,7 @@ class ClaudeCodeExecutor:
                 stderr=subprocess.PIPE,
                 cwd=working_dir,
                 text=True,
-                env=self._clean_env(sid),
+                env=self._clean_env(sid, session.attempt_id, session.turn_id),
                 # own session/process-group leader so the operator kill can
                 # `os.killpg(pgid, ...)` the CLI + every child it spawns WITHOUT
                 # touching this worker process (which shares the worker's group).

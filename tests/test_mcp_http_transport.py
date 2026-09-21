@@ -30,12 +30,22 @@ def server(monkeypatch) -> mcp_server.LifeOSMCPServer:
     def fake_call(self: mcp_server.LifeOSMCPServer, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         return {"echo": {"tool": tool_name, "arguments": arguments}}
 
+    formatter_arguments: list[dict[str, Any] | None] = []
+
+    def fake_format(
+        self: mcp_server.LifeOSMCPServer, tool_name: str, data: dict[str, Any],
+        arguments: dict[str, Any] | None = None,
+    ) -> str:
+        formatter_arguments.append(arguments)
+        return json.dumps(data)
+
     monkeypatch.setattr(mcp_server.LifeOSMCPServer, "_call_api", fake_call)
     monkeypatch.setattr(
         mcp_server.LifeOSMCPServer,
         "_format_response",
-        lambda self, tool_name, data: json.dumps(data),
+        fake_format,
     )
+    srv.formatter_arguments = formatter_arguments
     return srv
 
 
@@ -115,7 +125,9 @@ def test_tools_list_returns_registered_tools(client: TestClient, bearer_token: s
 
 
 @pytest.mark.unit
-def test_tools_call_dispatches_to_handler(client: TestClient, bearer_token: str):
+def test_tools_call_dispatches_to_handler(
+    client: TestClient, bearer_token: str, server: mcp_server.LifeOSMCPServer,
+):
     resp = client.post(
         "/mcp",
         json={
@@ -132,6 +144,7 @@ def test_tools_call_dispatches_to_handler(client: TestClient, bearer_token: str)
     payload = json.loads(body["result"]["content"][0]["text"])
     assert payload["echo"]["tool"] == "lifeos_search"
     assert payload["echo"]["arguments"] == {"query": "hello"}
+    assert server.formatter_arguments == [{"query": "hello"}]
 
 
 @pytest.mark.unit

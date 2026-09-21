@@ -638,7 +638,7 @@ async def test_turn_shape_and_literal_keys(proxy_client):
     assert set(turn.keys()) == {
         "current_datetime", "current_datetime_iso", "timezone",
         "time_resolution_instruction", "personal_context",
-        "existing_tags", "tags_instruction",
+        "existing_tags", "tags_instruction", "task_hierarchy_instruction",
         "session_cost_usd", "session_turn_count",
         "session_input_tokens", "session_output_tokens",
         "session_cost_is_lower_bound",
@@ -651,6 +651,8 @@ async def test_turn_shape_and_literal_keys(proxy_client):
     assert isinstance(turn["personal_context"], str)  # may be empty
     assert isinstance(turn["existing_tags"], list)
     assert isinstance(turn["tags_instruction"], str) and turn["tags_instruction"]
+    assert "Projects are ordinary tasks" in turn["task_hierarchy_instruction"]
+    assert "explicit confirmation" in turn["task_hierarchy_instruction"]
     assert isinstance(turn["caller_session_id"], str) and turn["caller_session_id"]
     # `turn` and `persona` are siblings under `lifeos_context`, never merged
     # into one object — each key set is disjoint from the other's.

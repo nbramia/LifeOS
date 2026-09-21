@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-09-18
+> **Last Updated:** 2026-09-21
 
 Engineering view of the agent worker — the stand-alone process that consumes engine-assigned tasks and runs them on either a local LLM or Anthropic Managed Agents. For consumer-facing behavior, see [product/agent-worker.md](../product/agent-worker.md). For operator setup, see [guides/agent-worker-setup.md](../../guides/agent-worker-setup.md).
 
@@ -20,15 +20,16 @@ Engineering view of the agent worker — the stand-alone process that consumes e
 8. [Managed executor (Claude path)](#managed-executor-claude-path)
 9. [Card assignment](#card-assignment)
 10. [System prompts](#system-prompts)
-11. [Inter-agent coordination](#inter-agent-coordination)
-12. [Budget enforcement](#budget-enforcement)
-13. [Restart resumability](#restart-resumability)
-14. [Lifecycle drift reconciliation](#lifecycle-drift-reconciliation)
-15. [Telegram clarification flow](#telegram-clarification-flow)
-16. [Transcripts](#transcripts)
-17. [Agent Output notes](#agent-output-notes)
-18. [Configuration surface](#configuration-surface)
-19. [Related Documents](#related-documents)
+11. [Project task context and coordination](#project-task-context-and-coordination)
+12. [Inter-agent coordination](#inter-agent-coordination)
+13. [Budget enforcement](#budget-enforcement)
+14. [Restart resumability](#restart-resumability)
+15. [Lifecycle drift reconciliation](#lifecycle-drift-reconciliation)
+16. [Telegram clarification flow](#telegram-clarification-flow)
+17. [Transcripts](#transcripts)
+18. [Agent Output notes](#agent-output-notes)
+19. [Configuration surface](#configuration-surface)
+20. [Related Documents](#related-documents)
 
 ---
 
@@ -91,7 +92,7 @@ All code lives in `api/services/agent_worker/`:
 | `spend_tracker.py` | Daily $-cap ledger; pause semantics when cap ≤ 0 |
 | `transcript_store.py` | Append-only JSONL per `session_id` at `data/agent_transcripts/` |
 | `tools.py` | `STANDARD_TOOLS` (Read/Write/Edit/Bash/Glob/Grep/WebFetch/WebSearch/sleep) + `ToolRegistry` combining standard + inter-agent + MCP tools |
-| `inter_agent.py` | `lifeos_agent_*` family — spawn, send, check, yield_until, kill, transcript_read, sessions_list, user_ask, execution_override; MCP caller proofs bind remote calls to one session |
+| `inter_agent.py` | `lifeos_agent_*` family — project_handoff, spawn, send, check, yield_until, kill, transcript_read, sessions_list, user_ask, execution_override; MCP caller proofs bind remote calls to one session and handoff calls to one executor turn |
 | `pricing.py` | Per-model $/token table; `MANAGED_SESSION_HOUR_OVERHEAD = $0.08` |
 | `router.py` | Thin local-vs-claude dispatch helper |
 
@@ -363,7 +364,9 @@ Routing precedence (per the prompt instructions):
 
 Hardening: response is parsed defensively (handles `` ```json `` fences, partial schemas, missing keys, exceptions). On any parse failure the result defaults to `sane=false` so the worker parks the task rather than running with garbage.
 
-**Jev destructiveness judgment.** Alongside the regex-based sanity gate above, preflight can ask TypeSafe's Jev (see [Typed judgments (Jev)](../../guides/agent-worker-setup.md#typed-judgments-jev)) two questions about the task title: a 5-level harm `Score` (read-only ... irreversible mass/external loss) and an `irreversible` `Noul` (the probability that running the task as written permanently destroys data or sends something unrecallable). `LIFEOS_AGENT_JEV_DESTRUCTIVE_GATE` controls what happens with the answers — `off` (no Jev call), `shadow` (default: the answers are recorded on `PreflightResult.destructive_score`/`destructive_probability` and logged in the preflight transcript event, but never change `sane`/`sane_fatal`), or `block` (a harm score >= 2.5 or an irreversible probability >= 0.85 parks the task for operator confirmation — non-fatal `sane=False`, `sane_fatal` stays `False`, and `destructive_block` is set `True`). This judgment runs immediately after the regex gate, so a title the regex already matched keeps its fatal verdict regardless of what Jev says; the regex stays in force in every gate mode. Unlike an ordinary non-fatal sanity opinion from the classifier, a `destructive_block` park is a code-thresholded verdict over a calibrated probability — `LIFEOS_AGENT_DEFAULT_ROUTE`'s sanity demotion (§ above) checks `destructive_block` and leaves it parked even on an install where a default route is configured, rather than demoting it to advisory the way it demotes the classifier's own inferred opinion. Effectively `off` whenever no TypeSafe key is configured, regardless of the setting. A failed Jev call logs a warning and leaves both fields `None` — no task fails or blocks because of it.
+**Jev destructiveness judgment.** Alongside the regex-based sanity gate above, preflight can ask TypeSafe's Jev (see [Typed judgments (Jev)](../../guides/agent-worker-setup.md#typed-judgments-jev)) two questions about the instructions that will execute: a 5-level harm `Score` (read-only ... irreversible mass/external loss) and an `irreversible` `Noul` (the probability that running the task as written permanently destroys data or sends something unrecallable). Ordinary tasks send their title. A project child also sends a separate, at-most-8,192-character `execution_instructions` value assembled from its child title/notes and bounded parent title/objective/acceptance notes; this bound accommodates the complete 8,097-character maximum assembled context without trimming the parent acceptance tail. Sibling status/output and unrelated task content are excluded. This is additional remote data sent only when the operator configures TypeSafe and leaves the gate enabled. The safety context never enters the Haiku classifier prompt or `jev_task_routing.judge_task`, so parent engine/model words cannot corroborate a route, choose a preset, or grant cloud consent.
+
+`LIFEOS_AGENT_JEV_DESTRUCTIVE_GATE` controls what happens with the answers — `off` (no Jev call), `shadow` (default: the answers are recorded on `PreflightResult.destructive_score`/`destructive_probability` and logged in the preflight transcript event, but never change `sane`/`sane_fatal`), or `block` (a harm score >= 2.5 or an irreversible probability >= 0.85 parks the task for operator confirmation — non-fatal `sane=False`, `sane_fatal` stays `False`, and `destructive_block` is set `True`). This judgment runs immediately after the regex gate, so a title the regex already matched keeps its fatal verdict regardless of what Jev says; the regex stays in force in every gate mode. Unlike an ordinary non-fatal sanity opinion from the classifier, a `destructive_block` park is a code-thresholded verdict over a calibrated probability — `LIFEOS_AGENT_DEFAULT_ROUTE`'s sanity demotion (§ above) checks `destructive_block` and leaves it parked even on an install where a default route is configured, rather than demoting it to advisory the way it demotes the classifier's own inferred opinion. Effectively `off` whenever no TypeSafe key is configured, regardless of the setting. A failed Jev call logs a warning and leaves both fields `None` — no task fails or blocks because of it.
 
 ---
 
@@ -389,11 +392,15 @@ Cost: `$0` when served by the local llama-server (`local` maps to `$0` in `prici
 
 ### Working directory
 
-Both `ROUTE_LOCAL` and `ROUTE_REMOTE` share this one executor, so a single guard covers a task pinned to either. A card names a directory with the same `[key:: value]` inline-field convention `assignment.py` reads `host`/`model`/`effort` from: `[working_dir:: /srv/checkouts/example]`. Unlike the CLI routes' `directory_resolver.resolve_working_directory` (a Jev fan-out judgment when `TYPESAFE_API_KEY` is set, else a keyword guess off the task title — see below), this field is never inferred — unset means the executor runs in the worker process's own working directory.
+Both `ROUTE_LOCAL` and `ROUTE_REMOTE` share this one executor, so a single guard covers a task pinned to either. A card names a directory with the same `[key:: value]` inline-field convention `assignment.py` reads `host`/`model`/`effort` from: `[working_dir:: /srv/checkouts/example]`. That explicit field is authoritative. A normal board dispatch may otherwise derive a workflow location through the bounded affinity/title rules below; a direct executor call with no resolved `working_dir` runs in the worker process's own working directory.
 
 `resolve_working_directory(task, *, allow_uncloned=True)` asks the Jev fan-out judgment (`jev_task_routing.judge_task`) first: a `location` answer with confidence >= 0.6 resolves against the union of the operator's GitHub repositories (`directory_resolver._github_repos()`, `gh repo list <owner>`, disk-cached 24h with an atomic temp-file + `os.replace` write), the scanned local project directories, LifeOS, the vault, and home — a repo Jev names that isn't cloned on this host still resolves to a path under `code_dir`. Below that confidence, or with no Jev judgment at all, it falls back unchanged to the keyword cascade. Every GitHub repo name — freshly fetched from `gh` or read back from the on-disk cache — is validated (`^[A-Za-z0-9._-]{1,100}$`, and never bare `.`/`..`) before it's trusted for a path; a name that fails validation is dropped, and the cache's own `path` field is never deserialized — every path is rebuilt from the validated name.
 
-For the CLI routes specifically, `_dispatch` computes whether the session is bound for a remote `LIFEOS_AGENT_HOSTS` host (`session.host`, already set from the board assignment by this point) and passes `allow_uncloned=False` in that case, so the one resolution that gets persisted to `session.execution_spec` (write-once — see `_resolve_session_execution`) never names an uncloned GitHub-only repo for a spawn this process can neither clone into nor confirm the repo exists on. `allow_uncloned=False` rejects a chosen directory that doesn't exist on this host and falls through to the keyword cascade instead. For a local spawn, the worker clones an uncloned repo (`directory_resolver.ensure_cloned`, `gh repo clone <owner>/<name>`) right before spawning; `ensure_cloned` independently re-validates the target — refusing (no `gh` invocation at all) unless the path resolves to exactly `code_root / <name>` for a `name` that's both well-formed and present in the operator's known repo list — so a manipulated cache file or an arbitrary `[working_dir::]` card field can't reach a real clone. A clone failure parks the task at `#agent-blocked` naming the repository instead of spawning into a missing directory.
+`resolve_location_affinity(value)` accepts only a name present in that same catalog and returns `None` for every other value; it never interprets an arbitrary `fields.project` string as a path. A hierarchy child resolves one write-once execution target in this order: explicit child `working_dir`; recognized child affinity; parent `working_dir` when the parent's host and the child's actual execution host are the same; recognized parent affinity; title/Jev fallback. Affinity and title/Jev mappings are API-host paths, so a CLI session assigned to a different `LIFEOS_AGENT_HOSTS` host skips both mappings. A remote child may still use its explicit directory or a parent directory explicitly scoped to that same remote host; otherwise its persisted working directory remains unset and the remote CLI starts in its own default directory. Codex preserves that unset state through command construction: the remote command omits `-C` instead of substituting the API process's current directory, while the local `ssh` client starts from the API process's directory without exposing that path to the remote command.
+
+In-process `local`/`remote` routes accept an affinity or title-derived path only when it is an existing directory on the API host. They call the title resolver with `allow_uncloned=False` and recheck the returned fallback, so an uncloned catalog result or a missing keyword fallback cannot become a frozen invalid path. Explicit child and compatible parent `working_dir` fields remain authoritative and reach the executor's ordinary path validation unchanged. Local CLI routes retain clone-on-demand for recognized repositories.
+
+For a local CLI spawn, the worker clones an uncloned repo (`directory_resolver.ensure_cloned`, `gh repo clone <owner>/<name>`) right before spawning. `ensure_cloned` independently re-validates the target — refusing (no `gh` invocation at all) unless the path resolves to exactly `code_root / <name>` for a `name` that's both well-formed and present in the operator's known repo list — so a manipulated cache file or an arbitrary affinity can't reach a real clone. A clone failure parks the task at `#agent-blocked` naming the repository instead of spawning into a missing directory.
 
 `local_executor._resolve_task_working_dir(task)` runs before conversation seeding or any LLM call, so a refused directory never reaches the model:
 
@@ -533,11 +540,85 @@ All four model-facing prompts are structured per [Anthropic's Claude 4.6/4.7 pro
 | Cloud per-task user message | `managed_executor.py` (`_user_message_for`) | Initial user turn for each managed session |
 | Haiku preflight prompt | `preflight.py` (`_PREFLIGHT_INSTRUCTIONS`) | Claude Haiku classifier |
 
+Every executor's task-opening prompt includes the shared [`PROJECT_TASK_GUIDANCE`](../../../api/services/agent_worker/delegation.py#L28) fragment; Hermes adds it only when starting a new conversation. When a Managed preset class narrows its tools, the [cross-cutting set](../../../api/services/agent_worker/tool_filter.py#L44) retains project inspection, lifecycle, resume, and handoff tools; fullstack and unknown classes instead leave the preset unfiltered.
+
 Cache strategy: the local executor's static portion is a module-level constant so prompt caches don't invalidate between sessions; only the small trailing `<this_task>` block (expected_output + soft budget) varies.
 
 The cloud preset YAML is mirrored verbatim in [`guides/agent-worker-setup.md`](../../guides/agent-worker-setup.md) for fresh-clone operators.
 
 ---
+
+## Project task context and coordination
+
+Task hierarchy is a vault relationship, not session lineage. A child task
+stores `fields.parent_id`; its worker session still uses the child's own task
+ID, assignment, review state and lifecycle. The HTTP task payload carries
+derived `parent_id`, `parent_title`, `is_project`, `child_count`, hierarchy
+validity and compact project progress. Candidate filtering and the atomic claim
+boundary both reject project parents, invalid observed hierarchy,
+execution-paused tasks, and children whose parent cancellation is pending.
+
+Before dispatching a child, the worker fetches current hierarchy and adds one
+bounded `project_context` object to the execution input. It contains the
+parent's stable ID/title, objective and acceptance notes, plus a compact sibling
+status summary. It does not copy arbitrary sibling notes or unrelated personal
+tasks. This keeps the child independently executable while preserving enough
+parent intent to judge its own output.
+
+Project planning uses `ProjectTaskService.plan_and_delegate`, which creates an
+operator-origin session with a synthetic task ID derived from the project and
+stable operation ID. The service stages that session as non-dispatchable,
+persists the parent-to-session/request link, then makes it claimable. Retries
+recover the same session. For CLI, local, and remote owners, the canonical
+execution request is derived from the project owner's route plus its model,
+effort and host fields. Its explicit working directory wins; otherwise
+`resolve_existing_location_affinity` scans only existing local project,
+LifeOS, vault, and home directories for an executor that supports
+`working_dir` on the API host. It never consults the GitHub catalog or starts
+a subprocess while the project-operation lock is held. Managed Agents
+ownership uses the explicit consent alias's model and retains configured
+effort and host, but not the configured model, working directory, or affinity
+fallback, as described in the
+[task-management product spec](../product/task-management.md#projects-and-subtasks).
+Planning does not infer a new cloud authorization. The coordination prompt
+contains the project objective/acceptance notes and at most 50 current child
+IDs, assignments and states. It instructs child creation to use a stable
+`operation_key` derived from the project ID, planning operation ID, and child
+role; the shared task create path recovers the existing task for a repeated
+key. Transcript events supply coordinator state and
+result; its terminal state never projects completion or failure onto the
+parent task.
+
+Project cancellation persists its operation fence before any teardown, then
+uses the existing session cancellation and CLI teardown paths outside the task
+write lock. Done children are preserved, unfinished human/unassigned children
+are cancelled through guarded task writes, and review-pending output is tagged
+abandoned without acceptance. Any failed or unverifiable stop keeps the parent
+fenced as cancellation-pending. A retry with the same operation ID recomputes
+current state and applies only outstanding work; a different operation is
+rejected while the fence remains.
+
+`lifeos_agent_project_handoff` is the only exception to the ordinary
+live-parent attachment guard. It accepts 1–20 complete child requests from an
+ordinary top-level task's exact current session, attempt, and turn; the MCP
+transport attests those identities, so the model cannot select a different
+source task. The service records the normalized request in the source
+transcript, writes small operation/identity/hash pointers on the parent,
+creates deterministic keyed children and a blocked coordinator, and fences all
+of them from normal claim or Open. The child assignment and optional execution
+request are independent: omitted values are not copied from the source, and
+metered targets must already be in that source turn's permitted provider scope.
+
+The executor observes a successful handoff as a terminal action for its turn.
+Only after the executor return boundary carries the route's required stop
+evidence and is recorded as a matching quiescence event can the worker
+terminalize that source session without projecting normal task completion,
+clear the handoff fence, and release the coordinator. Hermes requires its
+positive upstream `done` event; a client disconnect or deadline is not upstream
+stop proof. A missing proof, failed finalization, or cancellation race keeps
+work pending and non-runnable. Reconciliation runs before ordinary lifecycle
+drift repair; there is no atomic transaction spanning Markdown, SQLite, and an
+external executor.
 
 ## Inter-agent coordination
 
@@ -545,6 +626,7 @@ Local agents can spawn child sessions and coordinate via the `lifeos_agent_*` to
 
 | Tool | Purpose |
 |---|---|
+| `lifeos_agent_project_handoff` | Stage 1–20 uniquely keyed durable children from the exact current ordinary-task turn. It is terminal for that turn; staged work remains fenced until the worker proves quiescence and finalizes it. |
 | `lifeos_agent_spawn` | Create a child on `local`, `remote`, `claude`, `hermes`, `claude_code`, or `codex`. Legacy `model=<executor>` and Claude-Code `tier` remain valid; the strict `execution` object carries canonical route/model/effort/location/budget choices. Omitting the route inherits an active bounded override or the caller route. |
 | `lifeos_agent_send` | Post a message to a child session's queue. Also a lifecycle transition: a direct parent sending to its own COMPLETED `claude_code`/`codex` child with a persisted CLI session id **reopens** it — the message is enqueued as the child's next turn *before* the status flips back to `claimed` (so a dispatch tick can never claim an empty resume prompt), and the spawned-session dispatcher resumes the CLI session via `-r` with full prior context. All other terminal sends still reject. |
 | `lifeos_agent_check` | Poll a child's current state. |
@@ -681,6 +763,24 @@ Completed status is accepted only when the executor's terminal evidence is
 valid; Hermes specifically requires a `done` event, non-empty content, and no
 error. Session/attempt identity and usage fields are transport data; ledger and
 served-model provenance remains owned by the usage ledger.
+
+Project-handoff recovery preserves the source turn fence across process
+restarts. Reconciliation can activate staged children and the bounded
+coordinator only after it verifies the persisted source session, attempt, and
+turn have quiesced and the exact source turn is not cancelled. The worker
+records an exact-turn executor return before its cancellation guard; when
+cancellation already owns a local or Managed turn, it retains the quiescence
+event but skips source completion, finalization, and child release. A Hermes
+return records quiescence only with a positive upstream `done` event, including
+after cancellation; a disconnect, deadline, or local cancellation marker alone
+does not prove the upstream turn stopped. Operator teardown can record the same
+evidence only when the existing Managed post-kill state probe reports a terminal
+provider state and the persisted session, attempt, and turn still match. A
+terminal or absent local row, best-effort CLI stop, missing Managed driver, or
+registry cancellation alone is not proof. These unknown stops remain pending
+with an explicit failure, so the same scoped cancellation can be retried after
+evidence arrives. This applies to an interrupted stage before any child exists
+as well as to an already-derived project.
 
 `SessionStore` persists an immutable `attempt_id` and attempt number for each
 deliberate execution, plus a new immutable `turn_id` for every executor start

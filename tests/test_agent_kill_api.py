@@ -172,6 +172,7 @@ def test_kill_calls_managed_driver_when_present(client, stores, monkeypatch):
 
     driver = MagicMock()
     driver.kill_session.side_effect = [None, RuntimeError("network error")]
+    driver.get_session_state.return_value.status = "cancelled"
     monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: driver)
 
     r = client.post(f"/api/agents/sessions/{parent.session_id}/kill", json={})

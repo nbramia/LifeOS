@@ -73,6 +73,19 @@ def caller_proof_for_session(session_id: str, secret: str) -> str:
     ).hexdigest()
 
 
+def caller_turn_proof_for_session(
+    session_id: str, attempt_id: str, turn_id: str, secret: str,
+) -> str:
+    """Bind one MCP request to the executor turn that received the secret."""
+    values = (session_id, attempt_id, turn_id)
+    if not secret or any(not isinstance(value, str) or not value.strip() for value in values):
+        return ""
+    message = "lifeos-agent-turn-v1\0" + "\0".join(value.strip() for value in values)
+    return hmac.new(
+        secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256,
+    ).hexdigest()
+
+
 # Engines an in-flight agent may spawn a child on. `claude`/`local` are the
 # in-process routes (Managed Agents API / Gemma); `claude_code`/`codex` are the
 # CLI routes, used for capability fallback (browser/GUI, native computer use).
@@ -129,6 +142,9 @@ class InterAgentContext:
     caps: Caps
     managed_driver: Any | None = None
     worker_handle: Any | None = None  # Worker — circular import avoided
+    caller_attempt_id: str | None = None
+    caller_turn_id: str | None = None
+    task_manager: Any | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -219,8 +235,57 @@ def _with_caller(props: dict, required: list[str]) -> dict:
 
 INTER_AGENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
+        "name": "lifeos_agent_project_handoff",
+        "description": (
+            "Convert the current ordinary top-level task into a one-level durable project. "
+            "This is terminal for the current executor turn: after a successful call, stop."
+        ),
+        "input_schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "caller_session_id": _CALLER_PROP,
+                "caller_proof": _CALLER_PROOF_PROP,
+                "caller_attempt_id": {"type": "string"},
+                "caller_turn_id": {"type": "string"},
+                "caller_turn_proof": {"type": "string"},
+                "operation_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                "children": {
+                    "type": "array", "minItems": 1, "maxItems": 20,
+                    "items": {
+                        "type": "object", "additionalProperties": False,
+                        "properties": {
+                            "key": {"type": "string", "minLength": 1, "maxLength": 64},
+                            "description": {"type": "string", "minLength": 1, "maxLength": 500},
+                            "notes": {"type": "string", "maxLength": 6000},
+                            "assignee": {
+                                "type": ["string", "null"],
+                                "enum": [None, "me", "claude", "codex", "hermes", "local", "cloud", "cloud-haiku", "cloud-sonnet"],
+                            },
+                            "execution": {
+                                "type": "object", "additionalProperties": False,
+                                "properties": {
+                                    "executor": {"type": "string", "enum": ["local", "remote", "claude", "hermes", "claude_code", "codex"]},
+                                    "model_id": {"type": "string"},
+                                    "effort": {"type": "string", "enum": ["low", "medium", "high", "max"]},
+                                    "host": {"type": "string"},
+                                    "working_dir": {"type": "string"},
+                                },
+                            },
+                        },
+                        "required": ["key", "description"],
+                    },
+                },
+            },
+            "required": [
+                "caller_session_id", "caller_proof", "caller_attempt_id",
+                "caller_turn_id", "caller_turn_proof", "operation_id", "children",
+            ],
+        },
+    },
+    {
         "name": "lifeos_agent_spawn",
-        "description": "Spawn a child agent session that runs in parallel. Returns immediately with a `child_session_id` you can monitor with `lifeos_agent_check` or wait on with `lifeos_agent_yield_until`. Budget is drawn from your remaining lineage budget. Omit the route to inherit an active scoped override (or the caller route). Use `claude_code` to delegate work that needs a real browser / GUI automation — its `--chrome` browser works headless, unlike Codex's (whose computer use is a desktop-app-only feature, unavailable here). For legacy `model=claude_code` children, `tier` selects a Claude tier; when omitted, the CLI configured default is used.",
+        "description": "Spawn a child agent session that runs in parallel. Returns immediately with a `child_session_id` you can monitor with `lifeos_agent_check` or wait on with `lifeos_agent_yield_until`. Budget is drawn from your remaining lineage budget. Omit the route to inherit an active scoped override (or the caller route). Choose `claude_code` or `codex` according to the capabilities configured for that executor. For legacy `model=claude_code` children, `tier` selects a Claude tier; when omitted, the CLI configured default is used.",
         "input_schema": _with_caller({
             "prompt": {"type": "string", "description": "Task description for the child agent"},
             "model": {"type": "string", "enum": ["claude", "local", "remote", "hermes", "claude_code", "codex"], "description": "Legacy executor selector; canonical callers may instead supply execution.executor."},
@@ -609,6 +674,169 @@ def spawn(ctx: InterAgentContext, args: dict) -> dict:
         "task_id": child_task_id,
         "budget": child_budget,
     })
+
+
+def project_handoff(ctx: InterAgentContext, args: dict) -> dict:
+    """Stage a durable project for the exact current owning executor turn."""
+    import re
+
+    from api.services import agent_board
+    from api.services.agent_worker.execution import (
+        ExecutionSpec,
+        parse_execution_request,
+        parse_legacy_route_alias,
+        unsupported_explicit_fields,
+    )
+    from api.services.task_manager import get_task_manager
+    from api.services.task_projects import ProjectHandoffError, ProjectTaskService
+
+    caller = ctx.session_store.get_by_session_id(ctx.caller_session_id)
+    if caller is None:
+        return _err("caller session not found", code="stale_turn")
+    attempt_id = ctx.caller_attempt_id or (args.get("caller_attempt_id") or "").strip()
+    turn_id = ctx.caller_turn_id or (args.get("caller_turn_id") or "").strip()
+    if (
+        not attempt_id or not turn_id
+        or caller.attempt_id != attempt_id
+        or caller.turn_id != turn_id
+        or not ctx.session_store.is_current_turn(caller.task_id, attempt_id, turn_id)
+    ):
+        return _err("caller does not own the current executor turn", code="stale_turn")
+
+    operation_id = (args.get("operation_id") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", operation_id):
+        return _err("operation_id must be a stable 1-128 character key", code="invalid_arg")
+    raw_children = args.get("children")
+    if not isinstance(raw_children, list) or not 1 <= len(raw_children) <= 20:
+        return _err("children must contain between 1 and 20 entries", code="invalid_arg")
+
+    allowed_child = {"key", "description", "notes", "assignee", "execution"}
+    allowed_execution = {"executor", "model_id", "effort", "host", "working_dir"}
+    normalized_children: list[dict[str, Any]] = []
+    keys: set[str] = set()
+    from api.services.task_manager import _validate_text_fields
+
+    for index, raw in enumerate(raw_children):
+        if not isinstance(raw, dict) or set(raw) - allowed_child:
+            return _err(f"child {index} has unknown fields", code="invalid_arg")
+        key = (raw.get("key") or "").strip()
+        description = (raw.get("description") or "").strip()
+        notes = raw.get("notes")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", key):
+            return _err(f"child {index} key is invalid", code="invalid_arg")
+        if key in keys:
+            return _err(f"child key {key!r} is duplicated", code="invalid_arg")
+        keys.add(key)
+        if not description or len(description) > 500:
+            return _err(f"child {key} description must be 1-500 characters", code="invalid_arg")
+        if notes is not None and (not isinstance(notes, str) or len(notes) > 6000):
+            return _err(f"child {key} notes must be at most 6000 characters", code="invalid_arg")
+        assignee = raw.get("assignee")
+        if assignee is not None:
+            if not isinstance(assignee, str):
+                return _err(f"child {key} assignee is invalid", code="invalid_assignment")
+            assignee = assignee.strip().lower().lstrip("#")
+        allowed_assignees = {"me", *agent_board.AGENT_EXECUTOR_TAGS}
+        if assignee is not None and assignee not in allowed_assignees:
+            return _err(f"child {key} assignee is invalid", code="invalid_assignment")
+
+        raw_execution = raw.get("execution")
+        normalized_execution: dict[str, str] | None = None
+        request = None
+        if raw_execution is not None:
+            if not isinstance(raw_execution, dict) or set(raw_execution) - allowed_execution:
+                return _err(f"child {key} execution has unsupported fields", code="invalid_execution")
+            parsed = parse_execution_request(raw_execution)
+            if not parsed.ok or parsed.request is None or not parsed.request.executor:
+                return _err(
+                    "; ".join(item.message for item in parsed.diagnostics)
+                    or f"child {key} execution.executor is required",
+                    code="invalid_execution",
+                )
+            request = parsed.request
+            unsupported = unsupported_explicit_fields(request, request.executor)
+            if unsupported:
+                return _err(
+                    "; ".join(item.message for item in unsupported),
+                    code="unsupported_execution_field",
+                )
+            if request.host:
+                from api.services.agent_worker.remote_spawn import (
+                    HostResolutionError,
+                    api_host_name,
+                    resolve_host_target,
+                )
+
+                try:
+                    resolve_host_target(request.host, api_host_name())
+                except HostResolutionError as exc:
+                    return _err(str(exc), code="invalid_execution")
+            normalized_execution = {
+                name: value for name in allowed_execution
+                if (value := raw_execution.get(name)) is not None
+            }
+
+        alias_request = None
+        if assignee and assignee != "me":
+            alias = parse_legacy_route_alias(f"#{assignee}")
+            alias_request = alias.request
+            if alias_request is None:
+                return _err(f"child {key} assignee cannot be resolved", code="invalid_assignment")
+        if assignee == "me" and request is not None:
+            return _err(f"child {key} assigned to me cannot carry agent execution", code="execution_conflict")
+        if request is not None and alias_request is not None:
+            if request.executor != alias_request.executor or (
+                alias_request.model_id and request.model_id
+                and alias_request.model_id != request.model_id
+            ):
+                return _err(
+                    f"child {key} execution conflicts with assignee {assignee}",
+                    code="execution_conflict",
+                )
+
+        target_executor = request.executor if request else (
+            alias_request.executor if alias_request else None
+        )
+        if target_executor in {"claude", "remote"}:
+            root = ctx.session_store.get_by_session_id(
+                caller.root_session_id or caller.session_id,
+            ) or caller
+            source_executor = None
+            if caller.execution_spec:
+                try:
+                    source_executor = ExecutionSpec.from_dict(caller.execution_spec).executor
+                except (TypeError, ValueError):
+                    source_executor = None
+            if root.routing in NON_API_BILLED_ROOT_ROUTINGS or source_executor != target_executor:
+                return _err(
+                    f"child {key} requests metered executor {target_executor} outside the source turn's explicit target",
+                    code="api_billing_blocked",
+                )
+
+        child = {"key": key, "description": description, "assignee": assignee}
+        if notes is not None:
+            child["notes"] = notes
+        if normalized_execution is not None:
+            child["execution"] = normalized_execution
+        try:
+            _validate_text_fields(description, notes)
+            for value in (normalized_execution or {}).values():
+                _validate_text_fields(value)
+        except ValueError as exc:
+            return _err(f"child {key}: {exc}", code="invalid_arg")
+        normalized_children.append(child)
+
+    manager = ctx.task_manager or get_task_manager()
+    try:
+        return ProjectTaskService(
+            manager, ctx.session_store, ctx.transcript_store,
+        ).stage_handoff(
+            caller, operation_id=operation_id, children=normalized_children,
+        )
+    except ProjectHandoffError as exc:
+        return _err(str(exc), code=exc.code)
+    except (ValueError, KeyError) as exc:
+        return _err(str(exc), code="invalid_arg")
 
 
 def execution_override(ctx: InterAgentContext, args: dict) -> dict:
@@ -1078,19 +1306,29 @@ def teardown_session(
     session whose `host` names a machine other than the API host — None
     (the default) uses a real `subprocess.run` over ssh.
 
-    Returns `{"managed_failure": <reason or None>}` so the caller can
-    surface partial-success in its response.
+    `managed_stop_verified` is true only after the existing Managed state
+    probe observes a terminal provider state.  A successful-looking kill
+    request, a missing driver, or the local status transition is not proof.
     """
     managed_failure: str | None = None
+    managed_status: str | None = None
+    managed_stop_verified = False
     from api.services.agent_worker.executor_lifecycle import (
         CancelResult, ExecutorCapabilities, ExecutorRegistry,
     )
 
     def cancel_route(session, reason):
-        nonlocal managed_failure
+        nonlocal managed_failure, managed_status, managed_stop_verified
         if session.managed_agent_session_id and managed_driver is not None:
             try:
                 managed_driver.kill_session(session.managed_agent_session_id, reason=reason)
+                remote = managed_driver.get_session_state(session.managed_agent_session_id)
+                managed_status = remote.status
+                managed_stop_verified = remote.status in {
+                    "idle", "completed", "failed", "cancelled", "budget_exceeded",
+                }
+                if not managed_stop_verified:
+                    managed_failure = f"managed runtime still reports {remote.status}"
             except Exception as exc:  # noqa: BLE001 — local teardown still proceeds
                 managed_failure = str(exc)
                 logger.warning("kill_session %s failed: %s", session.managed_agent_session_id, exc)
@@ -1121,7 +1359,11 @@ def teardown_session(
     # alone doesn't stop the OS process (the worker's `claude -p` keeps running
     # until the next poll) — this reaps it promptly so an operator kill actually
     # stops compute within seconds.
-    return {"managed_failure": managed_failure}
+    return {
+        "managed_failure": managed_failure,
+        "managed_status": managed_status,
+        "managed_stop_verified": managed_stop_verified,
+    }
 
 
 def kill(ctx: InterAgentContext, args: dict) -> dict:
@@ -1247,6 +1489,7 @@ def user_ask(ctx: InterAgentContext, args: dict) -> dict:
 
 
 DISPATCH_TABLE = {
+    "lifeos_agent_project_handoff": project_handoff,
     "lifeos_agent_spawn": spawn,
     "lifeos_agent_send": send,
     "lifeos_agent_check": check,

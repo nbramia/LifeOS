@@ -176,7 +176,12 @@ class HermesExecutor:
         turn_id = session.turn_id
         active_key = (sid, attempt_id, turn_id)
 
-        request_body = {"question": prompt, "persona_id": self._persona_id}
+        from api.services.agent_worker.delegation import PROJECT_TASK_GUIDANCE
+
+        question = prompt
+        if not conversation_id:
+            question = f"{PROJECT_TASK_GUIDANCE}\n\nTask:\n{prompt}"
+        request_body = {"question": question, "persona_id": self._persona_id}
         if conversation_id:
             request_body["conversation_id"] = conversation_id
         raw_body = json.dumps(request_body).encode("utf-8")
@@ -189,6 +194,35 @@ class HermesExecutor:
                 attempt_id=attempt_id, turn_id=turn_id,
             )
             return ExecutorOutcome(status=STATUS_FAILED, reason=f"envelope build failed: {exc}")
+        try:
+            from api.services.agent_worker.inter_agent import (
+                caller_proof_for_session,
+                caller_turn_proof_for_session,
+            )
+            envelope = json.loads(envelope_body)
+            turn = envelope["lifeos_context"]["turn"]
+            secret = getattr(settings, "mcp_bearer_token", "")
+            turn.update({
+                "caller_session_id": sid,
+                "caller_attempt_id": attempt_id,
+                "caller_turn_id": turn_id,
+                "caller_proof": caller_proof_for_session(sid, secret),
+                "caller_turn_proof": caller_turn_proof_for_session(
+                    sid, attempt_id, turn_id, secret,
+                ),
+            })
+            envelope_body = json.dumps(envelope).encode("utf-8")
+        except (KeyError, TypeError, ValueError) as exc:
+            self.transcript_store.append(sid, "hermes_turn_identity_failed", {
+                "error": type(exc).__name__,
+            })
+            self.session_store.update_status(
+                session.task_id, STATUS_FAILED,
+                attempt_id=attempt_id, turn_id=turn_id,
+            )
+            return ExecutorOutcome(
+                status=STATUS_FAILED, reason="Hermes turn identity injection failed",
+            )
 
         # Cancellation can win after begin_executor_turn() allocated the
         # immutable ids but before the upstream request is created.  The

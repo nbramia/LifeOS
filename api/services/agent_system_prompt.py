@@ -162,6 +162,23 @@ TAGS_INSTRUCTION = (
     "rather than collapsing to a similar existing tag."
 )
 
+# Shared task-hierarchy guidance for native chat and gateway/persona clients.
+# It is deliberately prompt-ready: ``build_system_prompt`` includes the same
+# text natively that ``build_turn_context`` exports to the Hermes envelope.
+TASK_HIERARCHY_INSTRUCTION = (
+    "Projects are ordinary tasks classified only by other tasks' parent references; "
+    "task hierarchy is not agent-session ancestry. Resolve stable task IDs and inspect "
+    "the parent plus its relevant children before acting on a project. When breaking "
+    "work down, create durable children with parent_id and preserve each child's "
+    "independent assignment; never copy the parent's routing tags or choose a cloud "
+    "provider unless the operator explicitly delegated that choice. Completing a "
+    "project must use the validated project-completion path and must not mark unfinished "
+    "children done. Before cancelling a project, preview its unfinished, running, and "
+    "awaiting-review children, explain that pending review output will be abandoned, "
+    "and obtain explicit confirmation; report partial stop failures honestly. Cancelling "
+    "one child never cancels its parent or siblings."
+)
+
 
 def _get_existing_tags() -> list[dict]:
     """Existing task tags with usage counts, shared by the native prompt, the
@@ -203,7 +220,8 @@ def build_turn_context(persona_id: str | None = None, conversation_id: str | Non
     Returns a JSON-serializable dict with the literal keys pinned by the
     `lifeos_context` cross-repo contract: ``current_datetime``,
     ``current_datetime_iso``, ``timezone``, ``time_resolution_instruction``,
-    ``personal_context``, ``existing_tags``, ``tags_instruction``, plus the
+    ``personal_context``, ``existing_tags``, ``tags_instruction``,
+    ``task_hierarchy_instruction``, plus the
     session-cost fields (and ``session_cost_is_lower_bound``) below.
 
     ``conversation_id`` scopes the session-cost fields to one conversation's
@@ -222,6 +240,7 @@ def build_turn_context(persona_id: str | None = None, conversation_id: str | Non
         "personal_context": settings.personal_context(persona_id or ""),
         "existing_tags": _get_existing_tags(),
         "tags_instruction": TAGS_INSTRUCTION,
+        "task_hierarchy_instruction": TASK_HIERARCHY_INSTRUCTION,
         # Session-to-date cost: the verbatim sum of every turn
         # already recorded for this conversation, EXCLUDING the turn
         # currently being built (its own usage isn't recorded until its
@@ -298,6 +317,8 @@ def build_system_prompt(persona: str | None = None, max_tool_rounds: int = 5,
             ),
         }
     )
+
+    blocks.append({"type": "text", "text": TASK_HIERARCHY_INSTRUCTION})
 
     tags_block = _existing_tags_block()
     if tags_block:

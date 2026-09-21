@@ -18,7 +18,7 @@ pytestmark = pytest.mark.unit
 _TURN_KEYS = {
     "current_datetime", "current_datetime_iso", "timezone",
     "time_resolution_instruction", "personal_context",
-    "existing_tags", "tags_instruction",
+    "existing_tags", "tags_instruction", "task_hierarchy_instruction",
     "session_cost_usd", "session_turn_count",
     "session_input_tokens", "session_output_tokens",
     "session_cost_is_lower_bound",
@@ -50,6 +50,8 @@ def test_shape_and_literal_keys(client):
     assert isinstance(body["personal_context"], str)
     assert isinstance(body["existing_tags"], list)
     assert isinstance(body["tags_instruction"], str) and body["tags_instruction"]
+    assert "Projects are ordinary tasks" in body["task_hierarchy_instruction"]
+    assert "explicit confirmation" in body["task_hierarchy_instruction"]
     # No conversation_id given -- present and zero, not omitted or an error.
     assert body["session_cost_usd"] == 0.0
     assert body["session_turn_count"] == 0

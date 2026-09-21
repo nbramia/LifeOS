@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-09-18
+> **Last Updated:** 2026-09-20
 
 Engineering view of the `/agents` page — endpoint shapes, ingest paths, status inference, layout, and security boundaries. For the consumer view see [product/agent-viz.md](../product/agent-viz.md).
 
@@ -13,22 +13,23 @@ Engineering view of the `/agents` page — endpoint shapes, ingest paths, status
 1. [Architecture overview](#architecture-overview)
 2. [Endpoints](#endpoints)
 3. [Kanban board](#kanban-board)
-4. [Snapshot shape](#snapshot-shape)
-5. [LifeOS agent ingest](#lifeos-agent-ingest)
-6. [Claude Code ingest](#claude-code-ingest)
-7. [Status inference (Claude Code)](#status-inference-claude-code)
-8. [Live process detection](#live-process-detection)
-9. [Cross-machine CLI session registration](#cross-machine-cli-session-registration)
-10. [Remote transcript mirror](#remote-transcript-mirror)
-11. [Snapshot caching](#snapshot-caching)
-12. [Delegation timeline](#delegation-timeline)
-13. [Card metadata and cross-tab linking](#card-metadata-and-cross-tab-linking)
-14. [Side-panel SSE](#side-panel-sse)
-15. [Operator kill](#operator-kill)
-16. [Claude Code resume + Go To](#claude-code-resume--go-to)
-17. [Worker resilience](#worker-resilience)
-18. [Security boundaries](#security-boundaries)
-19. [Related Documents](#related-documents)
+4. [Project board model](#project-board-model)
+5. [Snapshot shape](#snapshot-shape)
+6. [LifeOS agent ingest](#lifeos-agent-ingest)
+7. [Claude Code ingest](#claude-code-ingest)
+8. [Status inference (Claude Code)](#status-inference-claude-code)
+9. [Live process detection](#live-process-detection)
+10. [Cross-machine CLI session registration](#cross-machine-cli-session-registration)
+11. [Remote transcript mirror](#remote-transcript-mirror)
+12. [Snapshot caching](#snapshot-caching)
+13. [Delegation timeline](#delegation-timeline)
+14. [Card metadata and cross-tab linking](#card-metadata-and-cross-tab-linking)
+15. [Side-panel SSE](#side-panel-sse)
+16. [Operator kill](#operator-kill)
+17. [Claude Code resume + Go To](#claude-code-resume--go-to)
+18. [Worker resilience](#worker-resilience)
+19. [Security boundaries](#security-boundaries)
+20. [Related Documents](#related-documents)
 
 ---
 
@@ -116,9 +117,19 @@ Heartbeats: per-session SSE emits a `:heartbeat\n\n` comment every 15s when ther
 | `POST /board/cards/{id}/accept` | Adds the `accepted` tag (see `ACCEPTED_TAG`) and sets `status="done"` if either isn't already true; a no-op write-wise (no `TaskManager.update` call at all) when both already hold, so the endpoint is genuinely idempotent — not just safe to call twice. Successful responses include an opaque `undo_token` etag for the matching toast action. |
 | `POST /board/cards/{id}/undo-accept` | Body `{token?}`. Removes the `accepted` tag from an accepted card, preserving unrelated tags and fields and ensuring `agent-completed` remains present so the card returns to Review; a supplied token must still match the Accept transition or the endpoint returns 409. Legacy callers may omit the token. |
 | `POST /board/cards/{id}/review-action` | Body `{action, note?, assignee?}`. `respond` deposits a required note into the card's open blocked question and Hermes sessions continue through their existing conversation; `reject` requires a note, commits the card transition before publishing the follow-up row, then resumes the prior session; `reassign` moves a Review card to Assigned for a validated assignee, optionally appends a context note, retires old completion anchors, and retains the prior session's messages/transcript and compatible native handles for the next claim. Fresh local, remote, Hermes, Managed Agents, and CLI routes receive bounded task notes plus a bounded synthetic prior transcript/output in their first prompt or durable message. Task writes recompute tag/note patches against the latest CAS snapshot; failed paired steps roll back only action-owned changes when the transition version still matches, otherwise they return a clear rollback-conflict response without clobbering concurrent notes, tags, or claims. |
-| `POST /board/cards/{id}/cancel` | Reads the task, then checks ownership before anything else: `is_review_pending` first, then `is_agent_owned` on the raw tags, so a `me` card or a Review card that somehow already carries `status="cancelled"` gets its real 409 instead of a misleading idempotent 200. Once ownership/review clears, looks up any live `cli_sessions` row for the card before the idempotent short-circuit, so a repeat call reports the same untorn-down CLI session every time rather than only the first. `status == "cancelled"` then short-circuits to a response that still carries that CLI-session failure list but touches no session. Otherwise calls `evaluate_card_action(..., "cancel")`, which also refuses an already-**finished** card — `status` `"done"` (e.g. accepted) as well as `"cancelled"` — with `CANCEL_ALREADY_FINISHED_ERROR`, "this card is already finished — nothing to cancel" (the route's own idempotent short-circuit for a legitimately-already-cancelled card is a deliberate exception applied before ever reaching this check). Finds the card's live LifeOS-agent session with a direct `SessionStore.get(card_id)` primary-key read — `task_id` is the `sessions` table's PK — not the 200-row, most-recently-started `_build_snapshot()` window `_task_card` uses for display, which could silently miss an older still-running session. If one exists and isn't terminal, tears down its whole subtree via `_kill_session_subtree` (shared with the kill endpoint, reason `"cancelled from the board"`). A `SubtreeTeardownError` from that call (a genuine mid-subtree failure, distinct from an individual managed-agent teardown failure, which is folded into `failures` instead) stops the task from ever being marked cancelled — the response reports which sessions were already stopped before the failure and invites a retry; a `TaskConflictError` on the final status write, after a successful teardown, says the session is already stopped and invites a retry rather than the generic conflict text. A live cc:/cx: CLI session (opened via the drawer's Open button) lives in the separate `cli_sessions` table, keyed by its own session_id, not task_id, so the primary-key lookup above can never find it; `_kill_cli_sessions` tears those down separately, after the cancel is known to be allowed, and reports them under `killed`. It kills the pane each session runs in (`wezterm cli kill-pane --pane-id`), never `cli_sessions.wezterm_pid`, which is the wezterm-gui process owning every other pane the operator has open. A session whose pane is already gone, or that recorded none, still has its row marked terminal — the row exists to say whether work is running. A session recorded against another machine is reported under `failures` instead: this API can only reach its own wezterm. Strips `agent-running`/`agent-blocked`/`human` from the tags (any of which would otherwise outrank Done in `derive_lane`) and writes `status="cancelled"` — `TaskManager` stamps `[cancelled:: <date>]` and the `- [-]` checkbox. Response: `{id, lane, status, tags, killed, failures}`. |
+| `POST /board/cards/{id}/cancel` | Reads the task, then checks ownership before anything else: `is_review_pending` first, then `is_agent_owned` on the raw tags, so a `me` card or a Review card that somehow already carries `status="cancelled"` gets its real 409 instead of a misleading idempotent 200. A pending executor handoff is then refused with `"pending handoffs use the Cancel handoff action"` before any LifeOS or CLI session lookup or teardown; that state uses the scoped `/api/tasks/{id}/project/cancel` flow even when interrupted before its first child. Once these preflights clear, the route looks up any live `cli_sessions` row for the card before the idempotent short-circuit, so a repeat call reports the same untorn-down CLI session every time rather than only the first. `status == "cancelled"` then short-circuits to a response that still carries that CLI-session failure list but touches no session. Otherwise calls `evaluate_card_action(..., "cancel")`, which also refuses an already-**finished** card — `status` `"done"` (e.g. accepted) as well as `"cancelled"` — with `CANCEL_ALREADY_FINISHED_ERROR`, "this card is already finished — nothing to cancel" (the route's own idempotent short-circuit for a legitimately-already-cancelled card is a deliberate exception applied before ever reaching this check). Finds the card's live LifeOS-agent session with a direct `SessionStore.get(card_id)` primary-key read — `task_id` is the `sessions` table's PK — not the 200-row, most-recently-started `_build_snapshot()` window `_task_card` uses for display, which could silently miss an older still-running session. If one exists and isn't terminal, tears down its whole subtree via `_kill_session_subtree` (shared with the kill endpoint, reason `"cancelled from the board"`). A `SubtreeTeardownError` from that call (a genuine mid-subtree failure, distinct from an individual managed-agent teardown failure, which is folded into `failures` instead) stops the task from ever being marked cancelled — the response reports which sessions were already stopped before the failure and invites a retry; a `TaskConflictError` on the final status write, after a successful teardown, says the session is already stopped and invites a retry rather than the generic conflict text. A live cc:/cx: CLI session (opened via the drawer's Open button) lives in the separate `cli_sessions` table, keyed by its own session_id, not task_id, so the primary-key lookup above can never find it; `_kill_cli_sessions` tears those down separately, after the cancel is known to be allowed, and reports them under `killed`. It kills the pane each session runs in (`wezterm cli kill-pane --pane-id`), never `cli_sessions.wezterm_pid`, which is the wezterm-gui process owning every other pane the operator has open. A session whose pane is already gone, or that recorded none, still has its row marked terminal — the row exists to say whether work is running. A session recorded against another machine is reported under `failures` instead: this API can only reach its own wezterm. Strips `agent-running`/`agent-blocked`/`human` from the tags (any of which would otherwise outrank Done in `derive_lane`) and writes `status="cancelled"` — `TaskManager` stamps `[cancelled:: <date>]` and the `- [-]` checkbox. Response: `{id, lane, status, tags, killed, failures}`. |
 | `GET /pending-questions` | `session_store.list_open_questions()` — unanswered, unprocessed, not-timed-out `pending_questions` rows whose `kind` is `clarification` or `goal_approval`; `followup` (completion notices) and `status_anchor` (routing plumbing) rows are excluded so a Review card never renders a fake pending-question badge. |
 | `POST /pending-questions/{id}/answer` | `session_store.deposit_answer_by_id(question_id, answer)` — writes `answer`/`answered_at` on that exact row id, then invalidates `_board_cache` so the stream's next tick reflects it immediately. |
+
+## Project board model
+
+`ProjectTaskService` computes hierarchy summaries from the complete task set before board filters run. A task card and the additive task read model carry `parent_id`, `parent_title`, `is_project`, `child_count`, `hierarchy_valid`, `hierarchy_error`, and, for derived projects, a compact `project` object containing state counts, resolved count, execution-pause state, cancellation state, and coordinator summary. The card payload intentionally never embeds a child tree; the project drawer requests `GET /api/tasks/{id}/children?limit=50&offset=0` for its authoritative child rows.
+
+Relationship mutations use the existing task write contract: `POST /api/tasks` accepts `fields.parent_id` for a new child and `PUT /api/tasks/{id}` sets, clears, or replaces that field to attach, detach, or reparent. The shared task write boundary validates each resulting relationship and applies the first-child pause before writing the child. The board sends no client-side relationship inference, and refreshes after every successful mutation.
+
+Project controls use additive task routes: `POST /api/tasks/{id}/project/start`, `/project/plan` with a stable `operation_id`, `/project/complete` with `acknowledge_cancelled_children`, and `/resume-execution`. Cancellation is a two-step request to `/project/cancel`: `{confirm:false}` obtains the non-mutating scope preview, then `{confirm:true, operation_id}` records intent and starts/retries the cascade. The result exposes `complete`, `pending`, stopped and preserved IDs, abandoned review IDs, and individual failures, so the drawer never reports an incomplete remote stop as a completed cancellation.
+
+The board respects the server-computed project policy (`can_start_project`, `can_plan_project`, `can_complete_project`, `can_cancel_project`, and `can_resume_execution`) instead of reconstructing task lifecycle rules in JavaScript. The normal task assignment picker remains authoritative for every child; the project drawer only provides a compact independent child assignment control that uses the same guarded task/lane mutation path.
 
 ### Card outcome and PR status
 
@@ -652,7 +663,7 @@ POST /api/agents/sessions/{id}/kill   body: {"reason": "..."}
 2. The actual subtree teardown is `_kill_session_subtree(target, reason)` (`api/routes/agents.py`) — shared with `POST /board/cards/{id}/cancel`, which needs the identical mechanics on the card's linked session. It:
    - Walks the subtree via `_collect_subtree(session_store, target)` — BFS from the target through `parent_session_id`, **not** from `root_session_id`. Non-root targets only take down their own descendants, leaving unrelated peers under the same root alone.
    - For each session in the subtree (target first, then descendants): skips already-terminal entries, emits `operator_killed` (target) or `cascade_killed` (descendants) to the transcript, and calls `api.services.agent_worker.inter_agent.teardown_session(...)` to actually mark the session terminal in the store and tear down the managed remote if one exists.
-   - Managed-Agents teardown uses a `ManagedAgentsDriver` instance constructed lazily from `settings.anthropic_api_key`. If the key isn't set, kill degrades to local-only and the worker's next managed poll reconciles the remote side.
+   - Managed-Agents teardown uses a `ManagedAgentsDriver` instance constructed lazily from `settings.anthropic_api_key`. Its post-kill `get_session_state` result records handoff quiescence only when it is terminal and the task's persisted source session, attempt, and turn still match. A missing driver or non-terminal state records no proof; cancellation therefore stays pending with an explicit stop-verification failure.
    - For a session whose `host` is set, `teardown_session` signals the process over ssh (`ssh <target> kill -- -<pgid>`, the `<pgid>` recorded from the remote executor's spawn — see [Card assignment](agent-worker.md#card-assignment)) instead of the local `os.killpg` path. A missing `remote_pgid` or an unregistered host degrades to a DB-only kill, the same as a missing local pid event does.
 3. `operator_kill_session` itself is the 404/terminal pre-checks plus a call into `_kill_session_subtree` — no teardown logic lives in the route handler directly.
 

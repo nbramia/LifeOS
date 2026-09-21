@@ -32,6 +32,11 @@ def server(monkeypatch, tmp_path: Path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(mcp_server, "AGENT_SESSIONS_DB", tmp_path / "data" / "agent_sessions.db")
     monkeypatch.setattr(mcp_server, "AGENT_TRANSCRIPTS_DIR", tmp_path / "data" / "agent_transcripts")
+    monkeypatch.setattr(
+        mcp_server.LifeOSMCPServer,
+        "_load_openapi_spec",
+        lambda self: self._build_tools_fallback(),
+    )
     srv = mcp_server.LifeOSMCPServer()
     return srv
 
@@ -68,7 +73,7 @@ def test_inter_agent_tools_are_registered(server):
 
 @pytest.mark.unit
 def test_mcp_catalog_count_and_inter_agent_schema_contract(server):
-    """The registered fallback catalog is 63 curated + 9 inter-agent tools.
+    """The registered fallback catalog is 69 curated + 10 inter-agent tools.
 
     The ninth inter-agent tool is the canonical execution-override surface;
     keeping this assertion next to the schema checks prevents docs and live
@@ -76,9 +81,9 @@ def test_mcp_catalog_count_and_inter_agent_schema_contract(server):
     """
     from api.services.agent_worker.inter_agent import INTER_AGENT_TOOL_SCHEMAS
 
-    assert len(mcp_server.CURATED_ENDPOINTS) == mcp_server.CURATED_TOOL_COUNT == 63
-    assert len(INTER_AGENT_TOOL_SCHEMAS) == 9
-    assert len(server.tools) == 72
+    assert len(mcp_server.CURATED_ENDPOINTS) == mcp_server.CURATED_TOOL_COUNT == 69
+    assert len(INTER_AGENT_TOOL_SCHEMAS) == 10
+    assert len(server.tools) == 79
     assert len({tool["name"] for tool in server.tools}) == len(server.tools)
 
 
@@ -148,6 +153,46 @@ def test_mcp_rejects_caller_without_trusted_identity_or_transport_proof(server):
         "session_id": "sess-forged",
     })
     assert result["error"] == "trusted MCP caller identity is unavailable"
+
+
+@pytest.mark.unit
+def test_handoff_stdio_requires_process_bound_exact_turn(server):
+    server._trusted_session_id = "sess-synthetic"
+    server._trusted_attempt_id = ""
+    server._trusted_turn_id = ""
+
+    result = server._call_api("lifeos_agent_project_handoff", {
+        "caller_session_id": "sess-synthetic",
+        "caller_proof": "ignored-for-stdio",
+        "caller_attempt_id": "attempt-model-supplied",
+        "caller_turn_id": "turn-model-supplied",
+        "caller_turn_proof": "model-supplied",
+        "operation_id": "synthetic-v1",
+        "children": [{"key": "one", "description": "Synthetic child"}],
+    })
+
+    assert result["error"] == "trusted MCP turn identity is unavailable"
+
+
+@pytest.mark.unit
+def test_handoff_http_rejects_session_valid_but_turn_forged_proof(server):
+    from api.services.agent_worker.inter_agent import caller_proof_for_session
+
+    server._trusted_session_id = ""
+    server._mcp_transport_secret = "synthetic-mcp-secret"
+    result = server._call_api("lifeos_agent_project_handoff", {
+        "caller_session_id": "sess-synthetic",
+        "caller_proof": caller_proof_for_session(
+            "sess-synthetic", "synthetic-mcp-secret",
+        ),
+        "caller_attempt_id": "attempt-synthetic",
+        "caller_turn_id": "turn-forged",
+        "caller_turn_proof": "forged",
+        "operation_id": "synthetic-v1",
+        "children": [{"key": "one", "description": "Synthetic child"}],
+    })
+
+    assert result["error"] == "invalid MCP caller turn proof"
 
 
 @pytest.mark.unit

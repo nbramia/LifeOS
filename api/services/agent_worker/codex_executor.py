@@ -42,12 +42,13 @@ from api.services.agent_worker.claude_code_executor import (
     _ALTERNATE_AUTH_ENV_PREFIXES,
     _CLARIFY_RE,
 )
-from api.services.agent_worker.delegation import delegation_preamble
+from api.services.agent_worker.delegation import PROJECT_TASK_GUIDANCE, delegation_preamble
 from api.services.agent_worker.local_executor import ExecutorOutcome
 from api.services.agent_worker.remote_spawn import (
     HostResolutionError,
     build_remote_argv,
     env_names_matching_prefixes,
+    is_local_host,
     last_nonempty_line,
     read_line_with_deadline,
     read_remote_pgid_line,
@@ -82,9 +83,16 @@ def _resolve_codex_binary() -> str:
     return resolve_for_spawn(settings.codex_binary)
 
 
-def _delegation_header(session_id: str) -> str:
+def _delegation_header(
+    session_id: str, attempt_id: str | None = None, turn_id: str | None = None,
+) -> str:
     """Per-session preamble line telling Codex its LifeOS session id and how to
     hand off work it can't do (e.g. browser automation) to another engine."""
+    identity = (
+        f"\nlifeos_session_id={session_id}; lifeos_attempt_id={attempt_id}; "
+        f"lifeos_turn_id={turn_id}."
+        if attempt_id and turn_id else ""
+    )
     return "=== YOUR SESSION ===\n" + delegation_preamble(
         session_id,
         trigger=(
@@ -92,7 +100,7 @@ def _delegation_header(session_id: str) -> str:
             "automation you can't perform headlessly —"
         ),
         model='"claude_code" for the browser-enabled Claude Code CLI',
-    )
+    ) + "\n\n" + PROJECT_TASK_GUIDANCE + identity
 
 
 def _git_discipline_header(working_dir: str) -> str:
@@ -210,7 +218,7 @@ class CodexExecutor:
             session.task_id, "execute", session=session,
         )
 
-        working_dir = task.get("working_dir") or os.getcwd()
+        working_dir = task.get("working_dir") or None
         # Warn (once per process) if Codex can't reach the lifeos MCP server —
         # without it the agent is context-blind to personal data. See
         # docs/guides/agent-worker-setup.md § Codex for the config block.
@@ -222,8 +230,15 @@ class CodexExecutor:
         # `working_dir` is a worker-provisioned worktree — the git-discipline
         # instructions. Only on the opening turn — resume() reloads the
         # thread, which already carries this from the first prompt.
-        delegation = _delegation_header(session.session_id)
-        git_discipline = _git_discipline_header(working_dir)
+        delegation = _delegation_header(
+            session.session_id, session.attempt_id, session.turn_id,
+        )
+        prompt_working_dir = working_dir
+        if prompt_working_dir is None and is_local_host(session.host, _api_host_name()):
+            prompt_working_dir = os.getcwd()
+        git_discipline = (
+            _git_discipline_header(prompt_working_dir) if prompt_working_dir else ""
+        )
         full_prompt = f"{delegation}\n{git_discipline}{CAPABILITIES_PREAMBLE}\n{prompt}"
         return self._with_identity(session, self._run(
             session=session,
@@ -247,12 +262,11 @@ class CodexExecutor:
         session = self.session_store.begin_executor_turn(
             session.task_id, "resume", session=session,
         )
-        wd = working_dir or os.getcwd()
         return self._with_identity(session, self._run(
             session=session,
             prompt=message,
             task_title=session.task_id,
-            working_dir=wd,
+            working_dir=working_dir,
             resume_session_id=resume_id,
         ))
 
@@ -263,7 +277,7 @@ class CodexExecutor:
     def _build_command(
         self,
         prompt: str,
-        working_dir: str,
+        working_dir: Optional[str],
         resume_session_id: Optional[str],
         last_message_file: str,
         model: Optional[str] = None,
@@ -279,9 +293,10 @@ class CodexExecutor:
             "--skip-git-repo-check",
             "--sandbox", "workspace-write",
             "--dangerously-bypass-approvals-and-sandbox",
-            "-C", working_dir,
-            "-o", last_message_file,
         ]
+        if working_dir:
+            common.extend(("-C", working_dir))
+        common.extend(("-o", last_message_file))
         # Board-assigned model/effort. When neither flag is passed, codex
         # falls back to whatever `~/.codex/config.toml` says.
         # `--model` only when set (an unset board model keeps that
@@ -327,7 +342,11 @@ class CodexExecutor:
             )
 
     @staticmethod
-    def _clean_env(session_id: str | None = None) -> dict:
+    def _clean_env(
+        session_id: str | None = None,
+        attempt_id: str | None = None,
+        turn_id: str | None = None,
+    ) -> dict:
         """Strip CODEX_* env vars so the subprocess doesn't inherit the
         operator's interactive Codex context — keep CODEX_HOME so auth
         (`~/.codex/auth.json`) is preserved.
@@ -346,6 +365,10 @@ class CodexExecutor:
         }
         if session_id:
             env["LIFEOS_AGENT_SESSION_ID"] = session_id
+            if attempt_id:
+                env["LIFEOS_AGENT_ATTEMPT_ID"] = attempt_id
+            if turn_id:
+                env["LIFEOS_AGENT_TURN_ID"] = turn_id
             from api.services.agent_worker.session_resources import scratch_env
             env.update(scratch_env(session_id))
         return env
@@ -366,7 +389,7 @@ class CodexExecutor:
         session,
         prompt: str,
         task_title: str,
-        working_dir: str,
+        working_dir: Optional[str],
         resume_session_id: Optional[str],
     ) -> ExecutorOutcome:
         sid = session.session_id
@@ -374,12 +397,6 @@ class CodexExecutor:
         # clobber each other.
         last_msg_fd, last_msg_path = tempfile.mkstemp(prefix="codex_last_", suffix=".txt")
         os.close(last_msg_fd)
-
-        cmd = self._build_command(
-            prompt, working_dir, resume_session_id, last_msg_path,
-            model=getattr(session, "model", None),
-            effort=getattr(session, "effort", None),
-        )
 
         # Board-assigned host: resolve BEFORE any spawn call. An
         # unknown host name fails the task closed with no ssh invocation.
@@ -398,17 +415,30 @@ class CodexExecutor:
             return ExecutorOutcome(status=STATUS_FAILED, reason=str(exc))
         if target is not None:
             is_remote = True
+
+        command_working_dir = working_dir
+        if command_working_dir is None and not is_remote:
+            command_working_dir = os.getcwd()
+        cmd = self._build_command(
+            prompt, command_working_dir, resume_session_id, last_msg_path,
+            model=getattr(session, "model", None),
+            effort=getattr(session, "effort", None),
+        )
+
+        if target is not None:
             cmd = build_remote_argv(
                 cmd,
                 target=target,
                 unset_env_names=self._remote_unset_env_names(),
                 session_id=sid,
-                env={key: value for key, value in self._clean_env(sid).items() if key in {"TMPDIR", "TMP", "TEMP"}},
+                env={key: value for key, value in self._clean_env(
+                    sid, session.attempt_id, session.turn_id,
+                ).items() if key in {"TMPDIR", "TMP", "TEMP", "LIFEOS_AGENT_ATTEMPT_ID", "LIFEOS_AGENT_TURN_ID"}},
             )
 
         self.transcript_store.append(sid, "codex_spawn", {
             "resume": bool(resume_session_id),
-            "working_dir": working_dir,
+            "working_dir": command_working_dir,
             "host": host,
             "remote": is_remote,
         })
@@ -418,9 +448,9 @@ class CodexExecutor:
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                cwd=working_dir,
+                cwd=os.getcwd() if is_remote else command_working_dir,
                 text=True,
-                env=self._clean_env(sid),
+                env=self._clean_env(sid, session.attempt_id, session.turn_id),
                 # own process-group leader so the operator kill can
                 # `os.killpg(pgid, ...)` codex + its children without touching
                 # the worker process. Mirrors ClaudeCodeExecutor. For a remote

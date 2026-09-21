@@ -241,6 +241,36 @@ def _location_options() -> list[tuple[str, str, str]]:
     return list(options.values())
 
 
+def resolve_location_affinity(affinity: object) -> str | None:
+    """Resolve a repository-affinity name through the location catalog.
+
+    Affinity is opaque metadata, not a path. Unknown values therefore return
+    ``None`` instead of being passed through to a filesystem consumer.
+    """
+    if not isinstance(affinity, str) or not affinity.strip():
+        return None
+    key = affinity.strip().lower()
+    return {name.lower(): path for name, _description, path in _location_options()}.get(key)
+
+
+def resolve_existing_location_affinity(affinity: object) -> str | None:
+    """Resolve an affinity using existing directories on this host only.
+
+    This bounded variant never consults the GitHub repository catalog, so it
+    is safe for short task-mutation critical sections that must not perform a
+    subprocess or network lookup. Stale scan entries are rejected at the
+    filesystem boundary.
+    """
+    if not isinstance(affinity, str) or not affinity.strip():
+        return None
+    options = dict(_scan_projects())
+    options.setdefault("lifeos", _LIFEOS_DIR)
+    options["vault"] = str(settings.vault_path)
+    options["home"] = _HOME
+    resolved = options.get(affinity.strip().lower())
+    return resolved if resolved and os.path.isdir(resolved) else None
+
+
 def ensure_cloned(path: str) -> bool:
     """Clone the operator's GitHub repo into `path` if it isn't there yet.
 
@@ -294,10 +324,9 @@ def resolve_working_directory(task: str, *, allow_uncloned: bool = True) -> str:
     `allow_uncloned=False` rejects a Jev-chosen directory that doesn't
     exist yet on this host (named only via `_github_repos()`, never
     locally scanned or cloned) and falls through to the keyword cascade
-    instead — for a spawn this process can't clone into (a remote
-    `LIFEOS_AGENT_HOSTS` host), a path with no evidence it exists anywhere
-    the CLI will actually run is worse than the keyword guess. Defaults to
-    True (today's behavior) for every other caller.
+    instead. Callers that cannot clone before execution use this option,
+    then validate the fallback independently. The default keeps
+    clone-on-demand available to local CLI routes.
     """
     from api.services.jev_task_routing import judge_task
 

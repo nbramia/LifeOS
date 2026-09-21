@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** API Gateway
-> **Last Updated:** 2026-09-15
+> **Last Updated:** 2026-09-20
 
 MCP (Model Context Protocol) server that exposes LifeOS capabilities to AI assistants like Claude Code.
 
@@ -33,9 +33,10 @@ The LifeOS MCP server dynamically discovers endpoints from the LifeOS OpenAPI sp
 - Formatted responses for human readability
 - Fallback schemas when API unavailable
 
-The source catalog contains 63 curated LifeOS endpoint tools. It also
-registers 9 worker coordination tools (`lifeos_agent_*`), including
-`lifeos_agent_execution_override`, for a 72-tool fallback catalog. When the
+The source catalog contains 69 curated LifeOS endpoint tools. It also
+registers 10 worker coordination tools (`lifeos_agent_*`), including
+`lifeos_agent_project_handoff` and `lifeos_agent_execution_override`, for a
+79-tool fallback catalog. When the
 OpenAPI document omits an unavailable endpoint, the live list may be smaller;
 the inter-agent tools remain registered as a separate contract.
 
@@ -54,7 +55,7 @@ Claude Code  ←→  MCP Protocol  ←→  mcp_server.py  ←→  LifeOS API
 |------|-------------|
 | `lifeos_ask` | Query knowledge base with synthesized answer |
 | `lifeos_search` | Search vault without synthesis (raw results) |
-| `lifeos_turn_context` | Per-turn context (date/time, relative-time guidance, existing task tags) — read at the start of a turn |
+| `lifeos_turn_context` | Per-turn context (date/time, relative-time guidance, existing task tags, task-hierarchy guidance) — read at the start of a turn |
 
 ### Calendar & Meeting Tools
 | Tool | Description |
@@ -91,11 +92,49 @@ Tasks can also be managed via natural language chat. See [Task Management spec](
 
 | Tool | Description |
 |------|-------------|
-| `lifeos_task_create` | Create a task (stored as Obsidian Tasks markdown) |
-| `lifeos_task_list` | List/filter tasks by status, context, tag, due date, or fuzzy query |
-| `lifeos_task_update` | Update a task's description, status, context, priority, due date, or tags |
-| `lifeos_task_complete` | Mark a task as done |
+| `lifeos_task_create` | Create a task; set `fields.parent_id` for a project child and `operation_key` for retry-safe creation |
+| `lifeos_task_list` | List/filter enriched tasks, including parent identity and compact derived project progress; filtered output is labeled as scoped |
+| `lifeos_task_update` | Update a task; set/clear `fields.parent_id` to attach, reparent, or detach a child |
+| `lifeos_task_complete` | Mark an ordinary task as done; project parents use the checked project action |
 | `lifeos_task_delete` | Delete a task |
+| `lifeos_task_children` | Retrieve the actual children of a project by stable parent ID, with pagination; partial pages state their displayed count and offset |
+| `lifeos_project_start` | Mark an open project active without launching the parent as an ordinary worker task |
+| `lifeos_project_complete` | Complete a project after every child and coordination guard passes; cancelled children require explicit reduced-scope acknowledgement |
+| `lifeos_project_plan` | Start or recover an idempotent agent-owner planning/delegation run |
+| `lifeos_project_cancel` | Preview cancellation scope, then confirm a resumable cascading cancellation with a stable operation ID |
+| `lifeos_task_resume_execution` | Resume a paused ordinary task after its final child link is removed |
+| `lifeos_agent_project_handoff` | The current executor turn stages an ordinary top-level task as a one-level durable project and then ends; children remain blocked until that turn has stopped and been verified |
+
+Project classification comes only from incoming `fields.parent_id` references;
+it is unrelated to `lifeos_agent_spawn` session ancestry. Before mutating a
+project, retrieve its children rather than treating a compact list summary as
+the full tree. Project planning derives one `operation_key` per intended child
+from the project ID, planning operation ID, and child role, then reuses it on
+retry. `lifeos_project_cancel` is intentionally two-step: the preview
+reports unfinished, running, and awaiting-review work; confirmation abandons
+pending-review output without accepting it, and a partial result remains
+pending until retried with the same `operation_id`.
+
+`lifeos_agent_project_handoff` is distinct from ordinary child attachment and
+from `lifeos_agent_spawn`. It accepts an attested current executor turn, a
+stable operation ID, and 1–20 keyed child requests. The server derives the
+source task and session; it rejects a child, an existing project, a stale turn,
+or a caller that tries to broaden provider consent. Each durable child retains
+its own explicit assignment and execution request; omitted assignment remains
+unassigned. A successful staging response tells the caller to stop, and work
+does not become runnable until the worker observes and records that terminal
+turn boundary. If termination cannot be verified, the handoff remains visibly
+pending rather than reporting the parent complete. Recovery retains that fence
+across restarts: it does not release staged work until the matching source turn
+is verified stopped. The existing project cancellation operation remains the
+operator escape hatch, and reports pending rather than success until scoped
+teardown is verified. Exact-turn executor return or a positive Managed terminal
+state can satisfy that proof; a terminal row, best-effort CLI stop, or missing
+Managed driver cannot. Hermes additionally requires a positive upstream `done`
+event; a disconnect, deadline, or local cancellation marker is not stop proof.
+A returned turn after cancellation retains only valid route-specific stop
+proof, never activates staged work. This applies even before a staged request
+has created a child, when the source remains an ordinary task.
 
 ### Human Queue Tools
 
@@ -592,4 +631,4 @@ See `mcp_server.py` for implementation details:
 
 - [API Reference](api-reference.md) -- Full API endpoint contracts
 - [Chat UI](chat-ui.md) -- Chat interface that uses the same tools
-- [Agent Worker](agent-worker.md) -- The `lifeos_agent_*` family extends the MCP catalog for inter-agent coordination (spawn / send / check / yield_until / kill / transcript_read / sessions_list / user_ask)
+- [Agent Worker](agent-worker.md) -- The `lifeos_agent_*` family extends the MCP catalog for durable handoff and inter-agent coordination

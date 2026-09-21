@@ -1017,7 +1017,11 @@ def _now() -> datetime:
 _BOARD_STREAM_INTERVAL = 0.5
 
 
-def _card_policy(task, session_store: SessionStore) -> dict[str, Any]:
+def _card_policy(
+    task,
+    session_store: SessionStore,
+    hierarchy_fields: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Server-computed policy block for a task card — the ONLY source of
     truth for which human moves are allowed on this card. The drawer and
     the board both read this instead of re-implementing
@@ -1027,12 +1031,27 @@ def _card_policy(task, session_store: SessionStore) -> dict[str, Any]:
     `PUT /api/tasks/{id}`).
     """
     from api.services import agent_board
+    from api.services.task_projects import (
+        EXECUTION_PAUSED_FIELD,
+        HANDOFF_OPERATION_FIELD,
+        field_truthy,
+    )
 
     has_live = session_store.has_live_session(task.id, status=task.status, tags=task.tags)
+    hierarchy_fields = hierarchy_fields or {}
+    project = hierarchy_fields.get("project")
+    coordinator = (project or {}).get("coordinator") or {}
 
     def _outcome(action: str, target_lane: str | None = None) -> dict[str, Any]:
         error = agent_board.evaluate_card_action(
             task.status, task.tags, action, target_lane, has_live_session=has_live,
+            is_project=bool(hierarchy_fields.get("is_project")),
+            cancellation_pending=bool(
+                (project or {}).get("cancellation_pending")
+                or hierarchy_fields.get("parent_cancellation_pending")
+            ),
+            has_live_coordinator=bool(coordinator.get("live")),
+            hierarchy_valid=hierarchy_fields.get("hierarchy_valid", True),
         )
         return {"allowed": error is None, "reason": error[1] if error else None}
 
@@ -1051,13 +1070,44 @@ def _card_policy(task, session_store: SessionStore) -> dict[str, Any]:
         if not (outcome := _outcome("lane_move", lane))["allowed"]
     }
 
+    project_actions = agent_board.project_action_policy(
+        task.status,
+        task.tags,
+        project,
+        hierarchy_valid=hierarchy_fields.get("hierarchy_valid", True),
+        execution_paused=field_truthy(task.fields.get(EXECUTION_PAUSED_FIELD)),
+        handoff_pending=bool(task.fields.get(HANDOFF_OPERATION_FIELD)),
+    )
+    cancel = _outcome("cancel")
+    if task.fields.get(HANDOFF_OPERATION_FIELD):
+        cancel = {
+            "allowed": False,
+            "reason": "pending handoffs use the Cancel handoff action",
+        }
     return {
         "claimed": agent_board.is_claimed(task.status, task.tags, has_live),
         "agent_owned": agent_board.is_agent_owned(task.tags),
-        "cancel": _outcome("cancel"),
+        "cancel": cancel,
         "assignee": _outcome("assignee_change"),
         "fields": _outcome("field_edit"),
         "lanes": lanes_refused,
+        **project_actions,
+    }
+
+
+def _card_action_hierarchy_facts(task_manager, card_id: str) -> dict[str, bool]:
+    """Read hierarchy facts at the same point a board mutation is admitted."""
+    hierarchy_fields = task_manager.project_read_fields(card_id)
+    project = hierarchy_fields.get("project") or {}
+    coordinator = project.get("coordinator") or {}
+    return {
+        "is_project": bool(hierarchy_fields.get("is_project")),
+        "cancellation_pending": bool(
+            project.get("cancellation_pending")
+            or hierarchy_fields.get("parent_cancellation_pending")
+        ),
+        "has_live_coordinator": bool(coordinator.get("live")),
+        "hierarchy_valid": hierarchy_fields.get("hierarchy_valid", True),
     }
 
 
@@ -1121,12 +1171,14 @@ def _task_card(task, sessions_by_task: dict[str, list[dict[str, Any]]],
                 open_question_by_task: dict[str, dict[str, Any]],
                 session_store: SessionStore,
                 outcomes_by_task: dict[str, dict[str, Any]],
-                pr_status_by_url: dict[str, dict[str, Any]]) -> dict[str, Any]:
+                pr_status_by_url: dict[str, dict[str, Any]],
+                hierarchy_fields: dict[str, Any] | None = None) -> dict[str, Any]:
     from api.services import agent_board
 
     candidates = sessions_by_task.get(task.id) or []
     session = max(candidates, key=lambda s: s.get("last_activity_at") or 0) if candidates else None
     pq = open_question_by_task.get(task.id)
+    hierarchy_fields = hierarchy_fields or {}
     return {
         "kind": "task",
         "id": task.id,
@@ -1148,8 +1200,9 @@ def _task_card(task, sessions_by_task: dict[str, list[dict[str, Any]]],
         "priority": task.priority,
         "session": session,
         "pending_question": _pending_question_view(pq) if pq else None,
-        "policy": _card_policy(task, session_store),
+        "policy": _card_policy(task, session_store, hierarchy_fields),
         "outcome": _card_outcome_view(outcomes_by_task.get(task.id), pr_status_by_url),
+        **hierarchy_fields,
     }
 
 
@@ -1196,12 +1249,17 @@ def _build_board() -> dict[str, Any]:
     from api.services import agent_board
     from api.services.task_manager import get_task_manager
     from api.services.scheduler_store import get_scheduler_store
+    from api.services.task_projects import ProjectTaskService, build_task_hierarchy
 
     task_manager = get_task_manager()
     scheduler_store = get_scheduler_store()
     session_store = _get_session_store()
 
     tasks = task_manager.list_tasks()
+    hierarchy = build_task_hierarchy(tasks)
+    project_service = ProjectTaskService(
+        task_manager, session_store, _get_transcript_store(),
+    )
     now = _now()
 
     sessions_by_task: dict[str, list[dict[str, Any]]] = {}
@@ -1222,9 +1280,14 @@ def _build_board() -> dict[str, Any]:
     lanes: dict[str, list[dict[str, Any]]] = {lane: [] for lane in agent_board.LANES}
     for task in tasks:
         lane = agent_board.derive_lane(task.status, task.tags, task.fields, now)
+        hierarchy_fields = hierarchy.read_fields(
+            task.id,
+            project_service.coordinator_view(task),
+        )
         lanes[lane].append(_task_card(
             task, sessions_by_task, open_question_by_task, session_store,
             outcomes_by_task, pr_status_by_url,
+            hierarchy_fields,
         ))
 
     for entry in scheduler_store.list_all():
@@ -1349,6 +1412,7 @@ async def move_board_card(card_id: str, body: LaneMoveRequest) -> dict[str, Any]
     """
     from api.services import agent_board
     from api.services.task_manager import get_task_manager, TaskConflictError
+    from api.services.task_projects import ProjectConflictError
 
     task_manager = get_task_manager()
     task = task_manager.get(card_id)
@@ -1359,6 +1423,7 @@ async def move_board_card(card_id: str, body: LaneMoveRequest) -> dict[str, Any]
     has_live = session_store.has_live_session(card_id, status=task.status, tags=task.tags)
     plan = agent_board.plan_lane_move(
         task.status, task.tags, body.lane, body.assignee, has_live_session=has_live,
+        **_card_action_hierarchy_facts(task_manager, card_id),
     )
     if plan.error is not None:
         status_code, detail = plan.error
@@ -1376,6 +1441,7 @@ async def move_board_card(card_id: str, body: LaneMoveRequest) -> dict[str, Any]
             has_live_session=session_store.has_live_session(
                 card_id, status=current.status, tags=current.tags,
             ),
+            **_card_action_hierarchy_facts(task_manager, card_id),
         )
         if fresh.error is not None:
             raise agent_board.CardDecisionChanged(fresh.error)
@@ -1410,6 +1476,8 @@ async def move_board_card(card_id: str, body: LaneMoveRequest) -> dict[str, Any]
         except agent_board.CardDecisionChanged as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
         except TaskConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ProjectConflictError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -1931,6 +1999,7 @@ async def cancel_board_card(card_id: str) -> dict[str, Any]:
     """
     from api.services import agent_board
     from api.services.task_manager import get_task_manager, TaskConflictError
+    from api.services.task_projects import HANDOFF_OPERATION_FIELD, ProjectConflictError
 
     task_manager = get_task_manager()
     task = task_manager.get(card_id)
@@ -1951,6 +2020,11 @@ async def cancel_board_card(card_id: str) -> dict[str, Any]:
         raise HTTPException(
             status_code=agent_board.CANCEL_NOT_AGENT_OWNED_ERROR[0],
             detail=agent_board.CANCEL_NOT_AGENT_OWNED_ERROR[1],
+        )
+    if task.fields.get(HANDOFF_OPERATION_FIELD):
+        raise HTTPException(
+            status_code=409,
+            detail="pending handoffs use the Cancel handoff action",
         )
 
     session_store = _get_session_store()
@@ -1988,7 +2062,10 @@ async def cancel_board_card(card_id: str) -> dict[str, Any]:
         }
 
     has_live = session_store.has_live_session(card_id, status=task.status, tags=task.tags)
-    error = agent_board.evaluate_card_action(task.status, task.tags, "cancel", has_live_session=has_live)
+    error = agent_board.evaluate_card_action(
+        task.status, task.tags, "cancel", has_live_session=has_live,
+        **_card_action_hierarchy_facts(task_manager, card_id),
+    )
     if error is not None:
         status_code, detail = error
         raise HTTPException(status_code=status_code, detail=detail)
@@ -2043,6 +2120,7 @@ async def cancel_board_card(card_id: str) -> dict[str, Any]:
             has_live_session=session_store.has_live_session(
                 card_id, status=current.status, tags=current.tags,
             ),
+            **_card_action_hierarchy_facts(task_manager, card_id),
         )
         if fresh_error is not None:
             raise agent_board.CardDecisionChanged(fresh_error)
@@ -2066,6 +2144,8 @@ async def cancel_board_card(card_id: str) -> dict[str, Any]:
                 f"({exc}) — retry the cancel to finish it"
             ),
         ) from exc
+    except ProjectConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     if task is None:
@@ -2475,6 +2555,56 @@ class SubtreeTeardownError(Exception):
         self.failures = failures
 
 
+def _record_verified_managed_handoff_stop(
+    transcript_store: TranscriptStore,
+    session: Session,
+    teardown_result: dict[str, Any],
+) -> None:
+    """Retain exact-turn proof from the existing Managed terminal-state probe."""
+    if not teardown_result.get("managed_stop_verified"):
+        return
+    from api.services.task_manager import get_task_manager
+    from api.services.task_projects import (
+        HANDOFF_OPERATION_FIELD,
+        HANDOFF_QUIESCENT_EVENT,
+        HANDOFF_SOURCE_ATTEMPT_FIELD,
+        HANDOFF_SOURCE_SESSION_FIELD,
+        HANDOFF_SOURCE_TURN_FIELD,
+    )
+
+    task = get_task_manager().get(session.task_id)
+    if task is None:
+        return
+    fields = task.fields
+    operation_id = fields.get(HANDOFF_OPERATION_FIELD)
+    attempt_id = fields.get(HANDOFF_SOURCE_ATTEMPT_FIELD)
+    turn_id = fields.get(HANDOFF_SOURCE_TURN_FIELD)
+    if not (
+        operation_id
+        and fields.get(HANDOFF_SOURCE_SESSION_FIELD) == session.session_id
+        and attempt_id == session.attempt_id
+        and turn_id == session.turn_id
+    ):
+        return
+    if any(
+        event.get("kind") == HANDOFF_QUIESCENT_EVENT
+        and (event.get("payload") or {}).get("operation_id") == operation_id
+        and (event.get("payload") or {}).get("attempt_id") == attempt_id
+        and (event.get("payload") or {}).get("turn_id") == turn_id
+        for event in transcript_store.read(session.session_id)
+    ):
+        return
+    transcript_store.append(session.session_id, HANDOFF_QUIESCENT_EVENT, {
+        "project_id": task.id,
+        "operation_id": operation_id,
+        "attempt_id": attempt_id,
+        "turn_id": turn_id,
+        "executor": session.routing,
+        "reason": "verified managed teardown",
+        "managed_status": teardown_result.get("managed_status"),
+    })
+
+
 async def _kill_session_subtree(target: Session, reason: str) -> tuple[list[str], list[dict[str, str]]]:
     """Tear down `target` and every descendant in its subtree. Target gets
     an `operator_killed` transcript event; descendants get `cascade_killed`.
@@ -2527,6 +2657,18 @@ async def _kill_session_subtree(target: Session, reason: str) -> tuple[list[str]
                     raise SubtreeTeardownError(
                         f"teardown failed for session {s.session_id}: {exc}", killed, failures,
                     ) from exc
+                try:
+                    _record_verified_managed_handoff_stop(transcript_store, s, result)
+                except Exception as exc:  # noqa: BLE001 — stop remains durable
+                    logger.warning(
+                        "could not retain verified handoff stop for %s: %s",
+                        s.session_id,
+                        exc,
+                    )
+                    failures.append({
+                        "session_id": s.session_id,
+                        "reason": "verified handoff stop could not be recorded",
+                    })
                 killed.append(s.session_id)
                 if result.get("managed_failure"):
                     failures.append({

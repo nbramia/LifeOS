@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-09-10
+**Last Updated:** 2026-09-20
 
 Chat/search, Google integration (Calendar/Gmail/Drive), and messaging (iMessage/Slack) HTTP endpoints, with request/response shapes. Split out of [api-reference.md](api-reference.md) alongside its other adjacent catalogs (CRM, MCP tools, agent activity) because the combined file was over the product-spec size target.
 
@@ -130,7 +130,7 @@ List chat personas available to HTTP clients (web chat, voice/whisper-relay). Re
 
 ### GET /api/chat/turn-context
 
-Read-only per-turn context: the current date/time, the relative-time-resolution instruction, a persona-scoped personal-context block, existing task tags with usage counts, and session-to-date cost/token totals. Exports the same computation the native orchestrator folds into its system prompt (`build_turn_context()` in `api/services/agent_system_prompt.py`), as plain JSON with no dependency on the Anthropic content-block format — any MCP client (registered as `lifeos_turn_context`) or the Hermes backend can pull it at the start of a turn without a LifeOS-specific integration. Never creates, mutates, or persists anything.
+Read-only per-turn context: the current date/time, the relative-time-resolution instruction, a persona-scoped personal-context block, existing task tags with usage counts, task-hierarchy guidance, and session-to-date cost/token totals. Exports the same computation the native orchestrator folds into its system prompt (`build_turn_context()` in `api/services/agent_system_prompt.py`), as plain JSON with no dependency on the Anthropic content-block format — any MCP client (registered as `lifeos_turn_context`) or the Hermes backend can pull it at the start of a turn without a LifeOS-specific integration. Never creates, mutates, or persists anything.
 
 **Query Parameters:**
 - `persona_id` (optional, default `"primary"`) — same registry `GET /api/personas` resolves against. Unknown ids return **400**.
@@ -147,6 +147,7 @@ Read-only per-turn context: the current date/time, the relative-time-resolution 
   "personal_context": "",
   "existing_tags": [{ "tag": "ai-agent", "count": 12 }],
   "tags_instruction": "When the user asks to tag a task, prefer an existing tag...",
+  "task_hierarchy_instruction": "Projects are ordinary tasks classified only by other tasks' parent references...",
   "session_cost_usd": 0.0031,
   "session_turn_count": 2,
   "session_input_tokens": 300,

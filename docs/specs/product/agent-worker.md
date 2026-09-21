@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-09-18
+> **Last Updated:** 2026-09-20
 
 LifeOS includes an external **agent worker** that picks up engine-assigned tasks and completes them autonomously — running locally on a self-hosted LLM or on Anthropic's Managed Agents cloud, with budget caps you can specify in the task title and full audit transcripts on every run. When the agent finishes (or gets stuck), it notifies you on Telegram. If it has a question mid-run, it asks via Telegram and waits for your reply.
 
@@ -14,14 +14,15 @@ The point is hands-free task completion for the long tail of small chores that a
 
 1. [Quick example](#quick-example)
 2. [Task conventions](#task-conventions)
-3. [Routing — local vs cloud](#routing--local-vs-cloud)
-4. [Budgets](#budgets)
-5. [Tag lifecycle](#tag-lifecycle)
-6. [Telegram interactions](#telegram-interactions)
-7. [Capability boundaries](#capability-boundaries)
-8. [Safety model](#safety-model)
-9. [Configuration knobs](#configuration-knobs)
-10. [Related Documents](#related-documents)
+3. [Projects and independently assigned children](#projects-and-independently-assigned-children)
+4. [Routing — local vs cloud](#routing--local-vs-cloud)
+5. [Budgets](#budgets)
+6. [Tag lifecycle](#tag-lifecycle)
+7. [Telegram interactions](#telegram-interactions)
+8. [Capability boundaries](#capability-boundaries)
+9. [Safety model](#safety-model)
+10. [Configuration knobs](#configuration-knobs)
+11. [Related Documents](#related-documents)
 
 ---
 
@@ -68,6 +69,88 @@ Without an explicit routing tag, the preflight reads the title. "With local agen
 To skip the question entirely for a task you know needs the remote provider, tag it `#cloud`; for one that needs Anthropic's own cloud connectors, tag it `#cloud-haiku` or `#cloud-sonnet`.
 
 Tag precedence (first match wins): `#local` → `#claude` → `#codex` → `#hermes` → `#cloud-haiku` → `#cloud-sonnet` → `#cloud`. The CLI routes (`#claude`, `#codex`) skip the cost-confirmation gate because they're subscription-billed, and so does `#hermes` (billed however Hermes bills, not a per-token Anthropic charge) and `#cloud` (the remote provider is priced but isn't the confirmation ceremony's Anthropic "expensive exception"); per-session dollar rollups still appear in `/agents` via the rollout ingest (the `cc:` and `cx:` session rows).
+
+## Projects and independently assigned children
+
+A project is an ordinary vault task that has at least one incoming child
+reference. Each child is another ordinary task with `fields.parent_id` set to
+the parent's stable task ID. Completed and cancelled children still make the
+parent a project while their links remain. Removing the final link restores
+ordinary-task presentation without changing the parent's ID, notes, history,
+or independent execution pause.
+
+Projects are never claimed or opened as ordinary worker tasks. Their assignee
+is the owner, while every child keeps its own assignment and normal execution
+and review lifecycle. Creating or attaching a child does not inherit the
+parent's engine tags. When the worker starts a child, its bounded execution
+context contains that child's instructions plus the parent ID, title,
+objective/acceptance notes, and a compact sibling-status summary; unrelated
+tasks are not copied into the prompt. When the optional Jev destructive gate
+is enabled, its safety judgment receives the child title/instructions and the
+bounded parent title/objective notes that the child will execute under. The
+ordinary route, model, preset and cloud-consent decisions still see only the
+child title, fields and tags; sibling state is not sent to Jev.
+
+Child location selection keeps an explicit `working_dir` authoritative, then
+uses a recognized `fields.project` repository-affinity mapping, a compatible
+parent directory or affinity, and finally the ordinary title-based fallback.
+Affinity strings are catalog names, never raw paths. API-host mappings and
+inferred title paths are not copied to a different remote execution host; a
+remote child without an explicit or same-host parent path starts in that
+host's default directory. In-process routes accept inferred locations only
+when the directory already exists on the API host; their unset fallback stays
+in effect rather than freezing an uncloned path into the execution snapshot.
+
+An agent-owned project's explicit **Plan and delegate** action starts an
+operator-origin coordination session. That session is separate from task
+hierarchy and from any historical task-backed session: it receives the current
+child IDs, assignments, states and outcomes, may create durable children
+through validated task tools, and may assign only within the operator's
+delegated scope and provider consent. A stable operation ID makes retries
+recover the same coordination request. Each intended child also carries a
+stable `operation_key` derived from that request and the child's role, so a
+retried create recovers the existing task instead of duplicating child work.
+The coordinator finishing or failing does not finish the project. An explicit
+coordinator `working_dir` remains authoritative. Its optional project-affinity
+fallback selects only an existing local directory on the API host; remote CLI
+coordinators start in the remote host's default directory unless they have an
+explicit path.
+
+Project completion is explicit. All children must be done or cancelled, no
+review may remain unaccepted, no coordinator may be live, and no cancellation
+may be pending. Cancelled children require acknowledgement of reduced scope;
+they are never counted as successful completion. Cancelling a project is also
+explicit and two-step: the preview names unfinished, running and
+awaiting-review work, then a confirmed operation stops controllable sessions,
+cancels unfinished children, and records review output as abandoned rather
+than accepted. A failed or unverifiable stop leaves cancellation pending and
+reports the remaining session so the same operation can be retried. Cancelling
+one child never cancels siblings or its parent.
+
+An ordinary top-level task currently owned by an executor can be converted into
+a project with `lifeos_agent_project_handoff`. This is a terminal action for
+that exact executor turn, not ordinary child attachment: the caller submits a
+stable operation ID and 1–20 uniquely keyed child requests, then stops. The
+worker records the source turn's stop before activating the staged children and
+bounded coordinator. A stop it cannot verify leaves the handoff pending; it
+does not mark the original task complete or release any staged work. Existing
+projects use **Plan and delegate**, not this conversion. Session-agent
+delegation (`lifeos_agent_spawn`) remains separate from durable project
+children. A child never becomes a project, and a coordinator is one bounded
+run rather than an always-on monitor.
+
+A pending handoff remains fenced through worker recovery. The source stays
+paused and staged work stays blocked until its matching source turn is known
+to have stopped. Exact-turn executor return and a positive Managed terminal-
+state check are stop proof; a terminal local row, a best-effort CLI stop, or an
+unavailable Managed driver is not. An operator can use the existing project
+cancellation flow while a handoff is pending, but cancellation remains pending
+with a stop-verification failure until proof arrives. Cancellation still wins
+if the source returns afterward: the stop proof is retained without completing
+the source or releasing staged work, and the same cancellation operation can
+then finish. A staged intent with no children is still an ordinary task, not a
+project, and is shown as a pending handoff rather than as successful project
+work.
 
 ---
 
@@ -179,9 +262,9 @@ Default clarification timeout is 72 hours (`LIFEOS_AGENT_CLARIFICATION_TIMEOUT_H
 
 ## Safety model
 
-The agent runs with the operator's full filesystem and shell access — no sandbox. This is intentional and consistent with the rest of LifeOS (you trust it with your data); see the [Design Principles](../../../AGENTS.md#development-principles) section in the project AGENTS doc. Four overlapping protections keep things sane:
+The agent runs with the operator's full filesystem and shell access — no sandbox. This is intentional and consistent with the rest of LifeOS (you trust it with your data); see the [Design Principles](../../../AGENTS.md#development-principles) section in the project AGENTS doc. Overlapping protections keep things sane:
 
-1. **Haiku preflight sanity check** — flags obviously destructive titles (`rm -rf /`, "delete all my data") and parks them at `#agent-failed` before the executor sees them.
+1. **Preflight safety checks** — deterministic destructive-title checks fail closed. When explicitly configured, Jev additionally scores irreversible harm in `shadow` mode or parks threshold-crossing tasks for confirmation in `block` mode; project children are judged against their bounded child-plus-parent execution instructions, without allowing parent text to select an engine or grant cloud consent.
 2. **Daily $-cap** — backstop against runaway loops; pauses all new claims when crossed.
 3. **Per-task budgets** — enforced from outside the agent loop, so the model can't override them.
 4. **Telegram notification on every terminal state** — you find out quickly if something runs that shouldn't have.

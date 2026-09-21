@@ -3444,16 +3444,11 @@ def test_clone_on_demand_skipped_for_remote_host(tmp_path: Path, monkeypatch):
 
 
 @pytest.mark.unit
-def test_remote_cli_spawn_falls_back_to_keyword_cascade_for_uncloned_repo(tmp_path: Path, monkeypatch):
-    """A remote-host CLI spawn whose Jev-judged location is a GitHub-only
-    repo (no local directory) must resolve to the keyword-cascade result
-    instead — this process can neither clone into the remote host nor
-    confirm the repo exists there. Exercises the real
-    `resolve_working_directory`, not a stub, so it proves the
-    `allow_uncloned` plumbing through `_resolve_session_execution`'s
-    write-once persisted spec, not just the clone-on-demand block."""
-    import os as _os
-
+@pytest.mark.parametrize("child_affinity", ["widget", None])
+def test_remote_cli_spawn_withholds_recognized_child_and_parent_affinities(
+    tmp_path: Path, monkeypatch, child_affinity: str | None,
+):
+    """Recognized API-host affinities are never reused as a remote host cwd."""
     from config.settings import settings as _settings
     monkeypatch.setattr(_settings, "agent_hosts", {"studio": "user@studio"}, raising=False)
 
@@ -3461,6 +3456,7 @@ def test_remote_cli_spawn_falls_back_to_keyword_cascade_for_uncloned_repo(tmp_pa
     from api.services.jev_task_routing import JevAnswer, TaskJudgment
     monkeypatch.setattr(dr, "_location_options", lambda: [
         ("widget", "an uncloned repo", "/code/Widget"),
+        ("parent-widget", "a parent repo", "/code/ParentWidget"),
     ])
     monkeypatch.setattr(
         "api.services.jev_task_routing.judge_task",
@@ -3472,7 +3468,20 @@ def test_remote_cli_spawn_falls_back_to_keyword_cascade_for_uncloned_repo(tmp_pa
 
     api = FakeApi(tasks=[
         {"id": "t1", "description": "do something random", "status": "in_progress",
-         "tags": [RUNNING_TAG, "claude"], "fields": {"host": "studio"}},
+         "tags": [RUNNING_TAG, "claude"],
+         "fields": dict(
+             host="studio",
+             parent_id="parent1",
+             **({"project": child_affinity} if child_affinity else {}),
+         ),
+         "parent_id": "parent1"},
+        {"id": "parent1", "description": "Synthetic parent", "status": "todo",
+         "tags": [], "child_count": 1,
+         "fields": {
+             "host": "different-remote",
+             "working_dir": "/different-remote/repository",
+             "project": "parent-widget",
+         }},
     ])
     pool = _CapturingPool()
     w = _make_worker(tmp_path, api,
@@ -3485,9 +3494,67 @@ def test_remote_cli_spawn_falls_back_to_keyword_cascade_for_uncloned_repo(tmp_pa
 
     refreshed = w.session_store.get("t1")
     spec = ExecutionSpec.from_dict(refreshed.execution_spec)
-    # "do something random" matches no keyword cascade phrase, so the
-    # cascade's own default (home) is the expected fallback — proving the
-    # Jev-chosen "/code/Widget" (which doesn't exist on this host) was
-    # rejected, not silently substituted for something else Jev-flavored.
-    assert spec.working_dir == _os.path.expanduser("~")
+    assert spec.working_dir is None
     assert BLOCKED_TAG not in api.tasks["t1"]["tags"]
+
+
+@pytest.mark.unit
+def test_remote_cli_spawn_keeps_explicit_child_working_directory(tmp_path: Path, monkeypatch):
+    from config.settings import settings as _settings
+
+    monkeypatch.setattr(_settings, "agent_hosts", {"studio": "user@studio"}, raising=False)
+    explicit_remote_dir = "/srv/checkouts/SyntheticRepo"
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "do something random", "status": "in_progress",
+         "tags": [RUNNING_TAG, "claude"],
+         "fields": {"host": "studio", "working_dir": explicit_remote_dir}},
+    ])
+    pool = _CapturingPool()
+    w = _make_worker(
+        tmp_path,
+        api,
+        preflight_caller=_golden_preflight(routing="claude"),
+        local_executor=None,
+        claude_code_executor=_ReadyCliExecutor(),
+        cli_pool=pool,
+    )
+    w.session_store.create(task_id="t1", status=STATUS_CLAIMED)
+
+    w._dispatch(api.tasks["t1"])
+
+    spec = ExecutionSpec.from_dict(w.session_store.get("t1").execution_spec)
+    assert spec.working_dir == explicit_remote_dir
+    assert len(pool.submitted) == 1
+
+
+@pytest.mark.unit
+def test_remote_cli_spawn_can_use_parent_path_on_same_host(tmp_path: Path, monkeypatch):
+    from config.settings import settings as _settings
+
+    monkeypatch.setattr(_settings, "agent_hosts", {"studio": "user@studio"}, raising=False)
+    parent_remote_dir = "/srv/checkouts/ParentSyntheticRepo"
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "implement phase", "status": "in_progress",
+         "tags": [RUNNING_TAG, "claude"],
+         "fields": {"host": "studio", "parent_id": "parent1"},
+         "parent_id": "parent1"},
+        {"id": "parent1", "description": "Synthetic parent", "status": "todo",
+         "tags": [], "child_count": 1,
+         "fields": {"host": "studio", "working_dir": parent_remote_dir}},
+    ])
+    pool = _CapturingPool()
+    w = _make_worker(
+        tmp_path,
+        api,
+        preflight_caller=_golden_preflight(routing="claude"),
+        local_executor=None,
+        claude_code_executor=_ReadyCliExecutor(),
+        cli_pool=pool,
+    )
+    w.session_store.create(task_id="t1", status=STATUS_CLAIMED)
+
+    w._dispatch(api.tasks["t1"])
+
+    spec = ExecutionSpec.from_dict(w.session_store.get("t1").execution_spec)
+    assert spec.working_dir == parent_remote_dir
+    assert len(pool.submitted) == 1

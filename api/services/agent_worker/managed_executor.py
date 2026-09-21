@@ -97,7 +97,14 @@ def _truncate_oversized_tool_result(event: dict) -> dict:
     return new_event
 
 
-def _user_message_for(task: dict, session_id: str, expected_output: str, budget: dict) -> str:
+def _user_message_for(
+    task: dict,
+    session_id: str,
+    expected_output: str,
+    budget: dict,
+    attempt_id: str | None = None,
+    turn_id: str | None = None,
+) -> str:
     """The initial user turn sent to a managed session.
 
     Prepended with the LifeOS capabilities preamble (see
@@ -119,11 +126,12 @@ def _user_message_for(task: dict, session_id: str, expected_output: str, budget:
     process boundary.
     """
     from api.services.agent_worker.capabilities_preamble import CAPABILITIES_PREAMBLE
+    from api.services.agent_worker.delegation import PROJECT_TASK_GUIDANCE
     title = (task.get("description") or "").strip()
     context = task.get("context")
     max_dollars = budget.get("max_dollars")
     dollars_str = f"~${max_dollars}" if max_dollars is not None else "unset"
-    parts = [CAPABILITIES_PREAMBLE, f"Task: {title}"]
+    parts = [CAPABILITIES_PREAMBLE, PROJECT_TASK_GUIDANCE, f"Task: {title}"]
     if context:
         parts.append(f"Context: {context}")
     notes = (task.get("notes") or "").strip()
@@ -132,12 +140,22 @@ def _user_message_for(task: dict, session_id: str, expected_output: str, budget:
         # retain the latest operator direction without allowing an unbounded
         # vault note to dominate the first remote prompt.
         parts.append(f"Task notes:\n{notes[-6000:]}")
-    from api.services.agent_worker.inter_agent import caller_proof_for_session
+    from api.services.agent_worker.inter_agent import (
+        caller_proof_for_session,
+        caller_turn_proof_for_session,
+    )
     from config.settings import settings
     proof = caller_proof_for_session(session_id, getattr(settings, "mcp_bearer_token", ""))
     identity = f"lifeos_session_id={session_id}; "
     if proof:
         identity += f"lifeos_session_proof={proof}; "
+    if attempt_id and turn_id:
+        turn_proof = caller_turn_proof_for_session(
+            session_id, attempt_id, turn_id, getattr(settings, "mcp_bearer_token", ""),
+        )
+        identity += f"lifeos_attempt_id={attempt_id}; lifeos_turn_id={turn_id}; "
+        if turn_proof:
+            identity += f"lifeos_turn_proof={turn_proof}; "
     # No token cap is the default (opt-in only via a title hint) — omit the
     # clause entirely rather than rendering "~None tokens".
     max_tokens = budget.get("max_tokens")
@@ -281,6 +299,7 @@ class ManagedExecutor:
 
         initial_message = _user_message_for(
             task, sid, session.expected_output or "text", budget,
+            session.attempt_id, session.turn_id,
         )
         preset_class = getattr(session, "preset_class", None)
 

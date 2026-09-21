@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Task Management
-> **Last Updated:** 2026-09-15
+> **Last Updated:** 2026-09-20
 
 Engineering view of the task store — how a task is located, written, and
 reindexed. For the product-facing feature description, statuses, and API
@@ -16,6 +16,8 @@ does not restate those.
 | File | Role |
 |------|------|
 | `api/services/task_manager.py` | `Task`, `TaskManager` (CRUD + markdown round-trip + index cache + dashboard), module-level parse/format helpers |
+| `api/services/task_projects.py` | Derived hierarchy/read model, relationship validation, explicit project lifecycle and coordinator/cancellation recovery |
+| `api/services/operation_lock.py` | Re-entrant cross-process boundary for relationship, claim, and durable-operation races |
 | `api/services/task_watcher.py` | `TaskWatcher` — watchdog observer that reindexes on external edits |
 | `api/services/atomic_write.py` | `atomic_write_text`/`atomic_write_lines` — shared temp-file-plus-rename helper, also used by `scheduler_store.py` |
 | `api/routes/tasks.py` | `/api/tasks` HTTP surface |
@@ -379,6 +381,95 @@ carry a `wait_reason` badge; operator waits use the existing blocked/Human
 Queue behavior. Repeated events are keyed by `event_id` and are no-ops after
 acknowledgement.
 
+## Derived hierarchy and project lifecycle
+
+`fields.parent_id` is the only persisted membership edge. `TaskHierarchy`
+builds incoming-child and parent maps from the complete task set, including
+terminal children, before any API filters are applied. It produces compact
+read fields for task and board responses and a stable validation error for an
+observed malformed edge. Malformed direct-vault edits stay indexed and visible;
+they fail worker claim/open instead of being dropped or interpreted as safe
+ordinary work.
+
+`fields.project` is independent repository-affinity metadata and never enters
+the hierarchy maps. An affinity-only task remains an ordinary task;
+`is_project`, `child_count`, and the derived `project` summary depend only on
+valid incoming `fields.parent_id` edges, while both persisted fields continue
+to round-trip in the task's `fields` map. Worker dispatch may resolve the
+affinity through its recognized location catalog, but an unknown string remains
+opaque metadata and never becomes a raw path; hierarchy edits perform no
+affinity migration or rewrite.
+
+Relationship creation, mutation, deletion, and atomic worker claim share
+`.task-operation.lock`. The re-entrant wrapper lets a first-child mutation
+pause the parent through the ordinary TaskManager write path while retaining
+one outer OS lock. Every path that needs both locks acquires the instance
+`RLock` and then the process lock. Each process refreshes authoritative
+Markdown after taking that boundary. Therefore a first-child attachment and a
+worker claim serialize: the claim either records its live state first and
+attachment refuses, or the attachment records the pause and child first and
+claim refuses. Per-file CAS still protects the bytes written inside that
+broader decision boundary.
+
+API-mediated first attachment persists `execution_paused=true` before writing
+the child. A valid relationship first observed during watcher/full reindex
+also repairs the pause onto the parent; claim derives `is_project`
+independently, so it fails closed even if that repair loses a CAS and waits for
+the next watcher pass. A repair pass suppresses nested repair entry while its
+bounded CAS retry reindexes competing external edits. Removing the final child
+retains the pause. Invalid external relationships are not rewritten
+automatically.
+
+Interactive Open writes a short `execution_reservation_until` lease under the
+same operation boundary before spawning a CLI. First-child attachment and
+worker claim treat a live lease as execution, closing the hook-registration
+gap; the first lifecycle status projection clears it, and an abandoned lease
+expires without repair work.
+
+Direct vault writes cannot be atomic with API decisions before the watcher has
+observed them. The watcher debounce is the explicit observation window: an
+unobserved edit can race an API request, while any observed relationship is
+included in hierarchy validation, pause repair, and claim/open guards. This is
+why classification and claim safety never rely on the pause field alone.
+
+`TaskManager` enforces caller-independent guards for create/update/complete/
+delete/claim and lifecycle-tag swaps. A swap cannot manufacture worker
+lifecycle state on a task that fails project claim admission, while a card
+that already carries `agent-running` or `agent-blocked` can still complete,
+fail, block, or resume through the worker's atomic transition. The route maps
+an admission conflict to HTTP 409. `ProjectTaskService` composes the slower
+explicit actions:
+
+- start and completion mutate the ordinary parent without forging agent tags;
+- plan/delegate stages a separate operator-origin session as non-dispatchable,
+  links its session and request IDs onto the parent, then makes it claimable;
+- retry-safe child creation uses `TaskManager.create_or_find_by_operation()`;
+  the coordinator derives one durable `operation_key` per intended child from
+  the project ID, planning operation ID, and child role, and a later call that
+  reuses the key with different task inputs recovers the original unchanged;
+- cancellation writes its operation ID/timestamp first, releases task locks
+  before session teardown, and re-reads current children on every pass;
+- a failed or unverifiable stop leaves intent and affected work unresolved for
+  a same-ID retry, including after process restart;
+- cancellation preview returns that pending operation ID, and policy keeps the
+  cancel action available so clients can issue the required same-ID retry;
+- review cancellation removes the review lifecycle marker, adds
+  `agent-result-abandoned`, and preserves SessionStore/transcript output rather
+  than recording acceptance.
+
+The coordinator uses a synthetic task ID derived from project ID plus a hash of
+the caller's stable operation ID. Its canonical execution request comes from
+the parent owner and assignment fields. The existing legacy-alias adapter maps
+`#cloud-haiku` and `#cloud-sonnet` to the Managed Agents executor and their
+explicit model consent while retaining configured effort and host assignment
+fields. This gives restart recovery a direct lookup and prevents repeated
+clicks from creating duplicate sessions without a new SQL table. Parent fields
+link coordination directly; coordinator summaries scan the transcript through
+its streaming iterator and retain only the latest 100 events in memory. The
+scan remains linear in transcript length and does not add a cache. Capped board
+snapshots and the task-backed session keyed by the parent ID are not used for
+liveness.
+
 ## Related Documents
 
 ### Specifications
@@ -392,6 +483,7 @@ acknowledgement.
 
 ### Code References
 - [task_manager.py](../../../api/services/task_manager.py) — Store, round-trip, CAS writes
+- [task_projects.py](../../../api/services/task_projects.py) — Hierarchy and project lifecycle
 - [task_watcher.py](../../../api/services/task_watcher.py) — File watcher
 - [atomic_write.py](../../../api/services/atomic_write.py) — Shared atomic-write helper
-- [tests/test_task_manager.py](../../../tests/test_task_manager.py) · [test_task_watcher.py](../../../tests/test_task_watcher.py) · [test_atomic_write.py](../../../tests/test_atomic_write.py) — Coverage
+- [tests/test_task_manager.py](../../../tests/test_task_manager.py) · [test_task_projects.py](../../../tests/test_task_projects.py) · [test_task_watcher.py](../../../tests/test_task_watcher.py) · [test_atomic_write.py](../../../tests/test_atomic_write.py) — Coverage

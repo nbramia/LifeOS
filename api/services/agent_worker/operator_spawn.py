@@ -6,7 +6,7 @@ parentless session created on demand from Telegram or chat, with no backing
 `#agent` vault task.
 
 Routing follows the override-then-preflight rule locked with the user:
-explicit ``local`` / ``claude`` wins; otherwise ``run_preflight`` decides,
+an explicit canonical executor wins; otherwise ``run_preflight`` decides,
 falling back to the existing Telegram clarification flow on ``ROUTE_ASK``.
 
 The created session is marked ``origin='operator'`` so the worker's
@@ -49,6 +49,8 @@ def create_operator_session(
     preflight_caller=None,
     budget: dict | None = None,
     execution_request: ExecutionRequest | None = None,
+    task_id: str | None = None,
+    dispatch_ready: bool = True,
 ) -> dict:
     """Create a parentless operator-spawned session.
 
@@ -68,7 +70,9 @@ def create_operator_session(
         return {"ok": False, "error": "prompt is required"}
 
     routing_source = "explicit"
-    if explicit_routing in (ROUTE_LOCAL, ROUTE_CLAUDE):
+    if explicit_routing in {
+        ROUTE_LOCAL, ROUTE_CLAUDE, "remote", "hermes", "claude_code", "codex",
+    }:
         routing = explicit_routing
     else:
         routing_source = "preflight"
@@ -81,9 +85,9 @@ def create_operator_session(
         routing = pre.routing  # local / claude / ask
 
     needs_routing = routing == ROUTE_ASK
-    status = STATUS_BLOCKED if needs_routing else STATUS_CLAIMED
+    status = STATUS_BLOCKED if needs_routing or not dispatch_ready else STATUS_CLAIMED
     session_id = new_session_id()
-    task_id = f"op_{session_id.removeprefix('sess_')}"
+    task_id = task_id or f"op_{session_id.removeprefix('sess_')}"
 
     # Enqueue the prompt BEFORE the session row exists. The worker is a separate
     # process ticking against the shared DB; if it observed a CLAIMED operator

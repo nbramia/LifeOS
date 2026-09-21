@@ -375,12 +375,19 @@ TOOL_DEFINITIONS = [
     {
         "name": "manage_tasks",
         "description": (
-            "Manage Obsidian tasks. Actions: 'create' (new task — always lands in "
+            "Manage Obsidian tasks and projects through the shared validated task "
+            "services. A project is an ordinary task with one or more incoming child "
+            "parent references; task hierarchy is not agent-session ancestry. Actions: "
+            "'create' (new task — always lands in "
             "Inbox; do not pass a context — status/notes/fields are accepted), "
             "'list' (filter tasks; supports the context filter for already-"
             "categorized tasks), 'complete' (mark task done), 'update' (edit any "
             "field on an existing task, including tags, notes, operator fields, or "
-            "moving the task to a different context), 'tags' (list every distinct "
+            "moving the task to a different context), 'children' (retrieve a project's "
+            "actual children), 'start_project', 'complete_project', 'plan_project', "
+            "'cancel_project' (first preview, then explicitly confirmed cascade), and "
+            "'resume_execution' (for a paused ordinary task after its last child was "
+            "removed), 'tags' (list every distinct "
             "tag across all tasks with usage counts — the same list is already in "
             "the system prompt; call this action only if the user explicitly asks "
             "'what tags do I have', or to double-check a stale cache). When "
@@ -394,7 +401,11 @@ TOOL_DEFINITIONS = [
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["create", "list", "complete", "update", "tags"],
+                    "enum": [
+                        "create", "list", "complete", "update", "children",
+                        "start_project", "complete_project", "plan_project",
+                        "cancel_project", "resume_execution", "tags",
+                    ],
                     "description": "Action to perform.",
                 },
                 "description": {
@@ -403,7 +414,15 @@ TOOL_DEFINITIONS = [
                 },
                 "task_id": {
                     "type": "string",
-                    "description": "Task ID (required for complete and update).",
+                    "description": "Stable task ID (required for task/project actions other than create, list, and tags).",
+                },
+                "parent_id": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "Stable parent task ID for create/update. A string creates, attaches, "
+                        "or reparents a durable child relationship; null detaches on update. "
+                        "Projects are derived only from incoming parent references."
+                    ),
                 },
                 "context": {
                     "type": "string",
@@ -455,6 +474,45 @@ TOOL_DEFINITIONS = [
                 "query": {
                     "type": "string",
                     "description": "Search within task descriptions (for list).",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum children to return for the children action (default 50).",
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Zero-based child offset for the children action (default 0).",
+                },
+                "operation_id": {
+                    "type": "string",
+                    "description": (
+                        "Stable client-generated ID for plan_project or confirmed "
+                        "cancel_project. Reuse it on retries so interrupted work recovers "
+                        "instead of launching or cancelling twice."
+                    ),
+                },
+                "operation_key": {
+                    "type": "string",
+                    "description": (
+                        "create only: stable caller-generated key for retry-safe creation. "
+                        "A planning coordinator should derive one key per intended child from "
+                        "its project ID, plan operation ID, and child role, then reuse it on retry."
+                    ),
+                },
+                "confirm": {
+                    "type": "boolean",
+                    "description": (
+                        "cancel_project only: omit/false for a non-mutating preview; true "
+                        "only after the operator explicitly confirms the previewed unfinished, "
+                        "running, and awaiting-review scope."
+                    ),
+                },
+                "acknowledge_cancelled_children": {
+                    "type": "boolean",
+                    "description": (
+                        "complete_project only: true explicitly acknowledges reduced scope "
+                        "when cancelled children exist; cancelled work is never counted as success."
+                    ),
                 },
                 "notes": {
                     "type": "string",
@@ -1107,6 +1165,9 @@ def _journal_filter_task_create_input(tool_input: dict, user_message: str) -> di
     low = message.lower()
     message_tags = {t.lower() for t in _MESSAGE_TAG_RE.findall(message)}
     filtered = dict(tool_input)
+    parent_id = filtered.get("parent_id")
+    if parent_id and not _field_attested("parent_id", str(parent_id), low):
+        filtered.pop("parent_id", None)
     tags = filtered.get("tags")
     if tags:
         filtered["tags"] = [
@@ -1137,11 +1198,11 @@ def _journal_tool_gate(name: str, tool_input: dict, user_message: str) -> tuple[
         return None, f"Error: '{name}' is not available on the journal persona."
     if name == "manage_tasks":
         action = tool_input.get("action")
-        if action in ("complete", "update"):
+        if action not in ("create", "list", "children", "tags"):
             return None, (
                 f"Error: manage_tasks action '{action}' is not available on "
-                "the journal persona — journal files work, it does not "
-                "complete or edit existing tasks."
+                "the journal persona — journal files work, it does not edit "
+                "existing tasks or projects."
             )
         if action == "create":
             return _journal_filter_task_create_input(tool_input, user_message), None
@@ -2401,21 +2462,107 @@ def _tool_person_info(inp: dict):
 
 # -- Task helpers --
 
+def _task_project_service(tm, *, lifecycle: bool = False):
+    """Build the shared project service around the native tool's TaskManager.
+
+    Read/ordinary mutation helpers need only its hierarchy projection. Every
+    project mutation needs the durable worker stores so live-coordinator guards
+    and teardown match HTTP; the shared service keeps that policy out of this
+    adapter.
+    """
+    from api.services.task_projects import ProjectTaskService
+    if not lifecycle:
+        return ProjectTaskService(tm)
+    from api.services.agent_worker.session_store import SessionStore
+    from api.services.agent_worker.transcript_store import TranscriptStore
+    return ProjectTaskService(tm, SessionStore(), TranscriptStore())
+
+
+def _task_with_parent_field(inp: dict, *, allow_clear: bool) -> dict:
+    fields = dict(inp.get("fields") or {})
+    if "parent_id" not in inp:
+        return fields
+    parent_id = inp.get("parent_id")
+    if parent_id is None and not allow_clear:
+        return fields
+    if "parent_id" in fields and fields["parent_id"] != parent_id:
+        raise ValueError("parent_id conflicts with fields.parent_id")
+    fields["parent_id"] = parent_id
+    return fields
+
+
+def _format_native_task(task, hierarchy, service=None) -> str:
+    entry = hierarchy.entry(task.id)
+    status_icon = {
+        "todo": "[ ]", "done": "[x]", "in_progress": "[/]",
+        "cancelled": "[-]", "deferred": "[>]", "blocked": "[?]", "urgent": "[!]",
+    }.get(task.status, f"[{task.status}]")
+    due = f" (due {task.due_date})" if task.due_date else ""
+    text = f"{status_icon} {task.description}{due} [id:{task.id}]"
+    if entry.parent_id:
+        text += f"\n  Parent: {entry.parent_title or 'Unknown parent'} [id:{entry.parent_id}]"
+        parent = hierarchy.tasks.get(entry.parent_id)
+        if parent and parent.fields.get("project_cancel_operation_id"):
+            text += " | Cancellation pending"
+    if entry.is_project:
+        coordinator = service.coordinator_view(task) if service is not None else None
+        summary = hierarchy.project_summary(task.id, coordinator) or {}
+        counts = summary.get("counts") or {}
+        parts = []
+        for key, label in (
+            ("done", "done"), ("awaiting_review", "awaiting review"),
+            ("cancelled", "cancelled"), ("blocked", "blocked"),
+            ("running", "running"), ("unassigned", "unassigned"),
+            ("assigned", "assigned"),
+        ):
+            if counts.get(key):
+                parts.append(f"{counts[key]} {label}")
+        text += f"\n  Project: {entry.child_count} children"
+        if parts:
+            text += f" ({', '.join(parts)})"
+        if summary.get("ready_to_close"):
+            text += " | Ready to close"
+        if summary.get("cancellation_pending"):
+            text += " | Cancellation pending"
+        if coordinator:
+            text += f"\n  Coordinator: {coordinator.get('status') or 'unknown'}"
+            if coordinator.get("result"):
+                text += f" | Result: {coordinator['result']}"
+    if not entry.valid:
+        text += f"\n  Hierarchy invalid: {entry.error or 'unknown'}"
+    return text
+
 def _task_create(inp: dict) -> str:
     from api.services.task_manager import get_task_manager
     tm = get_task_manager()
-    fields = {k: v for k, v in (inp.get("fields") or {}).items() if v is not None}
-    task = tm.create(
-        description=inp["description"],
-        status=inp.get("status") or "todo",
-        priority=inp.get("priority", ""),
-        due_date=inp.get("due_date"),
-        tags=inp.get("tags"),
-        notes=inp.get("notes"),
-        fields=fields,
-    )
-    due = f", due {task.due_date}" if task.due_date else ""
-    return f"Task created: \"{task.description}\" (id: {task.id}{due})"
+    fields = {k: v for k, v in _task_with_parent_field(inp, allow_clear=False).items() if v is not None}
+    operation_key = (inp.get("operation_key") or "").strip()
+    if operation_key:
+        task, created = tm.create_or_find_by_operation(
+            operation_key,
+            description=inp["description"],
+            status=inp.get("status") or "todo",
+            priority=inp.get("priority", ""),
+            due_date=inp.get("due_date"),
+            tags=inp.get("tags"),
+            notes=inp.get("notes"),
+            fields=fields,
+        )
+    else:
+        task = tm.create(
+            description=inp["description"],
+            status=inp.get("status") or "todo",
+            priority=inp.get("priority", ""),
+            due_date=inp.get("due_date"),
+            tags=inp.get("tags"),
+            notes=inp.get("notes"),
+            fields=fields,
+        )
+        created = True
+    service = _task_project_service(tm, lifecycle=True)
+    hierarchy = service.hierarchy()
+    verb = "created" if created else "recovered"
+    return f"Task {verb}:\n" + _format_native_task(task, hierarchy, service)
 
 
 def _task_list(inp: dict) -> str:
@@ -2442,11 +2589,32 @@ def _task_list(inp: dict) -> str:
             )
             return f"No tasks matched. Filtered on {', '.join(applied)}.{hint}"
         return "No tasks found."
-    lines = []
-    for t in tasks:
-        status_icon = {"todo": "[ ]", "done": "[x]", "in_progress": "[/]"}.get(t.status, f"[{t.status}]")
-        due = f" (due {t.due_date})" if t.due_date else ""
-        lines.append(f"{status_icon} {t.description}{due} [id:{t.id}]")
+    service = _task_project_service(tm, lifecycle=True)
+    hierarchy = service.hierarchy()
+    lines = [_format_native_task(task, hierarchy, service) for task in tasks]
+    if any((inp.get(key) is not None) for key in ("status", "context", "query")):
+        lines.append("[Filtered list; project summaries still use the complete task set.]")
+    return "\n".join(lines)
+
+
+def _task_children(inp: dict) -> str:
+    from api.services.task_manager import get_task_manager
+    task_id = inp.get("task_id")
+    if not task_id:
+        return "Error: 'task_id' is required for children."
+    tm = get_task_manager()
+    service = _task_project_service(tm, lifecycle=True)
+    hierarchy = service.hierarchy()
+    if task_id not in hierarchy.tasks:
+        return f"Error: Task '{task_id}' not found."
+    children = hierarchy.children(task_id)
+    offset = max(0, int(inp.get("offset") or 0))
+    limit = min(200, max(1, int(inp.get("limit") or 50)))
+    shown = children[offset:offset + limit]
+    if not shown:
+        return f"No children found for task '{task_id}'."
+    lines = [_format_native_task(task, hierarchy, service) for task in shown]
+    lines.append(f"[Showing {len(shown)} of {len(children)} children; offset {offset}.]")
     return "\n".join(lines)
 
 
@@ -2469,6 +2637,8 @@ def _task_update(inp: dict) -> str:
         return "Error: 'task_id' is required for update."
     tm = get_task_manager()
     updates = {k: inp[k] for k in _UPDATABLE_FIELDS if k in inp and inp[k] is not None}
+    if "parent_id" in inp:
+        updates["fields"] = _task_with_parent_field(inp, allow_clear=True)
     if not updates:
         return (
             "Error: no updatable fields provided (description, status, context, "
@@ -2478,7 +2648,92 @@ def _task_update(inp: dict) -> str:
     if not task:
         return f"Error: Task '{task_id}' not found."
     changed = ", ".join(f"{k}={updates[k]!r}" for k in updates)
-    return f"Task updated: \"{task.description}\" (id: {task.id}; changed: {changed})"
+    service = _task_project_service(tm, lifecycle=True)
+    hierarchy = service.hierarchy()
+    return f"Task updated (changed: {changed}):\n{_format_native_task(task, hierarchy, service)}"
+
+
+def _task_start_project(inp: dict) -> str:
+    from api.services.task_manager import get_task_manager
+    task = _task_project_service(get_task_manager(), lifecycle=True).start_project(
+        inp.get("task_id") or ""
+    )
+    return f"Project started: \"{task.description}\" (id: {task.id})"
+
+
+def _task_complete_project(inp: dict) -> str:
+    from api.services.task_manager import get_task_manager
+    task = _task_project_service(get_task_manager(), lifecycle=True).complete_project(
+        inp.get("task_id") or "",
+        acknowledge_cancelled_children=bool(inp.get("acknowledge_cancelled_children")),
+    )
+    return f"Project completed: \"{task.description}\" (id: {task.id})"
+
+
+def _task_plan_project(inp: dict) -> str:
+    from api.services.task_manager import get_task_manager
+    result = _task_project_service(get_task_manager(), lifecycle=True).plan_and_delegate(
+        inp.get("task_id") or "", operation_id=inp.get("operation_id") or "",
+    )
+    verb = "started" if result.get("created") else "recovered"
+    return (
+        f"Project planning {verb}: session {result.get('session_id', '')} | "
+        f"status {result.get('status', '')} | operation_id {result.get('operation_id', '')}"
+    )
+
+
+async def _task_cancel_project(inp: dict) -> str:
+    from api.services.task_manager import get_task_manager
+    service = _task_project_service(get_task_manager(), lifecycle=True)
+    task_id = inp.get("task_id") or ""
+    if not inp.get("confirm"):
+        preview = service.cancel_preview(task_id)
+        pending = preview.get("operation_id")
+        retry = (
+            f" Cancellation is already pending; reuse operation_id {pending!r} for confirmation."
+            if pending
+            else " Generate one stable operation_id for confirmation and reuse it on retries."
+        )
+        return (
+            "Confirmation required before project cancellation: "
+            f"{preview['unfinished_count']} unfinished, {preview['running_count']} running, "
+            f"{preview['awaiting_review_count']} awaiting review. Awaiting-review output will "
+            "be abandoned, not accepted. Explain this scope to the operator and obtain explicit "
+            "confirmation before calling cancel_project again with confirm=true."
+            + retry
+        )
+    result = await service.cancel_project(task_id, operation_id=inp.get("operation_id") or "")
+    progress = (
+        f"Cancelled children: {', '.join(result.get('cancelled_child_ids') or []) or 'none'}; "
+        f"preserved done children: {', '.join(result.get('preserved_child_ids') or []) or 'none'}; "
+        f"abandoned review children: "
+        f"{', '.join(result.get('abandoned_review_ids') or []) or 'none'}; "
+        f"stopped sessions: {', '.join(result.get('stopped_session_ids') or []) or 'none'}."
+    )
+    if result.get("complete") and not result.get("pending"):
+        return (
+            f"Project cancellation complete (operation_id {result.get('operation_id', '')}). "
+            + progress
+        )
+    failures = result.get("failures") or []
+    details = "; ".join(
+        f"{item.get('session_id') or item.get('child_id') or 'unknown'}: "
+        f"{item.get('reason') or item.get('error') or 'stop failed'}"
+        for item in failures
+    ) or "unresolved child/session work remains"
+    return (
+        f"Cancellation incomplete (operation_id {result.get('operation_id', '')}): {details}. "
+        f"{progress} "
+        "Cancellation remains pending; retry with the same operation_id after resolving failures."
+    )
+
+
+def _task_resume_execution(inp: dict) -> str:
+    from api.services.task_manager import get_task_manager
+    task = _task_project_service(get_task_manager(), lifecycle=True).resume_execution(
+        inp.get("task_id") or ""
+    )
+    return f"Task execution resumed: \"{task.description}\" (id: {task.id})"
 
 
 def _task_tags(_inp: dict) -> str:
@@ -2499,6 +2754,18 @@ def _tool_manage_tasks(inp: dict):
         return _task_complete(inp)
     elif action == "update":
         return _task_update(inp)
+    elif action == "children":
+        return _task_children(inp)
+    elif action == "start_project":
+        return _task_start_project(inp)
+    elif action == "complete_project":
+        return _task_complete_project(inp)
+    elif action == "plan_project":
+        return _task_plan_project(inp)
+    elif action == "cancel_project":
+        return _task_cancel_project(inp)
+    elif action == "resume_execution":
+        return _task_resume_execution(inp)
     elif action == "tags":
         return _task_tags(inp)
     return f"Error: Unknown manage_tasks action '{action}'"

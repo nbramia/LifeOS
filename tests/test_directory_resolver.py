@@ -246,6 +246,53 @@ class TestJevLocationResolution:
         assert result == str(existing)
 
 
+class TestLocationAffinityResolution:
+    """Repository affinity is an option key, never an arbitrary path."""
+
+    def test_recognized_affinity_maps_through_catalog(self, monkeypatch):
+        import api.services.directory_resolver as mod
+
+        monkeypatch.setattr(mod, "_location_options", lambda: [
+            ("synthetic-repo", "a synthetic repository", "/catalog/SyntheticRepo"),
+        ])
+
+        assert mod.resolve_location_affinity(" Synthetic-Repo ") == "/catalog/SyntheticRepo"
+
+    def test_unknown_affinity_is_not_treated_as_path(self, monkeypatch):
+        import api.services.directory_resolver as mod
+
+        monkeypatch.setattr(mod, "_location_options", lambda: [
+            ("synthetic-repo", "a synthetic repository", "/catalog/SyntheticRepo"),
+        ])
+
+        assert mod.resolve_location_affinity("/untrusted/arbitrary/path") is None
+
+    def test_existing_local_affinity_never_consults_github(self, monkeypatch, tmp_path):
+        import api.services.directory_resolver as mod
+
+        existing = tmp_path / "SyntheticRepo"
+        existing.mkdir()
+        monkeypatch.setattr(mod, "_scan_projects", lambda: [("syntheticrepo", str(existing))])
+        monkeypatch.setattr(
+            mod,
+            "_github_repos",
+            lambda: pytest.fail("existing-local affinity must not consult GitHub"),
+        )
+
+        assert mod.resolve_existing_location_affinity(" SyntheticRepo ") == str(existing)
+
+    def test_existing_local_affinity_rejects_missing_catalog_path(self, monkeypatch):
+        import api.services.directory_resolver as mod
+
+        monkeypatch.setattr(
+            mod,
+            "_scan_projects",
+            lambda: [("syntheticrepo", "/missing/SyntheticRepo")],
+        )
+
+        assert mod.resolve_existing_location_affinity("syntheticrepo") is None
+
+
 class TestGithubRepoListing:
     """`_github_repos()` and its 24h on-disk cache."""
 

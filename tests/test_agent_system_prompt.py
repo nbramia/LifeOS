@@ -109,12 +109,14 @@ def test_build_turn_context_shape(tm):
     assert set(turn.keys()) == {
         "current_datetime", "current_datetime_iso", "timezone",
         "time_resolution_instruction", "personal_context",
-        "existing_tags", "tags_instruction",
+        "existing_tags", "tags_instruction", "task_hierarchy_instruction",
         "session_cost_usd", "session_turn_count",
         "session_input_tokens", "session_output_tokens",
         "session_cost_is_lower_bound",
     }
     assert turn["existing_tags"] == []
+    assert "Projects are ordinary tasks" in turn["task_hierarchy_instruction"]
+    assert "parent references" in turn["task_hierarchy_instruction"]
     assert turn["personal_context"] == ""
     # No conversation_id given -- a fresh/unscoped session reports zero
     # rather than omitting the fields or erroring.
@@ -130,6 +132,15 @@ def test_build_turn_context_existing_tags_populated(tm):
     turn = agent_system_prompt.build_turn_context()
     assert {"tag": "work", "count": 1} in turn["existing_tags"]
     assert {"tag": "urgent", "count": 1} in turn["existing_tags"]
+
+
+def test_native_prompt_explains_project_mutation_safety(tm):
+    text = "\n".join(_text_blocks(build_system_prompt()))
+    assert "Projects are ordinary tasks" in text
+    assert "task hierarchy is not agent-session ancestry" in text
+    assert "preview its unfinished, running, and awaiting-review children" in text
+    assert "explicit confirmation" in text
+    assert "Cancelling one child never cancels its parent or siblings" in text
 
 
 def test_build_turn_context_degrades_on_task_manager_failure(monkeypatch):

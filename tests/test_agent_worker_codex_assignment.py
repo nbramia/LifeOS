@@ -188,11 +188,43 @@ def test_remote_host_wraps_argv_in_ssh_and_captures_pgid(tmp_path, monkeypatch):
     assert "env -u" in remote_command
     assert f"LIFEOS_AGENT_SESSION_ID={session.session_id}" in remote_command
     assert "setsid bash -c" in remote_command
+    assert " -C " not in remote_command
+    assert str(tmp_path) not in remote_command
+    assert spawn_calls[0][1]["cwd"] == str(tmp_path)
     assert spawn_calls[0][1]["env"]["LIFEOS_AGENT_SESSION_ID"] == session.session_id
     assert "ANTHROPIC_API_KEY" not in spawn_calls[0][1]["env"]
 
     refreshed = store.get("t1")
     assert refreshed.remote_pgid == 1212
+
+
+def test_remote_host_keeps_explicit_remote_directory_out_of_local_spawn_cwd(
+    tmp_path, monkeypatch,
+):
+    spawn_calls: list = []
+    lines = _lines_for(
+        [_THREAD_EVENT, _AGENT_MESSAGE_COMPLETED, _TURN_COMPLETED, _SESSION_COMPLETED],
+        pgid_line="PGID:1313\n",
+    )
+    store, executor = _build(
+        tmp_path,
+        monkeypatch,
+        spawn_calls=spawn_calls,
+        lines=lines,
+        agent_hosts={"studio": "user@studio.example"},
+    )
+    session = store.create(task_id="t-explicit", routing="codex", host="studio")
+    remote_dir = "/srv/checkouts/SyntheticRepo"
+
+    outcome = executor.execute(
+        session,
+        {"description": "do the thing", "working_dir": remote_dir},
+    )
+
+    assert outcome.status != STATUS_FAILED
+    remote_command = spawn_calls[0][0][-1]
+    assert f"-C {remote_dir}" in remote_command
+    assert spawn_calls[0][1]["cwd"] == str(tmp_path)
 
 
 def test_unknown_host_fails_without_ssh_call(tmp_path, monkeypatch):
