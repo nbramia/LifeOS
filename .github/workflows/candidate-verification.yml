@@ -49,12 +49,20 @@ concurrency:
 permissions:
   contents: read
 
+# The Actions cache token is read-only for every job unless a job says
+# otherwise; only prepare-environment below, which never touches the
+# candidate, declares write. (`pull_request_target` would be read-only by
+# default anyway; `workflow_dispatch` would not, and the execution job runs
+# candidate code, so the default is pinned here rather than left to the
+# trigger.)
+cache-mode: read
+
 jobs:
   prepare-environment:
     # Builds and saves the cached CPU test environment from the PROTECTED
     # runner checkout alone. It never checks out, installs from, or runs
-    # anything of the candidate, and it is the only job holding a
-    # cache-write scope (`actions: write`): the execution job below can only
+    # anything of the candidate, and it is the only job whose cache token
+    # may write (`cache-mode: write`): the execution job below can only
     # restore. Wheels only (`--only-binary`), keyed on exactly what
     # determines the environment plus the ISO week, so a candidate whose
     # requirements file equals the protected one restores the same key.
@@ -63,7 +71,7 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
-      actions: write
+    cache-mode: write
     env:
       TRUSTED_RUNNER_SHA: ${{ github.event.pull_request.base.sha || github.event.inputs.trusted_runner_sha }}
       TORCH_CPU_VERSION: "2.14.0+cpu"
@@ -251,8 +259,8 @@ jobs:
       # those ranges resolved to when the key was first built, so the week
       # bounds how stale that resolution can get. This job only restores:
       # the cache is written by the prepare-environment job above, which
-      # never checks out or runs candidate code and holds the only
-      # cache-write scope, so what any run restores is the product of wheel
+      # never checks out or runs candidate code and is the only job whose
+      # cache token may write, so what any run restores is the product of wheel
       # installation from the protected requirements file and nothing else.
       # A candidate that changes requirements.txt misses and installs fresh.
       - name: Bound the cached environment's age

@@ -143,9 +143,12 @@ build (or sooner by any change to `requirements.txt`).
 The cache is written by one job only, `prepare-environment`, which checks out
 the protected runner alone, builds the venv from the *runner's*
 `requirements.txt` with `--only-binary=:all:` (no source distribution ever
-executes), records a package fingerprint inside the venv, and saves. It is
-the only job with a cache-write scope (`actions: write`); the execution job,
-which runs candidate code in its verify step, can only restore. A candidate
+executes), records a package fingerprint inside the venv, and saves. The
+workflow pins `cache-mode: read` for every job and that job alone declares
+`cache-mode: write`, so its cache token is the only one that may save
+whatever the trigger (`pull_request_target` issues read-only cache tokens by
+default; `workflow_dispatch` does not, and the execution job runs candidate
+code in its verify step, so it is held to read explicitly). A candidate
 whose requirements file equals the protected one hashes to the same key and
 restores that environment; a candidate that changes the file misses,
 installs fresh from its own file, and saves nothing. On a hit the install

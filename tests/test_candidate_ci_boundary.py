@@ -207,7 +207,12 @@ def test_candidate_workflow_caches_the_test_environment_from_a_trusted_job_only(
     jobs = yaml.safe_load(workflow)["jobs"]
     prepare = jobs["prepare-environment"]
     execute = jobs["execute-candidate"]
-    assert prepare["permissions"] == {"contents": "read", "actions": "write"}
+    workflow_yaml = yaml.safe_load(workflow)
+    assert workflow_yaml["cache-mode"] == "read"
+    assert prepare["cache-mode"] == "write"
+    assert "cache-mode" not in execute
+    assert "cache-mode" not in jobs["publish-aggregate"]
+    assert prepare["permissions"] == {"contents": "read"}
     assert "actions" not in execute["permissions"]
     assert "environment" not in prepare
     prepare_text = workflow[workflow.index("  prepare-environment:"):workflow.index("  execute-candidate:")]
