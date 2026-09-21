@@ -60,13 +60,13 @@ def test_candidate_workflow_separates_untrusted_execution_from_status_publisher(
     assert 'test "$TRUSTED_RUNNER_SHA" = "$WORKFLOW_SHA"' in workflow
     assert 'git -C candidate cat-file commit "$CANDIDATE_SHA"' in workflow
     assert 'test "$FIRST_PARENT" = "$TRUSTED_RUNNER_SHA"' in workflow
-    assert workflow.index("name: Bind dispatched runner") < execute.index("name: Install the declared CPU test environment")
+    assert execute.index("name: Bind dispatched runner") < execute.index("name: Install the declared CPU test environment")
 
     # Lane selection is a trusted decision taken before any environment is
     # built: a docs-only candidate installs and executes nothing, and the
     # publisher records that mode explicitly rather than inferring success
     # from an absent job.
-    assert workflow.index("name: Bind dispatched runner") < workflow.index("name: Select the lanes") < execute.index("actions/setup-python")
+    assert execute.index("name: Bind dispatched runner") < execute.index("name: Select the lanes") < execute.index("actions/setup-python")
     assert "python3 trusted-runner/scripts/candidate_lanes.py" in workflow
     assert "verification_mode: ${{ steps.reuse.outputs.mode || steps.select.outputs.mode }}" in workflow
     executed = "steps.select.outputs.mode == 'executed'"
@@ -96,7 +96,7 @@ def test_candidate_workflow_separates_untrusted_execution_from_status_publisher(
     assert "python3 trusted-runner/scripts/candidate_reuse.py" in reuse
     assert 'git -C candidate fetch --quiet --depth=1 origin "$HEAD_SHA"' in reuse
     assert '[ "$(git -C candidate rev-parse "$HEAD_SHA^{tree}")" != "$TREE" ]' in reuse
-    assert workflow.index("name: Select the lanes") < workflow.index("name: Reuse a passing shadow verification") < execute.index("actions/setup-python")
+    assert execute.index("name: Select the lanes") < execute.index("name: Reuse a passing shadow verification") < execute.index("actions/setup-python")
     for step in ("actions/setup-python", "name: Install the declared CPU test environment", "name: Verify the retained lanes"):
         block = execute[execute.index(step):]
         block = block[:block.index("\n      - ")]
