@@ -78,6 +78,19 @@ jobs:
       PIP_DISABLE_PIP_VERSION_CHECK: "1"
       PIP_NO_INPUT: "1"
     steps:
+      # A dispatched run's trusted_runner_sha is caller input. This job is
+      # the one that may write the shared cache, so before it checks out or
+      # builds anything it requires that input to be the immutable commit
+      # the workflow itself was resolved from -- the same binding the
+      # execution job applies. pull_request_target's base.sha is GitHub-set.
+      - name: Bind the environment builder to protected workflow provenance
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          if [ "$EVENT_NAME" = workflow_dispatch ]; then
+            test "$TRUSTED_RUNNER_SHA" = "$WORKFLOW_SHA"
+          fi
       - name: Checkout the protected runner definition
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:

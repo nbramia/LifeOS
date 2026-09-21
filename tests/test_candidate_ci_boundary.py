@@ -223,6 +223,7 @@ def test_candidate_workflow_caches_the_test_environment_from_a_trusted_job_only(
     assert prepare_text.count("--only-binary=:all:") == 2
     assert "lookup-only: true" in prepare_text
     assert prepare_text.index("name: Build the CPU test environment") < prepare_text.index("name: Save the installed CPU test environment")
+    assert prepare["steps"][0]["name"] == "Bind the environment builder to protected workflow provenance"
     assert "key: ${{ steps.env-cache.outputs.cache-primary-key }}" in prepare_text
     assert "actions/cache/save" not in workflow[workflow.index("  execute-candidate:"):]
     execute_text = workflow[workflow.index("  execute-candidate:"):workflow.index("  publish-aggregate:")]
@@ -714,3 +715,29 @@ def test_reuse_step_reads_the_second_parent_from_commit_headers_not_the_message(
     )
     assert result.stdout == head_sha
     assert forged not in result.stdout
+
+
+
+@pytest.mark.unit
+def test_environment_builder_binding_step_rejects_a_forged_runner_sha():
+    """The only cache-writing job runs the same provenance binding the
+    execution job does, as its first step: a dispatched run whose
+    trusted_runner_sha is not the commit the workflow was resolved from
+    fails before anything is checked out, built, or saved. The
+    pull_request_target path passes any value because its base SHA is
+    GitHub-set, not caller input."""
+    import yaml
+
+    workflow = yaml.safe_load((ROOT / ".github/workflows/candidate-verification.yml").read_text())
+    steps = workflow["jobs"]["prepare-environment"]["steps"]
+    assert steps[0]["name"] == "Bind the environment builder to protected workflow provenance"
+    script = steps[0]["run"]
+
+    def run(*, trusted_runner_sha: str, workflow_sha: str, event_name: str = "workflow_dispatch") -> int:
+        env = {**os.environ, "TRUSTED_RUNNER_SHA": trusted_runner_sha, "EVENT_NAME": event_name, "WORKFLOW_SHA": workflow_sha}
+        return subprocess.run(["bash", "-eo", "pipefail", "-c", script], env=env, capture_output=True).returncode
+
+    assert run(trusted_runner_sha="a" * 40, workflow_sha="a" * 40) == 0
+    assert run(trusted_runner_sha="b" * 40, workflow_sha="a" * 40) != 0
+    assert run(trusted_runner_sha="", workflow_sha="a" * 40) != 0
+    assert run(trusted_runner_sha="not-a-sha", workflow_sha="irrelevant", event_name="pull_request_target") == 0
