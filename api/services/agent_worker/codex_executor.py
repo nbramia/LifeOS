@@ -335,8 +335,8 @@ class CodexExecutor:
         # that doesn't exist gives that key a bare `{env_vars: [...]}`
         # table with no `command`, which fails Codex's config loader
         # entirely ("invalid transport") — an install with no lifeos MCP
-        # server configured must keep working (context-blind, same as
-        # today) rather than hard-failing every `#codex` task. The value is
+        # server configured keeps running Codex without LifeOS tools
+        # rather than hard-failing every `#codex` task. The value is
         # the ordered union of any `env_vars` the operator's server entry
         # already declares plus the identity names — a bare override would
         # otherwise silently replace (not extend) an existing list, e.g. one
