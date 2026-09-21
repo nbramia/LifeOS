@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -19,25 +21,27 @@ from api.services.jev_client import JevClient, JevError
 
 pytestmark = pytest.mark.unit
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
 REPO = "acme/widgets"
 HEAD_SHA = "1111111111111111111111111111111111abcd"
 BASE_SHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 MAIN_RUN_ID = "1001"
+APP = 4891159  # the dedicated App id; see tests/test_candidate_reuse.py
 
 
 def _args(**overrides) -> argparse.Namespace:
-    base = dict(run_id=MAIN_RUN_ID, repo=REPO, work_dir=None, history_limit=10, jev_timeout=5.0)
+    base = dict(run_id=MAIN_RUN_ID, repo=REPO, work_dir=None, history_limit=10, jev_timeout=5.0, trusted_app_id=APP)
     base.update(overrides)
     return argparse.Namespace(**base)
 
 
-def _check_runs_response(name: str, output: dict, *, started_at: str = "2026-01-01T00:00:00Z", check_id: int = 1) -> str:
-    return json.dumps({
-        "check_runs": [{
-            "name": name, "id": check_id, "started_at": started_at,
-            "output": {"text": json.dumps(output)},
-        }],
-    })
+def _check_runs_response(
+    name: str, output: dict, *, started_at: str = "2026-01-01T00:00:00Z", check_id: int = 1, app_id: int | None = APP,
+) -> str:
+    check: dict = {"name": name, "id": check_id, "started_at": started_at, "output": {"text": json.dumps(output)}}
+    if app_id is not None:
+        check["app"] = {"id": app_id}
+    return json.dumps({"check_runs": [check]})
 
 
 # ---------------------------------------------------------------------------
@@ -451,6 +455,163 @@ def test_run_triage_never_calls_check_run_issue_or_human_queue_apis(tmp_path, mo
         assert "issue create" not in joined
         assert "issue comment" not in joined
         assert call[:2] != ["gh", "issue"]
+
+
+def test_run_triage_removes_the_auto_created_work_dir_after_running(monkeypatch):
+    """With no `--work-dir`, the temp directory created for the receipts and
+    lane logs must not survive the call."""
+    monkeypatch.setattr(gt, "jev_configured", lambda: False)
+    captured: dict[str, Path] = {}
+
+    def download(args):
+        dest = Path(args[args.index("--dir") + 1])
+        pattern = args[args.index("--pattern") + 1]
+        captured.setdefault("work_dir", dest.parent)
+        dest.mkdir(parents=True, exist_ok=True)
+        if pattern == "lane-receipts-*":
+            part = dest / f"lane-receipts-{HEAD_SHA}-part0"
+            part.mkdir()
+            (part / "fast-unit.json").write_text(json.dumps({"reports": {}}))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    fake_run = _base_fake_run([], files=["api/main.py"], extra={"download": download})
+
+    exit_code, _ = gt.run_triage(_args(work_dir=None), run=fake_run)
+
+    assert exit_code == gt.EXIT_OK
+    assert not captured["work_dir"].exists()
+
+
+def test_run_triage_keeps_an_explicit_work_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(gt, "jev_configured", lambda: False)
+    explicit = tmp_path / "kept-work-dir"
+
+    def download(args):
+        dest = Path(args[args.index("--dir") + 1])
+        pattern = args[args.index("--pattern") + 1]
+        dest.mkdir(parents=True, exist_ok=True)
+        if pattern == "lane-receipts-*":
+            part = dest / f"lane-receipts-{HEAD_SHA}-part0"
+            part.mkdir()
+            (part / "fast-unit.json").write_text(json.dumps({"reports": {}}))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    fake_run = _base_fake_run([], files=["api/main.py"], extra={"download": download})
+
+    exit_code, _ = gt.run_triage(_args(work_dir=explicit), run=fake_run)
+
+    assert exit_code == gt.EXIT_OK
+    assert explicit.exists()
+
+
+# ---------------------------------------------------------------------------
+# App-id trust (security: check runs are only trusted from the dedicated App)
+# ---------------------------------------------------------------------------
+
+def test_fetch_check_output_ignores_check_with_mismatched_app_id():
+    output = {"candidate": HEAD_SHA, "tree": "t1", "trusted_runner": BASE_SHA, "mode": "executed", "lanes": ["fast-unit"], "conclusion": "success"}
+
+    def fake_run(args, **kwargs):
+        return SimpleNamespace(returncode=0, stdout=_check_runs_response("candidate-verification", output, app_id=99999), stderr="")
+
+    assert gt.fetch_check_output(REPO, HEAD_SHA, APP, run=fake_run) is None
+
+
+def test_fetch_check_output_ignores_check_with_missing_app_id():
+    output = {"candidate": HEAD_SHA, "tree": "t1", "trusted_runner": BASE_SHA, "mode": "executed", "lanes": ["fast-unit"], "conclusion": "success"}
+
+    def fake_run(args, **kwargs):
+        return SimpleNamespace(returncode=0, stdout=_check_runs_response("candidate-verification", output, app_id=None), stderr="")
+
+    assert gt.fetch_check_output(REPO, HEAD_SHA, APP, run=fake_run) is None
+
+
+def test_fetch_check_output_accepts_check_with_matching_app_id():
+    output = {"candidate": HEAD_SHA, "tree": "t1", "trusted_runner": BASE_SHA, "mode": "executed", "lanes": ["fast-unit"], "conclusion": "success"}
+
+    def fake_run(args, **kwargs):
+        return SimpleNamespace(returncode=0, stdout=_check_runs_response("candidate-verification", output), stderr="")
+
+    assert gt.fetch_check_output(REPO, HEAD_SHA, APP, run=fake_run) == output
+
+
+def test_find_tree_matches_ignores_check_with_mismatched_app_id():
+    """A forged same-name check, otherwise a perfect match on tree and
+    conclusion, must never count as a tree match."""
+    history = [gt.HistoryRun(run_id="2002", head_sha="2222222222222222222222222222222222222b")]
+    output = {"candidate": "x", "tree": "tree-xyz", "trusted_runner": BASE_SHA, "mode": "executed", "lanes": ["fast-unit"], "conclusion": "success"}
+
+    def fake_run(args, **kwargs):
+        return SimpleNamespace(returncode=0, stdout=_check_runs_response("candidate-verification", output, app_id=99999), stderr="")
+
+    assert gt.find_tree_matches(REPO, "tree-xyz", history, APP, run=fake_run) == []
+
+
+# ---------------------------------------------------------------------------
+# Rename handling (security: a rename must not bypass the data/config refusal)
+# ---------------------------------------------------------------------------
+
+def test_changed_files_includes_previous_filename_for_a_rename():
+    def fake_run(args, **kwargs):
+        payload = {"files": [
+            {"filename": "docs/notes.md", "status": "renamed", "previous_filename": "config/notes.md"},
+            {"filename": "api/main.py", "status": "modified"},
+        ]}
+        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+
+    files = gt.changed_files(REPO, BASE_SHA, HEAD_SHA, run=fake_run)
+    assert "config/notes.md" in files
+    assert "docs/notes.md" in files
+    assert "api/main.py" in files
+
+
+def _refusal_fake_run(compare_files: list[dict]):
+    def fake_run(args, **kwargs):
+        if args[:3] == ["gh", "run", "view"]:
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"headSha": HEAD_SHA, "workflowName": "Candidate verification"}), stderr="")
+        if args[:2] == ["gh", "api"] and "check-runs" in args[2]:
+            output = {"candidate": HEAD_SHA, "tree": "t1", "trusted_runner": BASE_SHA, "mode": "executed", "lanes": ["fast-unit"], "conclusion": "failure"}
+            return SimpleNamespace(returncode=0, stdout=_check_runs_response("candidate-verification", output), stderr="")
+        if args[:2] == ["gh", "api"] and "compare" in args[2]:
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"files": compare_files}), stderr="")
+        raise AssertionError(f"unexpected call: {args}")
+
+    return fake_run
+
+
+def test_run_triage_refuses_on_a_rename_out_of_a_protected_prefix(tmp_path):
+    fake_run = _refusal_fake_run([{"filename": "docs/notes.md", "status": "renamed", "previous_filename": "config/notes.md"}])
+
+    with pytest.raises(gt.GateTriageRefusal) as exc_info:
+        gt.run_triage(_args(work_dir=tmp_path / "work"), run=fake_run)
+    assert "config/notes.md" in str(exc_info.value)
+
+
+def test_run_triage_refuses_on_a_rename_into_a_protected_prefix(tmp_path):
+    fake_run = _refusal_fake_run([{"filename": "config/new_notes.md", "status": "renamed", "previous_filename": "docs/notes.md"}])
+
+    with pytest.raises(gt.GateTriageRefusal) as exc_info:
+        gt.run_triage(_args(work_dir=tmp_path / "work"), run=fake_run)
+    assert "config/new_notes.md" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# Real subprocess invocation
+# ---------------------------------------------------------------------------
+
+def test_script_runs_as_a_real_subprocess_without_pythonpath():
+    """Reproduces the documented invocation exactly: every other test in
+    this module imports `scripts.gate_triage` under pytest's own
+    rootdir-relative sys.path, which masks a missing `sys.path` insert in
+    the script itself. Only a real subprocess with no PYTHONPATH catches
+    it. Uses `--help` so it needs no `gh` on PATH."""
+    result = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "scripts" / "gate_triage.py"), "--help"],
+        text=True, capture_output=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ModuleNotFoundError" not in result.stderr
+    assert "--run-id" in result.stdout
 
 
 # ---------------------------------------------------------------------------

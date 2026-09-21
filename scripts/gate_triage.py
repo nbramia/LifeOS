@@ -38,6 +38,10 @@ import tempfile
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
+# Direct hook invocation executes this file by path, which otherwise places
+# ``scripts/`` (not the checkout root) on sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from api.services.jev_client import JevClient, JevError, jev_configured
 
 logger = logging.getLogger(__name__)
@@ -47,6 +51,10 @@ Runner = Callable[..., subprocess.CompletedProcess]
 _CHECK_NAMES = ("candidate-verification", "candidate-verification-shadow")
 _PROTECTED_PREFIXES = ("data/", "config/")
 _MAX_EXCERPT_CHARS = 4000
+# The dedicated GitHub App id that publishes the candidate-verification and
+# candidate-verification-shadow checks; see scripts/candidate_reuse.py and
+# tests/test_candidate_reuse.py.
+_TRUSTED_APP_ID_DEFAULT = 4891159
 
 _FAILURE_CLASS_CRITERIA: dict[str, str] = {
     "timing": "A race or timing sensitivity: a sleep too short, an async wait, a scheduling race.",
@@ -108,9 +116,15 @@ def fetch_run_summary(repo: str, run_id: str, *, run: Runner = subprocess.run) -
     return RunSummary(run_id=str(run_id), head_sha=head_sha, workflow_name=data.get("workflowName", ""))
 
 
-def fetch_check_output(repo: str, sha: str, *, run: Runner = subprocess.run) -> dict | None:
+def fetch_check_output(repo: str, sha: str, trusted_app_id: int, *, run: Runner = subprocess.run) -> dict | None:
     """The newest App-published `candidate-verification*` structured record
-    on `sha`, or None when none is found or the API call fails."""
+    on `sha` from the dedicated app (`app.id == trusted_app_id`), or None
+    when none is found, none was published by that app, or the API call
+    fails. A check whose `app.id` does not match is never trusted, even
+    when its name and structured output are otherwise well-formed --
+    exactly as `scripts/candidate_reuse.py::reusable_shadow` treats the
+    shadow check, since a same-repo workflow with `checks: write` could
+    otherwise publish a forged record under the same name."""
     result = _run(run, ["gh", "api", f"repos/{repo}/commits/{sha}/check-runs"])
     if result.returncode != 0:
         return None
@@ -121,6 +135,8 @@ def fetch_check_output(repo: str, sha: str, *, run: Runner = subprocess.run) -> 
     candidates: list[tuple[str, int, dict]] = []
     for check in payload.get("check_runs", []) if isinstance(payload, dict) else []:
         if not isinstance(check, dict) or check.get("name") not in _CHECK_NAMES:
+            continue
+        if (check.get("app") or {}).get("id") != trusted_app_id:
             continue
         text = (check.get("output") or {}).get("text")
         if not isinstance(text, str):
@@ -139,6 +155,9 @@ def fetch_check_output(repo: str, sha: str, *, run: Runner = subprocess.run) -> 
 
 
 def changed_files(repo: str, base_sha: str, head_sha: str, *, run: Runner = subprocess.run) -> list[str]:
+    """Every path this diff touches, including a renamed entry's prior path
+    -- so `refusal_reason()`, which only inspects the returned names, also
+    refuses a rename out of (or into) a protected prefix."""
     # GitHub's compare API caps `files` at 300 entries per page; a triage
     # candidate's diff is expected to stay well under that, so this reads
     # only the first page rather than paginating.
@@ -152,7 +171,18 @@ def changed_files(repo: str, base_sha: str, head_sha: str, *, run: Runner = subp
     files = payload.get("files") if isinstance(payload, dict) else None
     if not isinstance(files, list):
         return []
-    return [f["filename"] for f in files if isinstance(f, dict) and isinstance(f.get("filename"), str)]
+    names: list[str] = []
+    for f in files:
+        if not isinstance(f, dict):
+            continue
+        filename = f.get("filename")
+        if isinstance(filename, str):
+            names.append(filename)
+        if f.get("status") == "renamed":
+            previous_filename = f.get("previous_filename")
+            if isinstance(previous_filename, str):
+                names.append(previous_filename)
+    return names
 
 
 def refusal_reason(files: Sequence[str]) -> str | None:
@@ -205,11 +235,11 @@ def list_recent_runs(
 
 
 def find_tree_matches(
-    repo: str, tree: str, candidates: Sequence[HistoryRun], *, run: Runner = subprocess.run,
+    repo: str, tree: str, candidates: Sequence[HistoryRun], trusted_app_id: int, *, run: Runner = subprocess.run,
 ) -> list[HistoryRun]:
     matches = []
     for candidate in candidates:
-        output = fetch_check_output(repo, candidate.head_sha, run=run)
+        output = fetch_check_output(repo, candidate.head_sha, trusted_app_id, run=run)
         if output is None:
             continue
         if output.get("tree") == tree and output.get("conclusion") == "success":
@@ -219,14 +249,14 @@ def find_tree_matches(
 
 def find_passing_elsewhere(
     repo: str, tree: str, failing: Sequence[str], *, run_id: str, workflow: str,
-    history_limit: int, work_dir: Path, run: Runner = subprocess.run,
+    history_limit: int, work_dir: Path, trusted_app_id: int, run: Runner = subprocess.run,
 ) -> dict[str, str]:
     """`{nodeid: other_run_id}` for failing tests that passed in another
     retained run that verified the identical tree successfully."""
     if not tree or not failing:
         return {}
     recent = list_recent_runs(repo, workflow, exclude_run_id=run_id, limit=history_limit, run=run)
-    matches = find_tree_matches(repo, tree, recent, run=run)
+    matches = find_tree_matches(repo, tree, recent, trusted_app_id, run=run)
     remaining = set(failing)
     found: dict[str, str] = {}
     for match in matches:
@@ -474,29 +504,10 @@ def render_report(run_id: str, head_sha: str, tree: str | None, reports: Sequenc
 # CLI
 # ---------------------------------------------------------------------------
 
-def run_triage(args: argparse.Namespace, *, run: Runner = subprocess.run) -> tuple[int, str]:
-    """Returns `(EXIT_OK, report_text)` on success. Raises `GateTriageError`
-    (or its `GateTriageRefusal` subclass) for a data/config refusal or any
-    other unrecoverable step -- `main()` prints that to stderr and exits
-    non-zero."""
-    repo = resolve_repo(args.repo, run=run)
-    summary = fetch_run_summary(repo, args.run_id, run=run)
-    check_output = fetch_check_output(repo, summary.head_sha, run=run)
-    base_sha = check_output.get("trusted_runner") if check_output else None
-    if not isinstance(base_sha, str) or not base_sha:
-        raise GateTriageError(
-            f"no App-published verification check found on {summary.head_sha}; cannot "
-            "establish the candidate's base commit to diff against, so refusing to run "
-            "rather than skip the data/config safety check"
-        )
-    tree = check_output.get("tree") if isinstance(check_output.get("tree"), str) else None
-
-    files = changed_files(repo, base_sha, summary.head_sha, run=run)
-    reason = refusal_reason(files)
-    if reason:
-        raise GateTriageRefusal(reason)
-
-    work_dir = args.work_dir or Path(tempfile.mkdtemp(prefix="gate-triage-"))
+def _download_and_report(
+    work_dir: Path, args: argparse.Namespace, repo: str, summary: RunSummary,
+    tree: str | None, files: Sequence[str], *, run: Runner,
+) -> tuple[int, str]:
     receipts_dir = work_dir / "receipts"
     logs_dir = work_dir / "logs"
 
@@ -512,7 +523,7 @@ def run_triage(args: argparse.Namespace, *, run: Runner = subprocess.run) -> tup
     if tree:
         passing_elsewhere = find_passing_elsewhere(
             repo, tree, failing, run_id=args.run_id, workflow=summary.workflow_name,
-            history_limit=args.history_limit, work_dir=work_dir, run=run,
+            history_limit=args.history_limit, work_dir=work_dir, trusted_app_id=args.trusted_app_id, run=run,
         )
 
     reports = build_reports(failing, log_text, passing_elsewhere)
@@ -521,11 +532,48 @@ def run_triage(args: argparse.Namespace, *, run: Runner = subprocess.run) -> tup
     return EXIT_OK, render_report(args.run_id, summary.head_sha, tree, reports)
 
 
+def run_triage(args: argparse.Namespace, *, run: Runner = subprocess.run) -> tuple[int, str]:
+    """Returns `(EXIT_OK, report_text)` on success. Raises `GateTriageError`
+    (or its `GateTriageRefusal` subclass) for a data/config refusal or any
+    other unrecoverable step -- `main()` prints that to stderr and exits
+    non-zero.
+
+    An explicit `--work-dir` is used and left in place exactly as given.
+    With none given, a fresh temp directory holds the downloaded receipts
+    and lane logs only for the duration of this call and is removed before
+    returning, whether triage succeeds or raises."""
+    repo = resolve_repo(args.repo, run=run)
+    summary = fetch_run_summary(repo, args.run_id, run=run)
+    check_output = fetch_check_output(repo, summary.head_sha, args.trusted_app_id, run=run)
+    base_sha = check_output.get("trusted_runner") if check_output else None
+    if not isinstance(base_sha, str) or not base_sha:
+        raise GateTriageError(
+            f"no App-published verification check found on {summary.head_sha}; cannot "
+            "establish the candidate's base commit to diff against, so refusing to run "
+            "rather than skip the data/config safety check"
+        )
+    tree = check_output.get("tree") if isinstance(check_output.get("tree"), str) else None
+
+    files = changed_files(repo, base_sha, summary.head_sha, run=run)
+    reason = refusal_reason(files)
+    if reason:
+        raise GateTriageRefusal(reason)
+
+    if args.work_dir is not None:
+        return _download_and_report(args.work_dir, args, repo, summary, tree, files, run=run)
+    with tempfile.TemporaryDirectory(prefix="gate-triage-") as tmp_dir:
+        return _download_and_report(Path(tmp_dir), args, repo, summary, tree, files, run=run)
+
+
 def main(argv: Sequence[str] | None = None, *, run: Runner = subprocess.run) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--run-id", required=True, help="the failed candidate-verification run id")
     parser.add_argument("--repo", help="owner/repo; defaults to `gh repo view`'s current repository")
-    parser.add_argument("--work-dir", type=Path, help="defaults to a fresh temp directory")
+    parser.add_argument("--work-dir", type=Path, help="defaults to a fresh temp directory, removed before exit")
+    parser.add_argument(
+        "--trusted-app-id", type=int, default=_TRUSTED_APP_ID_DEFAULT,
+        help="GitHub App id that must have published the check runs this command trusts",
+    )
     parser.add_argument("--history-limit", type=int, default=20, help="recent runs to scan for a matching tree")
     parser.add_argument("--jev-timeout", type=float, default=30.0, help="per-test Jev call timeout, in seconds")
     args = parser.parse_args(argv)

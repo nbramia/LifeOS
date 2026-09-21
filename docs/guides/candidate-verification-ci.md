@@ -354,10 +354,13 @@ creates a Human-queue card or issue -- it only prints.
 
 The candidate's base commit and tree come from the App-published check's
 structured output on the run's head SHA (see above) -- never from
-candidate-authored text. When a failing test's node id appears as `passed`
-in another retained run whose structured output names the identical tree, it
-is marked passing elsewhere on this tree. With `TYPESAFE_API_KEY` configured,
-each failing test also gets one Jev call answering `caused_by_candidate` (a
+candidate-authored text, and only a check run whose `app.id` equals
+`--trusted-app-id` (default 4891159, the same dedicated App id
+`candidate_reuse.py` requires) is read; a same-name check published by any
+other app is ignored. When a failing test's node id appears as `passed` in another
+retained run whose structured output names the identical tree, it is marked
+passing elsewhere on this tree. With `TYPESAFE_API_KEY` configured, each
+failing test also gets one Jev call answering `caused_by_candidate` (a
 probability) and `failure_class` (a choice among `timing`/`ordering`/
 `environment`/`real`), printed alongside the deterministic facts. Only the
 bounded traceback excerpt and the candidate's changed-file list are ever sent
@@ -367,9 +370,14 @@ still exits successfully.
 
 The command refuses to run, before downloading anything, when the
 candidate's diff touches `data/` or `config/` -- paths that could carry
-personal values -- and when no App-published check is found on the run's
+personal values -- including a renamed file whose prior or new path falls
+under either prefix, and when no App-published check is found on the run's
 head SHA, since without it there is no base commit to diff against and thus
 no way to run that safety check.
+
+With no `--work-dir`, the downloaded receipts and lane logs live in a
+temporary directory that is removed before the command exits, success or
+refusal alike; an explicit `--work-dir` is left in place with its contents.
 
 ## Enabling the Gate
 
