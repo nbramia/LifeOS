@@ -1013,6 +1013,18 @@ class Worker:
         recovered = 0
         for session in pending:
             sid = session.session_id
+            # The reconciliation above can complete this exact turn's handoff
+            # (or otherwise move it) between the pre-reconcile snapshot and
+            # here — re-read the row and skip a snapshot that's now stale
+            # rather than rolling back work reconciliation already finished.
+            current = self.session_store.get_by_session_id(sid)
+            if (
+                current is None
+                or current.status in TERMINAL_STATUSES
+                or current.attempt_id != session.attempt_id
+                or current.turn_id != session.turn_id
+            ):
+                continue
             if self._recover_project_handoff_session(session):
                 continue
             # Sleeping sessions are healthy — main loop will wake them.
@@ -6329,6 +6341,27 @@ class Worker:
     # Outcome handling (shared between fresh dispatch and sleep wake-up)
     # ------------------------------------------------------------------
 
+    def _record_handoff_quiescence(
+        self, session: Session, events: list[dict[str, Any]], operation_id: str,
+        attempt_id: str, turn_id: str, executor: str | None,
+    ) -> None:
+        """Append proof that this exact turn stopped, deduped per operation/attempt/turn."""
+        if any(
+            event.get("kind") == HANDOFF_QUIESCENT_EVENT
+            and (event.get("payload") or {}).get("operation_id") == operation_id
+            and (event.get("payload") or {}).get("attempt_id") == attempt_id
+            and (event.get("payload") or {}).get("turn_id") == turn_id
+            for event in events
+        ):
+            return
+        self.transcript_store.append(session.session_id, HANDOFF_QUIESCENT_EVENT, {
+            "project_id": session.task_id,
+            "operation_id": operation_id,
+            "attempt_id": attempt_id,
+            "turn_id": turn_id,
+            "executor": executor or session.routing,
+        })
+
     def _maybe_finalize_project_handoff(self, session: Session, outcome) -> bool:
         """Consume an exact post-return handoff without projecting task completion."""
         attempt_id = getattr(outcome, "attempt_id", None) or session.attempt_id
@@ -6365,31 +6398,41 @@ class Worker:
         ):
             # The task view fetched here (an index rebuilt by another process
             # on a debounce) may simply be stale — the MCP server's staging
-            # write hasn't landed in it yet. Record that this exact turn
-            # returned with satisfied stop evidence so reconciliation can
-            # retry once the view catches up; don't project quiescence or
-            # completion from a view that doesn't yet show this handoff.
+            # write hasn't landed in it yet. This operation_id comes from
+            # this exact turn's own request event, and the turn has already
+            # returned with the route's stop evidence — the same proof the
+            # fresh path below records at return for these routes — so it's
+            # recorded here too: proof the source stopped, not activation.
+            # The finalizer still requires matching task fields, a terminal
+            # source, and no cancellation before it does anything with it.
+            # Record a return-pending event so reconciliation can retry once
+            # the view catches up.
             termination_evidence = getattr(outcome, "termination_evidence", {}) or {}
             stop_evidence_satisfied = (
                 session.routing != ROUTE_HERMES
                 or termination_evidence.get("done_seen") is True
             )
-            if stop_evidence_satisfied and not any(
-                event.get("kind") == PROJECT_HANDOFF_RETURN_PENDING_EVENT
-                and (event.get("payload") or {}).get("operation_id") == operation_id
-                and (event.get("payload") or {}).get("attempt_id") == attempt_id
-                and (event.get("payload") or {}).get("turn_id") == turn_id
-                for event in events
-            ):
-                self.transcript_store.append(
-                    session.session_id, PROJECT_HANDOFF_RETURN_PENDING_EVENT, {
-                        "operation_id": operation_id,
-                        "attempt_id": attempt_id,
-                        "turn_id": turn_id,
-                        "executor": getattr(outcome, "executor", None) or session.routing,
-                        "termination_evidence": termination_evidence,
-                    },
+            if stop_evidence_satisfied:
+                executor = getattr(outcome, "executor", None)
+                self._record_handoff_quiescence(
+                    session, events, operation_id, attempt_id, turn_id, executor,
                 )
+                if not any(
+                    event.get("kind") == PROJECT_HANDOFF_RETURN_PENDING_EVENT
+                    and (event.get("payload") or {}).get("operation_id") == operation_id
+                    and (event.get("payload") or {}).get("attempt_id") == attempt_id
+                    and (event.get("payload") or {}).get("turn_id") == turn_id
+                    for event in events
+                ):
+                    self.transcript_store.append(
+                        session.session_id, PROJECT_HANDOFF_RETURN_PENDING_EVENT, {
+                            "operation_id": operation_id,
+                            "attempt_id": attempt_id,
+                            "turn_id": turn_id,
+                            "executor": executor or session.routing,
+                            "termination_evidence": termination_evidence,
+                        },
+                    )
             return True
         if (
             session.routing == ROUTE_HERMES
@@ -6397,20 +6440,10 @@ class Worker:
             is not True
         ):
             return True
-        if not any(
-            event.get("kind") == HANDOFF_QUIESCENT_EVENT
-            and (event.get("payload") or {}).get("operation_id") == operation_id
-            and (event.get("payload") or {}).get("attempt_id") == attempt_id
-            and (event.get("payload") or {}).get("turn_id") == turn_id
-            for event in events
-        ):
-            self.transcript_store.append(session.session_id, HANDOFF_QUIESCENT_EVENT, {
-                "project_id": session.task_id,
-                "operation_id": operation_id,
-                "attempt_id": attempt_id,
-                "turn_id": turn_id,
-                "executor": getattr(outcome, "executor", None) or session.routing,
-            })
+        self._record_handoff_quiescence(
+            session, events, operation_id, attempt_id, turn_id,
+            getattr(outcome, "executor", None),
+        )
         # The exact turn has returned with the route's required stop evidence,
         # so retain that proof even when cancellation won the race. The guard
         # still prevents source completion, finalization, and child release.

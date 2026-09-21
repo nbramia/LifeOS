@@ -578,7 +578,8 @@ def test_exact_cancellation_guard_blocks_handoff_before_terminal_status(
 async def test_cancelled_return_with_mismatched_persisted_turn_stays_fenced(
     handoff, tmp_path: Path,
 ):
-    """A returned stale turn cannot attest a newer persisted handoff identity."""
+    """A returned stale turn's quiescence proof is scoped to its own attempt
+    and turn — it cannot attest a newer persisted handoff identity."""
     manager, store, transcripts, source, ctx = handoff
     staged = dispatch(ctx, "lifeos_agent_project_handoff", _request())
 
@@ -620,9 +621,19 @@ async def test_cancelled_return_with_mismatched_persisted_turn_stays_fenced(
     )
 
     assert finalizers == []
+    # The exact old turn's own return is recorded as quiescence proof — proof
+    # that turn stopped, not that it satisfies the newer persisted identity.
+    assert any(
+        event["kind"] == HANDOFF_QUIESCENT_EVENT
+        and event["payload"].get("operation_id") == staged["operation_id"]
+        and event["payload"].get("attempt_id") == source.attempt_id
+        and event["payload"].get("turn_id") == source.turn_id
+        for event in transcripts.read(source.session_id)
+    )
     assert not any(
         event["kind"] == HANDOFF_QUIESCENT_EVENT
         and event["payload"].get("operation_id") == staged["operation_id"]
+        and event["payload"].get("turn_id") == "turn-newer-synthetic"
         for event in transcripts.read(source.session_id)
     )
     retry = await service.cancel_project(
@@ -799,28 +810,39 @@ def test_worker_stale_return_then_reconcile_finalizes_once_view_catches_up(
         and event["payload"].get("turn_id") == source.turn_id
     ]
     assert len(pending) == 1
-    assert not any(
-        event["kind"] == HANDOFF_QUIESCENT_EVENT
-        for event in transcripts.read(source.session_id)
-    )
+    # The exact turn already carries the route's stop evidence, so the return
+    # itself is recorded as quiescence proof even while the view is stale —
+    # it's proof the source stopped, not activation of the handoff.
+    quiescent = [
+        event for event in transcripts.read(source.session_id)
+        if event["kind"] == HANDOFF_QUIESCENT_EVENT
+        and event["payload"].get("operation_id") == staged["operation_id"]
+        and event["payload"].get("attempt_id") == source.attempt_id
+        and event["payload"].get("turn_id") == source.turn_id
+    ]
+    assert len(quiescent) == 1
 
-    # A repeat stale return for the exact same turn must not duplicate the event.
+    # A repeat stale return for the exact same turn must not duplicate either event.
     assert worker._maybe_finalize_project_handoff(store.get(source.task_id), outcome) is True
     assert len([
         event for event in transcripts.read(source.session_id)
         if event["kind"] == PROJECT_HANDOFF_RETURN_PENDING_EVENT
     ]) == 1
+    assert len([
+        event for event in transcripts.read(source.session_id)
+        if event["kind"] == HANDOFF_QUIESCENT_EVENT
+    ]) == 1
 
     fresh["enabled"] = True
     worker._reconcile_project_handoffs()
 
-    assert any(
-        event["kind"] == HANDOFF_QUIESCENT_EVENT
+    assert len([
+        event for event in transcripts.read(source.session_id)
+        if event["kind"] == HANDOFF_QUIESCENT_EVENT
         and event["payload"].get("operation_id") == staged["operation_id"]
         and event["payload"].get("attempt_id") == source.attempt_id
         and event["payload"].get("turn_id") == source.turn_id
-        for event in transcripts.read(source.session_id)
-    )
+    ]) == 1
     assert store.get(source.task_id).status == STATUS_COMPLETED
     assert finalizers == [{
         "operation_id": staged["operation_id"],
@@ -888,6 +910,69 @@ def test_worker_stale_return_then_cancellation_keeps_reconciliation_fenced(
     )
     assert all(
         not manager.can_start_execution(child.id)
+        for child in build_task_hierarchy(manager.list_tasks()).children(source.task_id)
+    )
+
+
+@pytest.mark.asyncio
+async def test_worker_stale_return_then_cancel_project_completes_via_recorded_quiescence(
+    handoff, tmp_path: Path,
+):
+    """The exact turn's quiescence proof recorded on a stale return lets
+    `cancel_project` verify the handoff source stopped and complete, instead
+    of waiting forever on proof that was already available."""
+    manager, store, transcripts, source, ctx = handoff
+    stale_snapshot = _task_payload(manager, source.task_id)
+    staged = dispatch(ctx, "lifeos_agent_project_handoff", _request())
+    fresh = {"enabled": False}
+
+    async def stop_session(session):
+        teardown_session(
+            store,
+            transcripts,
+            session,
+            transcript_kind="operator_killed",
+            transcript_payload={"reason": "project cancellation"},
+            managed_driver=None,
+        )
+        return [session.session_id], []
+
+    service = ProjectTaskService(
+        manager, store, transcripts, session_teardown=stop_session,
+    )
+    worker, finalizers = _stale_view_worker(
+        tmp_path, manager, store, transcripts, service,
+        source.task_id, stale_snapshot, fresh,
+    )
+    outcome = ExecutorOutcome(
+        status=STATUS_COMPLETED,
+        session_id=source.session_id,
+        attempt_id=source.attempt_id,
+        turn_id=source.turn_id,
+        executor="local",
+    )
+    assert worker._maybe_finalize_project_handoff(store.get(source.task_id), outcome) is True
+    assert any(
+        event["kind"] == HANDOFF_QUIESCENT_EVENT
+        and event["payload"].get("operation_id") == staged["operation_id"]
+        and event["payload"].get("attempt_id") == source.attempt_id
+        and event["payload"].get("turn_id") == source.turn_id
+        for event in transcripts.read(source.session_id)
+    )
+    assert finalizers == []
+
+    result = await service.cancel_project(
+        source.task_id, operation_id="cancel-stale-return-v1",
+    )
+
+    assert result["complete"] is True
+    assert result["pending"] is False
+    assert result["failures"] == []
+    parent = manager.get(source.task_id)
+    assert parent.status == "cancelled"
+    assert HANDOFF_OPERATION_FIELD not in parent.fields
+    assert all(
+        child.status == "cancelled"
         for child in build_task_hierarchy(manager.list_tasks()).children(source.task_id)
     )
 
@@ -1016,6 +1101,83 @@ async def test_hermes_stale_return_without_done_seen_records_no_return_pending(
     )
 
 
+def test_hermes_stale_return_with_done_seen_reconciles_via_return_pending_evidence(
+    tmp_path: Path,
+):
+    """Hermes's positive stop evidence recorded on a stale return threads
+    through to reconcile's synthetic retry outcome so a later fresh view
+    can finalize — the return-pending event must carry the real evidence,
+    not an empty one."""
+    manager = TaskManager(
+        vault_path=tmp_path / "hermes-vault",
+        index_path=tmp_path / "hermes-index" / "tasks.json",
+        live_session_checker=lambda *_args: False,
+    )
+    store = SessionStore(tmp_path / "hermes-sessions.db")
+    transcripts = TranscriptStore(tmp_path / "hermes-transcripts")
+    parent = manager.create(
+        "Coordinate the synthetic Hermes launch",
+        status="in_progress",
+        tags=["hermes", "agent-running"],
+    )
+    source = store.create(
+        parent.id, status=STATUS_CLAIMED, routing="hermes", execution_spec=_spec("hermes"),
+    )
+    source = store.begin_executor_turn(parent.id, "execute", session=source)
+    assert store.mark_executor_turn_running(parent.id, source.attempt_id, source.turn_id)
+    source = store.get(parent.id)
+    ctx = InterAgentContext(
+        store, transcripts, source.session_id, Caps(),
+        caller_attempt_id=source.attempt_id, caller_turn_id=source.turn_id,
+        task_manager=manager,
+    )
+    stale_snapshot = _task_payload(manager, source.task_id)
+    staged = dispatch(ctx, "lifeos_agent_project_handoff", _request())
+    service = ProjectTaskService(manager, store, transcripts)
+    fresh = {"enabled": False}
+    worker, finalizers = _stale_view_worker(
+        tmp_path, manager, store, transcripts, service,
+        source.task_id, stale_snapshot, fresh,
+    )
+    outcome = ExecutorOutcome(
+        status=STATUS_COMPLETED,
+        session_id=source.session_id,
+        attempt_id=source.attempt_id,
+        turn_id=source.turn_id,
+        executor="hermes",
+        termination_evidence={
+            "done_seen": True, "error_seen": False, "terminal_success": True,
+        },
+    )
+
+    assert worker._maybe_finalize_project_handoff(store.get(source.task_id), outcome) is True
+
+    assert finalizers == []
+    assert store.get(source.task_id).status == STATUS_RUNNING
+    pending = [
+        event for event in transcripts.read(source.session_id)
+        if event["kind"] == PROJECT_HANDOFF_RETURN_PENDING_EVENT
+    ]
+    assert len(pending) == 1
+    assert pending[0]["payload"]["termination_evidence"]["done_seen"] is True
+
+    fresh["enabled"] = True
+    worker._reconcile_project_handoffs()
+
+    assert store.get(source.task_id).status == STATUS_COMPLETED
+    assert finalizers == [{
+        "operation_id": staged["operation_id"],
+        "source_session_id": source.session_id,
+        "source_attempt_id": source.attempt_id,
+        "source_turn_id": source.turn_id,
+    }]
+    assert HANDOFF_OPERATION_FIELD not in manager.get(source.task_id).fields
+    assert all(
+        manager.can_start_execution(child.id)
+        for child in build_task_hierarchy(manager.list_tasks()).children(source.task_id)
+    )
+
+
 def test_reconcile_does_not_retry_a_newer_turn_over_a_stale_return_pending_event(
     handoff, tmp_path: Path,
 ):
@@ -1042,6 +1204,14 @@ def test_reconcile_does_not_retry_a_newer_turn_over_a_stale_return_pending_event
         event["kind"] == PROJECT_HANDOFF_RETURN_PENDING_EVENT
         for event in transcripts.read(source.session_id)
     )
+    # The old turn's own quiescence proof is recorded on return — that's
+    # unaffected by the session moving on below and isn't what reconciliation
+    # would need to retry finalization for the newer turn.
+    quiescent_before = [
+        event for event in transcripts.read(source.session_id)
+        if event["kind"] == HANDOFF_QUIESCENT_EVENT
+    ]
+    assert len(quiescent_before) == 1
 
     # The session moves on to a newer turn under the same attempt — the
     # stale return-pending event above still names the old turn.
@@ -1054,10 +1224,10 @@ def test_reconcile_does_not_retry_a_newer_turn_over_a_stale_return_pending_event
     worker._reconcile_project_handoffs()
 
     assert finalizers == []
-    assert not any(
-        event["kind"] == HANDOFF_QUIESCENT_EVENT
-        for event in transcripts.read(source.session_id)
-    )
+    assert [
+        event for event in transcripts.read(source.session_id)
+        if event["kind"] == HANDOFF_QUIESCENT_EVENT
+    ] == quiescent_before
     assert manager.get(source.task_id).fields[HANDOFF_OPERATION_FIELD] == (
         staged["operation_id"]
     )
@@ -1176,6 +1346,103 @@ def test_resume_pending_reconciles_quiescent_handoff_without_rolling_back_coordi
     )
     coordinator = store.get_by_session_id(staged["coordinator_session_id"])
     assert coordinator.status == STATUS_CLAIMED
+
+
+def test_resume_pending_skips_a_source_the_reconcile_snapshot_already_finalized(
+    handoff, tmp_path: Path, monkeypatch,
+):
+    """resume_pending snapshots non-terminal sessions before reconciliation
+    finalizes a handoff — a source that reconciliation completes between the
+    snapshot and the loop must not be rolled back as an orphan."""
+    manager, store, transcripts, source, ctx = handoff
+    stale_snapshot = _task_payload(manager, source.task_id)
+    staged = dispatch(ctx, "lifeos_agent_project_handoff", _request())
+    service = ProjectTaskService(manager, store, transcripts)
+    fresh = {"enabled": False}
+    finalizers: list[dict] = []
+    puts: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "PUT" and request.url.path.startswith("/api/tasks/"):
+            puts.append({
+                "task_id": request.url.path.rsplit("/", 1)[-1],
+                "body": json.loads(request.content),
+            })
+            return httpx.Response(200, json={"ok": True})
+        if request.method == "GET" and request.url.path == "/api/tasks":
+            tasks = [
+                payload
+                for task in manager.list_tasks()
+                if (payload := _task_payload(manager, task.id)) is not None
+            ]
+            return httpx.Response(200, json={"tasks": tasks, "total": len(tasks)})
+        if request.method == "GET" and request.url.path == f"/api/tasks/{source.task_id}":
+            if not fresh["enabled"]:
+                return httpx.Response(200, json=stale_snapshot)
+            payload = _task_payload(manager, source.task_id)
+            return httpx.Response(200, json=payload) if payload else httpx.Response(404)
+        if request.method == "GET" and request.url.path.startswith("/api/tasks/"):
+            task_id = request.url.path.rsplit("/", 1)[-1]
+            payload = _task_payload(manager, task_id)
+            return httpx.Response(200, json=payload) if payload else httpx.Response(404)
+        if request.method == "POST" and request.url.path.endswith(
+            "/project/handoff/finalize"
+        ):
+            task_id = request.url.path.split("/api/tasks/", 1)[1].split("/", 1)[0]
+            body = json.loads(request.content)
+            finalizers.append(body)
+            try:
+                result = service.finalize_handoff(task_id, **body)
+            except ProjectHandoffError as exc:
+                return httpx.Response(
+                    409,
+                    json={"detail": {"code": exc.code, "message": str(exc)}},
+                )
+            return httpx.Response(200, json=result)
+        return httpx.Response(404)
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(handler), base_url="http://synthetic-api",
+    )
+    worker = Worker(
+        api_base="http://synthetic-api",
+        session_store=store,
+        transcript_store=transcripts,
+        spend_tracker=SpendTracker(
+            db_path=tmp_path / "worker-spend.db", daily_cap_dollars=100,
+        ),
+        http_client=client,
+    )
+    notices: list[str] = []
+    monkeypatch.setattr(worker, "_notify", lambda text, bot=None: notices.append(text))
+    outcome = ExecutorOutcome(
+        status=STATUS_COMPLETED,
+        session_id=source.session_id,
+        attempt_id=source.attempt_id,
+        turn_id=source.turn_id,
+        executor="local",
+    )
+    # The exact turn returned while the task view was still stale (the
+    # worker process then crashed/restarted before the view caught up),
+    # leaving the session row RUNNING with the return-pending proof already
+    # on its transcript.
+    assert worker._maybe_finalize_project_handoff(store.get(source.task_id), outcome) is True
+    assert store.get(source.task_id).status == STATUS_RUNNING
+
+    fresh["enabled"] = True
+    worker.resume_pending()
+
+    assert store.get(source.task_id).status == STATUS_COMPLETED
+    assert len(finalizers) == 1
+    assert not any(
+        event["kind"] == "resume_failed"
+        for event in transcripts.read(source.session_id)
+    )
+    assert not any("could not be safely resumed" in text for text in notices)
+    assert not any(put["task_id"] == source.task_id for put in puts)
+    assert manager.get(source.task_id).fields[LAST_HANDOFF_OPERATION_FIELD] == (
+        staged["operation_id"]
+    )
 
 
 def test_handoff_retry_repairs_coordinator_without_execution_snapshot(
