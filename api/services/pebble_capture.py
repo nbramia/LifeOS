@@ -52,8 +52,8 @@ _INLINE_AUTHORITY_RE = re.compile(r"\[\s*\w+\s*::|#[\w-]+")
 
 # Single source of truth for executor aliasing: how a spoken/typed phrase
 # resolves to the canonical tag the board and the authority gate use.
-# Speech-to-text commonly renders "Claude" as "clod" and "Claude Code" as
-# "clod code" or "cloud code"; "deepseek"/"fireworks" name the configured
+# Speech-to-text commonly renders "Claude" as "clod" or "quad" and "Claude
+# Code" as "clod code", "quad code", or "cloud code"; "deepseek"/"fireworks" name the configured
 # remote provider, which the board tags "cloud" (mirrors the
 # `cloud|deepseek|fireworks` group in agent_worker/worker.py) -- never the
 # Anthropic API. Every canonical executor tag also maps to itself so a
@@ -63,6 +63,8 @@ EXECUTOR_ALIASES: dict[str, str] = {
     "claude code": "claude",
     "cloud code": "claude",
     "clod": "claude",
+    "quad code": "claude",
+    "quad": "claude",
     "deepseek": "cloud",
     "fireworks": "cloud",
     **{tag: tag for tag in AGENT_EXECUTOR_TAGS},
@@ -1120,6 +1122,49 @@ class JevPebbleClassifier:
             return []
 
 
+# The spoken filing request in front of a task ("make a task to", "add a
+# to-do for", ...) -- wording about the task, not part of it.
+_TASK_REQUEST_PREFIX_RE = re.compile(
+    r"^\s*(?:please\s+)?(?:can\s+you\s+)?(?:make|create|add|file|open|put\s+in|set\s+up)\s+"
+    r"(?:me\s+)?(?:a\s+|an\s+)?(?:new\s+)?(?:task|to-?do|todo|reminder)\s+"
+    r"(?:to|for|about|that\s+(?:i\s+)?(?:need\s+to|should)?)\s*",
+    re.IGNORECASE,
+)
+
+
+def _strip_task_request(item: str) -> str:
+    """Drop the filing request from a task fragment, keeping the task itself.
+
+    The result is still a literal span of the transcript (only its first
+    letter is capitalized, and evidence checks are case-insensitive).
+    Returns the fragment unchanged when nothing meaningful would remain.
+    """
+    stripped = _TASK_REQUEST_PREFIX_RE.sub("", item, count=1).strip()
+    if stripped == item.strip() or not _scope_terms(stripped):
+        return item
+    return stripped[0].upper() + stripped[1:]
+
+
+def _jev_plain_task(item: str, final_text: str) -> dict[str, Any]:
+    """A task for the speaker, titled without the spoken filing request and
+    carrying `#me` when they explicitly assigned it to themselves ("... and
+    assign it to me").
+
+    Jev's `executor` question only names AI agents, so self-assignment is
+    read from the transcript here. The evidence is the one sentence holding
+    both the item and the assignment; `validate_plan` re-proves it before
+    the tag survives.
+    """
+    title = _strip_task_request(item)
+    action: dict[str, Any] = {"kind": "task", "index": 0, "title": title, "action_evidence": title}
+    for match in re.finditer(r"[^.!?;\n]+", final_text):
+        sentence = match.group(0).strip()
+        if item.casefold() in sentence.casefold() and "me" in _explicit_tags(sentence):
+            action.update(tags=["me"], delegation_evidence=sentence)
+            break
+    return action
+
+
 def _jev_plan_from_answers(
     answers: dict[str, Any], final_text: str, recorded_at: str,
     item_criteria: dict[str, str], work_criteria: dict[str, str],
@@ -1150,7 +1195,7 @@ def _jev_plan_from_answers(
     delegation_evidence = final_text.strip(" .")
 
     if disp == "task":
-        return [{"kind": "task", "index": 0, "title": item, "action_evidence": item}]
+        return [_jev_plain_task(item, final_text)]
 
     if disp in ("notify_schedule", "agent_schedule") and _RECURRENCE_RE.search(final_text):
         return []
@@ -1159,7 +1204,7 @@ def _jev_plan_from_answers(
         recorded_local = _utc(recorded_at).astimezone(ZoneInfo(settings.timezone))
         when = parse_contextual_time(final_text, recorded_local)
         if when is None:
-            return [{"kind": "task", "index": 0, "title": item, "action_evidence": item}]
+            return [_jev_plain_task(item, final_text)]
         return [{
             "kind": "schedule", "index": 0, "title": item, "schedule_type": "once",
             "schedule_value": when.isoformat(), "timezone": settings.timezone,
