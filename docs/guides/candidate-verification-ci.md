@@ -340,6 +340,37 @@ leaves the source ref at the candidate SHA. It never restores the original PR
 head, and a newer source commit causes the cleanup lease to retain the newer
 ref.
 
+## Advisory gate triage
+
+`scripts/gate_triage.py --run-id <id>` reads a failed run's retained lane
+logs and receipts, the candidate's diff, and the retained receipts of other
+recent runs, and prints every failing node id with a bounded traceback
+excerpt from the lane log. It never republishes a check, reruns a lane, or
+creates a Human-queue card or issue -- it only prints.
+
+```bash
+~/.venvs/lifeos/bin/python scripts/gate_triage.py --run-id 123456789 [--repo OWNER/REPO]
+```
+
+The candidate's base commit and tree come from the App-published check's
+structured output on the run's head SHA (see above) -- never from
+candidate-authored text. When a failing test's node id appears as `passed`
+in another retained run whose structured output names the identical tree, it
+is marked passing elsewhere on this tree. With `TYPESAFE_API_KEY` configured,
+each failing test also gets one Jev call answering `caused_by_candidate` (a
+probability) and `failure_class` (a choice among `timing`/`ordering`/
+`environment`/`real`), printed alongside the deterministic facts. Only the
+bounded traceback excerpt and the candidate's changed-file list are ever sent
+to Jev, never full test output. With no key configured, or when a judgment
+call fails or times out, the deterministic facts print alone and the command
+still exits successfully.
+
+The command refuses to run, before downloading anything, when the
+candidate's diff touches `data/` or `config/` -- paths that could carry
+personal values -- and when no App-published check is found on the run's
+head SHA, since without it there is no base commit to diff against and thus
+no way to run that safety check.
+
 ## Enabling the Gate
 
 1. Create the `candidate-verification-publish` Environment on the
