@@ -33,7 +33,10 @@ def _fake_run(runs, checks_by_sha, *, fail=False):
             return SimpleNamespace(returncode=1, stdout="", stderr="boom")
         if "/actions/workflows/" in path:
             assert "created=%3E%3D" in path
-            return SimpleNamespace(returncode=0, stdout=json.dumps({"workflow_runs": runs}), stderr="")
+            page = int(path.split("&page=")[1].split("&")[0])
+            pages = runs if isinstance(runs, list) and runs and isinstance(runs[0], list) else [runs]
+            batch = pages[page - 1] if page - 1 < len(pages) else []
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"workflow_runs": batch}), stderr="")
         sha = path.split("/commits/")[1].split("/")[0]
         return SimpleNamespace(returncode=0, stdout=json.dumps({"check_runs": checks_by_sha.get(sha, [])}), stderr="")
 
@@ -135,3 +138,34 @@ def test_cli_reports_an_api_failure_with_exit_one(capsys):
     code = main(["--repository", "o/r"], run=_fake_run([], {}, fail=True), notify=lambda ch, text: True)
     assert code == 1
     assert "could not run" in capsys.readouterr().err
+
+
+
+@pytest.mark.unit
+def test_a_full_first_page_is_followed_by_the_next_page():
+    """A stalled run on the second page is found, so a busy day cannot hide
+    an imbalance behind the 100-run page cap."""
+    first = [_run_item(i, "workflow_dispatch", "completed", "cancelled", 10, "a" * 40) for i in range(100)]
+    second = [_run_item(999, "workflow_dispatch", "in_progress", None, 90, "b" * 40)]
+    fake = _fake_run([first, second], {})
+    report = collect("o/r", app_id=APP, now=NOW, run=fake)
+    assert [i.run_id for i in report.imbalances] == [999]
+    assert report.cancelled == 100
+    assert sum("/actions/workflows/" in c[2] for c in fake.calls) == 2
+
+
+@pytest.mark.unit
+def test_a_short_first_page_is_the_only_page_fetched():
+    fake = _fake_run([_run_item(1, "workflow_dispatch", "completed", "cancelled", 10, "a" * 40)], {})
+    collect("o/r", app_id=APP, now=NOW, run=fake)
+    assert sum("/actions/workflows/" in c[2] for c in fake.calls) == 1
+
+
+@pytest.mark.unit
+def test_an_unbounded_window_is_an_error_not_a_truncated_report():
+    from scripts import gate_flow_check
+
+    full = [_run_item(i, "workflow_dispatch", "completed", "cancelled", 10, "a" * 40) for i in range(100)]
+    fake = _fake_run([full] * (gate_flow_check.MAX_PAGES + 1), {})
+    with pytest.raises(FlowCheckError):
+        collect("o/r", app_id=APP, now=NOW, run=fake)

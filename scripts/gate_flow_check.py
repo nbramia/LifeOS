@@ -93,6 +93,24 @@ def _published(run: Runner, repository: str, head_sha: str, check_name: str, app
     return False
 
 
+PAGE_SIZE = 100
+MAX_PAGES = 20
+
+
+def _runs_since(run: Runner, repository: str, since: str) -> list[Mapping[str, Any]]:
+    """Every run created at or after ``since``, following pages until one
+    comes back short; a window that would need more than MAX_PAGES pages is
+    an error rather than a silently truncated report."""
+    runs: list[Mapping[str, Any]] = []
+    for page in range(1, MAX_PAGES + 1):
+        payload = _api(run, f"repos/{repository}/actions/workflows/{WORKFLOW_FILE}/runs?per_page={PAGE_SIZE}&page={page}&created=%3E%3D{since}")
+        batch = payload.get("workflow_runs", []) if isinstance(payload, Mapping) else []
+        runs.extend(item for item in batch if isinstance(item, Mapping))
+        if len(batch) < PAGE_SIZE:
+            return runs
+    raise FlowCheckError(f"more than {MAX_PAGES * PAGE_SIZE} runs in the window; narrow --hours")
+
+
 def collect(
     repository: str,
     *,
@@ -105,8 +123,7 @@ def collect(
     """Every imbalance among the workflow's runs created in the last ``hours``."""
     now = now or datetime.now(timezone.utc)
     since = (now - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    payload = _api(run, f"repos/{repository}/actions/workflows/{WORKFLOW_FILE}/runs?per_page=100&created=%3E%3D{since}")
-    runs = payload.get("workflow_runs", []) if isinstance(payload, Mapping) else []
+    runs = _runs_since(run, repository, since)
     imbalances: list[Imbalance] = []
     counted = cancelled = 0
     for item in runs:
