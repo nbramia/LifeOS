@@ -34,6 +34,7 @@ def _runner(responses: dict[str, dict]):
 @pytest.mark.unit
 def test_candidate_workflow_separates_untrusted_execution_from_status_publisher():
     workflow = (ROOT / ".github/workflows/candidate-verification.yml").read_text()
+    execute = workflow[workflow.index("  execute-candidate:"):workflow.index("  publish-aggregate:")]
     assert "pull_request_target:" in workflow
     assert "workflow_dispatch:" in workflow
     assert "candidate_sha:" in workflow
@@ -59,22 +60,22 @@ def test_candidate_workflow_separates_untrusted_execution_from_status_publisher(
     assert 'test "$TRUSTED_RUNNER_SHA" = "$WORKFLOW_SHA"' in workflow
     assert 'git -C candidate cat-file commit "$CANDIDATE_SHA"' in workflow
     assert 'test "$FIRST_PARENT" = "$TRUSTED_RUNNER_SHA"' in workflow
-    assert workflow.index("name: Bind dispatched runner") < workflow.index("name: Install the declared CPU test environment")
+    assert execute.index("name: Bind dispatched runner") < execute.index("name: Install the declared CPU test environment")
 
     # Lane selection is a trusted decision taken before any environment is
     # built: a docs-only candidate installs and executes nothing, and the
     # publisher records that mode explicitly rather than inferring success
     # from an absent job.
-    assert workflow.index("name: Bind dispatched runner") < workflow.index("name: Select the lanes") < workflow.index("actions/setup-python")
+    assert execute.index("name: Bind dispatched runner") < execute.index("name: Select the lanes") < execute.index("actions/setup-python")
     assert "python3 trusted-runner/scripts/candidate_lanes.py" in workflow
     assert "verification_mode: ${{ steps.reuse.outputs.mode || steps.select.outputs.mode }}" in workflow
     executed = "steps.select.outputs.mode == 'executed'"
     for step in ("actions/setup-python", "name: Install the declared CPU test environment", "name: Verify the retained lanes"):
-        block = workflow[workflow.index(step):]
+        block = execute[execute.index(step):]
         block = block[:block.index("\n      - ")]
         assert executed in block, step
     for step in ("name: Prove checkout identity", "name: Bind dispatched runner"):
-        block = workflow[workflow.index(step):]
+        block = execute[execute.index(step):]
         block = block[:block.index("\n      - ")]
         assert executed not in block, step
     assert "create-github-app-token" in workflow
@@ -88,16 +89,16 @@ def test_candidate_workflow_separates_untrusted_execution_from_status_publisher(
     # the runner's own decision script over App-published check data, read
     # with a read-only token before any environment exists; the shadow run
     # itself never reuses anything.
-    reuse = workflow[workflow.index("name: Reuse a passing shadow verification"):]
+    reuse = execute[execute.index("name: Reuse a passing shadow verification"):]
     reuse = reuse[:reuse.index("\n      - ")]
     assert "github.event_name == 'workflow_dispatch'" in reuse
     assert "vars.LIFEOS_CANDIDATE_APP_ID != ''" in reuse
     assert "python3 trusted-runner/scripts/candidate_reuse.py" in reuse
     assert 'git -C candidate fetch --quiet --depth=1 origin "$HEAD_SHA"' in reuse
     assert '[ "$(git -C candidate rev-parse "$HEAD_SHA^{tree}")" != "$TREE" ]' in reuse
-    assert workflow.index("name: Select the lanes") < workflow.index("name: Reuse a passing shadow verification") < workflow.index("actions/setup-python")
+    assert execute.index("name: Select the lanes") < execute.index("name: Reuse a passing shadow verification") < execute.index("actions/setup-python")
     for step in ("actions/setup-python", "name: Install the declared CPU test environment", "name: Verify the retained lanes"):
-        block = workflow[workflow.index(step):]
+        block = execute[execute.index(step):]
         block = block[:block.index("\n      - ")]
         assert "steps.reuse.outputs.mode != 'reused'" in block, step
     assert "mode === 'reused'" in publisher
@@ -189,34 +190,53 @@ def test_candidate_workflow_pins_actions_and_proves_cpu_wheel_identity():
 
 
 @pytest.mark.unit
-def test_candidate_workflow_caches_the_test_environment_only_from_wheel_installation():
-    """The cached environment is saved from the install step alone.
+def test_candidate_workflow_caches_the_test_environment_from_a_trusted_job_only():
+    """The cached environment is written by a job that never touches the
+    candidate.
 
-    The verify step runs candidate code; a save placed after it would let a
-    candidate shape the environment every later run restores. So the save
-    sits between install and verify, only on a miss, keyed on exactly what
-    determines the environment; a hit still proves the torch identity and
-    the package fingerprint the miss path recorded, and the install stays
-    wheels-only.
+    The execution job runs candidate code in its verify step, so it holds
+    no cache-write scope and only restores. A separate job checks out the
+    protected runner alone, builds wheels-only from its requirements file,
+    and saves under the same key shape the execution job restores with; a
+    hit in the execution job still proves the torch identity and the
+    package fingerprint the build recorded.
     """
+    import yaml
+
     workflow = (ROOT / ".github/workflows/candidate-verification.yml").read_text()
-    restore_at = workflow.index("name: Restore the installed CPU test environment")
-    install_at = workflow.index("name: Install the declared CPU test environment")
-    save_at = workflow.index("name: Save the installed CPU test environment")
-    verify_at = workflow.index("name: Verify the retained lanes")
-    assert restore_at < install_at < save_at < verify_at
-    assert "actions/cache/save" not in workflow[verify_at:]
-    assert "actions/cache" not in workflow[workflow.index("publish-aggregate:"):]
-    restore = workflow[restore_at:install_at]
-    assert "key: lifeos-test-env-v1-${{ runner.os }}-py${{ steps.python.outputs.python-version }}-torch${{ env.TORCH_CPU_VERSION }}-${{ hashFiles('candidate/requirements.txt') }}-${{ steps.cache-window.outputs.week }}" in restore
-    # Open requirement ranges resolve at build time, so the key carries the
-    # ISO week to bound how old a restored resolution can be.
-    window = workflow[workflow.index("name: Bound the cached environment's age"):restore_at]
+    jobs = yaml.safe_load(workflow)["jobs"]
+    prepare = jobs["prepare-environment"]
+    execute = jobs["execute-candidate"]
+    workflow_yaml = yaml.safe_load(workflow)
+    assert workflow_yaml["cache-mode"] == "read"
+    assert prepare["cache-mode"] == "write"
+    assert "cache-mode" not in execute
+    assert "cache-mode" not in jobs["publish-aggregate"]
+    assert prepare["permissions"] == {"contents": "read"}
+    assert "actions" not in execute["permissions"]
+    assert "environment" not in prepare
+    prepare_text = workflow[workflow.index("  prepare-environment:"):workflow.index("  execute-candidate:")]
+    assert "path: candidate" not in prepare_text
+    assert "candidate/" not in prepare_text
+    assert "hashFiles('trusted-runner/requirements.txt')" in prepare_text
+    assert "-r trusted-runner/requirements.txt" in prepare_text
+    assert prepare_text.count("--only-binary=:all:") == 2
+    assert "lookup-only: true" in prepare_text
+    assert prepare_text.index("name: Build the CPU test environment") < prepare_text.index("name: Save the installed CPU test environment")
+    assert prepare["steps"][0]["name"] == "Bind the environment builder to protected workflow provenance"
+    assert "key: ${{ steps.env-cache.outputs.cache-primary-key }}" in prepare_text
+    assert "actions/cache/save" not in workflow[workflow.index("  execute-candidate:"):]
+    execute_text = workflow[workflow.index("  execute-candidate:"):workflow.index("  publish-aggregate:")]
+    restore_at = execute_text.index("name: Restore the installed CPU test environment")
+    install_at = execute_text.index("name: Install the declared CPU test environment")
+    verify_at = execute_text.index("name: Verify the retained lanes")
+    assert restore_at < install_at < verify_at
+    key = "lifeos-test-env-v1-${{ runner.os }}-py${{ steps.python.outputs.python-version }}-torch${{ env.TORCH_CPU_VERSION }}-"
+    assert key + "${{ hashFiles('candidate/requirements.txt') }}-${{ steps.cache-window.outputs.week }}" in execute_text[restore_at:install_at]
+    assert key + "${{ hashFiles('trusted-runner/requirements.txt') }}-${{ steps.cache-window.outputs.week }}" in prepare_text
+    window = execute_text[execute_text.index("name: Bound the cached environment's age"):restore_at]
     assert 'echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"' in window
-    save = workflow[save_at:verify_at]
-    assert "steps.env-cache.outputs.cache-hit != 'true'" in save
-    assert "key: ${{ steps.env-cache.outputs.cache-primary-key }}" in save
-    install = workflow[install_at:save_at]
+    install = execute_text[install_at:verify_at]
     assert 'if [ "$CACHE_HIT" != "true" ]; then' in install
     assert "python -m playwright install-deps chromium" in install
     assert 'test "$(python -m pip freeze --all | LC_ALL=C sort | sha256sum)" = "$(cat "$FINGERPRINT")"' in install
@@ -695,3 +715,29 @@ def test_reuse_step_reads_the_second_parent_from_commit_headers_not_the_message(
     )
     assert result.stdout == head_sha
     assert forged not in result.stdout
+
+
+
+@pytest.mark.unit
+def test_environment_builder_binding_step_rejects_a_forged_runner_sha():
+    """The only cache-writing job runs the same provenance binding the
+    execution job does, as its first step: a dispatched run whose
+    trusted_runner_sha is not the commit the workflow was resolved from
+    fails before anything is checked out, built, or saved. The
+    pull_request_target path passes any value because its base SHA is
+    GitHub-set, not caller input."""
+    import yaml
+
+    workflow = yaml.safe_load((ROOT / ".github/workflows/candidate-verification.yml").read_text())
+    steps = workflow["jobs"]["prepare-environment"]["steps"]
+    assert steps[0]["name"] == "Bind the environment builder to protected workflow provenance"
+    script = steps[0]["run"]
+
+    def run(*, trusted_runner_sha: str, workflow_sha: str, event_name: str = "workflow_dispatch") -> int:
+        env = {**os.environ, "TRUSTED_RUNNER_SHA": trusted_runner_sha, "EVENT_NAME": event_name, "WORKFLOW_SHA": workflow_sha}
+        return subprocess.run(["bash", "-eo", "pipefail", "-c", script], env=env, capture_output=True).returncode
+
+    assert run(trusted_runner_sha="a" * 40, workflow_sha="a" * 40) == 0
+    assert run(trusted_runner_sha="b" * 40, workflow_sha="a" * 40) != 0
+    assert run(trusted_runner_sha="", workflow_sha="a" * 40) != 0
+    assert run(trusted_runner_sha="not-a-sha", workflow_sha="irrelevant", event_name="pull_request_target") == 0
