@@ -1242,7 +1242,7 @@ def _journal_tool_gate(
     return tool_input, None
 
 
-_TASK_OWN_ID_RE = re.compile(r"\[id:([\w-]+)\]")
+_TASK_OWN_ID_RE = re.compile(r"\[id:([\w-]+)\]\s*$")
 
 
 def _journal_created_task_id(result: str) -> Optional[str]:
@@ -1250,12 +1250,18 @@ def _journal_created_task_id(result: str) -> Optional[str]:
     None. Only a result starting with "Task created:" yields an id — "Task
     recovered:" (an existing task returned by a repeated `operation_key`)
     and an "Error:" result never do. `_format_native_task`'s own-task line
-    always comes before its `Parent: ... [id:...]` line, so the first match
-    in the result is always the created task's own id, never the parent's.
+    is always the first line after the "Task created:" header, and its own
+    `[id:...]` always ends that line — so matching only that line, anchored
+    to its end, is required: an unvalidated field like `due_date` is
+    rendered earlier on the same line and can itself contain `[id:...]`
+    text.
     """
     if not result.startswith("Task created:"):
         return None
-    match = _TASK_OWN_ID_RE.search(result)
+    lines = result.splitlines()
+    if len(lines) < 2:
+        return None
+    match = _TASK_OWN_ID_RE.search(lines[1])
     return match.group(1) if match else None
 
 
