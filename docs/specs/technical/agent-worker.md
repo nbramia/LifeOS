@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-09-20
+> **Last Updated:** 2026-09-21
 
 Engineering view of the agent worker — the stand-alone process that consumes engine-assigned tasks and runs them on either a local LLM or Anthropic Managed Agents. For consumer-facing behavior, see [product/agent-worker.md](../product/agent-worker.md). For operator setup, see [guides/agent-worker-setup.md](../../guides/agent-worker-setup.md).
 
@@ -539,6 +539,8 @@ All four model-facing prompts are structured per [Anthropic's Claude 4.6/4.7 pro
 | Local Gemma `_system_prompt` | `local_executor.py` (`_SYSTEM_PROMPT_STATIC` + per-task `<this_task>` trailer) | Gemma 4 26B |
 | Cloud per-task user message | `managed_executor.py` (`_user_message_for`) | Initial user turn for each managed session |
 | Haiku preflight prompt | `preflight.py` (`_PREFLIGHT_INSTRUCTIONS`) | Claude Haiku classifier |
+
+Every executor's task-opening prompt includes the shared [`PROJECT_TASK_GUIDANCE`](../../../api/services/agent_worker/delegation.py#L28) fragment; Hermes adds it only when starting a new conversation. When a Managed preset class narrows its tools, the [cross-cutting set](../../../api/services/agent_worker/tool_filter.py#L44) retains project inspection, lifecycle, resume, and handoff tools; fullstack and unknown classes instead leave the preset unfiltered.
 
 Cache strategy: the local executor's static portion is a module-level constant so prompt caches don't invalidate between sessions; only the small trailing `<this_task>` block (expected_output + soft budget) varies.
 

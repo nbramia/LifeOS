@@ -1,7 +1,7 @@
 # Agent Worker Setup
 
 > **Status:** Complete
-> **Last Updated:** 2026-09-05
+> **Last Updated:** 2026-09-21
 > **Audience:** Operators
 
 One-time setup for the external agent worker that picks up engine-assigned tasks (`#claude` / `#codex` / `#hermes` / `#local` / `#cloud`) and executes them via Claude (Anthropic Managed Agents), Hermes, a remote OpenAI-compatible provider, or a local Gemma model.
