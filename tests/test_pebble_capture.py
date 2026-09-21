@@ -1405,7 +1405,7 @@ async def test_jev_classifier_task_disposition_files_the_selected_item_fragment(
     client = _FakeJevClient(_jev_answers(disposition="task", item="s0"))
     [action] = await JevPebbleClassifier(client=client).classify(transcript, "2030-01-01T10:00:00Z")
     assert action["kind"] == "task"
-    assert action["title"] == "Add a task to buy synthetic milk"
+    assert action["title"] == "Buy synthetic milk"
     assert action["action_evidence"] == action["title"]
 
 
@@ -1417,7 +1417,25 @@ async def test_jev_classifier_task_assigned_to_me_carries_the_me_tag_through_val
     [action] = validate_plan(raw, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
     assert action.kind == "task"
     assert action.tags == ("me",)
-    assert action.title == "Make a task to charge the synthetic earbuds"
+    assert action.title == "Charge the synthetic earbuds"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("transcript", "expected_title"),
+    [
+        ("Make a task to charge the synthetic earbuds", "Charge the synthetic earbuds"),
+        ("Please create a new to-do for renewing the synthetic permit", "Renewing the synthetic permit"),
+        ("Can you add me a task to call the synthetic plumber", "Call the synthetic plumber"),
+        ("Charge the synthetic earbuds", "Charge the synthetic earbuds"),
+        ("Make a task to do it", "Make a task to do it"),
+    ],
+)
+async def test_jev_classifier_task_title_drops_the_filing_request(transcript, expected_title):
+    client = _FakeJevClient(_jev_answers(disposition="task", item="s0"))
+    raw = await JevPebbleClassifier(client=client).classify(transcript, "2030-01-01T10:00:00Z")
+    [action] = validate_plan(raw, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    assert action.title == expected_title
 
 
 @pytest.mark.asyncio
