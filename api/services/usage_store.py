@@ -10,6 +10,7 @@ from typing import Optional
 from pathlib import Path
 from dataclasses import dataclass
 
+from api.services.sqlite_connect import connect_closing
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -52,7 +53,7 @@ class UsageStore:
 
     def _init_db(self):
         """Initialize the database schema."""
-        with sqlite3.connect(self.db_path) as conn:
+        with connect_closing(self.db_path) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS usage (
@@ -176,7 +177,7 @@ class UsageStore:
 
         now = datetime.now().isoformat()
 
-        with sqlite3.connect(self.db_path) as conn:
+        with connect_closing(self.db_path) as conn:
             if usage_key:
                 # The unique usage-key index is the idempotency gate.  Begin
                 # the write transaction before INSERT OR IGNORE so two
@@ -229,7 +230,7 @@ class UsageStore:
 
     def bind_usage_key(self, record_id: int, usage_key: str) -> None:
         """Attach a canonical ledger key to an already-written legacy row."""
-        with sqlite3.connect(self.db_path) as conn:
+        with connect_closing(self.db_path) as conn:
             conn.execute(
                 "UPDATE usage SET usage_key=? WHERE id=? AND usage_key IS NULL",
                 (usage_key, record_id),
@@ -238,14 +239,14 @@ class UsageStore:
 
     def has_usage_key(self, usage_key: str) -> bool:
         """Whether a canonical projection already materialized this key."""
-        with sqlite3.connect(self.db_path) as conn:
+        with connect_closing(self.db_path) as conn:
             return conn.execute(
                 "SELECT 1 FROM usage WHERE usage_key=? LIMIT 1", (usage_key,)
             ).fetchone() is not None
 
     def conversation_id_for_usage_key(self, usage_key: str) -> str | None:
         """Return the legacy conversation binding for a projected usage key."""
-        with sqlite3.connect(self.db_path) as conn:
+        with connect_closing(self.db_path) as conn:
             row = conn.execute(
                 "SELECT conversation_id FROM usage WHERE usage_key=? LIMIT 1",
                 (usage_key,),
@@ -285,7 +286,7 @@ class UsageStore:
                 "turn_count": 0, "is_lower_bound": False,
             }
 
-        with sqlite3.connect(self.db_path) as conn:
+        with connect_closing(self.db_path) as conn:
             row = conn.execute(
                 """
                 SELECT SUM(cost_usd), SUM(input_tokens), SUM(output_tokens), COUNT(*), SUM(unpriced)
@@ -337,7 +338,7 @@ class UsageStore:
             query += " WHERE timestamp <= ?"
             params = [end_date.isoformat()]
 
-        with sqlite3.connect(self.db_path) as conn:
+        with connect_closing(self.db_path) as conn:
             row = conn.execute(query, params).fetchone()
 
             return {
@@ -378,7 +379,7 @@ class UsageStore:
             ORDER BY date ASC
         """
 
-        with sqlite3.connect(self.db_path) as conn:
+        with connect_closing(self.db_path) as conn:
             rows = conn.execute(query, [start_date.isoformat()]).fetchall()
 
             return [

@@ -25,11 +25,11 @@ The shape mirrors `HermesPersonaThreadStore`, and for the same reasons:
 The TTL comfortably exceeds `agent_clarification_timeout_hours`, so the
 question a row points at is already closed by the time the row expires.
 """
-import sqlite3
 import time
 from pathlib import Path
 from typing import Optional
 
+from api.services.sqlite_connect import connect_closing
 from config.settings import settings
 
 _TTL_SECONDS = 7 * 24 * 3600
@@ -48,7 +48,7 @@ class HermesQuestionThreadStore:
         self._init_db()
 
     def _init_db(self) -> None:
-        with sqlite3.connect(self.db_path) as conn:
+        with connect_closing(self.db_path) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS question_threads (
@@ -73,7 +73,7 @@ class HermesQuestionThreadStore:
         call — see the module docstring for why this is opportunistic.
         """
         now = time.time()
-        with sqlite3.connect(self.db_path) as conn:
+        with connect_closing(self.db_path) as conn:
             conn.execute(
                 """
                 INSERT INTO question_threads (chat_id, message_id, question_id, created_at)
@@ -103,7 +103,7 @@ class HermesQuestionThreadStore:
         it was never recorded, has expired, or belongs to a different chat.
         Never raises — an unknown id is exactly as valid a result as an
         expired one, both meaning "no anchor" to the caller."""
-        with sqlite3.connect(self.db_path) as conn:
+        with connect_closing(self.db_path) as conn:
             row = conn.execute(
                 "SELECT question_id, created_at FROM question_threads "
                 "WHERE chat_id = ? AND message_id = ?",

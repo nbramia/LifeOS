@@ -36,6 +36,7 @@ from api.services.jev_task_routing import judge_task
 from api.services.journal_filing_policy import PEBBLE_DISPOSITION_CRITERIA, classifier_prompt
 from api.services.llm_client import LocalLLMClient, extract_json
 from api.services.scheduler_store import SchedulerStore
+from api.services.sqlite_connect import connect_closing
 from api.services.task_manager import TaskManager
 from api.services.time_parser import parse_contextual_time
 from config.settings import settings
@@ -398,13 +399,9 @@ class CaptureLedger:
     def _connect(self) -> Iterator[sqlite3.Connection]:
         """Yield a connection, closing it on the way out — see
         `SessionStore._connect` for the same pattern."""
-        db = sqlite3.connect(self.path, timeout=10, isolation_level=None)
-        db.row_factory = sqlite3.Row
-        try:
-            with db:
-                yield db
-        finally:
-            db.close()
+        with connect_closing(self.path, timeout=10, isolation_level=None) as db:
+            db.row_factory = sqlite3.Row
+            yield db
 
     def select_plan(self, identity: CaptureIdentity, revision: str, digest: str, plan: list[PlannedAction]) -> str:
         """Store a first plan once; changed final revisions are held, not replayed."""

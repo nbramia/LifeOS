@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from api.services.agent_worker.session_store import DEFAULT_DB_PATH, SessionStore
+from api.services.sqlite_connect import connect_closing
 
 
 MEASURED = "measured"
@@ -244,14 +245,10 @@ class UsageLedger:
         """Yield a connection, closing it on the way out — see
         `SessionStore._connect`, which shares this database and this
         pattern."""
-        conn = sqlite3.connect(str(self.db_path), isolation_level=None, timeout=10.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        try:
-            with conn:
-                yield conn
-        finally:
-            conn.close()
+        with connect_closing(str(self.db_path), isolation_level=None, timeout=10.0) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            yield conn
 
     @staticmethod
     def _nonnegative(value: int | float | None, name: str) -> int | float | None:

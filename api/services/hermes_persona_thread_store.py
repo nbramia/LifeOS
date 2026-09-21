@@ -33,11 +33,11 @@ Design choices:
   without a special case: each link in the chain becomes a valid anchor for
   the next.
 """
-import sqlite3
 import time
 from pathlib import Path
 from typing import Optional
 
+from api.services.sqlite_connect import connect_closing
 from config.settings import settings
 
 # A Hermes-Telegram persona thread is a conversational thread, not a
@@ -62,7 +62,7 @@ class HermesPersonaThreadStore:
         self._init_db()
 
     def _init_db(self) -> None:
-        with sqlite3.connect(self.db_path) as conn:
+        with connect_closing(self.db_path) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS persona_threads (
@@ -89,7 +89,7 @@ class HermesPersonaThreadStore:
         than a separate sweep.
         """
         now = time.time()
-        with sqlite3.connect(self.db_path) as conn:
+        with connect_closing(self.db_path) as conn:
             conn.execute(
                 """
                 INSERT INTO persona_threads (chat_id, message_id, persona_id, created_at)
@@ -119,7 +119,7 @@ class HermesPersonaThreadStore:
         it was never recorded, has expired, or belongs to a different chat.
         Never raises — an unknown id is exactly as valid a result as an
         expired one, both meaning "no inheritance" to the caller."""
-        with sqlite3.connect(self.db_path) as conn:
+        with connect_closing(self.db_path) as conn:
             row = conn.execute(
                 "SELECT persona_id, created_at FROM persona_threads WHERE chat_id = ? AND message_id = ?",
                 (chat_id, message_id),

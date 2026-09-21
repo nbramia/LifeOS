@@ -87,6 +87,19 @@ gh run download <run-id> --pattern 'lane-receipts-*' --dir /tmp/lane-receipts
   --lane-log-dir /tmp/lane-receipts/lane-receipts-<sha>-part3
 ```
 
+Each part also uploads `impact-selection-<candidate sha>-part<n>`, holding
+`impact_selection.json`: what a
+static import-graph selector (`scripts/test_impact.py`, run from the runner's
+checkout over the candidate tree without importing it) would have run for
+this candidate — its mode (`select`, or `full` when a changed path could
+reach tests outside the import graph: the conftest or any helper under
+`tests/`, a dependency manifest, the workflow, a verifier input, or an
+unmodeled file type), the selected modules and their share of recorded
+duration, and which failing modules in that part fell outside the selection.
+The same table is appended to the job's step summary. This is measurement
+only; the gate ran every retained lane regardless, and the verifier's
+arguments do not depend on it.
+
 The full lane log (pytest's own output) is uploaded only from a failed part,
 under `lane-logs-<candidate sha>-part<n>`.
 
@@ -125,18 +138,25 @@ dependency resolution entirely, so a restored environment holds whatever
 those ranges resolved to when its key was first built, not what they would
 resolve to today. The weekly component bounds that staleness to at most one
 week; a release published mid-week is first exercised by the next week's
-build (or sooner by any change to `requirements.txt`). On a miss the install step builds
-it with `--only-binary=:all:` (no source distribution ever executes) and
-records a package fingerprint inside the venv; the save step runs immediately
-after, before any candidate code, and nowhere later. On a hit the install
+build (or sooner by any change to `requirements.txt`).
+
+The cache is written by one job only, `prepare-environment`, which checks out
+the protected runner alone, builds the venv from the *runner's*
+`requirements.txt` with `--only-binary=:all:` (no source distribution ever
+executes), records a package fingerprint inside the venv, and saves. The
+workflow pins `cache-mode: read` for every job and that job alone declares
+`cache-mode: write`, so its cache token is the only one that may save
+whatever the trigger (`pull_request_target` issues read-only cache tokens by
+default; `workflow_dispatch` does not, and the execution job runs candidate
+code in its verify step, so it is held to read explicitly). A candidate
+whose requirements file equals the protected one hashes to the same key and
+restores that environment; a candidate that changes the file misses,
+installs fresh from its own file, and saves nothing. On a hit the install
 step activates the venv, installs Chromium's system packages (never cached),
-and fails unless the fingerprint of what was restored equals the one the miss
-path recorded for that key — a consistency check that the restored venv is
+and fails unless the fingerprint of what was restored equals the one the
+build recorded for that key — a consistency check that the restored venv is
 the one this key built, not an integrity check against the requirements
 file. The torch identity assertions run on both paths.
-Caches written from a `pull_request_target` run are scoped to `main`, so
-every candidate with the same key shares one environment that only wheel
-installation has ever touched.
 
 ## Privacy-audit applicability
 
@@ -186,9 +206,13 @@ runner's own `scripts/candidate_reuse.py`, reuses a
 `candidate-verification-shadow` verdict only when the App published it, its
 conclusion is `success`, its `trusted_runner` and `tree` equal the run's own,
 its `mode` is `executed`, and its `lanes` cover every lane the run selected.
-The check summary then names the reused check. Any mismatch, a missing
-App id, an unreachable head, or a malformed record executes the lanes as
-usual; a shadow run never reuses anything. Reuse only recognises
+The check summary then names the reused check. The App id the runner
+matches against is `vars.LIFEOS_CANDIDATE_APP_ID` read from the execution
+job, which has no environment, so the variable must exist at repository
+scope (an environment-scoped copy on the publisher's environment is invisible
+there and leaves the reuse step skipped). Any mismatch, a missing App id, an
+unreachable head, or a malformed record executes the lanes as usual; a shadow
+run never reuses anything. Reuse only recognises
 verification this runner already performed on identical bytes, so a
 candidate that a rebase changed is verified afresh.
 
