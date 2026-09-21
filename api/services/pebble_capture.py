@@ -235,6 +235,7 @@ class PlannedAction:
     action_evidence: str = ""
     human_key: str = ""
     decision_evidence: str = ""
+    parent_index: Optional[int] = None
 
     def operation_key(self, identity: CaptureIdentity) -> str:
         raw = f"{identity.source_id}\0{identity.capture_id}\0{self.index}".encode()
@@ -249,6 +250,7 @@ class PlannedAction:
             "tags": list(self.tags), "delegation_evidence": self.delegation_evidence,
             "action_evidence": self.action_evidence,
             "human_key": self.human_key, "decision_evidence": self.decision_evidence,
+            "parent_index": self.parent_index,
         }
 
 
@@ -768,6 +770,13 @@ def validate_plan(raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at
     # to cite the same span first. Only a delegated task (one that actually
     # carries a proven assignee tag) or a filed schedule writes here.
     used_scheduled_delegation_evidence: set[str] = set()
+    # Task indexes eligible to be named as a parent by a later child: kept
+    # (not dropped for reusing evidence), and not themselves a child --
+    # hierarchy is one level deep. Populated only once an action has fully
+    # survived validation and been appended to ``result``, so "earlier in
+    # the plan" is enforced structurally: a child can only reference an
+    # index already present here, never a later or dropped one.
+    available_parents: set[int] = set()
     for raw_action in raw:
         if not isinstance(raw_action, dict):
             raise PebbleCaptureError("classifier action must be an object")
@@ -792,10 +801,17 @@ def validate_plan(raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at
         # justify at most one filed action, not several.
         action_key = action_evidence.casefold()
         reused_action_evidence = kind == "task" and bool(action_evidence) and action_key in used_action_evidence
+        parent_index: Optional[int] = None
         # Tags are task metadata. A model may redundantly copy an agent
         # schedule's executor into ``tags``; ignore it here so only the
         # schedule-specific authority check below consumes its evidence.
         if kind == "task":
+            raw_parent_index = raw_action.get("parent_index")
+            if raw_parent_index is not None:
+                if (isinstance(raw_parent_index, bool) or not isinstance(raw_parent_index, int)
+                        or raw_parent_index == index or raw_parent_index not in available_parents):
+                    raise PebbleCaptureError("task parent_index is invalid")
+                parent_index = raw_parent_index
             for raw_tag in raw_tags:
                 if not isinstance(raw_tag, str):
                     continue
@@ -815,6 +831,7 @@ def validate_plan(raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at
         action = PlannedAction(
             kind=kind, title=title, index=index, tags=normalized_tags,
             delegation_evidence=evidence, action_evidence=action_evidence,
+            parent_index=parent_index,
         )
         if kind == "task":
             due = raw_action.get("due_date", "")
@@ -914,6 +931,8 @@ def validate_plan(raw: Iterable[dict[str, Any]], *, transcript: str, recorded_at
                 raise PebbleCaptureError("human action lacks an explicit operator-only decision")
             action = replace(action, human_key=key, decision_evidence=evidence)
         result.append(action)
+        if kind == "task" and parent_index is None:
+            available_parents.add(index)
     return result
 
 
@@ -991,7 +1010,19 @@ class PebbleJournalClassifier:
                 raise PebbleCaptureError("classifier returned no valid action plan") from exc
 
 
-_JEV_SPLIT_RE = re.compile(r",\s*|\s+(?:and|before|but|then|so)\s+|[.;!?]\s+")
+# A colon must be followed by whitespace to split ("with subtasks: clear
+# the shelves"), never a bare colon with no following space ("at 3:00 PM"),
+# so a clock time never fragments. "with sub-tasks"/"with subtasks"/"with
+# steps" is itself a delimiter -- consumed whole, along with one optional
+# trailing connector word or colon -- so it never leaks into a fragment's
+# title. A comma may itself be immediately followed by one connector word
+# ("X, and Y"), consumed together as a single delimiter so an Oxford-comma
+# list item doesn't keep a stray leading "and".
+_JEV_SPLIT_RE = re.compile(
+    r",\s*(?:and|before|but|then|so)?\s*|\s+(?:and|before|but|then|so)\s+|[.;!?]\s+"
+    r"|\s+with\s+(?:sub-?tasks?|steps)\b(?:\s*(?:of|like|including|:))?\s*"
+    r"|:\s+"
+)
 
 # A recurring cadence -- "every morning", "weekly", "on weekdays" -- names
 # more than the single instant `parse_contextual_time` can resolve; filing a
@@ -1074,6 +1105,8 @@ class JevPebbleClassifier:
         item_criteria = {f"s{i}": fragment for i, fragment in enumerate(fragments)}
         item_criteria["none"] = "No single fragment -- the whole note is the request"
         work_criteria = {f"s{i}": fragment for i, fragment in enumerate(fragments)}
+        parent_criteria = {f"s{i}": fragment for i, fragment in enumerate(fragments)}
+        parent_criteria["none"] = "No fragment names a parent to-do or project"
         questions = {
             "disposition": {
                 "type": "choice",
@@ -1108,7 +1141,36 @@ class JevPebbleClassifier:
                 "instructions": "Which AI agent, if any, did the speaker ask to do the work?",
                 "criteria": _executor_criteria(),
             },
+            "structure": {
+                "type": "choice",
+                "instructions": (
+                    "Only when the speaker asked for a to-do: did they ask "
+                    "for one item, several separate to-dos each explicitly "
+                    "requested, or one parent to-do with sub-tasks?"
+                ),
+                "criteria": {
+                    "single": "One item was asked for.",
+                    "separate": "Several separate to-dos were each explicitly asked for.",
+                    "project": "One parent to-do with sub-tasks was asked for.",
+                },
+            },
+            "parent": {
+                "type": "choice",
+                "instructions": (
+                    "If the speaker asked for a parent to-do with sub-tasks, "
+                    "which fragment names the parent or project itself?"
+                ),
+                "criteria": parent_criteria,
+            },
         }
+        for i, fragment in enumerate(fragments):
+            questions[f"req_s{i}"] = {
+                "type": "noul",
+                "instructions": (
+                    f'"{fragment}" was explicitly asked to be filed as its '
+                    "own to-do or sub-task."
+                ),
+            }
         try:
             answers = await self._client.aask({"voice_note": final_text}, questions)
         except JevError:
@@ -1123,13 +1185,21 @@ class JevPebbleClassifier:
 
 
 # The spoken filing request in front of a task ("make a task to", "add a
-# to-do for", ...) -- wording about the task, not part of it.
+# to-do for", "make a project to", "make tasks to", ...) -- wording about
+# the task, not part of it.
 _TASK_REQUEST_PREFIX_RE = re.compile(
-    r"^\s*(?:please\s+)?(?:can\s+you\s+)?(?:make|create|add|file|open|put\s+in|set\s+up)\s+"
-    r"(?:me\s+)?(?:a\s+|an\s+)?(?:new\s+)?(?:task|to-?do|todo|reminder)\s+"
+    r"^\s*(?:please\s+)?(?:can\s+you\s+)?(?:make|create|add|file|open|put\s+in|set\s+up|start)\s+"
+    r"(?:me\s+)?(?:a\s+|an\s+)?(?:new\s+)?(?:tasks?|to-?dos?|todos?|reminders?|projects?)\s+"
     r"(?:to|for|about|that\s+(?:i\s+)?(?:need\s+to|should)?)\s*",
     re.IGNORECASE,
 )
+
+# A leading "subtasks"/"sub-tasks" marker left in front of a child fragment
+# ("Sub-tasks: clear the shelves") -- wording about the sub-task, not part
+# of it. Segmentation (`_JEV_SPLIT_RE`) already consumes this phrase when it
+# falls on a fragment boundary; this covers a fragment that still starts
+# with it.
+_LEADING_SUBTASK_RE = re.compile(r"^\s*sub-?tasks?\s*:?\s*", re.IGNORECASE)
 
 
 def _strip_task_request(item: str) -> str:
@@ -1139,30 +1209,158 @@ def _strip_task_request(item: str) -> str:
     letter is capitalized, and evidence checks are case-insensitive).
     Returns the fragment unchanged when nothing meaningful would remain.
     """
-    stripped = _TASK_REQUEST_PREFIX_RE.sub("", item, count=1).strip()
+    working = _TASK_REQUEST_PREFIX_RE.sub("", item, count=1)
+    working = _LEADING_SUBTASK_RE.sub("", working, count=1)
+    stripped = working.strip()
     if stripped == item.strip() or not _scope_terms(stripped):
         return item
     return stripped[0].upper() + stripped[1:]
 
 
-def _jev_plain_task(item: str, final_text: str) -> dict[str, Any]:
-    """A task for the speaker, titled without the spoken filing request and
-    carrying `#me` when they explicitly assigned it to themselves ("... and
-    assign it to me").
+def _jev_self_assignment(item: str, final_text: str) -> Optional[tuple[list[str], str]]:
+    """Return (["me"], sentence) when the speaker explicitly self-assigned
+    `item` ("... and assign it to me"), else `None`.
 
     Jev's `executor` question only names AI agents, so self-assignment is
     read from the transcript here. The evidence is the one sentence holding
     both the item and the assignment; `validate_plan` re-proves it before
     the tag survives.
     """
-    title = _strip_task_request(item)
-    action: dict[str, Any] = {"kind": "task", "index": 0, "title": title, "action_evidence": title}
     for match in re.finditer(r"[^.!?;\n]+", final_text):
         sentence = match.group(0).strip()
         if item.casefold() in sentence.casefold() and "me" in _explicit_tags(sentence):
-            action.update(tags=["me"], delegation_evidence=sentence)
-            break
+            return ["me"], sentence
+    return None
+
+
+def _jev_plain_task(item: str, final_text: str) -> dict[str, Any]:
+    """A task for the speaker, titled without the spoken filing request and
+    carrying `#me` when they explicitly assigned it to themselves ("... and
+    assign it to me").
+    """
+    title = _strip_task_request(item)
+    action: dict[str, Any] = {"kind": "task", "index": 0, "title": title, "action_evidence": title}
+    assignment = _jev_self_assignment(item, final_text)
+    if assignment is not None:
+        tags, sentence = assignment
+        action.update(tags=tags, delegation_evidence=sentence)
     return action
+
+
+# Named confidence floors for the multi-item Jev shapes (see
+# `_jev_structured_tasks`): below either, the request is treated as if
+# Jev hadn't offered that shape at all.
+_STRUCTURE_CONFIDENCE_FLOOR = 0.5
+_REQUESTED_FRAGMENT_FLOOR = 0.7
+
+
+def _requested_fragment_indexes(answers: dict[str, Any], item_criteria: dict[str, str]) -> list[int]:
+    """Fragment indexes, in transcript order, whose `req_s<i>` answer meets
+    `_REQUESTED_FRAGMENT_FLOOR` for "explicitly asked to be filed"."""
+    indexes = []
+    for key in item_criteria:
+        if key == "none":
+            continue
+        req = answers.get(f"req_{key}") or {}
+        noul = req.get("noul")
+        if isinstance(noul, (int, float)) and noul >= _REQUESTED_FRAGMENT_FLOOR:
+            indexes.append(int(key[1:]))
+    return sorted(indexes)
+
+
+def _jev_multi_task_action(
+    item: str, final_text: str, *, index: int, allow_me: bool, parent_index: Optional[int] = None,
+) -> dict[str, Any]:
+    """One task action for a list or project item.
+
+    A literal transcript span with its filing request stripped, its first
+    letter capitalized regardless of whether anything was stripped (a
+    mid-sentence fragment like "order the synthetic filters" otherwise keeps
+    the original text's lowercase leading letter). Only the first action in
+    a list, or the parent in a project, may carry `#me` -- `allow_me=False`
+    skips the self-assignment scan entirely for every other item.
+    """
+    stripped = _strip_task_request(item)
+    title = stripped[0].upper() + stripped[1:] if stripped else stripped
+    action: dict[str, Any] = {"kind": "task", "index": index, "title": title, "action_evidence": title}
+    if parent_index is not None:
+        action["parent_index"] = parent_index
+    if allow_me:
+        assignment = _jev_self_assignment(item, final_text)
+        if assignment is not None:
+            tags, sentence = assignment
+            action.update(tags=tags, delegation_evidence=sentence)
+    return action
+
+
+# validate_plan's own cap; the parent (when there is one) is always kept, so
+# a project's children are capped one lower.
+_MAX_PLAN_ACTIONS = 8
+
+
+def _jev_structured_tasks(
+    answers: dict[str, Any], final_text: str, item_criteria: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Turn a `task`-disposition Jev answer into one, several, or a
+    parent-plus-children set of raw task actions, per the `structure`
+    answer.
+
+    Falls back to the single-task shape (`_jev_plain_task`) when `structure`
+    is missing, below `_STRUCTURE_CONFIDENCE_FLOOR`, or not a recognized
+    choice -- this is the strong default, unchanged from before this shape
+    existed. A `project` answer whose named parent isn't itself a requested
+    fragment falls back to `separate`.
+    """
+    fragments = {key: value for key, value in item_criteria.items() if key != "none"}
+    structure_answer = answers.get("structure") or {}
+    structure_confidence = structure_answer.get("confidence")
+    structure_choice = structure_answer.get("choice")
+    if (not isinstance(structure_confidence, (int, float))
+            or structure_confidence < _STRUCTURE_CONFIDENCE_FLOOR
+            or structure_choice not in ("separate", "project")):
+        structure_choice = "single"
+
+    item_choice = (answers.get("item") or {}).get("choice")
+    single_item = (
+        item_criteria.get(item_choice) if item_choice and item_choice != "none" else final_text.strip(" .")
+    )
+    if structure_choice == "single":
+        return [_jev_plain_task(single_item, final_text)]
+
+    requested = _requested_fragment_indexes(answers, item_criteria)
+    requested_items = [(i, fragments[f"s{i}"]) for i in requested]
+
+    if structure_choice == "project":
+        parent_choice = (answers.get("parent") or {}).get("choice")
+        parent_i: Optional[int] = None
+        if parent_choice and parent_choice != "none":
+            try:
+                candidate = int(parent_choice[1:])
+            except (TypeError, ValueError, IndexError):
+                candidate = None
+            if candidate is not None and any(i == candidate for i, _ in requested_items):
+                parent_i = candidate
+        if parent_i is not None:
+            parent_item = fragments[f"s{parent_i}"]
+            children = [frag for i, frag in requested_items if i != parent_i][: _MAX_PLAN_ACTIONS - 1]
+            actions = [_jev_multi_task_action(parent_item, final_text, index=0, allow_me=True)]
+            for offset, child_item in enumerate(children, start=1):
+                actions.append(
+                    _jev_multi_task_action(
+                        child_item, final_text, index=offset, allow_me=False, parent_index=0
+                    )
+                )
+            return actions
+        # No valid parent named: fall back to filing the requested fragments
+        # as separate to-dos rather than dropping the request entirely.
+
+    if not requested_items:
+        return []
+    limited = requested_items[:_MAX_PLAN_ACTIONS]
+    return [
+        _jev_multi_task_action(frag_item, final_text, index=position, allow_me=(position == 0))
+        for position, (_i, frag_item) in enumerate(limited)
+    ]
 
 
 def _jev_plan_from_answers(
@@ -1195,7 +1393,7 @@ def _jev_plan_from_answers(
     delegation_evidence = final_text.strip(" .")
 
     if disp == "task":
-        return [_jev_plain_task(item, final_text)]
+        return _jev_structured_tasks(answers, final_text, item_criteria)
 
     if disp in ("notify_schedule", "agent_schedule") and _RECURRENCE_RE.search(final_text):
         return []
@@ -1403,6 +1601,16 @@ class PebbleCaptureConsumer:
                     ) <= _now_utc()):
                 return "schedule_elapsed"
         for action in actions:
+            parent_object_id: Optional[str] = None
+            if action.kind == "task" and action.parent_index is not None:
+                parent_effect = self.ledger.effect(identity, action.parent_index)
+                if not parent_effect or parent_effect["state"] != "applied" or not parent_effect["object_id"]:
+                    # The parent isn't applied yet -- claimed by another
+                    # worker within its lease, or not yet reached in this
+                    # pass. A child cannot attach to a task that doesn't
+                    # exist yet, so hold without creating it.
+                    return "in_progress"
+                parent_object_id = parent_effect["object_id"]
             existing_claim = self.ledger.effect(identity, action.index)
             if existing_claim and existing_claim["state"] == "applying":
                 if time.time() - existing_claim["claimed_at"] < _EFFECT_LEASE_SECONDS:
@@ -1428,6 +1636,8 @@ class PebbleCaptureConsumer:
             if action.kind == "task":
                 tags = list(action.tags)
                 fields = self._software_project_fields(action.title, tags)
+                if parent_object_id is not None:
+                    fields = {**(fields or {}), "parent_id": parent_object_id}
                 try:
                     task, _ = self.task_manager.create_or_find_by_operation(
                         key, description=action.title, due_date=action.due_date or None,

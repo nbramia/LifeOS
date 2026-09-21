@@ -55,6 +55,21 @@ _CASES = [
     ("The blue mug is on the table.", False),
     ("I have a doctor's appointment tomorrow and the car needs an oil change.", False),
     ("Let me know how the synthetic report turned out.", False),
+    (
+        "Make tasks to charge the synthetic earbuds, order the synthetic filters, "
+        "and call the synthetic vet.",
+        True,
+    ),
+    (
+        "Make a project to renovate the synthetic garage with subtasks clear the shelves, "
+        "buy paint, and paint the walls.",
+        True,
+    ),
+    (
+        "I keep thinking about all the synthetic things I should do: clean the garage, "
+        "fix the fence, and paint the shed.",
+        False,
+    ),
 ]
 
 # (transcript, expected single filed item) -- only the first-asked item
