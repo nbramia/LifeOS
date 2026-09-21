@@ -1,7 +1,7 @@
 # Candidate Verification CI
 
 **Status:** Partial
-**Last Updated:** 2026-09-20
+**Last Updated:** 2026-09-21
 **Audience:** Operators
 
 Candidate verification runs on GitHub-hosted ephemeral runners. The publisher
@@ -157,6 +157,30 @@ and fails unless the fingerprint of what was restored equals the one the
 build recorded for that key — a consistency check that the restored venv is
 the one this key built, not an integrity check against the requirements
 file. The torch identity assertions run on both paths.
+
+## Flow check: jobs in equals jobs out
+
+`scripts/gate_flow_check.py` reads the verification workflow's runs from
+the last day and the check runs on each run's commit, and reports every run
+the gate started but did not finish with a published check: a run still
+queued or in progress past the 25-minute ceiling (**stalled**), or a
+completed run whose commit carries no check of the expected name published
+by the dedicated App (**unpublished** — `candidate-verification` for a
+dispatched candidate, `candidate-verification-shadow` for a pull request
+head). Cancelled runs are superseded ones and are not counted. A capacity
+deadlock or a publisher that never reports looks like slowness from the
+outside; this is the cheap signal that distinguishes the two.
+
+```bash
+~/.venvs/lifeos/bin/python scripts/gate_flow_check.py            # print the report
+~/.venvs/lifeos/bin/python scripts/gate_flow_check.py --notify telegram   # also deliver it, only on an imbalance
+```
+
+Exit status is 0 when balanced, 2 on an imbalance, 1 when the API could not
+be read. `--hours` and `--ceiling-minutes` widen or tighten the window. The
+check changes nothing and needs only `gh` authentication; a recurring run
+belongs in the host's crontab or a systemd timer on the machine that holds
+the Telegram configuration.
 
 ## Privacy-audit applicability
 
