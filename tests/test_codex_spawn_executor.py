@@ -443,12 +443,20 @@ def test_resume_does_not_prepend_preamble(stores, tmp_path):
 
 
 @pytest.mark.unit
-def test_resume_also_forwards_identity_env_vars_override(stores, tmp_path):
+def test_resume_also_forwards_identity_env_vars_override(stores, tmp_path, monkeypatch):
     """The `-c mcp_servers.lifeos.env_vars=[...]` override (see
     `codex_executor._IDENTITY_ENV_VARS`) that lets the LifeOS MCP server
     attest the caller must reach Codex on `codex exec resume` too, not just
     a fresh `codex exec` — both paths build their argv through the same
-    `_build_command`, so this proves that's still true for resume."""
+    `_build_command`, so this proves that's still true for resume. Only
+    added when the lifeos MCP server is actually configured (see
+    `_lifeos_mcp_server_configured`), so this points CODEX_HOME at a tmp
+    config that declares it."""
+    codex_home = tmp_path / "codex_home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('[mcp_servers.lifeos]\ncommand = "py"\n')
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
     sess_store, tr_store = stores
     session = sess_store.create(
         task_id="t_res2", session_id="sess_res2", status="claimed", routing="codex",

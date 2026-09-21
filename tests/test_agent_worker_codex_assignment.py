@@ -123,23 +123,37 @@ def test_model_and_effort_flags_in_argv(tmp_path, monkeypatch):
     assert "model_reasoning_effort=high" in cmd
 
 
-def _mcp_env_vars_override(cmd: list[str]) -> str:
-    """Locate the `-c mcp_servers.lifeos.env_vars=[...]` argv pair's value."""
+def _mcp_env_vars_override(cmd: list[str]) -> str | None:
+    """Locate the `-c mcp_servers.lifeos.env_vars=[...]` argv pair's value,
+    or None when no such pair is present."""
     for i, tok in enumerate(cmd):
         if tok == "-c" and i + 1 < len(cmd) and cmd[i + 1].startswith(
             "mcp_servers.lifeos.env_vars=",
         ):
             return cmd[i + 1]
-    raise AssertionError(f"no mcp_servers.lifeos.env_vars override found in {cmd}")
+    return None
+
+
+def _write_codex_config_with_lifeos_server(tmp_path: Path, monkeypatch) -> None:
+    """Point CODEX_HOME at a tmp config declaring `[mcp_servers.lifeos]` —
+    `_build_command` only adds the identity `env_vars` override when the
+    operator's Codex config actually has that server, since overriding
+    `env_vars` on a server that doesn't exist breaks Codex's config loader."""
+    codex_home = tmp_path / "codex_home"
+    codex_home.mkdir()
+    (codex_home / "config.toml").write_text('[mcp_servers.lifeos]\ncommand = "py"\n')
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
 
 
 def test_identity_env_vars_forwarded_via_mcp_env_vars_override(tmp_path, monkeypatch):
     """Codex only forwards parent env vars listed in a stdio MCP server's own
-    `env_vars` config key, so without this `-c` override the standard
+    `env_vars` config key, so without this `-c` override a configured
     `[mcp_servers.lifeos]` block (command + args only) never sees
     LIFEOS_AGENT_SESSION_ID/_ATTEMPT_ID/_TURN_ID and `lifeos_agent_*` tools
     can't attest the caller. Assert the override is present, TOML-parseable,
-    and names exactly the three identity vars — for a fresh execute()."""
+    and names exactly the three identity vars — for a fresh execute() when
+    the lifeos MCP server is configured."""
+    _write_codex_config_with_lifeos_server(tmp_path, monkeypatch)
     spawn_calls: list = []
     lines = _lines_for([_THREAD_EVENT, _TURN_COMPLETED, _SESSION_COMPLETED])
     store, executor = _build(tmp_path, monkeypatch, spawn_calls=spawn_calls, lines=lines)
@@ -148,8 +162,33 @@ def test_identity_env_vars_forwarded_via_mcp_env_vars_override(tmp_path, monkeyp
     assert outcome.status != STATUS_FAILED
     cmd = spawn_calls[0][0]
     override = _mcp_env_vars_override(cmd)
+    assert override is not None, f"no mcp_servers.lifeos.env_vars override found in {cmd}"
     parsed = tomllib.loads(override)
     assert parsed["mcp_servers"]["lifeos"]["env_vars"] == list(_IDENTITY_ENV_VARS)
+
+
+def test_no_mcp_env_vars_override_when_lifeos_server_not_configured(tmp_path, monkeypatch):
+    """The regression this guards: passing `-c mcp_servers.lifeos.env_vars=
+    [...]` when Codex's config has NO `[mcp_servers.lifeos]` server creates a
+    server entry with no `command`, which fails Codex's config loader
+    entirely ("invalid transport"). A fresh open-source install — which
+    today just runs context-blind and logs the executor's missing-MCP
+    warning — must keep working rather than hard-failing every `#codex`
+    task, so no override should be added when the block is absent."""
+    codex_home = tmp_path / "codex_home_empty"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))  # no config.toml at all
+    spawn_calls: list = []
+    lines = _lines_for([_THREAD_EVENT, _TURN_COMPLETED, _SESSION_COMPLETED])
+    store, executor = _build(tmp_path, monkeypatch, spawn_calls=spawn_calls, lines=lines)
+    session = store.create(task_id="t1", routing="codex")
+    outcome = executor.execute(session, {"description": "do the thing"})
+    assert outcome.status != STATUS_FAILED
+    cmd = spawn_calls[0][0]
+    assert _mcp_env_vars_override(cmd) is None, (
+        f"mcp_servers.lifeos.env_vars override present with no lifeos MCP "
+        f"server configured — this would crash a real codex spawn: {cmd}"
+    )
 
 
 def test_board_assigned_model_reaches_argv_via_set_assignment(tmp_path, monkeypatch):

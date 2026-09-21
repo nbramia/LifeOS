@@ -32,6 +32,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import tomllib
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -134,8 +135,10 @@ _CODEX_ENV_KEEP = {"CODEX_HOME"}
 # tools. Codex does not forward arbitrary parent env vars to a stdio MCP
 # server child — only names listed in that server's own `env_vars` config
 # key — so `_build_command` also passes these names via a `-c
-# mcp_servers.lifeos.env_vars=[...]` override, which works regardless of
-# what the operator's `[mcp_servers.lifeos]` block declares.
+# mcp_servers.lifeos.env_vars=[...]` override whenever the operator's Codex
+# config already declares an `[mcp_servers.lifeos]` server (see
+# `_lifeos_mcp_server_configured`); it's skipped otherwise, since overriding
+# `env_vars` on a server that doesn't exist breaks Codex's config loader.
 _IDENTITY_ENV_VARS = (
     "LIFEOS_AGENT_SESSION_ID",
     "LIFEOS_AGENT_ATTEMPT_ID",
@@ -323,15 +326,49 @@ class CodexExecutor:
         # Codex only forwards parent env vars named in a stdio MCP server's
         # own `env_vars` config key (see `_IDENTITY_ENV_VARS`) — this
         # override makes the identity vars `_clean_env` sets reach the
-        # lifeos MCP child without requiring an operator config edit.
-        common = [
-            "-c",
-            "mcp_servers.lifeos.env_vars=" + json.dumps(list(_IDENTITY_ENV_VARS)),
-            *common,
-        ]
+        # lifeos MCP child without requiring an operator config edit. Only
+        # add it when the operator's config actually declares an
+        # `[mcp_servers.lifeos]` server: overriding `env_vars` on a server
+        # that doesn't exist gives that key a bare `{env_vars: [...]}`
+        # table with no `command`, which fails Codex's config loader
+        # entirely ("invalid transport") — an install with no lifeos MCP
+        # server configured must keep working (context-blind, same as
+        # today) rather than hard-failing every `#codex` task.
+        if self._lifeos_mcp_server_configured():
+            common = [
+                "-c",
+                "mcp_servers.lifeos.env_vars=" + json.dumps(list(_IDENTITY_ENV_VARS)),
+                *common,
+            ]
         if resume_session_id:
             return [binary, "exec", "resume", resume_session_id, *common, prompt]
         return [binary, "exec", *common, prompt]
+
+    @staticmethod
+    def _codex_config_path() -> str:
+        """Path to the Codex CLI's own config file — `$CODEX_HOME/config.toml`
+        when set, else `~/.codex/config.toml`. Shared by
+        `_lifeos_mcp_server_configured` and `_warn_if_mcp_missing`."""
+        codex_home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+        return os.path.join(codex_home, "config.toml")
+
+    @classmethod
+    def _lifeos_mcp_server_configured(cls) -> bool:
+        """True when the Codex config declares an `[mcp_servers.lifeos]`
+        server. Parsed with `tomllib` (not a substring check) so the
+        `_build_command` gate is accurate: a false positive there would add
+        the `env_vars` override for a server Codex doesn't actually have,
+        which breaks config loading entirely (see `_build_command`).
+        Any read or parse failure reads as "not configured" — the
+        conservative default for that gate. Cheap per-spawn: the file is
+        small and read once per `_build_command` call.
+        """
+        try:
+            with open(cls._codex_config_path(), "rb") as f:
+                cfg = tomllib.load(f)
+        except (OSError, tomllib.TOMLDecodeError):
+            return False
+        return "lifeos" in (cfg.get("mcp_servers") or {})
 
     def _warn_if_mcp_missing(self) -> None:
         """Best-effort check that Codex has the lifeos MCP server configured.
@@ -348,19 +385,12 @@ class CodexExecutor:
         if self._mcp_warned:
             return
         self._mcp_warned = True
-        codex_home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
-        config_path = os.path.join(codex_home, "config.toml")
-        try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                contents = f.read()
-        except OSError:
-            contents = ""
-        if "[mcp_servers.lifeos]" not in contents:
+        if not self._lifeos_mcp_server_configured():
             logger.warning(
                 "Codex has no [mcp_servers.lifeos] in %s — the agent cannot reach "
                 "lifeos_* tools and will be blind to personal data. See "
                 "docs/guides/agent-worker-setup.md § Codex MCP setup.",
-                config_path,
+                self._codex_config_path(),
             )
 
     @staticmethod
