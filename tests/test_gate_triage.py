@@ -504,6 +504,35 @@ def test_run_triage_keeps_an_explicit_work_dir(tmp_path, monkeypatch):
     assert explicit.exists()
 
 
+def test_run_triage_removes_the_auto_created_work_dir_when_download_raises(monkeypatch):
+    """`run_triage()`'s docstring promises the auto-created work dir is
+    removed whether triage succeeds or raises. The success case is covered
+    by `test_run_triage_removes_the_auto_created_work_dir_after_running`,
+    and the only other error-path test
+    (`test_run_triage_refuses_when_no_verification_check_is_published`)
+    passes an explicit `--work-dir` and never exercises the auto-created
+    directory at all. This pins the raise path: with no `--work-dir`, a
+    failed lane-receipts download makes `_download_and_report` raise
+    `GateTriageError`, and the temp directory created for it must still be
+    gone afterward."""
+    monkeypatch.setattr(gt, "jev_configured", lambda: False)
+    captured: dict[str, Path] = {}
+
+    def download(args):
+        dest = Path(args[args.index("--dir") + 1])
+        captured.setdefault("work_dir", dest.parent)
+        dest.mkdir(parents=True, exist_ok=True)
+        return SimpleNamespace(returncode=1, stdout="", stderr="boom")
+
+    fake_run = _base_fake_run([], files=["api/main.py"], extra={"download": download})
+
+    with pytest.raises(gt.GateTriageError):
+        gt.run_triage(_args(work_dir=None), run=fake_run)
+
+    assert "work_dir" in captured
+    assert not captured["work_dir"].exists()
+
+
 # ---------------------------------------------------------------------------
 # App-id trust (security: check runs are only trusted from the dedicated App)
 # ---------------------------------------------------------------------------
