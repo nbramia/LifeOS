@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import json
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,7 @@ from api.services.agent_worker.codex_executor import (
     REASON_AWAITING_CLARIFICATION,
     REASON_BINARY_NOT_FOUND,
     REASON_KILLED,
+    _IDENTITY_ENV_VARS,
 )
 from api.services.agent_worker.executor_lifecycle import adapter_for
 from api.services.agent_worker.session_store import (
@@ -438,6 +440,52 @@ def test_resume_does_not_prepend_preamble(stores, tmp_path):
     assert "=== LIFEOS BRIEFING" not in prompt_arg
     assert prompt_arg == "and tomorrow?"
     assert "resume" in captured["cmd"]
+
+
+@pytest.mark.unit
+def test_resume_also_forwards_identity_env_vars_override(stores, tmp_path):
+    """The `-c mcp_servers.lifeos.env_vars=[...]` override (see
+    `codex_executor._IDENTITY_ENV_VARS`) that lets the LifeOS MCP server
+    attest the caller must reach Codex on `codex exec resume` too, not just
+    a fresh `codex exec` — both paths build their argv through the same
+    `_build_command`, so this proves that's still true for resume."""
+    sess_store, tr_store = stores
+    session = sess_store.create(
+        task_id="t_res2", session_id="sess_res2", status="claimed", routing="codex",
+        budget={"wall_seconds": 60, "max_tokens": 1000, "max_dollars": 1.0},
+        expected_output="text", origin="operator",
+    )
+    sess_store.set_claude_code_session_id("t_res2", "thread-abc")
+    session = sess_store.get_by_session_id("sess_res2")
+
+    captured: dict = {}
+
+    def fake_spawn(cmd, **kwargs):
+        captured["cmd"] = cmd
+        for i, tok in enumerate(cmd):
+            if tok == "-o" and i + 1 < len(cmd):
+                with open(cmd[i + 1], "w") as f:
+                    f.write("ok\n")
+        return _FakeProc([{"type": "session.completed"}], returncode=0)
+
+    executor = CodexExecutor(
+        session_store=sess_store, transcript_store=tr_store,
+        spawn_fn=fake_spawn, binary_resolver=lambda: "/usr/bin/true",
+        heartbeat_interval=9999,
+    )
+    executor.resume(session, "and tomorrow?", working_dir=str(tmp_path))
+
+    cmd = captured["cmd"]
+    override = None
+    for i, tok in enumerate(cmd):
+        if tok == "-c" and i + 1 < len(cmd) and cmd[i + 1].startswith(
+            "mcp_servers.lifeos.env_vars=",
+        ):
+            override = cmd[i + 1]
+            break
+    assert override is not None, f"no mcp_servers.lifeos.env_vars override found in {cmd}"
+    parsed = tomllib.loads(override)
+    assert parsed["mcp_servers"]["lifeos"]["env_vars"] == list(_IDENTITY_ENV_VARS)
 
 
 @pytest.mark.unit

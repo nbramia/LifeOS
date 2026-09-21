@@ -5,12 +5,13 @@ and the unknown-host failure path (no ssh call).
 from __future__ import annotations
 
 import json
+import tomllib
 from pathlib import Path
 from typing import Iterable
 
 import pytest
 
-from api.services.agent_worker.codex_executor import CodexExecutor
+from api.services.agent_worker.codex_executor import _IDENTITY_ENV_VARS, CodexExecutor
 from api.services.agent_worker.session_store import STATUS_FAILED, SessionStore
 from api.services.agent_worker.transcript_store import TranscriptStore
 
@@ -120,6 +121,35 @@ def test_model_and_effort_flags_in_argv(tmp_path, monkeypatch):
     assert "--model" in cmd and cmd[cmd.index("--model") + 1] == "gpt-5.5"
     assert "-c" in cmd
     assert "model_reasoning_effort=high" in cmd
+
+
+def _mcp_env_vars_override(cmd: list[str]) -> str:
+    """Locate the `-c mcp_servers.lifeos.env_vars=[...]` argv pair's value."""
+    for i, tok in enumerate(cmd):
+        if tok == "-c" and i + 1 < len(cmd) and cmd[i + 1].startswith(
+            "mcp_servers.lifeos.env_vars=",
+        ):
+            return cmd[i + 1]
+    raise AssertionError(f"no mcp_servers.lifeos.env_vars override found in {cmd}")
+
+
+def test_identity_env_vars_forwarded_via_mcp_env_vars_override(tmp_path, monkeypatch):
+    """Codex only forwards parent env vars listed in a stdio MCP server's own
+    `env_vars` config key, so without this `-c` override the standard
+    `[mcp_servers.lifeos]` block (command + args only) never sees
+    LIFEOS_AGENT_SESSION_ID/_ATTEMPT_ID/_TURN_ID and `lifeos_agent_*` tools
+    can't attest the caller. Assert the override is present, TOML-parseable,
+    and names exactly the three identity vars — for a fresh execute()."""
+    spawn_calls: list = []
+    lines = _lines_for([_THREAD_EVENT, _TURN_COMPLETED, _SESSION_COMPLETED])
+    store, executor = _build(tmp_path, monkeypatch, spawn_calls=spawn_calls, lines=lines)
+    session = store.create(task_id="t1", routing="codex")
+    outcome = executor.execute(session, {"description": "do the thing"})
+    assert outcome.status != STATUS_FAILED
+    cmd = spawn_calls[0][0]
+    override = _mcp_env_vars_override(cmd)
+    parsed = tomllib.loads(override)
+    assert parsed["mcp_servers"]["lifeos"]["env_vars"] == list(_IDENTITY_ENV_VARS)
 
 
 def test_board_assigned_model_reaches_argv_via_set_assignment(tmp_path, monkeypatch):
