@@ -114,6 +114,30 @@ branch, so a PR that edits the topology is gated by whatever topology `main`
 carries, and an edited topology's first real exercise is the first candidate
 built after that edit merges.
 
+## The cached test environment
+
+Each execution part restores its installed environment — a venv holding the
+CPU torch build and `requirements.txt`, plus Playwright's Chromium — from a
+cache keyed on the runner image, the interpreter version, `TORCH_CPU_VERSION`,
+the requirements hash, a schema version, and the ISO week. The week matters
+because most entries in `requirements.txt` are open ranges: a hit skips
+dependency resolution entirely, so a restored environment holds whatever
+those ranges resolved to when its key was first built, not what they would
+resolve to today. The weekly component bounds that staleness to at most one
+week; a release published mid-week is first exercised by the next week's
+build (or sooner by any change to `requirements.txt`). On a miss the install step builds
+it with `--only-binary=:all:` (no source distribution ever executes) and
+records a package fingerprint inside the venv; the save step runs immediately
+after, before any candidate code, and nowhere later. On a hit the install
+step activates the venv, installs Chromium's system packages (never cached),
+and fails unless the fingerprint of what was restored equals the one the miss
+path recorded for that key — a consistency check that the restored venv is
+the one this key built, not an integrity check against the requirements
+file. The torch identity assertions run on both paths.
+Caches written from a `pull_request_target` run are scoped to `main`, so
+every candidate with the same key shares one environment that only wheel
+installation has ever touched.
+
 ## Privacy-audit applicability
 
 `tests/test_fixtures_no_personal_data.py::test_no_fixture_contains_a_real_sensitive_value`
@@ -130,8 +154,43 @@ checkout/pre-push audit continues to run read-only whenever the `.env` exists.
 The publisher job is separate from candidate execution. It receives
 `checks: write`, does not check out candidate files or consume candidate
 artifacts, and reports the result for the event's exact candidate SHA. A
-missing, cancelled, or failed execution maps to a failed aggregate result; no
-docs-only path skips the aggregate job.
+missing, cancelled, or failed execution maps to a failed aggregate result.
+
+Success is an explicit outcome, never the absence of a job. Before any
+environment is built, the execution job classifies the changed set with
+`scripts/candidate_lanes.py` from the *runner's* checkout and records a
+verification mode as a job output:
+
+| Mode | When | What runs |
+|------|------|-----------|
+| `executed` | Any change outside the docs-only rule | `fast-unit`, plus `browser-free` when a `web/` file changed |
+| `docs-only` | Every changed file is `.md`/`.txt`/`.rst` or under `docs/`, and none is a dependency manifest | Nothing — no install, no lane |
+| `reused` | A dispatched run whose candidate tree equals its head's tree, and the head carries a passing shadow verdict from this same runner | Nothing — the shadow already executed the lanes |
+
+The docs-only rule is the one `scripts/test.sh`'s `decide_plan` applies to
+the local plan, and `tests/test_candidate_lanes.py` holds the two to the same
+answers. The publisher publishes success only when the execution job passed
+*and* recorded one of these modes, and its check summary names the mode. An
+unavailable changed set is classified `executed` with every retained lane.
+The changed set is the diff from the merge base when the checkout can
+compute one, so a branch behind the base is judged on its own changes; when
+it cannot, the two-commit diff stands in as a superset.
+
+Every check the publisher issues carries a structured record in its output
+text — `candidate`, `tree`, `trusted_runner`, `mode`, `lanes`, `conclusion`
+— alongside the summary line. The tree and lanes come from the runner's
+selection step, which runs before any candidate code; the runner commit is
+event data. A dispatched run reads the check runs on its candidate's second
+parent (the pull request head) with a read-only token and, through the
+runner's own `scripts/candidate_reuse.py`, reuses a
+`candidate-verification-shadow` verdict only when the App published it, its
+conclusion is `success`, its `trusted_runner` and `tree` equal the run's own,
+its `mode` is `executed`, and its `lanes` cover every lane the run selected.
+The check summary then names the reused check. Any mismatch, a missing
+App id, an unreachable head, or a malformed record executes the lanes as
+usual; a shadow run never reuses anything. Reuse only recognises
+verification this runner already performed on identical bytes, so a
+candidate that a rebase changed is verified afresh.
 
 GitHub's required-status-check matching identifies a `context` string and a
 reporting `app_id` — never which workflow file or run produced it. A

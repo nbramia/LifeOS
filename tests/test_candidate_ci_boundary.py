@@ -4,7 +4,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -58,9 +60,49 @@ def test_candidate_workflow_separates_untrusted_execution_from_status_publisher(
     assert 'git -C candidate cat-file commit "$CANDIDATE_SHA"' in workflow
     assert 'test "$FIRST_PARENT" = "$TRUSTED_RUNNER_SHA"' in workflow
     assert workflow.index("name: Bind dispatched runner") < workflow.index("name: Install the declared CPU test environment")
+
+    # Lane selection is a trusted decision taken before any environment is
+    # built: a docs-only candidate installs and executes nothing, and the
+    # publisher records that mode explicitly rather than inferring success
+    # from an absent job.
+    assert workflow.index("name: Bind dispatched runner") < workflow.index("name: Select the lanes") < workflow.index("actions/setup-python")
+    assert "python3 trusted-runner/scripts/candidate_lanes.py" in workflow
+    assert "verification_mode: ${{ steps.reuse.outputs.mode || steps.select.outputs.mode }}" in workflow
+    executed = "steps.select.outputs.mode == 'executed'"
+    for step in ("actions/setup-python", "name: Install the declared CPU test environment", "name: Verify the retained lanes"):
+        block = workflow[workflow.index(step):]
+        block = block[:block.index("\n      - ")]
+        assert executed in block, step
+    for step in ("name: Prove checkout identity", "name: Bind dispatched runner"):
+        block = workflow[workflow.index(step):]
+        block = block[:block.index("\n      - ")]
+        assert executed not in block, step
     assert "create-github-app-token" in workflow
     assert workflow.index("name: candidate-execution") < workflow.index("name: candidate-verification-publisher")
     publisher = workflow[workflow.index("name: candidate-verification-publisher"):]
+    assert "VERIFICATION_MODE: ${{ needs.execute-candidate.outputs.verification_mode }}" in publisher
+    assert "mode === 'docs-only'" in publisher
+    assert "process.env.RESULT === 'success' && explicit" in publisher
+
+    # A dispatched candidate may reuse its head's shadow verdict, but only via
+    # the runner's own decision script over App-published check data, read
+    # with a read-only token before any environment exists; the shadow run
+    # itself never reuses anything.
+    reuse = workflow[workflow.index("name: Reuse a passing shadow verification"):]
+    reuse = reuse[:reuse.index("\n      - ")]
+    assert "github.event_name == 'workflow_dispatch'" in reuse
+    assert "vars.LIFEOS_CANDIDATE_APP_ID != ''" in reuse
+    assert "python3 trusted-runner/scripts/candidate_reuse.py" in reuse
+    assert 'git -C candidate fetch --quiet --depth=1 origin "$HEAD_SHA"' in reuse
+    assert '[ "$(git -C candidate rev-parse "$HEAD_SHA^{tree}")" != "$TREE" ]' in reuse
+    assert workflow.index("name: Select the lanes") < workflow.index("name: Reuse a passing shadow verification") < workflow.index("actions/setup-python")
+    for step in ("actions/setup-python", "name: Install the declared CPU test environment", "name: Verify the retained lanes"):
+        block = workflow[workflow.index(step):]
+        block = block[:block.index("\n      - ")]
+        assert "steps.reuse.outputs.mode != 'reused'" in block, step
+    assert "mode === 'reused'" in publisher
+    assert "trusted_runner: process.env.TRUSTED_RUNNER_SHA" in publisher
+    assert "tree: process.env.VERIFICATION_TREE" in publisher
     assert "actions/checkout" not in publisher
     assert "--sha \"$CANDIDATE_SHA\"" in workflow
     assert "candidate-verification-${{ github.event.pull_request.number" in workflow
@@ -109,6 +151,8 @@ def test_candidate_workflow_pins_actions_and_proves_cpu_wheel_identity():
         "actions/setup-python": "a26af69be951a213d495a4c3e4e4022e16d87065",
         "actions/create-github-app-token": "5d869da34e18e7287c1daad50e0b8ea0f506ce69",
         "actions/github-script": "60a0d83039c74a4aee543508d2ffcb1c3799cdea",
+        "actions/cache/restore": "0057852bfaa89a56745cba8c7296529d2fc39830",
+        "actions/cache/save": "0057852bfaa89a56745cba8c7296529d2fc39830",
     }
     for action, sha in pinned_actions.items():
         assert f"{action}@{sha}" in workflow
@@ -120,6 +164,45 @@ def test_candidate_workflow_pins_actions_and_proves_cpu_wheel_identity():
     assert "requirements-without-torch" not in workflow
     assert 'assert torch.__version__ == os.environ["TORCH_CPU_VERSION"]' in workflow
     assert "torch.version.cuda is None and torch.version.hip is None" in workflow
+
+
+@pytest.mark.unit
+def test_candidate_workflow_caches_the_test_environment_only_from_wheel_installation():
+    """The cached environment is saved from the install step alone.
+
+    The verify step runs candidate code; a save placed after it would let a
+    candidate shape the environment every later run restores. So the save
+    sits between install and verify, only on a miss, keyed on exactly what
+    determines the environment; a hit still proves the torch identity and
+    the package fingerprint the miss path recorded, and the install stays
+    wheels-only.
+    """
+    workflow = (ROOT / ".github/workflows/candidate-verification.yml").read_text()
+    restore_at = workflow.index("name: Restore the installed CPU test environment")
+    install_at = workflow.index("name: Install the declared CPU test environment")
+    save_at = workflow.index("name: Save the installed CPU test environment")
+    verify_at = workflow.index("name: Verify the retained lanes")
+    assert restore_at < install_at < save_at < verify_at
+    assert "actions/cache/save" not in workflow[verify_at:]
+    assert "actions/cache" not in workflow[workflow.index("publish-aggregate:"):]
+    restore = workflow[restore_at:install_at]
+    assert "key: lifeos-test-env-v1-${{ runner.os }}-py${{ steps.python.outputs.python-version }}-torch${{ env.TORCH_CPU_VERSION }}-${{ hashFiles('candidate/requirements.txt') }}-${{ steps.cache-window.outputs.week }}" in restore
+    # Open requirement ranges resolve at build time, so the key carries the
+    # ISO week to bound how old a restored resolution can be.
+    window = workflow[workflow.index("name: Bound the cached environment's age"):restore_at]
+    assert 'echo "week=$(date -u +%G-W%V)" >> "$GITHUB_OUTPUT"' in window
+    save = workflow[save_at:verify_at]
+    assert "steps.env-cache.outputs.cache-hit != 'true'" in save
+    assert "key: ${{ steps.env-cache.outputs.cache-primary-key }}" in save
+    install = workflow[install_at:save_at]
+    assert 'if [ "$CACHE_HIT" != "true" ]; then' in install
+    assert "python -m playwright install-deps chromium" in install
+    assert 'test "$(python -m pip freeze --all | LC_ALL=C sort | sha256sum)" = "$(cat "$FINGERPRINT")"' in install
+    assert 'echo "$VENV/bin" >> "$GITHUB_PATH"' in install
+    assert "--no-binary" not in install
+    assert install.count("--only-binary=:all:") == 2
+    # The identity proof runs on both paths: it sits after the branch closes.
+    assert install.index("          fi\n") < install.index('assert torch.__version__ == os.environ["TORCH_CPU_VERSION"]')
 
 
 @pytest.mark.unit
@@ -384,36 +467,47 @@ def test_environment_audit_accepts_a_policy_naming_exactly_main():
 
 
 @pytest.mark.unit
-def test_candidate_workflow_lane_selection_defaults_to_every_lane_before_narrowing():
-    """Lane selection must fail closed.
+def test_candidate_workflow_lane_selection_is_the_trusted_runner_script():
+    """Lane selection is one trusted decision, taken before anything is built.
 
-    The gate skips the server-free browser lane only when the candidate's diff
-    touches no ``web/`` path. Every other outcome — an unavailable diff, an
-    empty diff, a fetch failure — has to run every retained lane, so the
-    default assignment precedes any narrowing and the narrowing sits inside a
-    guard that requires a successful, non-empty diff.
+    The step feeds the changed set to the runner's own ``candidate_lanes.py``
+    (whose fail-closed rules ``tests/test_candidate_lanes.py`` pins: an empty
+    or unavailable diff runs every retained lane, only a ``web/`` path keeps
+    the browser lane, and only the docs-only rule executes nothing) and the
+    verifier consumes exactly the lanes that script chose. The changed set
+    prefers the merge-base diff and falls back to the two-commit diff, so a
+    computation failure degrades to a superset rather than to nothing.
     """
     import yaml
 
     workflow = yaml.safe_load((ROOT / ".github/workflows/candidate-verification.yml").read_text())
     steps = workflow["jobs"]["execute-candidate"]["steps"]
     selection = next(s for s in steps if "Select the lanes" in (s.get("name") or ""))
+    assert selection["id"] == "select"
     script = selection["run"]
-
-    default_at = script.index("LANES=fast-unit,browser-free")
-    narrow_at = script.index("LANES=fast-unit\n")
-    assert default_at < narrow_at, "the every-lane default must precede any narrowing"
-
-    # The narrowing is reachable only through a successful, non-empty diff.
-    guard = script[:narrow_at]
-    assert "git -C candidate diff --name-only" in guard
-    assert '[ -n "$CHANGED" ]' in guard
-
-    # Anchored, so a path merely containing "web/" cannot suppress the lane.
-    assert "grep -q '^web/'" in script
+    assert 'git -C candidate fetch --no-tags --depth=1 origin "$TRUSTED_RUNNER_SHA"' in script
+    assert script.index("fetch --no-tags") < script.index("diff --name-only --merge-base")
+    assert '|| git -C candidate diff --name-only "$TRUSTED_RUNNER_SHA" "$CANDIDATE_SHA"' in script
+    assert "python3 trusted-runner/scripts/candidate_lanes.py" in script
+    assert "candidate/scripts" not in script
+    assert 'sed -n \'s/^lanes=/LANES=/p\'' in script
+    outputs = workflow["jobs"]["execute-candidate"]["outputs"]
+    assert outputs["verification_mode"] == "${{ steps.reuse.outputs.mode || steps.select.outputs.mode }}"
+    assert outputs["verification_tree"] == "${{ steps.select.outputs.tree }}"
+    assert outputs["verification_lanes"] == "${{ steps.select.outputs.lanes }}"
+    assert outputs["reused_check_id"] == "${{ steps.reuse.outputs.reused_check_id }}"
+    assert outputs["reused_candidate"] == "${{ steps.reuse.outputs.reused_candidate }}"
+    publisher = workflow["jobs"]["publish-aggregate"]
+    script_step = next(s for s in publisher["steps"] if "github-script" in (s.get("uses") or ""))
+    assert script_step["env"]["REUSED_CHECK_ID"] == "${{ needs.execute-candidate.outputs.reused_check_id }}"
+    assert script_step["env"]["REUSED_CANDIDATE"] == "${{ needs.execute-candidate.outputs.reused_candidate }}"
+    assert "process.env.REUSED_CHECK_ID" in script_step["with"]["script"]
+    assert "process.env.REUSED_CANDIDATE" in script_step["with"]["script"]
+    assert workflow["jobs"]["execute-candidate"]["permissions"] == {"contents": "read", "checks": "read"}
 
     verify = next(s for s in steps if "Verify the retained lanes" in (s.get("name") or ""))
     assert '--lanes "$LANES"' in verify["run"], "the verifier must consume the selected lanes"
+    assert verify["if"] == "${{ steps.select.outputs.mode == 'executed' && steps.reuse.outputs.mode != 'reused' }}"
 
 
 @pytest.mark.unit
@@ -425,7 +519,9 @@ def test_publisher_treats_every_non_success_execution_result_as_a_failed_check()
     every part succeeded. Everything else (a failure, a cancellation at the
     ceiling, a job that never started) has to publish failure, which
     requires the mapping to allow-list `success` rather than deny-list the
-    outcomes anyone happened to think of.
+    outcomes anyone happened to think of. Success additionally requires an
+    explicit verification mode, so a job that passed without ever reaching
+    its selection step cannot publish green.
     """
     import yaml
 
@@ -436,7 +532,8 @@ def test_publisher_treats_every_non_success_execution_result_as_a_failed_check()
     script = next(
         step for step in publisher["steps"] if "github-script" in (step.get("uses") or "")
     )["with"]["script"]
-    assert "process.env.RESULT === 'success' ? 'success' : 'failure'" in script
+    assert "process.env.RESULT === 'success' && explicit ? 'success' : 'failure'" in script
+    assert "const explicit = mode === 'executed' || mode === 'docs-only' || mode === 'reused'" in script
 
 
 @pytest.mark.unit
@@ -445,3 +542,134 @@ def test_lane_command_records_slowest_test_durations():
     source = (ROOT / "scripts/verify_candidate.py").read_text()
     assert '"--durations=25"' in source
     assert '"--durations-min=1.0"' in source
+
+
+
+def _lane_selection_step_run() -> str:
+    import yaml
+
+    workflow = yaml.safe_load((ROOT / ".github/workflows/candidate-verification.yml").read_text())
+    steps = workflow["jobs"]["execute-candidate"]["steps"]
+    return next(s for s in steps if "Select the lanes" in (s.get("name") or ""))["run"]
+
+
+def _git(repo, *args):
+    return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True).stdout.strip()
+
+
+def _two_shallow_checkouts(tmp_path, head_files: dict):
+    """An origin with a base commit and a head commit on top, cloned the way
+    the workflow does: `trusted-runner` at the base, `candidate` at the head,
+    each a separate depth-1 clone sharing no objects."""
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    _git(origin, "init", "-q", "-b", "base")
+    _git(origin, "config", "user.email", "ci@example.invalid")
+    _git(origin, "config", "user.name", "ci")
+    _git(origin, "config", "uploadpack.allowAnySHA1InWant", "true")
+    (origin / "README.md").write_text("base\n")
+    (origin / "api").mkdir()
+    (origin / "api" / "x.py").write_text("X = 1\n")
+    _git(origin, "add", "-A")
+    _git(origin, "commit", "-q", "-m", "base")
+    base_sha = _git(origin, "rev-parse", "HEAD")
+    _git(origin, "checkout", "-q", "-b", "main")
+    for rel, body in head_files.items():
+        path = origin / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body)
+    _git(origin, "add", "-A")
+    _git(origin, "commit", "-q", "-m", "head")
+    head_sha = _git(origin, "rev-parse", "HEAD")
+    work = tmp_path / "work"
+    work.mkdir()
+    subprocess.run(["git", "clone", "-q", "--depth=1", "--branch", "base", f"file://{origin}", str(work / "trusted-runner")], check=True)
+    subprocess.run(["git", "clone", "-q", "--depth=1", "--branch", "main", f"file://{origin}", str(work / "candidate")], check=True)
+    (work / "trusted-runner" / "scripts").mkdir()
+    shutil.copy(ROOT / "scripts" / "candidate_lanes.py", work / "trusted-runner" / "scripts" / "candidate_lanes.py")
+    return work, base_sha, head_sha
+
+
+def _run_lane_selection(tmp_path, head_files: dict) -> dict:
+    work, base_sha, head_sha = _two_shallow_checkouts(tmp_path, head_files)
+    runner_temp = tmp_path / "runner-temp"
+    runner_temp.mkdir()
+    output = tmp_path / "github-output"
+    output.touch()
+    env = {
+        **os.environ,
+        "PATH": f"{Path(sys.executable).parent}{os.pathsep}{os.environ.get('PATH', '')}",
+        "TRUSTED_RUNNER_SHA": base_sha, "CANDIDATE_SHA": head_sha,
+        "RUNNER_TEMP": str(runner_temp), "GITHUB_OUTPUT": str(output), "GITHUB_ENV": str(tmp_path / "github-env"),
+    }
+    result = subprocess.run(["bash", "-eo", "pipefail", "-c", _lane_selection_step_run()], cwd=work, env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    return dict(line.split("=", 1) for line in output.read_text().splitlines() if "=" in line)
+
+
+@pytest.mark.unit
+def test_lane_selection_step_sees_the_real_diff_across_two_shallow_checkouts(tmp_path):
+    """The step diffs two commits that live in different depth-1 clones, so it
+    must fetch the base into the candidate clone first; without that fetch
+    every run degrades to "changed set unavailable" and the docs-only and
+    web/ rules never fire."""
+    outputs = _run_lane_selection(tmp_path, {"docs/guide.md": "docs\n"})
+    assert outputs["mode"] == "docs-only"
+    assert outputs["lanes"] == ""
+    assert "unavailable" not in outputs["reason"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("head_files,lanes", [
+    ({"web/app.js": "1\n"}, "fast-unit,browser-free"),
+    ({"api/x.py": "X = 2\n"}, "fast-unit"),
+], ids=["web_change", "api_change"])
+def test_lane_selection_step_keeps_the_browser_lane_only_for_a_web_change(tmp_path, head_files, lanes):
+    outputs = _run_lane_selection(tmp_path, head_files)
+    assert (outputs["mode"], outputs["lanes"]) == ("executed", lanes)
+
+
+def _reuse_step_run() -> str:
+    import yaml
+
+    workflow = yaml.safe_load((ROOT / ".github/workflows/candidate-verification.yml").read_text())
+    steps = workflow["jobs"]["execute-candidate"]["steps"]
+    return next(s for s in steps if "Reuse a passing shadow verification" in (s.get("name") or ""))["run"]
+
+
+@pytest.mark.unit
+def test_reuse_step_reads_the_second_parent_from_commit_headers_not_the_message(tmp_path):
+    """The candidate is a two-parent commit whose message carries
+    candidate-authored text: its title line and closing references. The head the
+    reuse step fetches must come from the commit's header lines, so a message
+    line that happens to start with `parent <hex>` can never redirect it."""
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    _git(origin, "init", "-q", "-b", "main")
+    _git(origin, "config", "user.email", "ci@example.invalid")
+    _git(origin, "config", "user.name", "ci")
+    (origin / "a.txt").write_text("base\n")
+    _git(origin, "add", "-A")
+    _git(origin, "commit", "-q", "-m", "base")
+    base_sha = _git(origin, "rev-parse", "HEAD")
+    (origin / "a.txt").write_text("head\n")
+    _git(origin, "add", "-A")
+    _git(origin, "commit", "-q", "-m", "head")
+    head_sha = _git(origin, "rev-parse", "HEAD")
+    forged = "f" * 40
+    message = f"candidate\n\nparent {forged}\nparent {forged}\nCloses #1\n"
+    candidate_sha = subprocess.run(
+        ["git", "-C", str(origin), "commit-tree", f"{head_sha}^{{tree}}", "-p", base_sha, "-p", head_sha, "-m", message],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    work = tmp_path / "work"
+    (work / "candidate").mkdir(parents=True)
+    shutil.copytree(origin / ".git", work / "candidate" / ".git")
+    extraction = _reuse_step_run().split("\n")[0]
+    assert extraction.startswith('HEAD_SHA="$(git -C candidate cat-file commit "$CANDIDATE_SHA"')
+    result = subprocess.run(
+        ["bash", "-e", "-c", extraction + '\nprintf %s "$HEAD_SHA"'], cwd=work,
+        env={**os.environ, "CANDIDATE_SHA": candidate_sha}, capture_output=True, text=True, check=True,
+    )
+    assert result.stdout == head_sha
+    assert forged not in result.stdout
