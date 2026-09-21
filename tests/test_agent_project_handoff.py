@@ -38,7 +38,7 @@ from api.services.agent_worker.session_store import (
 )
 from api.services.agent_worker.transcript_store import TranscriptStore
 from api.services.agent_worker.spend_tracker import SpendTracker
-from api.services.agent_worker.worker import Worker
+from api.services.agent_worker.worker import PROJECT_HANDOFF_RETURN_PENDING_EVENT, Worker
 from api.services.task_manager import TaskManager
 from api.services.task_projects import (
     HANDOFF_OPERATION_FIELD,
@@ -700,6 +700,367 @@ def test_worker_post_return_boundary_attests_and_calls_narrow_finalizer(tmp_path
         for event in transcripts.read(session.session_id)
     )
     assert store.list_all_card_outcomes() == {}
+
+
+def _stale_view_worker(
+    tmp_path: Path,
+    manager: TaskManager,
+    store: SessionStore,
+    transcripts: TranscriptStore,
+    service: ProjectTaskService,
+    source_task_id: str,
+    stale_snapshot: dict,
+    fresh: dict,
+) -> tuple[Worker, list[dict]]:
+    """A worker whose GET of `source_task_id` serves a stale snapshot until
+    `fresh["enabled"]` is set — modeling the file-watcher debounce window
+    between the MCP server's handoff-staging write and the API's task index
+    picking it up."""
+    finalizers: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/tasks":
+            tasks = [
+                payload
+                for task in manager.list_tasks()
+                if (payload := _task_payload(manager, task.id)) is not None
+            ]
+            return httpx.Response(200, json={"tasks": tasks, "total": len(tasks)})
+        if request.method == "GET" and request.url.path == f"/api/tasks/{source_task_id}":
+            if not fresh["enabled"]:
+                return httpx.Response(200, json=stale_snapshot)
+            payload = _task_payload(manager, source_task_id)
+            return httpx.Response(200, json=payload) if payload else httpx.Response(404)
+        if request.method == "GET" and request.url.path.startswith("/api/tasks/"):
+            task_id = request.url.path.rsplit("/", 1)[-1]
+            payload = _task_payload(manager, task_id)
+            return httpx.Response(200, json=payload) if payload else httpx.Response(404)
+        if request.method == "POST" and request.url.path.endswith(
+            "/project/handoff/finalize"
+        ):
+            task_id = request.url.path.split("/api/tasks/", 1)[1].split("/", 1)[0]
+            body = json.loads(request.content)
+            finalizers.append(body)
+            try:
+                result = service.finalize_handoff(task_id, **body)
+            except ProjectHandoffError as exc:
+                return httpx.Response(
+                    409,
+                    json={"detail": {"code": exc.code, "message": str(exc)}},
+                )
+            return httpx.Response(200, json=result)
+        return httpx.Response(404)
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(handler), base_url="http://synthetic-api",
+    )
+    return Worker(
+        api_base="http://synthetic-api",
+        session_store=store,
+        transcript_store=transcripts,
+        spend_tracker=SpendTracker(
+            db_path=tmp_path / "worker-spend.db", daily_cap_dollars=100,
+        ),
+        http_client=client,
+    ), finalizers
+
+
+def test_worker_stale_return_then_reconcile_finalizes_once_view_catches_up(
+    handoff, tmp_path: Path,
+):
+    """A turn that returns before the task view shows the handoff retries via
+    reconciliation once the view is fresh, instead of losing the handoff."""
+    manager, store, transcripts, source, ctx = handoff
+    stale_snapshot = _task_payload(manager, source.task_id)
+    staged = dispatch(ctx, "lifeos_agent_project_handoff", _request())
+    service = ProjectTaskService(manager, store, transcripts)
+    fresh = {"enabled": False}
+    worker, finalizers = _stale_view_worker(
+        tmp_path, manager, store, transcripts, service,
+        source.task_id, stale_snapshot, fresh,
+    )
+    outcome = ExecutorOutcome(
+        status=STATUS_COMPLETED,
+        session_id=source.session_id,
+        attempt_id=source.attempt_id,
+        turn_id=source.turn_id,
+        executor="local",
+    )
+
+    assert worker._maybe_finalize_project_handoff(store.get(source.task_id), outcome) is True
+
+    assert finalizers == []
+    assert store.get(source.task_id).status == STATUS_RUNNING
+    pending = [
+        event for event in transcripts.read(source.session_id)
+        if event["kind"] == PROJECT_HANDOFF_RETURN_PENDING_EVENT
+        and event["payload"].get("operation_id") == staged["operation_id"]
+        and event["payload"].get("attempt_id") == source.attempt_id
+        and event["payload"].get("turn_id") == source.turn_id
+    ]
+    assert len(pending) == 1
+    assert not any(
+        event["kind"] == HANDOFF_QUIESCENT_EVENT
+        for event in transcripts.read(source.session_id)
+    )
+
+    # A repeat stale return for the exact same turn must not duplicate the event.
+    assert worker._maybe_finalize_project_handoff(store.get(source.task_id), outcome) is True
+    assert len([
+        event for event in transcripts.read(source.session_id)
+        if event["kind"] == PROJECT_HANDOFF_RETURN_PENDING_EVENT
+    ]) == 1
+
+    fresh["enabled"] = True
+    worker._reconcile_project_handoffs()
+
+    assert any(
+        event["kind"] == HANDOFF_QUIESCENT_EVENT
+        and event["payload"].get("operation_id") == staged["operation_id"]
+        and event["payload"].get("attempt_id") == source.attempt_id
+        and event["payload"].get("turn_id") == source.turn_id
+        for event in transcripts.read(source.session_id)
+    )
+    assert store.get(source.task_id).status == STATUS_COMPLETED
+    assert finalizers == [{
+        "operation_id": staged["operation_id"],
+        "source_session_id": source.session_id,
+        "source_attempt_id": source.attempt_id,
+        "source_turn_id": source.turn_id,
+    }]
+    assert HANDOFF_OPERATION_FIELD not in manager.get(source.task_id).fields
+    assert all(
+        manager.can_start_execution(child.id)
+        for child in build_task_hierarchy(manager.list_tasks()).children(source.task_id)
+    )
+
+
+def test_worker_stale_return_then_cancellation_keeps_reconciliation_fenced(
+    handoff, tmp_path: Path,
+):
+    """Cancelling the exact turn after a stale return still blocks reconciliation
+    from completing the source or releasing children."""
+    manager, store, transcripts, source, ctx = handoff
+    stale_snapshot = _task_payload(manager, source.task_id)
+    staged = dispatch(ctx, "lifeos_agent_project_handoff", _request())
+    service = ProjectTaskService(manager, store, transcripts)
+    fresh = {"enabled": False}
+    worker, finalizers = _stale_view_worker(
+        tmp_path, manager, store, transcripts, service,
+        source.task_id, stale_snapshot, fresh,
+    )
+    outcome = ExecutorOutcome(
+        status=STATUS_COMPLETED,
+        session_id=source.session_id,
+        attempt_id=source.attempt_id,
+        turn_id=source.turn_id,
+        executor="local",
+    )
+    assert worker._maybe_finalize_project_handoff(store.get(source.task_id), outcome) is True
+    assert any(
+        event["kind"] == PROJECT_HANDOFF_RETURN_PENDING_EVENT
+        for event in transcripts.read(source.session_id)
+    )
+
+    with store._connect() as conn:
+        conn.execute(
+            "INSERT INTO cancellation_guards "
+            "(session_id, task_id, attempt_id, turn_id, reason, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                source.session_id,
+                source.task_id,
+                source.attempt_id,
+                source.turn_id,
+                "synthetic post-return cancellation",
+                int(datetime.now(timezone.utc).timestamp()),
+            ),
+        )
+    assert store.is_cancelled(source.task_id, source.attempt_id, source.turn_id)
+
+    fresh["enabled"] = True
+    worker._reconcile_project_handoffs()
+
+    assert finalizers == []
+    assert store.get(source.task_id).status == STATUS_RUNNING
+    assert manager.get(source.task_id).fields[HANDOFF_OPERATION_FIELD] == (
+        staged["operation_id"]
+    )
+    assert all(
+        not manager.can_start_execution(child.id)
+        for child in build_task_hierarchy(manager.list_tasks()).children(source.task_id)
+    )
+
+
+@pytest.mark.asyncio
+async def test_hermes_stale_return_without_done_seen_records_no_return_pending(
+    tmp_path: Path, monkeypatch,
+):
+    """Hermes stop evidence is required before a stale return is even attested;
+    without it, reconciliation has nothing to retry."""
+    from api.routes import hermes_proxy
+    from api.services.conversation_store import ConversationStore
+    from api.services.usage_store import UsageStore
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "hermes_backend_url", "http://hermes.example")
+    monkeypatch.setattr(settings, "hermes_backend_token", "synthetic-backend-token")
+    monkeypatch.setattr(settings, "mcp_bearer_token", "synthetic-turn-secret")
+    monkeypatch.setattr(settings, "claude_timeout_seconds", 3600)
+    conversations = ConversationStore(db_path=str(tmp_path / "conversations.db"))
+    usage = UsageStore(db_path=str(tmp_path / "usage.db"))
+    monkeypatch.setattr(hermes_proxy, "get_store", lambda: conversations)
+    monkeypatch.setattr(hermes_proxy, "get_usage_store", lambda: usage)
+    monkeypatch.setattr(hermes_proxy, "schedule_retitle", lambda _conversation_id: None)
+
+    store = SessionStore(tmp_path / "hermes-sessions.db")
+    transcripts = TranscriptStore(tmp_path / "hermes-transcripts")
+    manager = TaskManager(
+        vault_path=tmp_path / "hermes-vault",
+        index_path=tmp_path / "hermes-index" / "tasks.json",
+        live_session_checker=lambda *_args: False,
+    )
+    parent = manager.create(
+        "Coordinate the synthetic Hermes launch",
+        status="in_progress",
+        tags=["hermes", "agent-running"],
+    )
+    source = store.create(
+        parent.id,
+        status=STATUS_CLAIMED,
+        routing="hermes",
+        execution_spec=_spec("hermes"),
+    )
+    upstream = _HandoffHermesStream("disconnect")
+    executor = HermesExecutor(
+        session_store=store,
+        transcript_store=transcripts,
+        http_client_factory=lambda: _HandoffHermesClient(upstream),
+    )
+    outcomes: list[ExecutorOutcome] = []
+    executor_thread = threading.Thread(
+        target=lambda: outcomes.append(
+            executor.execute(
+                source,
+                {"description": "Coordinate synthetic Hermes work"},
+            )
+        ),
+        daemon=True,
+    )
+    executor_thread.start()
+    assert upstream.opened.wait(5)
+    running = store.get(parent.id)
+    context = InterAgentContext(
+        store,
+        transcripts,
+        running.session_id,
+        Caps(),
+        caller_attempt_id=running.attempt_id,
+        caller_turn_id=running.turn_id,
+        task_manager=manager,
+    )
+    staged = dispatch(context, "lifeos_agent_project_handoff", _request())
+    assert staged["ok"] is True
+    stale_snapshot = {
+        "id": parent.id,
+        "description": parent.description,
+        "status": "in_progress",
+        "tags": list(parent.tags),
+        "fields": {},
+    }
+    upstream.released.set()
+    executor_thread.join(5)
+    assert outcomes, "Hermes executor did not return"
+    outcome = outcomes[0]
+    assert outcome.termination_evidence.get("done_seen") is False
+    service = ProjectTaskService(manager, store, transcripts)
+    fresh = {"enabled": False}
+    worker, finalizers = _stale_view_worker(
+        tmp_path, manager, store, transcripts, service,
+        parent.id, stale_snapshot, fresh,
+    )
+    refreshed = store.get(parent.id)
+    normalized = normalize_outcome(
+        outcome, refreshed, route="hermes", transcript_store=transcripts,
+    )
+
+    # The stale view's mismatched fields would normally earn a return-pending
+    # attestation, but Hermes without a real `done` event has no positive
+    # stop evidence, so nothing is recorded and no POST is attempted.
+    assert worker._maybe_finalize_project_handoff(refreshed, normalized) is True
+
+    assert finalizers == []
+    assert not any(
+        event["kind"] == PROJECT_HANDOFF_RETURN_PENDING_EVENT
+        for event in transcripts.read(running.session_id)
+    )
+
+    # The Hermes executor already terminalized the source session on its own
+    # (independent of the handoff), so reconciliation takes the ordinary
+    # terminal-source path here rather than the return-pending retry path —
+    # and the server rejects it because no quiescence proof was ever
+    # recorded above, leaving the handoff fenced.
+    fresh["enabled"] = True
+    worker._reconcile_project_handoffs()
+
+    assert not any(
+        event["kind"] == HANDOFF_QUIESCENT_EVENT
+        for event in transcripts.read(running.session_id)
+    )
+    assert manager.get(parent.id).fields.get(HANDOFF_OPERATION_FIELD) == (
+        staged["operation_id"]
+    )
+    assert all(
+        not manager.can_start_execution(child.id)
+        for child in build_task_hierarchy(manager.list_tasks()).children(parent.id)
+    )
+
+
+def test_reconcile_does_not_retry_a_newer_turn_over_a_stale_return_pending_event(
+    handoff, tmp_path: Path,
+):
+    """A return-pending event stamped with an old turn must not be re-attempted
+    once the session has advanced to a newer turn under the same handoff."""
+    manager, store, transcripts, source, ctx = handoff
+    stale_snapshot = _task_payload(manager, source.task_id)
+    staged = dispatch(ctx, "lifeos_agent_project_handoff", _request())
+    service = ProjectTaskService(manager, store, transcripts)
+    fresh = {"enabled": False}
+    worker, finalizers = _stale_view_worker(
+        tmp_path, manager, store, transcripts, service,
+        source.task_id, stale_snapshot, fresh,
+    )
+    outcome = ExecutorOutcome(
+        status=STATUS_COMPLETED,
+        session_id=source.session_id,
+        attempt_id=source.attempt_id,
+        turn_id=source.turn_id,
+        executor="local",
+    )
+    assert worker._maybe_finalize_project_handoff(store.get(source.task_id), outcome) is True
+    assert any(
+        event["kind"] == PROJECT_HANDOFF_RETURN_PENDING_EVENT
+        for event in transcripts.read(source.session_id)
+    )
+
+    # The session moves on to a newer turn under the same attempt — the
+    # stale return-pending event above still names the old turn.
+    advanced = store.begin_executor_turn(
+        source.task_id, "execute", session=store.get(source.task_id),
+    )
+    assert advanced.turn_id != source.turn_id
+
+    fresh["enabled"] = True
+    worker._reconcile_project_handoffs()
+
+    assert finalizers == []
+    assert not any(
+        event["kind"] == HANDOFF_QUIESCENT_EVENT
+        for event in transcripts.read(source.session_id)
+    )
+    assert manager.get(source.task_id).fields[HANDOFF_OPERATION_FIELD] == (
+        staged["operation_id"]
+    )
 
 
 def test_finalize_route_rechecks_exact_source_identity(handoff, monkeypatch):

@@ -196,6 +196,13 @@ _RESOURCE_CLEANUP_BATCH_SIZE = 10
 _WORKTREE_RECENT_SECONDS = 24 * 60 * 60
 _TASK_FETCH_FAILED = object()
 
+# Recorded by _maybe_finalize_project_handoff when an executor turn returns
+# with valid stop evidence but the task view fetched over HTTP has not yet
+# picked up the handoff fields staged by another process (MCP server write +
+# file-watcher debounce). _reconcile_project_handoffs looks for this event to
+# retry finalization once the task view catches up.
+PROJECT_HANDOFF_RETURN_PENDING_EVENT = "project_handoff_return_pending"
+
 # A recurring (cron) schedule stamps its handed-off #agent task with a
 # `sched-<id>` tag (see scheduler_store._hand_off_to_agent). The worker reads
 # it on completion to append every fire's output to one shared note per
@@ -6356,6 +6363,33 @@ class Worker:
             or fields.get(HANDOFF_SOURCE_ATTEMPT_FIELD) != attempt_id
             or fields.get(HANDOFF_SOURCE_TURN_FIELD) != turn_id
         ):
+            # The task view fetched here (an index rebuilt by another process
+            # on a debounce) may simply be stale — the MCP server's staging
+            # write hasn't landed in it yet. Record that this exact turn
+            # returned with satisfied stop evidence so reconciliation can
+            # retry once the view catches up; don't project quiescence or
+            # completion from a view that doesn't yet show this handoff.
+            termination_evidence = getattr(outcome, "termination_evidence", {}) or {}
+            stop_evidence_satisfied = (
+                session.routing != ROUTE_HERMES
+                or termination_evidence.get("done_seen") is True
+            )
+            if stop_evidence_satisfied and not any(
+                event.get("kind") == PROJECT_HANDOFF_RETURN_PENDING_EVENT
+                and (event.get("payload") or {}).get("operation_id") == operation_id
+                and (event.get("payload") or {}).get("attempt_id") == attempt_id
+                and (event.get("payload") or {}).get("turn_id") == turn_id
+                for event in events
+            ):
+                self.transcript_store.append(
+                    session.session_id, PROJECT_HANDOFF_RETURN_PENDING_EVENT, {
+                        "operation_id": operation_id,
+                        "attempt_id": attempt_id,
+                        "turn_id": turn_id,
+                        "executor": getattr(outcome, "executor", None) or session.routing,
+                        "termination_evidence": termination_evidence,
+                    },
+                )
             return True
         if (
             session.routing == ROUTE_HERMES
@@ -6425,10 +6459,43 @@ class Worker:
             source_attempt_id = fields.get(HANDOFF_SOURCE_ATTEMPT_FIELD)
             source_turn_id = fields.get(HANDOFF_SOURCE_TURN_FIELD)
             source = self.session_store.get_by_session_id(source_session_id or "")
-            if (
-                source is None or source.status not in TERMINAL_STATUSES
-                or not source_attempt_id or not source_turn_id
-            ):
+            if source is None or not source_attempt_id or not source_turn_id:
+                continue
+            if source.status not in TERMINAL_STATUSES:
+                # A still-running source can't be finalized directly, but an
+                # exact turn that already returned with satisfied stop
+                # evidence (recorded as a return-pending event because the
+                # task view hadn't caught up yet) is safe to re-attempt now
+                # that this call sees a fresh view.
+                if (
+                    source.attempt_id != source_attempt_id
+                    or source.turn_id != source_turn_id
+                ):
+                    continue
+                try:
+                    source_events = self.transcript_store.read(source.session_id)
+                except Exception as exc:
+                    logger.warning(
+                        "handoff return-pending read failed for %s: %s",
+                        source.session_id, exc,
+                    )
+                    continue
+                pending = next((
+                    event.get("payload") or {}
+                    for event in reversed(source_events)
+                    if event.get("kind") == PROJECT_HANDOFF_RETURN_PENDING_EVENT
+                    and (event.get("payload") or {}).get("operation_id") == operation_id
+                    and (event.get("payload") or {}).get("attempt_id") == source_attempt_id
+                    and (event.get("payload") or {}).get("turn_id") == source_turn_id
+                ), None)
+                if pending is None:
+                    continue
+                self._maybe_finalize_project_handoff(source, SimpleNamespace(
+                    attempt_id=source_attempt_id,
+                    turn_id=source_turn_id,
+                    executor=pending.get("executor"),
+                    termination_evidence=pending.get("termination_evidence") or {},
+                ))
                 continue
             try:
                 response = self._http.post(
