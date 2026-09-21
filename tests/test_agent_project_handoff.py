@@ -2114,6 +2114,180 @@ def test_resume_pending_does_not_rearm_a_newer_turn_over_stale_handoff_identity(
     assert "agent-running" in parent.tags
 
 
+def test_resume_pending_recovers_a_restart_inside_the_stale_view_window(
+    handoff, tmp_path: Path, monkeypatch,
+):
+    """A restart landing inside the task-view debounce window must not roll
+    the handoff source back to FAILED: the bounded re-fetch in restart
+    recovery must see the view catch up and finalize normally."""
+    from api.services.agent_worker import worker as worker_module
+
+    manager, store, transcripts, source, ctx = handoff
+    staged = dispatch(ctx, "lifeos_agent_project_handoff", _request())
+    service = ProjectTaskService(manager, store, transcripts)
+    parent_before = manager.get(source.task_id)
+    stale_snapshot = {
+        "id": source.task_id,
+        "description": parent_before.description,
+        "status": "in_progress",
+        "tags": list(parent_before.tags),
+        "fields": {},
+    }
+
+    # A prior process already returned this exact turn while the view was
+    # stale — recording quiescence + return-pending proof and leaving the
+    # source RUNNING, as `_maybe_finalize_project_handoff` does.
+    fresh = {"enabled": False}
+    stale_worker, _ = _stale_view_worker(
+        tmp_path, manager, store, transcripts, service,
+        source.task_id, stale_snapshot, fresh,
+    )
+    outcome = ExecutorOutcome(
+        status=STATUS_COMPLETED,
+        session_id=source.session_id,
+        attempt_id=source.attempt_id,
+        turn_id=source.turn_id,
+        executor="local",
+    )
+    assert stale_worker._maybe_finalize_project_handoff(
+        store.get(source.task_id), outcome,
+    ) is True
+    assert store.get(source.task_id).status == STATUS_RUNNING
+
+    # A new Worker process (the restart) whose task view for this source is
+    # still stale on the first calls, then catches up partway through the
+    # bounded re-fetch — modeling the file-watcher debounce resolving mid-wait.
+    calls = {"n": 0}
+    fresh_after = 3
+    finalizers: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/tasks":
+            tasks = [
+                payload
+                for task in manager.list_tasks()
+                if (payload := _task_payload(manager, task.id)) is not None
+            ]
+            return httpx.Response(200, json={"tasks": tasks, "total": len(tasks)})
+        if request.method == "GET" and request.url.path == f"/api/tasks/{source.task_id}":
+            calls["n"] += 1
+            if calls["n"] <= fresh_after:
+                return httpx.Response(200, json=stale_snapshot)
+            payload = _task_payload(manager, source.task_id)
+            return httpx.Response(200, json=payload) if payload else httpx.Response(404)
+        if request.method == "GET" and request.url.path.startswith("/api/tasks/"):
+            task_id = request.url.path.rsplit("/", 1)[-1]
+            payload = _task_payload(manager, task_id)
+            return httpx.Response(200, json=payload) if payload else httpx.Response(404)
+        if request.method == "POST" and request.url.path.endswith(
+            "/project/handoff/finalize"
+        ):
+            task_id = request.url.path.split("/api/tasks/", 1)[1].split("/", 1)[0]
+            body = json.loads(request.content)
+            finalizers.append(body)
+            try:
+                result = service.finalize_handoff(task_id, **body)
+            except ProjectHandoffError as exc:
+                return httpx.Response(
+                    409,
+                    json={"detail": {"code": exc.code, "message": str(exc)}},
+                )
+            return httpx.Response(200, json=result)
+        return httpx.Response(404)
+
+    client = httpx.Client(
+        transport=httpx.MockTransport(handler), base_url="http://synthetic-api",
+    )
+    restarted = Worker(
+        api_base="http://synthetic-api",
+        session_store=store,
+        transcript_store=transcripts,
+        spend_tracker=SpendTracker(
+            db_path=tmp_path / "restart-spend.db", daily_cap_dollars=100,
+        ),
+        http_client=client,
+    )
+    notices: list[str] = []
+    monkeypatch.setattr(restarted, "_notify", lambda text, bot=None: notices.append(text))
+    monkeypatch.setattr(worker_module, "_HANDOFF_RECOVERY_STALE_VIEW_ATTEMPTS", 5)
+    monkeypatch.setattr(worker_module, "_HANDOFF_RECOVERY_STALE_VIEW_RETRY_DELAY_S", 0)
+
+    recovered = restarted.resume_pending()
+
+    assert recovered == 0
+    assert calls["n"] > fresh_after, "the fix must retry past the stale view"
+    current = store.get(source.task_id)
+    assert current.status == STATUS_COMPLETED
+    assert finalizers == [{
+        "operation_id": staged["operation_id"],
+        "source_session_id": source.session_id,
+        "source_attempt_id": source.attempt_id,
+        "source_turn_id": source.turn_id,
+    }]
+    parent = manager.get(source.task_id)
+    assert HANDOFF_OPERATION_FIELD not in parent.fields
+    assert parent.fields[LAST_HANDOFF_OPERATION_FIELD] == staged["operation_id"]
+    assert parent.status != "todo"
+    assert not any(
+        event["kind"] == "resume_failed" for event in transcripts.read(source.session_id)
+    )
+    assert not any("could not be safely resumed" in notice for notice in notices)
+
+
+def test_resume_pending_skips_the_stale_view_wait_without_a_request_event(
+    tmp_path: Path, monkeypatch,
+):
+    """An ordinary crashed session — no handoff ever staged for its turn —
+    takes the existing orphan rollback immediately; the stale-view wait added
+    for handoff restart recovery must never trigger for it."""
+    store = SessionStore(tmp_path / "ordinary-sessions.db")
+    transcripts = TranscriptStore(tmp_path / "ordinary-transcripts")
+    manager = TaskManager(
+        vault_path=tmp_path / "ordinary-vault",
+        index_path=tmp_path / "ordinary-index" / "tasks.json",
+        live_session_checker=lambda *_args: False,
+    )
+    task = manager.create(
+        "Synthetic ordinary task", status="in_progress", tags=["local", "agent-running"],
+    )
+    session = store.create(
+        task.id, status=STATUS_CLAIMED, routing="local", execution_spec=_spec(),
+    )
+    session = store.begin_executor_turn(task.id, "execute", session=session)
+    assert store.mark_executor_turn_running(task.id, session.attempt_id, session.turn_id)
+
+    worker, finalizers = _handoff_worker(
+        tmp_path, manager, store, transcripts, ProjectTaskService(manager, store, transcripts),
+    )
+    notices: list[str] = []
+    monkeypatch.setattr(worker, "_notify", lambda text, bot=None: notices.append(text))
+    fetch_calls = {"n": 0}
+    original_fetch_task = worker._fetch_task
+
+    def counting_fetch_task(task_id, **kwargs):
+        fetch_calls["n"] += 1
+        return original_fetch_task(task_id, **kwargs)
+
+    monkeypatch.setattr(worker, "_fetch_task", counting_fetch_task)
+
+    started = time.monotonic()
+    recovered = worker.resume_pending()
+    elapsed = time.monotonic() - started
+
+    # No retry loop was entered: the fetch count matches the ordinary
+    # orphan-rollback path exactly (one in `_recover_project_handoff_session`,
+    # two inside the FAILED-status projection, one for the rollback's task
+    # snapshot) — never the extra fetches a stale-view wait would add.
+    assert fetch_calls["n"] == 4
+    assert elapsed < 1.0
+    assert recovered == 1
+    assert finalizers == []
+    current = store.get(task.id)
+    assert current.status == STATUS_FAILED
+    assert transcripts.read(session.session_id)[-1]["kind"] == "resume_failed"
+    assert any("could not be safely resumed" in notice for notice in notices)
+
+
 def test_remove_tag_returns_conflict_for_handoff_fences_and_allows_ordinary_task(
     handoff, monkeypatch,
 ):

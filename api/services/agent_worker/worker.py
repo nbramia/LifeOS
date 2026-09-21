@@ -186,6 +186,16 @@ _INLINE_SUMMARY_MAX_CHARS = 2000
 _BLOCKED_PROMPT_SEND_ATTEMPTS = 3
 _BLOCKED_PROMPT_RETRY_DELAY_S = 0.5
 
+# A restart landing inside the task-view debounce window (the API's task
+# index picks up the MCP server's handoff-staging write only after a
+# file-watcher debounce) must not mistake a fenced handoff source for an
+# ordinary orphan. `_recover_project_handoff_session` re-fetches the task
+# this many times, sleeping between attempts, before giving up — bounded to
+# roughly cover the debounce plus rebuild. The delay is a module constant
+# so tests can zero it out.
+_HANDOFF_RECOVERY_STALE_VIEW_ATTEMPTS = 6
+_HANDOFF_RECOVERY_STALE_VIEW_RETRY_DELAY_S = 1.0
+
 # Answered-question claims use the existing `processed` integer as a small
 # durable lease: 0 = queued, 2 = claimed, 1 = conclusively handled. SessionStore
 # releases only claims inherited at process start; live claims are cleaned up by
@@ -6548,11 +6558,45 @@ class Worker:
                 logger.warning("handoff reconciliation failed for %s: %s", task_id, exc)
         return finalized
 
+    def _session_staged_this_turns_handoff(self, session: Session) -> bool:
+        """True when this exact attempt/turn's transcript has a handoff
+        request event — signalling that a missing HANDOFF_OPERATION_FIELD on
+        the fetched task may be a stale view rather than proof no handoff
+        was staged."""
+        try:
+            events = self.transcript_store.read(session.session_id)
+        except Exception as exc:
+            logger.warning(
+                "handoff recovery transcript read failed for %s: %s",
+                session.session_id, exc,
+            )
+            return False
+        return any(
+            event.get("kind") == HANDOFF_REQUEST_EVENT
+            and (event.get("payload") or {}).get("source_attempt_id") == session.attempt_id
+            and (event.get("payload") or {}).get("source_turn_id") == session.turn_id
+            for event in events
+        )
+
     def _recover_project_handoff_session(self, session: Session) -> bool:
         """Keep staged handoffs fenced until this restart proves source quiescence."""
         task = self._fetch_task(session.task_id)
         fields = (task or {}).get("fields") or {}
         operation_id = fields.get(HANDOFF_OPERATION_FIELD)
+        if not operation_id and self._session_staged_this_turns_handoff(session):
+            # The task view fetched here (an index rebuilt by another process
+            # on a debounce) may simply be stale rather than showing that no
+            # handoff was ever staged: this exact turn's own transcript has
+            # the request event, so the MCP server's staging write may not
+            # have landed in the view yet. Re-fetch with bounded retries
+            # instead of falling through to the ordinary orphan rollback.
+            for _ in range(_HANDOFF_RECOVERY_STALE_VIEW_ATTEMPTS - 1):
+                time.sleep(_HANDOFF_RECOVERY_STALE_VIEW_RETRY_DELAY_S)
+                task = self._fetch_task(session.task_id)
+                fields = (task or {}).get("fields") or {}
+                operation_id = fields.get(HANDOFF_OPERATION_FIELD)
+                if operation_id:
+                    break
         if not operation_id:
             return False
         exact_source = (
