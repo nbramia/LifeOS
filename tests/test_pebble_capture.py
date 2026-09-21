@@ -1410,6 +1410,33 @@ async def test_jev_classifier_task_disposition_files_the_selected_item_fragment(
 
 
 @pytest.mark.asyncio
+async def test_jev_classifier_task_assigned_to_me_carries_the_me_tag_through_validate_plan():
+    transcript = "Make a task to charge the synthetic earbuds and assign it to me."
+    client = _FakeJevClient(_jev_answers(disposition="task", item="s0"))
+    raw = await JevPebbleClassifier(client=client).classify(transcript, "2030-01-01T10:00:00Z")
+    [action] = validate_plan(raw, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    assert action.kind == "task"
+    assert action.tags == ("me",)
+    assert action.title == "Make a task to charge the synthetic earbuds"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "transcript",
+    [
+        "Make a task to charge the synthetic earbuds",
+        "Make a task to charge the synthetic earbuds but don't assign it to me.",
+        "Make a task to charge the synthetic earbuds. Sam said assign it to me.",
+    ],
+)
+async def test_jev_classifier_task_without_positive_self_assignment_has_no_assignee(transcript):
+    client = _FakeJevClient(_jev_answers(disposition="task", item="s0"))
+    raw = await JevPebbleClassifier(client=client).classify(transcript, "2030-01-01T10:00:00Z")
+    [action] = validate_plan(raw, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    assert action.tags == ()
+
+
+@pytest.mark.asyncio
 async def test_jev_classifier_selects_the_named_fragment_not_always_the_first():
     """Multi-item selection: several things follow one request, and only
     the fragment Jev actually names should file."""
@@ -1567,6 +1594,11 @@ async def test_jev_classifier_falls_back_to_log_only_when_jev_fails():
     ("transcript", "action_evidence", "expected_tag"),
     [
         ("Have clod code fix the synthetic login bug.", "fix the synthetic login bug", "claude"),
+        (
+            "Create a task, assign it to quad, to fix the synthetic login bug.",
+            "fix the synthetic login bug",
+            "claude",
+        ),
         (
             "Ask deepseek to summarize the synthetic report.",
             "summarize the synthetic report",
