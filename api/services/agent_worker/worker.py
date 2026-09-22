@@ -77,6 +77,7 @@ from api.services.agent_board import (
     REASSIGNED_TAG,
     derive_assignee,
     is_snoozed as _is_snoozed,
+    normalize_tags as _normalize_tags,
 )
 from api.services.agent_worker.preflight import (
     ROUTE_ASK,
@@ -102,6 +103,11 @@ from api.services.agent_worker.session_store import (
     Session,
     SessionStore,
 )
+from api.services.agent_worker.delegation import (
+    PROJECT_CANCEL as _OWNER_TOOL_PROJECT_CANCEL,
+    PROJECT_COMPLETE as _OWNER_TOOL_PROJECT_COMPLETE,
+    TASK_CHILDREN as _OWNER_TOOL_TASK_CHILDREN,
+)
 from api.services.agent_worker.managed_executor import _sanitize_title as _managed_sanitize_title
 from api.services.agent_worker.spend_tracker import SpendTracker
 from api.services.agent_worker.usage_ledger import UsageLedger
@@ -119,8 +125,10 @@ from api.services.runtime_identity import (
     publish_runtime_identity,
 )
 from api.services.task_projects import (
+    CANCEL_OPERATION_FIELD,
     CHILD_ORIGIN_AGENT,
     CHILD_ORIGIN_FIELD,
+    COORDINATOR_SESSION_FIELD,
     HANDOFF_OPERATION_FIELD,
     HANDOFF_QUIESCENT_EVENT,
     HANDOFF_REQUEST_EVENT,
@@ -131,6 +139,9 @@ from api.services.task_projects import (
     LAST_ABORTED_HANDOFF_FIELD,
     LAST_HANDOFF_OPERATION_FIELD,
     PARENT_ID_FIELD,
+    PROJECT_PAUSED_FIELD,
+    field_truthy,
+    owner_state,
 )
 from config.settings import settings
 
@@ -227,6 +238,22 @@ _PROJECT_NOTICE_AGENT_CHILDREN_GT5 = "agent_children_gt5"
 _PROJECT_NOTICE_CHILD_THRESHOLD = 5
 # Cap on how many child titles a fan-out notice lists.
 _PROJECT_NOTICE_MAX_TITLES = 10
+
+# Persistent project owner wake reconciler (see _reconcile_project_owners).
+# Quiet-window debounce: once a project's child-state diff against its last
+# acknowledged snapshot goes from empty to non-empty, the reconciler waits
+# this long (anchored on the first observation, not a sliding window) before
+# waking the owner, so several children changing state in a burst coalesce
+# into one wake instead of one per child.
+_OWNER_WAKE_QUIET_SECONDS = 30
+# Consecutive failed owner-wake turns before the project auto-pauses with
+# reason "owner_failed" (a failed wake redelivers the same events once
+# before that happens).
+_OWNER_WAKE_FAILURE_PAUSE_THRESHOLD = 2
+# Wake message length cap (Telegram-adjacent headroom, same rationale as
+# _INLINE_SUMMARY_MAX_CHARS) and how many child reasons it lists.
+_OWNER_WAKE_MESSAGE_MAX_CHARS = 8000
+_OWNER_WAKE_MAX_REASONS = 50
 
 # A recurring (cron) schedule stamps its handed-off #agent task with a
 # `sched-<id>` tag (see scheduler_store._hand_off_to_agent). The worker reads
@@ -1058,6 +1085,24 @@ class Worker:
             # Blocked sessions are waiting on the user; leave alone.
             if session.status == STATUS_BLOCKED:
                 continue
+            # An operator-origin CLAIMED session with an undelivered pending
+            # message is a native CLI resume that was queued (enqueue_message
+            # + either begin_new_execution's CAS, for a persistent-project-
+            # owner wake, or the plain CLAIMED flip a follow-up reply uses —
+            # see _continue_session/_reconcile_project_owners) but never
+            # actually launched by the process that crashed or restarted —
+            # the dispatch that would drain or peek that queue never got the
+            # chance to run. Safe to leave alone rather than roll back:
+            # `_dispatch_spawned_sessions` peeks a resume's pending message
+            # rather than draining it, so the message survives a restart
+            # either way, and this session is picked up normally on a
+            # later tick like any other CLAIMED session carrying one.
+            if (
+                session.status == STATUS_CLAIMED
+                and session.origin == "operator"
+                and self.session_store.has_pending_messages(sid)
+            ):
+                continue
             # Deliberate self-restart: finalize quietly, skip the alarming
             # rollback. The doctor already shipped + notified before the bounce.
             if sid in self_restart_sids or session.task_id in self_restart_tids:
@@ -1216,6 +1261,12 @@ class Worker:
         self._poll_managed_sessions()
         # Resume yielded sessions whose children have all reached terminal state.
         self._resume_yielded_for_children()
+        # Wake each agent-owned project's persistent owner session for any
+        # child event it hasn't acknowledged yet. Gated on the spend-cap
+        # check above (an owner wake spends); reuses this tick's shared
+        # `/api/tasks` fetch. Runs before the dispatch call below so a
+        # wake queued this pass is picked up the same tick.
+        self._reconcile_project_owners(project_tasks)
         # Dispatch any newly-spawned sessions (no #agent task — created via
         # lifeos_agent_spawn). They show up with status=claimed and a routing.
         self._dispatch_spawned_sessions()
@@ -2039,6 +2090,24 @@ class Worker:
                 # without identity are legacy/unbound and are rejected too:
                 # accepting them would let an answer arrive after a reopen
                 # and attach to the replacement execution.
+                if (
+                    (q.get("kind") or "clarification") == "followup"
+                    and self.session_store.is_project_owner_session(session_id)
+                ):
+                    # A persistent-project-owner wake (see
+                    # _reconcile_project_owners) rotated this session's
+                    # attempt between its completion notice and this reply
+                    # — surface that rather than silently discarding it, so
+                    # it doesn't look like the reply just worked.
+                    self.transcript_store.append(session_id, "owner_followup_reply_stale", {
+                        "question_id": q["id"], "reply_attempt_id": q_attempt,
+                        "reply_turn_id": q_turn, "current_attempt_id": session.attempt_id,
+                    })
+                    self._notify(
+                        "A reply to a project owner's completion notice arrived after "
+                        "the owner had already been woken by a newer project event, so "
+                        "it wasn't applied. Reply again if it's still relevant."
+                    )
                 self.session_store.mark_question_processed(q["id"])
                 continue
 
@@ -2648,6 +2717,45 @@ class Worker:
             "waiting_reason": transition.waiting_reason,
         })
 
+    def _continue_session(
+        self, session: Session, message: str, *, sender_id: str = "operator",
+    ) -> bool:
+        """Enqueue `message` for native delivery on `session`'s existing
+        thread — the same mechanism `_dispatch_spawned_sessions` uses to
+        resume a claude_code/codex session in place (`-r <id>` / `codex exec
+        resume <id>`) instead of starting a fresh one. Shared by operator
+        follow-ups (`_resume_as_followup`) and persistent-project-owner
+        wakes (`_reconcile_project_owners`).
+
+        Only claude_code/codex are implemented: they resume off-tick, and
+        `_dispatch_spawned_sessions` drains (a fresh dispatch) or peeks and
+        later confirms (a resume) this same queue. The other routes
+        (local/remote, Hermes, Managed) execute synchronously through their
+        own mechanisms entirely and are not implemented here.
+
+        This call is delivery only — it never itself changes `session`'s
+        status. A CAS reopen (`begin_new_execution`) or a plain flip to
+        CLAIMED, whichever the caller's scenario needs, is the caller's own
+        responsibility, sequenced around this call however its own
+        crash-safety ordering requires (an owner wake enqueues, then CASes,
+        so a crash between the two still redelivers on retry rather than
+        silently dropping the message — see `_reconcile_project_owners`).
+
+        Returns whether the message was actually enqueued. False means
+        `session`'s identity had already moved on underneath the caller (a
+        concurrent cancellation, or a lost identity race), so nothing was
+        sent.
+        """
+        if session.routing not in (ROUTE_CLAUDE_CODE, ROUTE_CODEX):
+            raise NotImplementedError(
+                f"native continuation is not implemented for route {session.routing!r}"
+            )
+        enqueued = self.session_store.enqueue_message(
+            session.session_id, sender_id, message,
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
+        return bool(enqueued)
+
     def _resume_as_followup(self, q: dict, session: Session, answer: str) -> None:
         """Operator replied to a completion message — reopen the COMPLETED
         session as a follow-up turn. The conversation history is preserved
@@ -2765,36 +2873,18 @@ class Worker:
             self._handle_outcome(session, task, outcome)
             return
 
-        if session.routing == "claude_code":
-            # /claude follow-ups. Hand the reply off as a fresh pending
-            # message so _dispatch_claude_code_session drains it and resumes
-            # via ClaudeCodeExecutor.resume(). Flipping status back to CLAIMED
-            # puts the session in the same shape as a freshly-claimed one —
-            # the dispatcher's resume branch keys on session.claude_code_session_id
-            # being set, so it knows this is a resume rather than first run.
+        if session.routing in (ROUTE_CLAUDE_CODE, ROUTE_CODEX):
+            # /claude and /codex follow-ups. Hand the reply off as a fresh
+            # pending message so _dispatch_claude_code_session/
+            # _dispatch_codex_session drains it and resumes via the
+            # executor's own resume() — see _continue_session. Flipping
+            # status back to CLAIMED puts the session in the same shape as
+            # a freshly-claimed one — the dispatcher's resume branch keys
+            # on session.claude_code_session_id being set, so it knows this
+            # is a resume rather than a first run.
             if not self.session_store.question_claimed(q["id"]):
                 return
-            self.session_store.enqueue_message(
-                sid, "operator", answer,
-                attempt_id=session.attempt_id, turn_id=session.turn_id,
-            )
-            self.session_store.update_status(
-                task_id, STATUS_CLAIMED,
-                attempt_id=session.attempt_id, turn_id=session.turn_id,
-            )
-            self.session_store.mark_question_processed(q["id"])
-            return
-
-        if session.routing == "codex":
-            # /codex follow-ups — same pattern as /claude. CodexExecutor.resume()
-            # uses the persisted claude_code_session_id (reused column) to invoke
-            # `codex exec resume <id>`.
-            if not self.session_store.question_claimed(q["id"]):
-                return
-            self.session_store.enqueue_message(
-                sid, "operator", answer,
-                attempt_id=session.attempt_id, turn_id=session.turn_id,
-            )
+            self._continue_session(session, answer)
             self.session_store.update_status(
                 task_id, STATUS_CLAIMED,
                 attempt_id=session.attempt_id, turn_id=session.turn_id,
@@ -6726,6 +6816,301 @@ class Worker:
                 )
             sent += 1
         return sent
+
+    @staticmethod
+    def _project_is_agent_owned(task: dict[str, Any]) -> bool:
+        """Same test `ProjectTaskService._plan_and_delegate_locked` uses to
+        decide a project is agent- (not operator-) owned: an engine
+        assignee tag, or a Managed consent sub-tag."""
+        tags = task.get("tags") or []
+        if derive_assignee(tags) in _BOARD_AGENT_ASSIGNEES:
+            return True
+        normalized = _normalize_tags(tags)
+        return any(tag in normalized for tag in MANAGED_AGENT_ASSIGNEES)
+
+    def _pause_project_for_owner_failure(self, project_id: str, title: str, reason: str) -> None:
+        """Best-effort: auto-pause a project whose owner turn just failed
+        (or exceeded its budget), and send one Telegram notice. A failure
+        here (network, API) is logged and otherwise swallowed -- a later
+        owner failure, if the project is still unexpectedly unpaused, tries
+        again."""
+        try:
+            response = self._http.post(
+                f"{self.api_base}/api/tasks/{project_id}/project/pause",
+                json={"reason": reason},
+            )
+            response.raise_for_status()
+        except Exception as exc:
+            logger.warning("owner-failure auto-pause failed for %s: %s", project_id, exc)
+            return
+        label = "exceeded its budget" if reason == "owner_budget" else (
+            f"failed {_OWNER_WAKE_FAILURE_PAUSE_THRESHOLD} times in a row"
+        )
+        self._notify(
+            f"⏸ Project owner {label} for '{title}' — paused (reason: {reason}). "
+            f"Board: /agents?card={project_id}"
+        )
+
+    def _owner_wake_message(
+        self,
+        project_id: str,
+        title: str,
+        *,
+        events: dict[str, str],
+        children_by_id: dict[str, dict[str, Any]],
+        counts: dict[str, str],
+        acked: dict[str, Any],
+        integration_branch: str | None,
+        outcomes: dict[str, dict[str, Any]],
+    ) -> str:
+        """Build the message delivered with an owner wake: which children
+        changed state and how, the project's current child-state counts,
+        and a reminder of the owner's tools. Bounded to
+        `_OWNER_WAKE_MESSAGE_MAX_CHARS`."""
+        reason_lines = []
+        for child_id, new_state in list(events.items())[:_OWNER_WAKE_MAX_REASONS]:
+            child = children_by_id.get(child_id) or {}
+            prev_state = acked.get(child_id, "new")
+            outcome = outcomes.get(child_id) or {}
+            summary = str(outcome.get("summary") or "").strip()[:500]
+            pr_urls = outcome.get("pr_urls") or []
+            line = (
+                f"- {child_id} | {child.get('description') or child_id} | "
+                f"{prev_state}→{new_state}"
+            )
+            if summary:
+                line += f" | {summary}"
+            if pr_urls:
+                line += f" | {pr_urls[0]}"
+            reason_lines.append(line)
+        tally: dict[str, int] = {}
+        for state in counts.values():
+            tally[state] = tally.get(state, 0) + 1
+        counts_line = ", ".join(f"{k}={v}" for k, v in sorted(tally.items()))
+        lines = [
+            f"Project owner wake: '{title}' ({project_id})",
+            "Changed children:",
+            *(reason_lines or ["(none listed)"]),
+            f"Current counts: {counts_line or 'none'}",
+        ]
+        if integration_branch:
+            lines.append(f"Integration branch: {integration_branch}")
+        lines.append(
+            f"Use `{_OWNER_TOOL_TASK_CHILDREN}` to inspect the full child list, and create or "
+            f"assign children as needed. `{_OWNER_TOOL_PROJECT_COMPLETE}` refuses while this "
+            "turn is live, so report readiness in your final response and let the operator "
+            f"complete the project from the board, or call `{_OWNER_TOOL_PROJECT_CANCEL}` if "
+            "it must stop instead."
+        )
+        message = "\n".join(lines)
+        if len(message) > _OWNER_WAKE_MESSAGE_MAX_CHARS:
+            message = message[: _OWNER_WAKE_MESSAGE_MAX_CHARS - 3] + "..."
+        return message
+
+    def _reconcile_one_project_owner(
+        self,
+        project_id: str,
+        owner_session_id: str,
+        *,
+        children: list[dict[str, Any]],
+        paused: bool,
+        integration_branch: str | None,
+        title: str,
+        outcomes: dict[str, dict[str, Any]],
+    ) -> bool:
+        """One project's pass through the wake reconciler's steps 1-6 (see
+        `_reconcile_project_owners`). Returns whether an owner wake was
+        actually dispatched this pass."""
+        current_snapshot = {
+            child["id"]: owner_state(child) for child in children if child.get("id")
+        }
+        state = self.session_store.ensure_project_owner_state(
+            project_id, owner_session_id=owner_session_id, baseline_states=current_snapshot,
+        )
+        if state is None:  # pragma: no cover - defensive, row was just ensured
+            return False
+        if paused:
+            return False
+        # The consecutive-failure counter is reset on resume by
+        # `ProjectTaskService.resume_project` itself (the one place a pause
+        # transition is unambiguous), not guessed here on every tick.
+
+        owner = self.session_store.get_by_session_id(owner_session_id)
+        if owner is None or owner.status not in TERMINAL_STATUSES:
+            return False
+
+        wake_attempt_id = state.get("wake_attempt_id")
+        if wake_attempt_id and wake_attempt_id == owner.attempt_id:
+            if owner.status == STATUS_COMPLETED:
+                delivered = state.get("delivered_states") or {}
+                self.session_store.ack_project_owner_wake(project_id, acked_states=delivered)
+                state = self.session_store.get_project_owner_state(project_id) or state
+            elif owner.status == STATUS_BUDGET_EXCEEDED:
+                # A budget breach pauses immediately -- it isn't a retry
+                # signal, so the failure counter is left untouched.
+                self.session_store.clear_project_owner_in_flight(project_id)
+                self._pause_project_for_owner_failure(project_id, title, "owner_budget")
+                return False
+            else:
+                failures = self.session_store.record_project_owner_wake_failure(project_id)
+                if failures >= _OWNER_WAKE_FAILURE_PAUSE_THRESHOLD:
+                    self._pause_project_for_owner_failure(project_id, title, "owner_failed")
+                    return False
+                state = self.session_store.get_project_owner_state(project_id) or state
+
+        acked = state.get("acked_states") or {}
+        # A child observed back at `active` re-baselines its acked entry
+        # immediately, even though `active` is never itself an event: a
+        # wake only ever moves `acked` at ack time, so without this, a
+        # child that goes e.g. failed -> (acked "failed") -> active ->
+        # failed again would never re-diff as a new event -- the acked
+        # value would still read "failed" from the first round, matching
+        # the repeat exactly. This also runs on an otherwise-empty diff, not
+        # only when some other child has a live event this same pass.
+        stale_active = {
+            cid: "active" for cid, new_state in current_snapshot.items()
+            if new_state == "active" and acked.get(cid, "active") != "active"
+        }
+        if stale_active:
+            self.session_store.correct_project_owner_baseline(
+                project_id, corrections=stale_active,
+            )
+            acked = {**acked, **stale_active}
+        events = {
+            cid: new_state for cid, new_state in current_snapshot.items()
+            if new_state != "active" and acked.get(cid) != new_state
+        }
+        has_events = bool(events) or bool(state.get("wake_request_reason"))
+        first_unseen_at = state.get("first_unseen_at")
+        if not has_events:
+            if first_unseen_at:
+                self.session_store.set_project_owner_anchor(project_id, None)
+            return False
+
+        now_ts = int(time.time())
+        if not first_unseen_at:
+            self.session_store.set_project_owner_anchor(project_id, now_ts)
+            return False
+        if now_ts - first_unseen_at < _OWNER_WAKE_QUIET_SECONDS:
+            return False
+
+        if owner.routing not in (ROUTE_CLAUDE_CODE, ROUTE_CODEX):
+            # Continuation for the other routes lands separately; the diff
+            # stays pending (anchor already elapsed) so it wakes as soon as
+            # that support exists.
+            return False
+
+        children_by_id = {child["id"]: child for child in children if child.get("id")}
+        message = self._owner_wake_message(
+            project_id, title, events=events, children_by_id=children_by_id,
+            counts=current_snapshot, acked=acked, integration_branch=integration_branch,
+            outcomes=outcomes,
+        )
+        # Enqueue before the CAS: a crash between the two leaves the owner
+        # still terminal with an orphaned pending message, harmlessly
+        # re-enqueued (at worst, delivered twice) on a later retry -- never
+        # lost. Enqueuing after the CAS instead could deliver an empty
+        # resume with no message at all if a crash landed in that gap.
+        if not self._continue_session(owner, message):
+            # The owner's identity moved on underneath us -- most commonly
+            # a lingering `cancellation_guards` row for its current
+            # attempt/turn (e.g. an operator-cancelled live CLI session,
+            # see telegram.py) that will match forever since nothing here
+            # ever rotates the attempt without a successful enqueue. Count
+            # this as a wake failure (same threshold/auto-pause path as a
+            # turn that actually ran and failed) rather than silently
+            # retrying forever with no visible signal.
+            failures = self.session_store.record_project_owner_wake_failure(project_id)
+            if failures >= _OWNER_WAKE_FAILURE_PAUSE_THRESHOLD:
+                self._pause_project_for_owner_failure(project_id, title, "owner_failed")
+            return False
+        try:
+            reopened = self.session_store.begin_new_execution(
+                owner.task_id, request=owner.execution_request,
+            )
+        except ValueError:
+            # Lost the single-flight race -- another turn is already live.
+            return False
+        self.session_store.record_project_owner_wake(
+            project_id, delivered_states=current_snapshot,
+            wake_attempt_id=reopened.attempt_id, wake_turn_id=reopened.turn_id,
+        )
+        return True
+
+    def _reconcile_project_owners(self, tasks: list[dict[str, Any]] | None = None) -> int:
+        """Wake each agent-owned project's persistent owner session when a
+        child's state has changed since the owner last acknowledged it.
+
+        Runs once per tick, after the spend-cap gate and before
+        `_dispatch_spawned_sessions` (see `tick()`), so a wake's CLI
+        dispatch is picked up the same pass it's queued in, and a capped
+        tick — which returns before reaching this call at all — never
+        spends on a wake. Shares the tick's `/api/tasks` fetch with the
+        other project reconcilers.
+
+        For each project with an owner session recorded in
+        `COORDINATOR_SESSION_FIELD` that is agent-owned, not done or
+        cancelled, and has no cancellation or handoff pending, see
+        `_reconcile_one_project_owner` for the per-project steps: create
+        the durable state row on first observation, skip while paused,
+        wait while the owner is mid-turn (this plus `begin_new_execution`'s
+        CAS is what makes two owner turns at once impossible), reconcile a
+        just-finished wake's outcome (ack on success, redeliver on failure,
+        auto-pause after `_OWNER_WAKE_FAILURE_PAUSE_THRESHOLD` consecutive
+        failures or immediately on a budget breach), then wake once any
+        accumulated events have sat for the `_OWNER_WAKE_QUIET_SECONDS`
+        quiet window. Only claude_code/codex owners are actually woken
+        here (native CLI resume); the other routes' continuation is
+        separate.
+        """
+        if tasks is None:
+            tasks = self._fetch_tasks_for_project_reconciliation()
+        if tasks is None:
+            return 0
+        children_by_parent: dict[str, list[dict[str, Any]]] = {}
+        for t in tasks:
+            fields = t.get("fields") or {}
+            parent_id = t.get("parent_id") or fields.get(PARENT_ID_FIELD)
+            if parent_id:
+                children_by_parent.setdefault(parent_id, []).append(t)
+        outcomes = self.session_store.list_all_card_outcomes()
+
+        woken = 0
+        for task in tasks:
+            project_id = task.get("id")
+            if not project_id:
+                continue
+            fields = task.get("fields") or {}
+            owner_session_id = fields.get(COORDINATOR_SESSION_FIELD)
+            if not owner_session_id:
+                continue
+            status = str(task.get("status") or "todo").lower()
+            if status in ("done", "cancelled"):
+                continue
+            if fields.get(CANCEL_OPERATION_FIELD) or fields.get(HANDOFF_OPERATION_FIELD):
+                continue
+            if not self._project_is_agent_owned(task):
+                continue
+            try:
+                woke = self._reconcile_one_project_owner(
+                    project_id, owner_session_id,
+                    children=children_by_parent.get(project_id, []),
+                    paused=field_truthy(fields.get(PROJECT_PAUSED_FIELD)),
+                    integration_branch=fields.get(INTEGRATION_BRANCH_FIELD),
+                    title=task.get("description") or project_id,
+                    outcomes=outcomes,
+                )
+            except Exception as exc:
+                # One project's reconciliation must never abort the whole
+                # tick -- a non-CLI-routed owner reaches `_continue_session`
+                # today and raises `NotImplementedError`, which would
+                # otherwise propagate out of `tick()` and skip every later
+                # step, including claim dispatch, for every other project.
+                logger.warning("project owner reconciliation failed for %s: %s", project_id, exc)
+                continue
+            if woke:
+                woken += 1
+        return woken
 
     def _session_staged_this_turns_handoff(self, session: Session) -> bool:
         """True when this exact attempt/turn's transcript has a handoff

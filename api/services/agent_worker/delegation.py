@@ -41,9 +41,10 @@ project's own owner already carries that same route.
 
 A durable hierarchy has exactly one child level. Use stable child keys and
 inspect the existing children before retrying or creating work. A child cannot
-become a project. For an existing project, use `{PROJECT_PLAN}` to run one
-bounded coordinator session; it is not an always-on monitor and does not wake
-automatically for every child completion.
+become a project. For an existing project, use `{PROJECT_PLAN}` to create its
+persistent owner session. The owner is woken automatically when a child's
+state changes -- newly blocked, failed, done, cancelled, or awaiting review --
+with several such events batched into one wake.
 
 If you are the current executor of an ordinary live top-level task and need to
 turn that task into a project, call `{PROJECT_HANDOFF}` once with a stable

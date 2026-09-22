@@ -84,6 +84,13 @@ CHILD_CREATOR_SESSION_FIELD = "project_child_creator_session"
 HANDOFF_REQUEST_EVENT = "project_handoff_requested"
 HANDOFF_QUIESCENT_EVENT = "project_handoff_quiescent"
 
+# Mirrors FAILED_TAG / BUDGET_EXCEEDED_TAG in
+# api/services/agent_worker/worker.py (not imported -- worker.py imports
+# from this module, so the reverse import would be circular; the same
+# tradeoff `agent_board.py` makes for these same two tags).
+_FAILED_TAG = "agent-failed"
+_BUDGET_EXCEEDED_TAG = "agent-budget-exceeded"
+
 
 class ProjectConflictError(ValueError):
     """A project mutation conflicts with current hierarchy/lifecycle state."""
@@ -277,6 +284,46 @@ def field_timestamp_future(value: Any) -> bool:
 
 def build_task_hierarchy(tasks: Iterable["Task"]) -> TaskHierarchy:
     return TaskHierarchy(tasks)
+
+
+def owner_state(task: dict[str, Any]) -> str:
+    """Classify one project child's state for the persistent-owner wake
+    reconciler (`Worker._reconcile_project_owners`), from the raw dict
+    shape the worker's `/api/tasks` fetch returns -- not a `Task` object,
+    see `TaskHierarchy.child_state` for the board's equivalent
+    classification over `Task` objects.
+
+    Six states, checked in priority order the same way the board derives a
+    lane (`agent_board.natural_lane`): `awaiting_review` (worker-completed,
+    not yet accepted -- wins even over a terminal status) beats `failed`
+    (`agent-failed`/`agent-budget-exceeded` -- both leave the task's own
+    status at `cancelled`, so this must be checked before the plain
+    `cancelled` case below) beats `cancelled` beats `done` beats `blocked`
+    (needs a human) beats `active` (everything else: unassigned, assigned,
+    genuinely running, or a machine wait -- `agent-wait-provider`/
+    `agent-wait-dependency` are worker-owned and self-clearing;
+    `natural_lane` routes them to In progress, not Human queue, and an
+    owner wake would just burn a paid turn on a transient provider
+    rate-limit). Only a non-`active` state is ever an owner-wake event.
+    """
+    raw_tags = task.get("tags") or []
+    tags = agent_board.normalize_tags(raw_tags)
+    status = str(task.get("status") or "todo").lower()
+    if agent_board.is_review_pending(raw_tags):
+        return "awaiting_review"
+    if _FAILED_TAG in tags or _BUDGET_EXCEEDED_TAG in tags:
+        return "failed"
+    if status == "cancelled":
+        return "cancelled"
+    if status == "done":
+        return "done"
+    if (
+        status == "blocked"
+        or agent_board.BLOCKED_TAG in tags
+        or agent_board.HUMAN_TAG in tags
+    ):
+        return "blocked"
+    return "active"
 
 
 def validate_parent_change(
@@ -505,7 +552,17 @@ class ProjectTaskService:
         return updated
 
     def resume_project(self, task_id: str) -> "Task":
-        """Clear the durable paused state, re-enabling child claims and Open."""
+        """Clear the durable paused state, re-enabling child claims and Open.
+
+        Also gives the project's persistent owner (if any) a fresh
+        consecutive-failure budget: `project_owner_state.consecutive_failures`
+        is worker-owned state with no other reset path, and forgiving it
+        here -- at the one moment a pause transition is unambiguous -- is
+        simpler than having the reconciler guess a transition happened on
+        every subsequent tick. A harmless no-op for a project paused for an
+        unrelated ("operator") reason, where the count is normally already
+        zero.
+        """
         hierarchy = self.hierarchy()
         task = hierarchy.tasks.get(task_id)
         if task is None:
@@ -527,6 +584,8 @@ class ProjectTaskService:
         )
         if updated is None:
             raise KeyError(task_id)
+        if self.session_store is not None:
+            self.session_store.reset_project_owner_failures(task_id)
         return updated
 
     def stage_handoff(
@@ -1103,8 +1162,11 @@ class ProjectTaskService:
                 f"assignee={child.get('assignee') or 'unassigned'}"
             )
         lines.append(
-            "This is a bounded coordinator run, not a persistent monitor. Inspect child state, "
-            "help resolve scoped blockers, and use the explicit project completion/cancellation actions."
+            "You are this project's persistent owner: you are woken automatically "
+            "when a child's state changes -- newly blocked, failed, done, cancelled, "
+            "or awaiting review -- with several such events batched into one wake. "
+            "Inspect child state, help resolve scoped blockers, and use the explicit "
+            "project completion/cancellation actions."
         )
         return "\n".join(lines)
 
@@ -1597,7 +1659,11 @@ class ProjectTaskService:
             + "\nUse task hierarchy, not session ancestry. Preserve explicit child assignments "
             "and do not expand provider/cloud consent beyond this delegated scope. When creating "
             "a child, derive one stable operation_key from this project ID, operation ID, and the "
-            "child's role; reuse that key on retry so the task tool recovers the same child."
+            "child's role; reuse that key on retry so the task tool recovers the same child.\n"
+            "You are this project's persistent owner: you are woken automatically when a "
+            "child's state changes -- newly blocked, failed, done, cancelled, or awaiting "
+            "review -- with several such events batched into one wake. The project ends only "
+            "through the explicit project completion/cancellation actions."
         )
 
 

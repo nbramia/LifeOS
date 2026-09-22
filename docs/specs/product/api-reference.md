@@ -502,7 +502,7 @@ conditions.
 
 ### POST /api/tasks/{id}/project/plan
 
-Start or recover the agent owner's bounded coordinator run.
+Start the project's persistent owner session, or recover its retry/restart idempotency.
 
 ```json
 { "operation_id": "synthetic-planning-request-1" }
