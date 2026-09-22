@@ -361,3 +361,71 @@ class TestHoverCardRows:
         rows = _call(page, "hoverCardRows", d)
         labels = [r[0] for r in rows]
         assert labels == ["Duration", "Cost"]
+
+
+class TestDescendantsOf:
+    """`descendantsOf` walks `parent_session_id` — behind Kill's cascade
+    preview (session_actions.js's `openKillModal`), which must name exactly
+    what a Kill click actually takes with it."""
+
+    def test_basic_bfs_via_parent_session_id(self, page: Page, web_base_url):
+        _load_module(page, web_base_url)
+        sessions = [
+            {"session_id": "root", "status": "running"},
+            {"session_id": "child", "parent_session_id": "root", "status": "running"},
+            {"session_id": "grandchild", "parent_session_id": "child", "status": "running"},
+            {"session_id": "unrelated", "status": "running"},
+        ]
+        out = _call(page, "descendantsOf", sessions, {"session_id": "root"})
+        assert {d["session_id"] for d in out} == {"child", "grandchild"}
+
+    def test_includes_children_of_the_resolved_kill_target_id(self, page: Page, web_base_url):
+        """A worker-spawned CLI session's board id (the `cc:`/`cx:`
+        transcript id) is not the id Kill actually cascades from when the
+        two differ (`cli_kill_target_id`, api/routes/agents.py's
+        `_cli_kill_info`) — a real child that session spawned via a tool
+        call carries the OWNING session's id as `parent_session_id`, never
+        the transcript id, so the preview must walk both roots to match
+        what Kill actually tears down."""
+        _load_module(page, web_base_url)
+        sessions = [
+            {"session_id": "cc:worker", "status": "running"},
+            # A synthetic in-transcript subagent — parented on the
+            # transcript id itself.
+            {"session_id": "cc:worker:agent:abc", "parent_session_id": "cc:worker", "status": "running"},
+            # A real LifeOS child spawned via a tool call from inside that
+            # session — parented on the OWNING sessions row, not "cc:worker".
+            {"session_id": "sess_owner_child", "parent_session_id": "sess_owner", "status": "running"},
+        ]
+        session = {"session_id": "cc:worker", "cli_kill_target_id": "sess_owner"}
+        out = _call(page, "descendantsOf", sessions, session)
+        assert {d["session_id"] for d in out} == {"cc:worker:agent:abc", "sess_owner_child"}
+
+    def test_omits_cli_kill_target_id_root_itself_from_the_result(self, page: Page, web_base_url):
+        """The owning session itself must never appear as its own
+        descendant, even though it seeds the walk."""
+        _load_module(page, web_base_url)
+        sessions = [
+            {"session_id": "cc:worker", "status": "running"},
+            {"session_id": "sess_owner", "status": "running"},
+            {"session_id": "sess_owner_child", "parent_session_id": "sess_owner", "status": "running"},
+        ]
+        session = {"session_id": "cc:worker", "cli_kill_target_id": "sess_owner"}
+        out = _call(page, "descendantsOf", sessions, session)
+        ids = {d["session_id"] for d in out}
+        assert "sess_owner" not in ids
+        assert "cc:worker" not in ids
+        assert ids == {"sess_owner_child"}
+
+    def test_same_id_and_target_id_behaves_like_no_target_id(self, page: Page, web_base_url):
+        """When `cli_kill_target_id` equals the session's own id (a
+        pane-bound row, or a plain LifeOS session default), the walk isn't
+        affected — no double-counting from seeding the same root twice."""
+        _load_module(page, web_base_url)
+        sessions = [
+            {"session_id": "root", "status": "running"},
+            {"session_id": "child", "parent_session_id": "root", "status": "running"},
+        ]
+        session = {"session_id": "root", "cli_kill_target_id": "root"}
+        out = _call(page, "descendantsOf", sessions, session)
+        assert [d["session_id"] for d in out] == ["child"]

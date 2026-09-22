@@ -819,6 +819,14 @@ class SessionStore:
                         "UPDATE sessions SET claude_code_session_id = code_session_id "
                         "WHERE claude_code_session_id IS NULL AND code_session_id IS NOT NULL"
                     )
+            # `get_by_claude_code_session_id`'s reverse lookup (kill route,
+            # snapshot eligibility) and the board snapshot both query this
+            # column per CLI transcript row, so it needs an index rather than
+            # a full table scan.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_claude_code_session_id "
+                "ON sessions(claude_code_session_id)"
+            )
             # Idempotent migration for the per-session Claude Code tier.
             # Old rows stay NULL → omit --model and use the CLI default.
             if "claude_code_model" not in sess_cols:
@@ -1086,6 +1094,25 @@ class SessionStore:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+        return self._row_to_session(row) if row else None
+
+    def get_by_claude_code_session_id(self, claude_code_session_id: str) -> Session | None:
+        """Reverse lookup: the `sessions` row whose `claude_code_session_id`
+        matches a Claude Code / Codex CLI transcript's own id — the bare id
+        under a board `cc:`/`cx:`-prefixed session_id (`CLI_ENGINE_PREFIXES`,
+        `session_ingest.CC_PREFIX`). Lets a caller holding only that
+        transcript id (a worker-spawned CLI session never registers a
+        `cli_sessions` row, since it runs headless with no wezterm pane to
+        bind) find the row that actually owns the subprocess. Most recent
+        activity wins on the rare chance more than one row ever recorded the
+        same CLI session id.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM sessions WHERE claude_code_session_id = ? "
+                "ORDER BY last_activity_at DESC LIMIT 1",
+                (claude_code_session_id,),
             ).fetchone()
         return self._row_to_session(row) if row else None
 

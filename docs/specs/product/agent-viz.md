@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-09-20
+> **Last Updated:** 2026-09-22
 
 `/agents` is a Kanban board of the operator's work queue — vault tasks, agent questions, and scheduled work in one place, organized into lanes by status and tag. A **Graph** tab shows a deterministic delegation timeline as a secondary, read-mostly view for watching what's actively running: every LifeOS agent worker task (`#agent`-tagged), local CLI sessions discovered on the filesystem from both Claude Code (`~/.claude/projects/`) and Codex (`~/.codex/sessions/`), and Claude Code / Codex sessions registered from **any other machine** on the tailnet via a lightweight hook script.
 
@@ -366,7 +366,7 @@ A kill takes down the target session **and every descendant in its subtree** —
 - If the target was a Managed Agents (cloud) session, the worker process also tears down the remote session via the Anthropic API so you stop being billed for idle session-hours.
 - The task in your vault transitions to whatever the worker writes as the post-kill tag (typically `#agent-failed`).
 
-A CLI session the board opened gets a working **Kill**: it ends the pane that session runs in, and the card's session shows terminal. **Cancel** on such a card does the same before marking the card cancelled, so cancelling actually stops the work rather than leaving an agent running behind a closed card. A session recorded against another machine is reported instead — this API can only reach its own terminal — and so is a worker-spawned CLI session, which has no pane handle to end; for either, stop it in the terminal where it's running.
+A CLI session the board opened gets a working **Kill**: it ends the pane that session runs in, and the card's session shows terminal. **Cancel** on such a card does the same before marking the card cancelled, so cancelling actually stops the work rather than leaving an agent running behind a closed card. A worker-spawned CLI session — no pane, since it runs headless — also gets a working Kill: it resolves back to the session that owns the subprocess and tears it down the same way Kill on a non-CLI live session does. A session recorded against another machine is reported instead — this API can only reach its own terminal — stop it in the terminal where it's running. An operator-run CLI session LifeOS never spawned (no pane, and no LifeOS session owns it) shows Kill disabled with a reason instead of offering a button that can't work, and the confirmation preview only ever names what a Kill click actually takes with it — never more, never less.
 
 ---
 
