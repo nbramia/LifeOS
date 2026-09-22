@@ -687,3 +687,189 @@ def test_partial_cancel_keeps_intent_and_retry_finishes(manager: TaskManager, st
     assert second["complete"] is True
     assert restarted.get(child.id).status == "cancelled"
     assert restarted.get(parent.id).status == "cancelled"
+
+
+# ---------------------------------------------------------------------------
+# Pause / resume
+# ---------------------------------------------------------------------------
+
+
+def test_pause_blocks_claim_and_resume_reenables_it(manager: TaskManager):
+    from api.services.task_projects import (
+        PROJECT_PAUSED_AT_FIELD,
+        PROJECT_PAUSED_FIELD,
+        PROJECT_PAUSE_REASON_FIELD,
+    )
+
+    service = ProjectTaskService(manager)
+    parent = manager.create("Synthetic pausable project", tags=["codex"])
+    manager.create("Synthetic pausable child", tags=["codex"], fields={"parent_id": parent.id})
+
+    paused = service.pause_project(parent.id)
+    assert paused.fields[PROJECT_PAUSED_FIELD] == "true"
+    assert paused.fields[PROJECT_PAUSE_REASON_FIELD] == "operator"
+    assert PROJECT_PAUSED_AT_FIELD in paused.fields
+
+    # The project task itself is never claimable regardless of pause (it's
+    # a project, not ordinary work) — that's the pre-existing "is_project"
+    # refusal, not the pause-specific one, so it stays the soft (False,
+    # False) shape rather than raising.
+    assert manager.claim_for_agent(
+        parent.id,
+        pickup_tags={"codex"},
+        exclusion_tags=set(),
+        eligible_statuses={"todo"},
+    ) == (False, False)
+    child = manager.list_children(parent.id)[0]
+    with pytest.raises(ProjectConflictError, match="paused"):
+        manager.claim_for_agent(
+            child.id,
+            pickup_tags={"codex"},
+            exclusion_tags=set(),
+            eligible_statuses={"todo"},
+        )
+    assert manager.can_start_execution(child.id) is False
+
+    resumed = service.resume_project(parent.id)
+    assert PROJECT_PAUSED_FIELD not in resumed.fields
+    assert PROJECT_PAUSE_REASON_FIELD not in resumed.fields
+    assert manager.claim_for_agent(
+        child.id,
+        pickup_tags={"codex"},
+        exclusion_tags=set(),
+        eligible_statuses={"todo"},
+    ) == (True, False)
+
+
+def test_pause_rejects_an_unrecognized_reason(manager: TaskManager):
+    service = ProjectTaskService(manager)
+    parent = manager.create("Synthetic reason project")
+    manager.create("Synthetic reason child", fields={"parent_id": parent.id})
+
+    with pytest.raises(ValueError, match="invalid pause reason"):
+        service.pause_project(parent.id, reason="not_a_real_reason")
+
+
+def test_pause_and_resume_require_a_project(manager: TaskManager):
+    service = ProjectTaskService(manager)
+    task = manager.create("Synthetic ordinary task")
+
+    with pytest.raises(ProjectConflictError, match="not a project"):
+        service.pause_project(task.id)
+    with pytest.raises(ProjectConflictError, match="not a project"):
+        service.resume_project(task.id)
+
+
+def test_pause_and_pause_fields_are_guarded_from_ordinary_updates(manager: TaskManager):
+    from api.services.task_projects import PROJECT_PAUSED_FIELD
+
+    task = manager.create("Synthetic guarded pause task")
+
+    with pytest.raises(ProjectConflictError, match="explicit project lifecycle"):
+        manager.update(task.id, fields={PROJECT_PAUSED_FIELD: "true"})
+    with pytest.raises(ProjectConflictError, match="explicit project lifecycle"):
+        manager.create("Synthetic guarded pause create", fields={PROJECT_PAUSED_FIELD: "true"})
+
+
+def test_plan_and_delegate_is_refused_while_paused(manager: TaskManager, stores):
+    from api.services.task_projects import _coordinator_task_id
+
+    sessions, transcripts = stores
+    service = ProjectTaskService(manager, sessions, transcripts)
+    parent = manager.create("Synthetic paused planning project", tags=["codex"])
+    manager.create("Synthetic paused planning child", fields={"parent_id": parent.id})
+    service.pause_project(parent.id)
+
+    with pytest.raises(ProjectConflictError, match="paused"):
+        service.plan_and_delegate(parent.id, operation_id="plan-while-paused")
+
+    # Refused before staging a coordinator session, not merely at the
+    # linking write — a paused project should never spin one up at all.
+    synthetic_task_id = _coordinator_task_id(parent.id, "plan-while-paused")
+    assert sessions.get(synthetic_task_id) is None
+
+
+def test_a_child_already_mid_turn_still_lands_in_review_while_paused(manager: TaskManager):
+    """Pausing a project must not interrupt a child's already-running turn —
+    only new claims and Open are refused. The ordinary worker transition into
+    Review (status/tags writes with no `_project_action`) still succeeds."""
+    service = ProjectTaskService(manager)
+    parent = manager.create("Synthetic finish-in-flight project", tags=["codex"])
+    child = manager.create(
+        "Synthetic running child", tags=["codex", "agent-running"],
+        status="in_progress", fields={"parent_id": parent.id},
+    )
+    service.pause_project(parent.id)
+
+    landed = manager.swap_tag(child.id, "agent-running", "agent-completed")
+    assert landed is True
+    assert "agent-completed" in manager.get(child.id).tags
+
+
+def test_pause_and_resume_are_available_while_a_child_is_running(manager: TaskManager):
+    """Cancel and operator Complete stay available while paused (design);
+    pausing itself must also not be blocked by ordinary running work."""
+    service = ProjectTaskService(manager)
+    parent = manager.create("Synthetic live-child project", tags=["codex"])
+    manager.create(
+        "Synthetic live child", tags=["codex", "agent-running"],
+        status="in_progress", fields={"parent_id": parent.id},
+    )
+
+    paused = service.pause_project(parent.id)
+    assert paused.fields["project_paused"] == "true"
+    resumed = service.resume_project(parent.id)
+    assert "project_paused" not in resumed.fields
+
+
+def test_pause_races_a_concurrent_claim_under_the_task_operation_lock(tmp_path: Path):
+    """Contention test: whichever of pause or claim wins the shared
+    `.task-operation.lock` first, the outcome stays consistent — a winning
+    claim is never retroactively undone by the losing pause, and a winning
+    pause always leaves the claim refused with a 409-mapped error."""
+    vault = tmp_path / "vault"
+    index = tmp_path / "index" / "tasks.json"
+    seed = TaskManager(vault_path=vault, index_path=index, live_session_checker=lambda *_: False)
+    parent = seed.create("Synthetic pause-race project", tags=["codex"])
+    child = seed.create("Synthetic pause-race child", fields={"parent_id": parent.id})
+    pause_manager = TaskManager(vault_path=vault, index_path=index, live_session_checker=lambda *_: False)
+    claim_manager = TaskManager(vault_path=vault, index_path=index, live_session_checker=lambda *_: False)
+    pause_service = ProjectTaskService(pause_manager)
+    barrier = threading.Barrier(2)
+    outcome: dict[str, object] = {}
+
+    def pause():
+        barrier.wait()
+        pause_service.pause_project(parent.id)
+
+    def claim():
+        barrier.wait()
+        try:
+            outcome["claim"] = claim_manager.claim_for_agent(
+                child.id,
+                pickup_tags={"codex"},
+                exclusion_tags=set(),
+                eligible_statuses={"todo"},
+            )[0]
+        except ProjectConflictError:
+            outcome["claim"] = False
+            outcome["claim_refused_paused"] = True
+
+    threads = [threading.Thread(target=pause), threading.Thread(target=claim)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+
+    rebuilt = TaskManager(vault_path=vault, index_path=index, live_session_checker=lambda *_: False)
+    paused_after = rebuilt.get(parent.id).fields.get("project_paused") == "true"
+    assert paused_after is True
+    if outcome["claim"]:
+        # The claim won the race before the pause took effect — a live claim
+        # is never retroactively undone by a pause that lands afterward.
+        assert rebuilt.get(child.id).status == "in_progress"
+    else:
+        # The pause won (or the claim otherwise lost) — the child was never
+        # claimed, and a paused-specific loss is reported distinctly.
+        assert rebuilt.get(child.id).status == "todo"

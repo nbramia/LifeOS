@@ -455,6 +455,27 @@ creator. Both fields are in `TaskManager.create`'s and
 `_guard_project_update`'s `internal_fields` sets, so neither create's raw
 `fields` dict nor an ordinary update can set or clear them.
 
+`pause_project`/`resume_project` set and clear three internal parent fields —
+`project_paused`, `project_paused_at`, `project_pause_reason` (`operator`,
+`owner_failed`, or `owner_budget`) — through the same `_project_operation`
+path, so they land in `TaskManager.create`'s and `_guard_project_update`'s
+`internal_fields` sets like every other project-lifecycle field. Pause
+enforcement lives entirely in `_project_claim_allowed`: a truthy
+`project_paused` on a child's parent refuses that child's claim and
+interactive Open exactly like a pending cancellation or handoff, and a
+`parent_project_paused` read field carries the same fact to task/board
+consumers next to `parent_handoff_pending`. `claim_for_agent` additionally
+raises `ProjectConflictError` (-> HTTP 409) the moment it observes a paused
+parent, both before and inside its CAS retry closure, so a worker's claim
+attempt gets an unambiguous refusal distinct from ordinary staleness — every
+other `_project_claim_allowed` refusal reason still returns the softer
+`(False, False)`. Pause does not touch `_guard_project_update`'s status/tags
+guards, so a child mid-turn when the pause takes effect keeps transitioning
+through its own lifecycle (running -> review) undisturbed, and Cancel and
+operator Complete on the project itself stay available. `plan_and_delegate`
+refuses a paused project outright, checked both before staging the
+coordinator session and again in the linking CAS precondition.
+
 `ProjectTaskService` composes the slower explicit actions:
 
 - start and completion mutate the ordinary parent without forging agent tags;

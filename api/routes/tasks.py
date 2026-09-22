@@ -357,6 +357,7 @@ class TaskResponse(BaseModel):
     hierarchy_error: Optional[str] = None
     parent_cancellation_pending: bool = False
     parent_handoff_pending: bool = False
+    parent_project_paused: bool = False
     project: Optional[dict] = None
 
     @classmethod
@@ -789,6 +790,8 @@ async def claim_agent_task(task_id: str):
             exclusion_tags=set(_AGENT_CLAIM_EXCLUSION_TAGS),
             eligible_statuses=set(_AGENT_PICKUP_STATUSES),
         )
+    except ProjectConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except TaskConflictError as e:
         raise HTTPException(status_code=409, detail=str(e))
     return ClaimAgentResponse(
@@ -947,6 +950,61 @@ async def cancel_project(task_id: str, body: CancelProjectRequest):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+class ProjectPauseRequest(BaseModel):
+    reason: Optional[str] = Field(
+        default=None,
+        description="operator | owner_failed | owner_budget. Defaults to operator.",
+    )
+
+
+@router.post("/{task_id}/project/pause", response_model=TaskResponse)
+async def pause_project(task_id: str, body: ProjectPauseRequest):
+    """Pause a project: blocks every child's worker claim and interactive
+    Open, and Plan and delegate, until resumed. A child already mid-turn
+    finishes normally and its result still lands in Review; Cancel and
+    operator Complete remain available. Agents may pause a project — only
+    Resume refuses an agent-attributed caller (see below)."""
+    manager = get_task_manager()
+    try:
+        task = _project_service(manager).pause_project(task_id, reason=body.reason or "operator")
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Task not found")
+    except ProjectConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (TaskConflictError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return _task_response(manager, task)
+
+
+@router.post("/{task_id}/project/resume", response_model=TaskResponse)
+async def resume_project(
+    task_id: str,
+    x_lifeos_agent_session: Optional[str] = Header(default=None, alias=AGENT_SESSION_HEADER),
+):
+    """Clear a project's paused state. Refused with 403 for a caller that
+    carries `AGENT_SESSION_HEADER` — only the operator (a request that sends
+    no header at all) may resume a paused project, so an agent that paused
+    one cannot silently undo it."""
+    if (x_lifeos_agent_session or "").strip():
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "agent_resume_forbidden",
+                "message": "Agents cannot resume a paused project; only the operator can.",
+            },
+        )
+    manager = get_task_manager()
+    try:
+        task = _project_service(manager).resume_project(task_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Task not found")
+    except ProjectConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except TaskConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return _task_response(manager, task)
 
 
 @router.post("/{task_id}/project/handoff/finalize")

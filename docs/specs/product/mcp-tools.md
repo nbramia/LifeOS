@@ -33,10 +33,10 @@ The LifeOS MCP server dynamically discovers endpoints from the LifeOS OpenAPI sp
 - Formatted responses for human readability
 - Fallback schemas when API unavailable
 
-The source catalog contains 69 curated LifeOS endpoint tools. It also
+The source catalog contains 71 curated LifeOS endpoint tools. It also
 registers 10 worker coordination tools (`lifeos_agent_*`), including
-`lifeos_agent_project_handoff` and `lifeos_agent_execution_override`, for a
-79-tool fallback catalog. When the
+`lifeos_agent_project_handoff` and `lifeos_agent_execution_override`, for an
+81-tool fallback catalog. When the
 OpenAPI document omits an unavailable endpoint, the live list may be smaller;
 the inter-agent tools remain registered as a separate contract.
 
@@ -102,6 +102,8 @@ Tasks can also be managed via natural language chat. See [Task Management spec](
 | `lifeos_project_complete` | Complete a project after every child and coordination guard passes; cancelled children require explicit reduced-scope acknowledgement |
 | `lifeos_project_plan` | Start or recover an idempotent agent-owner planning/delegation run |
 | `lifeos_project_cancel` | Preview cancellation scope, then confirm a resumable cascading cancellation with a stable operation ID |
+| `lifeos_project_pause` | Pause a project: blocks child claims, Open, and Plan and delegate until resumed; a mid-turn child still finishes into Review |
+| `lifeos_project_resume` | Resume a paused project; refused with 403 for an agent-attributed caller — only the operator can resume |
 | `lifeos_task_resume_execution` | Resume a paused ordinary task after its final child link is removed |
 | `lifeos_agent_project_handoff` | The current executor turn stages an ordinary top-level task as a one-level durable project and then ends; children remain blocked until that turn has stopped and been verified |
 

@@ -550,13 +550,43 @@ def test_call_api_sends_no_agent_session_header_for_interactive_operator():
 
 @pytest.mark.unit
 def test_call_api_agent_session_header_scoped_to_task_create_and_update():
-    """The header is only added on the two curated task-write tools, not on
-    every other write."""
+    """The header is only added on the curated task-write and project-resume
+    tools, not on every other write."""
     module = _load_mcp_module()
     server = module.LifeOSMCPServer(trusted_session_id="sess-stdio-worker")
     server.client = _stub_client()
 
     server._call_api("lifeos_gmail_draft", {"to": "x@y", "subject": "hi", "body": "ok"})
+
+    headers = server.client.post.call_args.kwargs["headers"] or {}
+    assert module.AGENT_SESSION_HEADER not in headers
+
+
+@pytest.mark.unit
+def test_call_api_sends_agent_session_header_for_project_resume():
+    """`lifeos_project_resume` carries the caller-asserted worker identity
+    too, so `POST /api/tasks/{id}/project/resume` can refuse an
+    agent-attributed caller — see `AGENT_SESSION_HEADER` in
+    `api/routes/tasks.py`."""
+    module = _load_mcp_module()
+    server = module.LifeOSMCPServer(trusted_session_id="sess-stdio-worker")
+    server.client = _stub_client()
+
+    server._call_api("lifeos_project_resume", {"task_id": "proj1234"})
+
+    headers = server.client.post.call_args.kwargs["headers"]
+    assert headers[module.AGENT_SESSION_HEADER] == "sess-stdio-worker"
+
+
+@pytest.mark.unit
+def test_call_api_does_not_send_agent_session_header_for_project_pause():
+    """Agents are allowed to pause a project, so `lifeos_project_pause` does
+    not need caller-asserted identity."""
+    module = _load_mcp_module()
+    server = module.LifeOSMCPServer(trusted_session_id="sess-stdio-worker")
+    server.client = _stub_client()
+
+    server._call_api("lifeos_project_pause", {"task_id": "proj1234"})
 
     headers = server.client.post.call_args.kwargs["headers"] or {}
     assert module.AGENT_SESSION_HEADER not in headers

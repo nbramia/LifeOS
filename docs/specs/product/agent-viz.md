@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-09-20
+> **Last Updated:** 2026-09-22
 
 `/agents` is a Kanban board of the operator's work queue — vault tasks, agent questions, and scheduled work in one place, organized into lanes by status and tag. A **Graph** tab shows a deterministic delegation timeline as a secondary, read-mostly view for watching what's actively running: every LifeOS agent worker task (`#agent`-tagged), local CLI sessions discovered on the filesystem from both Claude Code (`~/.claude/projects/`) and Codex (`~/.codex/sessions/`), and Claude Code / Codex sessions registered from **any other machine** on the tailnet via a lightweight hook script.
 
@@ -41,6 +41,13 @@ Project cards show a compact resolved/total count; child cards keep their normal
 Opening a project uses a wider drawer. Its notes remain the objective and acceptance criteria, while the project section shows progress states, owner, coordination state and result, and an authoritative child list. Each child opens its normal drawer, can be assigned independently, and can be detached or moved to another project; the project drawer can also create a new linked child or attach an existing task by ID. Creating or attaching a child never silently copies the parent's assignment or starts work.
 
 **Start project** marks a project active without pretending its owner executed the child work. **Plan and delegate** starts one bounded coordination run for the assigned owner; the drawer exposes that run's state, result, and session. **Complete project** requires every child to be resolved and any coordinator/cancellation work to be finished; closing with cancelled children asks for an explicit reduced-scope acknowledgement. **Cancel project** first previews unfinished, running, and awaiting-review work, then confirms a cascade that preserves completed work and pending-review output without accepting it. A partial cancellation remains visibly pending until its stop failures can be retried.
+
+**Pause project** blocks every child's worker claim and interactive Open, and
+disables **Plan and delegate**, without stopping a child already mid-turn —
+its result still lands in Review normally. The drawer shows **Paused
+(reason)** and swaps the action for **Resume project**, which clears the
+paused state so claims and Open succeed again. **Cancel project** and
+**Complete project** stay available while paused.
 
 A project created by an executor handoff can show **Handoff pending** in this
 same drawer. Its message explains that child execution remains blocked until

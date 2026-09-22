@@ -483,6 +483,7 @@ def project_action_policy(
     live = bool(coordinator.get("live"))
     pending = bool(summary.get("cancellation_pending"))
     handoff_pending = bool(handoff_pending or summary.get("handoff_pending"))
+    paused = bool(summary.get("paused"))
     is_project = bool(project_summary)
     terminal = (current_status or "").lower() in {"done", "cancelled"}
     agent_owner = derive_assignee(current_tags) in AGENT_ASSIGNEES
@@ -493,7 +494,7 @@ def project_action_policy(
         ),
         "can_plan_project": bool(
             is_project and agent_owner and hierarchy_valid and not terminal and not live
-            and not pending and not handoff_pending
+            and not pending and not handoff_pending and not paused
         ),
         "can_complete_project": bool(
             is_project and hierarchy_valid and not terminal and not live and not pending
@@ -508,6 +509,19 @@ def project_action_policy(
         "can_resume_execution": bool(
             not is_project and execution_paused and hierarchy_valid and not pending
             and not handoff_pending
+        ),
+        # Pause never depends on `live` — pausing a running project is the
+        # whole point (it stops new child claims while current work
+        # finishes). Resume is refused for an agent-attributed caller at the
+        # route layer, not here — this policy only decides whether the
+        # action is offered at all.
+        "can_pause_project": bool(
+            is_project and hierarchy_valid and not terminal
+            and not pending and not handoff_pending and not paused
+        ),
+        "can_resume_project": bool(
+            is_project and hierarchy_valid and not terminal
+            and not pending and not handoff_pending and paused
         ),
     }
 

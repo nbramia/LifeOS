@@ -143,6 +143,15 @@ than accepted. A failed or unverifiable stop leaves cancellation pending and
 reports the remaining session so the same operation can be retried. Cancelling
 one child never cancels siblings or its parent.
 
+Pause and resume give a project a temporary hold, distinct from cancellation:
+pausing blocks every child's worker claim and interactive Open, and refuses
+Plan and delegate, without stopping anything already running — a child that's
+mid-turn when the pause takes effect finishes normally and its result still
+lands in Review. Cancel and operator Complete remain available while paused.
+An agent may pause a project (for example, ahead of an automatic pause after
+repeated owner failures); only the operator may resume one, so a pause an
+agent applies can't be silently undone by agent action.
+
 An ordinary top-level task currently owned by an executor can be converted into
 a project with `lifeos_agent_project_handoff`. This is a terminal action for
 that exact executor turn, not ordinary child attachment: the caller submits a

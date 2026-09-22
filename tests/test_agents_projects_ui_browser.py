@@ -44,6 +44,7 @@ def _policy():
         "can_start_project": True, "can_plan_project": True,
         "can_complete_project": True, "can_cancel_project": True,
         "can_resume_execution": False,
+        "can_pause_project": True, "can_resume_project": False,
     }
 
 
@@ -66,6 +67,7 @@ def _state():
                    project={
                        "child_count": 8, "resolved_count": 2, "ready_to_close": False,
                        "execution_paused": True, "cancellation_pending": False,
+                       "paused": False, "pause_reason": None,
                        "counts": {"done": 1, "awaiting_review": 1, "cancelled": 1,
                                   "blocked": 4, "running": 1, "unassigned": 0, "assigned": 0},
                        "coordinator": {"session_id": "coord-1", "status": "running", "live": True,
@@ -309,6 +311,49 @@ def test_pending_project_cancellation_reuses_preview_operation_id(page: Page, ag
         {"confirm": False, "operation_id": None},
         {"confirm": True, "operation_id": retry_operation_id},
     ]
+
+
+def test_pause_project_action_posts_to_the_pause_endpoint(page: Page, agents_base_url):
+    state, seen = _state(), []
+    _open(page, agents_base_url, state, seen)
+    page.locator('[data-card-id="project-1"]').click()
+
+    with page.expect_request(lambda request: (
+        request.method == "POST"
+        and request.url.rstrip("/").endswith("/api/tasks/project-1/project/pause")
+    )) as request_info:
+        page.locator('[data-action="project-pause"]').click()
+
+    assert request_info.value.post_data_json == {}
+    expect(page.locator('[data-action="project-resume"]')).to_have_count(0)
+
+
+def test_paused_project_shows_reason_and_offers_resume(page: Page, agents_base_url):
+    state, seen = _state(), []
+    project = state["lanes"]["assigned"][0]["project"]
+    project["paused"] = True
+    project["pause_reason"] = "owner_failed"
+    state["lanes"]["assigned"][0]["policy"] = {
+        **_policy(), "can_pause_project": False, "can_resume_project": True,
+    }
+    _open(page, agents_base_url, state, seen)
+    page.locator('[data-card-id="project-1"]').click()
+
+    expect(page.locator('[data-field="project-paused"]')).to_contain_text("Paused (owner_failed)")
+    expect(page.locator('[data-action="project-pause"]')).to_have_count(0)
+    expect(page.locator('[data-action="project-resume"]')).to_be_enabled()
+    # Cancel and Complete stay available while paused — pause never blocks
+    # the operator's own terminal actions on the project.
+    expect(page.locator('[data-action="project-cancel"]')).to_be_enabled()
+    expect(page.locator('[data-action="project-complete"]')).to_be_enabled()
+
+    with page.expect_request(lambda request: (
+        request.method == "POST"
+        and request.url.rstrip("/").endswith("/api/tasks/project-1/project/resume")
+    )) as request_info:
+        page.locator('[data-action="project-resume"]').click()
+
+    assert request_info.value.post_data_json == {}
 
 
 def test_pending_handoff_is_visible_and_keeps_project_cancellation_available(page: Page, agents_base_url):

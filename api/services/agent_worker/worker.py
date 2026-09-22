@@ -3781,6 +3781,7 @@ class Worker:
                 or task.get("hierarchy_valid") is False
                 or task.get("parent_cancellation_pending")
                 or task.get("parent_handoff_pending")
+                or task.get("parent_project_paused")
             ):
                 continue
             if str((task.get("fields") or {}).get("execution_paused", "")).lower() in {
@@ -3854,6 +3855,7 @@ class Worker:
             and task.get("hierarchy_valid") is not False
             and not task.get("parent_cancellation_pending")
             and not task.get("parent_handoff_pending")
+            and not task.get("parent_project_paused")
             and str(fields.get("execution_paused", "")).lower() not in {"1", "true", "yes", "on"}
         )
 
@@ -3870,6 +3872,7 @@ class Worker:
             and task.get("hierarchy_valid") is not False
             and not task.get("parent_cancellation_pending")
             and not task.get("parent_handoff_pending")
+            and not task.get("parent_project_paused")
             and str(fields.get("execution_paused", "")).lower() not in {"1", "true", "yes", "on"}
         )
 
@@ -3902,6 +3905,7 @@ class Worker:
             or task.get("hierarchy_valid") is False
             or task.get("parent_cancellation_pending")
             or task.get("parent_handoff_pending")
+            or task.get("parent_project_paused")
             or str(fields.get("execution_paused", "")).lower() in {"1", "true", "yes", "on"}
         ):
             self._fail_closed_task_resume(session, phase)

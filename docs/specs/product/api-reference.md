@@ -415,10 +415,12 @@ List/filter tasks.
 
 Every task item includes additive hierarchy fields: `parent_id`,
 `parent_title`, `is_project`, `child_count`, `hierarchy_valid`,
-`hierarchy_error`, `parent_cancellation_pending`, and `project`. `project` is `null` for an ordinary task;
+`hierarchy_error`, `parent_cancellation_pending`, `parent_handoff_pending`,
+`parent_project_paused`, and `project`. `project` is `null` for an ordinary task;
 for a derived project it contains full-set progress counts,
-`ready_to_close`, execution-pause/cancellation state, and the linked
-coordinator status/result. Counts are computed before these query filters.
+`ready_to_close`, execution-pause/cancellation/handoff/paused state (`paused`,
+`pause_reason`), and the linked coordinator status/result. Counts are
+computed before these query filters.
 
 ### GET /api/tasks/conflicts
 
@@ -526,6 +528,31 @@ The response reports `complete`, `pending`, cancelled/preserved/abandoned child
 IDs, stopped session IDs, and exact failures. A partial result keeps the
 operation pending; retry with the same ID after resolving the reported stop.
 A different ID returns **409** while intent is pending.
+
+### POST /api/tasks/{id}/project/pause
+
+Pause a project:
+
+```json
+{ "reason": "operator" }
+```
+
+`reason` is optional (defaults to `operator`; the only other recognized
+values are `owner_failed` and `owner_budget`, both reserved for automatic
+pauses). Returns the enriched parent task. While paused, every child's
+worker claim returns **409** and interactive Open and Plan and delegate are
+refused; a child already mid-turn is unaffected and its result still lands
+in Review. Cancel and operator Complete remain available. Returns **409**
+for an ordinary task or pending cancellation/handoff, **422** for an
+unrecognized `reason`.
+
+### POST /api/tasks/{id}/project/resume
+
+Clear a project's paused state, so claims, Open, and Plan and delegate
+succeed again. Refused with **403**
+`{"code": "agent_resume_forbidden", ...}` for a caller that carries
+`X-LifeOS-Agent-Session` — only the operator (no header) may resume a
+project an agent paused.
 
 ### POST /api/tasks/{id}/resume-execution
 

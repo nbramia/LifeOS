@@ -47,6 +47,8 @@ def test_candidate_filter_excludes_projects_paused_and_invalid(tmp_path: Path):
         {"id": "paused01", "status": "todo", "tags": ["codex"], "fields": {"execution_paused": "true"}, "is_project": False, "hierarchy_valid": True},
         {"id": "invalid1", "status": "todo", "tags": ["codex"], "fields": {}, "is_project": False, "hierarchy_valid": False},
         {"id": "cancel01", "status": "todo", "tags": ["codex"], "fields": {}, "is_project": False, "hierarchy_valid": True, "parent_cancellation_pending": True},
+        {"id": "handoff01", "status": "todo", "tags": ["codex"], "fields": {}, "is_project": False, "hierarchy_valid": True, "parent_handoff_pending": True},
+        {"id": "prjpaused1", "status": "todo", "tags": ["codex"], "fields": {}, "is_project": False, "hierarchy_valid": True, "parent_project_paused": True},
     ]
 
     def handler(request: httpx.Request):
@@ -56,6 +58,34 @@ def test_candidate_filter_excludes_projects_paused_and_invalid(tmp_path: Path):
 
     worker = _worker(tmp_path, handler)
     assert [task["id"] for task in worker._list_agent_tasks()] == ["plain001"]
+
+
+def test_claim_current_checks_reject_a_paused_project_parent(tmp_path: Path):
+    """`_task_claim_is_current`/`_claim_is_current`/`_revalidate_task_resume`
+    all fail closed for a child whose parent project is paused — the same
+    shape as an existing pending cancellation/handoff."""
+    task = {
+        "id": "child01", "status": "in_progress", "tags": ["codex", "agent-running"],
+        "fields": {}, "is_project": False, "hierarchy_valid": True,
+        "parent_project_paused": True,
+    }
+
+    def handler(request: httpx.Request):
+        if request.url.path == "/api/tasks/child01":
+            return httpx.Response(200, json=task)
+        return httpx.Response(404)
+
+    worker = _worker(tmp_path, handler)
+    assert worker._task_claim_is_current(task) is False
+    assert worker._claim_is_current("child01") is False
+
+    from api.services.agent_worker.session_store import Session
+
+    session = Session(
+        task_id="child01", session_id="sess-child01",
+        status="blocked", started_at=0, last_activity_at=0,
+    )
+    assert worker._revalidate_task_resume(session, "phase", {"codex"}) is None
 
 
 def test_child_dispatch_context_is_bounded_to_its_project(tmp_path: Path):
