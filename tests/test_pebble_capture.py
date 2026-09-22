@@ -21,6 +21,8 @@ from api.services.pebble_capture import (
     PebbleCaptureConsumer,
     PebbleCaptureError,
     PebbleJournalClassifier,
+    PlannedAction,
+    _segment_transcript,
     _validated_classifier_actions,
     parse_framed_blocks,
     ready_result,
@@ -1379,13 +1381,23 @@ class _FakeJevClient:
         return self.answers
 
 
-def _jev_answers(*, disposition, confidence=0.9, item="none", work="none", executor="none"):
-    return {
+def _jev_answers(
+    *, disposition, confidence=0.9, item="none", work="none", executor="none",
+    structure=None, structure_confidence=0.9, parent=None, req=None,
+):
+    answers = {
         "disposition": {"choice": disposition, "confidence": confidence},
         "item": {"choice": item, "confidence": 0.9},
         "work": {"choice": work, "confidence": 0.9},
         "executor": {"choice": executor, "confidence": 0.9},
     }
+    if structure is not None:
+        answers["structure"] = {"choice": structure, "confidence": structure_confidence}
+    if parent is not None:
+        answers["parent"] = {"choice": parent, "confidence": 0.9}
+    for key, noul in (req or {}).items():
+        answers[f"req_{key}"] = {"noul": noul}
+    return answers
 
 
 @pytest.mark.asyncio
@@ -2260,3 +2272,442 @@ def test_watcher_stop_drains_active_consumer_and_cancels_queued_work(tmp_path):
     assert not stopper.is_alive()
     assert consumer.capture_ids == ["capture-1"]
     assert not watcher.is_alive()
+
+
+# --------------------------------------------------------------------------
+# PlannedAction.parent_index: to_dict round-trip and backward-compatible
+# loading of a plan stored before the field existed.
+
+
+def test_planned_action_to_dict_includes_parent_index():
+    action = PlannedAction(kind="task", title="Synthetic child", index=1, parent_index=0)
+    assert action.to_dict()["parent_index"] == 0
+    assert PlannedAction(kind="task", title="Synthetic parent", index=0).to_dict()["parent_index"] is None
+
+
+def test_ledger_loads_a_plan_stored_before_parent_index_existed(tmp_path):
+    ledger = CaptureLedger(tmp_path / "ledger.sqlite")
+    identity = CaptureIdentity("synthetic-pebble", "capture-1")
+    old_item = {
+        "kind": "task", "title": "Old synthetic task", "index": 0, "due_date": "",
+        "schedule_type": "", "schedule_value": "", "timezone": "", "action": "",
+        "executor": "", "message": "", "tags": [], "delegation_evidence": "",
+        "action_evidence": "", "human_key": "", "decision_evidence": "",
+    }
+    with ledger._connect() as db:
+        db.execute(
+            "INSERT INTO pebble_captures (source_id,capture_id,revision,payload_digest,plan_json,state) "
+            "VALUES (?, ?, ?, ?, ?, 'planned')",
+            (identity.source_id, identity.capture_id, "1", "digest", json.dumps([old_item])),
+        )
+    [loaded] = ledger.load_plan(identity)
+    assert loaded.parent_index is None
+    assert loaded.title == "Old synthetic task"
+
+
+# --------------------------------------------------------------------------
+# validate_plan: parent_index acceptance and rejection.
+
+
+def test_validate_plan_links_a_child_to_an_earlier_parent():
+    transcript = "Renovate the synthetic garage. Clear the synthetic shelves."
+    actions = [
+        {"kind": "task", "index": 0, "title": "Renovate the synthetic garage",
+         "action_evidence": "Renovate the synthetic garage"},
+        {"kind": "task", "index": 1, "title": "Clear the synthetic shelves",
+         "action_evidence": "Clear the synthetic shelves", "parent_index": 0},
+    ]
+    [parent, child] = validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    assert parent.parent_index is None
+    assert child.parent_index == 0
+
+
+@pytest.mark.parametrize(
+    ("actions", "case"),
+    [
+        (
+            [{"kind": "task", "index": 0, "title": "A", "action_evidence": "a", "parent_index": 0}],
+            "names its own index",
+        ),
+        (
+            [{"kind": "task", "index": 0, "title": "A", "action_evidence": "a", "parent_index": 5}],
+            "missing from the plan",
+        ),
+        (
+            [
+                {"kind": "task", "index": 0, "title": "A", "action_evidence": "a", "parent_index": 1},
+                {"kind": "task", "index": 1, "title": "B", "action_evidence": "b"},
+            ],
+            "names a later action",
+        ),
+        (
+            [
+                {"kind": "task", "index": 0, "title": "A", "action_evidence": "a"},
+                {"kind": "task", "index": 1, "title": "B", "action_evidence": "b", "parent_index": 0},
+                {"kind": "task", "index": 2, "title": "C", "action_evidence": "c", "parent_index": 1},
+            ],
+            "names an action that itself has a parent_index",
+        ),
+        (
+            [{"kind": "task", "index": 0, "title": "A", "action_evidence": "a", "parent_index": True}],
+            "is a bool, not an int",
+        ),
+        (
+            [{"kind": "task", "index": 0, "title": "A", "action_evidence": "a", "parent_index": "0"}],
+            "is a string, not an int",
+        ),
+    ],
+)
+def test_validate_plan_rejects_an_invalid_parent_index(actions, case):
+    with pytest.raises(PebbleCaptureError):
+        validate_plan(actions, transcript="Synthetic transcript.", recorded_at="2030-01-01T10:00:00Z")
+
+
+def test_validate_plan_rejects_a_parent_naming_a_non_task_action():
+    transcript = "I need to decide which synthetic option to approve. Do the synthetic follow-up."
+    actions = [
+        {"kind": "human", "index": 0, "title": "Choose synthetic option", "decision_evidence": transcript},
+        {"kind": "task", "index": 1, "title": "Follow up", "action_evidence": "Do the synthetic follow-up",
+         "parent_index": 0},
+    ]
+    with pytest.raises(PebbleCaptureError):
+        validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+
+
+def test_validate_plan_rejects_a_child_whose_parent_was_dropped_for_reused_evidence():
+    """A parent dropped for reusing an earlier action's evidence span never
+    reaches ``result``, so a child naming it can't link to nothing."""
+    transcript = "Handle the synthetic review."
+    actions = [
+        {"kind": "task", "index": 0, "title": "First", "action_evidence": "handle the synthetic review"},
+        {"kind": "task", "index": 1, "title": "Duplicate", "action_evidence": "handle the synthetic review"},
+        {"kind": "task", "index": 2, "title": "Child", "action_evidence": "handle it too", "parent_index": 1},
+    ]
+    with pytest.raises(PebbleCaptureError):
+        validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+
+
+def test_validate_plan_rejects_a_plain_child_under_a_delegated_parent():
+    """A task delegated to an agent executor never becomes a hierarchy
+    parent, even for an otherwise-plain child naming it."""
+    transcript = "Assign the synthetic audit to Codex. Update the synthetic ledger."
+    actions = [
+        {"kind": "task", "index": 0, "title": "Assign the synthetic audit to Codex",
+         "tags": ["codex"], "delegation_evidence": "Assign the synthetic audit to Codex",
+         "action_evidence": "the synthetic audit"},
+        {"kind": "task", "index": 1, "title": "Update the synthetic ledger",
+         "action_evidence": "Update the synthetic ledger", "parent_index": 0},
+    ]
+    with pytest.raises(PebbleCaptureError):
+        validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+
+
+def test_validate_plan_rejects_a_delegated_child_under_a_plain_parent():
+    """A child that is itself delegated to an agent executor can't join the
+    hierarchy, even when the named parent is a plain, undelegated task."""
+    transcript = "Fix the synthetic pipe. Assign the synthetic report to Claude."
+    actions = [
+        {"kind": "task", "index": 0, "title": "Fix the synthetic pipe",
+         "action_evidence": "Fix the synthetic pipe"},
+        {"kind": "task", "index": 1, "title": "Assign the synthetic report to Claude",
+         "tags": ["claude"], "delegation_evidence": "Assign the synthetic report to Claude",
+         "action_evidence": "the synthetic report", "parent_index": 0},
+    ]
+    with pytest.raises(PebbleCaptureError):
+        validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+
+
+def test_validate_plan_links_a_plain_child_to_a_me_tagged_parent():
+    """``#me`` is a valid assignee but not an agent-executor tag, so a
+    ``#me`` task may still be named as a parent."""
+    transcript = (
+        "Charge the synthetic earbuds and assign it to me. "
+        "Plug in the synthetic charger."
+    )
+    actions = [
+        {"kind": "task", "index": 0, "title": "Charge the synthetic earbuds",
+         "tags": ["me"],
+         "delegation_evidence": "Charge the synthetic earbuds and assign it to me",
+         "action_evidence": "charge the synthetic earbuds"},
+        {"kind": "task", "index": 1, "title": "Plug in the synthetic charger",
+         "action_evidence": "Plug in the synthetic charger", "parent_index": 0},
+    ]
+    [parent, child] = validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    assert parent.tags == ("me",)
+    assert child.parent_index == 0
+
+
+# --------------------------------------------------------------------------
+# PebbleCaptureConsumer: ordered parent-then-children application, holding a
+# child whose parent isn't applied yet, and no-op replay.
+
+
+_PROJECT_ACTIONS = [
+    {"kind": "task", "index": 0, "title": "Renovate the synthetic garage",
+     "action_evidence": "Renovate the synthetic garage"},
+    {"kind": "task", "index": 1, "title": "Clear the synthetic shelves",
+     "action_evidence": "Clear the synthetic shelves", "parent_index": 0},
+    {"kind": "task", "index": 2, "title": "Buy synthetic paint",
+     "action_evidence": "Buy synthetic paint", "parent_index": 0},
+]
+
+
+@pytest.mark.asyncio
+async def test_consumer_creates_the_parent_first_then_children_with_parent_id(stores):
+    ledger, tasks, schedules = stores
+    consumer = PebbleCaptureConsumer(ledger, tasks, schedules, _Classifier(_PROJECT_ACTIONS), apply=True)
+    payload = {**_payload(), "final_text": "Make a project to renovate the synthetic garage."}
+    assert await consumer.process(payload) == "complete"
+    by_title = {task.description: task for task in tasks.list_tasks()}
+    parent = by_title["Renovate the synthetic garage"]
+    assert by_title["Clear the synthetic shelves"].fields.get("parent_id") == parent.id
+    assert by_title["Buy synthetic paint"].fields.get("parent_id") == parent.id
+
+
+@pytest.mark.asyncio
+async def test_consumer_holds_a_child_while_its_parent_is_claimed_by_another_worker(stores):
+    ledger, tasks, schedules = stores
+    consumer = PebbleCaptureConsumer(
+        ledger, tasks, schedules,
+        _Classifier(_PROJECT_ACTIONS[:2]),
+        apply=True,
+    )
+    payload = {**_payload(), "final_text": "Make a project to renovate the synthetic garage."}
+    identity, _revision, _final_text = ready_result(payload)
+    # Simulate another worker's live claim on the parent's effect (mid-lease,
+    # not yet applied): the child must not be created.
+    with ledger._connect() as db:
+        db.execute(
+            "INSERT INTO pebble_effects "
+            "(source_id,capture_id,action_index,operation_key,object_kind,object_id,state,claimed_at,generation) "
+            "VALUES (?, ?, 0, 'synthetic-op-0', NULL, NULL, 'applying', ?, 1)",
+            (identity.source_id, identity.capture_id, time.time()),
+        )
+    assert await consumer.process(payload) == "in_progress"
+    assert tasks.list_tasks() == []
+
+
+@pytest.mark.asyncio
+async def test_consumer_replay_of_a_fully_applied_project_creates_nothing(stores):
+    ledger, tasks, schedules = stores
+    classifier = _Classifier(_PROJECT_ACTIONS)
+    consumer = PebbleCaptureConsumer(ledger, tasks, schedules, classifier, apply=True)
+    payload = {**_payload(), "final_text": "Make a project to renovate the synthetic garage."}
+    assert await consumer.process(payload) == "complete"
+    assert len(tasks.list_tasks()) == 3
+    assert await consumer.process(payload) == "complete"
+    assert len(tasks.list_tasks()) == 3
+    assert classifier.calls == 1
+
+
+# --------------------------------------------------------------------------
+# JevPebbleClassifier: the "structure" shape (single/separate/project),
+# which fragments were requested, and which fragment names the parent.
+
+
+@pytest.mark.asyncio
+async def test_jev_classifier_separate_structure_files_each_requested_fragment():
+    transcript = (
+        "Make tasks to charge the synthetic earbuds, order the synthetic filters, "
+        "and call the synthetic vet."
+    )
+    client = _FakeJevClient(_jev_answers(
+        disposition="task", structure="separate", req={"s0": 0.9, "s1": 0.9, "s2": 0.9},
+    ))
+    actions = await JevPebbleClassifier(client=client).classify(transcript, "2030-01-01T10:00:00Z")
+    assert [action["title"] for action in actions] == [
+        "Charge the synthetic earbuds", "Order the synthetic filters", "Call the synthetic vet",
+    ]
+    assert all(action.get("parent_index") is None for action in actions)
+    validated = validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    assert len(validated) == 3
+
+
+@pytest.mark.asyncio
+async def test_jev_classifier_project_structure_links_children_to_the_named_parent():
+    transcript = (
+        "Make a project to renovate the synthetic garage with subtasks clear the shelves, "
+        "buy paint, and paint the walls."
+    )
+    client = _FakeJevClient(_jev_answers(
+        disposition="task", structure="project", parent="s0",
+        req={"s0": 0.9, "s1": 0.9, "s2": 0.9, "s3": 0.9},
+    ))
+    actions = await JevPebbleClassifier(client=client).classify(transcript, "2030-01-01T10:00:00Z")
+    assert actions[0]["title"] == "Renovate the synthetic garage"
+    assert actions[0].get("parent_index") is None
+    assert [action["title"] for action in actions[1:]] == [
+        "Clear the shelves", "Buy paint", "Paint the walls",
+    ]
+    assert all(action["parent_index"] == 0 for action in actions[1:])
+    validated = validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    assert len(validated) == 4
+
+
+@pytest.mark.asyncio
+async def test_jev_classifier_fragment_below_requested_floor_is_not_filed():
+    transcript = "Make tasks to charge the synthetic earbuds and maybe order the synthetic filters."
+    client = _FakeJevClient(_jev_answers(
+        disposition="task", structure="separate", req={"s0": 0.9, "s1": 0.4},
+    ))
+    [action] = await JevPebbleClassifier(client=client).classify(transcript, "2030-01-01T10:00:00Z")
+    assert action["title"] == "Charge the synthetic earbuds"
+
+
+@pytest.mark.asyncio
+async def test_jev_classifier_project_with_an_unrequested_parent_falls_back_to_separate():
+    transcript = "Make tasks to charge the synthetic earbuds and order the synthetic filters."
+    client = _FakeJevClient(_jev_answers(
+        disposition="task", structure="project", parent="s1", req={"s0": 0.9, "s1": 0.4},
+    ))
+    actions = await JevPebbleClassifier(client=client).classify(transcript, "2030-01-01T10:00:00Z")
+    assert [action["title"] for action in actions] == ["Charge the synthetic earbuds"]
+    assert all(action.get("parent_index") is None for action in actions)
+
+
+@pytest.mark.asyncio
+async def test_jev_classifier_project_with_no_named_parent_falls_back_to_separate():
+    transcript = "Make tasks to charge the synthetic earbuds and order the synthetic filters."
+    client = _FakeJevClient(_jev_answers(
+        disposition="task", structure="project", parent="none", req={"s0": 0.9, "s1": 0.9},
+    ))
+    actions = await JevPebbleClassifier(client=client).classify(transcript, "2030-01-01T10:00:00Z")
+    assert len(actions) == 2
+    assert all(action.get("parent_index") is None for action in actions)
+
+
+@pytest.mark.asyncio
+async def test_jev_classifier_never_yields_more_than_eight_actions_and_always_keeps_the_parent():
+    fragments = ", ".join(f"do synthetic thing {i}" for i in range(10))
+    transcript = f"Make a project to organize synthetic errands with subtasks {fragments}."
+    req = {"s0": 0.9, **{f"s{i + 1}": 0.9 for i in range(10)}}
+    client = _FakeJevClient(_jev_answers(disposition="task", structure="project", parent="s0", req=req))
+    actions = await JevPebbleClassifier(client=client).classify(transcript, "2030-01-01T10:00:00Z")
+    assert len(actions) == 8
+    assert actions[0].get("parent_index") is None
+    assert all(action["parent_index"] == 0 for action in actions[1:])
+
+
+@pytest.mark.asyncio
+async def test_jev_classifier_single_structure_keeps_current_single_task_behavior():
+    """An explicit ``structure="single"`` answer must produce the exact same
+    plan as the pre-existing single-item path, including ``#me`` and title
+    cleanup -- see the sibling non-parametrized regression test above."""
+    transcript = "Make a task to charge the synthetic earbuds and assign it to me."
+    client = _FakeJevClient(_jev_answers(disposition="task", item="s0", structure="single"))
+    raw = await JevPebbleClassifier(client=client).classify(transcript, "2030-01-01T10:00:00Z")
+    [action] = validate_plan(raw, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    assert action.title == "Charge the synthetic earbuds"
+    assert action.tags == ("me",)
+
+
+@pytest.mark.asyncio
+async def test_jev_classifier_missing_structure_answer_keeps_current_single_task_behavior():
+    """No ``structure`` answer at all (an older Jev model) behaves exactly
+    like today's single-item classification."""
+    transcript = "Add a task to buy synthetic milk and feed the cat"
+    client = _FakeJevClient(_jev_answers(disposition="task", item="s0"))
+    [action] = await JevPebbleClassifier(client=client).classify(transcript, "2030-01-01T10:00:00Z")
+    assert action["title"] == "Buy synthetic milk"
+
+
+@pytest.mark.asyncio
+async def test_jev_classifier_low_confidence_structure_falls_back_to_single():
+    transcript = "Make tasks to charge the synthetic earbuds and order the synthetic filters."
+    client = _FakeJevClient(_jev_answers(
+        disposition="task", item="none", structure="separate", structure_confidence=0.2,
+        req={"s0": 0.9, "s1": 0.9},
+    ))
+    actions = await JevPebbleClassifier(client=client).classify(transcript, "2030-01-01T10:00:00Z")
+    assert len(actions) == 1
+
+
+@pytest.mark.asyncio
+async def test_jev_classifier_only_the_first_action_may_carry_me_in_a_list():
+    transcript = (
+        "Make tasks to charge the synthetic earbuds and order the synthetic filters "
+        "and assign it to me."
+    )
+    client = _FakeJevClient(_jev_answers(
+        disposition="task", structure="separate", req={"s0": 0.9, "s1": 0.9},
+    ))
+    raw = await JevPebbleClassifier(client=client).classify(transcript, "2030-01-01T10:00:00Z")
+    validated = validate_plan(raw, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    assert validated[0].tags == ("me",)
+    assert all(action.tags == () for action in validated[1:])
+
+
+@pytest.mark.asyncio
+async def test_jev_classifier_only_the_parent_may_carry_me_in_a_project():
+    transcript = (
+        "Make a project to renovate the synthetic garage with subtasks clear the shelves "
+        "and assign it to me."
+    )
+    client = _FakeJevClient(_jev_answers(
+        disposition="task", structure="project", parent="s0", req={"s0": 0.9, "s1": 0.9},
+    ))
+    raw = await JevPebbleClassifier(client=client).classify(transcript, "2030-01-01T10:00:00Z")
+    validated = validate_plan(raw, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    assert validated[0].tags == ("me",)
+    assert validated[1].tags == ()
+
+
+# --------------------------------------------------------------------------
+# _segment_transcript: the new "with sub-tasks"/"with steps" and
+# colon-followed-by-whitespace split points, and the colon-in-a-clock-time
+# non-split.
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    ["with subtasks", "with sub-tasks", "with steps"],
+)
+def test_segment_transcript_splits_on_with_subtasks_variants(phrase):
+    text = f"Renovate the synthetic garage {phrase} clear the shelves"
+    assert _segment_transcript(text) == ["Renovate the synthetic garage", "clear the shelves"]
+
+
+@pytest.mark.parametrize("connector", ["of", "like", "including"])
+def test_segment_transcript_with_subtasks_optionally_followed_by_a_connector_word(connector):
+    text = f"Renovate the synthetic garage with subtasks {connector} clear the shelves"
+    assert _segment_transcript(text) == ["Renovate the synthetic garage", "clear the shelves"]
+
+
+def test_segment_transcript_splits_on_a_colon_followed_by_whitespace():
+    assert _segment_transcript("Renovate the synthetic garage: clear the shelves") == [
+        "Renovate the synthetic garage", "clear the shelves",
+    ]
+
+
+def test_segment_transcript_bare_colon_in_a_clock_time_does_not_split():
+    assert _segment_transcript("Remind me at 3:00 PM to call the synthetic vet") == [
+        "Remind me at 3:00 PM to call the synthetic vet"
+    ]
+
+
+# --------------------------------------------------------------------------
+# LLM classifier: the plan JSON schema documents parent_index, and
+# `_validated_classifier_actions` accepts and links a plan that uses it.
+
+
+def test_classifier_prompt_documents_parent_index():
+    prompt = classifier_prompt(
+        transcript="Synthetic note", recorded_at="2030-01-01T10:00:00Z",
+        local_timezone="UTC", allow_agent_schedule=True,
+    )
+    assert '"parent_index":null' in prompt
+    assert "parent_index" in prompt.split("Recording instant")[0]
+
+
+def test_validated_classifier_actions_accepts_and_links_a_parent_index_plan():
+    transcript = "Renovate the synthetic garage. Clear the synthetic shelves."
+    response = json.dumps({"actions": [
+        {"kind": "task", "index": 0, "title": "Renovate the synthetic garage",
+         "action_evidence": "Renovate the synthetic garage"},
+        {"kind": "task", "index": 1, "title": "Clear the synthetic shelves",
+         "action_evidence": "Clear the synthetic shelves", "parent_index": 0},
+    ]})
+    actions = _validated_classifier_actions(response, transcript, "2030-01-01T10:00:00Z")
+    [parent, child] = validate_plan(actions, transcript=transcript, recorded_at="2030-01-01T10:00:00Z")
+    assert parent.parent_index is None
+    assert child.parent_index == 0

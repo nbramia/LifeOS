@@ -74,6 +74,14 @@ raw revision creates no receipt, so a later ready reconciliation can proceed.
   quoted producer evidence and never becomes parser metadata.
 - Filing cannot authorize email, calendar, shell, endpoint, prompt, immediate
   agent work, or generic chat tools.
+- An explicit list request ("make tasks to X, Y, and Z") files each requested
+  item as its own unparented task, in transcript order; a plan asking for a
+  parent to-do with sub-tasks ("a project to X with sub-tasks A and B") files
+  X as the parent and links each other requested item to it via
+  `parent_index`. Only a plain to-do gains these shapes -- a delegated task or
+  a schedule still files one per capture, and hierarchy stays one level deep
+  (a child action cannot itself be a parent). A capture never yields more
+  than eight actions.
 
 Each effect has an operation key from `(source.id, capture_id, action index)`.
 The ledger claim plus the Markdown operation field lets a retry find a prior
