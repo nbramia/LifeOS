@@ -553,9 +553,9 @@ CURATED_ENDPOINTS = {
     },
 }
 
-# Contract count for the source catalog. The live fallback catalog is 69
-# curated tools plus 10 lifeos_agent_* tools = 79.
-CURATED_TOOL_COUNT = 69
+# Contract count for the source catalog. The live fallback catalog is 71
+# curated tools plus 10 lifeos_agent_* tools = 81.
+CURATED_TOOL_COUNT = 71
 
 
 class LifeOSMCPServer:
