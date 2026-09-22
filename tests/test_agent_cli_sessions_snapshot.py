@@ -111,6 +111,142 @@ def test_merged_row_is_single_with_event_status_and_transcript_tokens(client, st
     assert row["prompt_preview"] == "do the thing"
 
 
+# ---------------------------------------------------------------------------
+# `cli_kill_reachable`/`cli_kill_target_id` — the additive signals
+# `decideActions` (web/agents/session_actions.js) reads to decide whether
+# Kill can actually reach something for a `cc:`/`cx:` row (instead of
+# assuming every claude_code/codex session is killable), and the
+# `descendantsOf` callers (`openKillModal`'s cascade preview) read to
+# compute descendants from the id Kill will actually cascade from.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_kill_reachable_true_for_a_cli_row_with_a_bound_pane(client, stores, monkeypatch):
+    session_store, _ = stores
+    monkeypatch.setattr(agents_route, "_claude_code_snapshot",
+                        lambda: ([_fake_cc_transcript_row()], []))
+    session_store.record_cli_session_event(
+        engine="claude_code", event="user_prompt_submit",
+        session_id="merge-target", host="this-api-host",
+        cwd="/home/x", prompt="do the thing", pane_id=7,
+    )
+
+    row = next(
+        s for s in client.get("/api/agents/snapshot").json()["sessions"]
+        if s["session_id"] == "cc:merge-target"
+    )
+    assert row["cli_kill_reachable"] is True
+    # A pane-bound row kills itself — no owning session to cascade from.
+    assert row["cli_kill_target_id"] == "cc:merge-target"
+
+
+@pytest.mark.unit
+def test_kill_reachable_true_for_a_paneless_cli_row_with_a_running_owning_session(
+    client, stores, monkeypatch,
+):
+    """The LifeOS session hooks register a `cli_sessions` row for a
+    worker-spawned CLI session too, with no pane. Kill can still reach it —
+    through the `sessions` row that owns the subprocess — so it must report
+    reachable."""
+    session_store, _ = stores
+    monkeypatch.setattr(agents_route, "_claude_code_snapshot",
+                        lambda: ([_fake_cc_transcript_row()], []))
+    owner = session_store.create(task_id="owner-task", status="running", routing="claude_code")
+    session_store.set_claude_code_session_id(owner.task_id, "merge-target")
+    session_store.record_cli_session_event(
+        engine="claude_code", event="user_prompt_submit",
+        session_id="merge-target", host="this-api-host",
+        cwd="/home/x", prompt="do the thing",
+    )
+
+    row = next(
+        s for s in client.get("/api/agents/snapshot").json()["sessions"]
+        if s["session_id"] == "cc:merge-target"
+    )
+    assert row["cli_kill_reachable"] is True
+    # The row's own children carry the OWNING session as parent_session_id,
+    # not the transcript id — the preview has to cascade from that id too.
+    assert row["cli_kill_target_id"] == owner.session_id
+
+
+@pytest.mark.unit
+def test_kill_reachable_false_for_a_paneless_cli_row_with_no_owning_session(
+    client, stores, monkeypatch,
+):
+    """A pane-less `cli_sessions` row with no `sessions` row behind it (an
+    operator-run CLI session LifeOS never spawned) has nothing Kill can
+    reach — must report unreachable rather than offering a button that
+    can't work."""
+    session_store, _ = stores
+    monkeypatch.setattr(agents_route, "_claude_code_snapshot",
+                        lambda: ([_fake_cc_transcript_row()], []))
+    session_store.record_cli_session_event(
+        engine="claude_code", event="user_prompt_submit",
+        session_id="merge-target", host="this-api-host",
+        cwd="/home/x", prompt="do the thing",
+    )
+
+    row = next(
+        s for s in client.get("/api/agents/snapshot").json()["sessions"]
+        if s["session_id"] == "cc:merge-target"
+    )
+    assert row["cli_kill_reachable"] is False
+
+
+@pytest.mark.unit
+def test_kill_reachable_true_for_a_transcript_row_with_no_cli_row_but_an_owning_session(
+    client, stores, monkeypatch,
+):
+    """No session hooks installed at all (no `cli_sessions` row for this
+    transcript), but LifeOS still tracks the owning worker session — Kill
+    can reach it the same way `operator_kill_session` itself resolves this
+    case, so it must report reachable."""
+    session_store, _ = stores
+    monkeypatch.setattr(agents_route, "_claude_code_snapshot",
+                        lambda: ([_fake_cc_transcript_row()], []))
+    owner = session_store.create(task_id="owner-task-2", status="running", routing="claude_code")
+    session_store.set_claude_code_session_id(owner.task_id, "merge-target")
+
+    row = next(
+        s for s in client.get("/api/agents/snapshot").json()["sessions"]
+        if s["session_id"] == "cc:merge-target"
+    )
+    assert row["cli_kill_reachable"] is True
+    assert row["cli_kill_target_id"] == owner.session_id
+
+
+@pytest.mark.unit
+def test_kill_reachable_false_for_an_unlinked_transcript_row(client, stores, monkeypatch):
+    """No `cli_sessions` row, no owning `sessions` row — a fresh install
+    with no hooks, or a CLI session LifeOS never spawned — nothing to
+    reach."""
+    session_store, _ = stores
+    monkeypatch.setattr(agents_route, "_claude_code_snapshot",
+                        lambda: ([_fake_cc_transcript_row()], []))
+
+    row = next(
+        s for s in client.get("/api/agents/snapshot").json()["sessions"]
+        if s["session_id"] == "cc:merge-target"
+    )
+    assert row["cli_kill_reachable"] is False
+
+
+@pytest.mark.unit
+def test_kill_reachable_is_null_for_a_lifeos_worker_session_row(client, stores):
+    """A plain LifeOS session row is always killable via
+    `_kill_session_subtree` — `cli_kill_reachable` is not a meaningful
+    question for it, so it stays null rather than computed."""
+    session_store, _ = stores
+    session_store.create(task_id="local-task", status="running", routing="local")
+
+    row = next(
+        s for s in client.get("/api/agents/snapshot").json()["sessions"]
+        if s["source"] == "lifeos_agent"
+    )
+    assert row["cli_kill_reachable"] is None
+    assert row["cli_kill_target_id"] == row["session_id"]
+
+
 @pytest.mark.unit
 def test_remote_row_with_no_local_transcript(client, stores):
     session_store, _ = stores

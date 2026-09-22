@@ -119,6 +119,8 @@ from api.services.runtime_identity import (
     publish_runtime_identity,
 )
 from api.services.task_projects import (
+    CHILD_ORIGIN_AGENT,
+    CHILD_ORIGIN_FIELD,
     HANDOFF_OPERATION_FIELD,
     HANDOFF_QUIESCENT_EVENT,
     HANDOFF_REQUEST_EVENT,
@@ -126,7 +128,9 @@ from api.services.task_projects import (
     HANDOFF_SOURCE_SESSION_FIELD,
     HANDOFF_SOURCE_TURN_FIELD,
     INTEGRATION_BRANCH_FIELD,
+    LAST_ABORTED_HANDOFF_FIELD,
     LAST_HANDOFF_OPERATION_FIELD,
+    PARENT_ID_FIELD,
 )
 from config.settings import settings
 
@@ -213,6 +217,16 @@ _TASK_FETCH_FAILED = object()
 # file-watcher debounce). _reconcile_project_handoffs looks for this event to
 # retry finalization once the task view catches up.
 PROJECT_HANDOFF_RETURN_PENDING_EVENT = "project_handoff_return_pending"
+
+# Dedupe `kind`s in the `project_notices` table (see SessionStore) — one
+# durable row per project per kind, inserted only after a successful send.
+_PROJECT_NOTICE_HANDOFF = "handoff"
+_PROJECT_NOTICE_AGENT_CHILDREN_GT5 = "agent_children_gt5"
+# Agent-created child count strictly greater than this triggers the
+# fan-out notice (5 → 6 is the first crossing).
+_PROJECT_NOTICE_CHILD_THRESHOLD = 5
+# Cap on how many child titles a fan-out notice lists.
+_PROJECT_NOTICE_MAX_TITLES = 10
 
 # A recurring (cron) schedule stamps its handed-off #agent task with a
 # `sched-<id>` tag (see scheduler_store._hand_off_to_agent). The worker reads
@@ -1149,7 +1163,13 @@ class Worker:
         # worker is paused or near its daily cap.
         self._process_human_queue()
         self._replay_wait_wakeups()
-        self._reconcile_project_handoffs()
+        # Shared so both project reconcilers below see the same view of
+        # `/api/tasks` for this tick instead of one fetch each.
+        project_tasks = self._fetch_tasks_for_project_reconciliation()
+        self._reconcile_project_handoffs(project_tasks)
+        # Also ungated on the spend cap below: it only sends Telegram
+        # notices, never starts new work or spends money.
+        self._reconcile_project_notices(project_tasks)
         # Heal any vault tag left stranded by a terminal status write that
         # bypassed the projector (e.g. a kill landing on a parked/offline
         # session — see `_reconcile_lifecycle_drift`). Also never gated on
@@ -6507,15 +6527,26 @@ class Worker:
             })
         return True
 
-    def _reconcile_project_handoffs(self) -> int:
-        """Retry quiescent handoff finalizers before ordinary drift projection."""
-        finalized = 0
+    def _fetch_tasks_for_project_reconciliation(self) -> list[dict[str, Any]] | None:
+        """The full unfiltered task list used by the project reconcilers
+        below. Shared so a tick issues one `/api/tasks` fetch for both
+        rather than each reconciler fetching its own — see `tick()`.
+        Returns None on a fetch failure (each caller then no-ops for this
+        tick and simply retries on the next one)."""
         try:
             response = self._http.get(f"{self.api_base}/api/tasks")
             response.raise_for_status()
-            tasks = response.json().get("tasks", [])
+            return response.json().get("tasks", [])
         except Exception as exc:
-            logger.warning("handoff reconciliation list failed: %s", exc)
+            logger.warning("project reconciliation list failed: %s", exc)
+            return None
+
+    def _reconcile_project_handoffs(self, tasks: list[dict[str, Any]] | None = None) -> int:
+        """Retry quiescent handoff finalizers before ordinary drift projection."""
+        finalized = 0
+        if tasks is None:
+            tasks = self._fetch_tasks_for_project_reconciliation()
+        if tasks is None:
             return 0
         for task in tasks:
             task_id = task.get("id")
@@ -6582,6 +6613,119 @@ class Worker:
             except Exception as exc:
                 logger.warning("handoff reconciliation failed for %s: %s", task_id, exc)
         return finalized
+
+    def _reconcile_project_notices(self, tasks: list[dict[str, Any]] | None = None) -> int:
+        """One-time operator Telegram notices for agent-initiated project
+        activity. Runs before the spend-cap gate in `tick()`: it only
+        notifies, never spends, so it must not stop just because the
+        worker is paused or near its daily cap.
+
+        Two triggers, each deduped durably in `project_notices` so a
+        worker restart or a retried send never causes a duplicate:
+
+        (a) Handoff activation — `LAST_HANDOFF_OPERATION_FIELD` names an
+            operation with no recorded "handoff" notice yet. A staged but
+            not-yet-activated (or cancelled) handoff never sets this field,
+            so nothing fires before the project actually exists.
+        (b) Agent-created fan-out — more than `_PROJECT_NOTICE_CHILD_THRESHOLD`
+            children carry `CHILD_ORIGIN_FIELD == CHILD_ORIGIN_AGENT` (in any
+            status; operator-created children carry no origin field and
+            never count), with no recorded "agent_children_gt5" notice yet.
+            Excluded from this count: a parent with `HANDOFF_OPERATION_FIELD`
+            still set is a pending (not-yet-activated) handoff — its staged
+            children exist early, before there's a real project to report,
+            so fan-out is deferred to the activation tick, which reports both
+            triggers as one combined message when the child count already
+            exceeds the threshold. A parent whose only agent children came
+            from an aborted handoff (`LAST_ABORTED_HANDOFF_FIELD` set and
+            `LAST_HANDOFF_OPERATION_FIELD` never set) never announces a
+            project that never existed.
+
+        A project that trips both triggers on the same tick gets one
+        combined message and both rows are recorded for that one send. A
+        row is inserted only after a successful send, so a failed send
+        leaves the trigger unrecorded and is retried on a later tick.
+        """
+        if tasks is None:
+            tasks = self._fetch_tasks_for_project_reconciliation()
+        if tasks is None:
+            return 0
+        child_counts: dict[str, int] = {}
+        agent_children_by_parent: dict[str, list[dict[str, Any]]] = {}
+        for task in tasks:
+            fields = task.get("fields") or {}
+            parent_id = task.get("parent_id") or fields.get(PARENT_ID_FIELD)
+            if not parent_id:
+                continue
+            child_counts[parent_id] = child_counts.get(parent_id, 0) + 1
+            if fields.get(CHILD_ORIGIN_FIELD) == CHILD_ORIGIN_AGENT:
+                agent_children_by_parent.setdefault(parent_id, []).append(task)
+        sent = 0
+        for task in tasks:
+            project_id = task.get("id")
+            if not project_id:
+                continue
+            fields = task.get("fields") or {}
+            operation_id = fields.get(LAST_HANDOFF_OPERATION_FIELD)
+            handoff_due = bool(operation_id) and not self.session_store.has_project_notice(
+                project_id, _PROJECT_NOTICE_HANDOFF,
+            )
+            # A pending (staged, not-yet-activated) handoff already has its
+            # children stamped agent-origin — deferring fan-out here is what
+            # lets the activation tick send one combined message instead of
+            # an early one at staging plus a second at activation. A parent
+            # whose only agent children came from an aborted handoff never
+            # had a real project, so it never gets a fan-out notice either.
+            handoff_pending = bool(fields.get(HANDOFF_OPERATION_FIELD))
+            aborted_only = bool(fields.get(LAST_ABORTED_HANDOFF_FIELD)) and not operation_id
+            agent_children = agent_children_by_parent.get(project_id, [])
+            fanout_due = (
+                not handoff_pending
+                and not aborted_only
+                and len(agent_children) > _PROJECT_NOTICE_CHILD_THRESHOLD
+                and not self.session_store.has_project_notice(
+                    project_id, _PROJECT_NOTICE_AGENT_CHILDREN_GT5,
+                )
+            )
+            if not handoff_due and not fanout_due:
+                continue
+            title = task.get("description") or project_id
+            owner_tag = derive_assignee(task.get("tags") or [])
+            owner_label = f"#{owner_tag}" if owner_tag else "no owner yet"
+            board_link = f"/agents?card={project_id}"
+            titles = ", ".join(
+                (child.get("description") or child.get("id"))
+                for child in agent_children[:_PROJECT_NOTICE_MAX_TITLES]
+            )
+            if handoff_due and fanout_due:
+                body = (
+                    f"🗂 '{title}' became a project with {child_counts.get(project_id, 0)} "
+                    f"children (owner: {owner_label}) and already has "
+                    f"{len(agent_children)} agent-created children: {titles}. "
+                    f"Board: {board_link}"
+                )
+            elif handoff_due:
+                body = (
+                    f"🗂 '{title}' became a project with {child_counts.get(project_id, 0)} "
+                    f"children (owner: {owner_label}). Board: {board_link}"
+                )
+            else:
+                body = (
+                    f"🗂 '{title}' now has {len(agent_children)} agent-created "
+                    f"children: {titles}. Board: {board_link}"
+                )
+            if not self._notify(body):
+                continue
+            if handoff_due:
+                self.session_store.record_project_notice(
+                    project_id, _PROJECT_NOTICE_HANDOFF, marker=operation_id,
+                )
+            if fanout_due:
+                self.session_store.record_project_notice(
+                    project_id, _PROJECT_NOTICE_AGENT_CHILDREN_GT5,
+                )
+            sent += 1
+        return sent
 
     def _session_staged_this_turns_handoff(self, session: Session) -> bool:
         """True when this exact attempt/turn's transcript has a handoff
@@ -7671,11 +7815,20 @@ class Worker:
             return self._raw_telegram_send_with_id(text, bot=bot, **kwargs)
         return self._raw_telegram_send_with_id(text, **kwargs)
 
-    def _notify(self, text: str, bot: str | None = None) -> None:
+    def _notify(self, text: str, bot: str | None = None) -> bool:
+        """Send `text` to the operator's primary feed (or `bot`'s channel).
+
+        Returns whether the send is believed to have succeeded — most
+        callers fire-and-forget and ignore this, but a caller that must
+        retry an unsent notice (e.g. `_reconcile_project_notices`) uses it
+        to decide whether to record the notice as delivered.
+        """
         try:
-            self._telegram_send(text, bot=bot) if bot else self._telegram_send(text)
+            result = self._telegram_send(text, bot=bot) if bot else self._telegram_send(text)
         except Exception as exc:  # pragma: no cover — defensive
             logger.warning("telegram notify failed: %s", exc)
+            return False
+        return bool(result)
 
     def _notify_terminal(self, session: Session, body: str, label: str) -> None:
         """Send a terminal-state notification (completed / failed / budget) and

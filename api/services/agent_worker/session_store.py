@@ -675,6 +675,19 @@ CREATE TABLE IF NOT EXISTS pr_status_cache (
     checked_at INTEGER NOT NULL,
     stale      INTEGER NOT NULL DEFAULT 1
 );
+
+-- One row per (project, notice kind) sent to the operator: a durable
+-- dedupe marker so a worker restart or a retried send never causes a
+-- duplicate Telegram notice for the same project/trigger. `kind` is
+-- "handoff" (marker: the handoff operation id) or "agent_children_gt5"
+-- (marker unused). See Worker._reconcile_project_notices.
+CREATE TABLE IF NOT EXISTS project_notices (
+    project_id  TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    marker      TEXT NOT NULL DEFAULT '',
+    notified_at INTEGER NOT NULL,
+    PRIMARY KEY(project_id, kind)
+);
 """
 
 
@@ -806,6 +819,14 @@ class SessionStore:
                         "UPDATE sessions SET claude_code_session_id = code_session_id "
                         "WHERE claude_code_session_id IS NULL AND code_session_id IS NOT NULL"
                     )
+            # `get_by_claude_code_session_id`'s reverse lookup (kill route,
+            # snapshot eligibility) and the board snapshot both query this
+            # column per CLI transcript row, so it needs an index rather than
+            # a full table scan.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_claude_code_session_id "
+                "ON sessions(claude_code_session_id)"
+            )
             # Idempotent migration for the per-session Claude Code tier.
             # Old rows stay NULL → omit --model and use the CLI default.
             if "claude_code_model" not in sess_cols:
@@ -1073,6 +1094,25 @@ class SessionStore:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+        return self._row_to_session(row) if row else None
+
+    def get_by_claude_code_session_id(self, claude_code_session_id: str) -> Session | None:
+        """Reverse lookup: the `sessions` row whose `claude_code_session_id`
+        matches a Claude Code / Codex CLI transcript's own id — the bare id
+        under a board `cc:`/`cx:`-prefixed session_id (`CLI_ENGINE_PREFIXES`,
+        `session_ingest.CC_PREFIX`). Lets a caller holding only that
+        transcript id (a worker-spawned CLI session never registers a
+        `cli_sessions` row, since it runs headless with no wezterm pane to
+        bind) find the row that actually owns the subprocess. Most recent
+        activity wins on the rare chance more than one row ever recorded the
+        same CLI session id.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM sessions WHERE claude_code_session_id = ? "
+                "ORDER BY last_activity_at DESC LIMIT 1",
+                (claude_code_session_id,),
             ).fetchone()
         return self._row_to_session(row) if row else None
 
@@ -4408,6 +4448,32 @@ class SessionStore:
                     "ON CONFLICT(url) DO UPDATE SET checked_at = excluded.checked_at, stale = 1",
                     (url, ts),
                 )
+
+    # ------------------------------------------------------------------
+    # Project notices — durable per-project, per-trigger Telegram dedupe
+    # (see Worker._reconcile_project_notices)
+    # ------------------------------------------------------------------
+
+    def has_project_notice(self, project_id: str, kind: str) -> bool:
+        """True once a notice of `kind` has been sent for `project_id`."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM project_notices WHERE project_id = ? AND kind = ?",
+                (project_id, kind),
+            ).fetchone()
+        return row is not None
+
+    def record_project_notice(self, project_id: str, kind: str, marker: str = "") -> None:
+        """Record that a notice of `kind` was sent for `project_id`. Callers
+        insert this only after a successful send, so a send that fails
+        leaves no row and is retried on a later tick."""
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO project_notices (project_id, kind, marker, notified_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(project_id, kind) DO NOTHING",
+                (project_id, kind, marker, _now()),
+            )
 
     @staticmethod
     def _row_to_cli_session(row: sqlite3.Row) -> CliSession:

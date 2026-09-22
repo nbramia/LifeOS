@@ -635,6 +635,32 @@ work pending and non-runnable. Reconciliation runs before ordinary lifecycle
 drift repair; there is no atomic transaction spanning Markdown, SQLite, and an
 external executor.
 
+`Worker._reconcile_project_notices()` runs each tick immediately after
+`_reconcile_project_handoffs()`, sharing that same tick's `/api/tasks` fetch
+(`_fetch_tasks_for_project_reconciliation`) rather than issuing a second one.
+It runs before the daily-spend-cap gate — it only sends Telegram notices,
+never starts work — and checks two triggers per project task: a
+`fields.project_last_handoff_operation_id` with no recorded `"handoff"`
+notice (activation, not staging, since a staged handoff never sets that
+field), and more than five children with `fields.project_child_origin ==
+"agent"` (any status) with no recorded `"agent_children_gt5"` notice. The
+fan-out count skips a parent that still carries
+`fields.project_handoff_operation_id` — a staged, not-yet-activated
+handoff already stamps its children agent-origin, so counting them early
+would send a fan-out notice before the activation notice and duplicate it;
+deferring until the pending field clears at activation is what lets a
+6+-child handoff report both triggers as one combined message. It also
+skips a parent whose only agent-origin children came from an aborted
+handoff (`fields.project_last_aborted_handoff_operation_id` set and
+`project_last_handoff_operation_id` never set) — a cancelled staged
+handoff never announces a project that never existed. Durable dedupe
+lives in `SessionStore`'s `project_notices` table (`PRIMARY
+KEY(project_id, kind)`); a row is written only after `Worker._notify`
+reports a successful send, so a failed send is retried on a later tick
+instead of being marked done, and a project that trips both triggers on
+the same tick gets one combined message with both rows written for that
+one send.
+
 ## Inter-agent coordination
 
 Local agents can spawn child sessions and coordinate via the `lifeos_agent_*` tool family:
