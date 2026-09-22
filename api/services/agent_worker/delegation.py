@@ -17,6 +17,7 @@ SEND = "lifeos_agent_send"
 SESSIONS_LIST = "lifeos_agent_sessions_list"
 YIELD_UNTIL = "lifeos_agent_yield_until"
 PROJECT_HANDOFF = "lifeos_agent_project_handoff"
+PROJECT_OWNER = "lifeos_agent_project_owner"
 TASK_CHILDREN = "lifeos_task_children"
 PROJECT_PLAN = "lifeos_project_plan"
 PROJECT_COMPLETE = "lifeos_project_complete"
@@ -54,10 +55,17 @@ working afterward, and do not report the original task as completed. The
 worker releases staged children only after it has observed your turn stop.
 Pending handoffs remain pending if that stop cannot be proved.
 
-Projects finish only through `{PROJECT_COMPLETE}` after their children and
-reviews are resolved. Use `{PROJECT_CANCEL}` for project cancellation; it
-cascades only after confirmation and may remain pending while a runtime stop
-is unverified. Cancelling one child does not cancel its parent or siblings.
+If you are a project's persistent owner, `{PROJECT_OWNER}` lets you act on
+your own project directly: `action=accept_child`/`reject_child` on a
+review-pending child of your own project (reject requires a `note` and is
+refused while the project is paused), and `action=complete_project` to mark
+your own project done — allowed even while your own turn is still live, once
+every other completion requirement (unresolved children, pending
+cancellation, cancelled-children acknowledgement) is met. `{PROJECT_COMPLETE}`
+remains the operator's own path and is refused while your turn is live.
+Use `{PROJECT_CANCEL}` for project cancellation; it cascades only after
+confirmation and may remain pending while a runtime stop is unverified.
+Cancelling one child does not cancel its parent or siblings.
 </project_tasks>"""
 
 

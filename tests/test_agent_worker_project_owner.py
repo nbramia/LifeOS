@@ -615,6 +615,11 @@ class TestOwnerGuidanceWording:
         assert "bounded coordinator" not in PROJECT_TASK_GUIDANCE
         assert "does not wake automatically" not in PROJECT_TASK_GUIDANCE
 
+    def test_project_task_guidance_names_the_owner_review_tool(self):
+        assert "lifeos_agent_project_owner" in PROJECT_TASK_GUIDANCE
+        assert "accept_child" in PROJECT_TASK_GUIDANCE
+        assert "complete_project" in PROJECT_TASK_GUIDANCE
+
     def test_handoff_coordination_prompt_describes_a_persistent_owner(self):
         from api.services.task_projects import ProjectTaskService
 
@@ -924,12 +929,15 @@ class TestOwnerSessionIdStaysFreshOnReplan:
 
 
 # ---------------------------------------------------------------------------
-# B1: the wake message must not point the owner at a tool call that always
-# refuses mid-wake
+# B1: the wake message must point the owner at the attested tool it can
+# actually use mid-wake — `lifeos_agent_project_owner`'s complete_project
+# action is allowed while this exact turn is live (see
+# `ProjectTaskService.complete_project`'s `owner_session` exemption), unlike
+# the operator-only `lifeos_project_complete`.
 # ---------------------------------------------------------------------------
 
-class TestWakeMessageDoesNotPromiseAnUnusableTool:
-    def test_wake_message_explains_complete_refuses_mid_turn(self, tmp_path):
+class TestWakeMessagePointsAtTheAttestedOwnerTool:
+    def test_wake_message_names_the_attested_owner_tool(self, tmp_path):
         w, api, owner = _setup(tmp_path, children=[_child("c1", "p1", "Design")])
         api.tasks["c1"]["status"] = "blocked"
         api.tasks["c1"]["tags"] = ["agent-blocked"]
@@ -938,8 +946,8 @@ class TestWakeMessageDoesNotPromiseAnUnusableTool:
         assert w._reconcile_project_owners() == 1
         pending = w.session_store.peek_pending_messages(owner.session_id)
         body = pending[0]["content"]
-        assert "refuses while this turn is live" in body
-        assert "operator" in body
+        assert "lifeos_agent_project_owner" in body
+        assert "refuses while this turn is live" not in body
 
 
 # ---------------------------------------------------------------------------
@@ -1344,13 +1352,33 @@ class TestCliFallbackBriefing:
         pending = w.session_store.peek_pending_messages(owner.session_id)
         assert len(pending) == 1
         briefing = pending[0]["content"]
+        # The bounded briefing itself: objective/child-table content, built
+        # and actually delivered through the real reconciler call path
+        # (`_reconcile_one_project_owner` -> `_owner_fallback_briefing`),
+        # not just constructed and discarded.
         assert "Fresh start for project owner" in briefing
         assert "Ship the migration" in briefing
         assert "c1" in briefing
         assert "Project owner wake:" not in briefing
+        # The owner-review/completion capability this briefing must describe
+        # -- a stale reference here (e.g. the old operator-only
+        # `lifeos_project_complete` wording, or a bad name entirely) would
+        # either surface as wrong guidance or, if it names an undefined
+        # symbol, crash `_owner_fallback_briefing` outright; either way the
+        # wake must still be recorded as delivered with the right content.
+        assert "lifeos_agent_project_owner" in briefing
+        assert "complete_project" in briefing
+        assert "accept_child" in briefing
         after = w.session_store.get(_OWNER_TASK_ID)
         assert after.routing == "claude_code"  # route never changes
         assert after.status == STATUS_CLAIMED  # still enqueued + CAS'd like the native path
+        # The wake is recorded delivered: `wake_attempt_id`/`wake_turn_id`
+        # are stamped for this exact new attempt so the reconciler's next
+        # pass can reconcile its outcome (ack on success, redeliver on
+        # failure) rather than treating it as never having been sent.
+        state = w.session_store.get_project_owner_state("p1")
+        assert state["wake_attempt_id"] == after.attempt_id
+        assert state["wake_turn_id"] == after.turn_id
 
     def test_present_cli_session_id_still_gets_the_terse_wake_diff(self, tmp_path):
         w, api, owner = _setup(

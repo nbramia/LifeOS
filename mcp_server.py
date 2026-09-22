@@ -554,7 +554,7 @@ CURATED_ENDPOINTS = {
 }
 
 # Contract count for the source catalog. The live fallback catalog is 71
-# curated tools plus 10 lifeos_agent_* tools = 81.
+# curated tools plus 11 lifeos_agent_* tools = 82.
 CURATED_TOOL_COUNT = 71
 
 
@@ -1447,7 +1447,7 @@ class LifeOSMCPServer:
                 return {"error": "invalid MCP caller proof"}
         caller_attempt_id = None
         caller_turn_id = None
-        if tool_name == "lifeos_agent_project_handoff":
+        if tool_name in ("lifeos_agent_project_handoff", "lifeos_agent_project_owner"):
             supplied_attempt = (arguments.pop("caller_attempt_id", None) or "").strip()
             supplied_turn = (arguments.pop("caller_turn_id", None) or "").strip()
             turn_proof = (arguments.pop("caller_turn_proof", None) or "").strip()

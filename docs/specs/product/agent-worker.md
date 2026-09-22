@@ -134,8 +134,16 @@ as before: children branch off and PR into `main`.
 
 Project completion is explicit. All children must be done or cancelled, no
 review may remain unaccepted, no coordinator may be live, and no cancellation
-may be pending. Cancelled children require acknowledgement of reduced scope;
-they are never counted as successful completion. Cancelling a project is also
+may be pending — except that a project's own attested owner session may
+complete its own project through `lifeos_agent_project_owner` while its own
+turn is still live; an operator completion is still refused while the
+coordinator is live. The same tool also lets that owner accept or reject a
+review-pending child of its own project — sharing the operator board's own
+Accept/Reject logic, so an owner acceptance is recorded distinctly from an
+operator one and a rejection (which requires a note and resumes the child's
+session with it) is refused while the project is paused. Cancelled children
+require acknowledgement of reduced scope; they are never counted as
+successful completion. Cancelling a project is also
 explicit and two-step: the preview names unfinished, running and
 awaiting-review work, then a confirmed operation stops controllable sessions,
 cancels unfinished children, and records review output as abandoned rather

@@ -488,12 +488,22 @@ class ProjectTaskService:
 
     def complete_project(
         self, task_id: str, *, acknowledge_cancelled_children: bool = False,
+        owner_session: Session | None = None,
     ) -> "Task":
+        """Mark a project done. `owner_session`, passed only by the attested
+        `lifeos_agent_project_owner` tool, exempts the live-coordinator guard
+        for exactly that caller's own turn — see
+        `TaskManager._guard_project_update`. An operator completion (no
+        `owner_session`) is refused while the coordinator is live, exactly
+        as before."""
         return self.manager.update(
             task_id,
             status="done",
             _acknowledge_cancelled_children=acknowledge_cancelled_children,
             _precondition=self._require_project_current,
+            _owner_turn_completion_session_id=(
+                owner_session.session_id if owner_session is not None else None
+            ),
         )
 
     def resume_execution(self, task_id: str) -> "Task":
@@ -1168,8 +1178,12 @@ class ProjectTaskService:
             "You are this project's persistent owner: you are woken automatically "
             "when a child's state changes -- newly blocked, failed, done, cancelled, "
             "or awaiting review -- with several such events batched into one wake. "
-            "Inspect child state, help resolve scoped blockers, and use the explicit "
-            "project completion/cancellation actions."
+            "Inspect child state, help resolve scoped blockers, and use "
+            "`lifeos_agent_project_owner` to accept or reject a review-pending "
+            "child of this project (reject requires a note) and to mark this "
+            "project done yourself once children and reviews are resolved -- "
+            "allowed even while this turn is still live -- or the explicit "
+            "project cancellation action if it must stop instead."
         )
         return "\n".join(lines)
 
@@ -1700,8 +1714,12 @@ class ProjectTaskService:
             "child's role; reuse that key on retry so the task tool recovers the same child.\n"
             "You are this project's persistent owner: you are woken automatically when a "
             "child's state changes -- newly blocked, failed, done, cancelled, or awaiting "
-            "review -- with several such events batched into one wake. The project ends only "
-            "through the explicit project completion/cancellation actions."
+            "review -- with several such events batched into one wake. Use "
+            "`lifeos_agent_project_owner` to accept or reject a review-pending child of "
+            "this project (reject requires a note) and to mark this project done "
+            "yourself once children and reviews are resolved -- allowed even while this "
+            "turn is still live -- or the explicit project cancellation action if it must "
+            "stop instead."
         )
 
 

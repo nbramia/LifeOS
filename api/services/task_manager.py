@@ -616,6 +616,14 @@ class TaskManager:
         acknowledge_cancelled_children = bool(
             kwargs.pop("_acknowledge_cancelled_children", False)
         )
+        # Set only by `ProjectTaskService.complete_project(owner_session=...)`
+        # for the attested project owner's own completion call. Exempts the
+        # live-coordinator completion guard, but only when this exact session
+        # id is the project's own recorded coordinator — see
+        # `_guard_project_update`.
+        owner_turn_completion_session_id = kwargs.pop(
+            "_owner_turn_completion_session_id", None
+        )
         notes_merge = kwargs.pop("_notes_merge", None)
         expected_updated_at = kwargs.pop("_expected_updated_at", None)
         # Internal board action hook: called with the latest task, before any
@@ -671,6 +679,7 @@ class TaskManager:
                     project_action=project_action,
                     project_operation=project_operation,
                     acknowledge_cancelled_children=acknowledge_cancelled_children,
+                    owner_turn_completion_session_id=owner_turn_completion_session_id,
                 )
 
             if relationship_change and not skip_project_validation:
@@ -1261,6 +1270,7 @@ class TaskManager:
         project_action: bool,
         project_operation: Optional[str],
         acknowledge_cancelled_children: bool,
+        owner_turn_completion_session_id: Optional[str] = None,
     ) -> None:
         from api.services.task_projects import (
             ABANDONED_AT_FIELD,
@@ -1368,7 +1378,16 @@ class TaskManager:
         if cancellation_pending:
             raise ProjectConflictError("project cancellation is pending")
         if coordinator_live:
-            raise ProjectConflictError("project coordinator is live")
+            # The attested project owner may complete its own project while
+            # its own turn is still live — but only when the recorded
+            # coordinator is exactly this attested session, never any other
+            # live session (including a different in-flight owner turn).
+            owner_turn_exempt = bool(
+                owner_turn_completion_session_id
+                and current.fields.get(COORDINATOR_SESSION_FIELD) == owner_turn_completion_session_id
+            )
+            if not owner_turn_exempt:
+                raise ProjectConflictError("project coordinator is live")
         unresolved = [
             child for child in hierarchy.children(current.id)
             if hierarchy.child_state(child) not in {"done", "cancelled"}

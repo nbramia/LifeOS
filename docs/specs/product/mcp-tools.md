@@ -34,9 +34,9 @@ The LifeOS MCP server dynamically discovers endpoints from the LifeOS OpenAPI sp
 - Fallback schemas when API unavailable
 
 The source catalog contains 71 curated LifeOS endpoint tools. It also
-registers 10 worker coordination tools (`lifeos_agent_*`), including
-`lifeos_agent_project_handoff` and `lifeos_agent_execution_override`, for an
-81-tool fallback catalog. When the
+registers 11 worker coordination tools (`lifeos_agent_*`), including
+`lifeos_agent_project_handoff`, `lifeos_agent_project_owner`, and
+`lifeos_agent_execution_override`, for an 82-tool fallback catalog. When the
 OpenAPI document omits an unavailable endpoint, the live list may be smaller;
 the inter-agent tools remain registered as a separate contract.
 
@@ -106,6 +106,7 @@ Tasks can also be managed via natural language chat. See [Task Management spec](
 | `lifeos_project_resume` | Resume a paused project; refused with 403 for an agent-attributed caller — only the operator can resume |
 | `lifeos_task_resume_execution` | Resume a paused ordinary task after its final child link is removed |
 | `lifeos_agent_project_handoff` | The current executor turn stages an ordinary top-level task as a one-level durable project and then ends; children remain blocked until that turn has stopped and been verified |
+| `lifeos_agent_project_owner` | The attested project owner accepts or rejects a review-pending child of its own project, or completes its own project — allowed even while its own turn is still live |
 
 Project classification comes only from incoming `fields.parent_id` references;
 it is unrelated to `lifeos_agent_spawn` session ancestry. Before mutating a
@@ -153,6 +154,27 @@ event; a disconnect, deadline, or local cancellation marker is not stop proof.
 A returned turn after cancellation retains only valid route-specific stop
 proof, never activates staged work. This applies even before a staged request
 has created a child, when the source remains an ordinary task.
+
+`lifeos_agent_project_owner` is attested the same way as
+`lifeos_agent_project_handoff` (an exact session, attempt, and turn), and is
+authorized only for the caller that is exactly the target project's current
+owner session, on its exact current turn. Its `action` is one of
+`accept_child`, `reject_child`, or `complete_project`. `accept_child` and
+`reject_child` target a review-pending child whose `parent_id` is the given
+project; `reject_child` requires a `note` and is refused with `paused` while
+the project is paused, because rejecting resumes the child session and so
+starts new child work. `accept_child`/`reject_child` share their underlying
+logic with the operator's own board Accept/Reject actions — an acceptance
+records who accepted (visible on the board), and a rejection's note is
+prefixed to make clear it came from the project owner rather than the
+operator. `complete_project` marks the caller's own project done; it is
+allowed even while the caller's own turn is still live — the one case the
+ordinary live-coordinator completion guard would otherwise refuse — while
+every other completion requirement (no pending cancellation, no unresolved
+children, cancelled-children acknowledgement) still applies exactly as it
+does for the operator's `lifeos_project_complete`. Stable error codes:
+`invalid_arg`, `not_found`, `stale_turn`, `not_owner`, `not_review`,
+`paused`, `forbidden`, `conflict`.
 
 ### Human Queue Tools
 

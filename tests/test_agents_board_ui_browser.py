@@ -4622,6 +4622,58 @@ class TestSnoozeDisplayAndUnsnooze:
         expect(page.locator('.board-lane[data-lane="snoozed"] [data-card-id="t-snoozed"]')).to_have_count(0)
 
 
+class TestAcceptedByDrawerRow:
+    """AC: a Done card accepted through `fields.review_accepted_by` shows
+    who accepted it — "Project owner" for an owner:<session_id> stamp,
+    "Operator" for the plain operator stamp — and a card with no stamp at
+    all shows neither."""
+
+    def _accepted_card(self, review_accepted_by):
+        return {
+            "kind": "task", "id": "t-accepted", "title": "Reviewed synthetic output",
+            "notes": "", "status": "done", "tags": ["codex", "agent-completed", "accepted"],
+            "assignee": "codex",
+            "fields": {"review_accepted_by": review_accepted_by} if review_accepted_by else {},
+            "context": "Inbox", "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        }
+
+    def _open_done_card(self, page: Page, agents_base_url, board_state) -> None:
+        # Done is hidden by default (see the lane-filter tests above) — reveal
+        # it before the card can be clicked.
+        _open_board(page, agents_base_url, board_state=board_state)
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='done']").check()
+        page.locator('[data-card-id="t-accepted"]').click()
+        expect(page.locator("#board-drawer-backdrop")).to_be_visible()
+
+    def test_owner_accepted_card_shows_project_owner(self, page: Page, agents_base_url):
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["done"].append(self._accepted_card("owner:sess-owner-1"))
+        self._open_done_card(page, agents_base_url, board_state)
+
+        meta = page.locator('#board-drawer [data-field="meta"]')
+        expect(meta).to_contain_text("Accepted by")
+        expect(meta).to_contain_text("Project owner")
+
+    def test_operator_accepted_card_shows_operator(self, page: Page, agents_base_url):
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["done"].append(self._accepted_card("operator"))
+        self._open_done_card(page, agents_base_url, board_state)
+
+        meta = page.locator('#board-drawer [data-field="meta"]')
+        expect(meta).to_contain_text("Accepted by")
+        expect(meta).to_contain_text("Operator")
+
+    def test_card_with_no_acceptance_stamp_shows_no_accepted_by_row(self, page: Page, agents_base_url):
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["done"].append(self._accepted_card(None))
+        self._open_done_card(page, agents_base_url, board_state)
+
+        meta = page.locator('#board-drawer [data-field="meta"]')
+        expect(meta).not_to_contain_text("Accepted by")
+
+
 class TestSnoozeDraggingClearsTheField:
     """AC: dragging a snoozed card to another lane clears the snooze (the
     server does it) — the UI must reflect the card landing in its new lane,

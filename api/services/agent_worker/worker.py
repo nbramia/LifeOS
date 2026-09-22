@@ -105,7 +105,7 @@ from api.services.agent_worker.session_store import (
 )
 from api.services.agent_worker.delegation import (
     PROJECT_CANCEL as _OWNER_TOOL_PROJECT_CANCEL,
-    PROJECT_COMPLETE as _OWNER_TOOL_PROJECT_COMPLETE,
+    PROJECT_OWNER as _OWNER_TOOL_PROJECT_OWNER,
     TASK_CHILDREN as _OWNER_TOOL_TASK_CHILDREN,
 )
 from api.services.agent_worker.managed_executor import _sanitize_title as _managed_sanitize_title
@@ -7067,10 +7067,11 @@ class Worker:
             lines.append(f"Integration branch: {integration_branch}")
         lines.append(
             f"Use `{_OWNER_TOOL_TASK_CHILDREN}` to inspect the full child list, and create or "
-            f"assign children as needed. `{_OWNER_TOOL_PROJECT_COMPLETE}` refuses while this "
-            "turn is live, so report readiness in your final response and let the operator "
-            f"complete the project from the board, or call `{_OWNER_TOOL_PROJECT_CANCEL}` if "
-            "it must stop instead."
+            f"assign children as needed. Use `{_OWNER_TOOL_PROJECT_OWNER}` (action=accept_child/"
+            "reject_child) to review a review-pending child of this project, and "
+            "action=complete_project to mark this project done yourself — allowed even "
+            "while this turn is still live, once children and reviews are resolved — or call "
+            f"`{_OWNER_TOOL_PROJECT_CANCEL}` if it must stop instead."
         )
         message = "\n".join(lines)
         if len(message) > _OWNER_WAKE_MESSAGE_MAX_CHARS:
@@ -7130,10 +7131,11 @@ class Worker:
             lines.append(f"Last owner result: {last_summary[:500]}")
         lines.append(
             f"Use `{_OWNER_TOOL_TASK_CHILDREN}` to inspect the full child list, and create or "
-            f"assign children as needed. `{_OWNER_TOOL_PROJECT_COMPLETE}` refuses while this "
-            "turn is live, so report readiness in your final response and let the operator "
-            f"complete the project from the board, or call `{_OWNER_TOOL_PROJECT_CANCEL}` if "
-            "it must stop instead."
+            f"assign children as needed. Use `{_OWNER_TOOL_PROJECT_OWNER}` (action=accept_child/"
+            "reject_child) to review a review-pending child of this project, and "
+            "action=complete_project to mark this project done yourself — allowed even "
+            "while this turn is still live, once children and reviews are resolved — or call "
+            f"`{_OWNER_TOOL_PROJECT_CANCEL}` if it must stop instead."
         )
         message = "\n".join(lines)
         if len(message) > _OWNER_WAKE_MESSAGE_MAX_CHARS:
