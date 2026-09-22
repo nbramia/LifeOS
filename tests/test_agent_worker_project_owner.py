@@ -1352,13 +1352,33 @@ class TestCliFallbackBriefing:
         pending = w.session_store.peek_pending_messages(owner.session_id)
         assert len(pending) == 1
         briefing = pending[0]["content"]
+        # The bounded briefing itself: objective/child-table content, built
+        # and actually delivered through the real reconciler call path
+        # (`_reconcile_one_project_owner` -> `_owner_fallback_briefing`),
+        # not just constructed and discarded.
         assert "Fresh start for project owner" in briefing
         assert "Ship the migration" in briefing
         assert "c1" in briefing
         assert "Project owner wake:" not in briefing
+        # The owner-review/completion capability this briefing must describe
+        # -- a stale reference here (e.g. the old operator-only
+        # `lifeos_project_complete` wording, or a bad name entirely) would
+        # either surface as wrong guidance or, if it names an undefined
+        # symbol, crash `_owner_fallback_briefing` outright; either way the
+        # wake must still be recorded as delivered with the right content.
+        assert "lifeos_agent_project_owner" in briefing
+        assert "complete_project" in briefing
+        assert "accept_child" in briefing
         after = w.session_store.get(_OWNER_TASK_ID)
         assert after.routing == "claude_code"  # route never changes
         assert after.status == STATUS_CLAIMED  # still enqueued + CAS'd like the native path
+        # The wake is recorded delivered: `wake_attempt_id`/`wake_turn_id`
+        # are stamped for this exact new attempt so the reconciler's next
+        # pass can reconcile its outcome (ack on success, redeliver on
+        # failure) rather than treating it as never having been sent.
+        state = w.session_store.get_project_owner_state("p1")
+        assert state["wake_attempt_id"] == after.attempt_id
+        assert state["wake_turn_id"] == after.turn_id
 
     def test_present_cli_session_id_still_gets_the_terse_wake_diff(self, tmp_path):
         w, api, owner = _setup(
