@@ -47,9 +47,12 @@ def _init_repo_with_origin(root: Path, name: str = "repo") -> Path:
     return repo
 
 
-def _provision(root: Path, task_id: str = "task-1", title: str = "fix the thing", name: str = "repo"):
+def _provision(
+    root: Path, task_id: str = "task-1", title: str = "fix the thing", name: str = "repo",
+    base_branch: str | None = None,
+):
     repo = _init_repo_with_origin(root, name=name)
-    result = ensure_worktree(str(repo), task_id, title)
+    result = ensure_worktree(str(repo), task_id, title, base_branch=base_branch)
     assert result.is_git
     return repo, Path(result.working_dir), result.branch
 
@@ -172,6 +175,84 @@ def test_finalize_nothing_to_push_opens_no_pr(tmp_path: Path):
     assert result.nothing_to_push is True
     assert result.pr_url is None
     assert gh.calls == []  # never even asked gh — no empty PR
+
+
+# ---------------------------------------------------------------------------
+# Integration branch — the base recorded in the worktree's ownership marker
+# by `ensure_worktree(..., base_branch=...)` determines the pull request's
+# base and the commits-ahead check, with no need to pass `base_branch` a
+# second time at finalize.
+# ---------------------------------------------------------------------------
+
+def test_finalize_pr_base_follows_the_markers_recorded_integration_branch(tmp_path: Path):
+    repo, worktree, branch = _provision(
+        tmp_path, task_id="task-int-1", base_branch="feat/integration-fin",
+    )
+    (worktree / "change.txt").write_text("work\n")
+    _git(worktree, "add", "change.txt")
+    _git(worktree, "commit", "-q", "-m", "do the work")
+
+    gh = _FakeGh()
+    result = finalize_worktree_session(
+        str(worktree), open_pr=True, pr_title="fix the thing", pr_body="done", gh_runner=gh,
+    )
+
+    assert result.pr_opened is True
+    create_call = next(c for c in gh.calls if c[:3] == ["gh", "pr", "create"])
+    assert create_call[create_call.index("--base") + 1] == "feat/integration-fin"
+    # The lazily-created integration branch actually landed on origin.
+    ls_remote = _git(repo, "ls-remote", "--heads", "origin", "feat/integration-fin").stdout
+    assert "feat/integration-fin" in ls_remote
+
+
+def test_finalize_explicit_base_branch_overrides_the_recorded_marker(tmp_path: Path):
+    repo, worktree, branch = _provision(
+        tmp_path, task_id="task-int-2", base_branch="feat/integration-marker",
+    )
+    (worktree / "change.txt").write_text("work\n")
+    _git(worktree, "add", "change.txt")
+    _git(worktree, "commit", "-q", "-m", "do the work")
+    _git(repo, "branch", "feat/integration-explicit", "main")
+    assert _git(repo, "push", "-q", "origin", "feat/integration-explicit").returncode == 0
+
+    gh = _FakeGh()
+    result = finalize_worktree_session(
+        str(worktree), open_pr=True, base_branch="feat/integration-explicit", gh_runner=gh,
+    )
+
+    assert result.pr_opened is True
+    create_call = next(c for c in gh.calls if c[:3] == ["gh", "pr", "create"])
+    assert create_call[create_call.index("--base") + 1] == "feat/integration-explicit"
+
+
+def test_finalize_commits_ahead_is_measured_against_the_recorded_integration_branch(tmp_path: Path):
+    repo, worktree, branch = _provision(
+        tmp_path, task_id="task-int-3", base_branch="feat/integration-noop",
+    )
+    # No commits beyond the integration branch's own tip.
+
+    gh = _FakeGh()
+    result = finalize_worktree_session(str(worktree), open_pr=True, gh_runner=gh)
+
+    assert result.nothing_to_push is True
+    assert not any(c[:3] == ["gh", "pr", "create"] for c in gh.calls)
+
+
+def test_finalize_falls_back_to_the_detected_default_when_no_base_is_recorded(tmp_path: Path):
+    """A worktree provisioned for a project with no recorded integration
+    branch carries no `base_branch` in its marker — finalize falls back to
+    the detected default branch."""
+    repo, worktree, branch = _provision(tmp_path, task_id="task-int-4")
+    (worktree / "change.txt").write_text("work\n")
+    _git(worktree, "add", "change.txt")
+    _git(worktree, "commit", "-q", "-m", "do the work")
+
+    gh = _FakeGh()
+    result = finalize_worktree_session(str(worktree), open_pr=True, gh_runner=gh)
+
+    assert result.pr_opened is True
+    create_call = next(c for c in gh.calls if c[:3] == ["gh", "pr", "create"])
+    assert create_call[create_call.index("--base") + 1] == "main"
 
 
 def test_finalize_reports_push_failure_without_pretending_success(tmp_path: Path):

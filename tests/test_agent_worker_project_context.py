@@ -101,6 +101,62 @@ def test_child_dispatch_context_is_bounded_to_its_project(tmp_path: Path):
     assert "Acceptance: synthetic verification passes" in enriched["notes"]
 
 
+def test_project_location_context_carries_the_recorded_integration_branch(tmp_path: Path):
+    parent = {
+        "id": "parent-int",
+        "description": "Synthetic integration project",
+        "notes": "",
+        "child_count": 1,
+        "fields": {"project_integration_branch": "feat/synthetic-integration-abc12345"},
+    }
+    children = [{"id": "child-int", "status": "todo", "tags": ["claude"]}]
+
+    def handler(request: httpx.Request):
+        if request.url.path == "/api/tasks/parent-int":
+            return httpx.Response(200, json=parent)
+        if request.url.path == "/api/tasks/parent-int/children":
+            return httpx.Response(200, json={"tasks": children, "total": 1})
+        return httpx.Response(404)
+
+    worker = _worker(tmp_path, handler)
+    enriched = worker._with_project_context({
+        "id": "child-int",
+        "description": "Synthetic child",
+        "fields": {"parent_id": "parent-int"},
+    })
+
+    assert enriched["_project_location_context"]["integration_branch"] == (
+        "feat/synthetic-integration-abc12345"
+    )
+
+
+def test_project_location_context_has_no_integration_branch_when_unrecorded(tmp_path: Path):
+    parent = {
+        "id": "parent-no-int",
+        "description": "Synthetic ordinary project",
+        "notes": "",
+        "child_count": 1,
+        "fields": {},
+    }
+    children = [{"id": "child-no-int", "status": "todo", "tags": ["claude"]}]
+
+    def handler(request: httpx.Request):
+        if request.url.path == "/api/tasks/parent-no-int":
+            return httpx.Response(200, json=parent)
+        if request.url.path == "/api/tasks/parent-no-int/children":
+            return httpx.Response(200, json={"tasks": children, "total": 1})
+        return httpx.Response(404)
+
+    worker = _worker(tmp_path, handler)
+    enriched = worker._with_project_context({
+        "id": "child-no-int",
+        "description": "Synthetic child",
+        "fields": {"parent_id": "parent-no-int"},
+    })
+
+    assert enriched["_project_location_context"]["integration_branch"] is None
+
+
 def test_actual_local_executor_receives_bounded_project_context(tmp_path: Path, monkeypatch):
     child = {
         "id": "child01",

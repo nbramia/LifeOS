@@ -25,6 +25,7 @@ from api.services.agent_worker.execution import (
     ExecutionSpec,
     parse_legacy_route_alias,
 )
+from api.services.agent_worker.git_worktree import derive_branch_name
 from api.services.agent_worker.session_store import (
     STATUS_BLOCKED,
     STATUS_CLAIMED,
@@ -58,6 +59,7 @@ HANDOFF_READY_AT_FIELD = "project_handoff_ready_at"
 LAST_HANDOFF_OPERATION_FIELD = "project_last_handoff_operation_id"
 HANDOFF_ACTIVATED_AT_FIELD = "project_handoff_activated_at"
 LAST_ABORTED_HANDOFF_FIELD = "project_last_aborted_handoff_operation_id"
+INTEGRATION_BRANCH_FIELD = "project_integration_branch"
 
 # Stamped on a project child created by an agent-attributed request (the
 # curated `lifeos_task_create` proxy carrying `X-LifeOS-Agent-Session`) or by
@@ -724,6 +726,10 @@ class ProjectTaskService:
                 LAST_HANDOFF_OPERATION_FIELD: operation_id,
                 HANDOFF_ACTIVATED_AT_FIELD: datetime.now(timezone.utc).isoformat(),
             }
+            if not task.fields.get(INTEGRATION_BRANCH_FIELD):
+                # Handoff finalize is inherently first-owner creation:
+                # record the project's deterministic integration branch.
+                cleared[INTEGRATION_BRANCH_FIELD] = _integration_branch_name(task)
             task = self.manager.update(
                 task.id,
                 status="in_progress",
@@ -1150,14 +1156,27 @@ class ProjectTaskService:
             ):
                 raise ProjectConflictError("project coordinator is already live")
 
+        plan_fields = {
+            EXECUTION_PAUSED_FIELD: "true",
+            COORDINATOR_SESSION_FIELD: session.session_id,
+            COORDINATOR_REQUEST_FIELD: operation_id,
+        }
+        # Record the integration branch only the moment this project first
+        # gets a persistent owner — no prior coordinator request and no
+        # prior handoff activation — never on a later re-Plan of a project
+        # that already had one. A re-Plan must not undo an operator's
+        # opt-out (clearing the field) or switch an in-flight project onto a
+        # new branch mid-stream.
+        is_first_owner = (
+            not task.fields.get(COORDINATOR_REQUEST_FIELD)
+            and not task.fields.get(LAST_HANDOFF_OPERATION_FIELD)
+        )
+        if is_first_owner and not task.fields.get(INTEGRATION_BRANCH_FIELD):
+            plan_fields[INTEGRATION_BRANCH_FIELD] = _integration_branch_name(task)
         linked = self.manager.update(
             task_id,
             status="in_progress",
-            fields={
-                EXECUTION_PAUSED_FIELD: "true",
-                COORDINATOR_SESSION_FIELD: session.session_id,
-                COORDINATOR_REQUEST_FIELD: operation_id,
-            },
+            fields=plan_fields,
             _project_operation="plan",
             _precondition=link_precondition,
         )
@@ -1514,6 +1533,25 @@ def _clean_field(fields: dict[str, str], key: str) -> str | None:
 def _coordinator_task_id(project_id: str, operation_id: str) -> str:
     digest = hashlib.sha256(operation_id.encode("utf-8")).hexdigest()[:12]
     return f"project_{project_id}_{digest}"
+
+
+def _integration_branch_name(task: "Task") -> str:
+    """The project's deterministic integration branch — follows the same
+    `<type>/<slug>-<suffix>` convention `ensure_worktree` derives a task's
+    own work branch from, but seeded so it can never collide with one. A
+    handed-off project keeps the source task's own id after activation, and
+    that task's own CLI worktree branch (if it has one) is derived from
+    `(task.description, task.id)` directly — the exact pair this would
+    collide with un-seeded, since a coding session that already pushed WIP
+    to that branch would then hand children (and this task's own worktree
+    finalize push) the same ref. The suffix is a short hash of the task id
+    rather than the id itself, so it stays deterministic and task-specific
+    (two different projects still get different suffixes) without ever
+    equaling the plain id `derive_branch_name` would use for the task's own
+    branch.
+    """
+    seed = hashlib.sha256(f"integration:{task.id}".encode("utf-8")).hexdigest()[:8]
+    return derive_branch_name(task.description, seed)
 
 
 def _handoff_request_hash(request: dict[str, Any]) -> str:

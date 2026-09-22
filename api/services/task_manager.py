@@ -383,6 +383,7 @@ class TaskManager:
                 HANDOFF_SOURCE_ATTEMPT_FIELD,
                 HANDOFF_SOURCE_SESSION_FIELD,
                 HANDOFF_SOURCE_TURN_FIELD,
+                INTEGRATION_BRANCH_FIELD,
                 LAST_ABORTED_HANDOFF_FIELD,
                 LAST_CANCEL_OPERATION_FIELD,
                 LAST_HANDOFF_OPERATION_FIELD,
@@ -399,6 +400,7 @@ class TaskManager:
                 HANDOFF_READY_AT_FIELD, LAST_HANDOFF_OPERATION_FIELD,
                 HANDOFF_ACTIVATED_AT_FIELD, LAST_ABORTED_HANDOFF_FIELD,
                 CHILD_ORIGIN_FIELD, CHILD_CREATOR_SESSION_FIELD,
+                INTEGRATION_BRANCH_FIELD,
             }
             if set(fields) & internal_fields:
                 raise ProjectConflictError(
@@ -1251,6 +1253,7 @@ class TaskManager:
             HANDOFF_SOURCE_ATTEMPT_FIELD,
             HANDOFF_SOURCE_SESSION_FIELD,
             HANDOFF_SOURCE_TURN_FIELD,
+            INTEGRATION_BRANCH_FIELD,
             LAST_ABORTED_HANDOFF_FIELD,
             LAST_HANDOFF_OPERATION_FIELD,
             ProjectConflictError,
@@ -1281,6 +1284,7 @@ class TaskManager:
             LAST_ABORTED_HANDOFF_FIELD,
             CHILD_ORIGIN_FIELD,
             CHILD_CREATOR_SESSION_FIELD,
+            INTEGRATION_BRANCH_FIELD,
         }
         if not project_action and fields_patch and set(fields_patch) & internal_fields:
             raise ProjectConflictError("use the explicit project lifecycle action for internal fields")

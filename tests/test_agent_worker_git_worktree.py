@@ -210,6 +210,172 @@ def test_ensure_worktree_fails_closed_without_touching_the_primary_checkout(tmp_
 
 
 # ---------------------------------------------------------------------------
+# base_branch — a project's integration branch. Lazily created on origin
+# off the default branch when missing, used as the worktree's base instead
+# of the default branch, and recorded in the ownership marker.
+# ---------------------------------------------------------------------------
+
+def test_ensure_worktree_with_base_branch_creates_it_lazily_and_bases_worktree_on_it(tmp_path: Path):
+    repo = _init_repo_with_origin(tmp_path, name="repo-integration")
+
+    result = ensure_worktree(
+        str(repo), "task-int-1", "fix the thing", base_branch="feat/integration-deadbeef",
+    )
+
+    assert result.is_git is True
+    ls_remote = _git(repo, "ls-remote", "--heads", "origin", "feat/integration-deadbeef").stdout
+    assert "feat/integration-deadbeef" in ls_remote
+    # Created off origin/main's current tip.
+    head = _git(Path(result.working_dir), "rev-parse", "HEAD").stdout.strip()
+    origin_main = _git(repo, "rev-parse", "origin/main").stdout.strip()
+    assert head == origin_main
+    marker = git_worktree._read_worker_marker(
+        result.working_dir, runner=None, timeout=git_worktree.DEFAULT_TIMEOUT,
+    )
+    assert marker["base_branch"] == "feat/integration-deadbeef"
+
+
+def test_ensure_worktree_uses_an_already_existing_base_branch_without_recreating(tmp_path: Path):
+    repo = _init_repo_with_origin(tmp_path, name="repo-existing-base")
+    origin = repo.parent / "repo-existing-base-origin.git"
+    other_clone = tmp_path / "other-clone-existing-base"
+    assert _git(tmp_path, "clone", "-q", str(origin), str(other_clone)).returncode == 0
+    _git(other_clone, "config", "user.email", "t@example.com")
+    _git(other_clone, "config", "user.name", "Test")
+    assert _git(other_clone, "checkout", "-q", "-b", "feat/integration-cafebabe").returncode == 0
+    (other_clone / "INTEGRATION.md").write_text("integration-only content\n")
+    assert _git(other_clone, "add", "INTEGRATION.md").returncode == 0
+    assert _git(other_clone, "commit", "-q", "-m", "integration branch work").returncode == 0
+    assert _git(other_clone, "push", "-q", "origin", "feat/integration-cafebabe").returncode == 0
+
+    result = ensure_worktree(
+        str(repo), "task-int-2", "fix the thing", base_branch="feat/integration-cafebabe",
+    )
+
+    # Based on the existing integration branch's own content, not recreated
+    # off main (which never has INTEGRATION.md).
+    assert (Path(result.working_dir) / "INTEGRATION.md").exists()
+    head = _git(Path(result.working_dir), "rev-parse", "HEAD").stdout.strip()
+    origin_integration = _git(repo, "rev-parse", "origin/feat/integration-cafebabe").stdout.strip()
+    assert head == origin_integration
+
+
+def test_ensure_remote_branch_treats_a_racing_creation_as_success(tmp_path: Path):
+    """Two children racing to create the same integration branch must both
+    succeed: even when this call's own push loses the race — the branch
+    already exists on origin by the time it runs — a re-fetch that finds
+    the ref is treated as success, never a failure."""
+    repo = _init_repo_with_origin(tmp_path, name="repo-race-base")
+
+    def losing_push(cmd, *, cwd=None, timeout=git_worktree.DEFAULT_TIMEOUT, input=None):
+        if cmd[:2] == ["git", "push"]:
+            # Stand in for a concurrent winner: the branch lands on origin
+            # out-of-band, and this call's own push reports failure anyway.
+            _git(repo, "push", "-q", "origin", "origin/main:refs/heads/feat/integration-raced")
+            return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr="stale info")
+        return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+
+    git_worktree._ensure_remote_branch(
+        str(repo), "feat/integration-raced", "main",
+        runner=losing_push, timeout=git_worktree.DEFAULT_TIMEOUT,
+    )
+
+    ls_remote = _git(repo, "ls-remote", "--heads", "origin", "feat/integration-raced").stdout
+    assert "feat/integration-raced" in ls_remote
+
+
+def test_ensure_remote_branch_raises_when_the_ref_is_still_missing_after_refetch(tmp_path: Path):
+    """A genuine push-rights/connectivity failure — the ref is still
+    missing even after the re-fetch — is a real error, not a race."""
+    repo = _init_repo_with_origin(tmp_path, name="repo-real-failure")
+
+    def always_failing_push(cmd, *, cwd=None, timeout=git_worktree.DEFAULT_TIMEOUT, input=None):
+        if cmd[:2] == ["git", "push"]:
+            return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr="permission denied")
+        return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+
+    with pytest.raises(WorktreeError):
+        git_worktree._ensure_remote_branch(
+            str(repo), "feat/integration-unreachable", "main",
+            runner=always_failing_push, timeout=git_worktree.DEFAULT_TIMEOUT,
+        )
+
+
+def test_ensure_worktree_reuse_keeps_the_originally_recorded_base_branch(tmp_path: Path):
+    repo = _init_repo_with_origin(tmp_path, name="repo-reuse-base")
+
+    first = ensure_worktree(
+        str(repo), "task-int-reuse", "fix the thing", base_branch="feat/integration-first",
+    )
+    assert first.reused is False
+
+    # A later call for the same task with a different (or no) base_branch
+    # must not disturb the worktree's original base.
+    second = ensure_worktree(
+        str(repo), "task-int-reuse", "fix the thing", base_branch="feat/integration-different",
+    )
+
+    assert second.reused is True
+    assert second.working_dir == first.working_dir
+    marker = git_worktree._read_worker_marker(
+        second.working_dir, runner=None, timeout=git_worktree.DEFAULT_TIMEOUT,
+    )
+    assert marker["base_branch"] == "feat/integration-first"
+
+
+def test_ensure_worktree_without_base_branch_records_none(tmp_path: Path):
+    """A task with no recorded integration branch (a non-project task, or a
+    project without the field) behaves exactly as before: no base_branch
+    is recorded and nothing extra is created on origin."""
+    repo = _init_repo_with_origin(tmp_path, name="repo-no-base")
+
+    result = ensure_worktree(str(repo), "task-no-base", "fix the thing")
+
+    marker = git_worktree._read_worker_marker(
+        result.working_dir, runner=None, timeout=git_worktree.DEFAULT_TIMEOUT,
+    )
+    assert marker["base_branch"] is None
+
+
+def test_integration_branch_never_collides_with_the_handed_off_source_tasks_own_branch(
+    tmp_path: Path,
+):
+    """A handed-off project keeps the source task's own id. That task's own
+    CLI worktree branch (if it has one) is derived from
+    `(description, task.id)` directly by `ensure_worktree` — the recorded
+    integration branch must never equal it, or children (and the source's
+    own worktree finalize push) would collide on the same ref."""
+    from api.services.task_manager import Task
+    from api.services.task_projects import _integration_branch_name
+
+    repo = _init_repo_with_origin(tmp_path, name="repo-collision")
+    task = Task(id="task-collide1", description="fix the launch pipeline")
+
+    # The source task's own CLI session already has a worktree with pushed
+    # in-flight work on its own branch.
+    source = ensure_worktree(str(repo), task.id, task.description)
+    (Path(source.working_dir) / "wip.txt").write_text("source task's own in-flight work\n")
+    _git(Path(source.working_dir), "add", "wip.txt")
+    _git(Path(source.working_dir), "commit", "-q", "-m", "source WIP")
+    assert _git(Path(source.working_dir), "push", "-q", "-u", "origin", source.branch).returncode == 0
+
+    integration_branch = _integration_branch_name(task)
+    assert integration_branch != source.branch
+
+    child = ensure_worktree(
+        str(repo), "task-collide-child", "add the launch step",
+        base_branch=integration_branch,
+    )
+
+    # A fresh branch off main, not the source's own pushed WIP.
+    assert not (Path(child.working_dir) / "wip.txt").exists()
+    head = _git(Path(child.working_dir), "rev-parse", "HEAD").stdout.strip()
+    origin_integration = _git(repo, "rev-parse", f"origin/{integration_branch}").stdout.strip()
+    origin_main = _git(repo, "rev-parse", "origin/main").stdout.strip()
+    assert head == origin_integration == origin_main
+
+
+# ---------------------------------------------------------------------------
 # describe_worktree — consulted by the executors' prompt assembly.
 # ---------------------------------------------------------------------------
 
