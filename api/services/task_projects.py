@@ -44,6 +44,9 @@ EXECUTION_PAUSED_FIELD = "execution_paused"
 EXECUTION_RESERVATION_FIELD = "execution_reservation_until"
 COORDINATOR_SESSION_FIELD = "project_coordinator_session_id"
 COORDINATOR_REQUEST_FIELD = "project_coordinator_request_id"
+# `request_project_owner_wake`'s `reason` for a Plan call against a project
+# that already has a terminal, resumable owner (see `_plan_and_delegate_locked`).
+PLAN_OWNER_WAKE_REASON = "plan_requested"
 CANCEL_OPERATION_FIELD = "project_cancel_operation_id"
 CANCEL_REQUESTED_AT_FIELD = "project_cancel_requested_at"
 LAST_CANCEL_OPERATION_FIELD = "project_last_cancel_operation_id"
@@ -1232,6 +1235,41 @@ class ProjectTaskService:
         prior_request = task.fields.get(COORDINATOR_REQUEST_FIELD)
         if prior_request and prior_request != operation_id and self._task_coordinator_live(task):
             raise ProjectConflictError("project coordinator is already live")
+
+        # A project that already has a terminal (not live), resumable owner
+        # from an earlier Plan gets that owner WOKEN, not a second, competing
+        # owner session. `prior_request != operation_id` distinguishes this
+        # from an idempotent retry of the very call that created/linked the
+        # current owner (which falls through to the ordinary path below and
+        # re-links the same session it already created). The worker's
+        # reconciler performs the actual wake on its next tick — this only
+        # records the request, so the API never races the tick.
+        existing_owner_session_id = task.fields.get(COORDINATOR_SESSION_FIELD)
+        if (
+            existing_owner_session_id
+            and prior_request
+            and prior_request != operation_id
+        ):
+            owner_session = self.session_store.get_by_session_id(existing_owner_session_id)
+            if owner_session is not None and owner_session.status in TERMINAL_STATUSES:
+                self.session_store.request_project_owner_wake(
+                    task_id, owner_session_id=existing_owner_session_id,
+                    reason=PLAN_OWNER_WAKE_REASON, operation_id=operation_id,
+                )
+                if self.transcript_store is not None:
+                    self.transcript_store.append(
+                        existing_owner_session_id, "project_owner_wake_requested", {
+                            "project_id": task_id, "operation_id": operation_id,
+                        },
+                    )
+                return {
+                    "project_id": task_id,
+                    "operation_id": operation_id,
+                    "session_id": existing_owner_session_id,
+                    "status": owner_session.status,
+                    "created": False,
+                    "wake_requested": True,
+                }
 
         synthetic_task_id = _coordinator_task_id(task_id, operation_id)
         session = self.session_store.get(synthetic_task_id)

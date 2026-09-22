@@ -97,6 +97,40 @@ def _truncate_oversized_tool_result(event: dict) -> dict:
     return new_event
 
 
+def turn_identity_block(
+    session_id: str, attempt_id: str | None = None, turn_id: str | None = None,
+) -> str:
+    """The `lifeos_session_id=...; lifeos_attempt_id=...; lifeos_turn_proof=...;`
+    clause every managed turn must carry so the agent can pass it back as
+    `caller_session_id`/`caller_attempt_id`/`caller_turn_id`/`caller_turn_proof`
+    on any `lifeos_agent_*` MCP call.
+
+    Attestation is bound to one exact attempt/turn (see
+    `caller_turn_proof_for_session`), so a continuation turn (a project-owner
+    wake posted via `post_user_message`) needs this recomputed for its OWN
+    new attempt/turn — the proof on the turn that just ended is not valid for
+    the one that's starting. `_user_message_for` calls this for a session's
+    first turn; the worker's owner-wake continuation calls it again for a
+    resumed turn.
+    """
+    from api.services.agent_worker.inter_agent import (
+        caller_proof_for_session,
+        caller_turn_proof_for_session,
+    )
+    from config.settings import settings
+    secret = getattr(settings, "mcp_bearer_token", "")
+    proof = caller_proof_for_session(session_id, secret)
+    identity = f"lifeos_session_id={session_id}; "
+    if proof:
+        identity += f"lifeos_session_proof={proof}; "
+    if attempt_id and turn_id:
+        turn_proof = caller_turn_proof_for_session(session_id, attempt_id, turn_id, secret)
+        identity += f"lifeos_attempt_id={attempt_id}; lifeos_turn_id={turn_id}; "
+        if turn_proof:
+            identity += f"lifeos_turn_proof={turn_proof}; "
+    return identity
+
+
 def _user_message_for(
     task: dict,
     session_id: str,
@@ -140,22 +174,7 @@ def _user_message_for(
         # retain the latest operator direction without allowing an unbounded
         # vault note to dominate the first remote prompt.
         parts.append(f"Task notes:\n{notes[-6000:]}")
-    from api.services.agent_worker.inter_agent import (
-        caller_proof_for_session,
-        caller_turn_proof_for_session,
-    )
-    from config.settings import settings
-    proof = caller_proof_for_session(session_id, getattr(settings, "mcp_bearer_token", ""))
-    identity = f"lifeos_session_id={session_id}; "
-    if proof:
-        identity += f"lifeos_session_proof={proof}; "
-    if attempt_id and turn_id:
-        turn_proof = caller_turn_proof_for_session(
-            session_id, attempt_id, turn_id, getattr(settings, "mcp_bearer_token", ""),
-        )
-        identity += f"lifeos_attempt_id={attempt_id}; lifeos_turn_id={turn_id}; "
-        if turn_proof:
-            identity += f"lifeos_turn_proof={turn_proof}; "
+    identity = turn_identity_block(session_id, attempt_id, turn_id)
     # No token cap is the default (opt-in only via a title hint) — omit the
     # clause entirely rather than rendering "~None tokens".
     max_tokens = budget.get("max_tokens")

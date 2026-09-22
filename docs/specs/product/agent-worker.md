@@ -163,10 +163,20 @@ child can never be assigned `#hermes` as its assignee or executor. Existing
 projects use **Plan and delegate**, not this conversion. Session-agent
 delegation (`lifeos_agent_spawn`) remains separate from durable project
 children. A child never becomes a project. A project's owner is a persistent
-session, not a single bounded run: for a claude_code/codex owner, the worker
-wakes it automatically (through the same native CLI resume any such session
-uses) whenever a child reaches awaiting-review, blocked, failed, done, or
-cancelled, coalescing several such events into one wake.
+session, not a single bounded run: the worker wakes it automatically —
+natively continuing its own thread on whichever route it already runs on —
+whenever a child reaches awaiting-review, blocked, failed, done, or
+cancelled, coalescing several such events into one wake. If that thread's
+native handle is unusable (a missing CLI session id, an unrecognized
+Managed sandbox, or a Hermes owner with no stored conversation), the owner
+instead gets a fresh
+turn on that same route, briefed with its objective, notes, current children
+and its own last result — the execution route an owner runs on never
+changes. Requesting **Plan and delegate** again for a project that already
+has a finished, resumable owner wakes that same owner instead of starting a
+second, competing one; a retried request with the same operation ID wakes it
+at most once. Managed Agents owners are woken only while the project still
+carries its explicit cloud-consent tag.
 
 A pending handoff remains fenced through worker recovery. The source stays
 paused and staged work stays blocked until its matching source turn is known

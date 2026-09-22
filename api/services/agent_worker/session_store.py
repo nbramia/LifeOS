@@ -4581,6 +4581,31 @@ class SessionStore:
             )
         return self.get_project_owner_state(project_id)
 
+    def request_project_owner_wake(
+        self, project_id: str, *, owner_session_id: str, reason: str, operation_id: str,
+    ) -> None:
+        """Record a Plan-time wake request against an existing, terminal
+        owner, so the reconciler treats it as one more event source
+        alongside a child-state change on its next pass (see
+        `Worker._reconcile_one_project_owner`'s `has_events` check) and
+        delivers it exactly once (`ack_project_owner_wake` clears both
+        columns on a successful wake). Idempotent per `operation_id`: a
+        retried Plan call re-writes the identical value rather than
+        accumulating anything. Creates the row (mirroring
+        `ensure_project_owner_state`) if the reconciler has not observed
+        this project yet."""
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO project_owner_state "
+                "(project_id, owner_session_id, acked_states_json, "
+                "wake_request_reason, wake_request_operation_id, updated_at) "
+                "VALUES (?, ?, '{}', ?, ?, ?) ON CONFLICT(project_id) DO UPDATE SET "
+                "wake_request_reason = excluded.wake_request_reason, "
+                "wake_request_operation_id = excluded.wake_request_operation_id, "
+                "updated_at = excluded.updated_at",
+                (project_id, owner_session_id, reason, operation_id, _now()),
+            )
+
     def set_project_owner_anchor(self, project_id: str, first_unseen_at: int | None) -> None:
         """Set or clear the quiet-window debounce anchor."""
         with self._connect() as conn:
