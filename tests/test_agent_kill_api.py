@@ -310,6 +310,53 @@ def test_operator_kill_reports_already_terminal_for_a_resolved_cli_transcript_id
 
 
 @pytest.mark.unit
+def test_operator_kill_signals_the_owning_subprocess_for_a_paneless_cli_session_row(
+    client, stores, monkeypatch,
+):
+    """With the LifeOS session hooks installed, a worker-spawned CLI session
+    DOES register a `cli_sessions` row — just with `pane_id` NULL, since
+    there's no wezterm pane to record. `get_cli_session` finds that row
+    first, so the route must not short-circuit into `_kill_cli_sessions`
+    (which can only mark a pane-less row ended, leaving the real subprocess
+    running): it has to resolve back to the owning `sessions` row and
+    actually signal it, and mark the `cli_sessions` row ended too, since a
+    killed subprocess sends no SessionEnd hook event of its own."""
+    import signal as _signal
+
+    session_store, transcript_store = stores
+    monkeypatch.setattr(agents_route, "_maybe_managed_driver", lambda: None)
+    monkeypatch.setattr(agents_route, "api_host_name", lambda: "this-box")
+
+    owner = session_store.create(task_id="cc-hooked", status=STATUS_RUNNING, routing="claude_code")
+    session_store.set_claude_code_session_id(owner.task_id, "transcript-uuid-3")
+    transcript_store.append(owner.session_id, "claude_code_pid", {"pid": 7171, "pgid": 7171})
+    # No `pane_id` — the hook registers a headless session with none to bind.
+    session_store.record_cli_session_event(
+        engine="claude_code", event="user_prompt_submit", session_id="transcript-uuid-3",
+        host="this-box", prompt="do the thing",
+    )
+
+    killpg_calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(inter_agent.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(inter_agent.os, "killpg", lambda pgid, sig: killpg_calls.append((pgid, sig)))
+    monkeypatch.setattr(inter_agent, "_LOCAL_KILL_GRACE_S", 0.0)
+
+    r = client.post("/api/agents/sessions/cc:transcript-uuid-3/kill", json={"reason": "runaway"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert set(body["killed"]) == {owner.session_id, "cc:transcript-uuid-3"}
+    assert body["failures"] == []
+
+    signalled_pgids = {pgid for pgid, _sig in killpg_calls}
+    assert signalled_pgids == {7171}
+    assert _signal.SIGTERM in {sig for _pgid, sig in killpg_calls}
+    assert _signal.SIGKILL in {sig for _pgid, sig in killpg_calls}
+
+    assert session_store.get_by_session_id(owner.session_id).status == STATUS_FAILED
+    assert session_store.get_cli_session("cc:transcript-uuid-3").status == "ended"
+
+
+@pytest.mark.unit
 def test_operator_kill_404s_for_a_cli_transcript_id_with_no_linked_worker_session(
     client, stores,
 ):

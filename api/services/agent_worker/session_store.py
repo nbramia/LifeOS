@@ -806,6 +806,14 @@ class SessionStore:
                         "UPDATE sessions SET claude_code_session_id = code_session_id "
                         "WHERE claude_code_session_id IS NULL AND code_session_id IS NOT NULL"
                     )
+            # `get_by_claude_code_session_id`'s reverse lookup (kill route,
+            # snapshot eligibility) and the board snapshot both query this
+            # column per CLI transcript row, so it needs an index rather than
+            # a full table scan.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_claude_code_session_id "
+                "ON sessions(claude_code_session_id)"
+            )
             # Idempotent migration for the per-session Claude Code tier.
             # Old rows stay NULL → omit --model and use the CLI default.
             if "claude_code_model" not in sess_cols:

@@ -196,16 +196,31 @@ export function decideActions(session, card) {
   }
 
   // Kill — offered live for any non-terminal session. A session the board
-  // opened (Open) gets a `cli_sessions` row with a wezterm pane bound
-  // (`is_cli_session`); the kill endpoint tears it down by killing that
-  // pane. A worker-spawned CLI session runs headless with no pane to bind,
-  // so it shows on the board under its CLI transcript's own `cc:`/`cx:`-
-  // prefixed id instead of a `cli_sessions` row — the kill endpoint
-  // resolves that id back to the `sessions` row that owns the subprocess
-  // and tears IT down, the same way project cancellation already does for
-  // a task's own live CLI-routed session.
+  // opened (Open) gets a `cli_sessions` row with a wezterm pane bound; the
+  // kill endpoint tears it down by killing that pane. A worker-spawned CLI
+  // session runs headless with no pane to bind, so it shows on the board
+  // under its CLI transcript's own `cc:`/`cx:`-prefixed id — the kill
+  // endpoint resolves that id back to the `sessions` row that owns the
+  // subprocess and tears IT down, the same way project cancellation already
+  // does for a task's own live CLI-routed session. Either way, that's only
+  // possible when SOMETHING ties the id to a pane or an owning worker
+  // session: `cli_kill_reachable` is the server's own answer to that
+  // question (computed the same way the kill endpoint itself resolves it —
+  // see `_cli_kill_reachable`, api/routes/agents.py), so an operator-run CLI
+  // session LifeOS never spawned (no pane, no owning session — common on an
+  // install with no session hooks) says so instead of offering a button
+  // that can't work. `undefined` (an older/synthetic session dict with no
+  // such field, or a non-CLI source the field is meaningless for) defaults
+  // to reachable — only an explicit `false` disables.
   if (s && !TERMINAL.has(s.status)) {
-    out.push({ id: 'kill', label: 'Kill', enabled: true, reason: null, danger: false });
+    if (isCliSession(s) && s.cli_kill_reachable === false) {
+      out.push({
+        id: 'kill', label: 'Kill', enabled: false, danger: false,
+        reason: `this live ${sourceLabelFor(s)} session isn't tracked by LifeOS — close it manually`,
+      });
+    } else {
+      out.push({ id: 'kill', label: 'Kill', enabled: true, reason: null, danger: false });
+    }
   }
 
   // Answer — a pending operator question. The card's own view wins when a

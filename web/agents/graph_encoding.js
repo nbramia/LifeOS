@@ -60,6 +60,15 @@ export function isRawIdValue(d, value) {
 // Graph tab's side panel (which already holds every known session) and the
 // Board drawer (which fetches `/api/agents/snapshot` on demand for this)
 // can never disagree about what "descendants" means.
+//
+// Also seeds from `session.cli_kill_target_id` when present and different
+// from `session.session_id` — a worker-spawned CLI session's board id (the
+// `cc:`/`cx:` transcript id) is not the id Kill actually cascades from (see
+// `_cli_kill_info`, api/routes/agents.py): the kill endpoint resolves it
+// back to the OWNING `sessions` row and tears THAT subtree down, so any
+// real child that row spawned via a tool call carries the owning row's id
+// as its own `parent_session_id`, never the transcript id. Walking both
+// roots is what makes the preview match what actually gets killed.
 export function descendantsOf(sessions, session) {
   if (!session) return [];
   const childrenOf = new Map();
@@ -68,9 +77,11 @@ export function descendantsOf(sessions, session) {
     if (!childrenOf.has(x.parent_session_id)) childrenOf.set(x.parent_session_id, []);
     childrenOf.get(x.parent_session_id).push(x);
   }
+  const roots = new Set([session.session_id]);
+  if (session.cli_kill_target_id) roots.add(session.cli_kill_target_id);
   const out = [];
-  const queue = [session.session_id];
-  const seen = new Set([session.session_id]);
+  const queue = [...roots];
+  const seen = new Set(roots);
   while (queue.length) {
     const sid = queue.shift();
     for (const child of (childrenOf.get(sid) || [])) {

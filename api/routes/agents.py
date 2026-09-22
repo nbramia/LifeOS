@@ -505,6 +505,65 @@ def _lane_for_session_dict(sd: dict[str, Any], tasks_by_id: dict[str, Any] | Non
     return agent_board.lane_for_session(sd.get("status"), task_status, task_tags, task_fields, _now())
 
 
+def _strip_cli_session_prefix(session_id: str) -> str | None:
+    """Undo a board `cc:`/`cx:` session_id prefix (`CLI_ENGINE_PREFIXES`,
+    mirrored by `session_ingest.CC_PREFIX`), returning the bare Claude Code /
+    Codex CLI transcript id it carries — or None when it carries neither.
+    """
+    for prefix in CLI_ENGINE_PREFIXES.values():
+        marker = f"{prefix}:"
+        if session_id.startswith(marker):
+            return session_id[len(marker):]
+    return None
+
+
+def _resolve_owning_worker_session(session_store: SessionStore, session_id: str) -> Session | None:
+    """Resolve a `cc:`/`cx:`-prefixed board id back to the `sessions` row
+    that owns its subprocess (`claude_code_session_id`), or None when the id
+    carries no recognized prefix or no such row exists. Used wherever a CLI
+    transcript id shows up with no reachable `cli_sessions` pane to kill —
+    either no `cli_sessions` row at all, or one with `pane_id` NULL.
+    """
+    raw_cli_id = _strip_cli_session_prefix(session_id)
+    return session_store.get_by_claude_code_session_id(raw_cli_id) if raw_cli_id else None
+
+
+def _cli_kill_info(
+    session_store: SessionStore, session_id: str, cli: CliSession | None,
+) -> tuple[bool, str]:
+    """Whether `POST .../kill` on this `cc:`/`cx:` board id can actually
+    reach something to tear down (`reachable`), and the session_id it will
+    actually act on (`kill_target_id`) if so.
+
+    Reachable via a bound wezterm pane (`_kill_cli_sessions`, target: the row
+    itself — an interactive terminal spawns no tracked children, so there's
+    no other id to cascade from) or, when there's no pane (a worker-spawned
+    session runs headless, whether or not the session hooks are installed),
+    a live `sessions` row that owns the subprocess
+    (`_resolve_owning_worker_session`, target: that row's own id) — the
+    exact fallback `operator_kill_session` itself uses for these same two
+    cases, so this mirrors it rather than re-deriving it independently.
+
+    Computed once here, at snapshot time, so two different callers can read
+    it off the row instead of re-deriving it: `decideActions`
+    (web/agents/session_actions.js) decides Kill's eligibility from
+    `reachable` instead of assuming every `claude_code`/`codex` session is
+    killable — an operator-run CLI session LifeOS never spawned (no
+    `cli_sessions` row, no owning `sessions` row either) genuinely isn't —
+    and `descendantsOf`'s callers (`openKillModal`'s cascade preview) use
+    `kill_target_id` to compute descendants from the id Kill will actually
+    cascade from, not the `cc:`/`cx:` id the card itself carries when those
+    differ (a worker-spawned session's own children carry the OWNING
+    `sessions` row as `parent_session_id`, not the CLI transcript id).
+    """
+    if cli is not None and cli.pane_id is not None:
+        return True, session_id
+    owner = _resolve_owning_worker_session(session_store, session_id)
+    if owner is not None and owner.status not in TERMINAL_STATUSES:
+        return True, owner.session_id
+    return False, session_id
+
+
 def _build_snapshot() -> dict[str, Any]:
     session_store = _get_session_store()
     transcript_store = _get_transcript_store()
@@ -567,6 +626,7 @@ def _build_snapshot() -> dict[str, Any]:
             _apply_cli_session_to_dict(sd, cli)
         else:
             sd["host"] = api_host_name()
+        sd["cli_kill_reachable"], sd["cli_kill_target_id"] = _cli_kill_info(session_store, sid, cli)
     session_dicts.extend(cc_sessions)
     edges.extend(cc_edges)
 
@@ -587,6 +647,7 @@ def _build_snapshot() -> dict[str, Any]:
             _apply_cli_session_to_dict(sd, cli)
         else:
             sd["host"] = api_host_name()
+        sd["cli_kill_reachable"], sd["cli_kill_target_id"] = _cli_kill_info(session_store, sid, cli)
     session_dicts.extend(cx_sessions)
     edges.extend(cx_edges)
 
@@ -637,6 +698,7 @@ def _build_snapshot() -> dict[str, Any]:
         cli = cli_by_id.pop(sid, None)
         if cli is not None:
             _apply_cli_session_to_dict(sd, cli)
+        sd["cli_kill_reachable"], sd["cli_kill_target_id"] = _cli_kill_info(session_store, sid, cli)
         session_dicts.append(sd)
         local_ids.add(sid)
         appended_mirrored_host_by_id[sid] = source_host
@@ -690,6 +752,7 @@ def _build_snapshot() -> dict[str, Any]:
             ),
         )
         sd["custom_label"] = agent_viz_label_override.get_override(cli.session_id)
+        sd["cli_kill_reachable"], sd["cli_kill_target_id"] = _cli_kill_info(session_store, cli.session_id, cli)
         session_dicts.append(sd)
 
     # Board lane + pending-question + card-join + repair fields, additive —
@@ -716,6 +779,12 @@ def _build_snapshot() -> dict[str, Any]:
         # Only a LifeOS session row can belong to a repair; a CLI-derived or
         # mirrored row carries the field as null so the shape is uniform.
         sd.setdefault("repair", None)
+        # Only a CLI-sourced row's own kill eligibility (and the id Kill
+        # actually acts on) is ever ambiguous — a plain LifeOS row is always
+        # killable via `_kill_session_subtree`, targeting itself, so both
+        # carry null/its own id rather than being computed.
+        sd.setdefault("cli_kill_reachable", None)
+        sd.setdefault("cli_kill_target_id", sd.get("session_id"))
         pq = open_question_by_session.get(sd.get("session_id"))
         sd["pending_question"] = _pending_question_view(pq) if pq else None
         task = tasks_by_id.get(sd.get("task_id")) if sd.get("task_id") else None
@@ -2686,18 +2755,6 @@ async def _kill_session_subtree(target: Session, reason: str) -> tuple[list[str]
                 pass
 
 
-def _strip_cli_session_prefix(session_id: str) -> str | None:
-    """Undo a board `cc:`/`cx:` session_id prefix (`CLI_ENGINE_PREFIXES`,
-    mirrored by `session_ingest.CC_PREFIX`), returning the bare Claude Code /
-    Codex CLI transcript id it carries — or None when it carries neither.
-    """
-    for prefix in CLI_ENGINE_PREFIXES.values():
-        marker = f"{prefix}:"
-        if session_id.startswith(marker):
-            return session_id[len(marker):]
-    return None
-
-
 @router.post("/sessions/{session_id}/kill")
 async def operator_kill_session(session_id: str, body: KillRequest | None = None) -> dict[str, Any]:
     """Operator-initiated kill: stop the target session and all descendants
@@ -2720,21 +2777,39 @@ async def operator_kill_session(session_id: str, body: KillRequest | None = None
         if cli is not None:
             if cli.status == CLI_STATUS_ENDED:
                 return {"killed": [], "failures": [], "reason": "already ended"}
+            if cli.pane_id is None:
+                # A worker-spawned `claude_code`/`codex` session runs
+                # headless — no wezterm pane — but with the LifeOS session
+                # hooks installed it still registers a `cli_sessions` row,
+                # just with no pane to record. `_kill_cli_sessions` can't
+                # reach a real process through a pane-less row (it only
+                # marks the row ended); resolve back to the `sessions` row
+                # that actually owns the subprocess and tear THAT down
+                # first, through the same `_kill_session_subtree` path
+                # project cancellation already uses for a task's own live
+                # CLI-routed session (`TaskProjectService._stop_session`).
+                owner = _resolve_owning_worker_session(session_store, session_id)
+                if owner is not None and owner.status not in TERMINAL_STATUSES:
+                    killed, failures = await _kill_session_subtree(owner, reason)
+                    # A killed CLI subprocess sends no SessionEnd hook event
+                    # of its own, so the row would otherwise stay
+                    # idle/running forever — the board's card-join overlay
+                    # (`_apply_cli_session_to_dict`) prefers this row's own
+                    # status over the transcript's inferred one.
+                    try:
+                        session_store.mark_cli_session_ended(cli.session_id)
+                    except Exception as exc:  # noqa: BLE001 — the real kill already happened
+                        logger.warning(
+                            "could not mark cli_sessions row %s ended after killing "
+                            "its owning session: %s", cli.session_id, exc,
+                        )
+                    return {"killed": sorted({*killed, cli.session_id}), "failures": failures}
             killed, failures = await _kill_cli_sessions([cli], reason or "killed by the operator")
             return {"killed": killed, "failures": failures}
-        # A worker-spawned `claude_code`/`codex` session never registers a
-        # `cli_sessions` row at all — it runs headless, with no wezterm pane
-        # for the SessionStart hook to bind. The board still shows it, under
-        # its CLI transcript's own `cc:`/`cx:`-prefixed id (see
-        # `session_ingest.CC_PREFIX`), because that id is neither a
-        # `sessions` row nor a `cli_sessions` row. Resolve it back to the
-        # `sessions` row that actually owns the subprocess — the same raw id
-        # under the prefix is what `claude_code_session_id` was set to — and
-        # fall through to the normal subtree teardown below: the exact
-        # mechanism project cancellation already uses for a task's own live
-        # CLI-routed session (`TaskProjectService._stop_session`).
-        raw_cli_id = _strip_cli_session_prefix(session_id)
-        target = session_store.get_by_claude_code_session_id(raw_cli_id) if raw_cli_id else None
+        # No `cli_sessions` row at all (no session hooks installed, or a
+        # stale/expired row) — same resolution as the pane-less case above,
+        # one level up: fall through to the normal subtree teardown below.
+        target = _resolve_owning_worker_session(session_store, session_id)
         if target is None:
             raise HTTPException(status_code=404, detail=f"session {session_id} not found")
     if target.status in TERMINAL_STATUSES:
