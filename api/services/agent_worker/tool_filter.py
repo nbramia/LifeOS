@@ -54,6 +54,7 @@ CROSS_CUTTING_LIFEOS_TOOLS = (
     "lifeos_agent_sessions_list",
     "lifeos_agent_user_ask",
     "lifeos_agent_project_handoff",
+    "lifeos_agent_project_owner",
     # General vault search — often the first move on any task
     "lifeos_search",
     "lifeos_ask",

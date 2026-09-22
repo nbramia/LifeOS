@@ -73,17 +73,18 @@ def test_inter_agent_tools_are_registered(server):
 
 @pytest.mark.unit
 def test_mcp_catalog_count_and_inter_agent_schema_contract(server):
-    """The registered fallback catalog is 71 curated + 10 inter-agent tools.
+    """The registered fallback catalog is 71 curated + 11 inter-agent tools.
 
-    The ninth inter-agent tool is the canonical execution-override surface;
-    keeping this assertion next to the schema checks prevents docs and live
-    registration from silently disagreeing after tool additions.
+    The eleventh inter-agent tool is the attested project-owner review/
+    completion surface (`lifeos_agent_project_owner`); keeping this
+    assertion next to the schema checks prevents docs and live registration
+    from silently disagreeing after tool additions.
     """
     from api.services.agent_worker.inter_agent import INTER_AGENT_TOOL_SCHEMAS
 
     assert len(mcp_server.CURATED_ENDPOINTS) == mcp_server.CURATED_TOOL_COUNT == 71
-    assert len(INTER_AGENT_TOOL_SCHEMAS) == 10
-    assert len(server.tools) == 81
+    assert len(INTER_AGENT_TOOL_SCHEMAS) == 11
+    assert len(server.tools) == 82
     assert len({tool["name"] for tool in server.tools}) == len(server.tools)
 
 

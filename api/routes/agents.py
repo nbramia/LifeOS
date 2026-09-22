@@ -1706,43 +1706,17 @@ async def accept_board_card(card_id: str) -> dict[str, Any]:
     calling this on an already-accepted, already-done card is a no-op.
     """
     from api.services import agent_board
-    from api.services.task_manager import get_task_manager, TaskConflictError
+    from api.services.board_review import BoardReviewError, accept_review
+    from api.services.task_manager import get_task_manager
 
     task_manager = get_task_manager()
-    task = task_manager.get(card_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail="card not found")
-
-    tags_norm = {t.lstrip("#").lower() for t in task.tags}
-    already_accepted = agent_board.ACCEPTED_TAG in tags_norm
-    # Uses the natural (status/tag-only) lane, not the snoozed one — a
-    # snoozed Review card is still a Review card as far as Accept is
-    # concerned; accepting it both moves it to Done and wakes it (the
-    # `fields=` clear on the write below).
-    if agent_board.natural_lane(task.status, task.tags) != "review" and not already_accepted:
-        raise HTTPException(status_code=409, detail="card is not in the Review lane")
-
-    needs_tag = not already_accepted
-    needs_status = task.status != "done"
-    if needs_tag or needs_status:
-        try:
-            def add_accepted(tags: list[str]) -> list[str]:
-                normalized_latest = {str(tag).lstrip("#").lower() for tag in tags}
-                if agent_board.ACCEPTED_TAG in normalized_latest:
-                    return list(tags)
-                if not agent_board.is_review_pending(tags):
-                    raise TaskConflictError("card changed; refresh before accepting")
-                return [*tags, agent_board.ACCEPTED_TAG]
-
-            task = task_manager.update(
-                card_id, status="done", _tags_merge=add_accepted,
-                fields={agent_board.SNOOZED_UNTIL_FIELD: None},
-            )
-        except TaskConflictError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        if task is None:
-            raise HTTPException(status_code=404, detail="card not found")
-        _invalidate_board_cache()
+    try:
+        result = accept_review(task_manager, card_id, reviewer="operator")
+    except BoardReviewError as exc:
+        status_code = 404 if exc.code == "not_found" else 409
+        raise HTTPException(status_code=status_code, detail=exc.message) from exc
+    task = result.task
+    _invalidate_board_cache()
 
     lane = agent_board.derive_lane(task.status, task.tags, task.fields)
     # updated_at is already refreshed only by the successful CAS write and is
@@ -1820,6 +1794,7 @@ async def review_board_card_action(card_id: str, body: ReviewActionRequest) -> d
     the worker re-arms that session when it claims the new assignment.
     """
     from api.services import agent_board
+    from api.services.board_review import BoardReviewError, reject_review
     from api.services.task_manager import get_task_manager, TaskConflictError
 
     action = body.action.strip().lower()
@@ -1856,6 +1831,24 @@ async def review_board_card_action(card_id: str, body: ReviewActionRequest) -> d
             _invalidate_board_cache()
             return {"id": card_id, "action": action, "queued": True, "question_id": question["id"]}
 
+        if action == "reject":
+            try:
+                result = reject_review(task_manager, session_store, card_id, note, reviewer="operator")
+            except BoardReviewError as exc:
+                status_code = 404 if exc.code == "not_found" else 409
+                raise HTTPException(status_code=status_code, detail=exc.message) from exc
+            updated = result.task
+            _invalidate_board_cache()
+            return {
+                "id": updated.id,
+                "action": action,
+                "lane": agent_board.derive_lane(updated.status, updated.tags, updated.fields),
+                "status": updated.status,
+                "tags": list(updated.tags),
+                "queued": result.followup_id is not None,
+                "context_preserved": True,
+            }
+
         plan = agent_board.plan_review_action(
             task.status, task.tags, action, body.assignee,
         )
@@ -1864,19 +1857,12 @@ async def review_board_card_action(card_id: str, body: ReviewActionRequest) -> d
             raise HTTPException(status_code=status_code, detail=detail)
 
         session = session_store.get(card_id)
-        # Reject continues the prior session, so it needs one. Reassign only
-        # needs a target assignee — a card whose session was never recorded
-        # (or has since been pruned) still reassigns, and reports
-        # `context_preserved: false` rather than being refused outright.
-        if session is None and action == "reject":
-            raise HTTPException(status_code=409, detail="the prior agent session cannot be resumed")
+        # Reassign only needs a target assignee — a card whose session was
+        # never recorded (or has since been pruned) still reassigns, and
+        # reports `context_preserved: false` rather than being refused
+        # outright.
         if session is not None and session.status not in TERMINAL_STATUSES:
             raise HTTPException(status_code=409, detail="the prior agent session is still running")
-        if action == "reject" and session.routing == "hermes" and not session.conversation_id:
-            raise HTTPException(
-                status_code=409,
-                detail="Hermes cannot continue this review because its conversation id is missing; reassign it to retry with a fresh context",
-            )
 
         old_status = task.status
         old_tags = list(task.tags)
@@ -1902,9 +1888,6 @@ async def review_board_card_action(card_id: str, body: ReviewActionRequest) -> d
                 agent_board.ACCEPTED_TAG,
             }
             cleaned = [t for t in tags if t.lstrip("#").lower() not in lifecycle]
-            if action == "reject":
-                cleaned.append(agent_board.RUNNING_TAG)
-                return cleaned
             cleaned = [
                 t for t in cleaned
                 if t.lstrip("#").lower() not in agent_board.AGENT_EXECUTOR_TAGS
@@ -1968,9 +1951,6 @@ async def review_board_card_action(card_id: str, body: ReviewActionRequest) -> d
                 logger.error("review action rollback failed for %s: %s", card_id, restore_exc)
                 return False
 
-        # Commit the paired card transition before exposing a pre-answered
-        # follow-up row. The worker cannot consume a follow-up for a card that
-        # is still in Review; failures roll the card back.
         try:
             updated = task_manager.update(
                 card_id, status=plan.status, _tags_merge=merge_review_tags,
@@ -1983,26 +1963,11 @@ async def review_board_card_action(card_id: str, body: ReviewActionRequest) -> d
             raise HTTPException(status_code=404, detail="card not found")
         transition_version = updated.updated_at
 
-        followup_id: int | None = None
-        if action == "reject":
-            try:
-                followup_id = session_store.enqueue_web_followup(
-                    session.session_id, card_id, note,
-                )
-            except Exception as exc:  # noqa: BLE001
-                if followup_id is not None:
-                    session_store.delete_pending_question(followup_id)
-                rolled_back = restore_card()
-                detail = f"could not queue review continuation: {type(exc).__name__}"
-                if not rolled_back:
-                    detail += "; rollback conflict — card changed, refresh before retrying"
-                raise HTTPException(status_code=409, detail=detail) from exc
-
-        if action == "reassign" and session is None:
+        if session is None:
             # No prior run to anchor to: the card moves, and the caller is
             # told plainly that nothing came with it.
             context_preserved = False
-        elif action == "reassign":
+        else:
             transcript_store = _get_transcript_store()
             target_assignee = (body.assignee or "").lstrip("#").lower()
             native_handle_usable = bool(
@@ -2038,8 +2003,6 @@ async def review_board_card_action(card_id: str, body: ReviewActionRequest) -> d
                 if not rolled_back:
                     detail += "; rollback conflict — card changed, refresh before retrying"
                 raise HTTPException(status_code=409, detail=detail) from exc
-        else:
-            context_preserved = True
         _invalidate_board_cache()
         return {
             "id": updated.id,
@@ -2047,7 +2010,7 @@ async def review_board_card_action(card_id: str, body: ReviewActionRequest) -> d
             "lane": agent_board.derive_lane(updated.status, updated.tags, updated.fields),
             "status": updated.status,
             "tags": list(updated.tags),
-            "queued": followup_id is not None,
+            "queued": False,
             "context_preserved": context_preserved,
         }
 

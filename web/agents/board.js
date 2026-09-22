@@ -2715,6 +2715,16 @@ export function initBoard() {
         `);
       }
     }
+    if (card.fields && card.fields.review_accepted_by) {
+      const acceptedBy = card.fields.review_accepted_by;
+      const label = acceptedBy.startsWith('owner:') ? 'Project owner' : 'Operator';
+      items.push(`
+        <div class="drawer-meta-item">
+          <span class="drawer-meta-label">Accepted by</span>
+          <span class="drawer-meta-value" title="${escapeAttr(acceptedBy)}">${escapeHtml(label)}</span>
+        </div>
+      `);
+    }
     if (card.status) {
       items.push(`
         <div class="drawer-meta-item">

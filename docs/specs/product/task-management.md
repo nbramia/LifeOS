@@ -207,7 +207,19 @@ Projects use explicit lifecycle actions:
 - **Complete project** requires every child to be done or cancelled, every
   agent result to be accepted, no live coordinator, and no pending
   cancellation. Closing with cancelled children requires explicit reduced-
-  scope acknowledgement.
+  scope acknowledgement. The project's own attested owner session can
+  complete its own project through `lifeos_agent_project_owner` even while
+  that owner's own turn is still live — the one case this guard otherwise
+  refuses; an operator completion is still refused while the coordinator is
+  live, exactly as before.
+- An agent-owned project's attested owner session can also accept or reject
+  a review-pending child of its own project (`lifeos_agent_project_owner`,
+  actions `accept_child`/`reject_child`), scoped to that project and the
+  owner's own current turn. This shares its underlying logic with the
+  operator's board Accept/Reject: an acceptance is recorded distinctly from
+  an operator one, and a rejection (which requires a note, and resumes the
+  child's session with it) is refused while the project is paused, since
+  rejecting starts new child work.
 - **Cancel project** previews affected open, running, and review-pending
   children before confirmation. Confirmation persists intent before stopping
   sessions, cancels unfinished human work, and abandons review results without

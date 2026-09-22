@@ -383,7 +383,7 @@ class ToolRegistry:
                 # over MCP HTTP can supply it); for local we override.
                 args = dict(arguments or {})
                 args["caller_session_id"] = self._inter_ctx.caller_session_id
-                if name == "lifeos_agent_project_handoff":
+                if name in ("lifeos_agent_project_handoff", "lifeos_agent_project_owner"):
                     args["caller_attempt_id"] = self._inter_ctx.caller_attempt_id
                     args["caller_turn_id"] = self._inter_ctx.caller_turn_id
                 payload = inter_agent.dispatch(self._inter_ctx, name, args)

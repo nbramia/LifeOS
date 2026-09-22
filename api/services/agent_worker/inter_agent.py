@@ -313,6 +313,52 @@ INTER_AGENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "lifeos_agent_project_owner",
+        "description": (
+            "Review and complete the project you own, as its attested owner. "
+            "`accept_child`/`reject_child` act on a review-pending child of "
+            "your own project (reject requires `note` and is refused while "
+            "the project is paused); `complete_project` marks your project "
+            "done and is allowed even while your own turn is still live "
+            "(every other completion requirement — unresolved children, "
+            "pending cancellation, cancelled-children acknowledgement — "
+            "still applies). Scoped strictly to the project you own and "
+            "your own current turn."
+        ),
+        "input_schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "caller_session_id": _CALLER_PROP,
+                "caller_proof": _CALLER_PROOF_PROP,
+                "caller_attempt_id": {"type": "string"},
+                "caller_turn_id": {"type": "string"},
+                "caller_turn_proof": {"type": "string"},
+                "action": {
+                    "type": "string",
+                    "enum": ["accept_child", "reject_child", "complete_project"],
+                },
+                "project_id": {"type": "string", "minLength": 1},
+                "child_task_id": {
+                    "type": "string",
+                    "description": "Required for accept_child/reject_child.",
+                },
+                "note": {
+                    "type": "string", "maxLength": 6000,
+                    "description": "Required for reject_child.",
+                },
+                "acknowledge_cancelled_children": {
+                    "type": "boolean",
+                    "description": "complete_project only: acknowledge cancelled children before completing reduced scope.",
+                },
+            },
+            "required": [
+                "caller_session_id", "caller_proof", "caller_attempt_id",
+                "caller_turn_id", "caller_turn_proof", "action", "project_id",
+            ],
+        },
+    },
+    {
         "name": "lifeos_agent_spawn",
         "description": "Spawn a child agent session that runs in parallel. Returns immediately with a `child_session_id` you can monitor with `lifeos_agent_check` or wait on with `lifeos_agent_yield_until`. Budget is drawn from your remaining lineage budget. Omit the route to inherit an active scoped override (or the caller route). Choose `claude_code` or `codex` according to the capabilities configured for that executor. For legacy `model=claude_code` children, `tier` selects a Claude tier; when omitted, the CLI configured default is used.",
         "input_schema": _with_caller({
@@ -869,6 +915,149 @@ def project_handoff(ctx: InterAgentContext, args: dict) -> dict:
         return _err(str(exc), code=exc.code)
     except (ValueError, KeyError) as exc:
         return _err(str(exc), code="invalid_arg")
+
+
+def _project_is_agent_owned(tags: list[str]) -> bool:
+    """Same test `ProjectTaskService._plan_and_delegate_locked` (and the
+    worker's `_project_is_agent_owned`) use to decide a project is agent-
+    (not operator-) owned: an engine assignee tag, or a Managed consent
+    sub-tag."""
+    from api.services import agent_board
+
+    if agent_board.derive_assignee(tags) in agent_board.AGENT_ASSIGNEES:
+        return True
+    normalized = agent_board.normalize_tags(tags)
+    return any(tag in normalized for tag in agent_board.MANAGED_AGENT_ASSIGNEES)
+
+
+def project_owner(ctx: InterAgentContext, args: dict) -> dict:
+    """Attested project-owner review and completion.
+
+    `accept_child`/`reject_child` share their underlying logic with the
+    operator's board accept/reject routes (`api/services/board_review.py`);
+    `complete_project` calls `ProjectTaskService.complete_project` with
+    `owner_session=caller`, which exempts only this exact attested caller
+    from the live-coordinator completion guard.
+
+    Authorization is exactly like `project_handoff`: the caller must be
+    exactly the project's current owner session (`project_coordinator_
+    session_id`), on its exact current turn. Stable error codes: `invalid_arg`,
+    `not_found`, `stale_turn`, `not_owner`, `not_review`, `paused`, `forbidden`,
+    `conflict`.
+    """
+    from api.services import agent_board
+    from api.services.board_review import BoardReviewError, accept_review, reject_review
+    from api.services.task_manager import TaskConflictError, get_task_manager
+    from api.services.task_projects import (
+        CANCEL_OPERATION_FIELD,
+        COORDINATOR_SESSION_FIELD,
+        HANDOFF_OPERATION_FIELD,
+        PROJECT_PAUSED_FIELD,
+        ProjectConflictError,
+        ProjectTaskService,
+        clean_parent_id,
+        field_truthy,
+    )
+
+    action = (args.get("action") or "").strip()
+    if action not in {"accept_child", "reject_child", "complete_project"}:
+        return _err(
+            "action must be accept_child, reject_child, or complete_project",
+            code="invalid_arg",
+        )
+    project_id = (args.get("project_id") or "").strip()
+    if not project_id:
+        return _err("project_id is required", code="invalid_arg")
+
+    caller = ctx.session_store.get_by_session_id(ctx.caller_session_id)
+    if caller is None:
+        return _err("caller session not found", code="stale_turn")
+    attempt_id = ctx.caller_attempt_id or (args.get("caller_attempt_id") or "").strip()
+    turn_id = ctx.caller_turn_id or (args.get("caller_turn_id") or "").strip()
+    if (
+        not attempt_id or not turn_id
+        or caller.attempt_id != attempt_id
+        or caller.turn_id != turn_id
+        or not ctx.session_store.is_current_turn(caller.task_id, attempt_id, turn_id)
+    ):
+        return _err("caller does not own the current executor turn", code="stale_turn")
+
+    manager = ctx.task_manager or get_task_manager()
+    project = manager.get(project_id)
+    if project is None:
+        return _err(f"project {project_id} not found", code="not_found")
+    if (project.fields.get(COORDINATOR_SESSION_FIELD) or "") != caller.session_id:
+        return _err("caller is not this project's current owner", code="not_owner")
+    if project.status in {"done", "cancelled"}:
+        return _err("project is already finished", code="forbidden")
+    if project.fields.get(CANCEL_OPERATION_FIELD) or project.fields.get(HANDOFF_OPERATION_FIELD):
+        return _err("project cancellation or handoff is pending", code="forbidden")
+    if not _project_is_agent_owned(project.tags):
+        return _err("project is not agent-owned", code="forbidden")
+
+    reviewer = f"owner:{caller.session_id}"
+
+    if action in {"accept_child", "reject_child"}:
+        child_task_id = (args.get("child_task_id") or "").strip()
+        if not child_task_id:
+            return _err("child_task_id is required", code="invalid_arg")
+        child = manager.get(child_task_id)
+        if child is None:
+            return _err(f"child {child_task_id} not found", code="not_found")
+        if clean_parent_id(child.fields.get("parent_id")) != project_id:
+            return _err("child does not belong to this project", code="not_owner")
+        if not agent_board.is_review_pending(child.tags):
+            return _err("child is not review-pending", code="not_review")
+
+        if action == "reject_child":
+            if field_truthy(project.fields.get(PROJECT_PAUSED_FIELD)):
+                return _err("project is paused", code="paused")
+            note = (args.get("note") or "").strip()
+            if not note:
+                return _err("note is required to reject", code="invalid_arg")
+            try:
+                result = reject_review(
+                    manager, ctx.session_store, child_task_id, note, reviewer=reviewer,
+                )
+            except BoardReviewError as exc:
+                return _err(exc.message, code=exc.code)
+            ctx.transcript_store.append(caller.session_id, "project_owner_reject", {
+                "project_id": project_id, "child_task_id": child_task_id,
+            })
+            return _ok({
+                "task_id": result.task.id, "status": result.task.status,
+                "tags": list(result.task.tags),
+            })
+
+        try:
+            result = accept_review(manager, child_task_id, reviewer=reviewer)
+        except BoardReviewError as exc:
+            return _err(exc.message, code=exc.code)
+        ctx.transcript_store.append(caller.session_id, "project_owner_accept", {
+            "project_id": project_id, "child_task_id": child_task_id,
+        })
+        return _ok({
+            "task_id": result.task.id, "status": result.task.status,
+            "tags": list(result.task.tags),
+        })
+
+    # action == "complete_project"
+    acknowledge_cancelled_children = bool(args.get("acknowledge_cancelled_children"))
+    service = ProjectTaskService(manager, ctx.session_store, ctx.transcript_store)
+    try:
+        completed = service.complete_project(
+            project_id,
+            acknowledge_cancelled_children=acknowledge_cancelled_children,
+            owner_session=caller,
+        )
+    except KeyError:
+        return _err(f"project {project_id} not found", code="not_found")
+    except (ProjectConflictError, TaskConflictError) as exc:
+        return _err(str(exc), code="conflict")
+    ctx.transcript_store.append(caller.session_id, "project_owner_complete", {
+        "project_id": project_id,
+    })
+    return _ok({"task_id": completed.id, "status": completed.status})
 
 
 def execution_override(ctx: InterAgentContext, args: dict) -> dict:
@@ -1522,6 +1711,7 @@ def user_ask(ctx: InterAgentContext, args: dict) -> dict:
 
 DISPATCH_TABLE = {
     "lifeos_agent_project_handoff": project_handoff,
+    "lifeos_agent_project_owner": project_owner,
     "lifeos_agent_spawn": spawn,
     "lifeos_agent_send": send,
     "lifeos_agent_check": check,

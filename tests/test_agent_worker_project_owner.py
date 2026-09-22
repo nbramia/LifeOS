@@ -579,6 +579,11 @@ class TestOwnerGuidanceWording:
         assert "bounded coordinator" not in PROJECT_TASK_GUIDANCE
         assert "does not wake automatically" not in PROJECT_TASK_GUIDANCE
 
+    def test_project_task_guidance_names_the_owner_review_tool(self):
+        assert "lifeos_agent_project_owner" in PROJECT_TASK_GUIDANCE
+        assert "accept_child" in PROJECT_TASK_GUIDANCE
+        assert "complete_project" in PROJECT_TASK_GUIDANCE
+
     def test_handoff_coordination_prompt_describes_a_persistent_owner(self):
         from api.services.task_projects import ProjectTaskService
 
@@ -884,12 +889,15 @@ class TestOwnerSessionIdStaysFreshOnReplan:
 
 
 # ---------------------------------------------------------------------------
-# B1: the wake message must not point the owner at a tool call that always
-# refuses mid-wake
+# B1: the wake message must point the owner at the attested tool it can
+# actually use mid-wake — `lifeos_agent_project_owner`'s complete_project
+# action is allowed while this exact turn is live (see
+# `ProjectTaskService.complete_project`'s `owner_session` exemption), unlike
+# the operator-only `lifeos_project_complete`.
 # ---------------------------------------------------------------------------
 
-class TestWakeMessageDoesNotPromiseAnUnusableTool:
-    def test_wake_message_explains_complete_refuses_mid_turn(self, tmp_path):
+class TestWakeMessagePointsAtTheAttestedOwnerTool:
+    def test_wake_message_names_the_attested_owner_tool(self, tmp_path):
         w, api, owner = _setup(tmp_path, children=[_child("c1", "p1", "Design")])
         api.tasks["c1"]["status"] = "blocked"
         api.tasks["c1"]["tags"] = ["agent-blocked"]
@@ -898,5 +906,5 @@ class TestWakeMessageDoesNotPromiseAnUnusableTool:
         assert w._reconcile_project_owners() == 1
         pending = w.session_store.peek_pending_messages(owner.session_id)
         body = pending[0]["content"]
-        assert "refuses while this turn is live" in body
-        assert "operator" in body
+        assert "lifeos_agent_project_owner" in body
+        assert "refuses while this turn is live" not in body
