@@ -76,7 +76,7 @@ def _stub_worktree_provisioning(monkeypatch):
 
     monkeypatch.setattr(
         "api.services.agent_worker.git_worktree.ensure_worktree",
-        lambda working_dir, task_id, title, host=None: WorktreeResult(
+        lambda working_dir, task_id, title, host=None, base_branch=None: WorktreeResult(
             working_dir=working_dir, is_git=False,
         ),
     )
