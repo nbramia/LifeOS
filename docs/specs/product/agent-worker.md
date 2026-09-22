@@ -169,6 +169,17 @@ then finish. A staged intent with no children is still an ordinary task, not a
 project, and is shown as a pending handoff rather than as successful project
 work.
 
+The moment a handoff activates — not when it's merely staged — you get a
+one-time Telegram notice naming the project title, child count, owner, and a
+board-card link. A staged handoff that's cancelled before activating never
+sends one. Separately, you get a one-time notice the first time an
+agent-owned project's agent-created children exceed five, listing the child
+titles (operator-created children don't count toward this). A handoff that
+activates with more than five agent-created children already present sends
+one combined notice instead of two. Each notice fires exactly once per
+project per trigger, even across a worker restart; a notice that fails to
+send is retried on a later poll rather than lost.
+
 ---
 
 ## Routing — local vs cloud

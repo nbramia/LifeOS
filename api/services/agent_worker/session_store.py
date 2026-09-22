@@ -675,6 +675,19 @@ CREATE TABLE IF NOT EXISTS pr_status_cache (
     checked_at INTEGER NOT NULL,
     stale      INTEGER NOT NULL DEFAULT 1
 );
+
+-- One row per (project, notice kind) sent to the operator: a durable
+-- dedupe marker so a worker restart or a retried send never causes a
+-- duplicate Telegram notice for the same project/trigger. `kind` is
+-- "handoff" (marker: the handoff operation id) or "agent_children_gt5"
+-- (marker unused). See Worker._reconcile_project_notices.
+CREATE TABLE IF NOT EXISTS project_notices (
+    project_id  TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    marker      TEXT NOT NULL DEFAULT '',
+    notified_at INTEGER NOT NULL,
+    PRIMARY KEY(project_id, kind)
+);
 """
 
 
@@ -4408,6 +4421,32 @@ class SessionStore:
                     "ON CONFLICT(url) DO UPDATE SET checked_at = excluded.checked_at, stale = 1",
                     (url, ts),
                 )
+
+    # ------------------------------------------------------------------
+    # Project notices — durable per-project, per-trigger Telegram dedupe
+    # (see Worker._reconcile_project_notices)
+    # ------------------------------------------------------------------
+
+    def has_project_notice(self, project_id: str, kind: str) -> bool:
+        """True once a notice of `kind` has been sent for `project_id`."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM project_notices WHERE project_id = ? AND kind = ?",
+                (project_id, kind),
+            ).fetchone()
+        return row is not None
+
+    def record_project_notice(self, project_id: str, kind: str, marker: str = "") -> None:
+        """Record that a notice of `kind` was sent for `project_id`. Callers
+        insert this only after a successful send, so a send that fails
+        leaves no row and is retried on a later tick."""
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO project_notices (project_id, kind, marker, notified_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(project_id, kind) DO NOTHING",
+                (project_id, kind, marker, _now()),
+            )
 
     @staticmethod
     def _row_to_cli_session(row: sqlite3.Row) -> CliSession:
