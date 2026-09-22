@@ -128,6 +128,7 @@ from api.services.task_projects import (
     HANDOFF_SOURCE_SESSION_FIELD,
     HANDOFF_SOURCE_TURN_FIELD,
     INTEGRATION_BRANCH_FIELD,
+    LAST_ABORTED_HANDOFF_FIELD,
     LAST_HANDOFF_OPERATION_FIELD,
     PARENT_ID_FIELD,
 )
@@ -6608,6 +6609,15 @@ class Worker:
             children carry `CHILD_ORIGIN_FIELD == CHILD_ORIGIN_AGENT` (in any
             status; operator-created children carry no origin field and
             never count), with no recorded "agent_children_gt5" notice yet.
+            Excluded from this count: a parent with `HANDOFF_OPERATION_FIELD`
+            still set is a pending (not-yet-activated) handoff — its staged
+            children exist early, before there's a real project to report,
+            so fan-out is deferred to the activation tick, which reports both
+            triggers as one combined message when the child count already
+            exceeds the threshold. A parent whose only agent children came
+            from an aborted handoff (`LAST_ABORTED_HANDOFF_FIELD` set and
+            `LAST_HANDOFF_OPERATION_FIELD` never set) never announces a
+            project that never existed.
 
         A project that trips both triggers on the same tick gets one
         combined message and both rows are recorded for that one send. A
@@ -6638,9 +6648,19 @@ class Worker:
             handoff_due = bool(operation_id) and not self.session_store.has_project_notice(
                 project_id, _PROJECT_NOTICE_HANDOFF,
             )
+            # A pending (staged, not-yet-activated) handoff already has its
+            # children stamped agent-origin — deferring fan-out here is what
+            # lets the activation tick send one combined message instead of
+            # an early one at staging plus a second at activation. A parent
+            # whose only agent children came from an aborted handoff never
+            # had a real project, so it never gets a fan-out notice either.
+            handoff_pending = bool(fields.get(HANDOFF_OPERATION_FIELD))
+            aborted_only = bool(fields.get(LAST_ABORTED_HANDOFF_FIELD)) and not operation_id
             agent_children = agent_children_by_parent.get(project_id, [])
             fanout_due = (
-                len(agent_children) > _PROJECT_NOTICE_CHILD_THRESHOLD
+                not handoff_pending
+                and not aborted_only
+                and len(agent_children) > _PROJECT_NOTICE_CHILD_THRESHOLD
                 and not self.session_store.has_project_notice(
                     project_id, _PROJECT_NOTICE_AGENT_CHILDREN_GT5,
                 )

@@ -20,6 +20,8 @@ from api.services.agent_worker.worker import Worker
 from api.services.task_projects import (
     CHILD_ORIGIN_AGENT,
     CHILD_ORIGIN_FIELD,
+    HANDOFF_OPERATION_FIELD,
+    LAST_ABORTED_HANDOFF_FIELD,
     LAST_HANDOFF_OPERATION_FIELD,
     PARENT_ID_FIELD,
 )
@@ -63,11 +65,21 @@ def _operator_child(task_id: str, project_id: str, description: str) -> dict:
 
 
 def _project(
-    task_id: str, description: str, *, tags=None, handoff_operation_id: str | None = None,
+    task_id: str,
+    description: str,
+    *,
+    tags=None,
+    handoff_operation_id: str | None = None,
+    pending_handoff_operation_id: str | None = None,
+    aborted_handoff_operation_id: str | None = None,
 ) -> dict:
     fields = {}
     if handoff_operation_id:
         fields[LAST_HANDOFF_OPERATION_FIELD] = handoff_operation_id
+    if pending_handoff_operation_id:
+        fields[HANDOFF_OPERATION_FIELD] = pending_handoff_operation_id
+    if aborted_handoff_operation_id:
+        fields[LAST_ABORTED_HANDOFF_FIELD] = aborted_handoff_operation_id
     return {
         "id": task_id,
         "description": description,
@@ -262,6 +274,62 @@ def test_handoff_activation_with_more_than_five_agent_children_sends_one_combine
     assert "Agent child 0" in sent[0]
     assert w.session_store.has_project_notice("proj1", "handoff")
     assert w.session_store.has_project_notice("proj1", "agent_children_gt5")
+
+
+@pytest.mark.unit
+def test_pending_handoff_staged_children_defer_fanout_to_the_activation_tick(tmp_path: Path):
+    """Realistic sequence: a handoff stages 6 agent-origin children before
+    it activates. A tick on that staged snapshot must not send an early
+    fan-out notice — `HANDOFF_OPERATION_FIELD` still being set marks the
+    handoff pending, not yet a real project. Once the same operation
+    activates (`LAST_HANDOFF_OPERATION_FIELD` set, the pending field
+    cleared), the next tick sends exactly one combined message."""
+    api = FakeApi(tasks=[
+        _project("proj1", "Big project", tags=["claude"], pending_handoff_operation_id="op-1"),
+        *[_agent_child(f"c{i}", "proj1", f"Agent child {i}") for i in range(6)],
+    ])
+    w = _make_worker(tmp_path, api)
+
+    # Staged snapshot: pending handoff, no notice yet.
+    assert w._reconcile_project_notices() == 0
+    assert w._sent_telegram == []  # type: ignore[attr-defined]
+    assert not w.session_store.has_project_notice("proj1", "handoff")
+    assert not w.session_store.has_project_notice("proj1", "agent_children_gt5")
+
+    # Activated snapshot: one combined message, both rows recorded.
+    api.tasks["proj1"] = _project(
+        "proj1", "Big project", tags=["claude"], handoff_operation_id="op-1",
+    )
+    assert w._reconcile_project_notices() == 1
+    sent = w._sent_telegram  # type: ignore[attr-defined]
+    assert len(sent) == 1
+    assert "Big project" in sent[0]
+    assert "6" in sent[0]
+    assert "Agent child 0" in sent[0]
+    assert w.session_store.has_project_notice("proj1", "handoff")
+    assert w.session_store.has_project_notice("proj1", "agent_children_gt5")
+
+
+@pytest.mark.unit
+def test_cancelled_staged_handoff_sends_nothing(tmp_path: Path):
+    """A staged handoff that's cancelled before activating never sets
+    LAST_HANDOFF_OPERATION_FIELD; its children remain agent-origin (now
+    cancelled) but the parent only ever carries
+    LAST_ABORTED_HANDOFF_FIELD — no notice for a project that never
+    existed."""
+    api = FakeApi(tasks=[
+        _project("proj1", "Big project", tags=["claude"], aborted_handoff_operation_id="op-1"),
+        *[
+            _agent_child(f"c{i}", "proj1", f"Agent child {i}", status="cancelled")
+            for i in range(6)
+        ],
+    ])
+    w = _make_worker(tmp_path, api)
+
+    assert w._reconcile_project_notices() == 0
+    assert w._sent_telegram == []  # type: ignore[attr-defined]
+    assert not w.session_store.has_project_notice("proj1", "handoff")
+    assert not w.session_store.has_project_notice("proj1", "agent_children_gt5")
 
 
 @pytest.mark.unit
