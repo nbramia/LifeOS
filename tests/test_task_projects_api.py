@@ -203,6 +203,54 @@ def test_plan_endpoint_is_idempotent(project_api):
     assert first.json()["session_id"] == second.json()["session_id"]
     assert second.json()["created"] is False
     assert sessions.get_by_session_id(first.json()["session_id"]).status == "claimed"
+    assert "wake_requested" not in second.json()
+
+
+def test_plan_wakes_a_terminal_existing_owner_instead_of_a_second_session(project_api):
+    """Plan against a project that already has a terminal, resumable owner
+    (from an earlier Plan request) records a wake request instead of
+    creating a second, competing owner session -- idempotent per
+    operation_id, including a retry of the SAME new request."""
+    client, manager, sessions = project_api
+    parent = manager.create("Synthetic project", tags=["local"])
+    manager.create("Synthetic child", fields={"parent_id": parent.id})
+
+    first = client.post(
+        f"/api/tasks/{parent.id}/project/plan", json={"operation_id": "op-1"},
+    )
+    assert first.status_code == 200
+    owner_session_id = first.json()["session_id"]
+    owner = sessions.get_by_session_id(owner_session_id)
+    sessions.update_status(
+        owner.task_id, "completed", attempt_id=owner.attempt_id, turn_id=owner.turn_id,
+    )
+
+    second = client.post(
+        f"/api/tasks/{parent.id}/project/plan", json={"operation_id": "op-2"},
+    )
+    assert second.status_code == 200
+    body = second.json()
+    assert body["wake_requested"] is True
+    assert body["session_id"] == owner_session_id
+    assert body["created"] is False
+    # No second session was created for this project.
+    assert sessions.get_by_session_id(owner_session_id) is not None
+    state = sessions.get_project_owner_state(parent.id)
+    assert state is not None
+    assert state["wake_request_operation_id"] == "op-2"
+    assert state["owner_session_id"] == owner_session_id
+
+    # A retry with the SAME operation_id is a no-op beyond re-recording the
+    # identical request -- never a second wake_request, never a new session.
+    retry = client.post(
+        f"/api/tasks/{parent.id}/project/plan", json={"operation_id": "op-2"},
+    )
+    assert retry.status_code == 200
+    retry_body = retry.json()
+    assert retry_body["wake_requested"] is True
+    assert retry_body["session_id"] == owner_session_id
+    state_after_retry = sessions.get_project_owner_state(parent.id)
+    assert state_after_retry["wake_request_operation_id"] == "op-2"
 
 
 def test_create_child_operation_key_is_idempotent(project_api):

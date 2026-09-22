@@ -2831,6 +2831,13 @@ export function initBoard() {
       const project = card.project || {};
       const pendingHandoff = handoffPending(card);
       const coordinator = project.coordinator;
+      // A terminal, still-on-record owner gets woken, not replaced by a
+      // second session (see `plan_and_delegate`'s wake-request path) — the
+      // button says so up front rather than only after the fact in the toast.
+      const wakeExisting = Boolean(
+        coordinator && coordinator.session_id && coordinator.live === false
+        && coordinator.status !== 'missing',
+      );
       const coordination = coordinator ? `
         <div class="project-coordination" data-field="project-coordination">
           Coordination: ${escapeHtml(coordinator.status || 'pending')}
@@ -2850,7 +2857,7 @@ export function initBoard() {
           ${coordination}
           <div class="drawer-actions">
             <button type="button" class="drawer-action" data-action="project-start">Start project</button>
-            <button type="button" class="drawer-action" data-action="project-plan">Plan and delegate</button>
+            <button type="button" class="drawer-action" data-action="project-plan">${wakeExisting ? 'Wake project owner' : 'Plan and delegate'}</button>
             <button type="button" class="drawer-action" data-action="project-complete">Complete project</button>
             <button type="button" class="drawer-action danger" data-action="project-cancel">Cancel project</button>
             ${project.paused
@@ -3243,7 +3250,10 @@ export function initBoard() {
       'project-resume': 'can_resume_project',
     };
     const actionToasts = {
-      'project-plan': 'Coordination started.',
+      // A function reads the request's own response, since the same action
+      // can mean two different things (wake vs. new session) — see
+      // `plan_and_delegate`'s additive `wake_requested` field.
+      'project-plan': result => (result && result.wake_requested ? 'Woke project owner.' : 'Coordination started.'),
       'project-pause': 'Project paused.',
       'project-resume': 'Project resumed.',
     };
@@ -3256,7 +3266,12 @@ export function initBoard() {
         button.disabled = true;
         try {
           const result = await request();
-          if (result !== null) { await fetchBoard(); showToast(actionToasts[action] || 'Project updated.', false); }
+          if (result !== null) {
+            await fetchBoard();
+            const toast = actionToasts[action];
+            const message = typeof toast === 'function' ? toast(result) : (toast || 'Project updated.');
+            showToast(message, false);
+          }
         } catch (error) { showToast(`Couldn't update project: ${error.message}`, true); }
         finally { if (button.isConnected) button.disabled = false; }
       };

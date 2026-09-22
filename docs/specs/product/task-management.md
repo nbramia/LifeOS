@@ -196,14 +196,19 @@ through an ordinary edit.
 Projects use explicit lifecycle actions:
 
 - **Start** marks the parent active without creating worker lifecycle tags.
-- **Plan and delegate** starts one idempotent, bounded agent-owner coordination
-  run with current child state and the project's configured model, effort,
-  host, and working directory when its owner supports those fields. Managed
-  Agents ownership uses the explicit `#cloud-haiku` or `#cloud-sonnet` consent
-  tag and its model choice, retaining configured effort and host assignments
-  but not the configured model or working directory. Each child creation uses
-  a stable `operation_key`, so retrying the same planning step recovers the
-  existing child instead of duplicating it.
+- **Plan and delegate** starts one idempotent, persistent agent-owner
+  coordination session with current child state and the project's configured
+  model, effort, host, and working directory when its owner supports those
+  fields. Managed Agents ownership uses the explicit `#cloud-haiku` or
+  `#cloud-sonnet` consent tag and its model choice, retaining configured
+  effort and host assignments but not the configured model or working
+  directory. Each child creation uses a stable `operation_key`, so retrying
+  the same planning step recovers the existing child instead of duplicating
+  it. When the project already has a finished, resumable owner from an
+  earlier Plan or a handoff, this instead wakes that same owner on its own
+  thread — never a second, competing session — and the response says so
+  (`wake_requested`); a retried request with the same operation ID wakes it
+  at most once.
 - **Complete project** requires every child to be done or cancelled, every
   agent result to be accepted, no live coordinator, and no pending
   cancellation. Closing with cancelled children requires explicit reduced-

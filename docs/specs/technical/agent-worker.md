@@ -684,20 +684,64 @@ tracked by a single `first_unseen_at` anchor (set once when the diff goes
 from empty to non-empty, cleared once a wake is sent) — a wake fires once
 that anchor is at least `_OWNER_WAKE_QUIET_SECONDS` (30) old, so several
 children changing state in a burst coalesce into one wake rather than one
-per child. A wake is delivered only for a claude_code/codex owner today
-(the other routes accumulate events but are not yet continued): the wake
-message is enqueued onto the owner's still-terminal session via
-`Worker._continue_session` — the same native-resume delivery
-`_resume_as_followup` uses for a claude_code/codex follow-up reply, factored
-out so both call it — *before* `begin_new_execution` reopens it with the
-owner's prior `execution_request` (required, since `begin_new_execution`
-clears `execution_spec_json`, and a CLI resume's working directory is
-resolved from that request). Enqueuing first means a crash between the two
-redelivers on the next tick instead of losing the wake; the reopened session
-is left `CLAIMED` for `_dispatch_spawned_sessions` to pick up the same tick
-or the next, exactly as any other reopened CLI session. On the reconciler's
-next pass, a terminal owner whose recorded `wake_attempt_id` matches its
-current attempt reconciles that wake's outcome first: `COMPLETED` moves
+per child. `Worker._continue_session` is the shared native-continuation
+primitive `_resume_as_followup` and the owner-wake reconciler both call,
+one route branch per engine:
+
+- **claude_code/codex**: the wake message is enqueued onto the owner's
+  still-terminal session *before* `begin_new_execution` reopens it with the
+  owner's prior `execution_request` (required, since `begin_new_execution`
+  clears `execution_spec_json`, and a CLI resume's working directory is
+  resolved from that request). Enqueuing first means a crash between the two
+  redelivers on the next tick instead of losing the wake; the reopened
+  session is left `CLAIMED` for `_dispatch_spawned_sessions` to pick up the
+  same tick or the next. When the owner has no persisted CLI session id (it
+  never launched a subprocess, or one launched but never confirmed), the
+  same dispatcher's own fresh-vs-resume branch already treats a missing id
+  as a fresh spawn — the reconciler exploits that by enqueuing the bounded
+  fallback briefing below instead of the terse wake diff, so the route never
+  changes and no separate fallback mechanism is needed for this pair.
+- **local/remote**: the reverse order — `begin_new_execution` reopens the
+  owner first (these routes key their next turn off the session's live
+  attempt/turn), then the wake message is appended as the next conversation
+  turn and run inline via `_execute_start`, exactly like an ordinary
+  follow-up. The conversation always lives in `session_store`, so there is
+  no missing-handle case for these two routes.
+- **hermes**: reopened first, then submitted off-tick (a Hermes turn is a
+  blocking HTTP round trip) with `execute(..., prompt=...)`. The owner's
+  `conversation_id` decides native-vs-fresh inside the executor itself, so
+  the reconciler just picks which message to send: the terse wake diff when
+  a conversation is on record, the bounded fallback briefing when it isn't.
+- **claude (Managed Agents)**: reopened first, then `post_user_message`
+  posts the wake message to the owner's `managed_agent_session_id` — with a
+  freshly computed per-turn identity/proof clause, since `lifeos_agent_*`
+  attestation is bound to one exact turn and the turn that just ended has no
+  bearing on the one this continuation mints (`SessionStore.
+  begin_executor_turn`, since a CAS reopen alone leaves `turn_id` unset).
+  When there is no recorded remote session id, or posting to it fails (most
+  commonly because Anthropic already garbage-collected it), the reconciler
+  starts a brand-new Managed session on the same route instead
+  (`ManagedExecutor.start`), seeded with the bounded fallback briefing as
+  its task notes. Only reached at all while the project still carries a
+  `#cloud-haiku`/`#cloud-sonnet` consent tag — `_project_is_agent_owned` is
+  re-checked against the tick's live tags before any owner is looked up.
+
+The fallback briefing (`Worker._owner_fallback_briefing`) is bounded like the
+wake message itself: the project's own objective and notes, its current
+child table, and the owner's own last recorded card outcome — never a
+transcript excerpt, since a fresh start has no native thread to read one
+from. Reopening a project's owner reaches every route the same way whether
+the project was planned or came from an activated `lifeos_agent_project_handoff`
+— the wake reconciler has no separate path for either origin. Requesting
+Plan and delegate again for a project whose owner is already terminal
+records a wake request (`SessionStore.request_project_owner_wake`, idempotent
+per operation ID) instead of creating a second session; the reconciler folds
+that into the same event diff it already tracks, and the response adds
+`wake_requested: true`.
+
+On the reconciler's next pass, a terminal owner whose recorded
+`wake_attempt_id` matches its current attempt reconciles that wake's outcome
+first: `COMPLETED` moves
 `acked_states` to what was delivered and clears the failure count; `FAILED`
 leaves `acked_states` untouched (so the same events redeliver) and
 increments a `consecutive_failures` counter, auto-pausing the project
