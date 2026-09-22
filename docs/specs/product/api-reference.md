@@ -512,7 +512,11 @@ The operation ID is required and provides retry/restart idempotency. Returns
 `project_id`, `operation_id`, `session_id`, `status`, and `created`. The
 coordinator is a separate operator-origin session whose canonical route/model/
 effort/host/working-directory request is derived from the parent assignment;
-the parent is linked before the session becomes dispatchable.
+the parent is linked before the session becomes dispatchable. When the
+project already has a finished, resumable owner, no new session is created:
+`created` is `false`, `session_id` is the existing owner's, and the response
+adds `wake_requested: true` — the worker's next reconciliation pass wakes
+that owner instead.
 
 ### POST /api/tasks/{id}/project/cancel
 

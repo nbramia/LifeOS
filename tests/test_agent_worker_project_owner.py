@@ -38,6 +38,7 @@ import httpx
 import pytest
 
 from api.services.agent_worker.delegation import PROJECT_TASK_GUIDANCE
+from api.services.agent_worker.local_executor import ExecutorOutcome
 from api.services.agent_worker.session_store import (
     STATUS_BUDGET_EXCEEDED,
     STATUS_CLAIMED,
@@ -48,7 +49,7 @@ from api.services.agent_worker.session_store import (
 )
 from api.services.agent_worker.spend_tracker import SpendTracker
 from api.services.agent_worker.transcript_store import TranscriptStore
-from api.services.agent_worker.worker import Worker
+from api.services.agent_worker.worker import Worker, _SynchronousPool
 from api.services.task_projects import (
     CANCEL_OPERATION_FIELD,
     COORDINATOR_SESSION_FIELD,
@@ -113,7 +114,11 @@ def _project(
     }
 
 
-def _make_worker(tmp_path: Path, api: FakeApi, *, daily_cap_dollars: float = 100.0) -> Worker:
+def _make_worker(
+    tmp_path: Path, api: FakeApi, *, daily_cap_dollars: float = 100.0,
+    local_executor=None, remote_executor=None, hermes_executor=None,
+    managed_executor=None, cli_pool=None,
+) -> Worker:
     transport = httpx.MockTransport(api.handler)
     client = httpx.Client(transport=transport, base_url="http://api")
     sent: list[str] = []
@@ -130,6 +135,11 @@ def _make_worker(tmp_path: Path, api: FakeApi, *, daily_cap_dollars: float = 100
         poll_seconds=0.01,
         telegram_send=_send,
         http_client=client,
+        local_executor=local_executor,
+        remote_executor=remote_executor,
+        hermes_executor=hermes_executor,
+        managed_executor=managed_executor,
+        cli_pool=cli_pool,
     )
     w._sent = sent  # type: ignore[attr-defined]
     return w
@@ -150,18 +160,35 @@ def _setup(
     owner_routing: str = "claude_code",
     cancel_pending: bool = False,
     handoff_pending: bool = False,
+    local_executor=None,
+    remote_executor=None,
+    hermes_executor=None,
+    managed_executor=None,
+    cli_pool=None,
+    conversation_id: str | None = None,
+    managed_agent_session_id: str | None = None,
+    set_cli_session_id: bool = True,
 ) -> tuple[Worker, FakeApi, Session]:
     """Build a worker with one agent-owned project, its persistent owner
     session (`owner.session_id` is what `COORDINATOR_SESSION_FIELD` stores —
     NOT the owner's synthetic task id), and the given children."""
     api = FakeApi(tasks=[])
-    w = _make_worker(tmp_path, api, daily_cap_dollars=daily_cap_dollars)
+    w = _make_worker(
+        tmp_path, api, daily_cap_dollars=daily_cap_dollars,
+        local_executor=local_executor, remote_executor=remote_executor,
+        hermes_executor=hermes_executor, managed_executor=managed_executor,
+        cli_pool=cli_pool,
+    )
     owner = w.session_store.create(
         task_id=_OWNER_TASK_ID, routing=owner_routing, status=owner_status, origin="operator",
         execution_request=execution_request or {"executor": "claude_code", "working_dir": "/repo/wt-1"},
     )
-    if owner_routing in ("claude_code", "codex"):
+    if owner_routing in ("claude_code", "codex") and set_cli_session_id:
         w.session_store.set_claude_code_session_id(_OWNER_TASK_ID, "cli-owner-1")
+    if conversation_id is not None:
+        w.session_store.set_conversation_id(_OWNER_TASK_ID, conversation_id)
+    if managed_agent_session_id is not None:
+        w.session_store.set_managed_session_id(_OWNER_TASK_ID, managed_agent_session_id)
     owner = w.session_store.get(_OWNER_TASK_ID)
     project = _project(
         project_id, project_description, owner_session_id=owner.session_id,
@@ -774,9 +801,13 @@ class TestSelectionGates:
         assert w._reconcile_project_owners() == 0
         assert w.session_store.get_project_owner_state("p1") is None
 
-    def test_non_cli_routed_owner_is_not_woken(self, tmp_path, monkeypatch):
+    def test_unsupported_route_is_skipped_not_woken(self, tmp_path, monkeypatch):
+        """Every route this issue supports (local/remote/hermes/claude, plus
+        claude_code/codex) is now woken -- see the per-route tests below.
+        A route the reconciler has never heard of still gets a safe
+        skip, not a crash, so a future new route degrades gracefully."""
         w, api, owner = _setup(
-            tmp_path, children=[_child("c1", "p1", "Design")], owner_routing="hermes",
+            tmp_path, children=[_child("c1", "p1", "Design")], owner_routing="some_future_route",
         )
         api.tasks["c1"]["status"] = "blocked"
         api.tasks["c1"]["tags"] = ["agent-blocked"]
@@ -900,3 +931,295 @@ class TestWakeMessageDoesNotPromiseAnUnusableTool:
         body = pending[0]["content"]
         assert "refuses while this turn is live" in body
         assert "operator" in body
+
+
+# ---------------------------------------------------------------------------
+# Owner continuation on the other routes, and the fresh-context fallback
+# when no native handle exists. Stub executors mirror the real
+# ones' call shape (LocalExecutor.execute, HermesExecutor.execute,
+# ManagedExecutor.start / .driver.post_user_message) closely enough to
+# exercise Worker._continue_session / _deliver_owner_wake without any I/O.
+# ---------------------------------------------------------------------------
+
+class _StubLocalExecutor:
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    def execute(self, session, task):
+        self.calls.append({"session": session, "task": task})
+        return ExecutorOutcome(
+            status=STATUS_COMPLETED, final_text="local turn done",
+            session_id=session.session_id, attempt_id=session.attempt_id,
+            turn_id=session.turn_id, executor=session.routing,
+        )
+
+
+class _StubHermesExecutor:
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    def execute(self, session, task, prompt=None):
+        self.calls.append({
+            "session": session, "task": task, "prompt": prompt,
+            "conversation_id": session.conversation_id,
+        })
+        return ExecutorOutcome(
+            status=STATUS_COMPLETED, final_text="hermes turn done",
+            session_id=session.session_id, attempt_id=session.attempt_id,
+            turn_id=session.turn_id, executor="hermes",
+            continuation_id=session.conversation_id or "conv-fresh-1",
+        )
+
+
+class _StubManagedDriver:
+    def __init__(self, *, raise_on_post: bool = False):
+        self.posted: list[tuple[str, str]] = []
+        self.raise_on_post = raise_on_post
+
+    def post_user_message(self, session_id, content):
+        if self.raise_on_post:
+            raise RuntimeError("managed session not found (404)")
+        self.posted.append((session_id, content))
+
+
+class _StubManagedExecutor:
+    def __init__(self, driver: "_StubManagedDriver | None" = None):
+        self.driver = driver if driver is not None else _StubManagedDriver()
+        self.start_calls: list[dict] = []
+
+    def start(self, session, task):
+        self.start_calls.append({"session": session, "task": task})
+        return ExecutorOutcome(
+            status=STATUS_COMPLETED, final_text="managed fresh start done",
+            session_id=session.session_id, attempt_id=session.attempt_id,
+            turn_id=session.turn_id, executor="claude",
+            continuation_id="remote-fresh-1",
+        )
+
+
+class TestLocalRemoteNativeContinuation:
+    def test_local_owner_wake_appends_and_runs_inline(self, tmp_path):
+        local = _StubLocalExecutor()
+        w, api, owner = _setup(
+            tmp_path, children=[_child("c1", "p1", "Design")],
+            owner_routing="local", execution_request={"executor": "local"},
+            local_executor=local, cli_pool=_SynchronousPool(),
+        )
+        api.tasks["c1"]["status"] = "blocked"
+        api.tasks["c1"]["tags"] = ["agent-blocked"]
+        _age_anchor(w, "p1", 31)
+
+        assert w._reconcile_project_owners() == 1
+        assert len(local.calls) == 1
+        # The wake diff (child id + prev->new state) reached the executor as
+        # a real conversation turn, appended to the session's own history.
+        history = [m["content"] for m in w.session_store.get_messages(owner.session_id)]
+        assert any("c1" in m for m in history)
+        after = w.session_store.get(_OWNER_TASK_ID)
+        assert after.routing == "local"  # route never changes
+        assert after.status == STATUS_COMPLETED  # the stub ran synchronously to completion
+
+    def test_remote_owner_wake_is_native_too(self, tmp_path):
+        remote = _StubLocalExecutor()
+        w, api, owner = _setup(
+            tmp_path, children=[_child("c1", "p1", "Design")],
+            owner_routing="remote", execution_request={"executor": "remote"},
+            remote_executor=remote, cli_pool=_SynchronousPool(),
+        )
+        api.tasks["c1"]["status"] = "blocked"
+        api.tasks["c1"]["tags"] = ["agent-blocked"]
+        _age_anchor(w, "p1", 31)
+
+        assert w._reconcile_project_owners() == 1
+        assert len(remote.calls) == 1
+        assert w.session_store.get(_OWNER_TASK_ID).routing == "remote"
+
+
+class TestHermesContinuation:
+    def test_native_continuation_uses_the_stored_conversation_id(self, tmp_path):
+        hermes = _StubHermesExecutor()
+        w, api, owner = _setup(
+            tmp_path, children=[_child("c1", "p1", "Design")],
+            owner_routing="hermes", execution_request={"executor": "hermes"},
+            hermes_executor=hermes, cli_pool=_SynchronousPool(),
+            conversation_id="conv-existing-1",
+        )
+        api.tasks["c1"]["status"] = "blocked"
+        api.tasks["c1"]["tags"] = ["agent-blocked"]
+        _age_anchor(w, "p1", 31)
+
+        assert w._reconcile_project_owners() == 1
+        assert len(hermes.calls) == 1
+        call = hermes.calls[0]
+        assert call["conversation_id"] == "conv-existing-1"
+        assert "c1" in call["prompt"]  # the terse wake diff, not a fallback briefing
+        after = w.session_store.get(_OWNER_TASK_ID)
+        assert after.routing == "hermes"
+        assert after.status == STATUS_COMPLETED
+
+    def test_fallback_briefing_when_no_conversation_is_stored(self, tmp_path):
+        """No native handle (never established a conversation) -- a fresh
+        turn on the SAME route, seeded with the bounded owner briefing
+        instead of the terse wake diff."""
+        hermes = _StubHermesExecutor()
+        w, api, owner = _setup(
+            tmp_path,
+            children=[_child("c1", "p1", "Design")],
+            owner_routing="hermes", execution_request={"executor": "hermes"},
+            hermes_executor=hermes, cli_pool=_SynchronousPool(),
+            conversation_id=None,
+            project_description="Ship the migration",
+        )
+        api.tasks["c1"]["status"] = "blocked"
+        api.tasks["c1"]["tags"] = ["agent-blocked"]
+        _age_anchor(w, "p1", 31)
+
+        assert w._reconcile_project_owners() == 1
+        assert len(hermes.calls) == 1
+        call = hermes.calls[0]
+        assert call["conversation_id"] is None
+        briefing = call["prompt"]
+        assert "Fresh start for project owner" in briefing
+        assert "Ship the migration" in briefing
+        assert "c1" in briefing
+        # Never the terse wake diff's own opening line for this project.
+        assert "Project owner wake:" not in briefing
+        assert w.session_store.get(_OWNER_TASK_ID).routing == "hermes"  # route never changes
+
+
+class TestManagedContinuation:
+    def test_native_continuation_posts_a_fresh_per_turn_proof(self, tmp_path, monkeypatch):
+        from config.settings import settings
+        monkeypatch.setattr(settings, "mcp_bearer_token", "synthetic-turn-secret", raising=False)
+        driver = _StubManagedDriver()
+        managed = _StubManagedExecutor(driver=driver)
+        w, api, owner = _setup(
+            tmp_path, children=[_child("c1", "p1", "Design")],
+            owner_routing="claude", execution_request={"executor": "claude"},
+            managed_executor=managed, cli_pool=_SynchronousPool(),
+            managed_agent_session_id="remote-sess-1",
+            project_tags=("cloud-sonnet",),
+        )
+        api.tasks["c1"]["status"] = "blocked"
+        api.tasks["c1"]["tags"] = ["agent-blocked"]
+        _age_anchor(w, "p1", 31)
+
+        first_attempt = w.session_store.get(_OWNER_TASK_ID).attempt_id
+        assert w._reconcile_project_owners() == 1
+        assert len(driver.posted) == 1
+        remote_id, body = driver.posted[0]
+        assert remote_id == "remote-sess-1"
+        assert "c1" in body
+        assert "lifeos_attempt_id=" in body and "lifeos_turn_proof=" in body
+        # The proof is for the NEW turn the CAS just minted, not the one
+        # that just ended.
+        new_attempt = w.session_store.get(_OWNER_TASK_ID).attempt_id
+        assert new_attempt != first_attempt
+        assert new_attempt in body
+        assert w.session_store.get(_OWNER_TASK_ID).routing == "claude"
+        assert managed.start_calls == []  # native path only, no fallback
+
+    def test_fallback_starts_a_fresh_managed_session_on_a_404(self, tmp_path):
+        driver = _StubManagedDriver(raise_on_post=True)
+        managed = _StubManagedExecutor(driver=driver)
+        w, api, owner = _setup(
+            tmp_path,
+            children=[_child("c1", "p1", "Design")],
+            owner_routing="claude", execution_request={"executor": "claude"},
+            managed_executor=managed, cli_pool=_SynchronousPool(),
+            managed_agent_session_id="remote-sess-stale",
+            project_tags=("cloud-sonnet",),
+            project_description="Ship the migration",
+        )
+        api.tasks["c1"]["status"] = "blocked"
+        api.tasks["c1"]["tags"] = ["agent-blocked"]
+        _age_anchor(w, "p1", 31)
+
+        assert w._reconcile_project_owners() == 1
+        assert len(driver.posted) == 0  # the post attempt failed, nothing landed
+        assert len(managed.start_calls) == 1
+        briefing = managed.start_calls[0]["task"].get("notes") or ""
+        assert "Fresh start for project owner" in briefing
+        assert "Ship the migration" in briefing
+        assert "c1" in briefing
+        assert w.session_store.get(_OWNER_TASK_ID).routing == "claude"  # route never changes
+
+    def test_fallback_starts_fresh_when_no_remote_session_id_at_all(self, tmp_path):
+        driver = _StubManagedDriver()
+        managed = _StubManagedExecutor(driver=driver)
+        w, api, owner = _setup(
+            tmp_path, children=[_child("c1", "p1", "Design")],
+            owner_routing="claude", execution_request={"executor": "claude"},
+            managed_executor=managed, cli_pool=_SynchronousPool(),
+            managed_agent_session_id=None,
+            project_tags=("cloud-sonnet",),
+        )
+        api.tasks["c1"]["status"] = "blocked"
+        api.tasks["c1"]["tags"] = ["agent-blocked"]
+        _age_anchor(w, "p1", 31)
+
+        assert w._reconcile_project_owners() == 1
+        assert len(driver.posted) == 0
+        assert len(managed.start_calls) == 1
+        assert w.session_store.get(_OWNER_TASK_ID).routing == "claude"
+
+    def test_managed_owner_never_runs_without_the_cloud_consent_tag(self, tmp_path):
+        """`_project_is_agent_owned` gates Managed continuation on the
+        project still carrying a #cloud-* tag -- a Managed-routed owner
+        session on a project whose tags don't include one is never even
+        looked up."""
+        driver = _StubManagedDriver()
+        managed = _StubManagedExecutor(driver=driver)
+        w, api, owner = _setup(
+            tmp_path, children=[_child("c1", "p1", "Design")],
+            owner_routing="claude", execution_request={"executor": "claude"},
+            managed_executor=managed, cli_pool=_SynchronousPool(),
+            managed_agent_session_id="remote-sess-1",
+            project_tags=("me",),  # no engine assignee, no #cloud-* tag
+        )
+        api.tasks["c1"]["status"] = "blocked"
+        api.tasks["c1"]["tags"] = ["agent-blocked"]
+        _age_anchor(w, "p1", 31)
+
+        assert w._reconcile_project_owners() == 0
+        assert driver.posted == []
+        assert managed.start_calls == []
+
+
+class TestCliFallbackBriefing:
+    def test_missing_cli_session_id_falls_back_to_a_fresh_bounded_briefing(self, tmp_path):
+        w, api, owner = _setup(
+            tmp_path,
+            children=[_child("c1", "p1", "Design")],
+            owner_routing="claude_code", set_cli_session_id=False,
+            project_description="Ship the migration",
+        )
+        api.tasks["c1"]["status"] = "blocked"
+        api.tasks["c1"]["tags"] = ["agent-blocked"]
+        _age_anchor(w, "p1", 31)
+
+        assert w._reconcile_project_owners() == 1
+        pending = w.session_store.peek_pending_messages(owner.session_id)
+        assert len(pending) == 1
+        briefing = pending[0]["content"]
+        assert "Fresh start for project owner" in briefing
+        assert "Ship the migration" in briefing
+        assert "c1" in briefing
+        assert "Project owner wake:" not in briefing
+        after = w.session_store.get(_OWNER_TASK_ID)
+        assert after.routing == "claude_code"  # route never changes
+        assert after.status == STATUS_CLAIMED  # still enqueued + CAS'd like the native path
+
+    def test_present_cli_session_id_still_gets_the_terse_wake_diff(self, tmp_path):
+        w, api, owner = _setup(
+            tmp_path, children=[_child("c1", "p1", "Design")], owner_routing="claude_code",
+        )
+        api.tasks["c1"]["status"] = "blocked"
+        api.tasks["c1"]["tags"] = ["agent-blocked"]
+        _age_anchor(w, "p1", 31)
+
+        assert w._reconcile_project_owners() == 1
+        pending = w.session_store.peek_pending_messages(owner.session_id)
+        body = pending[0]["content"]
+        assert body.startswith("Project owner wake:")
+        assert "Fresh start for project owner" not in body
