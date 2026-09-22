@@ -235,6 +235,7 @@ class TaskHierarchy:
             "paused": field_truthy(task.fields.get(PROJECT_PAUSED_FIELD)),
             "pause_reason": task.fields.get(PROJECT_PAUSE_REASON_FIELD),
             "coordinator": coordinator,
+            "integration_branch": task.fields.get(INTEGRATION_BRANCH_FIELD) or None,
         }
 
     def read_fields(self, task_id: str, coordinator: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1716,10 +1717,16 @@ class ProjectTaskService:
             "child's state changes -- newly blocked, failed, done, cancelled, or awaiting "
             "review -- with several such events batched into one wake. Use "
             "`lifeos_agent_project_owner` to accept or reject a review-pending child of "
-            "this project (reject requires a note) and to mark this project done "
-            "yourself once children and reviews are resolved -- allowed even while this "
-            "turn is still live -- or the explicit project cancellation action if it must "
-            "stop instead."
+            "this project (reject requires a note; accepting a child whose pull request "
+            "targets this project's own integration branch also merges it into that "
+            "branch first, and fails the whole call with merge_failed -- leaving the card "
+            "in review -- if that merge fails) and to mark this project done yourself once "
+            "children and reviews are resolved -- allowed even while this turn is still "
+            "live, except that it refuses with integration_unmerged while this project's "
+            "integration branch still has commits the default branch doesn't; merge that "
+            "branch into the default branch yourself, through this repository's own "
+            "documented merge process, then call complete_project again -- or the explicit "
+            "project cancellation action if it must stop instead."
         )
 
 

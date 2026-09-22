@@ -216,7 +216,13 @@ Projects use explicit lifecycle actions:
   complete its own project through `lifeos_agent_project_owner` even while
   that owner's own turn is still live — the one case this guard otherwise
   refuses; an operator completion is still refused while the coordinator is
-  live, exactly as before.
+  live, exactly as before. When the project has a recorded integration
+  branch, the owner's completion is additionally refused (`integration_
+  unmerged`, naming the branch) while that branch still has commits the
+  default branch doesn't — the owner merges it into the default branch
+  itself, through the repository's own documented merge process, and then
+  completes again; a project with no coding children on that branch yet
+  skips this check entirely, and operator completion is never gated by it.
 - An agent-owned project's attested owner session can also accept or reject
   a review-pending child of its own project (`lifeos_agent_project_owner`,
   actions `accept_child`/`reject_child`), scoped to that project and the
@@ -224,7 +230,13 @@ Projects use explicit lifecycle actions:
   operator's board Accept/Reject: an acceptance is recorded distinctly from
   an operator one, and a rejection (which requires a note, and resumes the
   child's session with it) is refused while the project is paused, since
-  rejecting starts new child work.
+  rejecting starts new child work. When the project has a recorded
+  integration branch, accepting a child whose pull request targets exactly
+  that branch also merges it into the branch first (on by default); a
+  failed merge fails the whole acceptance with `merge_failed` instead,
+  leaving the card in review, unmerged and unaccepted, so the owner can
+  reject it with a rebase instruction. A pull request targeting anything
+  else is never touched, and operator Accept from the board never merges.
 - **Cancel project** previews affected open, running, and review-pending
   children before confirmation. Confirmation persists intent before stopping
   sessions, cancels unfinished human work, and abandons review results without

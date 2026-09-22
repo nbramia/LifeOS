@@ -39,7 +39,7 @@ import os
 import signal
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from api.services.agent_worker import doctor_repair
 from api.services.agent_worker.hermes_session import HERMES_ROUTING
@@ -54,6 +54,9 @@ from api.services.agent_worker.session_store import (
     new_session_id,
 )
 from api.services.agent_worker.transcript_store import TranscriptStore
+
+if TYPE_CHECKING:
+    from api.services.task_manager import Task, TaskManager
 
 
 logger = logging.getLogger(__name__)
@@ -318,12 +321,21 @@ INTER_AGENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
             "Review and complete the project you own, as its attested owner. "
             "`accept_child`/`reject_child` act on a review-pending child of "
             "your own project (reject requires `note` and is refused while "
-            "the project is paused); `complete_project` marks your project "
-            "done and is allowed even while your own turn is still live "
-            "(every other completion requirement — unresolved children, "
-            "pending cancellation, cancelled-children acknowledgement — "
-            "still applies). Scoped strictly to the project you own and "
-            "your own current turn."
+            "the project is paused); accepting a child whose pull request "
+            "base is exactly your project's own integration branch also "
+            "merges that pull request into it first (`merge_pull_request`, "
+            "default true) — a failed merge fails the whole call with "
+            "`merge_failed` and leaves the card in review, unmerged and "
+            "unaccepted. `complete_project` marks your project done and is "
+            "allowed even while your own turn is still live (every other "
+            "completion requirement — unresolved children, pending "
+            "cancellation, cancelled-children acknowledgement — still "
+            "applies), except that it refuses with `integration_unmerged` "
+            "while your project's integration branch still has commits the "
+            "default branch doesn't; merge that branch into the default "
+            "branch yourself, through this repository's own documented "
+            "merge process, before calling complete_project again. Scoped "
+            "strictly to the project you own and your own current turn."
         ),
         "input_schema": {
             "type": "object",
@@ -346,6 +358,15 @@ INTER_AGENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "note": {
                     "type": "string", "maxLength": 6000,
                     "description": "Required for reject_child.",
+                },
+                "merge_pull_request": {
+                    "type": "boolean",
+                    "description": (
+                        "accept_child only, default true: also merge the child's recorded "
+                        "pull request into your project's integration branch, but only "
+                        "when its base is exactly that branch. A merge failure fails the "
+                        "whole call with merge_failed and leaves the card unaccepted."
+                    ),
                 },
                 "acknowledge_cancelled_children": {
                     "type": "boolean",
@@ -933,9 +954,12 @@ def _project_is_agent_owned(tags: list[str]) -> bool:
 # `board_review`'s errors are shared with the operator board routes and
 # carry their own, more granular codes. Only the closed set documented on
 # `lifeos_agent_project_owner` (`invalid_arg`, `not_found`, `stale_turn`,
-# `not_owner`, `not_review`, `paused`, `forbidden`, `conflict`) may reach an
-# owner caller; anything else is folded onto the nearest documented code
-# here rather than forwarded verbatim.
+# `not_owner`, `not_review`, `paused`, `forbidden`, `conflict`,
+# `merge_failed`, `integration_unmerged`) may reach an owner caller; anything
+# else is folded onto the nearest documented code here rather than forwarded
+# verbatim. `merge_failed`/`integration_unmerged` are never produced by
+# `board_review` itself -- they come from this module's own merge-on-accept
+# and completion-gate steps, below.
 _BOARD_REVIEW_CODE_MAP = {
     "no_session": "not_found",
     "session_running": "conflict",
@@ -948,20 +972,127 @@ def _owner_facing_code(code: str) -> str:
     return _BOARD_REVIEW_CODE_MAP.get(code, code)
 
 
+def _merge_child_pr_into_integration_branch(
+    ctx: InterAgentContext, child: "Task", integration_branch: str,
+) -> dict | None:
+    """None when there's nothing to merge (the child recorded no pull
+    request, its base isn't exactly ``integration_branch``, or it's
+    already merged) or a targeted merge just succeeded; an
+    ``_err(..., code="merge_failed")`` payload when a targeted merge was
+    attempted and failed. Never touches a pull request whose base isn't
+    exactly the project's own recorded integration branch."""
+    from api.services.agent_worker.git_worktree import merge_pull_request, pr_base_and_state
+
+    if ctx.session_store is None:
+        return None
+    outcome = ctx.session_store.get_card_outcome(child.id)
+    pr_urls = (outcome or {}).get("pr_urls") or []
+    if not pr_urls:
+        return None
+    pr_url = pr_urls[0]
+    child_session = ctx.session_store.get(child.id)
+    host = child_session.host if child_session is not None else None
+
+    data, error = pr_base_and_state(pr_url, host=host)
+    if error:
+        return _err(f"could not read {pr_url}: {error}", code="merge_failed")
+    if (data or {}).get("baseRefName") != integration_branch:
+        return None
+    if (data or {}).get("state") == "MERGED":
+        return None
+
+    merged, error = merge_pull_request(pr_url, host=host)
+    if not merged:
+        return _err(
+            f"could not merge {pr_url} into {integration_branch!r}: {error}",
+            code="merge_failed",
+        )
+    return None
+
+
+def _integration_unmerged_error(
+    ctx: InterAgentContext, manager: "TaskManager", project_id: str, integration_branch: str,
+) -> dict | None:
+    """None when the project's integration branch is fully merged into the
+    default branch, or when there's no coding child pull request on record
+    yet to derive the repository from (nothing was ever merged onto the
+    branch, so there's nothing for this gate to check); an
+    ``_err(..., code="integration_unmerged")`` payload otherwise, naming the
+    branch and either the comparison result or -- when the remote check
+    itself couldn't run (`gh` missing, an unresolvable host, a network
+    failure) -- that it couldn't be confirmed. Failing that check closed
+    (refusing completion) rather than open matches the contract: it must
+    never let a project complete over integration work nobody actually
+    verified merged."""
+    from api.services.agent_worker.git_worktree import (
+        repo_compare_ahead_by, repo_default_branch, repo_slug_from_pr_url,
+    )
+    from api.services.task_projects import PARENT_ID_FIELD, clean_parent_id
+
+    repo_slug = None
+    host = None
+    if ctx.session_store is not None:
+        for task in manager.list_tasks():
+            if clean_parent_id(task.fields.get(PARENT_ID_FIELD)) != project_id:
+                continue
+            outcome = ctx.session_store.get_card_outcome(task.id)
+            for url in (outcome or {}).get("pr_urls") or []:
+                slug = repo_slug_from_pr_url(url)
+                if slug:
+                    repo_slug = slug
+                    child_session = ctx.session_store.get(task.id)
+                    host = child_session.host if child_session is not None else None
+                    break
+            if repo_slug:
+                break
+    if repo_slug is None:
+        return None
+
+    default_branch, error = repo_default_branch(repo_slug, host=host)
+    if error or not default_branch:
+        return _err(
+            f"could not determine the default branch for {repo_slug} to check whether "
+            f"{integration_branch!r} is merged: {error or 'no branch returned'}",
+            code="integration_unmerged",
+        )
+    ahead_by, error = repo_compare_ahead_by(repo_slug, default_branch, integration_branch, host=host)
+    if error or ahead_by is None:
+        return _err(
+            f"could not confirm {integration_branch!r} is merged into {default_branch!r}: "
+            f"{error or 'no result returned'}",
+            code="integration_unmerged",
+        )
+    if ahead_by <= 0:
+        return None
+    return _err(
+        f"integration branch {integration_branch!r} has {ahead_by} commit(s) not yet merged "
+        f"into {default_branch!r}; merge it into the default branch through this repository's "
+        "own documented merge process, then call complete_project again",
+        code="integration_unmerged",
+    )
+
+
 def project_owner(ctx: InterAgentContext, args: dict) -> dict:
     """Attested project-owner review and completion.
 
     `accept_child`/`reject_child` share their underlying logic with the
     operator's board accept/reject routes (`api/services/board_review.py`);
-    `complete_project` calls `ProjectTaskService.complete_project` with
-    `owner_session=caller`, which exempts only this exact attested caller
-    from the live-coordinator completion guard.
+    accepting a child whose pull request base is exactly the project's
+    recorded integration branch also merges it first
+    (`_merge_child_pr_into_integration_branch`, `merge_pull_request` arg,
+    default true) -- a failed merge fails the whole call with
+    `merge_failed` and the card is never accepted. `complete_project` calls
+    `ProjectTaskService.complete_project` with `owner_session=caller`,
+    which exempts only this exact attested caller from the live-coordinator
+    completion guard, but first refuses with `integration_unmerged`
+    (`_integration_unmerged_error`) while the project's integration branch
+    still has commits the default branch doesn't.
 
     Authorization is exactly like `project_handoff`: the caller must be
     exactly the project's current owner session (`project_coordinator_
     session_id`), on its exact current turn. Stable error codes: `invalid_arg`,
     `not_found`, `stale_turn`, `not_owner`, `not_review`, `paused`, `forbidden`,
-    `conflict`.
+    `conflict`, `merge_failed`, `integration_unmerged`.
     """
     from api.services import agent_board
     from api.services.board_review import BoardReviewError, accept_review, reject_review
@@ -970,6 +1101,7 @@ def project_owner(ctx: InterAgentContext, args: dict) -> dict:
         CANCEL_OPERATION_FIELD,
         COORDINATOR_SESSION_FIELD,
         HANDOFF_OPERATION_FIELD,
+        INTEGRATION_BRANCH_FIELD,
         PROJECT_PAUSED_FIELD,
         ProjectConflictError,
         ProjectTaskService,
@@ -1047,6 +1179,14 @@ def project_owner(ctx: InterAgentContext, args: dict) -> dict:
                 "tags": list(result.task.tags),
             })
 
+        merge_pull_request_flag = args.get("merge_pull_request")
+        merge_pull_request_flag = True if merge_pull_request_flag is None else bool(merge_pull_request_flag)
+        integration_branch = (project.fields.get(INTEGRATION_BRANCH_FIELD) or "").strip()
+        if merge_pull_request_flag and integration_branch:
+            merge_error = _merge_child_pr_into_integration_branch(ctx, child, integration_branch)
+            if merge_error is not None:
+                return merge_error
+
         try:
             result = accept_review(manager, child_task_id, reviewer=reviewer)
         except BoardReviewError as exc:
@@ -1060,6 +1200,11 @@ def project_owner(ctx: InterAgentContext, args: dict) -> dict:
         })
 
     # action == "complete_project"
+    integration_branch = (project.fields.get(INTEGRATION_BRANCH_FIELD) or "").strip()
+    if integration_branch:
+        gate_error = _integration_unmerged_error(ctx, manager, project_id, integration_branch)
+        if gate_error is not None:
+            return gate_error
     acknowledge_cancelled_children = bool(args.get("acknowledge_cancelled_children"))
     service = ProjectTaskService(manager, ctx.session_store, ctx.transcript_store)
     try:

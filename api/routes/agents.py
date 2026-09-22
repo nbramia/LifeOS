@@ -1246,6 +1246,29 @@ def _card_outcome_view(
     }
 
 
+def _project_integration_prs(
+    hierarchy, project_id: str, outcomes_by_task: dict[str, dict[str, Any]],
+    pr_status_by_url: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """One entry per pull request a coding child of ``project_id`` has on
+    record, for the project drawer's integration-branch section. Every
+    coding child of a project with a recorded integration branch opens its
+    pull request against that branch by construction (`ensure_worktree`'s
+    `base_branch`), so this surfaces what's already on record rather than
+    re-verifying each PR's base itself — no `gh` call from a board build.
+    Reuses `_card_outcome_view`'s own per-PR shape (`url`/`number`/`state`/
+    `stale`) so the drawer can render each entry with the same
+    `outcomePrRowHtml` helper a child's own outcome section uses."""
+    entries: list[dict[str, Any]] = []
+    for child in hierarchy.children(project_id):
+        outcome = _card_outcome_view(outcomes_by_task.get(child.id), pr_status_by_url)
+        if not outcome:
+            continue
+        for pr in outcome["prs"]:
+            entries.append({**pr, "child_id": child.id, "title": child.description})
+    return entries
+
+
 def _task_card(task, sessions_by_task: dict[str, list[dict[str, Any]]],
                 open_question_by_task: dict[str, dict[str, Any]],
                 session_store: SessionStore,
@@ -1363,6 +1386,11 @@ def _build_board() -> dict[str, Any]:
             task.id,
             project_service.coordinator_view(task),
         )
+        project = hierarchy_fields.get("project")
+        if project and project.get("integration_branch"):
+            project["integration_prs"] = _project_integration_prs(
+                hierarchy, task.id, outcomes_by_task, pr_status_by_url,
+            )
         lanes[lane].append(_task_card(
             task, sessions_by_task, open_question_by_task, session_store,
             outcomes_by_task, pr_status_by_url,

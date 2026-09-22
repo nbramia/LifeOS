@@ -63,6 +63,15 @@ your own project done — allowed even while your own turn is still live, once
 every other completion requirement (unresolved children, pending
 cancellation, cancelled-children acknowledgement) is met. `{PROJECT_COMPLETE}`
 remains the operator's own path and is refused while your turn is live.
+When your project has a recorded integration branch, `accept_child` also
+merges the child's pull request into that branch first, but only when its
+base is exactly that branch (default on; pass `merge_pull_request=false` to
+skip) — a failed merge fails the whole call with `merge_failed`, leaving the
+card in review, unmerged and unaccepted. `complete_project` additionally
+refuses with `integration_unmerged` while your integration branch still has
+commits the default branch doesn't; merge it into the default branch
+yourself, through this repository's own documented merge process — never a
+LifeOS-specific script — then call `complete_project` again.
 Use `{PROJECT_CANCEL}` for project cancellation; it cascades only after
 confirmation and may remain pending while a runtime stop is unverified.
 Cancelling one child does not cancel its parent or siblings.

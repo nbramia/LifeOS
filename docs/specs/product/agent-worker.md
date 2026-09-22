@@ -141,7 +141,18 @@ coordinator is live. The same tool also lets that owner accept or reject a
 review-pending child of its own project — sharing the operator board's own
 Accept/Reject logic, so an owner acceptance is recorded distinctly from an
 operator one and a rejection (which requires a note and resumes the child's
-session with it) is refused while the project is paused. Cancelled children
+session with it) is refused while the project is paused. When the project
+has a recorded integration branch, accepting a child whose pull request
+targets exactly that branch also merges it into the branch first, by
+default; a failed merge fails the whole acceptance instead, so the card
+stays in review, unmerged and unaccepted, and the owner can reject it with a
+rebase instruction. Operator Accept from the board never merges. Completing
+a project with a recorded integration branch additionally requires that
+branch to already have nothing left unmerged into the default branch — the
+owner merges it there itself, through the repository's own documented merge
+process, before completion succeeds; the product only checks and reports
+that state, and never performs the merge on the owner's behalf. Operator
+Complete from the board is not gated by this check. Cancelled children
 require acknowledgement of reduced scope; they are never counted as
 successful completion. Cancelling a project is also
 explicit and two-step: the preview names unfinished, running and

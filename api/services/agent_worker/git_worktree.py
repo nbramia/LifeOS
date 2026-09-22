@@ -926,6 +926,119 @@ def pull_request_state(
     return state if state in {"OPEN", "MERGED", "CLOSED"} else None
 
 
+_PR_URL_RE = re.compile(r"^https?://[^/]+/([^/]+/[^/]+)/pull/\d+/?$")
+
+
+def repo_slug_from_pr_url(pr_url: str) -> Optional[str]:
+    """``"owner/repo"`` parsed out of a full GitHub pull request URL, or
+    None when it doesn't look like one. The only way the functions below
+    learn which repository to call `gh api` against without a local git
+    checkout to read a remote from — a project owner's own session (the
+    caller of `merge_pull_request`/`repo_compare_ahead_by`) has no
+    worktree of its own, so the repository comes from a child's already-
+    recorded pull request URL instead."""
+    match = _PR_URL_RE.match((pr_url or "").strip())
+    return match.group(1) if match else None
+
+
+def pr_base_and_state(
+    pr_url: str, *, host: Optional[str] = None, runner: Optional[Runner] = None,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> tuple[Optional[dict], Optional[str]]:
+    """``{"baseRefName": ..., "state": ...}`` for one pull request,
+    identified by its full URL rather than a branch name — works with no
+    local checkout at all, since `gh pr view <url>` resolves the
+    repository from the URL itself. Returns ``(None, error)`` on any
+    failure: an unresolvable host, a missing `gh` binary (surfaced by
+    `_run` as a non-zero return carrying the `OSError` text), or `gh`
+    itself refusing the lookup."""
+    try:
+        active = runner or resolve_runner_for_host(host)
+    except WorktreeError as exc:
+        return None, str(exc)
+    result = _run(
+        ["gh", "pr", "view", pr_url, "--json", "baseRefName,state"],
+        runner=active, timeout=timeout,
+    )
+    if result.returncode != 0:
+        return None, (result.stderr or f"gh pr view failed (exit {result.returncode})").strip()
+    try:
+        data = json.loads(result.stdout)
+    except (TypeError, ValueError):
+        return None, "gh pr view returned invalid JSON"
+    if not isinstance(data, dict):
+        return None, "gh pr view returned an unexpected response shape"
+    return data, None
+
+
+def merge_pull_request(
+    pr_url: str, *, host: Optional[str] = None, runner: Optional[Runner] = None,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> tuple[bool, Optional[str]]:
+    """``gh pr merge <url> --merge``, by full URL so no local checkout is
+    needed. ``(True, None)`` on success; ``(False, error)`` otherwise —
+    an unresolvable host, a missing `gh` binary, or `gh` itself refusing
+    the merge (conflicts, a required check still red, branch protection).
+    Never falls back to any other merge method."""
+    try:
+        active = runner or resolve_runner_for_host(host)
+    except WorktreeError as exc:
+        return False, str(exc)
+    result = _run(["gh", "pr", "merge", pr_url, "--merge"], runner=active, timeout=timeout)
+    if result.returncode != 0:
+        return False, (result.stderr or f"gh pr merge failed (exit {result.returncode})").strip()
+    return True, None
+
+
+def repo_default_branch(
+    repo_slug: str, *, host: Optional[str] = None, runner: Optional[Runner] = None,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> tuple[Optional[str], Optional[str]]:
+    """The repository's default branch name, via `gh api` rather than a
+    local `origin/HEAD` read (`_detect_default_branch`) — there is no
+    local checkout for the completion-time "is the integration branch
+    merged" check this feeds. ``(None, error)`` on any failure."""
+    try:
+        active = runner or resolve_runner_for_host(host)
+    except WorktreeError as exc:
+        return None, str(exc)
+    result = _run(
+        ["gh", "api", f"repos/{repo_slug}", "--jq", ".default_branch"],
+        runner=active, timeout=timeout,
+    )
+    if result.returncode != 0:
+        return None, (result.stderr or f"gh api repos/{repo_slug} failed (exit {result.returncode})").strip()
+    branch = result.stdout.strip()
+    if not branch:
+        return None, f"gh api repos/{repo_slug} returned an empty default branch"
+    return branch, None
+
+
+def repo_compare_ahead_by(
+    repo_slug: str, base: str, head: str, *, host: Optional[str] = None,
+    runner: Optional[Runner] = None, timeout: int = DEFAULT_TIMEOUT,
+) -> tuple[Optional[int], Optional[str]]:
+    """How many commits ``head`` is ahead of ``base`` in the remote
+    repository (`gh api repos/{slug}/compare/{base}...{head}`'s own
+    ``ahead_by``) — a generic, repository-agnostic "is this branch fully
+    merged" check with no PR of its own involved on either side.
+    ``(None, error)`` on any failure, including a missing `gh` binary."""
+    try:
+        active = runner or resolve_runner_for_host(host)
+    except WorktreeError as exc:
+        return None, str(exc)
+    result = _run(
+        ["gh", "api", f"repos/{repo_slug}/compare/{base}...{head}", "--jq", ".ahead_by"],
+        runner=active, timeout=timeout,
+    )
+    if result.returncode != 0:
+        return None, (result.stderr or f"gh api compare failed (exit {result.returncode})").strip()
+    try:
+        return int(result.stdout.strip()), None
+    except ValueError:
+        return None, "gh api compare returned a non-numeric ahead_by"
+
+
 def list_worker_worktrees(
     repo: str, *, host: Optional[str] = None, timeout: int = DEFAULT_TIMEOUT,
     runner: Optional[Runner] = None,
@@ -1040,6 +1153,11 @@ __all__ = [
     "ensure_worktree",
     "finalize_worktree_session",
     "pull_request_state",
+    "repo_slug_from_pr_url",
+    "pr_base_and_state",
+    "merge_pull_request",
+    "repo_default_branch",
+    "repo_compare_ahead_by",
     "list_worker_worktrees",
     "remove_worker_worktree",
 ]

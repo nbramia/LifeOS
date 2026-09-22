@@ -10,6 +10,10 @@ Covers:
   * The completion guard's owner-turn exemption
     (`TaskManager._guard_project_update`'s `owner_turn_completion_session_id`)
     is scoped to exactly the attested caller, never any other live session.
+  * Merge-on-accept and the `integration_unmerged` completion gate
+    (`api/services/agent_worker/inter_agent.py`'s `_merge_child_pr_into_
+    integration_branch`/`_integration_unmerged_error`), against a stubbed
+    `gh` seam -- no network, no real git worktree.
 """
 from __future__ import annotations
 
@@ -17,6 +21,8 @@ from pathlib import Path
 
 import pytest
 
+from api.services import agent_board
+from api.services.agent_worker import git_worktree
 from api.services.agent_worker.inter_agent import Caps, InterAgentContext, dispatch
 from api.services.agent_worker.session_store import STATUS_CLAIMED, STATUS_COMPLETED, SessionStore
 from api.services.agent_worker.transcript_store import TranscriptStore
@@ -25,6 +31,7 @@ from api.services.task_manager import TaskManager
 from api.services.task_projects import (
     CANCEL_OPERATION_FIELD,
     COORDINATOR_SESSION_FIELD,
+    INTEGRATION_BRANCH_FIELD,
     ProjectConflictError,
     ProjectTaskService,
 )
@@ -68,6 +75,23 @@ def _make_project(manager: TaskManager, store: SessionStore, *, tags=("claude",)
         project.id, fields={COORDINATOR_SESSION_FIELD: owner.session_id}, _project_action=True,
     )
     return project.id, child.id, owner
+
+
+def _set_integration_branch(manager: TaskManager, project_id: str, branch: str) -> None:
+    manager.update(
+        project_id, fields={INTEGRATION_BRANCH_FIELD: branch}, _project_action=True,
+    )
+
+
+def _record_pr(store: SessionStore, child_id: str, pr_url: str) -> None:
+    """Record `child_id`'s completion outcome carrying `pr_url` — the same
+    `card_outcomes` row `_merge_child_pr_into_integration_branch`/
+    `_integration_unmerged_error` read a child's recorded pull request
+    from."""
+    store.record_card_outcome(
+        child_id, session_id="synthetic-session", engine_label="codex",
+        summary="Synthetic completion.", branch="feat/synthetic-child", pr_urls=[pr_url],
+    )
 
 
 def _ctx(store: SessionStore, transcripts: TranscriptStore, manager: TaskManager, caller) -> InterAgentContext:
@@ -447,3 +471,238 @@ class TestProjectStateGuards:
         assert result == {
             "ok": False, "error": "forbidden", "message": "project is not agent-owned",
         }
+
+
+# ---------------------------------------------------------------------------
+# Merge-on-accept and the integration_unmerged completion gate
+# ---------------------------------------------------------------------------
+
+class TestMergeOnAccept:
+    def test_accepting_an_integration_targeted_pr_merges_it_first(self, env, monkeypatch):
+        manager, store, transcripts = env
+        project_id, child_id, owner = _make_project(manager, store)
+        _set_integration_branch(manager, project_id, "feat/integration-abc123")
+        _record_pr(store, child_id, "https://github.com/acme/widgets/pull/9")
+        merge_calls = []
+
+        def fake_pr_base_and_state(pr_url, **kwargs):
+            return {"baseRefName": "feat/integration-abc123", "state": "OPEN"}, None
+
+        def fake_merge_pull_request(pr_url, **kwargs):
+            merge_calls.append(pr_url)
+            return True, None
+
+        monkeypatch.setattr(git_worktree, "pr_base_and_state", fake_pr_base_and_state)
+        monkeypatch.setattr(git_worktree, "merge_pull_request", fake_merge_pull_request)
+        ctx = _ctx(store, transcripts, manager, owner)
+
+        result = _call(ctx, action="accept_child", project_id=project_id, child_task_id=child_id)
+
+        assert result["ok"] is True
+        assert merge_calls == ["https://github.com/acme/widgets/pull/9"]
+        assert manager.get(child_id).status == "done"
+
+    def test_merge_failure_fails_the_call_and_leaves_the_card_unaccepted(self, env, monkeypatch):
+        manager, store, transcripts = env
+        project_id, child_id, owner = _make_project(manager, store)
+        _set_integration_branch(manager, project_id, "feat/integration-abc123")
+        _record_pr(store, child_id, "https://github.com/acme/widgets/pull/9")
+
+        monkeypatch.setattr(
+            git_worktree, "pr_base_and_state",
+            lambda pr_url, **kw: ({"baseRefName": "feat/integration-abc123", "state": "OPEN"}, None),
+        )
+        monkeypatch.setattr(
+            git_worktree, "merge_pull_request",
+            lambda pr_url, **kw: (False, "merge conflict"),
+        )
+        ctx = _ctx(store, transcripts, manager, owner)
+
+        result = _call(ctx, action="accept_child", project_id=project_id, child_task_id=child_id)
+
+        assert result["ok"] is False
+        assert result["error"] == "merge_failed"
+        assert "merge conflict" in result["message"]
+        child = manager.get(child_id)
+        # Unmerged and unaccepted: the card is still exactly where it was.
+        assert child.status == "done"
+        assert "accepted" not in child.tags
+        assert agent_board.is_review_pending(child.tags)
+
+    def test_pr_targeting_a_different_branch_is_never_merged(self, env, monkeypatch):
+        manager, store, transcripts = env
+        project_id, child_id, owner = _make_project(manager, store)
+        _set_integration_branch(manager, project_id, "feat/integration-abc123")
+        _record_pr(store, child_id, "https://github.com/acme/widgets/pull/9")
+
+        monkeypatch.setattr(
+            git_worktree, "pr_base_and_state",
+            lambda pr_url, **kw: ({"baseRefName": "some/other-branch", "state": "OPEN"}, None),
+        )
+
+        def unexpected_merge(pr_url, **kw):
+            raise AssertionError("must never merge a PR whose base isn't the integration branch")
+
+        monkeypatch.setattr(git_worktree, "merge_pull_request", unexpected_merge)
+        ctx = _ctx(store, transcripts, manager, owner)
+
+        result = _call(ctx, action="accept_child", project_id=project_id, child_task_id=child_id)
+
+        assert result["ok"] is True
+        assert manager.get(child_id).status == "done"
+        assert "accepted" in manager.get(child_id).tags
+
+    def test_merge_pull_request_false_skips_the_merge_entirely(self, env, monkeypatch):
+        manager, store, transcripts = env
+        project_id, child_id, owner = _make_project(manager, store)
+        _set_integration_branch(manager, project_id, "feat/integration-abc123")
+        _record_pr(store, child_id, "https://github.com/acme/widgets/pull/9")
+
+        def unexpected_call(pr_url, **kw):
+            raise AssertionError("merge_pull_request=false must skip the base-branch check entirely")
+
+        monkeypatch.setattr(git_worktree, "pr_base_and_state", unexpected_call)
+        monkeypatch.setattr(git_worktree, "merge_pull_request", unexpected_call)
+        ctx = _ctx(store, transcripts, manager, owner)
+
+        result = _call(
+            ctx, action="accept_child", project_id=project_id, child_task_id=child_id,
+            merge_pull_request=False,
+        )
+
+        assert result["ok"] is True
+
+    def test_no_integration_branch_never_attempts_a_merge(self, env, monkeypatch):
+        manager, store, transcripts = env
+        project_id, child_id, owner = _make_project(manager, store)
+        _record_pr(store, child_id, "https://github.com/acme/widgets/pull/9")
+
+        def unexpected_call(pr_url, **kw):
+            raise AssertionError("a project with no integration branch has nothing to merge into")
+
+        monkeypatch.setattr(git_worktree, "pr_base_and_state", unexpected_call)
+        monkeypatch.setattr(git_worktree, "merge_pull_request", unexpected_call)
+        ctx = _ctx(store, transcripts, manager, owner)
+
+        result = _call(ctx, action="accept_child", project_id=project_id, child_task_id=child_id)
+
+        assert result["ok"] is True
+
+    def test_already_merged_pr_is_not_merged_again(self, env, monkeypatch):
+        manager, store, transcripts = env
+        project_id, child_id, owner = _make_project(manager, store)
+        _set_integration_branch(manager, project_id, "feat/integration-abc123")
+        _record_pr(store, child_id, "https://github.com/acme/widgets/pull/9")
+
+        monkeypatch.setattr(
+            git_worktree, "pr_base_and_state",
+            lambda pr_url, **kw: ({"baseRefName": "feat/integration-abc123", "state": "MERGED"}, None),
+        )
+
+        def unexpected_merge(pr_url, **kw):
+            raise AssertionError("an already-merged PR must not be merged again")
+
+        monkeypatch.setattr(git_worktree, "merge_pull_request", unexpected_merge)
+        ctx = _ctx(store, transcripts, manager, owner)
+
+        result = _call(ctx, action="accept_child", project_id=project_id, child_task_id=child_id)
+
+        assert result["ok"] is True
+
+
+class TestIntegrationUnmergedCompletionGate:
+    def test_refuses_completion_while_the_integration_branch_is_ahead(self, env, monkeypatch):
+        manager, store, transcripts = env
+        project_id, child_id, owner = _make_project(manager, store)
+        _set_integration_branch(manager, project_id, "feat/integration-abc123")
+        _record_pr(store, child_id, "https://github.com/acme/widgets/pull/9")
+        accept_review(manager, child_id, reviewer=f"owner:{owner.session_id}")
+
+        monkeypatch.setattr(git_worktree, "repo_default_branch", lambda slug, **kw: ("main", None))
+        monkeypatch.setattr(
+            git_worktree, "repo_compare_ahead_by", lambda slug, base, head, **kw: (3, None),
+        )
+        ctx = _ctx(store, transcripts, manager, owner)
+
+        result = _call(ctx, action="complete_project", project_id=project_id)
+
+        assert result["ok"] is False
+        assert result["error"] == "integration_unmerged"
+        assert "feat/integration-abc123" in result["message"]
+        assert manager.get(project_id).status != "done"
+
+    def test_completes_once_the_integration_branch_is_fully_merged(self, env, monkeypatch):
+        manager, store, transcripts = env
+        project_id, child_id, owner = _make_project(manager, store)
+        _set_integration_branch(manager, project_id, "feat/integration-abc123")
+        _record_pr(store, child_id, "https://github.com/acme/widgets/pull/9")
+        accept_review(manager, child_id, reviewer=f"owner:{owner.session_id}")
+
+        monkeypatch.setattr(git_worktree, "repo_default_branch", lambda slug, **kw: ("main", None))
+        monkeypatch.setattr(
+            git_worktree, "repo_compare_ahead_by", lambda slug, base, head, **kw: (0, None),
+        )
+        ctx = _ctx(store, transcripts, manager, owner)
+
+        result = _call(ctx, action="complete_project", project_id=project_id)
+
+        assert result["ok"] is True
+        assert manager.get(project_id).status == "done"
+
+    def test_no_coding_children_skips_the_gate_entirely(self, env, monkeypatch):
+        """An integration branch with no recorded child pull request yet
+        (nothing was ever merged onto it) has nothing for the gate to
+        check against -- it must never block completion."""
+        manager, store, transcripts = env
+        project_id, child_id, owner = _make_project(manager, store)
+        _set_integration_branch(manager, project_id, "feat/integration-abc123")
+        accept_review(manager, child_id, reviewer=f"owner:{owner.session_id}")
+
+        def unexpected_call(*args, **kwargs):
+            raise AssertionError("no coding-child PR on record -- the gate must not call gh at all")
+
+        monkeypatch.setattr(git_worktree, "repo_default_branch", unexpected_call)
+        monkeypatch.setattr(git_worktree, "repo_compare_ahead_by", unexpected_call)
+        ctx = _ctx(store, transcripts, manager, owner)
+
+        result = _call(ctx, action="complete_project", project_id=project_id)
+
+        assert result["ok"] is True
+        assert manager.get(project_id).status == "done"
+
+    def test_missing_gh_fails_closed_with_integration_unmerged(self, env, monkeypatch):
+        manager, store, transcripts = env
+        project_id, child_id, owner = _make_project(manager, store)
+        _set_integration_branch(manager, project_id, "feat/integration-abc123")
+        _record_pr(store, child_id, "https://github.com/acme/widgets/pull/9")
+        accept_review(manager, child_id, reviewer=f"owner:{owner.session_id}")
+
+        monkeypatch.setattr(
+            git_worktree, "repo_default_branch",
+            lambda slug, **kw: (None, "gh: command not found"),
+        )
+        ctx = _ctx(store, transcripts, manager, owner)
+
+        result = _call(ctx, action="complete_project", project_id=project_id)
+
+        assert result["ok"] is False
+        assert result["error"] == "integration_unmerged"
+        assert manager.get(project_id).status != "done"
+
+    def test_no_integration_branch_skips_the_gate(self, env, monkeypatch):
+        """A project with no recorded integration branch at all is
+        unaffected by this gate."""
+        manager, store, transcripts = env
+        project_id, child_id, owner = _make_project(manager, store)
+        accept_review(manager, child_id, reviewer=f"owner:{owner.session_id}")
+
+        def unexpected_call(*args, **kwargs):
+            raise AssertionError("a project with no integration branch has nothing to check")
+
+        monkeypatch.setattr(git_worktree, "repo_default_branch", unexpected_call)
+        monkeypatch.setattr(git_worktree, "repo_compare_ahead_by", unexpected_call)
+        ctx = _ctx(store, transcripts, manager, owner)
+
+        result = _call(ctx, action="complete_project", project_id=project_id)
+
+        assert result["ok"] is True

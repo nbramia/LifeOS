@@ -2844,6 +2844,24 @@ export function initBoard() {
           ${coordinator.result ? ` — ${escapeHtml(typeof coordinator.result === 'string' ? coordinator.result : JSON.stringify(coordinator.result))}` : ''}
           ${coordinator.session_id ? `<button type="button" class="project-inline-action" data-action="project-session" data-session-id="${escapeAttr(coordinator.session_id)}">View session</button>` : ''}
         </div>` : '<div class="project-coordination">No coordination run yet.</div>';
+      // Coding children of a project with a recorded integration branch
+      // always branch off and PR into it (see git_worktree.ensure_worktree's
+      // base_branch) — this just surfaces what the owner has already merged
+      // there, not a live re-check.
+      const integrationPrs = project.integration_prs || [];
+      const integrationHtml = project.integration_branch ? `
+        <div class="project-integration" data-field="project-integration">
+          Integration branch: <code>${escapeHtml(project.integration_branch)}</code>
+          ${integrationPrs.length ? `
+            <div class="project-integration-prs">
+              ${integrationPrs.map(pr => `
+                <div class="drawer-integration-pr">
+                  <span class="drawer-integration-pr-title">${escapeHtml(pr.title || pr.child_id)}</span>
+                  ${outcomePrRowHtml(pr)}
+                </div>
+              `).join('')}
+            </div>` : ''}
+        </div>` : '';
       return `
         <div class="drawer-section project-summary" data-field="project-details">
           <label class="drawer-label">Project progress</label>
@@ -2855,6 +2873,7 @@ export function initBoard() {
           ${pendingHandoff ? '<div class="project-error" data-field="handoff-pending">Handoff pending. Child execution is blocked until the source agent stop is verified. You can cancel the handoff; cancellation stays pending until that stop is verified.</div>' : ''}
           ${project.paused ? `<div class="project-error" data-field="project-paused">Paused (${escapeHtml(project.pause_reason || 'operator')}). Child claims, Open, and Plan and delegate are blocked; a child already mid-turn still finishes into Review.</div>` : ''}
           ${coordination}
+          ${integrationHtml}
           <div class="drawer-actions">
             <button type="button" class="drawer-action" data-action="project-start">Start project</button>
             <button type="button" class="drawer-action" data-action="project-plan">${wakeExisting ? 'Wake project owner' : 'Plan and delegate'}</button>

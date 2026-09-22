@@ -951,6 +951,113 @@ class TestWakeMessagePointsAtTheAttestedOwnerTool:
 
 
 # ---------------------------------------------------------------------------
+# The integration branch's merge state as a synthetic owner-wake event
+# (`_INTEGRATION_PR_EVENT_KEY`) -- reuses the exact same diff machinery a
+# child's own state change drives, rather than a second mechanism.
+# ---------------------------------------------------------------------------
+
+class TestIntegrationBranchMergeWakesTheOwner:
+    def _seed(self, w, api, *, integration_branch="feat/integration-abc123"):
+        from api.services.task_projects import INTEGRATION_BRANCH_FIELD
+
+        api.tasks["p1"]["fields"][INTEGRATION_BRANCH_FIELD] = integration_branch
+        w.session_store.record_card_outcome(
+            "c1", session_id="s1", engine_label="codex", summary="done",
+            branch="feat/child", pr_urls=["https://github.com/acme/widgets/pull/9"],
+        )
+
+    def test_still_ahead_is_the_baseline_never_an_event(self, tmp_path, monkeypatch):
+        w, api, owner = _setup(tmp_path, children=[
+            _child("c1", "p1", "Coding child", status="done", tags=["codex", "accepted"]),
+        ])
+        self._seed(w, api)
+        monkeypatch.setattr(
+            "api.services.agent_worker.git_worktree.repo_default_branch",
+            lambda slug, **kw: ("main", None),
+        )
+        monkeypatch.setattr(
+            "api.services.agent_worker.git_worktree.repo_compare_ahead_by",
+            lambda slug, base, head, **kw: (2, None),
+        )
+
+        # "active" (still ahead) is the non-event baseline -- like a plain
+        # child's own baseline, it's never itself recorded as an event, and
+        # produces no wake and no anchor.
+        assert w._reconcile_project_owners() == 0
+        assert not w.session_store.has_pending_messages(owner.session_id)
+        state = w.session_store.get_project_owner_state("p1")
+        assert state["first_unseen_at"] is None
+
+    def test_flipping_to_merged_wakes_the_owner(self, tmp_path, monkeypatch):
+        w, api, owner = _setup(tmp_path, children=[
+            _child("c1", "p1", "Coding child", status="done", tags=["codex", "accepted"]),
+        ])
+        self._seed(w, api)
+        monkeypatch.setattr(
+            "api.services.agent_worker.git_worktree.repo_default_branch",
+            lambda slug, **kw: ("main", None),
+        )
+        monkeypatch.setattr(
+            "api.services.agent_worker.git_worktree.repo_compare_ahead_by",
+            lambda slug, base, head, **kw: (2, None),
+        )
+        # Baseline pass: still ahead.
+        assert w._reconcile_project_owners() == 0
+
+        w._integration_ahead_cache.clear()
+        monkeypatch.setattr(
+            "api.services.agent_worker.git_worktree.repo_compare_ahead_by",
+            lambda slug, base, head, **kw: (0, None),
+        )
+        assert w._reconcile_project_owners() == 0  # anchor just set, window not elapsed
+        _age_anchor(w, "p1", 31)
+
+        assert w._reconcile_project_owners() == 1
+        assert _owner(w).status == STATUS_CLAIMED
+        pending = w.session_store.peek_pending_messages(owner.session_id)
+        assert len(pending) == 1
+        assert "feat/integration-abc123" in pending[0]["content"]
+        assert "→merged" in pending[0]["content"]
+
+    def test_no_coding_child_pr_recorded_yet_never_wakes(self, tmp_path, monkeypatch):
+        from api.services.task_projects import INTEGRATION_BRANCH_FIELD
+
+        w, api, owner = _setup(tmp_path, children=[
+            _child("c1", "p1", "Coding child", status="done", tags=["codex", "accepted"]),
+        ])
+        api.tasks["p1"]["fields"][INTEGRATION_BRANCH_FIELD] = "feat/integration-abc123"
+
+        def unexpected_call(*args, **kwargs):
+            raise AssertionError("no coding-child PR on record -- must never call gh at all")
+
+        monkeypatch.setattr(
+            "api.services.agent_worker.git_worktree.repo_default_branch", unexpected_call,
+        )
+        monkeypatch.setattr(
+            "api.services.agent_worker.git_worktree.repo_compare_ahead_by", unexpected_call,
+        )
+
+        assert w._reconcile_project_owners() == 0
+        state = w.session_store.get_project_owner_state("p1")
+        assert "_integration_pr" not in (state["acked_states"] or {})
+
+    def test_a_failed_remote_check_contributes_no_event(self, tmp_path, monkeypatch):
+        w, api, owner = _setup(tmp_path, children=[
+            _child("c1", "p1", "Coding child", status="done", tags=["codex", "accepted"]),
+        ])
+        self._seed(w, api)
+        monkeypatch.setattr(
+            "api.services.agent_worker.git_worktree.repo_default_branch",
+            lambda slug, **kw: (None, "gh: command not found"),
+        )
+
+        assert w._reconcile_project_owners() == 0
+        assert not w.session_store.has_pending_messages(owner.session_id)
+        state = w.session_store.get_project_owner_state("p1")
+        assert "_integration_pr" not in (state["acked_states"] or {})
+
+
+# ---------------------------------------------------------------------------
 # Owner continuation on the other routes, and the fresh-context fallback
 # when no native handle exists. Stub executors mirror the real
 # ones' call shape (LocalExecutor.execute, HermesExecutor.execute,

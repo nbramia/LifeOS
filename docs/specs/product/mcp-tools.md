@@ -167,14 +167,30 @@ starts new child work. `accept_child`/`reject_child` share their underlying
 logic with the operator's own board Accept/Reject actions — an acceptance
 records who accepted (visible on the board), and a rejection's note is
 prefixed to make clear it came from the project owner rather than the
-operator. `complete_project` marks the caller's own project done; it is
+operator. When the project has a recorded integration branch, `accept_child`
+also merges the child's recorded pull request into that branch first, but
+only when the pull request's base is exactly that branch
+(`merge_pull_request`, default `true`; a PR targeting anything else is never
+touched) — a failed merge fails the whole call with `merge_failed` and the
+card stays in review, unmerged and unaccepted, so the owner can reject it
+with a rebase instruction instead. Operator Accept from the board never
+merges. `complete_project` marks the caller's own project done; it is
 allowed even while the caller's own turn is still live — the one case the
 ordinary live-coordinator completion guard would otherwise refuse — while
 every other completion requirement (no pending cancellation, no unresolved
 children, cancelled-children acknowledgement) still applies exactly as it
-does for the operator's `lifeos_project_complete`. Stable error codes:
-`invalid_arg`, `not_found`, `stale_turn`, `not_owner`, `not_review`,
-`paused`, `forbidden`, `conflict`.
+does for the operator's `lifeos_project_complete`, and, when the project has
+a recorded integration branch, that branch must have zero commits the
+default branch doesn't (a generic "commits ahead" check, never a merge of
+its own) — otherwise it's refused with `integration_unmerged`, naming the
+branch, until the owner merges it into the default branch itself through
+this repository's own documented merge process. A project with no coding
+children (nothing was ever merged onto the branch) skips that check
+entirely, and a repository whose `gh` tooling the check depends on is
+unavailable fails it closed rather than treating the branch as merged.
+Operator Complete from the board is never gated by this check. Stable error
+codes: `invalid_arg`, `not_found`, `stale_turn`, `not_owner`, `not_review`,
+`paused`, `forbidden`, `conflict`, `merge_failed`, `integration_unmerged`.
 
 ### Human Queue Tools
 
