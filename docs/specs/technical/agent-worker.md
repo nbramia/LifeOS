@@ -661,6 +661,58 @@ instead of being marked done, and a project that trips both triggers on
 the same tick gets one combined message with both rows written for that
 one send.
 
+`Worker._reconcile_project_owners()` runs each tick after the daily-spend-cap
+gate and before `_dispatch_spawned_sessions()`, reusing the same shared
+`/api/tasks` fetch. For every non-terminal, non-cancellation/handoff-pending
+project whose parent carries an agent assignee (or Managed consent tag) and
+an owner session in `fields.project_coordinator_session_id`, it classifies
+each child's state (`owner_state`: `awaiting_review`, `blocked`, `failed` —
+`agent-failed`/`agent-budget-exceeded`, checked ahead of the plain
+`cancelled`/`done` statuses those two tags leave the task at — `done`,
+`cancelled`, or `active`) and diffs it against `SessionStore`'s
+`project_owner_state` table (`acked_states_json`, keyed on `project_id`,
+created on first observation with the current snapshot as its own baseline
+so that creation is never itself an event). A non-`active` state that
+differs from `acked_states` is an event. A paused project (see the product
+spec's pause/resume description) is skipped entirely — the diff against
+`acked_states` still grows underneath it, so resuming surfaces whatever
+piled up. A live owner session (anything but
+`COMPLETED`/`FAILED`/`BUDGET_EXCEEDED`) is left alone; this, together with
+`begin_new_execution`'s terminal-only compare-and-set, is what makes two
+owner turns impossible at once. Once there is a non-empty diff, its age is
+tracked by a single `first_unseen_at` anchor (set once when the diff goes
+from empty to non-empty, cleared once a wake is sent) — a wake fires once
+that anchor is at least `_OWNER_WAKE_QUIET_SECONDS` (30) old, so several
+children changing state in a burst coalesce into one wake rather than one
+per child. A wake is delivered only for a claude_code/codex owner today
+(the other routes accumulate events but are not yet continued): the wake
+message is enqueued onto the owner's still-terminal session via
+`Worker._continue_session` — the same native-resume delivery
+`_resume_as_followup` uses for a claude_code/codex follow-up reply, factored
+out so both call it — *before* `begin_new_execution` reopens it with the
+owner's prior `execution_request` (required, since `begin_new_execution`
+clears `execution_spec_json`, and a CLI resume's working directory is
+resolved from that request). Enqueuing first means a crash between the two
+redelivers on the next tick instead of losing the wake; the reopened session
+is left `CLAIMED` for `_dispatch_spawned_sessions` to pick up the same tick
+or the next, exactly as any other reopened CLI session. On the reconciler's
+next pass, a terminal owner whose recorded `wake_attempt_id` matches its
+current attempt reconciles that wake's outcome first: `COMPLETED` moves
+`acked_states` to what was delivered and clears the failure count; `FAILED`
+leaves `acked_states` untouched (so the same events redeliver) and
+increments a `consecutive_failures` counter, auto-pausing the project
+(`POST /project/pause {reason: "owner_failed"}`, one Telegram notice) once
+that counter reaches 2; `BUDGET_EXCEEDED` pauses immediately with reason
+`owner_budget`, without needing a second occurrence. `resume_pending()` on
+worker startup leaves an operator-origin `CLAIMED` session with an
+undelivered pending message alone rather than failing it — a wake that was
+compare-and-set open but not yet dispatched before a crash/restart is picked
+up normally by `_dispatch_spawned_sessions` on a later tick. Resuming a
+paused project resets `consecutive_failures`
+(`ProjectTaskService.resume_project`) — the one place a pause transition is
+unambiguous, rather than the reconciler inferring one happened on every
+later tick.
+
 ## Inter-agent coordination
 
 Local agents can spawn child sessions and coordinate via the `lifeos_agent_*` tool family:
@@ -914,6 +966,7 @@ The worker is signal-safe and crash-resumable. `resume_pending()` runs on startu
 
 - `YIELDED` with a `sleeps` row → leave alone (sleeps loop wakes it on schedule).
 - `BLOCKED` → leave alone (waiting on Telegram reply or operator unblock).
+- `CLAIMED`, operator-origin, with an undelivered `pending_messages` row → leave alone. This is a native CLI resume (a follow-up reply, or a persistent-project-owner wake — see [Inter-agent coordination](#inter-agent-coordination)) that was queued but never actually launched before the crash/restart; `_dispatch_spawned_sessions` picks it up normally on a later tick the same way it would have if the worker hadn't restarted, because a resume peeks its pending message rather than draining it, so nothing is lost either way.
 - Anything else (`CLAIMED` / `RUNNING` mid-execution) → undo the claim tag (swap `#agent-running` → `#agent` when the card had no engine assignee; otherwise remove `#agent-running` alone so an engine-only card is not injected with `#agent`), mark session `FAILED` in the DB, notify operator.
 
 A managed session's `managed_agent_session_id` is durable across worker restarts — on resume the worker reattaches via `GET /v1/sessions/{id}` and continues polling from `managed_cursor.last_event_id`.

@@ -157,13 +157,16 @@ a project with `lifeos_agent_project_handoff`. This is a terminal action for
 that exact executor turn, not ordinary child attachment: the caller submits a
 stable operation ID and 1–20 uniquely keyed child requests, then stops. The
 worker records the source turn's stop before activating the staged children and
-bounded coordinator. A stop it cannot verify leaves the handoff pending; it
+owner. A stop it cannot verify leaves the handoff pending; it
 does not mark the original task complete or release any staged work. A staged
 child can never be assigned `#hermes` as its assignee or executor. Existing
 projects use **Plan and delegate**, not this conversion. Session-agent
 delegation (`lifeos_agent_spawn`) remains separate from durable project
-children. A child never becomes a project, and a coordinator is one bounded
-run rather than an always-on monitor.
+children. A child never becomes a project. A project's owner is a persistent
+session, not a single bounded run: for a claude_code/codex owner, the worker
+wakes it automatically (through the same native CLI resume any such session
+uses) whenever a child reaches awaiting-review, blocked, failed, done, or
+cancelled, coalescing several such events into one wake.
 
 A pending handoff remains fenced through worker recovery. The source stays
 paused and staged work stays blocked until its matching source turn is known

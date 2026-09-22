@@ -741,6 +741,30 @@ def test_pause_blocks_claim_and_resume_reenables_it(manager: TaskManager):
     ) == (True, False)
 
 
+def test_resume_project_gives_the_owner_a_fresh_failure_budget(manager: TaskManager, stores):
+    """`consecutive_failures` on `project_owner_state` is worker-owned state
+    with no other reset path -- `resume_project` is the one place a pause
+    transition is unambiguous, so it forgives a prior owner-failure streak
+    there rather than the reconciler guessing a transition happened on
+    every later tick (see Worker._reconcile_project_owners)."""
+    session_store, _transcript_store = stores
+    service = ProjectTaskService(manager, session_store=session_store)
+    parent = manager.create("Synthetic owner-failure project", tags=["codex"])
+    manager.create("Synthetic owner-failure child", tags=["codex"], fields={"parent_id": parent.id})
+    owner = session_store.create(task_id="project_owner_op1", routing="claude_code", status="completed", origin="operator")
+    session_store.ensure_project_owner_state(
+        parent.id, owner_session_id=owner.session_id, baseline_states={},
+    )
+    session_store.record_project_owner_wake_failure(parent.id)
+    session_store.record_project_owner_wake_failure(parent.id)
+    assert session_store.get_project_owner_state(parent.id)["consecutive_failures"] == 2
+
+    service.pause_project(parent.id, reason="owner_failed")
+    service.resume_project(parent.id)
+
+    assert session_store.get_project_owner_state(parent.id)["consecutive_failures"] == 0
+
+
 def test_pause_rejects_an_unrecognized_reason(manager: TaskManager):
     service = ProjectTaskService(manager)
     parent = manager.create("Synthetic reason project")
