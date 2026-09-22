@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import AsyncGenerator
 from api.services.agent_system_prompt import build_system_prompt
 from api.services.agent_tools import TOOL_STATUS_MESSAGES, execute_tool_parallel, begin_email_send_turn, tools_for_persona
+from api.services.journal_capture import JOURNAL_PERSONA_ID
 from api.services.chat_helpers import role_content
 from api.services.synthesizer import build_message_content
 from api.services.perf_trace import trace_span
@@ -690,6 +691,14 @@ async def run_agent_loop(
     # this call rather than on `result` -- it exists only to build that
     # judgment's state and is never part of the AgentResult contract.
     calls_by_round: dict[int, list[dict]] = {}
+    # Per-turn set of task IDs created by a journal `manage_tasks` create this
+    # turn — a local variable, never persisted and never shared across turns
+    # or requests, so a sub-task can name a parent this same turn created
+    # without a spoken `parent_id:<id>` attestation (see
+    # `execute_tool_parallel`'s created_task_ids). None for every other
+    # persona, which keeps `_journal_filter_task_create_input`'s stripping
+    # behavior unchanged.
+    journal_created_task_ids: set | None = set() if persona_id == JOURNAL_PERSONA_ID else None
     # (task, start_monotonic, round_num) for every in-loop shadow call
     # fired this turn -- awaited together, capped, just before the final
     # "result" event below on the happy path. Everything from here to that
@@ -827,6 +836,7 @@ async def run_agent_loop(
                 with trace_span(f"tool_{name}") as span_meta:
                     tool_result_str = await execute_tool_parallel(
                         name, block.input, persona_id=persona_id, user_message=user_message,
+                        created_task_ids=journal_created_task_ids,
                     )
                     # str() defensively -- execute_tool_parallel's contract is
                     # always a str, but a non-str result must not raise here.
