@@ -447,8 +447,7 @@ def test_plan_and_delegate_is_idempotent_and_links_before_claim(
 def test_plan_and_delegate_records_the_integration_branch(
     manager: TaskManager, stores, monkeypatch, tmp_path: Path,
 ):
-    from api.services.agent_worker.git_worktree import derive_branch_name
-    from api.services.task_projects import INTEGRATION_BRANCH_FIELD
+    from api.services.task_projects import INTEGRATION_BRANCH_FIELD, _integration_branch_name
 
     sessions, transcripts = stores
     service = ProjectTaskService(manager, sessions, transcripts)
@@ -458,9 +457,32 @@ def test_plan_and_delegate_records_the_integration_branch(
     service.plan_and_delegate(parent.id, operation_id="op-branch-1")
 
     linked = manager.get(parent.id)
-    assert linked.fields[INTEGRATION_BRANCH_FIELD] == derive_branch_name(
-        parent.description, parent.id,
+    assert linked.fields[INTEGRATION_BRANCH_FIELD] == _integration_branch_name(parent)
+
+
+def test_replan_after_a_prior_coordinator_does_not_record_the_integration_branch(
+    manager: TaskManager, stores,
+):
+    """A re-Plan of a project that already had a coordinator request — an
+    owner whose integration-branch field is absent, or whose field the
+    operator cleared — must not record the field: only true first-owner
+    creation does."""
+    from api.services.task_projects import COORDINATOR_REQUEST_FIELD, INTEGRATION_BRANCH_FIELD
+
+    sessions, transcripts = stores
+    service = ProjectTaskService(manager, sessions, transcripts)
+    parent = manager.create("Synthetic pre-existing owner project", tags=["codex"])
+    manager.create("Synthetic pre-existing owner child", fields={"parent_id": parent.id})
+    manager.update(
+        parent.id,
+        fields={COORDINATOR_REQUEST_FIELD: "op-prior"},
+        _skip_project_validation=True,
     )
+
+    service.plan_and_delegate(parent.id, operation_id="op-replan")
+
+    linked = manager.get(parent.id)
+    assert INTEGRATION_BRANCH_FIELD not in linked.fields
 
 
 def test_plan_and_delegate_does_not_overwrite_an_existing_integration_branch(

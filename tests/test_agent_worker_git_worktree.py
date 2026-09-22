@@ -337,6 +337,44 @@ def test_ensure_worktree_without_base_branch_records_none(tmp_path: Path):
     assert marker["base_branch"] is None
 
 
+def test_integration_branch_never_collides_with_the_handed_off_source_tasks_own_branch(
+    tmp_path: Path,
+):
+    """A handed-off project keeps the source task's own id. That task's own
+    CLI worktree branch (if it has one) is derived from
+    `(description, task.id)` directly by `ensure_worktree` — the recorded
+    integration branch must never equal it, or children (and the source's
+    own worktree finalize push) would collide on the same ref."""
+    from api.services.task_manager import Task
+    from api.services.task_projects import _integration_branch_name
+
+    repo = _init_repo_with_origin(tmp_path, name="repo-collision")
+    task = Task(id="task-collide1", description="fix the launch pipeline")
+
+    # The source task's own CLI session already has a worktree with pushed
+    # in-flight work on its own branch.
+    source = ensure_worktree(str(repo), task.id, task.description)
+    (Path(source.working_dir) / "wip.txt").write_text("source task's own in-flight work\n")
+    _git(Path(source.working_dir), "add", "wip.txt")
+    _git(Path(source.working_dir), "commit", "-q", "-m", "source WIP")
+    assert _git(Path(source.working_dir), "push", "-q", "-u", "origin", source.branch).returncode == 0
+
+    integration_branch = _integration_branch_name(task)
+    assert integration_branch != source.branch
+
+    child = ensure_worktree(
+        str(repo), "task-collide-child", "add the launch step",
+        base_branch=integration_branch,
+    )
+
+    # A fresh branch off main, not the source's own pushed WIP.
+    assert not (Path(child.working_dir) / "wip.txt").exists()
+    head = _git(Path(child.working_dir), "rev-parse", "HEAD").stdout.strip()
+    origin_integration = _git(repo, "rev-parse", f"origin/{integration_branch}").stdout.strip()
+    origin_main = _git(repo, "rev-parse", "origin/main").stdout.strip()
+    assert head == origin_integration == origin_main
+
+
 # ---------------------------------------------------------------------------
 # describe_worktree — consulted by the executors' prompt assembly.
 # ---------------------------------------------------------------------------

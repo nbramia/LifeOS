@@ -580,15 +580,22 @@ ownership uses the explicit consent alias's model and retains configured
 effort and host, but not the configured model, working directory, or affinity
 fallback, as described in the
 [task-management product spec](../product/task-management.md#projects-and-subtasks).
-Planning does not infer a new cloud authorization. The same write that first
-links the owner session also records `fields.project_integration_branch`
-(`git_worktree.derive_branch_name(title, project_id)`) when the field isn't
-already set — the project's deterministic integration branch, following the
-repository's own `<type>/<slug>-<suffix>` branch-naming convention.
-`ProjectTaskService.finalize_handoff` records the same field the same way at
-handoff activation. An operator-owned project never reaches either write
-path, so it never gets one; an operator can clear the field directly to opt
-a project back out. The coordination prompt
+Planning does not infer a new cloud authorization. The write that first links
+the owner session — only when the project has no prior coordinator request
+and no prior handoff activation, so a later re-Plan of an already-owned
+project never touches it — also records `fields.project_integration_branch`
+(`task_projects._integration_branch_name`, `git_worktree.derive_branch_name`
+seeded on `title` plus a short hash of the project's own task id, not the id
+itself) when the field isn't already set — the project's deterministic
+integration branch, following the repository's own `<type>/<slug>-<suffix>`
+branch-naming convention, but guaranteed to differ from the work branch
+`ensure_worktree` would derive for that same task's own worktree (relevant
+for a handed-off project, which keeps the source task's id). `finalize_handoff`
+records the same field the same way at handoff activation — inherently a
+first-owner creation, so it keeps only the not-already-set check. An
+operator-owned project never reaches either write path, so it never gets one;
+an operator can clear the field directly to opt a project back out. The
+coordination prompt
 contains the project objective/acceptance notes and at most 50 current child
 IDs, assignments and states. It instructs child creation to use a stable
 `operation_key` derived from the project ID, planning operation ID, and child
