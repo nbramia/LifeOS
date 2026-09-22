@@ -5874,19 +5874,42 @@ class TestAgentCardMoveRulesAndCancel:
         assert t13["tags"] == ["me", "agent-notes", "notes"]
         assert not any("agent" in (p.get("tags") or []) for p in task_puts)
 
-    def test_kill_disabled_for_a_claude_code_cli_backed_live_session(self, page: Page, agents_base_url):
-        """RC1's positive case, missing until now: a claimed card whose
-        linked session is a live Claude Code CLI pane (opened via the
-        drawer's Open button, not started by the worker) renders Kill
-        disabled with the "close it manually" reason — Kill has no way to
-        tear down a CLI process the way it kills a LifeOS-agent session,
-        the same limitation Cancel already reports for the same shape."""
+    def test_kill_enabled_for_a_reachable_claude_code_cli_backed_live_session(self, page: Page, agents_base_url):
+        """A claimed card whose linked session is a live Claude Code CLI
+        session renders Kill enabled when the server reports it reachable
+        (`cli_kill_reachable` true or absent) — the kill endpoint resolves
+        the session id back to a pane or an owning worker session and tears
+        it down either way."""
         board_state = copy.deepcopy(_board_fixture())
         card = _claimed_agent_owned_card(card_id="t14", title="CLI-backed claimed card")
         card["session"] = {
             "session_id": "cc:cli-live-1", "status": "running",
             "host": "test-host", "routing": "claude_code",
             "model_label": "Sonnet", "source": "claude_code",
+            "cli_kill_reachable": True,
+        }
+        board_state["lanes"]["in_progress"].append(card)
+        _open_board(page, agents_base_url, board_state=board_state)
+
+        page.locator('[data-card-id="t14"]').click()
+        kill_btn = page.get_by_role("button", name="Kill", exact=True)
+        expect(kill_btn).to_be_visible()
+        expect(kill_btn).to_be_enabled()
+
+    def test_kill_disabled_for_an_unreachable_claude_code_cli_backed_live_session(self, page: Page, agents_base_url):
+        """A claimed card whose linked session is a live Claude Code CLI
+        session the server cannot resolve to a pane or an owning worker
+        session (`cli_kill_reachable: false` — an operator-run CLI session
+        LifeOS never spawned) renders Kill disabled with the "close it
+        manually" reason, the same limitation Cancel already reports for
+        the same shape."""
+        board_state = copy.deepcopy(_board_fixture())
+        card = _claimed_agent_owned_card(card_id="t14", title="CLI-backed claimed card")
+        card["session"] = {
+            "session_id": "cc:cli-live-1", "status": "running",
+            "host": "test-host", "routing": "claude_code",
+            "model_label": "Sonnet", "source": "claude_code",
+            "cli_kill_reachable": False,
         }
         board_state["lanes"]["in_progress"].append(card)
         _open_board(page, agents_base_url, board_state=board_state)
