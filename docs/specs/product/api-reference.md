@@ -498,7 +498,11 @@ coordinator, or cancellation remains unresolved.
 
 The acknowledgement is required when any child was cancelled. The endpoint
 never changes a child status. Generic complete/status writes enforce the same
-conditions.
+conditions. This is the operator's path and is always refused while the
+project's owner has a live turn; an agent-owned project's own owner completes
+it through the attested `lifeos_agent_project_owner` tool instead, which is
+subject to the same guards plus the integration-branch check — see
+[MCP Tools](mcp-tools.md).
 
 ### POST /api/tasks/{id}/project/plan
 

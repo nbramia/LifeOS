@@ -16,7 +16,7 @@ does not restate those.
 | File | Role |
 |------|------|
 | `api/services/task_manager.py` | `Task`, `TaskManager` (CRUD + markdown round-trip + index cache + dashboard), module-level parse/format helpers |
-| `api/services/task_projects.py` | Derived hierarchy/read model, relationship validation, explicit project lifecycle and coordinator/cancellation recovery |
+| `api/services/task_projects.py` | Derived hierarchy/read model, relationship validation, explicit project lifecycle (start/complete/plan/pause/resume/cancel), persistent-owner linkage, and handoff/cancellation recovery |
 | `api/services/operation_lock.py` | Re-entrant cross-process boundary for relationship, claim, and durable-operation races |
 | `api/services/task_watcher.py` | `TaskWatcher` — watchdog observer that reindexes on external edits |
 | `api/services/atomic_write.py` | `atomic_write_text`/`atomic_write_lines` — shared temp-file-plus-rename helper, also used by `scheduler_store.py` |
@@ -504,7 +504,24 @@ finish into Review.
   cancel action available so clients can issue the required same-ID retry;
 - review cancellation removes the review lifecycle marker, adds
   `agent-result-abandoned`, and preserves SessionStore/transcript output rather
-  than recording acceptance.
+  than recording acceptance;
+- pause and resume write and clear `project_paused`, `project_paused_at`, and
+  `project_pause_reason` (`operator | owner_failed | owner_budget`), and resume
+  also resets the owner's consecutive-failure counter;
+- completion accepts an `owner_session`, which carries
+  `_owner_turn_completion_session_id` into `_guard_project_update`. That
+  exempts the live-coordinator check for exactly the project's own recorded
+  owner session and nothing else; every other completion guard still applies,
+  and the operator's own completion route never passes it.
+
+The first time a project gains an owner — plan/delegate, or a handoff
+activation — it also records `project_integration_branch`, a deterministic
+branch name derived from the project's title and ID through the same
+`derive_branch_name` helper worktree provisioning uses. Coding children branch
+from, and open pull requests into, that branch; the owner's attested
+`complete_project` is refused with `integration_unmerged` while the branch
+still holds commits the default branch doesn't, and a branch the repository's
+merge process has already deleted reads as merged.
 
 The coordinator uses a synthetic task ID derived from project ID plus a hash of
 the caller's stable operation ID. Its canonical execution request comes from

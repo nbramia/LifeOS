@@ -128,7 +128,7 @@ deterministic integration branch name, following the same branch-naming
 convention every other coding change in the repository uses. Every coding
 child of that project then branches off, and opens its pull request into,
 that integration branch instead of `main` — see [Isolated worktree for coding
-sessions](#what-the-agent-cant-do) above. A project with no recorded integration branch
+sessions](#safety-model) below. A project with no recorded integration branch
 (including any operator-owned project, which never gets one) behaves exactly
 as before: children branch off and PR into `main`.
 
