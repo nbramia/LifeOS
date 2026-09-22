@@ -4,6 +4,7 @@ Tasks API routes for LifeOS.
 CRUD endpoints for tasks stored in Obsidian-compatible markdown.
 """
 import logging
+import re
 from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException, Query
@@ -34,6 +35,15 @@ router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 # `fields.assigned_by` caller-asserted fields on this API: not
 # cryptographically attested, just believed the way those already are.
 AGENT_SESSION_HEADER = "X-LifeOS-Agent-Session"
+# A bare token: real session ids (`sess_<hex>`) and the HTTP transport's
+# literal "unattested" both match. The header is caller-asserted and its
+# value round-trips into a stamped task field (`project_child_creator_session`
+# — see `_project_child_creator_session` in task_manager.py), which is
+# written into the vault Markdown line; without this check a value
+# containing `]`/`<!--` could forge adjacent inline fields or another
+# task's id comment. Rejected outright rather than sanitized, so a forged
+# header never reaches the write path at all.
+_AGENT_SESSION_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 # Tags a project child cannot carry when the write is agent-attributed.
 _HERMES_TAG = "hermes"
 _METERED_CHILD_TAGS = frozenset({"cloud", "cloud-haiku", "cloud-sonnet"})
@@ -110,6 +120,33 @@ def _require_valid_status(status: Optional[str]) -> None:
         )
 
 
+def _clean_agent_session_header(value: Optional[str]) -> Optional[str]:
+    """Validate and normalize `AGENT_SESSION_HEADER`, or raise 422.
+
+    Returns `None` when the header is absent or blank (interactive operator
+    MCP). A present value must be a bare token — see `_AGENT_SESSION_TOKEN_RE`
+    — before it can reach either the tag guard or the stamped
+    `project_child_creator_session` field, which round-trips into the vault
+    Markdown line: an unvalidated value could inject adjacent `[key:: value]`
+    fields or another task's id comment.
+    """
+    value = (value or "").strip()
+    if not value:
+        return None
+    if not _AGENT_SESSION_TOKEN_RE.fullmatch(value):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "invalid_agent_session_header",
+                "message": (
+                    f"{AGENT_SESSION_HEADER} must be a bare token: letters, "
+                    "digits, '_', or '-', at most 128 characters."
+                ),
+            },
+        )
+    return value
+
+
 def _enforce_agent_child_tag_guard(
     manager, *, parent_id: str, tags: Optional[list[str]],
 ) -> None:
@@ -124,6 +161,11 @@ def _enforce_agent_child_tag_guard(
     `project_coordinator_session_id`) already carries that exact route —
     mirrors the handoff handler's own metered-scope rule
     (`inter_agent.metered_target_out_of_scope`).
+
+    `tags` is every tag on a create (the task doesn't exist yet, so every
+    tag is new), but only the tags an update actually ADDS on an existing
+    child (see the caller in `update_task`) — re-sending a tag the operator
+    already assigned, unchanged, must not itself trigger a refusal.
     """
     from api.services import agent_board
     from api.services.agent_worker.execution import parse_legacy_route_alias
@@ -386,7 +428,7 @@ async def create_task(
     _require_valid_status(request.status)
     manager = get_task_manager()
     fields = {k: v for k, v in (request.fields or {}).items() if v is not None}
-    agent_session_id = (x_lifeos_agent_session or "").strip() or None
+    agent_session_id = _clean_agent_session_header(x_lifeos_agent_session)
     parent_id = (fields.get("parent_id") or "").strip()
     if agent_session_id and parent_id:
         _enforce_agent_child_tag_guard(manager, parent_id=parent_id, tags=request.tags)
@@ -962,7 +1004,7 @@ async def update_task(
     manager = get_task_manager()
     updates = {k: v for k, v in request.model_dump().items() if v is not None}
     actor = updates.pop("actor", None)
-    agent_session_id = (x_lifeos_agent_session or "").strip() or None
+    agent_session_id = _clean_agent_session_header(x_lifeos_agent_session)
 
     # The board's assignment pickers stamp `fields.assigned_by: "board"` on
     # every write (see web/agents/assignment.js) — that marker routes a
@@ -998,9 +1040,16 @@ async def update_task(
                 if fields_patch and "parent_id" in fields_patch
                 else clean_parent_id(current.fields.get("parent_id"))
             )
-            if effective_parent_id:
+            # Only tags this write actually ADDS are checked — a tags PUT
+            # replaces the whole list, so re-sending a tag the operator
+            # already assigned (e.g. #hermes) must not itself get refused;
+            # only introducing a new one does.
+            newly_added_tags = agent_board.normalize_tags(
+                updates["tags"]
+            ) - agent_board.normalize_tags(current.tags)
+            if effective_parent_id and newly_added_tags:
                 _enforce_agent_child_tag_guard(
-                    manager, parent_id=effective_parent_id, tags=updates["tags"],
+                    manager, parent_id=effective_parent_id, tags=sorted(newly_added_tags),
                 )
 
         if board_marked_field_change:

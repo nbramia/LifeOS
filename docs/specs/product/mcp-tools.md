@@ -117,8 +117,10 @@ pending until retried with the same `operation_id`.
 
 `lifeos_task_create`/`lifeos_task_update` carry a caller-asserted worker
 identity (an `X-LifeOS-Agent-Session` header, invisible to the tool
-schema — the stdio and local-executor MCP transports add it automatically)
-whenever this server has one; interactive operator MCP sends none. On a
+schema — the stdio and local-executor MCP transports add it automatically,
+and the agent-only HTTP transport always sends the literal `unattested`,
+since it has no per-call identity of its own) whenever this server has one;
+interactive operator MCP sends none. On a
 project-child create or update, an agent-attributed request can never
 assign `#hermes`, and a paid route (`#cloud`/`#cloud-haiku`/`#cloud-sonnet`)
 is refused unless the project's own owner already carries it. An

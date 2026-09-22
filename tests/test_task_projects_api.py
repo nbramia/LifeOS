@@ -321,6 +321,43 @@ def test_operator_update_adding_hermes_on_existing_child_succeeds(project_api):
     assert response.json()["tags"] == ["hermes"]
 
 
+def test_agent_update_preserving_operator_assigned_hermes_succeeds(project_api):
+    """A tags PUT replaces the whole list; only NEWLY added tags are
+    checked, so an agent editing an unrelated tag on a child the operator
+    already put #hermes on must not be refused for merely re-sending it."""
+    client, manager, _sessions = project_api
+    parent = manager.create("Synthetic project", tags=["local"])
+    child = manager.create(
+        "Synthetic child", tags=["hermes"], fields={"parent_id": parent.id},
+    )
+
+    response = client.put(
+        f"/api/tasks/{child.id}",
+        headers={"X-LifeOS-Agent-Session": "sess-agent-preserve-1"},
+        json={"tags": ["hermes", "research"]},
+    )
+
+    assert response.status_code == 200
+    assert set(response.json()["tags"]) == {"hermes", "research"}
+
+
+def test_agent_update_preserving_operator_assigned_metered_route_succeeds(project_api):
+    client, manager, _sessions = project_api
+    parent = manager.create("Synthetic project", tags=["local"])
+    child = manager.create(
+        "Synthetic child", tags=["cloud-sonnet"], fields={"parent_id": parent.id},
+    )
+
+    response = client.put(
+        f"/api/tasks/{child.id}",
+        headers={"X-LifeOS-Agent-Session": "sess-agent-preserve-2"},
+        json={"tags": ["cloud-sonnet", "research"]},
+    )
+
+    assert response.status_code == 200
+    assert set(response.json()["tags"]) == {"cloud-sonnet", "research"}
+
+
 def test_agent_create_stamps_origin_and_creator_session(project_api):
     client, manager, _sessions = project_api
     parent = manager.create("Synthetic project", tags=["local"])
@@ -514,3 +551,68 @@ def test_agent_metered_update_blocked_without_owner_consent(project_api):
     assert response.status_code == 422
     assert response.json()["detail"]["code"] == "api_billing_blocked"
     assert manager.get(child.id).tags == []
+
+
+# ---------------------------------------------------------------------------
+# X-LifeOS-Agent-Session header validation (injection guard)
+# ---------------------------------------------------------------------------
+
+def test_forged_agent_session_header_rejected_on_create(project_api):
+    """A header value containing vault-line syntax must never reach the
+    write path — it would otherwise be stamped verbatim into
+    `project_child_creator_session` and forge adjacent inline fields or
+    another task's id comment."""
+    client, manager, _sessions = project_api
+    parent = manager.create("Synthetic project", tags=["local"])
+    victim = manager.create("Synthetic victim task")
+
+    response = client.post(
+        "/api/tasks",
+        headers={
+            "X-LifeOS-Agent-Session": f"x] [assigned_by:: board] <!-- id:{victim.id} -->",
+        },
+        json={
+            "description": "Synthetic forged child",
+            "fields": {"parent_id": parent.id},
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "invalid_agent_session_header"
+    assert manager.list_children(parent.id) == []
+    assert manager.get(victim.id).fields == {}
+
+
+def test_forged_agent_session_header_rejected_on_update(project_api):
+    client, manager, _sessions = project_api
+    parent = manager.create("Synthetic project", tags=["local"])
+    child = manager.create("Synthetic child", fields={"parent_id": parent.id})
+
+    response = client.put(
+        f"/api/tasks/{child.id}",
+        headers={"X-LifeOS-Agent-Session": "bad header value with spaces"},
+        json={"tags": ["hermes"]},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "invalid_agent_session_header"
+    assert manager.get(child.id).tags == []
+
+
+def test_valid_agent_session_header_values_accepted(project_api):
+    """Real session ids (`sess_<hex>`) and the HTTP transport's literal
+    "unattested" both match the bare-token format."""
+    client, manager, _sessions = project_api
+    parent = manager.create("Synthetic project", tags=["local"])
+
+    for header_value in ("sess_0123456789abcdef", "unattested"):
+        response = client.post(
+            "/api/tasks",
+            headers={"X-LifeOS-Agent-Session": header_value},
+            json={
+                "description": f"Synthetic child for {header_value}",
+                "fields": {"parent_id": parent.id},
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["fields"][CHILD_CREATOR_SESSION_FIELD] == header_value
