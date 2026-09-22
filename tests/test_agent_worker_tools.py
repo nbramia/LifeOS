@@ -135,8 +135,10 @@ class _FakeMCPServer:
             },
         ]
         self._response = response
+        self.calls: list[tuple[str, dict, str | None]] = []
 
-    def _call_api(self, name, arguments):
+    def _call_api(self, name, arguments, agent_session_id=None):
+        self.calls.append((name, arguments, agent_session_id))
         return self._response
 
     def _format_response(self, name, data, arguments=None):
@@ -192,3 +194,35 @@ def test_registry_definitions_includes_standard_and_mcp():
         assert n in names
     # LifeOS tool
     assert "lifeos_fake" in names
+
+
+@pytest.mark.unit
+def test_registry_forwards_caller_session_id_as_agent_session_id():
+    """The in-process local executor's own InterAgentContext identity is
+    forwarded to `_call_api` for every curated MCP tool call, not just
+    inter-agent ones, so `lifeos_task_create`/`_update` can be attributed."""
+    from api.services.agent_worker.inter_agent import Caps, InterAgentContext
+
+    fake = _FakeMCPServer({"id": "task_1"})
+    ctx = InterAgentContext(
+        session_store=None, transcript_store=None,
+        caller_session_id="sess-local-caller", caps=Caps(),
+    )
+    reg = ToolRegistry(lifeos_mcp_server=fake, inter_agent_context=ctx)
+
+    r = reg.dispatch("lifeos_fake", {})
+
+    assert not r.is_error
+    assert fake.calls == [("lifeos_fake", {}, "sess-local-caller")]
+
+
+@pytest.mark.unit
+def test_registry_sends_no_agent_session_id_without_inter_agent_context():
+    """The standalone `ToolRegistry()` (preflight/test fixtures, no worker
+    identity) forwards no caller identity."""
+    fake = _FakeMCPServer({"id": "task_1"})
+    reg = ToolRegistry(lifeos_mcp_server=fake)
+
+    reg.dispatch("lifeos_fake", {})
+
+    assert fake.calls == [("lifeos_fake", {}, None)]

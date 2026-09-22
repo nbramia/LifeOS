@@ -25,6 +25,7 @@ from api.services.agent_worker.execution import (
     ExecutionSpec,
     parse_legacy_route_alias,
 )
+from api.services.agent_worker.git_worktree import derive_branch_name
 from api.services.agent_worker.session_store import (
     STATUS_BLOCKED,
     STATUS_CLAIMED,
@@ -43,6 +44,9 @@ EXECUTION_PAUSED_FIELD = "execution_paused"
 EXECUTION_RESERVATION_FIELD = "execution_reservation_until"
 COORDINATOR_SESSION_FIELD = "project_coordinator_session_id"
 COORDINATOR_REQUEST_FIELD = "project_coordinator_request_id"
+# `request_project_owner_wake`'s `reason` for a Plan call against a project
+# that already has a terminal, resumable owner (see `_plan_and_delegate_locked`).
+PLAN_OWNER_WAKE_REASON = "plan_requested"
 CANCEL_OPERATION_FIELD = "project_cancel_operation_id"
 CANCEL_REQUESTED_AT_FIELD = "project_cancel_requested_at"
 LAST_CANCEL_OPERATION_FIELD = "project_last_cancel_operation_id"
@@ -58,9 +62,37 @@ HANDOFF_READY_AT_FIELD = "project_handoff_ready_at"
 LAST_HANDOFF_OPERATION_FIELD = "project_last_handoff_operation_id"
 HANDOFF_ACTIVATED_AT_FIELD = "project_handoff_activated_at"
 LAST_ABORTED_HANDOFF_FIELD = "project_last_aborted_handoff_operation_id"
+INTEGRATION_BRANCH_FIELD = "project_integration_branch"
+
+# Set/cleared only by `ProjectTaskService.pause_project`/`resume_project` —
+# see `internal_fields` in `TaskManager.create` and `_guard_project_update`,
+# which refuse an ordinary create/update that touches any of the three.
+# While set, `TaskManager._project_claim_allowed` refuses every child's
+# worker claim and interactive Open; a running child's current turn is
+# unaffected and its result still lands in Review.
+PROJECT_PAUSED_FIELD = "project_paused"
+PROJECT_PAUSED_AT_FIELD = "project_paused_at"
+PROJECT_PAUSE_REASON_FIELD = "project_pause_reason"
+PROJECT_PAUSE_REASONS = frozenset({"operator", "owner_failed", "owner_budget"})
+
+# Stamped on a project child created by an agent-attributed request (the
+# curated `lifeos_task_create` proxy carrying `X-LifeOS-Agent-Session`) or by
+# a handoff. Internal — see `internal_fields` in `TaskManager.create` and
+# `_guard_project_update` — so an ordinary create/update can never set or
+# clear either field itself; only the create-time stamping paths do.
+CHILD_ORIGIN_FIELD = "project_child_origin"
+CHILD_ORIGIN_AGENT = "agent"
+CHILD_CREATOR_SESSION_FIELD = "project_child_creator_session"
 
 HANDOFF_REQUEST_EVENT = "project_handoff_requested"
 HANDOFF_QUIESCENT_EVENT = "project_handoff_quiescent"
+
+# Mirrors FAILED_TAG / BUDGET_EXCEEDED_TAG in
+# api/services/agent_worker/worker.py (not imported -- worker.py imports
+# from this module, so the reverse import would be circular; the same
+# tradeoff `agent_board.py` makes for these same two tags).
+_FAILED_TAG = "agent-failed"
+_BUDGET_EXCEEDED_TAG = "agent-budget-exceeded"
 
 
 class ProjectConflictError(ValueError):
@@ -200,7 +232,10 @@ class TaskHierarchy:
             "execution_paused": field_truthy(task.fields.get(EXECUTION_PAUSED_FIELD)),
             "cancellation_pending": bool(task.fields.get(CANCEL_OPERATION_FIELD)),
             "handoff_pending": bool(task.fields.get(HANDOFF_OPERATION_FIELD)),
+            "paused": field_truthy(task.fields.get(PROJECT_PAUSED_FIELD)),
+            "pause_reason": task.fields.get(PROJECT_PAUSE_REASON_FIELD),
             "coordinator": coordinator,
+            "integration_branch": task.fields.get(INTEGRATION_BRANCH_FIELD) or None,
         }
 
     def read_fields(self, task_id: str, coordinator: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -218,6 +253,9 @@ class TaskHierarchy:
             ),
             "parent_handoff_pending": bool(
                 parent and parent.fields.get(HANDOFF_OPERATION_FIELD)
+            ),
+            "parent_project_paused": bool(
+                parent and field_truthy(parent.fields.get(PROJECT_PAUSED_FIELD))
             ),
             "project": self.project_summary(task_id, coordinator),
         }
@@ -250,6 +288,46 @@ def field_timestamp_future(value: Any) -> bool:
 
 def build_task_hierarchy(tasks: Iterable["Task"]) -> TaskHierarchy:
     return TaskHierarchy(tasks)
+
+
+def owner_state(task: dict[str, Any]) -> str:
+    """Classify one project child's state for the persistent-owner wake
+    reconciler (`Worker._reconcile_project_owners`), from the raw dict
+    shape the worker's `/api/tasks` fetch returns -- not a `Task` object,
+    see `TaskHierarchy.child_state` for the board's equivalent
+    classification over `Task` objects.
+
+    Six states, checked in priority order the same way the board derives a
+    lane (`agent_board.natural_lane`): `awaiting_review` (worker-completed,
+    not yet accepted -- wins even over a terminal status) beats `failed`
+    (`agent-failed`/`agent-budget-exceeded` -- both leave the task's own
+    status at `cancelled`, so this must be checked before the plain
+    `cancelled` case below) beats `cancelled` beats `done` beats `blocked`
+    (needs a human) beats `active` (everything else: unassigned, assigned,
+    genuinely running, or a machine wait -- `agent-wait-provider`/
+    `agent-wait-dependency` are worker-owned and self-clearing;
+    `natural_lane` routes them to In progress, not Human queue, and an
+    owner wake would just burn a paid turn on a transient provider
+    rate-limit). Only a non-`active` state is ever an owner-wake event.
+    """
+    raw_tags = task.get("tags") or []
+    tags = agent_board.normalize_tags(raw_tags)
+    status = str(task.get("status") or "todo").lower()
+    if agent_board.is_review_pending(raw_tags):
+        return "awaiting_review"
+    if _FAILED_TAG in tags or _BUDGET_EXCEEDED_TAG in tags:
+        return "failed"
+    if status == "cancelled":
+        return "cancelled"
+    if status == "done":
+        return "done"
+    if (
+        status == "blocked"
+        or agent_board.BLOCKED_TAG in tags
+        or agent_board.HUMAN_TAG in tags
+    ):
+        return "blocked"
+    return "active"
 
 
 def validate_parent_change(
@@ -411,12 +489,22 @@ class ProjectTaskService:
 
     def complete_project(
         self, task_id: str, *, acknowledge_cancelled_children: bool = False,
+        owner_session: Session | None = None,
     ) -> "Task":
+        """Mark a project done. `owner_session`, passed only by the attested
+        `lifeos_agent_project_owner` tool, exempts the live-coordinator guard
+        for exactly that caller's own turn — see
+        `TaskManager._guard_project_update`. An operator completion (no
+        `owner_session`) is refused while the coordinator is live, exactly
+        as before."""
         return self.manager.update(
             task_id,
             status="done",
             _acknowledge_cancelled_children=acknowledge_cancelled_children,
             _precondition=self._require_project_current,
+            _owner_turn_completion_session_id=(
+                owner_session.session_id if owner_session is not None else None
+            ),
         )
 
     def resume_execution(self, task_id: str) -> "Task":
@@ -442,6 +530,77 @@ class ProjectTaskService:
             _project_operation="resume",
             _precondition=precondition,
         )
+
+    def pause_project(self, task_id: str, *, reason: str = "operator") -> "Task":
+        """Set the durable paused state on a project.
+
+        Blocks every child's worker claim and interactive Open (see
+        `TaskManager._project_claim_allowed`) without touching a child's
+        current run — an already-running turn finishes and its result still
+        lands in Review. Idempotent: pausing an already-paused project just
+        refreshes its reason and timestamp.
+        """
+        if reason not in PROJECT_PAUSE_REASONS:
+            raise ValueError(f"invalid pause reason: {reason!r}")
+        hierarchy = self.hierarchy()
+        task = hierarchy.tasks.get(task_id)
+        if task is None:
+            raise KeyError(task_id)
+        self._require_project_current(task)
+
+        def precondition(current: "Task") -> None:
+            self._require_project_current(current)
+
+        updated = self.manager.update(
+            task_id,
+            fields={
+                PROJECT_PAUSED_FIELD: "true",
+                PROJECT_PAUSED_AT_FIELD: datetime.now(timezone.utc).isoformat(),
+                PROJECT_PAUSE_REASON_FIELD: reason,
+            },
+            _project_operation="pause",
+            _precondition=precondition,
+        )
+        if updated is None:
+            raise KeyError(task_id)
+        return updated
+
+    def resume_project(self, task_id: str) -> "Task":
+        """Clear the durable paused state, re-enabling child claims and Open.
+
+        Also gives the project's persistent owner (if any) a fresh
+        consecutive-failure budget: `project_owner_state.consecutive_failures`
+        is worker-owned state with no other reset path, and forgiving it
+        here -- at the one moment a pause transition is unambiguous -- is
+        simpler than having the reconciler guess a transition happened on
+        every subsequent tick. A harmless no-op for a project paused for an
+        unrelated ("operator") reason, where the count is normally already
+        zero.
+        """
+        hierarchy = self.hierarchy()
+        task = hierarchy.tasks.get(task_id)
+        if task is None:
+            raise KeyError(task_id)
+        self._require_project_current(task)
+
+        def precondition(current: "Task") -> None:
+            self._require_project_current(current)
+
+        updated = self.manager.update(
+            task_id,
+            fields={
+                PROJECT_PAUSED_FIELD: None,
+                PROJECT_PAUSED_AT_FIELD: None,
+                PROJECT_PAUSE_REASON_FIELD: None,
+            },
+            _project_operation="resume-project",
+            _precondition=precondition,
+        )
+        if updated is None:
+            raise KeyError(task_id)
+        if self.session_store is not None:
+            self.session_store.reset_project_owner_failures(task_id)
+        return updated
 
     def stage_handoff(
         self,
@@ -576,6 +735,7 @@ class ProjectTaskService:
                 notes=child.get("notes"),
                 fields=fields,
                 _project_handoff_operation=operation_id,
+                _project_child_creator_session=source.session_id,
             )
             if (
                 child_task.fields.get(PARENT_ID_FIELD) != task.id
@@ -714,6 +874,10 @@ class ProjectTaskService:
                 LAST_HANDOFF_OPERATION_FIELD: operation_id,
                 HANDOFF_ACTIVATED_AT_FIELD: datetime.now(timezone.utc).isoformat(),
             }
+            if not task.fields.get(INTEGRATION_BRANCH_FIELD):
+                # Handoff finalize is inherently first-owner creation:
+                # record the project's deterministic integration branch.
+                cleared[INTEGRATION_BRANCH_FIELD] = _integration_branch_name(task)
             task = self.manager.update(
                 task.id,
                 status="in_progress",
@@ -1012,8 +1176,15 @@ class ProjectTaskService:
                 f"assignee={child.get('assignee') or 'unassigned'}"
             )
         lines.append(
-            "This is a bounded coordinator run, not a persistent monitor. Inspect child state, "
-            "help resolve scoped blockers, and use the explicit project completion/cancellation actions."
+            "You are this project's persistent owner: you are woken automatically "
+            "when a child's state changes -- newly blocked, failed, done, cancelled, "
+            "or awaiting review -- with several such events batched into one wake. "
+            "Inspect child state, help resolve scoped blockers, and use "
+            "`lifeos_agent_project_owner` to accept or reject a review-pending "
+            "child of this project (reject requires a note) and to mark this "
+            "project done yourself once children and reviews are resolved -- "
+            "allowed even while this turn is still live -- or the explicit "
+            "project cancellation action if it must stop instead."
         )
         return "\n".join(lines)
 
@@ -1042,6 +1213,8 @@ class ProjectTaskService:
             raise ProjectConflictError("task is not a project")
         if task.fields.get(CANCEL_OPERATION_FIELD):
             raise ProjectConflictError("project cancellation is pending")
+        if field_truthy(task.fields.get(PROJECT_PAUSED_FIELD)):
+            raise ProjectConflictError("project is paused")
         owner = agent_board.derive_assignee(task.tags)
         normalized_tags = agent_board.normalize_tags(task.tags)
         if owner is None:
@@ -1077,6 +1250,41 @@ class ProjectTaskService:
         prior_request = task.fields.get(COORDINATOR_REQUEST_FIELD)
         if prior_request and prior_request != operation_id and self._task_coordinator_live(task):
             raise ProjectConflictError("project coordinator is already live")
+
+        # A project that already has a terminal (not live), resumable owner
+        # from an earlier Plan gets that owner WOKEN, not a second, competing
+        # owner session. `prior_request != operation_id` distinguishes this
+        # from an idempotent retry of the very call that created/linked the
+        # current owner (which falls through to the ordinary path below and
+        # re-links the same session it already created). The worker's
+        # reconciler performs the actual wake on its next tick — this only
+        # records the request, so the API never races the tick.
+        existing_owner_session_id = task.fields.get(COORDINATOR_SESSION_FIELD)
+        if (
+            existing_owner_session_id
+            and prior_request
+            and prior_request != operation_id
+        ):
+            owner_session = self.session_store.get_by_session_id(existing_owner_session_id)
+            if owner_session is not None and owner_session.status in TERMINAL_STATUSES:
+                self.session_store.request_project_owner_wake(
+                    task_id, owner_session_id=existing_owner_session_id,
+                    reason=PLAN_OWNER_WAKE_REASON, operation_id=operation_id,
+                )
+                if self.transcript_store is not None:
+                    self.transcript_store.append(
+                        existing_owner_session_id, "project_owner_wake_requested", {
+                            "project_id": task_id, "operation_id": operation_id,
+                        },
+                    )
+                return {
+                    "project_id": task_id,
+                    "operation_id": operation_id,
+                    "session_id": existing_owner_session_id,
+                    "status": owner_session.status,
+                    "created": False,
+                    "wake_requested": True,
+                }
 
         synthetic_task_id = _coordinator_task_id(task_id, operation_id)
         session = self.session_store.get(synthetic_task_id)
@@ -1132,6 +1340,8 @@ class ProjectTaskService:
             pending = current.fields.get(CANCEL_OPERATION_FIELD)
             if pending:
                 raise ProjectConflictError("project cancellation is pending")
+            if field_truthy(current.fields.get(PROJECT_PAUSED_FIELD)):
+                raise ProjectConflictError("project is paused")
             current_request = current.fields.get(COORDINATOR_REQUEST_FIELD)
             if (
                 current_request
@@ -1140,14 +1350,27 @@ class ProjectTaskService:
             ):
                 raise ProjectConflictError("project coordinator is already live")
 
+        plan_fields = {
+            EXECUTION_PAUSED_FIELD: "true",
+            COORDINATOR_SESSION_FIELD: session.session_id,
+            COORDINATOR_REQUEST_FIELD: operation_id,
+        }
+        # Record the integration branch only the moment this project first
+        # gets a persistent owner — no prior coordinator request and no
+        # prior handoff activation — never on a later re-Plan of a project
+        # that already had one. A re-Plan must not undo an operator's
+        # opt-out (clearing the field) or switch an in-flight project onto a
+        # new branch mid-stream.
+        is_first_owner = (
+            not task.fields.get(COORDINATOR_REQUEST_FIELD)
+            and not task.fields.get(LAST_HANDOFF_OPERATION_FIELD)
+        )
+        if is_first_owner and not task.fields.get(INTEGRATION_BRANCH_FIELD):
+            plan_fields[INTEGRATION_BRANCH_FIELD] = _integration_branch_name(task)
         linked = self.manager.update(
             task_id,
             status="in_progress",
-            fields={
-                EXECUTION_PAUSED_FIELD: "true",
-                COORDINATOR_SESSION_FIELD: session.session_id,
-                COORDINATOR_REQUEST_FIELD: operation_id,
-            },
+            fields=plan_fields,
             _project_operation="plan",
             _precondition=link_precondition,
         )
@@ -1489,7 +1712,21 @@ class ProjectTaskService:
             + "\nUse task hierarchy, not session ancestry. Preserve explicit child assignments "
             "and do not expand provider/cloud consent beyond this delegated scope. When creating "
             "a child, derive one stable operation_key from this project ID, operation ID, and the "
-            "child's role; reuse that key on retry so the task tool recovers the same child."
+            "child's role; reuse that key on retry so the task tool recovers the same child.\n"
+            "You are this project's persistent owner: you are woken automatically when a "
+            "child's state changes -- newly blocked, failed, done, cancelled, or awaiting "
+            "review -- with several such events batched into one wake. Use "
+            "`lifeos_agent_project_owner` to accept or reject a review-pending child of "
+            "this project (reject requires a note; accepting a child whose pull request "
+            "targets this project's own integration branch also merges it into that "
+            "branch first, and fails the whole call with merge_failed -- leaving the card "
+            "in review -- if that merge fails) and to mark this project done yourself once "
+            "children and reviews are resolved -- allowed even while this turn is still "
+            "live, except that it refuses with integration_unmerged while this project's "
+            "integration branch still has commits the default branch doesn't; merge that "
+            "branch into the default branch yourself, through this repository's own "
+            "documented merge process, then call complete_project again -- or the explicit "
+            "project cancellation action if it must stop instead."
         )
 
 
@@ -1504,6 +1741,25 @@ def _clean_field(fields: dict[str, str], key: str) -> str | None:
 def _coordinator_task_id(project_id: str, operation_id: str) -> str:
     digest = hashlib.sha256(operation_id.encode("utf-8")).hexdigest()[:12]
     return f"project_{project_id}_{digest}"
+
+
+def _integration_branch_name(task: "Task") -> str:
+    """The project's deterministic integration branch — follows the same
+    `<type>/<slug>-<suffix>` convention `ensure_worktree` derives a task's
+    own work branch from, but seeded so it can never collide with one. A
+    handed-off project keeps the source task's own id after activation, and
+    that task's own CLI worktree branch (if it has one) is derived from
+    `(task.description, task.id)` directly — the exact pair this would
+    collide with un-seeded, since a coding session that already pushed WIP
+    to that branch would then hand children (and this task's own worktree
+    finalize push) the same ref. The suffix is a short hash of the task id
+    rather than the id itself, so it stays deterministic and task-specific
+    (two different projects still get different suffixes) without ever
+    equaling the plain id `derive_branch_name` would use for the task's own
+    branch.
+    """
+    seed = hashlib.sha256(f"integration:{task.id}".encode("utf-8")).hexdigest()[:8]
+    return derive_branch_name(task.description, seed)
 
 
 def _handoff_request_hash(request: dict[str, Any]) -> str:

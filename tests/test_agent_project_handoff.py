@@ -41,6 +41,8 @@ from api.services.agent_worker.spend_tracker import SpendTracker
 from api.services.agent_worker.worker import PROJECT_HANDOFF_RETURN_PENDING_EVENT, Worker
 from api.services.task_manager import TaskManager
 from api.services.task_projects import (
+    CHILD_CREATOR_SESSION_FIELD,
+    CHILD_ORIGIN_FIELD,
     HANDOFF_OPERATION_FIELD,
     HANDOFF_QUIESCENT_EVENT,
     HANDOFF_READY_AT_FIELD,
@@ -228,6 +230,72 @@ def test_handoff_stages_fenced_children_and_blocked_coordinator(handoff):
         manager.update(children[0].id, tags=["codex"])
 
 
+def test_handoff_staged_children_are_stamped_agent_origin(handoff):
+    manager, _store, _transcripts, source, ctx = handoff
+
+    result = dispatch(ctx, "lifeos_agent_project_handoff", _request())
+
+    assert result["ok"] is True
+    for item in result["child_tasks"]:
+        child = manager.get(item["task_id"])
+        assert child.fields[CHILD_ORIGIN_FIELD] == "agent"
+        assert child.fields[CHILD_CREATOR_SESSION_FIELD] == source.session_id
+
+
+def test_handoff_rejects_hermes_assignee_before_any_write(handoff):
+    manager, store, transcripts, source, ctx = handoff
+    request = _request()
+    request["children"][0]["assignee"] = "hermes"
+    del request["children"][0]["execution"]
+
+    result = dispatch(ctx, "lifeos_agent_project_handoff", request)
+
+    assert result == {
+        "ok": False,
+        "error": "hermes_delegation_forbidden",
+        "message": (
+            "child research cannot be assigned to hermes; the operator can "
+            "assign it from the board"
+        ),
+    }
+    assert [task.id for task in manager.list_tasks()] == [source.task_id]
+    assert store.list_sessions() == [source]
+    assert HANDOFF_OPERATION_FIELD not in manager.get(source.task_id).fields
+    assert transcripts.read(source.session_id) == []
+
+
+def test_handoff_rejects_hermes_executor_before_any_write(handoff):
+    manager, store, transcripts, source, ctx = handoff
+    request = _request()
+    request["children"][0]["assignee"] = None
+    request["children"][0]["execution"] = {"executor": "hermes"}
+
+    result = dispatch(ctx, "lifeos_agent_project_handoff", request)
+
+    assert result == {
+        "ok": False,
+        "error": "hermes_delegation_forbidden",
+        "message": (
+            "child research cannot execute on hermes; the operator can "
+            "assign it from the board"
+        ),
+    }
+    assert [task.id for task in manager.list_tasks()] == [source.task_id]
+    assert HANDOFF_OPERATION_FIELD not in manager.get(source.task_id).fields
+
+
+def test_handoff_schema_omits_hermes_from_assignee_and_executor_enums():
+    from api.services.agent_worker.inter_agent import INTER_AGENT_TOOL_SCHEMAS
+
+    schema = next(
+        item for item in INTER_AGENT_TOOL_SCHEMAS
+        if item["name"] == "lifeos_agent_project_handoff"
+    )
+    child_schema = schema["input_schema"]["properties"]["children"]["items"]["properties"]
+    assert "hermes" not in child_schema["assignee"]["enum"]
+    assert "hermes" not in child_schema["execution"]["properties"]["executor"]["enum"]
+
+
 def test_handoff_is_hash_idempotent_and_mismatch_is_stable(handoff):
     _manager, _store, _transcripts, _source, ctx = handoff
     first = dispatch(ctx, "lifeos_agent_project_handoff", _request())
@@ -339,6 +407,109 @@ def test_quiescence_finalization_keeps_parent_in_progress_without_fake_outcome(h
     )
     assert retry["state"] == "activated"
     assert retry["source_session_id"] == source.session_id
+
+
+def test_finalize_handoff_records_the_integration_branch(handoff):
+    from api.services.task_projects import INTEGRATION_BRANCH_FIELD, _integration_branch_name
+
+    manager, store, transcripts, source, ctx = handoff
+    staged = dispatch(ctx, "lifeos_agent_project_handoff", _request())
+    transcripts.append(source.session_id, HANDOFF_QUIESCENT_EVENT, {
+        "operation_id": staged["operation_id"],
+        "attempt_id": source.attempt_id,
+        "turn_id": source.turn_id,
+    })
+    assert store.update_status(
+        source.task_id,
+        STATUS_COMPLETED,
+        attempt_id=source.attempt_id,
+        turn_id=source.turn_id,
+        project=False,
+    )
+
+    result = ProjectTaskService(manager, store, transcripts).finalize_handoff(
+        source.task_id,
+        operation_id=staged["operation_id"],
+        source_session_id=source.session_id,
+        source_attempt_id=source.attempt_id,
+        source_turn_id=source.turn_id,
+    )
+
+    assert result["state"] == "activated"
+    parent = manager.get(source.task_id)
+    assert parent.fields[INTEGRATION_BRANCH_FIELD] == _integration_branch_name(parent)
+
+
+def test_finalize_handoff_integration_branch_never_collides_with_the_sources_own_work_branch(handoff):
+    """The source task keeps its own id after handoff activation, so its
+    own CLI worktree branch (derived from `(description, task.id)`
+    directly) must never equal the recorded integration branch — a
+    collision would hand children the source's own in-flight WIP instead of
+    a fresh branch off the default."""
+    from api.services.agent_worker.git_worktree import derive_branch_name
+    from api.services.task_projects import INTEGRATION_BRANCH_FIELD
+
+    manager, store, transcripts, source, ctx = handoff
+    staged = dispatch(ctx, "lifeos_agent_project_handoff", _request())
+    transcripts.append(source.session_id, HANDOFF_QUIESCENT_EVENT, {
+        "operation_id": staged["operation_id"],
+        "attempt_id": source.attempt_id,
+        "turn_id": source.turn_id,
+    })
+    assert store.update_status(
+        source.task_id,
+        STATUS_COMPLETED,
+        attempt_id=source.attempt_id,
+        turn_id=source.turn_id,
+        project=False,
+    )
+
+    ProjectTaskService(manager, store, transcripts).finalize_handoff(
+        source.task_id,
+        operation_id=staged["operation_id"],
+        source_session_id=source.session_id,
+        source_attempt_id=source.attempt_id,
+        source_turn_id=source.turn_id,
+    )
+
+    parent = manager.get(source.task_id)
+    sources_own_worktree_branch = derive_branch_name(parent.description, parent.id)
+    assert parent.fields[INTEGRATION_BRANCH_FIELD] != sources_own_worktree_branch
+
+
+def test_finalize_handoff_does_not_overwrite_an_existing_integration_branch(handoff):
+    from api.services.task_projects import INTEGRATION_BRANCH_FIELD
+
+    manager, store, transcripts, source, ctx = handoff
+    manager.update(
+        source.task_id,
+        fields={INTEGRATION_BRANCH_FIELD: "feat/operator-chosen-cafebabe"},
+        _skip_project_validation=True,
+    )
+    staged = dispatch(ctx, "lifeos_agent_project_handoff", _request())
+    transcripts.append(source.session_id, HANDOFF_QUIESCENT_EVENT, {
+        "operation_id": staged["operation_id"],
+        "attempt_id": source.attempt_id,
+        "turn_id": source.turn_id,
+    })
+    assert store.update_status(
+        source.task_id,
+        STATUS_COMPLETED,
+        attempt_id=source.attempt_id,
+        turn_id=source.turn_id,
+        project=False,
+    )
+
+    ProjectTaskService(manager, store, transcripts).finalize_handoff(
+        source.task_id,
+        operation_id=staged["operation_id"],
+        source_session_id=source.session_id,
+        source_attempt_id=source.attempt_id,
+        source_turn_id=source.turn_id,
+    )
+
+    parent = manager.get(source.task_id)
+    assert parent.fields[INTEGRATION_BRANCH_FIELD] == "feat/operator-chosen-cafebabe"
 
 
 def test_existing_project_uses_plan_and_cannot_handoff(handoff):

@@ -4622,6 +4622,58 @@ class TestSnoozeDisplayAndUnsnooze:
         expect(page.locator('.board-lane[data-lane="snoozed"] [data-card-id="t-snoozed"]')).to_have_count(0)
 
 
+class TestAcceptedByDrawerRow:
+    """AC: a Done card accepted through `fields.review_accepted_by` shows
+    who accepted it — "Project owner" for an owner:<session_id> stamp,
+    "Operator" for the plain operator stamp — and a card with no stamp at
+    all shows neither."""
+
+    def _accepted_card(self, review_accepted_by):
+        return {
+            "kind": "task", "id": "t-accepted", "title": "Reviewed synthetic output",
+            "notes": "", "status": "done", "tags": ["codex", "agent-completed", "accepted"],
+            "assignee": "codex",
+            "fields": {"review_accepted_by": review_accepted_by} if review_accepted_by else {},
+            "context": "Inbox", "updated_at": "2026-01-01T00:00:00+00:00",
+            "session": None, "pending_question": None,
+        }
+
+    def _open_done_card(self, page: Page, agents_base_url, board_state) -> None:
+        # Done is hidden by default (see the lane-filter tests above) — reveal
+        # it before the card can be clicked.
+        _open_board(page, agents_base_url, board_state=board_state)
+        page.locator("#board-lane-filter-btn").click()
+        page.locator("#board-lane-filter-options input[value='done']").check()
+        page.locator('[data-card-id="t-accepted"]').click()
+        expect(page.locator("#board-drawer-backdrop")).to_be_visible()
+
+    def test_owner_accepted_card_shows_project_owner(self, page: Page, agents_base_url):
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["done"].append(self._accepted_card("owner:sess-owner-1"))
+        self._open_done_card(page, agents_base_url, board_state)
+
+        meta = page.locator('#board-drawer [data-field="meta"]')
+        expect(meta).to_contain_text("Accepted by")
+        expect(meta).to_contain_text("Project owner")
+
+    def test_operator_accepted_card_shows_operator(self, page: Page, agents_base_url):
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["done"].append(self._accepted_card("operator"))
+        self._open_done_card(page, agents_base_url, board_state)
+
+        meta = page.locator('#board-drawer [data-field="meta"]')
+        expect(meta).to_contain_text("Accepted by")
+        expect(meta).to_contain_text("Operator")
+
+    def test_card_with_no_acceptance_stamp_shows_no_accepted_by_row(self, page: Page, agents_base_url):
+        board_state = copy.deepcopy(_board_fixture())
+        board_state["lanes"]["done"].append(self._accepted_card(None))
+        self._open_done_card(page, agents_base_url, board_state)
+
+        meta = page.locator('#board-drawer [data-field="meta"]')
+        expect(meta).not_to_contain_text("Accepted by")
+
+
 class TestSnoozeDraggingClearsTheField:
     """AC: dragging a snoozed card to another lane clears the snooze (the
     server does it) — the UI must reflect the card landing in its new lane,
@@ -5874,19 +5926,42 @@ class TestAgentCardMoveRulesAndCancel:
         assert t13["tags"] == ["me", "agent-notes", "notes"]
         assert not any("agent" in (p.get("tags") or []) for p in task_puts)
 
-    def test_kill_disabled_for_a_claude_code_cli_backed_live_session(self, page: Page, agents_base_url):
-        """RC1's positive case, missing until now: a claimed card whose
-        linked session is a live Claude Code CLI pane (opened via the
-        drawer's Open button, not started by the worker) renders Kill
-        disabled with the "close it manually" reason — Kill has no way to
-        tear down a CLI process the way it kills a LifeOS-agent session,
-        the same limitation Cancel already reports for the same shape."""
+    def test_kill_enabled_for_a_reachable_claude_code_cli_backed_live_session(self, page: Page, agents_base_url):
+        """A claimed card whose linked session is a live Claude Code CLI
+        session renders Kill enabled when the server reports it reachable
+        (`cli_kill_reachable` true or absent) — the kill endpoint resolves
+        the session id back to a pane or an owning worker session and tears
+        it down either way."""
         board_state = copy.deepcopy(_board_fixture())
         card = _claimed_agent_owned_card(card_id="t14", title="CLI-backed claimed card")
         card["session"] = {
             "session_id": "cc:cli-live-1", "status": "running",
             "host": "test-host", "routing": "claude_code",
             "model_label": "Sonnet", "source": "claude_code",
+            "cli_kill_reachable": True,
+        }
+        board_state["lanes"]["in_progress"].append(card)
+        _open_board(page, agents_base_url, board_state=board_state)
+
+        page.locator('[data-card-id="t14"]').click()
+        kill_btn = page.get_by_role("button", name="Kill", exact=True)
+        expect(kill_btn).to_be_visible()
+        expect(kill_btn).to_be_enabled()
+
+    def test_kill_disabled_for_an_unreachable_claude_code_cli_backed_live_session(self, page: Page, agents_base_url):
+        """A claimed card whose linked session is a live Claude Code CLI
+        session the server cannot resolve to a pane or an owning worker
+        session (`cli_kill_reachable: false` — an operator-run CLI session
+        LifeOS never spawned) renders Kill disabled with the "close it
+        manually" reason, the same limitation Cancel already reports for
+        the same shape."""
+        board_state = copy.deepcopy(_board_fixture())
+        card = _claimed_agent_owned_card(card_id="t14", title="CLI-backed claimed card")
+        card["session"] = {
+            "session_id": "cc:cli-live-1", "status": "running",
+            "host": "test-host", "routing": "claude_code",
+            "model_label": "Sonnet", "source": "claude_code",
+            "cli_kill_reachable": False,
         }
         board_state["lanes"]["in_progress"].append(card)
         _open_board(page, agents_base_url, board_state=board_state)

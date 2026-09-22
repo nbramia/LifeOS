@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Task Management
-> **Last Updated:** 2026-09-20
+> **Last Updated:** 2026-09-22
 
 Engineering view of the task store — how a task is located, written, and
 reindexed. For the product-facing feature description, statuses, and API
@@ -16,7 +16,7 @@ does not restate those.
 | File | Role |
 |------|------|
 | `api/services/task_manager.py` | `Task`, `TaskManager` (CRUD + markdown round-trip + index cache + dashboard), module-level parse/format helpers |
-| `api/services/task_projects.py` | Derived hierarchy/read model, relationship validation, explicit project lifecycle and coordinator/cancellation recovery |
+| `api/services/task_projects.py` | Derived hierarchy/read model, relationship validation, explicit project lifecycle (start/complete/plan/pause/resume/cancel), persistent-owner linkage, and handoff/cancellation recovery |
 | `api/services/operation_lock.py` | Re-entrant cross-process boundary for relationship, claim, and durable-operation races |
 | `api/services/task_watcher.py` | `TaskWatcher` — watchdog observer that reindexes on external edits |
 | `api/services/atomic_write.py` | `atomic_write_text`/`atomic_write_lines` — shared temp-file-plus-rename helper, also used by `scheduler_store.py` |
@@ -437,8 +437,57 @@ delete/claim and lifecycle-tag swaps. A swap cannot manufacture worker
 lifecycle state on a task that fails project claim admission, while a card
 that already carries `agent-running` or `agent-blocked` can still complete,
 fail, block, or resume through the worker's atomic transition. The route maps
-an admission conflict to HTTP 409. `ProjectTaskService` composes the slower
-explicit actions:
+an admission conflict to HTTP 409.
+
+Create/update on `/api/tasks` also read an optional, caller-asserted
+`X-LifeOS-Agent-Session` header — the same trust model as `actor` and
+`fields.assigned_by`, not cryptographic attestation. When present and the
+write is, or would become, a project child, `_enforce_agent_child_tag_guard`
+(`api/routes/tasks.py`) refuses `#hermes` outright and refuses a paid route
+(`#cloud`/`#cloud-haiku`/`#cloud-sonnet`) unless the project's owner
+(`project_coordinator_session_id`) already resolves to that same executor —
+`inter_agent.metered_target_out_of_scope`, the same function the handoff
+handler uses for its own source-turn scope check. A create that carries
+`fields.parent_id` under that header stamps `project_child_origin=agent`
+and `project_child_creator_session=<id>` on the new task; `stage_handoff`
+stamps its children the same way, with the handoff's source session as the
+creator. Both fields are in `TaskManager.create`'s and
+`_guard_project_update`'s `internal_fields` sets, so neither create's raw
+`fields` dict nor an ordinary update can set or clear them.
+
+`pause_project`/`resume_project` set and clear three internal parent fields —
+`project_paused`, `project_paused_at`, `project_pause_reason` (`operator`,
+`owner_failed`, or `owner_budget`) — through the same `_project_operation`
+path, so they land in `TaskManager.create`'s and `_guard_project_update`'s
+`internal_fields` sets like every other project-lifecycle field. Pause
+enforcement lives entirely in `_project_claim_allowed`: a truthy
+`project_paused` on a child's parent refuses that child's claim and
+interactive Open exactly like a pending cancellation or handoff, and a
+`parent_project_paused` read field carries the same fact to task/board
+consumers next to `parent_handoff_pending`. `claim_for_agent` additionally
+raises `ProjectConflictError` (-> HTTP 409) the moment it observes a paused
+parent, both before and inside its CAS retry closure, so a worker's claim
+attempt gets an unambiguous refusal distinct from ordinary staleness — every
+other `_project_claim_allowed` refusal reason still returns the softer
+`(False, False)`. Pause does not touch `_guard_project_update`'s status/tags
+guards, so a child mid-turn when the pause takes effect keeps transitioning
+through its own lifecycle (running -> review) undisturbed, and Cancel and
+operator Complete on the project itself stay available. `plan_and_delegate`
+refuses a paused project outright, checked both before staging the
+coordinator session and again in the linking CAS precondition.
+
+The worker only consults `parent_project_paused` when listing new claim
+candidates (`_list_agent_tasks`) — never in the functions that gate
+continuing an already-claimed child's in-flight work
+(`_task_claim_is_current`, `_claim_is_current`, `_revalidate_task_resume`),
+which every Managed poll, sleeping-session wake, spawned-child wait, and
+operator reply runs through. Those keep checking `parent_cancellation_pending`
+and `parent_handoff_pending` (a live child there is not supposed to exist),
+but deliberately not `parent_project_paused`: failing them closed on a pause
+would strand a running claim and abandon its session instead of letting it
+finish into Review.
+
+`ProjectTaskService` composes the slower explicit actions:
 
 - start and completion mutate the ordinary parent without forging agent tags;
 - plan/delegate stages a separate operator-origin session as non-dispatchable,
@@ -455,7 +504,24 @@ explicit actions:
   cancel action available so clients can issue the required same-ID retry;
 - review cancellation removes the review lifecycle marker, adds
   `agent-result-abandoned`, and preserves SessionStore/transcript output rather
-  than recording acceptance.
+  than recording acceptance;
+- pause and resume write and clear `project_paused`, `project_paused_at`, and
+  `project_pause_reason` (`operator | owner_failed | owner_budget`), and resume
+  also resets the owner's consecutive-failure counter;
+- completion accepts an `owner_session`, which carries
+  `_owner_turn_completion_session_id` into `_guard_project_update`. That
+  exempts the live-coordinator check for exactly the project's own recorded
+  owner session and nothing else; every other completion guard still applies,
+  and the operator's own completion route never passes it.
+
+The first time a project gains an owner — plan/delegate, or a handoff
+activation — it also records `project_integration_branch`, a deterministic
+branch name derived from the project's title and ID through the same
+`derive_branch_name` helper worktree provisioning uses. Coding children branch
+from, and open pull requests into, that branch; the owner's attested
+`complete_project` is refused with `integration_unmerged` while the branch
+still holds commits the default branch doesn't, and a branch the repository's
+merge process has already deleted reads as merged.
 
 The coordinator uses a synthetic task ID derived from project ID plus a hash of
 the caller's stable operation ID. Its canonical execution request comes from

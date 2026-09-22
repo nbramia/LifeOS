@@ -41,16 +41,27 @@ AGENT_TRANSCRIPTS_DIR = _REPO_ROOT / "data" / "agent_transcripts"
 API_BASE = os.environ.get("LIFEOS_API_URL", "http://localhost:8000")
 OPENAPI_URL = f"{API_BASE}/openapi.json"
 TURN_ID_HEADER = "X-LifeOS-Turn-ID"
+# Caller-asserted worker identity, sent on curated task create/update when
+# this server has one (stdio worker env, an in-process local executor
+# context, or the agent-only HTTP transport). Never sent by interactive
+# operator MCP. See `LifeOSMCPServer._resolve_agent_session_header`.
+AGENT_SESSION_HEADER = "X-LifeOS-Agent-Session"
 
 _TASK_CREATE_FIELDS_DESCRIPTION = (
     "Operator-editable inline fields (e.g. host, effort, model, key) plus "
     "custom fields. Set parent_id to a stable task ID to create a durable "
-    "child relationship; this is task hierarchy, not agent-session ancestry."
+    "child relationship; this is task hierarchy, not agent-session ancestry. "
+    "An agent-attributed create refuses #hermes on a project child, and a "
+    "paid route (#cloud/#cloud-haiku/#cloud-sonnet) unless the project owner "
+    "already carries it."
 )
 _TASK_UPDATE_FIELDS_DESCRIPTION = (
     "Merged into operator/unknown fields, not replaced: a string sets a field, "
     "null removes it. Set fields.parent_id to attach/reparent by stable task ID "
-    "or null to detach; project hierarchy is independent of agent-session ancestry."
+    "or null to detach; project hierarchy is independent of agent-session ancestry. "
+    "An agent-attributed update refuses #hermes on a project child, and a paid "
+    "route (#cloud/#cloud-haiku/#cloud-sonnet) unless the project owner already "
+    "carries it."
 )
 
 
@@ -458,6 +469,18 @@ CURATED_ENDPOINTS = {
         "method": "POST",
         "path": "/api/tasks/{task_id}/project/cancel"
     },
+    "/api/tasks/{task_id}/project/pause:POST": {
+        "name": "lifeos_project_pause",
+        "description": "Pause a project: blocks new child claims, Open, and Plan and delegate until resumed. A child already mid-turn still finishes into Review; Cancel and Complete remain available.",
+        "method": "POST",
+        "path": "/api/tasks/{task_id}/project/pause"
+    },
+    "/api/tasks/{task_id}/project/resume:POST": {
+        "name": "lifeos_project_resume",
+        "description": "Resume a paused project so claims and Open succeed again. Refused with 403 for an agent-attributed caller — only the operator can resume.",
+        "method": "POST",
+        "path": "/api/tasks/{task_id}/project/resume"
+    },
     "/api/tasks/{task_id}/resume-execution:POST": {
         "name": "lifeos_task_resume_execution",
         "description": "Resume automatic execution for a formerly-project task after its final child link was removed. Refuses current projects and tasks with pending cancellation.",
@@ -530,9 +553,9 @@ CURATED_ENDPOINTS = {
     },
 }
 
-# Contract count for the source catalog. The live fallback catalog is 69
-# curated tools plus 10 lifeos_agent_* tools = 79.
-CURATED_TOOL_COUNT = 69
+# Contract count for the source catalog. The live fallback catalog is 71
+# curated tools plus 11 lifeos_agent_* tools = 82.
+CURATED_TOOL_COUNT = 71
 
 
 class LifeOSMCPServer:
@@ -1279,6 +1302,19 @@ class LifeOSMCPServer:
                 },
                 "required": ["task_id"]
             },
+            "lifeos_project_pause": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "Stable project task ID"},
+                    "reason": {"type": "string", "description": "operator | owner_failed | owner_budget. Defaults to operator."}
+                },
+                "required": ["task_id"]
+            },
+            "lifeos_project_resume": {
+                "type": "object",
+                "properties": {"task_id": {"type": "string", "description": "Stable project task ID"}},
+                "required": ["task_id"]
+            },
             "lifeos_task_resume_execution": {
                 "type": "object",
                 "properties": {"task_id": {"type": "string", "description": "Stable ordinary task ID"}},
@@ -1411,7 +1447,7 @@ class LifeOSMCPServer:
                 return {"error": "invalid MCP caller proof"}
         caller_attempt_id = None
         caller_turn_id = None
-        if tool_name == "lifeos_agent_project_handoff":
+        if tool_name in ("lifeos_agent_project_handoff", "lifeos_agent_project_owner"):
             supplied_attempt = (arguments.pop("caller_attempt_id", None) or "").strip()
             supplied_turn = (arguments.pop("caller_turn_id", None) or "").strip()
             turn_proof = (arguments.pop("caller_turn_proof", None) or "").strip()
@@ -1533,7 +1569,33 @@ class LifeOSMCPServer:
             return False
         return cfg.get("method", "").upper() == "GET"
 
-    def _call_api(self, tool_name: str, arguments: dict, session_id: str | None = None) -> dict:
+    def _resolve_agent_session_header(self, explicit: str | None) -> str:
+        """Resolve the caller-asserted worker identity for `AGENT_SESSION_HEADER`.
+
+        Precedence: an explicit override (the in-process local executor
+        passes its `InterAgentContext.caller_session_id`), else the stdio
+        worker identity this process inherited via `LIFEOS_AGENT_SESSION_ID`,
+        else `"unattested"` when this server is the agent-only HTTP
+        transport (bearer bound, never used by an interactive operator).
+        Returns "" for interactive operator MCP — stdio with no worker env
+        and no HTTP transport bearer — which sends no header at all.
+        """
+        explicit = (explicit or "").strip()
+        if explicit:
+            return explicit
+        if self._trusted_session_id:
+            return self._trusted_session_id
+        if self._mcp_transport_secret:
+            return "unattested"
+        return ""
+
+    def _call_api(
+        self,
+        tool_name: str,
+        arguments: dict,
+        session_id: str | None = None,
+        agent_session_id: str | None = None,
+    ) -> dict:
         """Call the LifeOS API based on tool name and arguments.
 
         `session_id` (optional) enables the per-session result cache:
@@ -1541,6 +1603,10 @@ class LifeOSMCPServer:
         are served from a 60s LRU instead of round-tripping to the API. Writes
         (POST/PUT/DELETE) are never cached. The cache also skips inter-agent
         tools and the sync trigger (both sensitive to fresh state).
+
+        `agent_session_id` (optional) is the in-process local executor's own
+        caller identity override for `AGENT_SESSION_HEADER` — see
+        `_resolve_agent_session_header`.
         """
         # Custom handlers for tools that don't map 1:1 to endpoints
         if tool_name == "lifeos_sync_trigger":
@@ -1596,6 +1662,17 @@ class LifeOSMCPServer:
             request_key = (arguments.pop(request_key_header_arg, None) or "").strip()
             if request_key:
                 headers["X-Request-Key"] = request_key
+        # Curated task writes carry the caller-asserted worker identity, so
+        # the API can tell an agent-attributed project-child write from an
+        # operator's — see `_resolve_agent_session_header`.
+        # `lifeos_project_resume` gets the same header so the API can refuse
+        # an agent-attributed resume (403) — see
+        # `POST /api/tasks/{id}/project/resume`. `lifeos_project_pause` does
+        # not need it: agents are allowed to pause a project.
+        if tool_name in ("lifeos_task_create", "lifeos_task_update", "lifeos_project_resume"):
+            resolved_agent_session = self._resolve_agent_session_header(agent_session_id)
+            if resolved_agent_session:
+                headers[AGENT_SESSION_HEADER] = resolved_agent_session
 
         # Handle path parameters
         if "{" in endpoint_path:
@@ -2375,6 +2452,13 @@ class LifeOSMCPServer:
             if not complete:
                 text += "\nCancellation remains pending; retry with the same operation_id after resolving the failures."
             return text
+
+        elif tool_name == "lifeos_project_pause":
+            reason = data.get("fields", {}).get("project_pause_reason", "operator")
+            return f"Project paused ({reason}): **{data.get('description', '')}** (ID: {data.get('id', '')})"
+
+        elif tool_name == "lifeos_project_resume":
+            return f"Project resumed: **{data.get('description', '')}** (ID: {data.get('id', '')})"
 
         elif tool_name == "lifeos_task_resume_execution":
             return f"Task execution resumed: **{data.get('description', '')}** (ID: {data.get('id', '')})"

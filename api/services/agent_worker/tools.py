@@ -383,7 +383,7 @@ class ToolRegistry:
                 # over MCP HTTP can supply it); for local we override.
                 args = dict(arguments or {})
                 args["caller_session_id"] = self._inter_ctx.caller_session_id
-                if name == "lifeos_agent_project_handoff":
+                if name in ("lifeos_agent_project_handoff", "lifeos_agent_project_owner"):
                     args["caller_attempt_id"] = self._inter_ctx.caller_attempt_id
                     args["caller_turn_id"] = self._inter_ctx.caller_turn_id
                 payload = inter_agent.dispatch(self._inter_ctx, name, args)
@@ -413,7 +413,16 @@ class ToolRegistry:
 
         if name in self._mcp_tool_names:
             try:
-                data = self._mcp._call_api(name, arguments)
+                # The in-process executor's own caller identity, forwarded so
+                # `_call_api` can stamp curated task writes with
+                # `X-LifeOS-Agent-Session` — see mcp_server.py's
+                # `_resolve_agent_session_header`. None outside an inter-agent
+                # context (e.g. the standalone `ToolRegistry()` used by
+                # preflight/test fixtures), which sends no header.
+                agent_session_id = (
+                    self._inter_ctx.caller_session_id if self._inter_ctx is not None else None
+                )
+                data = self._mcp._call_api(name, arguments, agent_session_id=agent_session_id)
                 formatted = self._mcp._format_response(name, data, arguments)
                 # MCP _call_api signals errors by returning a dict with an
                 # "error" key — surface that as an error result.

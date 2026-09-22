@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** API Gateway
-> **Last Updated:** 2026-09-20
+> **Last Updated:** 2026-09-22
 
 MCP (Model Context Protocol) server that exposes LifeOS capabilities to AI assistants like Claude Code.
 
@@ -33,10 +33,10 @@ The LifeOS MCP server dynamically discovers endpoints from the LifeOS OpenAPI sp
 - Formatted responses for human readability
 - Fallback schemas when API unavailable
 
-The source catalog contains 69 curated LifeOS endpoint tools. It also
-registers 10 worker coordination tools (`lifeos_agent_*`), including
-`lifeos_agent_project_handoff` and `lifeos_agent_execution_override`, for a
-79-tool fallback catalog. When the
+The source catalog contains 71 curated LifeOS endpoint tools. It also
+registers 11 worker coordination tools (`lifeos_agent_*`), including
+`lifeos_agent_project_handoff`, `lifeos_agent_project_owner`, and
+`lifeos_agent_execution_override`, for an 82-tool fallback catalog. When the
 OpenAPI document omits an unavailable endpoint, the live list may be smaller;
 the inter-agent tools remain registered as a separate contract.
 
@@ -100,10 +100,13 @@ Tasks can also be managed via natural language chat. See [Task Management spec](
 | `lifeos_task_children` | Retrieve the actual children of a project by stable parent ID, with pagination; partial pages state their displayed count and offset |
 | `lifeos_project_start` | Mark an open project active without launching the parent as an ordinary worker task |
 | `lifeos_project_complete` | Complete a project after every child and coordination guard passes; cancelled children require explicit reduced-scope acknowledgement |
-| `lifeos_project_plan` | Start or recover an idempotent agent-owner planning/delegation run |
+| `lifeos_project_plan` | Start the project's persistent agent-owner session, or wake the one it already has; idempotent per operation ID |
 | `lifeos_project_cancel` | Preview cancellation scope, then confirm a resumable cascading cancellation with a stable operation ID |
+| `lifeos_project_pause` | Pause a project: blocks child claims, Open, and Plan and delegate until resumed; a mid-turn child still finishes into Review |
+| `lifeos_project_resume` | Resume a paused project; refused with 403 for an agent-attributed caller — only the operator can resume |
 | `lifeos_task_resume_execution` | Resume a paused ordinary task after its final child link is removed |
 | `lifeos_agent_project_handoff` | The current executor turn stages an ordinary top-level task as a one-level durable project and then ends; children remain blocked until that turn has stopped and been verified |
+| `lifeos_agent_project_owner` | The attested project owner accepts or rejects a review-pending child of its own project, or completes its own project — allowed even while its own turn is still live |
 
 Project classification comes only from incoming `fields.parent_id` references;
 it is unrelated to `lifeos_agent_spawn` session ancestry. Before mutating a
@@ -115,14 +118,30 @@ reports unfinished, running, and awaiting-review work; confirmation abandons
 pending-review output without accepting it, and a partial result remains
 pending until retried with the same `operation_id`.
 
+`lifeos_task_create`/`lifeos_task_update`, and `lifeos_project_resume`,
+carry a caller-asserted worker identity (an `X-LifeOS-Agent-Session`
+header, invisible to the tool schema — the stdio and local-executor MCP
+transports add it automatically, and the agent-only HTTP transport always
+sends the literal `unattested`, since it has no per-call identity of its
+own) whenever this server has one; interactive operator MCP sends none. On a
+project-child create or update, an agent-attributed request can never
+assign `#hermes`, and a paid route (`#cloud`/`#cloud-haiku`/`#cloud-sonnet`)
+is refused unless the project's own owner already carries it. An
+agent-attributed create is stamped internally as agent-created; an
+operator create is not, and neither stamp can be forged or cleared through
+an ordinary update. See [API Reference — Agent-session attribution and
+project-child guards](api-reference.md#agent-session-attribution-and-project-child-guards).
+
 `lifeos_agent_project_handoff` is distinct from ordinary child attachment and
 from `lifeos_agent_spawn`. It accepts an attested current executor turn, a
 stable operation ID, and 1–20 keyed child requests. The server derives the
 source task and session; it rejects a child, an existing project, a stale turn,
-or a caller that tries to broaden provider consent. Each durable child retains
-its own explicit assignment and execution request; omitted assignment remains
-unassigned. A successful staging response tells the caller to stop, and work
-does not become runnable until the worker observes and records that terminal
+or a caller that tries to broaden provider consent. `#hermes` is not a valid
+child assignee or executor — the schema omits it, and the handler rejects it
+outright. Each durable child retains its own explicit assignment and
+execution request; omitted assignment remains unassigned. A successful
+staging response tells the caller to stop, and work does not become runnable
+until the worker observes and records that terminal
 turn boundary. If termination cannot be verified, the handoff remains visibly
 pending rather than reporting the parent complete. Recovery retains that fence
 across restarts: it does not release staged work until the matching source turn
@@ -135,6 +154,48 @@ event; a disconnect, deadline, or local cancellation marker is not stop proof.
 A returned turn after cancellation retains only valid route-specific stop
 proof, never activates staged work. This applies even before a staged request
 has created a child, when the source remains an ordinary task.
+
+`lifeos_agent_project_owner` is attested the same way as
+`lifeos_agent_project_handoff` (an exact session, attempt, and turn), and is
+authorized only for the caller that is exactly the target project's current
+owner session, on its exact current turn. Its `action` is one of
+`accept_child`, `reject_child`, or `complete_project`. `accept_child` and
+`reject_child` target a review-pending child whose `parent_id` is the given
+project; `reject_child` requires a `note` and is refused with `paused` while
+the project is paused, because rejecting resumes the child session and so
+starts new child work. `accept_child`/`reject_child` share their underlying
+logic with the operator's own board Accept/Reject actions — an acceptance
+records who accepted (visible on the board), and a rejection's note is
+prefixed to make clear it came from the project owner rather than the
+operator. When the project has a recorded integration branch, `accept_child`
+also merges the child's recorded pull request into that branch first, but
+only when the pull request's base is exactly that branch
+(`merge_pull_request`, default `true`; a PR targeting anything else is never
+touched) — a failed merge fails the whole call with `merge_failed` and the
+card stays in review, unmerged and unaccepted, so the owner can reject it
+with a rebase instruction instead. A pull request already merged, or closed
+without being merged (superseded, abandoned), is nothing to merge and never
+produces `merge_failed`. Operator Accept from the board never merges.
+`complete_project` marks the caller's own project done; it is allowed even
+while the caller's own turn is still live — the one case the ordinary
+live-coordinator completion guard would otherwise refuse — while every other
+completion requirement (no pending cancellation, no unresolved children,
+cancelled-children acknowledgement) still applies exactly as it does for the
+operator's `lifeos_project_complete`, and, when the project has a recorded
+integration branch, that branch must have zero commits the default branch
+doesn't (a generic "commits ahead" check, never a merge of its own) —
+otherwise it's refused with `integration_unmerged`, naming the branch, until
+the owner merges it into the default branch itself through this repository's
+own documented merge process. A branch this repository's merge process has
+already deleted (its normal outcome once the owner merges it, per
+`scripts/candidate_publisher.py`) reads as fully merged rather than a check
+failure. A project with no coding children (nothing was ever merged onto the
+branch) skips that check entirely, and a repository whose `gh` tooling the
+check depends on is unavailable fails it closed rather than treating the
+branch as merged. Operator Complete from the board is never gated by this
+check. Stable error codes: `invalid_arg`, `not_found`, `stale_turn`,
+`not_owner`, `not_review`, `paused`, `forbidden`, `conflict`, `merge_failed`,
+`integration_unmerged`.
 
 ### Human Queue Tools
 

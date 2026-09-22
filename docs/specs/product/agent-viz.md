@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-09-20
+> **Last Updated:** 2026-09-22
 
 `/agents` is a Kanban board of the operator's work queue — vault tasks, agent questions, and scheduled work in one place, organized into lanes by status and tag. A **Graph** tab shows a deterministic delegation timeline as a secondary, read-mostly view for watching what's actively running: every LifeOS agent worker task (`#agent`-tagged), local CLI sessions discovered on the filesystem from both Claude Code (`~/.claude/projects/`) and Codex (`~/.codex/sessions/`), and Claude Code / Codex sessions registered from **any other machine** on the tailnet via a lightweight hook script.
 
@@ -40,7 +40,14 @@ Project cards show a compact resolved/total count; child cards keep their normal
 
 Opening a project uses a wider drawer. Its notes remain the objective and acceptance criteria, while the project section shows progress states, owner, coordination state and result, and an authoritative child list. Each child opens its normal drawer, can be assigned independently, and can be detached or moved to another project; the project drawer can also create a new linked child or attach an existing task by ID. Creating or attaching a child never silently copies the parent's assignment or starts work.
 
-**Start project** marks a project active without pretending its owner executed the child work. **Plan and delegate** starts one bounded coordination run for the assigned owner; the drawer exposes that run's state, result, and session. **Complete project** requires every child to be resolved and any coordinator/cancellation work to be finished; closing with cancelled children asks for an explicit reduced-scope acknowledgement. **Cancel project** first previews unfinished, running, and awaiting-review work, then confirms a cascade that preserves completed work and pending-review output without accepting it. A partial cancellation remains visibly pending until its stop failures can be retried.
+**Start project** marks a project active without pretending its owner executed the child work. **Plan and delegate** creates the project's persistent owner session, or wakes the one the project already has; whatever execution route that owner runs on, it is woken automatically whenever a child reaches awaiting-review, blocked, failed, done, or cancelled, rather than running once and going quiet, and the drawer exposes its current state, result, and session. An agent-owned project's owner can accept or reject a child's result itself, so a Review card can clear without the operator acting; the drawer names whoever accepted it. **Complete project** requires every child to be resolved and any coordinator/cancellation work to be finished; closing with cancelled children asks for an explicit reduced-scope acknowledgement. The owner has its own attested completion path, which stays available during its live turn but is refused while the project's integration branch still carries commits the default branch doesn't. **Cancel project** first previews unfinished, running, and awaiting-review work, then confirms a cascade that preserves completed work and pending-review output without accepting it. A partial cancellation remains visibly pending until its stop failures can be retried.
+
+**Pause project** blocks every child's worker claim and interactive Open, and
+disables **Plan and delegate**, without stopping a child already mid-turn —
+its result still lands in Review normally. The drawer shows **Paused
+(reason)** and swaps the action for **Resume project**, which clears the
+paused state so claims and Open succeed again. **Cancel project** and
+**Complete project** stay available while paused.
 
 A project created by an executor handoff can show **Handoff pending** in this
 same drawer. Its message explains that child execution remains blocked until
@@ -366,7 +373,7 @@ A kill takes down the target session **and every descendant in its subtree** —
 - If the target was a Managed Agents (cloud) session, the worker process also tears down the remote session via the Anthropic API so you stop being billed for idle session-hours.
 - The task in your vault transitions to whatever the worker writes as the post-kill tag (typically `#agent-failed`).
 
-A CLI session the board opened gets a working **Kill**: it ends the pane that session runs in, and the card's session shows terminal. **Cancel** on such a card does the same before marking the card cancelled, so cancelling actually stops the work rather than leaving an agent running behind a closed card. A session recorded against another machine is reported instead — this API can only reach its own terminal — and so is a worker-spawned CLI session, which has no pane handle to end; for either, stop it in the terminal where it's running.
+A CLI session the board opened gets a working **Kill**: it ends the pane that session runs in, and the card's session shows terminal. **Cancel** on such a card does the same before marking the card cancelled, so cancelling actually stops the work rather than leaving an agent running behind a closed card. A worker-spawned CLI session — no pane, since it runs headless — also gets a working Kill: it resolves back to the session that owns the subprocess and tears it down the same way Kill on a non-CLI live session does. A session recorded against another machine is reported instead — this API can only reach its own terminal — stop it in the terminal where it's running. An operator-run CLI session LifeOS never spawned (no pane, and no LifeOS session owns it) shows Kill disabled with a reason instead of offering a button that can't work, and the confirmation preview only ever names what a Kill click actually takes with it — never more, never less.
 
 ---
 

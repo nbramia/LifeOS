@@ -4,9 +4,10 @@ Tasks API routes for LifeOS.
 CRUD endpoints for tasks stored in Obsidian-compatible markdown.
 """
 import logging
+import re
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from api.services import human_queue
@@ -15,16 +16,37 @@ from api.services.agent_worker.session_store import SessionStore
 from api.services.agent_worker.transcript_store import TranscriptStore
 from api.services.task_manager import get_task_manager, Task, TaskConflictError, VALID_STATUSES
 from api.services.task_projects import (
+    COORDINATOR_SESSION_FIELD,
     ProjectConflictError,
     ProjectHandoffError,
     ProjectTaskService,
     TaskHierarchy,
     build_task_hierarchy,
+    clean_parent_id,
 )
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
+
+# Caller-asserted worker identity the MCP proxy adds to curated task create/
+# update when it has one — same header name as `mcp_server.py`'s
+# `AGENT_SESSION_HEADER`, same trust model as the existing `actor` and
+# `fields.assigned_by` caller-asserted fields on this API: not
+# cryptographically attested, just believed the way those already are.
+AGENT_SESSION_HEADER = "X-LifeOS-Agent-Session"
+# A bare token: real session ids (`sess_<hex>`) and the HTTP transport's
+# literal "unattested" both match. The header is caller-asserted and its
+# value round-trips into a stamped task field (`project_child_creator_session`
+# — see `_project_child_creator_session` in task_manager.py), which is
+# written into the vault Markdown line; without this check a value
+# containing `]`/`<!--` could forge adjacent inline fields or another
+# task's id comment. Rejected outright rather than sanitized, so a forged
+# header never reaches the write path at all.
+_AGENT_SESSION_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+# Tags a project child cannot carry when the write is agent-attributed.
+_HERMES_TAG = "hermes"
+_METERED_CHILD_TAGS = frozenset({"cloud", "cloud-haiku", "cloud-sonnet"})
 
 # Same claim vocabulary the worker fans out on (engine assignees + Managed
 # Agents consent tags). dry_run previews only when the create would be
@@ -98,6 +120,96 @@ def _require_valid_status(status: Optional[str]) -> None:
         )
 
 
+def _clean_agent_session_header(value: Optional[str]) -> Optional[str]:
+    """Validate and normalize `AGENT_SESSION_HEADER`, or raise 422.
+
+    Returns `None` when the header is absent or blank (interactive operator
+    MCP). A present value must be a bare token — see `_AGENT_SESSION_TOKEN_RE`
+    — before it can reach either the tag guard or the stamped
+    `project_child_creator_session` field, which round-trips into the vault
+    Markdown line: an unvalidated value could inject adjacent `[key:: value]`
+    fields or another task's id comment.
+    """
+    value = (value or "").strip()
+    if not value:
+        return None
+    if not _AGENT_SESSION_TOKEN_RE.fullmatch(value):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "invalid_agent_session_header",
+                "message": (
+                    f"{AGENT_SESSION_HEADER} must be a bare token: letters, "
+                    "digits, '_', or '-', at most 128 characters."
+                ),
+            },
+        )
+    return value
+
+
+def _enforce_agent_child_tag_guard(
+    manager, *, parent_id: str, tags: Optional[list[str]],
+) -> None:
+    """Refuse #hermes and an out-of-scope paid route on an agent-attributed
+    project-child write.
+
+    Only called when the caller asserted `AGENT_SESSION_HEADER` and the task
+    being written is, or would become, a project child (`parent_id` set or
+    already parented). `#hermes` is refused outright — the operator assigns
+    it from the board. A metered route (`#cloud`/`#cloud-haiku`/
+    `#cloud-sonnet`) is refused unless the project's owner (its
+    `project_coordinator_session_id`) already carries that exact route —
+    mirrors the handoff handler's own metered-scope rule
+    (`inter_agent.metered_target_out_of_scope`).
+
+    `tags` is every tag on a create (the task doesn't exist yet, so every
+    tag is new), but only the tags an update actually ADDS on an existing
+    child (see the caller in `update_task`) — re-sending a tag the operator
+    already assigned, unchanged, must not itself trigger a refusal.
+    """
+    from api.services import agent_board
+    from api.services.agent_worker.execution import parse_legacy_route_alias
+    from api.services.agent_worker.inter_agent import metered_target_out_of_scope
+
+    normalized = agent_board.normalize_tags(tags or [])
+    if _HERMES_TAG in normalized:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "hermes_delegation_forbidden",
+                "message": (
+                    "Agents cannot assign #hermes to project children; "
+                    "the operator can assign it from the board."
+                ),
+            },
+        )
+    metered_tag = next((tag for tag in normalized if tag in _METERED_CHILD_TAGS), None)
+    if metered_tag is None:
+        return
+    alias = parse_legacy_route_alias(f"#{metered_tag}")
+    target_executor = alias.request.executor if alias.recognized and alias.request else None
+    if target_executor is None:
+        return
+    session_store = _get_session_store()
+    parent = manager.get(parent_id)
+    owner_session_id = (
+        (parent.fields.get(COORDINATOR_SESSION_FIELD) or "").strip() if parent else ""
+    )
+    owner = session_store.get_by_session_id(owner_session_id) if owner_session_id else None
+    if owner is None or metered_target_out_of_scope(session_store, owner, target_executor):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "api_billing_blocked",
+                "message": (
+                    f"agent-attributed project children cannot request metered "
+                    f"route #{metered_tag} unless the project owner already "
+                    "carries it"
+                ),
+            },
+        )
+
+
 # ---------------------------------------------------------------------------
 # Request / Response models
 # ---------------------------------------------------------------------------
@@ -122,7 +234,9 @@ class CreateTaskRequest(BaseModel):
                     "operator explicitly named that engine — these tags are "
                     "operator-authority and outrank every routing safeguard, "
                     "so inventing one injects your own engine preference at "
-                    "the highest-precedence slot.",
+                    "the highest-precedence slot. On a project child from an "
+                    "agent, #hermes is always refused and a paid route is "
+                    "refused unless the project owner already carries it.",
     )
     reminder_id: Optional[str] = Field(default=None, description="Associated reminder ID")
     operation_key: Optional[str] = Field(
@@ -190,7 +304,9 @@ class UpdateTaskRequest(BaseModel):
                     "operator named. A routing tag (local/claude/codex/"
                     "hermes/cloud/cloud-haiku/cloud-sonnet) only if the operator "
                     "explicitly named that engine — these tags are operator-"
-                    "authority and outrank every routing safeguard.",
+                    "authority and outrank every routing safeguard. On a project "
+                    "child from an agent, #hermes is always refused and a paid "
+                    "route is refused unless the project owner already carries it.",
     )
     notes: Optional[str] = Field(
         default=None,
@@ -241,6 +357,7 @@ class TaskResponse(BaseModel):
     hierarchy_error: Optional[str] = None
     parent_cancellation_pending: bool = False
     parent_handoff_pending: bool = False
+    parent_project_paused: bool = False
     project: Optional[dict] = None
 
     @classmethod
@@ -286,7 +403,10 @@ class ConflictListResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 @router.post("")
-async def create_task(request: CreateTaskRequest):
+async def create_task(
+    request: CreateTaskRequest,
+    x_lifeos_agent_session: Optional[str] = Header(default=None, alias=AGENT_SESSION_HEADER),
+):
     """Create a new task, or preview its agent routing without creating it.
 
     When `dry_run=true` and the request carries an engine assignee or Managed
@@ -297,13 +417,23 @@ async def create_task(request: CreateTaskRequest):
     ~$0.001).
 
     Otherwise (no engine/consent tag, or `dry_run=false`), the task is created
-    normally.
+    normally. `AGENT_SESSION_HEADER`, when present, marks this create as
+    agent-attributed: a project-child create (`fields.parent_id` set) is
+    refused if it carries `#hermes` or an out-of-scope paid route (see
+    `_enforce_agent_child_tag_guard`), and on success the child is stamped
+    with its agent origin and creator session — an ordinary operator create
+    carries neither header nor stamp.
     """
     if request.dry_run and _has_agent_pickup_tag(request.tags):
         return _build_preflight_preview(request)
     _require_valid_status(request.status)
     manager = get_task_manager()
     fields = {k: v for k, v in (request.fields or {}).items() if v is not None}
+    agent_session_id = _clean_agent_session_header(x_lifeos_agent_session)
+    parent_id = (fields.get("parent_id") or "").strip()
+    if agent_session_id and parent_id:
+        _enforce_agent_child_tag_guard(manager, parent_id=parent_id, tags=request.tags)
+    child_creator_session = agent_session_id if (agent_session_id and parent_id) else None
     try:
         if request.operation_key:
             task, _created = manager.create_or_find_by_operation(
@@ -317,6 +447,7 @@ async def create_task(request: CreateTaskRequest):
                 reminder_id=request.reminder_id,
                 notes=request.notes,
                 fields=fields,
+                _project_child_creator_session=child_creator_session,
             )
         else:
             task = manager.create(
@@ -329,6 +460,7 @@ async def create_task(request: CreateTaskRequest):
                 reminder_id=request.reminder_id,
                 notes=request.notes,
                 fields=fields,
+                _project_child_creator_session=child_creator_session,
             )
     except ProjectConflictError as e:
         raise HTTPException(status_code=409, detail=str(e))
@@ -658,6 +790,8 @@ async def claim_agent_task(task_id: str):
             exclusion_tags=set(_AGENT_CLAIM_EXCLUSION_TAGS),
             eligible_statuses=set(_AGENT_PICKUP_STATUSES),
         )
+    except ProjectConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except TaskConflictError as e:
         raise HTTPException(status_code=409, detail=str(e))
     return ClaimAgentResponse(
@@ -818,6 +952,61 @@ async def cancel_project(task_id: str, body: CancelProjectRequest):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+class ProjectPauseRequest(BaseModel):
+    reason: Optional[str] = Field(
+        default=None,
+        description="operator | owner_failed | owner_budget. Defaults to operator.",
+    )
+
+
+@router.post("/{task_id}/project/pause", response_model=TaskResponse)
+async def pause_project(task_id: str, body: ProjectPauseRequest):
+    """Pause a project: blocks every child's worker claim and interactive
+    Open, and Plan and delegate, until resumed. A child already mid-turn
+    finishes normally and its result still lands in Review; Cancel and
+    operator Complete remain available. Agents may pause a project — only
+    Resume refuses an agent-attributed caller (see below)."""
+    manager = get_task_manager()
+    try:
+        task = _project_service(manager).pause_project(task_id, reason=body.reason or "operator")
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Task not found")
+    except ProjectConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (TaskConflictError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return _task_response(manager, task)
+
+
+@router.post("/{task_id}/project/resume", response_model=TaskResponse)
+async def resume_project(
+    task_id: str,
+    x_lifeos_agent_session: Optional[str] = Header(default=None, alias=AGENT_SESSION_HEADER),
+):
+    """Clear a project's paused state. Refused with 403 for a caller that
+    carries `AGENT_SESSION_HEADER` — only the operator (a request that sends
+    no header at all) may resume a paused project, so an agent that paused
+    one cannot silently undo it."""
+    if (x_lifeos_agent_session or "").strip():
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "agent_resume_forbidden",
+                "message": "Agents cannot resume a paused project; only the operator can.",
+            },
+        )
+    manager = get_task_manager()
+    try:
+        task = _project_service(manager).resume_project(task_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Task not found")
+    except ProjectConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except TaskConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return _task_response(manager, task)
+
+
 @router.post("/{task_id}/project/handoff/finalize")
 async def finalize_project_handoff(
     task_id: str, body: FinalizeProjectHandoffRequest,
@@ -856,12 +1045,24 @@ async def resume_task_execution(task_id: str):
 
 
 @router.put("/{task_id}", response_model=TaskResponse)
-async def update_task(task_id: str, request: UpdateTaskRequest):
-    """Update an existing task."""
+async def update_task(
+    task_id: str,
+    request: UpdateTaskRequest,
+    x_lifeos_agent_session: Optional[str] = Header(default=None, alias=AGENT_SESSION_HEADER),
+):
+    """Update an existing task.
+
+    `AGENT_SESSION_HEADER`, when present, marks this update as agent-
+    attributed: a tags patch that adds `#hermes` or an out-of-scope paid
+    route to a task that is, or would become, a project child is refused —
+    see `_enforce_agent_child_tag_guard`. An operator write (no header)
+    is unaffected.
+    """
     _require_valid_status(request.status)
     manager = get_task_manager()
     updates = {k: v for k, v in request.model_dump().items() if v is not None}
     actor = updates.pop("actor", None)
+    agent_session_id = _clean_agent_session_header(x_lifeos_agent_session)
 
     # The board's assignment pickers stamp `fields.assigned_by: "board"` on
     # every write (see web/agents/assignment.js) — that marker routes a
@@ -890,6 +1091,24 @@ async def update_task(task_id: str, request: UpdateTaskRequest):
 
     if current is not None:
         from api.services import agent_board
+
+        if agent_session_id and "tags" in updates:
+            effective_parent_id = (
+                clean_parent_id(fields_patch.get("parent_id"))
+                if fields_patch and "parent_id" in fields_patch
+                else clean_parent_id(current.fields.get("parent_id"))
+            )
+            # Only tags this write actually ADDS are checked — a tags PUT
+            # replaces the whole list, so re-sending a tag the operator
+            # already assigned (e.g. #hermes) must not itself get refused;
+            # only introducing a new one does.
+            newly_added_tags = agent_board.normalize_tags(
+                updates["tags"]
+            ) - agent_board.normalize_tags(current.tags)
+            if effective_parent_id and newly_added_tags:
+                _enforce_agent_child_tag_guard(
+                    manager, parent_id=effective_parent_id, tags=sorted(newly_added_tags),
+                )
 
         if board_marked_field_change:
             has_live = _get_session_store().has_live_session(

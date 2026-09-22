@@ -69,6 +69,16 @@ _SNAPSHOT_LIMIT = 200
 # or queue two resumes before the next board tick observes the first write.
 _BOARD_REVIEW_ACTION_LOCK = threading.RLock()
 
+# HTTP status for each `board_review.BoardReviewError.code` this route
+# surfaces. Preserves the pre-extraction mapping: a missing card is 404, a
+# bad-input code (the ValueError branch the old inline reject/accept code
+# raised 422 for) is 422, and every other card-state conflict is 409.
+_BOARD_REVIEW_HTTP_STATUS = {"not_found": 404, "invalid_arg": 422}
+
+
+def _board_review_status(code: str) -> int:
+    return _BOARD_REVIEW_HTTP_STATUS.get(code, 409)
+
 
 # Event kinds that count as errors. Includes operator/peer-initiated kills
 # because the frontend renders them as failures and the count chip should
@@ -505,6 +515,65 @@ def _lane_for_session_dict(sd: dict[str, Any], tasks_by_id: dict[str, Any] | Non
     return agent_board.lane_for_session(sd.get("status"), task_status, task_tags, task_fields, _now())
 
 
+def _strip_cli_session_prefix(session_id: str) -> str | None:
+    """Undo a board `cc:`/`cx:` session_id prefix (`CLI_ENGINE_PREFIXES`,
+    mirrored by `session_ingest.CC_PREFIX`), returning the bare Claude Code /
+    Codex CLI transcript id it carries — or None when it carries neither.
+    """
+    for prefix in CLI_ENGINE_PREFIXES.values():
+        marker = f"{prefix}:"
+        if session_id.startswith(marker):
+            return session_id[len(marker):]
+    return None
+
+
+def _resolve_owning_worker_session(session_store: SessionStore, session_id: str) -> Session | None:
+    """Resolve a `cc:`/`cx:`-prefixed board id back to the `sessions` row
+    that owns its subprocess (`claude_code_session_id`), or None when the id
+    carries no recognized prefix or no such row exists. Used wherever a CLI
+    transcript id shows up with no reachable `cli_sessions` pane to kill —
+    either no `cli_sessions` row at all, or one with `pane_id` NULL.
+    """
+    raw_cli_id = _strip_cli_session_prefix(session_id)
+    return session_store.get_by_claude_code_session_id(raw_cli_id) if raw_cli_id else None
+
+
+def _cli_kill_info(
+    session_store: SessionStore, session_id: str, cli: CliSession | None,
+) -> tuple[bool, str]:
+    """Whether `POST .../kill` on this `cc:`/`cx:` board id can actually
+    reach something to tear down (`reachable`), and the session_id it will
+    actually act on (`kill_target_id`) if so.
+
+    Reachable via a bound wezterm pane (`_kill_cli_sessions`, target: the row
+    itself — an interactive terminal spawns no tracked children, so there's
+    no other id to cascade from) or, when there's no pane (a worker-spawned
+    session runs headless, whether or not the session hooks are installed),
+    a live `sessions` row that owns the subprocess
+    (`_resolve_owning_worker_session`, target: that row's own id) — the
+    exact fallback `operator_kill_session` itself uses for these same two
+    cases, so this mirrors it rather than re-deriving it independently.
+
+    Computed once here, at snapshot time, so two different callers can read
+    it off the row instead of re-deriving it: `decideActions`
+    (web/agents/session_actions.js) decides Kill's eligibility from
+    `reachable` instead of assuming every `claude_code`/`codex` session is
+    killable — an operator-run CLI session LifeOS never spawned (no
+    `cli_sessions` row, no owning `sessions` row either) genuinely isn't —
+    and `descendantsOf`'s callers (`openKillModal`'s cascade preview) use
+    `kill_target_id` to compute descendants from the id Kill will actually
+    cascade from, not the `cc:`/`cx:` id the card itself carries when those
+    differ (a worker-spawned session's own children carry the OWNING
+    `sessions` row as `parent_session_id`, not the CLI transcript id).
+    """
+    if cli is not None and cli.pane_id is not None:
+        return True, session_id
+    owner = _resolve_owning_worker_session(session_store, session_id)
+    if owner is not None and owner.status not in TERMINAL_STATUSES:
+        return True, owner.session_id
+    return False, session_id
+
+
 def _build_snapshot() -> dict[str, Any]:
     session_store = _get_session_store()
     transcript_store = _get_transcript_store()
@@ -567,6 +636,7 @@ def _build_snapshot() -> dict[str, Any]:
             _apply_cli_session_to_dict(sd, cli)
         else:
             sd["host"] = api_host_name()
+        sd["cli_kill_reachable"], sd["cli_kill_target_id"] = _cli_kill_info(session_store, sid, cli)
     session_dicts.extend(cc_sessions)
     edges.extend(cc_edges)
 
@@ -587,6 +657,7 @@ def _build_snapshot() -> dict[str, Any]:
             _apply_cli_session_to_dict(sd, cli)
         else:
             sd["host"] = api_host_name()
+        sd["cli_kill_reachable"], sd["cli_kill_target_id"] = _cli_kill_info(session_store, sid, cli)
     session_dicts.extend(cx_sessions)
     edges.extend(cx_edges)
 
@@ -637,6 +708,7 @@ def _build_snapshot() -> dict[str, Any]:
         cli = cli_by_id.pop(sid, None)
         if cli is not None:
             _apply_cli_session_to_dict(sd, cli)
+        sd["cli_kill_reachable"], sd["cli_kill_target_id"] = _cli_kill_info(session_store, sid, cli)
         session_dicts.append(sd)
         local_ids.add(sid)
         appended_mirrored_host_by_id[sid] = source_host
@@ -690,6 +762,7 @@ def _build_snapshot() -> dict[str, Any]:
             ),
         )
         sd["custom_label"] = agent_viz_label_override.get_override(cli.session_id)
+        sd["cli_kill_reachable"], sd["cli_kill_target_id"] = _cli_kill_info(session_store, cli.session_id, cli)
         session_dicts.append(sd)
 
     # Board lane + pending-question + card-join + repair fields, additive —
@@ -716,6 +789,12 @@ def _build_snapshot() -> dict[str, Any]:
         # Only a LifeOS session row can belong to a repair; a CLI-derived or
         # mirrored row carries the field as null so the shape is uniform.
         sd.setdefault("repair", None)
+        # Only a CLI-sourced row's own kill eligibility (and the id Kill
+        # actually acts on) is ever ambiguous — a plain LifeOS row is always
+        # killable via `_kill_session_subtree`, targeting itself, so both
+        # carry null/its own id rather than being computed.
+        sd.setdefault("cli_kill_reachable", None)
+        sd.setdefault("cli_kill_target_id", sd.get("session_id"))
         pq = open_question_by_session.get(sd.get("session_id"))
         sd["pending_question"] = _pending_question_view(pq) if pq else None
         task = tasks_by_id.get(sd.get("task_id")) if sd.get("task_id") else None
@@ -1167,6 +1246,37 @@ def _card_outcome_view(
     }
 
 
+def _project_integration_prs(
+    hierarchy, project_id: str, outcomes_by_task: dict[str, dict[str, Any]],
+    pr_status_by_url: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """One entry per pull request a coding child of ``project_id`` has
+    already merged, for the project drawer's integration-branch section
+    ("links to the child pull requests merged into it"). Restricted to
+    ``state == "MERGED"`` (from the background-refreshed
+    ``pr_status_cache``, never a live `gh` call from a board build): a
+    board build has no persisted record of any PR's *base* branch, only
+    its cached merge state, so this can't distinguish a PR merged into the
+    project's own integration branch from one merged straight into the
+    default branch by an unrelated path — filtering to merged-only at
+    least drops every still-open or closed-unmerged PR, which is never
+    "merged into it" regardless of base. A child dispatched while the
+    project carried no recorded integration branch yet (see
+    `git_worktree.ensure_worktree`'s `base_branch`) is the one case a
+    listed PR's actual base might not be the branch named above it.
+    """
+    entries: list[dict[str, Any]] = []
+    for child in hierarchy.children(project_id):
+        outcome = _card_outcome_view(outcomes_by_task.get(child.id), pr_status_by_url)
+        if not outcome:
+            continue
+        for pr in outcome["prs"]:
+            if pr.get("state") != "MERGED":
+                continue
+            entries.append({**pr, "child_id": child.id, "title": child.description})
+    return entries
+
+
 def _task_card(task, sessions_by_task: dict[str, list[dict[str, Any]]],
                 open_question_by_task: dict[str, dict[str, Any]],
                 session_store: SessionStore,
@@ -1284,6 +1394,11 @@ def _build_board() -> dict[str, Any]:
             task.id,
             project_service.coordinator_view(task),
         )
+        project = hierarchy_fields.get("project")
+        if project and project.get("integration_branch"):
+            project["integration_prs"] = _project_integration_prs(
+                hierarchy, task.id, outcomes_by_task, pr_status_by_url,
+            )
         lanes[lane].append(_task_card(
             task, sessions_by_task, open_question_by_task, session_store,
             outcomes_by_task, pr_status_by_url,
@@ -1637,43 +1752,16 @@ async def accept_board_card(card_id: str) -> dict[str, Any]:
     calling this on an already-accepted, already-done card is a no-op.
     """
     from api.services import agent_board
-    from api.services.task_manager import get_task_manager, TaskConflictError
+    from api.services.board_review import BoardReviewError, accept_review
+    from api.services.task_manager import get_task_manager
 
     task_manager = get_task_manager()
-    task = task_manager.get(card_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail="card not found")
-
-    tags_norm = {t.lstrip("#").lower() for t in task.tags}
-    already_accepted = agent_board.ACCEPTED_TAG in tags_norm
-    # Uses the natural (status/tag-only) lane, not the snoozed one — a
-    # snoozed Review card is still a Review card as far as Accept is
-    # concerned; accepting it both moves it to Done and wakes it (the
-    # `fields=` clear on the write below).
-    if agent_board.natural_lane(task.status, task.tags) != "review" and not already_accepted:
-        raise HTTPException(status_code=409, detail="card is not in the Review lane")
-
-    needs_tag = not already_accepted
-    needs_status = task.status != "done"
-    if needs_tag or needs_status:
-        try:
-            def add_accepted(tags: list[str]) -> list[str]:
-                normalized_latest = {str(tag).lstrip("#").lower() for tag in tags}
-                if agent_board.ACCEPTED_TAG in normalized_latest:
-                    return list(tags)
-                if not agent_board.is_review_pending(tags):
-                    raise TaskConflictError("card changed; refresh before accepting")
-                return [*tags, agent_board.ACCEPTED_TAG]
-
-            task = task_manager.update(
-                card_id, status="done", _tags_merge=add_accepted,
-                fields={agent_board.SNOOZED_UNTIL_FIELD: None},
-            )
-        except TaskConflictError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        if task is None:
-            raise HTTPException(status_code=404, detail="card not found")
-        _invalidate_board_cache()
+    try:
+        result = accept_review(task_manager, card_id, reviewer="operator")
+    except BoardReviewError as exc:
+        raise HTTPException(status_code=_board_review_status(exc.code), detail=exc.message) from exc
+    task = result.task
+    _invalidate_board_cache()
 
     lane = agent_board.derive_lane(task.status, task.tags, task.fields)
     # updated_at is already refreshed only by the successful CAS write and is
@@ -1693,6 +1781,7 @@ async def undo_accept_board_card(card_id: str, body: UndoAcceptRequest | None = 
     Review. All unrelated tags and fields are left untouched.
     """
     from api.services import agent_board
+    from api.services.board_review import REVIEW_ACCEPTED_BY_FIELD
     from api.services.task_manager import get_task_manager, TaskConflictError
 
     task_manager = get_task_manager()
@@ -1729,6 +1818,7 @@ async def undo_accept_board_card(card_id: str, body: UndoAcceptRequest | None = 
 
         task = task_manager.update(
             card_id, _tags_merge=remove_accepted,
+            fields={REVIEW_ACCEPTED_BY_FIELD: None},
             _expected_updated_at=body.token if body and body.token is not None else None,
         )
     except TaskConflictError as exc:
@@ -1751,6 +1841,7 @@ async def review_board_card_action(card_id: str, body: ReviewActionRequest) -> d
     the worker re-arms that session when it claims the new assignment.
     """
     from api.services import agent_board
+    from api.services.board_review import BoardReviewError, reject_review
     from api.services.task_manager import get_task_manager, TaskConflictError
 
     action = body.action.strip().lower()
@@ -1787,6 +1878,25 @@ async def review_board_card_action(card_id: str, body: ReviewActionRequest) -> d
             _invalidate_board_cache()
             return {"id": card_id, "action": action, "queued": True, "question_id": question["id"]}
 
+        if action == "reject":
+            try:
+                result = reject_review(task_manager, session_store, card_id, note, reviewer="operator")
+            except BoardReviewError as exc:
+                raise HTTPException(
+                    status_code=_board_review_status(exc.code), detail=exc.message,
+                ) from exc
+            updated = result.task
+            _invalidate_board_cache()
+            return {
+                "id": updated.id,
+                "action": action,
+                "lane": agent_board.derive_lane(updated.status, updated.tags, updated.fields),
+                "status": updated.status,
+                "tags": list(updated.tags),
+                "queued": result.followup_id is not None,
+                "context_preserved": True,
+            }
+
         plan = agent_board.plan_review_action(
             task.status, task.tags, action, body.assignee,
         )
@@ -1795,19 +1905,12 @@ async def review_board_card_action(card_id: str, body: ReviewActionRequest) -> d
             raise HTTPException(status_code=status_code, detail=detail)
 
         session = session_store.get(card_id)
-        # Reject continues the prior session, so it needs one. Reassign only
-        # needs a target assignee — a card whose session was never recorded
-        # (or has since been pruned) still reassigns, and reports
-        # `context_preserved: false` rather than being refused outright.
-        if session is None and action == "reject":
-            raise HTTPException(status_code=409, detail="the prior agent session cannot be resumed")
+        # Reassign only needs a target assignee — a card whose session was
+        # never recorded (or has since been pruned) still reassigns, and
+        # reports `context_preserved: false` rather than being refused
+        # outright.
         if session is not None and session.status not in TERMINAL_STATUSES:
             raise HTTPException(status_code=409, detail="the prior agent session is still running")
-        if action == "reject" and session.routing == "hermes" and not session.conversation_id:
-            raise HTTPException(
-                status_code=409,
-                detail="Hermes cannot continue this review because its conversation id is missing; reassign it to retry with a fresh context",
-            )
 
         old_status = task.status
         old_tags = list(task.tags)
@@ -1833,9 +1936,6 @@ async def review_board_card_action(card_id: str, body: ReviewActionRequest) -> d
                 agent_board.ACCEPTED_TAG,
             }
             cleaned = [t for t in tags if t.lstrip("#").lower() not in lifecycle]
-            if action == "reject":
-                cleaned.append(agent_board.RUNNING_TAG)
-                return cleaned
             cleaned = [
                 t for t in cleaned
                 if t.lstrip("#").lower() not in agent_board.AGENT_EXECUTOR_TAGS
@@ -1899,9 +1999,6 @@ async def review_board_card_action(card_id: str, body: ReviewActionRequest) -> d
                 logger.error("review action rollback failed for %s: %s", card_id, restore_exc)
                 return False
 
-        # Commit the paired card transition before exposing a pre-answered
-        # follow-up row. The worker cannot consume a follow-up for a card that
-        # is still in Review; failures roll the card back.
         try:
             updated = task_manager.update(
                 card_id, status=plan.status, _tags_merge=merge_review_tags,
@@ -1914,26 +2011,11 @@ async def review_board_card_action(card_id: str, body: ReviewActionRequest) -> d
             raise HTTPException(status_code=404, detail="card not found")
         transition_version = updated.updated_at
 
-        followup_id: int | None = None
-        if action == "reject":
-            try:
-                followup_id = session_store.enqueue_web_followup(
-                    session.session_id, card_id, note,
-                )
-            except Exception as exc:  # noqa: BLE001
-                if followup_id is not None:
-                    session_store.delete_pending_question(followup_id)
-                rolled_back = restore_card()
-                detail = f"could not queue review continuation: {type(exc).__name__}"
-                if not rolled_back:
-                    detail += "; rollback conflict — card changed, refresh before retrying"
-                raise HTTPException(status_code=409, detail=detail) from exc
-
-        if action == "reassign" and session is None:
+        if session is None:
             # No prior run to anchor to: the card moves, and the caller is
             # told plainly that nothing came with it.
             context_preserved = False
-        elif action == "reassign":
+        else:
             transcript_store = _get_transcript_store()
             target_assignee = (body.assignee or "").lstrip("#").lower()
             native_handle_usable = bool(
@@ -1969,8 +2051,6 @@ async def review_board_card_action(card_id: str, body: ReviewActionRequest) -> d
                 if not rolled_back:
                     detail += "; rollback conflict — card changed, refresh before retrying"
                 raise HTTPException(status_code=409, detail=detail) from exc
-        else:
-            context_preserved = True
         _invalidate_board_cache()
         return {
             "id": updated.id,
@@ -1978,7 +2058,7 @@ async def review_board_card_action(card_id: str, body: ReviewActionRequest) -> d
             "lane": agent_board.derive_lane(updated.status, updated.tags, updated.fields),
             "status": updated.status,
             "tags": list(updated.tags),
-            "queued": followup_id is not None,
+            "queued": False,
             "context_preserved": context_preserved,
         }
 
@@ -2705,12 +2785,44 @@ async def operator_kill_session(session_id: str, body: KillRequest | None = None
         # subtree — an interactive terminal spawns no tracked children — so it
         # is torn down directly rather than through `_kill_session_subtree`.
         cli = session_store.get_cli_session(session_id)
-        if cli is None:
+        if cli is not None:
+            if cli.status == CLI_STATUS_ENDED:
+                return {"killed": [], "failures": [], "reason": "already ended"}
+            if cli.pane_id is None:
+                # A worker-spawned `claude_code`/`codex` session runs
+                # headless — no wezterm pane — but with the LifeOS session
+                # hooks installed it still registers a `cli_sessions` row,
+                # just with no pane to record. `_kill_cli_sessions` can't
+                # reach a real process through a pane-less row (it only
+                # marks the row ended); resolve back to the `sessions` row
+                # that actually owns the subprocess and tear THAT down
+                # first, through the same `_kill_session_subtree` path
+                # project cancellation already uses for a task's own live
+                # CLI-routed session (`TaskProjectService._stop_session`).
+                owner = _resolve_owning_worker_session(session_store, session_id)
+                if owner is not None and owner.status not in TERMINAL_STATUSES:
+                    killed, failures = await _kill_session_subtree(owner, reason)
+                    # A killed CLI subprocess sends no SessionEnd hook event
+                    # of its own, so the row would otherwise stay
+                    # idle/running forever — the board's card-join overlay
+                    # (`_apply_cli_session_to_dict`) prefers this row's own
+                    # status over the transcript's inferred one.
+                    try:
+                        session_store.mark_cli_session_ended(cli.session_id)
+                    except Exception as exc:  # noqa: BLE001 — the real kill already happened
+                        logger.warning(
+                            "could not mark cli_sessions row %s ended after killing "
+                            "its owning session: %s", cli.session_id, exc,
+                        )
+                    return {"killed": sorted({*killed, cli.session_id}), "failures": failures}
+            killed, failures = await _kill_cli_sessions([cli], reason or "killed by the operator")
+            return {"killed": killed, "failures": failures}
+        # No `cli_sessions` row at all (no session hooks installed, or a
+        # stale/expired row) — same resolution as the pane-less case above,
+        # one level up: fall through to the normal subtree teardown below.
+        target = _resolve_owning_worker_session(session_store, session_id)
+        if target is None:
             raise HTTPException(status_code=404, detail=f"session {session_id} not found")
-        if cli.status == CLI_STATUS_ENDED:
-            return {"killed": [], "failures": [], "reason": "already ended"}
-        killed, failures = await _kill_cli_sessions([cli], reason or "killed by the operator")
-        return {"killed": killed, "failures": failures}
     if target.status in TERMINAL_STATUSES:
         return {"killed": [], "failures": [], "reason": f"already {target.status}"}
 

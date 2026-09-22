@@ -2,7 +2,7 @@
 
 > **Audience:** All AI coding agents (Claude Code, Cursor, Copilot, etc.)
 > **Status:** Complete
-> **Last Updated:** 2026-09-16
+> **Last Updated:** 2026-09-22
 
 LifeOS is a self-hosted personal AI assistant with two halves:
 
@@ -233,7 +233,7 @@ Quick-reference guardrails for all contributors. These complement the Developmen
 | `api/services/perf_trace.py` | Request-level performance tracing (spans, SQLite) |
 | `api/routes/perf.py` | Performance trace query API |
 | `api/services/agent_worker/` | Autonomous worker for engine-assigned tasks (local Gemma or cloud Claude via Managed Agents) |
-| `mcp_server.py` | MCP server — stdio for Claude Code + HTTP transport for Managed Agents (79 tools: 69 from `CURATED_ENDPOINTS` plus 10 `lifeos_agent_*` tools registered separately by `_register_inter_agent_tools()` from `INTER_AGENT_TOOL_SCHEMAS`) |
+| `mcp_server.py` | MCP server — stdio for Claude Code + HTTP transport for Managed Agents (82 tools: 71 from `CURATED_ENDPOINTS` plus 11 `lifeos_agent_*` tools registered separately by `_register_inter_agent_tools()` from `INTER_AGENT_TOOL_SCHEMAS`) |
 | `tests/test_perf_benchmark.py` | Benchmark suite for query performance and quality |
 
 | Script | Purpose |

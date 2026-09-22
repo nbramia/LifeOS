@@ -39,7 +39,7 @@ import os
 import signal
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from api.services.agent_worker import doctor_repair
 from api.services.agent_worker.hermes_session import HERMES_ROUTING
@@ -54,6 +54,9 @@ from api.services.agent_worker.session_store import (
     new_session_id,
 )
 from api.services.agent_worker.transcript_store import TranscriptStore
+
+if TYPE_CHECKING:
+    from api.services.task_manager import Task, TaskManager
 
 
 logger = logging.getLogger(__name__)
@@ -105,6 +108,35 @@ SPAWN_MODELS = ("claude", "local", "remote", "hermes", *CLI_ROUTINGS)
 # so a Hermes-rooted lineage opening `model="claude"` would be an
 # undisclosed API-billed side door (see ADR-018).
 NON_API_BILLED_ROOT_ROUTINGS = CLI_ROUTINGS + (HERMES_ROUTING,)
+
+
+def metered_target_out_of_scope(
+    session_store: SessionStore, session: Session, target_executor: str,
+) -> bool:
+    """True when `session` is not already authorized for `target_executor`
+    ('claude' or 'remote' — the two metered engines).
+
+    A lineage rooted in a subscription-billed CLI/Hermes session can never
+    unlock a metered target, and the session's own resolved execution must
+    already match the requested executor exactly — an agent can only reach
+    a metered route its own already-authorized scope already carries, never
+    a new one it merely names. Shared by the handoff handler (checked
+    against the source turn's own caller session) and the project-child
+    write guard in `api/routes/tasks.py` (checked against the project
+    owner's session).
+    """
+    from api.services.agent_worker.execution import ExecutionSpec
+
+    root = session_store.get_by_session_id(
+        session.root_session_id or session.session_id,
+    ) or session
+    source_executor = None
+    if session.execution_spec:
+        try:
+            source_executor = ExecutionSpec.from_dict(session.execution_spec).executor
+        except (TypeError, ValueError):
+            source_executor = None
+    return root.routing in NON_API_BILLED_ROOT_ROUTINGS or source_executor != target_executor
 
 
 # Caps enforced on spawn. Operator overrides via settings (see `Caps` dataclass).
@@ -260,12 +292,12 @@ INTER_AGENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
                             "notes": {"type": "string", "maxLength": 6000},
                             "assignee": {
                                 "type": ["string", "null"],
-                                "enum": [None, "me", "claude", "codex", "hermes", "local", "cloud", "cloud-haiku", "cloud-sonnet"],
+                                "enum": [None, "me", "claude", "codex", "local", "cloud", "cloud-haiku", "cloud-sonnet"],
                             },
                             "execution": {
                                 "type": "object", "additionalProperties": False,
                                 "properties": {
-                                    "executor": {"type": "string", "enum": ["local", "remote", "claude", "hermes", "claude_code", "codex"]},
+                                    "executor": {"type": "string", "enum": ["local", "remote", "claude", "claude_code", "codex"]},
                                     "model_id": {"type": "string"},
                                     "effort": {"type": "string", "enum": ["low", "medium", "high", "max"]},
                                     "host": {"type": "string"},
@@ -280,6 +312,70 @@ INTER_AGENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
             "required": [
                 "caller_session_id", "caller_proof", "caller_attempt_id",
                 "caller_turn_id", "caller_turn_proof", "operation_id", "children",
+            ],
+        },
+    },
+    {
+        "name": "lifeos_agent_project_owner",
+        "description": (
+            "Review and complete the project you own, as its attested owner. "
+            "`accept_child`/`reject_child` act on a review-pending child of "
+            "your own project (reject requires `note` and is refused while "
+            "the project is paused); accepting a child whose pull request "
+            "base is exactly your project's own integration branch also "
+            "merges that pull request into it first (`merge_pull_request`, "
+            "default true) — a failed merge fails the whole call with "
+            "`merge_failed` and leaves the card in review, unmerged and "
+            "unaccepted. `complete_project` marks your project done and is "
+            "allowed even while your own turn is still live (every other "
+            "completion requirement — unresolved children, pending "
+            "cancellation, cancelled-children acknowledgement — still "
+            "applies), except that it refuses with `integration_unmerged` "
+            "while your project's integration branch still has commits the "
+            "default branch doesn't; merge that branch into the default "
+            "branch yourself, through this repository's own documented "
+            "merge process, before calling complete_project again. Scoped "
+            "strictly to the project you own and your own current turn."
+        ),
+        "input_schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "caller_session_id": _CALLER_PROP,
+                "caller_proof": _CALLER_PROOF_PROP,
+                "caller_attempt_id": {"type": "string"},
+                "caller_turn_id": {"type": "string"},
+                "caller_turn_proof": {"type": "string"},
+                "action": {
+                    "type": "string",
+                    "enum": ["accept_child", "reject_child", "complete_project"],
+                },
+                "project_id": {"type": "string", "minLength": 1},
+                "child_task_id": {
+                    "type": "string",
+                    "description": "Required for accept_child/reject_child.",
+                },
+                "note": {
+                    "type": "string", "maxLength": 6000,
+                    "description": "Required for reject_child.",
+                },
+                "merge_pull_request": {
+                    "type": "boolean",
+                    "description": (
+                        "accept_child only, default true: also merge the child's recorded "
+                        "pull request into your project's integration branch, but only "
+                        "when its base is exactly that branch. A merge failure fails the "
+                        "whole call with merge_failed and leaves the card unaccepted."
+                    ),
+                },
+                "acknowledge_cancelled_children": {
+                    "type": "boolean",
+                    "description": "complete_project only: acknowledge cancelled children before completing reduced scope.",
+                },
+            },
+            "required": [
+                "caller_session_id", "caller_proof", "caller_attempt_id",
+                "caller_turn_id", "caller_turn_proof", "action", "project_id",
             ],
         },
     },
@@ -682,7 +778,6 @@ def project_handoff(ctx: InterAgentContext, args: dict) -> dict:
 
     from api.services import agent_board
     from api.services.agent_worker.execution import (
-        ExecutionSpec,
         parse_execution_request,
         parse_legacy_route_alias,
         unsupported_explicit_fields,
@@ -736,6 +831,12 @@ def project_handoff(ctx: InterAgentContext, args: dict) -> dict:
             if not isinstance(assignee, str):
                 return _err(f"child {key} assignee is invalid", code="invalid_assignment")
             assignee = assignee.strip().lower().lstrip("#")
+        if assignee == "hermes":
+            return _err(
+                f"child {key} cannot be assigned to hermes; the operator can "
+                "assign it from the board",
+                code="hermes_delegation_forbidden",
+            )
         allowed_assignees = {"me", *agent_board.AGENT_EXECUTOR_TAGS}
         if assignee is not None and assignee not in allowed_assignees:
             return _err(f"child {key} assignee is invalid", code="invalid_assignment")
@@ -746,6 +847,12 @@ def project_handoff(ctx: InterAgentContext, args: dict) -> dict:
         if raw_execution is not None:
             if not isinstance(raw_execution, dict) or set(raw_execution) - allowed_execution:
                 return _err(f"child {key} execution has unsupported fields", code="invalid_execution")
+            if str(raw_execution.get("executor", "")).strip().lower() == "hermes":
+                return _err(
+                    f"child {key} cannot execute on hermes; the operator can "
+                    "assign it from the board",
+                    code="hermes_delegation_forbidden",
+                )
             parsed = parse_execution_request(raw_execution)
             if not parsed.ok or parsed.request is None or not parsed.request.executor:
                 return _err(
@@ -797,21 +904,13 @@ def project_handoff(ctx: InterAgentContext, args: dict) -> dict:
         target_executor = request.executor if request else (
             alias_request.executor if alias_request else None
         )
-        if target_executor in {"claude", "remote"}:
-            root = ctx.session_store.get_by_session_id(
-                caller.root_session_id or caller.session_id,
-            ) or caller
-            source_executor = None
-            if caller.execution_spec:
-                try:
-                    source_executor = ExecutionSpec.from_dict(caller.execution_spec).executor
-                except (TypeError, ValueError):
-                    source_executor = None
-            if root.routing in NON_API_BILLED_ROOT_ROUTINGS or source_executor != target_executor:
-                return _err(
-                    f"child {key} requests metered executor {target_executor} outside the source turn's explicit target",
-                    code="api_billing_blocked",
-                )
+        if target_executor in {"claude", "remote"} and metered_target_out_of_scope(
+            ctx.session_store, caller, target_executor,
+        ):
+            return _err(
+                f"child {key} requests metered executor {target_executor} outside the source turn's explicit target",
+                code="api_billing_blocked",
+            )
 
         child = {"key": key, "description": description, "assignee": assignee}
         if notes is not None:
@@ -837,6 +936,340 @@ def project_handoff(ctx: InterAgentContext, args: dict) -> dict:
         return _err(str(exc), code=exc.code)
     except (ValueError, KeyError) as exc:
         return _err(str(exc), code="invalid_arg")
+
+
+def _project_is_agent_owned(tags: list[str]) -> bool:
+    """Same test `ProjectTaskService._plan_and_delegate_locked` (and the
+    worker's `_project_is_agent_owned`) use to decide a project is agent-
+    (not operator-) owned: an engine assignee tag, or a Managed consent
+    sub-tag."""
+    from api.services import agent_board
+
+    if agent_board.derive_assignee(tags) in agent_board.AGENT_ASSIGNEES:
+        return True
+    normalized = agent_board.normalize_tags(tags)
+    return any(tag in normalized for tag in agent_board.MANAGED_AGENT_ASSIGNEES)
+
+
+# `board_review`'s errors are shared with the operator board routes and
+# carry their own, more granular codes. Only the closed set documented on
+# `lifeos_agent_project_owner` (`invalid_arg`, `not_found`, `stale_turn`,
+# `not_owner`, `not_review`, `paused`, `forbidden`, `conflict`,
+# `merge_failed`, `integration_unmerged`) may reach an owner caller; anything
+# else is folded onto the nearest documented code here rather than forwarded
+# verbatim. `merge_failed`/`integration_unmerged` are never produced by
+# `board_review` itself -- they come from this module's own merge-on-accept
+# and completion-gate steps, below.
+_BOARD_REVIEW_CODE_MAP = {
+    "no_session": "not_found",
+    "session_running": "conflict",
+    "hermes_conversation_missing": "conflict",
+    "followup_failed": "conflict",
+}
+
+
+def _owner_facing_code(code: str) -> str:
+    return _BOARD_REVIEW_CODE_MAP.get(code, code)
+
+
+def _merge_child_pr_into_integration_branch(
+    ctx: InterAgentContext, child: "Task", integration_branch: str, project_id: str,
+) -> dict | None:
+    """None when there's nothing to merge (the child recorded no pull
+    request, its base isn't exactly ``integration_branch``, it's already
+    merged, or it's closed without having been merged) or a targeted merge
+    just succeeded; an ``_err(..., code="merge_failed")`` payload when a
+    targeted merge was attempted and failed. Never touches a pull request
+    whose base isn't exactly the project's own recorded integration
+    branch.
+
+    A closed-but-unmerged PR (superseded, abandoned) is treated as nothing
+    to merge, not as a failure: `gh` would refuse to merge a closed PR, and
+    returning `merge_failed` for it would make a default `accept_child`
+    call permanently unable to accept that card unless the owner remembers
+    to pass `merge_pull_request=false` every time.
+
+    A successful merge is recorded to the transcript here, independent of
+    whatever the caller's subsequent `accept_review` call does with the
+    card -- a merge that lands and is then followed by an accept failure
+    (a stale card, a store error) must still leave a durable record that
+    the pull request was actually merged, rather than that fact living
+    only in the return value of a call whose accept half then failed.
+    """
+    from api.services.agent_worker.git_worktree import merge_pull_request, pr_base_and_state
+
+    if ctx.session_store is None:
+        return None
+    outcome = ctx.session_store.get_card_outcome(child.id)
+    pr_urls = (outcome or {}).get("pr_urls") or []
+    if not pr_urls:
+        return None
+    pr_url = pr_urls[0]
+    child_session = ctx.session_store.get(child.id)
+    host = child_session.host if child_session is not None else None
+
+    data, error = pr_base_and_state(pr_url, host=host)
+    if error:
+        return _err(f"could not read {pr_url}: {error}", code="merge_failed")
+    if (data or {}).get("baseRefName") != integration_branch:
+        return None
+    if (data or {}).get("state") in {"MERGED", "CLOSED"}:
+        return None
+
+    merged, error = merge_pull_request(pr_url, host=host)
+    if not merged:
+        return _err(
+            f"could not merge {pr_url} into {integration_branch!r}: {error}",
+            code="merge_failed",
+        )
+    if ctx.transcript_store is not None:
+        ctx.transcript_store.append(ctx.caller_session_id, "project_owner_merge", {
+            "project_id": project_id, "child_task_id": child.id,
+            "pr_url": pr_url, "integration_branch": integration_branch,
+        })
+    return None
+
+
+def _integration_unmerged_error(
+    ctx: InterAgentContext, manager: "TaskManager", project_id: str, integration_branch: str,
+) -> dict | None:
+    """None when the project's integration branch is fully merged into the
+    default branch, or when there's no coding child pull request on record
+    yet to derive the repository from (nothing was ever merged onto the
+    branch, so there's nothing for this gate to check); an
+    ``_err(..., code="integration_unmerged")`` payload otherwise, naming the
+    branch and either the comparison result or -- when the remote check
+    itself couldn't run (`gh` missing, an unresolvable host, a network
+    failure) -- that it couldn't be confirmed. Failing that check closed
+    (refusing completion) rather than open matches the contract: it must
+    never let a project complete over integration work nobody actually
+    verified merged.
+
+    Checks whether the branch still exists before comparing it against the
+    default branch: this repository's own documented merge process deletes
+    the source branch on merge, and a plain commits-ahead compare against
+    an already-deleted head ref 404s exactly the way a genuinely broken
+    check would. Treating that 404 as an ordinary check failure would
+    refuse completion forever the moment the owner does exactly what the
+    guidance tells it to -- a branch confirmed gone (`repo_branch_exists`
+    returning `False`, never merely a failed check) is instead the
+    terminal "fully merged" state.
+    """
+    from api.services.agent_worker.git_worktree import (
+        repo_branch_exists, repo_compare_ahead_by, repo_default_branch, repo_slug_from_pr_url,
+    )
+    from api.services.task_projects import PARENT_ID_FIELD, clean_parent_id
+
+    repo_slug = None
+    host = None
+    if ctx.session_store is not None:
+        for task in manager.list_tasks():
+            if clean_parent_id(task.fields.get(PARENT_ID_FIELD)) != project_id:
+                continue
+            outcome = ctx.session_store.get_card_outcome(task.id)
+            for url in (outcome or {}).get("pr_urls") or []:
+                slug = repo_slug_from_pr_url(url)
+                if slug:
+                    repo_slug = slug
+                    child_session = ctx.session_store.get(task.id)
+                    host = child_session.host if child_session is not None else None
+                    break
+            if repo_slug:
+                break
+    if repo_slug is None:
+        return None
+
+    # `repo_default_branch` runs first, always -- besides being needed for
+    # the compare below, its success independently confirms the repository
+    # itself exists, which is what makes a subsequent 404 from
+    # `repo_branch_exists` unambiguous ("the branch is gone", never "the
+    # repository is gone", which also 404s on the branches endpoint and
+    # must never be read as "fully merged").
+    default_branch, error = repo_default_branch(repo_slug, host=host)
+    if error or not default_branch:
+        return _err(
+            f"could not determine the default branch for {repo_slug} to check whether "
+            f"{integration_branch!r} is merged: {error or 'no branch returned'}",
+            code="integration_unmerged",
+        )
+
+    exists, error = repo_branch_exists(repo_slug, integration_branch, host=host)
+    if error:
+        return _err(
+            f"could not confirm whether {integration_branch!r} still exists in {repo_slug}: {error}",
+            code="integration_unmerged",
+        )
+    if exists is False:
+        return None
+
+    ahead_by, error = repo_compare_ahead_by(repo_slug, default_branch, integration_branch, host=host)
+    if error or ahead_by is None:
+        return _err(
+            f"could not confirm {integration_branch!r} is merged into {default_branch!r}: "
+            f"{error or 'no result returned'}",
+            code="integration_unmerged",
+        )
+    if ahead_by <= 0:
+        return None
+    return _err(
+        f"integration branch {integration_branch!r} has {ahead_by} commit(s) not yet merged "
+        f"into {default_branch!r}; merge it into the default branch through this repository's "
+        "own documented merge process, then call complete_project again",
+        code="integration_unmerged",
+    )
+
+
+def project_owner(ctx: InterAgentContext, args: dict) -> dict:
+    """Attested project-owner review and completion.
+
+    `accept_child`/`reject_child` share their underlying logic with the
+    operator's board accept/reject routes (`api/services/board_review.py`);
+    accepting a child whose pull request base is exactly the project's
+    recorded integration branch also merges it first
+    (`_merge_child_pr_into_integration_branch`, `merge_pull_request` arg,
+    default true) -- a failed merge fails the whole call with
+    `merge_failed` and the card is never accepted. `complete_project` calls
+    `ProjectTaskService.complete_project` with `owner_session=caller`,
+    which exempts only this exact attested caller from the live-coordinator
+    completion guard, but first refuses with `integration_unmerged`
+    (`_integration_unmerged_error`) while the project's integration branch
+    still has commits the default branch doesn't.
+
+    Authorization is exactly like `project_handoff`: the caller must be
+    exactly the project's current owner session (`project_coordinator_
+    session_id`), on its exact current turn. Stable error codes: `invalid_arg`,
+    `not_found`, `stale_turn`, `not_owner`, `not_review`, `paused`, `forbidden`,
+    `conflict`, `merge_failed`, `integration_unmerged`.
+    """
+    from api.services import agent_board
+    from api.services.board_review import BoardReviewError, accept_review, reject_review
+    from api.services.task_manager import TaskConflictError, get_task_manager
+    from api.services.task_projects import (
+        CANCEL_OPERATION_FIELD,
+        COORDINATOR_SESSION_FIELD,
+        HANDOFF_OPERATION_FIELD,
+        INTEGRATION_BRANCH_FIELD,
+        PROJECT_PAUSED_FIELD,
+        ProjectConflictError,
+        ProjectTaskService,
+        clean_parent_id,
+        field_truthy,
+    )
+
+    action = (args.get("action") or "").strip()
+    if action not in {"accept_child", "reject_child", "complete_project"}:
+        return _err(
+            "action must be accept_child, reject_child, or complete_project",
+            code="invalid_arg",
+        )
+    project_id = (args.get("project_id") or "").strip()
+    if not project_id:
+        return _err("project_id is required", code="invalid_arg")
+
+    caller = ctx.session_store.get_by_session_id(ctx.caller_session_id)
+    if caller is None:
+        return _err("caller session not found", code="stale_turn")
+    attempt_id = ctx.caller_attempt_id or (args.get("caller_attempt_id") or "").strip()
+    turn_id = ctx.caller_turn_id or (args.get("caller_turn_id") or "").strip()
+    if (
+        not attempt_id or not turn_id
+        or caller.attempt_id != attempt_id
+        or caller.turn_id != turn_id
+        or not ctx.session_store.is_current_turn(caller.task_id, attempt_id, turn_id)
+    ):
+        return _err("caller does not own the current executor turn", code="stale_turn")
+
+    manager = ctx.task_manager or get_task_manager()
+    project = manager.get(project_id)
+    if project is None:
+        return _err(f"project {project_id} not found", code="not_found")
+    if (project.fields.get(COORDINATOR_SESSION_FIELD) or "") != caller.session_id:
+        return _err("caller is not this project's current owner", code="not_owner")
+    if project.status in {"done", "cancelled"}:
+        return _err("project is already finished", code="forbidden")
+    if project.fields.get(CANCEL_OPERATION_FIELD) or project.fields.get(HANDOFF_OPERATION_FIELD):
+        return _err("project cancellation or handoff is pending", code="forbidden")
+    if not _project_is_agent_owned(project.tags):
+        return _err("project is not agent-owned", code="forbidden")
+
+    reviewer = f"owner:{caller.session_id}"
+
+    if action in {"accept_child", "reject_child"}:
+        child_task_id = (args.get("child_task_id") or "").strip()
+        if not child_task_id:
+            return _err("child_task_id is required", code="invalid_arg")
+        child = manager.get(child_task_id)
+        if child is None:
+            return _err(f"child {child_task_id} not found", code="not_found")
+        if clean_parent_id(child.fields.get("parent_id")) != project_id:
+            return _err("child does not belong to this project", code="not_owner")
+        if not agent_board.is_review_pending(child.tags):
+            return _err("child is not review-pending", code="not_review")
+
+        if action == "reject_child":
+            if field_truthy(project.fields.get(PROJECT_PAUSED_FIELD)):
+                return _err("project is paused", code="paused")
+            note = (args.get("note") or "").strip()
+            if not note:
+                return _err("note is required to reject", code="invalid_arg")
+            try:
+                result = reject_review(
+                    manager, ctx.session_store, child_task_id, note, reviewer=reviewer,
+                )
+            except BoardReviewError as exc:
+                return _err(exc.message, code=_owner_facing_code(exc.code))
+            ctx.transcript_store.append(caller.session_id, "project_owner_reject", {
+                "project_id": project_id, "child_task_id": child_task_id,
+            })
+            return _ok({
+                "task_id": result.task.id, "status": result.task.status,
+                "tags": list(result.task.tags),
+            })
+
+        merge_pull_request_flag = args.get("merge_pull_request")
+        merge_pull_request_flag = True if merge_pull_request_flag is None else bool(merge_pull_request_flag)
+        integration_branch = (project.fields.get(INTEGRATION_BRANCH_FIELD) or "").strip()
+        if merge_pull_request_flag and integration_branch:
+            merge_error = _merge_child_pr_into_integration_branch(
+                ctx, child, integration_branch, project_id,
+            )
+            if merge_error is not None:
+                return merge_error
+
+        try:
+            result = accept_review(manager, child_task_id, reviewer=reviewer)
+        except BoardReviewError as exc:
+            return _err(exc.message, code=_owner_facing_code(exc.code))
+        ctx.transcript_store.append(caller.session_id, "project_owner_accept", {
+            "project_id": project_id, "child_task_id": child_task_id,
+        })
+        return _ok({
+            "task_id": result.task.id, "status": result.task.status,
+            "tags": list(result.task.tags),
+        })
+
+    # action == "complete_project"
+    integration_branch = (project.fields.get(INTEGRATION_BRANCH_FIELD) or "").strip()
+    if integration_branch:
+        gate_error = _integration_unmerged_error(ctx, manager, project_id, integration_branch)
+        if gate_error is not None:
+            return gate_error
+    acknowledge_cancelled_children = bool(args.get("acknowledge_cancelled_children"))
+    service = ProjectTaskService(manager, ctx.session_store, ctx.transcript_store)
+    try:
+        completed = service.complete_project(
+            project_id,
+            acknowledge_cancelled_children=acknowledge_cancelled_children,
+            owner_session=caller,
+        )
+    except KeyError:
+        return _err(f"project {project_id} not found", code="not_found")
+    except (ProjectConflictError, TaskConflictError) as exc:
+        return _err(str(exc), code="conflict")
+    ctx.transcript_store.append(caller.session_id, "project_owner_complete", {
+        "project_id": project_id,
+    })
+    return _ok({"task_id": completed.id, "status": completed.status})
 
 
 def execution_override(ctx: InterAgentContext, args: dict) -> dict:
@@ -1490,6 +1923,7 @@ def user_ask(ctx: InterAgentContext, args: dict) -> dict:
 
 DISPATCH_TABLE = {
     "lifeos_agent_project_handoff": project_handoff,
+    "lifeos_agent_project_owner": project_owner,
     "lifeos_agent_spawn": spawn,
     "lifeos_agent_send": send,
     "lifeos_agent_check": check,

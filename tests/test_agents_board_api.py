@@ -659,6 +659,24 @@ class TestReviewActions:
         assert task_manager.get(task.id).tags == ["codex", "agent-completed"]
         assert session_store.list_answered_unprocessed_questions() == []
 
+    def test_reject_bad_input_from_the_task_write_is_a_422_not_a_409(self, client, stores, monkeypatch):
+        """`board_review.reject_review` maps a non-conflict `ValueError` from
+        the task write onto `invalid_arg`; the route must still surface that
+        as 422 (its status before the accept/reject logic moved into
+        `board_review.py`), not fold it into the generic 409 the same route
+        uses for every other `BoardReviewError` code."""
+        task_manager, _sched, session_store, _transcript = stores
+        task = task_manager.create("Review synthetic output", tags=["codex", "agent-completed"], status="done")
+        session_store.create(task_id=task.id, status=STATUS_COMPLETED, routing="local")
+        monkeypatch.setattr(task_manager, "update", lambda *_a, **_k: (_ for _ in ()).throw(ValueError("bad input")))
+
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reject", "note": "Retry the synthetic example."},
+        )
+        assert response.status_code == 422
+        assert task_manager.get(task.id).status == "done"
+
     def test_blocked_respond_uses_existing_question_path(self, client, stores):
         task_manager, _sched, session_store, _transcript = stores
         task = task_manager.create("Need synthetic clarification", tags=["agent-blocked"], status="blocked")
@@ -1771,6 +1789,21 @@ class TestAcceptBoardCard:
         updated = task_manager.get(task.id)
         assert updated.status == "done"
         assert updated.tags == ["hermes", "agent-completed", "keep-me"]
+
+    def test_undo_accept_clears_the_accepted_by_stamp(self, client, stores):
+        """A card `Undo`ne back to Review must not still claim to have been
+        accepted by whoever accepted it the first time — the drawer's
+        "Accepted by" row must disappear along with the `accepted` tag."""
+        task_manager, *_ = stores
+        task = task_manager.create("Review synthetic output", tags=["codex", "agent-completed"], status="done")
+
+        accepted = client.post(f"/api/agents/board/cards/{task.id}/accept")
+        assert accepted.status_code == 200
+        assert task_manager.get(task.id).fields.get("review_accepted_by") == "operator"
+
+        r = client.post(f"/api/agents/board/cards/{task.id}/undo-accept")
+        assert r.status_code == 200
+        assert "review_accepted_by" not in task_manager.get(task.id).fields
 
     def test_undo_accept_rejects_unaccepted_card(self, client, stores):
         task_manager, *_ = stores

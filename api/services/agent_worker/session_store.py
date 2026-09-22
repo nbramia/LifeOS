@@ -675,6 +675,51 @@ CREATE TABLE IF NOT EXISTS pr_status_cache (
     checked_at INTEGER NOT NULL,
     stale      INTEGER NOT NULL DEFAULT 1
 );
+
+-- One row per (project, notice kind) sent to the operator: a durable
+-- dedupe marker so a worker restart or a retried send never causes a
+-- duplicate Telegram notice for the same project/trigger. `kind` is
+-- "handoff" (marker: the handoff operation id) or "agent_children_gt5"
+-- (marker unused). See Worker._reconcile_project_notices.
+CREATE TABLE IF NOT EXISTS project_notices (
+    project_id  TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    marker      TEXT NOT NULL DEFAULT '',
+    notified_at INTEGER NOT NULL,
+    PRIMARY KEY(project_id, kind)
+);
+
+-- One row per agent-owned project with a persistent owner session: the
+-- durable acknowledgement state `Worker._reconcile_project_owners` diffs
+-- each tick's child states against. `acked_states_json` is the last
+-- snapshot the owner has actually processed (a successful wake's turn
+-- completing moves it there); `delivered_states_json` is the snapshot sent
+-- with the currently in-flight wake, cleared once that wake's outcome is
+-- known. `wake_attempt_id`/`wake_turn_id` identify that in-flight wake's
+-- session attempt/turn, so a later tick can tell whether the owner's
+-- terminal status belongs to this wake or something unrelated.
+-- `first_unseen_at` anchors the quiet-window debounce: set once when the
+-- diff against `acked_states_json` first goes from empty to non-empty,
+-- left alone while it stays non-empty, and cleared once a wake is sent (or
+-- the diff empties out on its own). `wake_request_reason`/
+-- `wake_request_operation_id` record an explicit operator-triggered wake
+-- request (e.g. a Plan call against a project that already has an owner)
+-- as a third event source alongside child-state changes; nothing in this
+-- table's own reconciler writes them yet. `consecutive_failures` counts
+-- back-to-back failed wake turns and drives the auto-pause threshold.
+CREATE TABLE IF NOT EXISTS project_owner_state (
+    project_id             TEXT PRIMARY KEY,
+    owner_session_id       TEXT NOT NULL,
+    acked_states_json      TEXT NOT NULL,
+    delivered_states_json  TEXT,
+    wake_attempt_id           TEXT,
+    wake_turn_id              TEXT,
+    first_unseen_at           INTEGER,
+    wake_request_reason       TEXT,
+    wake_request_operation_id TEXT,
+    consecutive_failures      INTEGER NOT NULL DEFAULT 0,
+    updated_at                INTEGER NOT NULL
+);
 """
 
 
@@ -806,6 +851,14 @@ class SessionStore:
                         "UPDATE sessions SET claude_code_session_id = code_session_id "
                         "WHERE claude_code_session_id IS NULL AND code_session_id IS NOT NULL"
                     )
+            # `get_by_claude_code_session_id`'s reverse lookup (kill route,
+            # snapshot eligibility) and the board snapshot both query this
+            # column per CLI transcript row, so it needs an index rather than
+            # a full table scan.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_claude_code_session_id "
+                "ON sessions(claude_code_session_id)"
+            )
             # Idempotent migration for the per-session Claude Code tier.
             # Old rows stay NULL → omit --model and use the CLI default.
             if "claude_code_model" not in sess_cols:
@@ -1073,6 +1126,25 @@ class SessionStore:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
+        return self._row_to_session(row) if row else None
+
+    def get_by_claude_code_session_id(self, claude_code_session_id: str) -> Session | None:
+        """Reverse lookup: the `sessions` row whose `claude_code_session_id`
+        matches a Claude Code / Codex CLI transcript's own id — the bare id
+        under a board `cc:`/`cx:`-prefixed session_id (`CLI_ENGINE_PREFIXES`,
+        `session_ingest.CC_PREFIX`). Lets a caller holding only that
+        transcript id (a worker-spawned CLI session never registers a
+        `cli_sessions` row, since it runs headless with no wezterm pane to
+        bind) find the row that actually owns the subprocess. Most recent
+        activity wins on the rare chance more than one row ever recorded the
+        same CLI session id.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM sessions WHERE claude_code_session_id = ? "
+                "ORDER BY last_activity_at DESC LIMIT 1",
+                (claude_code_session_id,),
             ).fetchone()
         return self._row_to_session(row) if row else None
 
@@ -4408,6 +4480,246 @@ class SessionStore:
                     "ON CONFLICT(url) DO UPDATE SET checked_at = excluded.checked_at, stale = 1",
                     (url, ts),
                 )
+
+    # ------------------------------------------------------------------
+    # Project notices — durable per-project, per-trigger Telegram dedupe
+    # (see Worker._reconcile_project_notices)
+    # ------------------------------------------------------------------
+
+    def has_project_notice(self, project_id: str, kind: str) -> bool:
+        """True once a notice of `kind` has been sent for `project_id`."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM project_notices WHERE project_id = ? AND kind = ?",
+                (project_id, kind),
+            ).fetchone()
+        return row is not None
+
+    def record_project_notice(self, project_id: str, kind: str, marker: str = "") -> None:
+        """Record that a notice of `kind` was sent for `project_id`. Callers
+        insert this only after a successful send, so a send that fails
+        leaves no row and is retried on a later tick."""
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO project_notices (project_id, kind, marker, notified_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(project_id, kind) DO NOTHING",
+                (project_id, kind, marker, _now()),
+            )
+
+    # ------------------------------------------------------------------
+    # Persistent project owner state (see Worker._reconcile_project_owners)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _row_to_project_owner_state(row: sqlite3.Row) -> dict:
+        def _loaded(key: str) -> dict | None:
+            raw = row[key]
+            if not raw:
+                return None
+            try:
+                parsed = json.loads(raw)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return None
+            return parsed if isinstance(parsed, dict) else None
+
+        return {
+            "project_id": row["project_id"],
+            "owner_session_id": row["owner_session_id"],
+            "acked_states": _loaded("acked_states_json") or {},
+            "delivered_states": _loaded("delivered_states_json"),
+            "wake_attempt_id": row["wake_attempt_id"],
+            "wake_turn_id": row["wake_turn_id"],
+            "first_unseen_at": row["first_unseen_at"],
+            "wake_request_reason": row["wake_request_reason"],
+            "wake_request_operation_id": row["wake_request_operation_id"],
+            "consecutive_failures": row["consecutive_failures"],
+            "updated_at": row["updated_at"],
+        }
+
+    def get_project_owner_state(self, project_id: str) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM project_owner_state WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+        return self._row_to_project_owner_state(row) if row is not None else None
+
+    def is_project_owner_session(self, session_id: str) -> bool:
+        """True when `session_id` is (currently) some project's persistent
+        owner -- distinguishes a stale-reply drop worth explaining (an
+        owner wake raced an operator's reply) from the ordinary, silent
+        stale-reply cases (a reassigned/retried session)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM project_owner_state WHERE owner_session_id = ? LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        return row is not None
+
+    def ensure_project_owner_state(
+        self, project_id: str, *, owner_session_id: str, baseline_states: dict,
+    ) -> dict:
+        """Create the row on first observation of this project, with the
+        current child-state snapshot as the baseline `acked_states` and
+        nothing delivered — so the diff against it is empty and this
+        creation itself never counts as an event (see the reconciler's
+        step 1). If the row already exists, `acked_states`/the rest of the
+        wake bookkeeping is left untouched, but `owner_session_id` is kept
+        in sync with the caller's current value -- a re-Plan can create a
+        new owner session for the same project, and this column is read
+        directly (e.g. by the board) rather than only through the
+        reconciler's own fresh per-tick lookups."""
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO project_owner_state "
+                "(project_id, owner_session_id, acked_states_json, updated_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(project_id) DO UPDATE SET "
+                "owner_session_id = excluded.owner_session_id, "
+                "updated_at = excluded.updated_at",
+                (project_id, owner_session_id, json.dumps(baseline_states), _now()),
+            )
+        return self.get_project_owner_state(project_id)
+
+    def request_project_owner_wake(
+        self, project_id: str, *, owner_session_id: str, reason: str, operation_id: str,
+    ) -> None:
+        """Record a Plan-time wake request against an existing, terminal
+        owner, so the reconciler treats it as one more event source
+        alongside a child-state change on its next pass (see
+        `Worker._reconcile_one_project_owner`'s `has_events` check) and
+        delivers it exactly once (`ack_project_owner_wake` clears both
+        columns on a successful wake). Idempotent per `operation_id`: a
+        retried Plan call re-writes the identical value rather than
+        accumulating anything. Creates the row (mirroring
+        `ensure_project_owner_state`) if the reconciler has not observed
+        this project yet."""
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO project_owner_state "
+                "(project_id, owner_session_id, acked_states_json, "
+                "wake_request_reason, wake_request_operation_id, updated_at) "
+                "VALUES (?, ?, '{}', ?, ?, ?) ON CONFLICT(project_id) DO UPDATE SET "
+                "wake_request_reason = excluded.wake_request_reason, "
+                "wake_request_operation_id = excluded.wake_request_operation_id, "
+                "updated_at = excluded.updated_at",
+                (project_id, owner_session_id, reason, operation_id, _now()),
+            )
+
+    def set_project_owner_anchor(self, project_id: str, first_unseen_at: int | None) -> None:
+        """Set or clear the quiet-window debounce anchor."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE project_owner_state SET first_unseen_at = ?, updated_at = ? "
+                "WHERE project_id = ?",
+                (first_unseen_at, _now(), project_id),
+            )
+
+    def record_project_owner_wake(
+        self, project_id: str, *, delivered_states: dict, wake_attempt_id: str,
+        wake_turn_id: str | None,
+    ) -> None:
+        """Record the snapshot delivered with an in-flight wake, once the
+        wake's CAS (`begin_new_execution`) has already succeeded. Clears the
+        debounce anchor -- the batch it covered has now been sent."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE project_owner_state SET delivered_states_json = ?, "
+                "wake_attempt_id = ?, wake_turn_id = ?, first_unseen_at = NULL, "
+                "updated_at = ? WHERE project_id = ?",
+                (
+                    json.dumps(delivered_states), wake_attempt_id, wake_turn_id,
+                    _now(), project_id,
+                ),
+            )
+
+    def ack_project_owner_wake(self, project_id: str, *, acked_states: dict) -> None:
+        """The in-flight wake's turn completed successfully: move `acked`
+        to what was delivered, clear the in-flight bookkeeping, and reset
+        the consecutive-failure counter."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE project_owner_state SET acked_states_json = ?, "
+                "delivered_states_json = NULL, wake_attempt_id = NULL, "
+                "wake_turn_id = NULL, wake_request_reason = NULL, "
+                "wake_request_operation_id = NULL, consecutive_failures = 0, "
+                "updated_at = ? WHERE project_id = ?",
+                (json.dumps(acked_states), _now(), project_id),
+            )
+
+    def record_project_owner_wake_failure(self, project_id: str) -> int:
+        """The in-flight wake's turn ended in failure: `acked` does not
+        move, so the next wake re-delivers the same unacknowledged events.
+        Clears the in-flight bookkeeping so this same failed attempt is not
+        reprocessed, and returns the new consecutive-failure count."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE project_owner_state SET delivered_states_json = NULL, "
+                "wake_attempt_id = NULL, wake_turn_id = NULL, "
+                "consecutive_failures = consecutive_failures + 1, updated_at = ? "
+                "WHERE project_id = ?",
+                (_now(), project_id),
+            )
+            row = conn.execute(
+                "SELECT consecutive_failures FROM project_owner_state WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+        return row["consecutive_failures"] if row is not None else 0
+
+    def clear_project_owner_in_flight(self, project_id: str) -> None:
+        """Clear the in-flight wake bookkeeping without moving
+        `acked_states` or touching the failure counter -- used for a
+        budget-exceeded outcome, which pauses the project immediately
+        rather than counting toward the consecutive-failure threshold."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE project_owner_state SET delivered_states_json = NULL, "
+                "wake_attempt_id = NULL, wake_turn_id = NULL, updated_at = ? "
+                "WHERE project_id = ?",
+                (_now(), project_id),
+            )
+
+    def correct_project_owner_baseline(self, project_id: str, *, corrections: dict) -> None:
+        """Patch specific keys in `acked_states_json` in place, leaving
+        every other column (and every other key already in the map) alone.
+
+        Re-baselines a child that has returned to `active` while
+        `acked_states` is still holding a stale non-`active` value for it
+        (see `Worker._reconcile_one_project_owner`) -- a wake only ever
+        moves `acked_states` at ack time, so without this, a child that
+        cycles e.g. failed -> active -> failed again would never re-diff
+        as a new event on the second failure; `acked_states` would still
+        read the first failure's value, matching the repeat exactly."""
+        if not corrections:
+            return
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT acked_states_json FROM project_owner_state WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            if row is None:
+                return
+            try:
+                acked = json.loads(row["acked_states_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                acked = {}
+            if not isinstance(acked, dict):
+                acked = {}
+            acked.update(corrections)
+            conn.execute(
+                "UPDATE project_owner_state SET acked_states_json = ?, updated_at = ? "
+                "WHERE project_id = ?",
+                (json.dumps(acked), _now(), project_id),
+            )
+
+    def reset_project_owner_failures(self, project_id: str) -> None:
+        """Give a resumed project a fresh failure budget."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE project_owner_state SET consecutive_failures = 0, updated_at = ? "
+                "WHERE project_id = ?",
+                (_now(), project_id),
+            )
 
     @staticmethod
     def _row_to_cli_session(row: sqlite3.Row) -> CliSession:

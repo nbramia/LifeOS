@@ -466,6 +466,133 @@ def test_call_api_skips_cache_when_session_id_missing():
 
 
 # ---------------------------------------------------------------------------
+# X-LifeOS-Agent-Session header (agent actor attribution)
+# ---------------------------------------------------------------------------
+
+def _load_mcp_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _stub_client():
+    from unittest.mock import MagicMock
+    fake = MagicMock()
+    fake_response = MagicMock()
+    fake_response.status_code = 200
+    fake_response.json.return_value = {"id": "task_1"}
+    fake_response.raise_for_status = MagicMock()
+    fake.post.return_value = fake_response
+    fake.request.return_value = fake_response
+    return fake
+
+
+@pytest.mark.unit
+def test_call_api_sends_agent_session_header_for_stdio_worker_identity():
+    """A stdio child spawned by the worker (LIFEOS_AGENT_SESSION_ID inherited,
+    modeled here via the constructor kwarg) stamps its own identity."""
+    module = _load_mcp_module()
+    server = module.LifeOSMCPServer(trusted_session_id="sess-stdio-worker")
+    server.client = _stub_client()
+
+    server._call_api("lifeos_task_create", {"description": "x"})
+
+    headers = server.client.post.call_args.kwargs["headers"]
+    assert headers[module.AGENT_SESSION_HEADER] == "sess-stdio-worker"
+
+
+@pytest.mark.unit
+def test_call_api_explicit_agent_session_id_overrides_trusted_identity():
+    """The in-process local executor's own caller_session_id (passed as
+    `agent_session_id`) wins over any process-local trusted identity."""
+    module = _load_mcp_module()
+    server = module.LifeOSMCPServer(trusted_session_id="sess-stdio-worker")
+    server.client = _stub_client()
+
+    server._call_api(
+        "lifeos_task_update", {"task_id": "t1"}, agent_session_id="sess-local-caller",
+    )
+
+    headers = server.client.request.call_args.kwargs["headers"]
+    assert headers[module.AGENT_SESSION_HEADER] == "sess-local-caller"
+
+
+@pytest.mark.unit
+def test_call_api_sends_unattested_header_for_http_transport():
+    """The agent-only HTTP transport (bearer bound) has no per-call worker
+    identity of its own, so it asserts the literal 'unattested' marker."""
+    module = _load_mcp_module()
+    server = module.LifeOSMCPServer()
+    server._mcp_transport_secret = "synthetic-bearer-secret"
+    server.client = _stub_client()
+
+    server._call_api("lifeos_task_create", {"description": "x"})
+
+    headers = server.client.post.call_args.kwargs["headers"]
+    assert headers[module.AGENT_SESSION_HEADER] == "unattested"
+
+
+@pytest.mark.unit
+def test_call_api_sends_no_agent_session_header_for_interactive_operator():
+    """Interactive operator MCP — no stdio worker env, no HTTP transport,
+    no in-process override — sends no header at all."""
+    module = _load_mcp_module()
+    server = module.LifeOSMCPServer()
+    server.client = _stub_client()
+
+    server._call_api("lifeos_task_create", {"description": "x"})
+
+    headers = server.client.post.call_args.kwargs["headers"] or {}
+    assert module.AGENT_SESSION_HEADER not in headers
+
+
+@pytest.mark.unit
+def test_call_api_agent_session_header_scoped_to_task_create_and_update():
+    """The header is only added on the curated task-write and project-resume
+    tools, not on every other write."""
+    module = _load_mcp_module()
+    server = module.LifeOSMCPServer(trusted_session_id="sess-stdio-worker")
+    server.client = _stub_client()
+
+    server._call_api("lifeos_gmail_draft", {"to": "x@y", "subject": "hi", "body": "ok"})
+
+    headers = server.client.post.call_args.kwargs["headers"] or {}
+    assert module.AGENT_SESSION_HEADER not in headers
+
+
+@pytest.mark.unit
+def test_call_api_sends_agent_session_header_for_project_resume():
+    """`lifeos_project_resume` carries the caller-asserted worker identity
+    too, so `POST /api/tasks/{id}/project/resume` can refuse an
+    agent-attributed caller — see `AGENT_SESSION_HEADER` in
+    `api/routes/tasks.py`."""
+    module = _load_mcp_module()
+    server = module.LifeOSMCPServer(trusted_session_id="sess-stdio-worker")
+    server.client = _stub_client()
+
+    server._call_api("lifeos_project_resume", {"task_id": "proj1234"})
+
+    headers = server.client.post.call_args.kwargs["headers"]
+    assert headers[module.AGENT_SESSION_HEADER] == "sess-stdio-worker"
+
+
+@pytest.mark.unit
+def test_call_api_does_not_send_agent_session_header_for_project_pause():
+    """Agents are allowed to pause a project, so `lifeos_project_pause` does
+    not need caller-asserted identity."""
+    module = _load_mcp_module()
+    server = module.LifeOSMCPServer(trusted_session_id="sess-stdio-worker")
+    server.client = _stub_client()
+
+    server._call_api("lifeos_project_pause", {"task_id": "proj1234"})
+
+    headers = server.client.post.call_args.kwargs["headers"] or {}
+    assert module.AGENT_SESSION_HEADER not in headers
+
+
+# ---------------------------------------------------------------------------
 # lifeos_people_search limit
 # ---------------------------------------------------------------------------
 

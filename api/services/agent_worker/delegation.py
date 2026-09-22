@@ -17,6 +17,7 @@ SEND = "lifeos_agent_send"
 SESSIONS_LIST = "lifeos_agent_sessions_list"
 YIELD_UNTIL = "lifeos_agent_yield_until"
 PROJECT_HANDOFF = "lifeos_agent_project_handoff"
+PROJECT_OWNER = "lifeos_agent_project_owner"
 TASK_CHILDREN = "lifeos_task_children"
 PROJECT_PLAN = "lifeos_project_plan"
 PROJECT_COMPLETE = "lifeos_project_complete"
@@ -34,13 +35,17 @@ inspect them with `{TASK_CHILDREN}` and give each an explicit, independent
 assignment and execution request. Never assume a child inherits your route,
 model, host, working directory, or provider consent; omitted assignment stays
 unassigned, and cloud/provider access is allowed only within the already
-authorized lineage scope.
+authorized lineage scope. A project-child create or update from an agent
+never carries #hermes — the operator assigns that from the board — and a
+paid route (#cloud/#cloud-haiku/#cloud-sonnet) is refused unless the
+project's own owner already carries that same route.
 
 A durable hierarchy has exactly one child level. Use stable child keys and
 inspect the existing children before retrying or creating work. A child cannot
-become a project. For an existing project, use `{PROJECT_PLAN}` to run one
-bounded coordinator session; it is not an always-on monitor and does not wake
-automatically for every child completion.
+become a project. For an existing project, use `{PROJECT_PLAN}` to create its
+persistent owner session. The owner is woken automatically when a child's
+state changes -- newly blocked, failed, done, cancelled, or awaiting review --
+with several such events batched into one wake.
 
 If you are the current executor of an ordinary live top-level task and need to
 turn that task into a project, call `{PROJECT_HANDOFF}` once with a stable
@@ -50,10 +55,26 @@ working afterward, and do not report the original task as completed. The
 worker releases staged children only after it has observed your turn stop.
 Pending handoffs remain pending if that stop cannot be proved.
 
-Projects finish only through `{PROJECT_COMPLETE}` after their children and
-reviews are resolved. Use `{PROJECT_CANCEL}` for project cancellation; it
-cascades only after confirmation and may remain pending while a runtime stop
-is unverified. Cancelling one child does not cancel its parent or siblings.
+If you are a project's persistent owner, `{PROJECT_OWNER}` lets you act on
+your own project directly: `action=accept_child`/`reject_child` on a
+review-pending child of your own project (reject requires a `note` and is
+refused while the project is paused), and `action=complete_project` to mark
+your own project done — allowed even while your own turn is still live, once
+every other completion requirement (unresolved children, pending
+cancellation, cancelled-children acknowledgement) is met. `{PROJECT_COMPLETE}`
+remains the operator's own path and is refused while your turn is live.
+When your project has a recorded integration branch, `accept_child` also
+merges the child's pull request into that branch first, but only when its
+base is exactly that branch (default on; pass `merge_pull_request=false` to
+skip) — a failed merge fails the whole call with `merge_failed`, leaving the
+card in review, unmerged and unaccepted. `complete_project` additionally
+refuses with `integration_unmerged` while your integration branch still has
+commits the default branch doesn't; merge it into the default branch
+yourself, through this repository's own documented merge process — never a
+LifeOS-specific script — then call `complete_project` again.
+Use `{PROJECT_CANCEL}` for project cancellation; it cascades only after
+confirmation and may remain pending while a runtime stop is unverified.
+Cancelling one child does not cancel its parent or siblings.
 </project_tasks>"""
 
 

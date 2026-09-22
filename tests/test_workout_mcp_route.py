@@ -206,7 +206,7 @@ class TestNoUnrelatedChange:
     def test_curated_endpoint_count(self):
         """The curated catalog contains the expected number of tools."""
         module = _load_mcp_module()
-        assert len(module.CURATED_ENDPOINTS) == 69
+        assert len(module.CURATED_ENDPOINTS) == 71
 
     def test_other_tools_unaffected(self):
         module = _load_mcp_module()

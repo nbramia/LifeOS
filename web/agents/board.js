@@ -2715,6 +2715,16 @@ export function initBoard() {
         `);
       }
     }
+    if (card.fields && card.fields.review_accepted_by) {
+      const acceptedBy = card.fields.review_accepted_by;
+      const label = acceptedBy.startsWith('owner:') ? 'Project owner' : 'Operator';
+      items.push(`
+        <div class="drawer-meta-item">
+          <span class="drawer-meta-label">Accepted by</span>
+          <span class="drawer-meta-value" title="${escapeAttr(acceptedBy)}">${escapeHtml(label)}</span>
+        </div>
+      `);
+    }
     if (card.status) {
       items.push(`
         <div class="drawer-meta-item">
@@ -2821,12 +2831,37 @@ export function initBoard() {
       const project = card.project || {};
       const pendingHandoff = handoffPending(card);
       const coordinator = project.coordinator;
+      // A terminal, still-on-record owner gets woken, not replaced by a
+      // second session (see `plan_and_delegate`'s wake-request path) — the
+      // button says so up front rather than only after the fact in the toast.
+      const wakeExisting = Boolean(
+        coordinator && coordinator.session_id && coordinator.live === false
+        && coordinator.status !== 'missing',
+      );
       const coordination = coordinator ? `
         <div class="project-coordination" data-field="project-coordination">
           Coordination: ${escapeHtml(coordinator.status || 'pending')}
           ${coordinator.result ? ` — ${escapeHtml(typeof coordinator.result === 'string' ? coordinator.result : JSON.stringify(coordinator.result))}` : ''}
           ${coordinator.session_id ? `<button type="button" class="project-inline-action" data-action="project-session" data-session-id="${escapeAttr(coordinator.session_id)}">View session</button>` : ''}
         </div>` : '<div class="project-coordination">No coordination run yet.</div>';
+      // Coding children of a project with a recorded integration branch
+      // always branch off and PR into it (see git_worktree.ensure_worktree's
+      // base_branch) — this just surfaces what the owner has already merged
+      // there, not a live re-check.
+      const integrationPrs = project.integration_prs || [];
+      const integrationHtml = project.integration_branch ? `
+        <div class="project-integration" data-field="project-integration">
+          Integration branch: <code>${escapeHtml(project.integration_branch)}</code>
+          ${integrationPrs.length ? `
+            <div class="project-integration-prs">
+              ${integrationPrs.map(pr => `
+                <div class="drawer-integration-pr">
+                  <span class="drawer-integration-pr-title">${escapeHtml(pr.title || pr.child_id)}</span>
+                  ${outcomePrRowHtml(pr)}
+                </div>
+              `).join('')}
+            </div>` : ''}
+        </div>` : '';
       return `
         <div class="drawer-section project-summary" data-field="project-details">
           <label class="drawer-label">Project progress</label>
@@ -2836,12 +2871,17 @@ export function initBoard() {
           ${project.execution_paused ? '<div class="project-coordination">Parent execution is paused while children own the work.</div>' : ''}
           ${project.cancellation_pending ? '<div class="project-error">Cancellation is still being reconciled. Retry cancellation after resolving any listed failures.</div>' : ''}
           ${pendingHandoff ? '<div class="project-error" data-field="handoff-pending">Handoff pending. Child execution is blocked until the source agent stop is verified. You can cancel the handoff; cancellation stays pending until that stop is verified.</div>' : ''}
+          ${project.paused ? `<div class="project-error" data-field="project-paused">Paused (${escapeHtml(project.pause_reason || 'operator')}). Child claims, Open, and Plan and delegate are blocked; a child already mid-turn still finishes into Review.</div>` : ''}
           ${coordination}
+          ${integrationHtml}
           <div class="drawer-actions">
             <button type="button" class="drawer-action" data-action="project-start">Start project</button>
-            <button type="button" class="drawer-action" data-action="project-plan">Plan and delegate</button>
+            <button type="button" class="drawer-action" data-action="project-plan">${wakeExisting ? 'Wake project owner' : 'Plan and delegate'}</button>
             <button type="button" class="drawer-action" data-action="project-complete">Complete project</button>
             <button type="button" class="drawer-action danger" data-action="project-cancel">Cancel project</button>
+            ${project.paused
+              ? '<button type="button" class="drawer-action" data-action="project-resume">Resume project</button>'
+              : '<button type="button" class="drawer-action" data-action="project-pause">Pause project</button>'}
             <button type="button" class="drawer-action" data-action="project-add-child">Add child</button>
             <button type="button" class="drawer-action" data-action="project-attach-child">Attach existing</button>
           </div>
@@ -3218,18 +3258,39 @@ export function initBoard() {
         if (cancelled && !window.confirm(`Close this project with ${cancelled} cancelled child${cancelled === 1 ? '' : 'ren'}?`)) return null;
         return projectRequest(`/api/tasks/${encodeURIComponent(card.id)}/project/complete`, { acknowledge_cancelled_children: cancelled > 0 });
       },
+      'project-pause': async () => projectRequest(`/api/tasks/${encodeURIComponent(card.id)}/project/pause`, {}),
+      'project-resume': async () => projectRequest(`/api/tasks/${encodeURIComponent(card.id)}/project/resume`, {}),
+    };
+    const actionPolicyNames = {
+      'project-start': 'can_start_project',
+      'project-plan': 'can_plan_project',
+      'project-complete': 'can_complete_project',
+      'project-pause': 'can_pause_project',
+      'project-resume': 'can_resume_project',
+    };
+    const actionToasts = {
+      // A function reads the request's own response, since the same action
+      // can mean two different things (wake vs. new session) — see
+      // `plan_and_delegate`'s additive `wake_requested` field.
+      'project-plan': result => (result && result.wake_requested ? 'Woke project owner.' : 'Coordination started.'),
+      'project-pause': 'Project paused.',
+      'project-resume': 'Project resumed.',
     };
     Object.entries(actions).forEach(([action, request]) => {
       const button = drawerEl.querySelector(`[data-action="${action}"]`);
       if (!button) return;
-      const policyName = action === 'project-start' ? 'can_start_project'
-        : action === 'project-plan' ? 'can_plan_project' : 'can_complete_project';
+      const policyName = actionPolicyNames[action];
       if ((card.policy && card.policy[policyName] === false) || pendingHandoff) button.disabled = true;
       button.onclick = async () => {
         button.disabled = true;
         try {
           const result = await request();
-          if (result !== null) { await fetchBoard(); showToast(action === 'project-plan' ? 'Coordination started.' : 'Project updated.', false); }
+          if (result !== null) {
+            await fetchBoard();
+            const toast = actionToasts[action];
+            const message = typeof toast === 'function' ? toast(result) : (toast || 'Project updated.');
+            showToast(message, false);
+          }
         } catch (error) { showToast(`Couldn't update project: ${error.message}`, true); }
         finally { if (button.isConnected) button.disabled = false; }
       };

@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-09-21
+> **Last Updated:** 2026-09-22
 
 Engineering view of the agent worker — the stand-alone process that consumes engine-assigned tasks and runs them on either a local LLM or Anthropic Managed Agents. For consumer-facing behavior, see [product/agent-worker.md](../product/agent-worker.md). For operator setup, see [guides/agent-worker-setup.md](../../guides/agent-worker-setup.md).
 
@@ -580,7 +580,22 @@ ownership uses the explicit consent alias's model and retains configured
 effort and host, but not the configured model, working directory, or affinity
 fallback, as described in the
 [task-management product spec](../product/task-management.md#projects-and-subtasks).
-Planning does not infer a new cloud authorization. The coordination prompt
+Planning does not infer a new cloud authorization. The write that first links
+the owner session — only when the project has no prior coordinator request
+and no prior handoff activation, so a later re-Plan of an already-owned
+project never touches it — also records `fields.project_integration_branch`
+(`task_projects._integration_branch_name`, `git_worktree.derive_branch_name`
+seeded on `title` plus a short hash of the project's own task id, not the id
+itself) when the field isn't already set — the project's deterministic
+integration branch, following the repository's own `<type>/<slug>-<suffix>`
+branch-naming convention, but guaranteed to differ from the work branch
+`ensure_worktree` would derive for that same task's own worktree (relevant
+for a handed-off project, which keeps the source task's id). `finalize_handoff`
+records the same field the same way at handoff activation — inherently a
+first-owner creation, so it keeps only the not-already-set check. An
+operator-owned project never reaches either write path, so it never gets one;
+an operator can clear the field directly to opt a project back out. The
+coordination prompt
 contains the project objective/acceptance notes and at most 50 current child
 IDs, assignments and states. It instructs child creation to use a stable
 `operation_key` derived from the project ID, planning operation ID, and child
@@ -620,13 +635,163 @@ work pending and non-runnable. Reconciliation runs before ordinary lifecycle
 drift repair; there is no atomic transaction spanning Markdown, SQLite, and an
 external executor.
 
+`Worker._reconcile_project_notices()` runs each tick immediately after
+`_reconcile_project_handoffs()`, sharing that same tick's `/api/tasks` fetch
+(`_fetch_tasks_for_project_reconciliation`) rather than issuing a second one.
+It runs before the daily-spend-cap gate — it only sends Telegram notices,
+never starts work — and checks two triggers per project task: a
+`fields.project_last_handoff_operation_id` with no recorded `"handoff"`
+notice (activation, not staging, since a staged handoff never sets that
+field), and more than five children with `fields.project_child_origin ==
+"agent"` (any status) with no recorded `"agent_children_gt5"` notice. The
+fan-out count skips a parent that still carries
+`fields.project_handoff_operation_id` — a staged, not-yet-activated
+handoff already stamps its children agent-origin, so counting them early
+would send a fan-out notice before the activation notice and duplicate it;
+deferring until the pending field clears at activation is what lets a
+6+-child handoff report both triggers as one combined message. It also
+skips a parent whose only agent-origin children came from an aborted
+handoff (`fields.project_last_aborted_handoff_operation_id` set and
+`project_last_handoff_operation_id` never set) — a cancelled staged
+handoff never announces a project that never existed. Durable dedupe
+lives in `SessionStore`'s `project_notices` table (`PRIMARY
+KEY(project_id, kind)`); a row is written only after `Worker._notify`
+reports a successful send, so a failed send is retried on a later tick
+instead of being marked done, and a project that trips both triggers on
+the same tick gets one combined message with both rows written for that
+one send.
+
+`Worker._reconcile_project_owners()` runs each tick after the daily-spend-cap
+gate and before `_dispatch_spawned_sessions()`, reusing the same shared
+`/api/tasks` fetch. For every non-terminal, non-cancellation/handoff-pending
+project whose parent carries an agent assignee (or Managed consent tag) and
+an owner session in `fields.project_coordinator_session_id`, it classifies
+each child's state (`owner_state`: `awaiting_review`, `blocked`, `failed` —
+`agent-failed`/`agent-budget-exceeded`, checked ahead of the plain
+`cancelled`/`done` statuses those two tags leave the task at — `done`,
+`cancelled`, or `active`) and diffs it against `SessionStore`'s
+`project_owner_state` table (`acked_states_json`, keyed on `project_id`,
+created on first observation with the current snapshot as its own baseline
+so that creation is never itself an event). A non-`active` state that
+differs from `acked_states` is an event. A project's recorded integration
+branch feeds the identical diff under one synthetic key
+(`_INTEGRATION_PR_EVENT_KEY = "_integration_pr"`, never a real task id):
+`Worker._integration_branch_wake_state` reports `"active"` (the same non-
+event baseline value a child's own `owner_state` uses) while the branch
+still has commits the default branch doesn't, `"merged"` once it doesn't or
+once `git_worktree.repo_branch_exists` confirms the branch itself is gone
+(this repository's documented merge process deletes it on merge, so a
+missing branch is the terminal "merged" state, not a check failure) —
+computed via `repo_default_branch` then `repo_branch_exists` then
+`repo_compare_ahead_by` (see below) against a repository slug derived from any project
+child's recorded PR URL, cached per project (success or failure alike, so a
+stuck check is never retried every tick) for `_INTEGRATION_AHEAD_CACHE_
+SECONDS` (the same window `_cleanup_session_resources` caches a child's own
+PR state for). No coding child PR on record yet, or the remote check itself
+failing, contributes no event that tick — never a false `"merged"`. This
+check is called only after the reconciler's own paused and owner-live
+short-circuits (`_reconcile_one_project_owner`), not while building the
+children-only baseline `ensure_project_owner_state` is seeded with — a
+paused or perpetually-busy project cannot act on a wake this pass either
+way, so it never pays the round trip. Because it reuses the exact same
+"active" baseline / non-"active" event
+convention, the diff's own built-in re-baseline (a key reported back at
+`"active"` after having been acked at something else silently resets to the
+new baseline with no wake — `stale_active` in `_reconcile_one_project_
+owner`) also covers the integration branch with no extra code: a branch
+that goes ahead again after having been acked "merged" simply re-baselines.
+A paused project (see the product spec's pause/resume description) is
+skipped entirely — the diff against `acked_states` still grows underneath
+it, so resuming surfaces whatever piled up. A live owner session (anything
+but
+`COMPLETED`/`FAILED`/`BUDGET_EXCEEDED`) is left alone; this, together with
+`begin_new_execution`'s terminal-only compare-and-set, is what makes two
+owner turns impossible at once. Once there is a non-empty diff, its age is
+tracked by a single `first_unseen_at` anchor (set once when the diff goes
+from empty to non-empty, cleared once a wake is sent) — a wake fires once
+that anchor is at least `_OWNER_WAKE_QUIET_SECONDS` (30) old, so several
+children changing state in a burst coalesce into one wake rather than one
+per child. `Worker._continue_session` is the shared native-continuation
+primitive `_resume_as_followup` and the owner-wake reconciler both call,
+one route branch per engine:
+
+- **claude_code/codex**: the wake message is enqueued onto the owner's
+  still-terminal session *before* `begin_new_execution` reopens it with the
+  owner's prior `execution_request` (required, since `begin_new_execution`
+  clears `execution_spec_json`, and a CLI resume's working directory is
+  resolved from that request). Enqueuing first means a crash between the two
+  redelivers on the next tick instead of losing the wake; the reopened
+  session is left `CLAIMED` for `_dispatch_spawned_sessions` to pick up the
+  same tick or the next. When the owner has no persisted CLI session id (it
+  never launched a subprocess, or one launched but never confirmed), the
+  same dispatcher's own fresh-vs-resume branch already treats a missing id
+  as a fresh spawn — the reconciler exploits that by enqueuing the bounded
+  fallback briefing below instead of the terse wake diff, so the route never
+  changes and no separate fallback mechanism is needed for this pair.
+- **local/remote**: the reverse order — `begin_new_execution` reopens the
+  owner first (these routes key their next turn off the session's live
+  attempt/turn), then the wake message is appended as the next conversation
+  turn and run inline via `_execute_start`, exactly like an ordinary
+  follow-up. The conversation always lives in `session_store`, so there is
+  no missing-handle case for these two routes.
+- **hermes**: reopened first, then submitted off-tick (a Hermes turn is a
+  blocking HTTP round trip) with `execute(..., prompt=...)`. The owner's
+  `conversation_id` decides native-vs-fresh inside the executor itself, so
+  the reconciler just picks which message to send: the terse wake diff when
+  a conversation is on record, the bounded fallback briefing when it isn't.
+- **claude (Managed Agents)**: reopened first, then `post_user_message`
+  posts the wake message to the owner's `managed_agent_session_id` — with a
+  freshly computed per-turn identity/proof clause, since `lifeos_agent_*`
+  attestation is bound to one exact turn and the turn that just ended has no
+  bearing on the one this continuation mints (`SessionStore.
+  begin_executor_turn`, since a CAS reopen alone leaves `turn_id` unset).
+  When there is no recorded remote session id, or posting to it fails (most
+  commonly because Anthropic already garbage-collected it), the reconciler
+  starts a brand-new Managed session on the same route instead
+  (`ManagedExecutor.start`), seeded with the bounded fallback briefing as
+  its task notes. Only reached at all while the project still carries a
+  `#cloud-haiku`/`#cloud-sonnet` consent tag — `_project_is_agent_owned` is
+  re-checked against the tick's live tags before any owner is looked up.
+
+The fallback briefing (`Worker._owner_fallback_briefing`) is bounded like the
+wake message itself: the project's own objective and notes, its current
+child table, and the owner's own last recorded card outcome — never a
+transcript excerpt, since a fresh start has no native thread to read one
+from. Reopening a project's owner reaches every route the same way whether
+the project was planned or came from an activated `lifeos_agent_project_handoff`
+— the wake reconciler has no separate path for either origin. Requesting
+Plan and delegate again for a project whose owner is already terminal
+records a wake request (`SessionStore.request_project_owner_wake`, idempotent
+per operation ID) instead of creating a second session; the reconciler folds
+that into the same event diff it already tracks, and the response adds
+`wake_requested: true`.
+
+On the reconciler's next pass, a terminal owner whose recorded
+`wake_attempt_id` matches its current attempt reconciles that wake's outcome
+first: `COMPLETED` moves
+`acked_states` to what was delivered and clears the failure count; `FAILED`
+leaves `acked_states` untouched (so the same events redeliver) and
+increments a `consecutive_failures` counter, auto-pausing the project
+(`POST /project/pause {reason: "owner_failed"}`, one Telegram notice) once
+that counter reaches 2; `BUDGET_EXCEEDED` pauses immediately with reason
+`owner_budget`, without needing a second occurrence. `resume_pending()` on
+worker startup leaves an operator-origin `CLAIMED` session with an
+undelivered pending message alone rather than failing it — a wake that was
+compare-and-set open but not yet dispatched before a crash/restart is picked
+up normally by `_dispatch_spawned_sessions` on a later tick. Resuming a
+paused project resets `consecutive_failures`
+(`ProjectTaskService.resume_project`) — the one place a pause transition is
+unambiguous, rather than the reconciler inferring one happened on every
+later tick.
+
 ## Inter-agent coordination
 
 Local agents can spawn child sessions and coordinate via the `lifeos_agent_*` tool family:
 
 | Tool | Purpose |
 |---|---|
-| `lifeos_agent_project_handoff` | Stage 1–20 uniquely keyed durable children from the exact current ordinary-task turn. It is terminal for that turn; staged work remains fenced until the worker proves quiescence and finalizes it. |
+| `lifeos_agent_project_handoff` | Stage 1–20 uniquely keyed durable children from the exact current ordinary-task turn. It is terminal for that turn; staged work remains fenced until the worker proves quiescence and finalizes it. `hermes` is not a valid child `assignee` or `execution.executor` — the schema omits it and the handler rejects it with `hermes_delegation_forbidden`; a metered `execution.executor` (`claude`/`remote`) is refused outside the source turn's own already-authorized scope (`inter_agent.metered_target_out_of_scope`). Staged children are stamped `project_child_origin=agent` plus the source session as `project_child_creator_session`. |
+| `lifeos_agent_project_owner` | Attested the same way as `lifeos_agent_project_handoff` (exact session, attempt, and turn). `action` is `accept_child`, `reject_child`, or `complete_project`, authorized only for the caller that is exactly the target project's current owner session on its exact current turn, with the project agent-owned, not terminal, and with no cancellation or handoff pending. `accept_child`/`reject_child` require the target child's `parent_id` to equal the project and the child to be review-pending; they share their underlying logic with the operator's board Accept/Reject via `api/services/board_review.py` (`accept_review`/`reject_review`), passing `reviewer="owner:<session_id>"` so an acceptance is recorded distinctly from an operator one and a rejection note is prefixed accordingly. `reject_child` additionally requires `note` and is refused with `paused` while the project is paused. When `merge_pull_request` (default `true`) and the project carries a recorded `project_integration_branch`, `accept_child` first calls `_merge_child_pr_into_integration_branch`: it reads the child's `card_outcomes` PR (`SessionStore.get_card_outcome`) via `git_worktree.pr_base_and_state`, and, only when that PR's `baseRefName` is exactly the integration branch and its state is neither `MERGED` nor `CLOSED` (both read as nothing to merge, never a failure — a closed-unmerged PR would otherwise make a default `accept_child` call permanently return `merge_failed`), merges it with `git_worktree.merge_pull_request` (`gh pr merge <url> --merge`) before accepting — a failed merge returns `merge_failed` and the child is never accepted; a PR targeting anything else, or accept_child called with `merge_pull_request=false`, is never touched. A successful merge is appended to the caller's transcript (`project_owner_merge`) independent of whether the subsequent `accept_review` call itself succeeds, so a merge that lands is never lost from the record by an accept failure right after it. `complete_project` calls `ProjectTaskService.complete_project(owner_session=caller)`, which exempts only this exact attested caller from the live-coordinator completion guard (`TaskManager._guard_project_update`'s `owner_turn_completion_session_id` check) — every other completion requirement still applies — but first, when the project carries a recorded integration branch, runs `_integration_unmerged_error`: it derives an `owner/repo` slug from any project child's recorded PR URL (`git_worktree.repo_slug_from_pr_url`), first resolves the repository's default branch (`git_worktree.repo_default_branch`, which also independently confirms the repository itself still exists), then checks whether the integration branch itself still exists (`git_worktree.repo_branch_exists`) — this repository's own documented merge process deletes the source branch on merge (`scripts/candidate_publisher.py`'s `delete_source`), so a confirmed-gone branch is the terminal "fully merged" state, not a failed check, and skips straight past the compare below; resolving the default branch first is what makes that 404 unambiguous, since a 404 on the branches endpoint for a repository that was just confirmed to exist can only mean the branch itself is gone — then, only when the branch still exists, compares it against the default branch (`repo_compare_ahead_by`, another `gh api` call, never a local checkout) and refuses with `integration_unmerged` — naming the branch and the comparison result — while `ahead_by > 0`. No coding child PR on record yet (nothing was ever merged onto the branch) skips this check entirely; `gh` being unavailable, or the check itself failing for any other reason, also produces `integration_unmerged` rather than treating the branch as merged. Neither step ever opens, drives, or merges a branch-to-default pull request itself — the owner does that through the repository's own documented merge process, named in `PROJECT_TASK_GUIDANCE` and the owner coordination prompt, never a repository-specific script in product code. Stable error codes: `invalid_arg`, `not_found`, `stale_turn`, `not_owner`, `not_review`, `paused`, `forbidden`, `conflict`, `merge_failed`, `integration_unmerged`. |
 | `lifeos_agent_spawn` | Create a child on `local`, `remote`, `claude`, `hermes`, `claude_code`, or `codex`. Legacy `model=<executor>` and Claude-Code `tier` remain valid; the strict `execution` object carries canonical route/model/effort/location/budget choices. Omitting the route inherits an active bounded override or the caller route. |
 | `lifeos_agent_send` | Post a message to a child session's queue. Also a lifecycle transition: a direct parent sending to its own COMPLETED `claude_code`/`codex` child with a persisted CLI session id **reopens** it — the message is enqueued as the child's next turn *before* the status flips back to `claimed` (so a dispatch tick can never claim an empty resume prompt), and the spawned-session dispatcher resumes the CLI session via `-r` with full prior context. All other terminal sends still reject. |
 | `lifeos_agent_check` | Poll a child's current state. |
@@ -658,9 +823,9 @@ Lineage budgets: every session tracks `root_session_id` + `spawn_depth`. A `line
 
 A fresh `claude_code`/`codex` dispatch whose resolved working directory sits inside a git repository never runs there directly — that directory can be the operator's own primary checkout, the exact working tree the production API server runs from. `git_worktree.py` (`ensure_worktree(working_dir, task_id, title, host=...)`) gives the session an isolated worktree on a fresh branch instead, called from `_dispatch()` right before `_resolve_session_execution` freezes the working directory onto the session's execution spec — after `(task.get("fields") or {}).get("working_dir") or resolve_working_directory(title)` picks a candidate directory the usual way, but before that candidate is handed to any executor. This runs for every `ROUTE_CLAUDE_CODE`/`ROUTE_CODEX` dispatch, including one pinned to a remote host (`assignment.host`) — see below. A candidate directory that isn't a git repository at all is unaffected either way (`ensure_worktree` returns it verbatim, `is_git=False`).
 
-Both the worktree's path and its branch name are deterministic functions of the repository toplevel and the task id (`worktree_dir_for`: a sibling directory named `<repo>-wt-agent-<task_id>`; `derive_branch_name`: `<type>/<slug>-<task_id suffix>`, `type` always one of `ALLOWED_BRANCH_TYPES` — `feat`/`fix`/`docs`/`test`/`refactor`/`chore`, the project's own branch-naming convention — read off a conventional prefix in the title (`fix: ...`) when present, else a leading keyword (`"Fix the printer"` → `fix`), else `feat`). Fresh provisioning runs `git fetch origin`, detects the default branch (`origin/HEAD` when set, else the first of `main`/`master` that exists), and creates the worktree with `git worktree add -b <branch> <dir> origin/<default>`. Reuse asks git's own registry (`git worktree list --porcelain`) for a worktree already at the deterministic path, both before attempting `add` and again if `add` itself fails — two dispatch ticks racing the same task can both miss the first check and then have one `add` fail on the ref the other just created; the second probe catches that and reuses rather than failing a task that already has a valid worktree. Any other git failure raises `WorktreeError`, which `_dispatch()` treats as failing the task closed (`_mark_failed`) — never a fallback to running inside the caller-supplied directory.
+Both the worktree's path and its branch name are deterministic functions of the repository toplevel and the task id (`worktree_dir_for`: a sibling directory named `<repo>-wt-agent-<task_id>`; `derive_branch_name`: `<type>/<slug>-<task_id suffix>`, `type` always one of `ALLOWED_BRANCH_TYPES` — `feat`/`fix`/`docs`/`test`/`refactor`/`chore`, the project's own branch-naming convention — read off a conventional prefix in the title (`fix: ...`) when present, else a leading keyword (`"Fix the printer"` → `fix`), else `feat`). Fresh provisioning runs `git fetch origin`, detects the default branch (`origin/HEAD` when set, else the first of `main`/`master` that exists), and creates the worktree with `git worktree add -b <branch> <dir> origin/<base>`, where `<base>` is the repository's detected default branch unless `ensure_worktree` was given a `base_branch` — `_dispatch()` passes `_project_location_context["integration_branch"]` (populated from the parent's `fields.project_integration_branch` by `_with_project_context`) for a coding child of a project that has one recorded. When a `base_branch` is given and `origin/<base_branch>` doesn't exist yet, it's created first — `git push origin origin/<default>:refs/heads/<base_branch>`, then a re-fetch — and the push itself is allowed to fail: only the ref still being missing after the re-fetch is a real error, so two children racing to create the same integration branch both succeed regardless of which one's push actually lands it. `base_branch` (or `None` for a task with nothing recorded) is written into the ownership marker below. Reuse asks git's own registry (`git worktree list --porcelain`) for a worktree already at the deterministic path, both before attempting `add` and again if `add` itself fails — two dispatch ticks racing the same task can both miss the first check and then have one `add` fail on the ref the other just created; the second probe catches that and reuses rather than failing a task that already has a valid worktree, keeping whichever base branch that worktree was originally provisioned against. Any other git failure raises `WorktreeError`, which `_dispatch()` treats as failing the task closed (`_mark_failed`) — never a fallback to running inside the caller-supplied directory.
 
-Each provisioned worktree carries a JSON ownership marker in its linked git directory. Cleanup requires both the `-wt-agent-<task-id>` path shape and that marker; either signal alone is insufficient. This prevents the primary checkout and operator-created worktrees from becoming cleanup targets.
+Each provisioned worktree carries a JSON ownership marker in its linked git directory, including the `base_branch` it was provisioned against. Cleanup requires both the `-wt-agent-<task-id>` path shape and that marker; either signal alone is insufficient. This prevents the primary checkout and operator-created worktrees from becoming cleanup targets.
 
 Every command provisioning runs — `test`/`mkdir`/`git fetch`/`git worktree add`/the registry probe — goes through an injectable `Runner` (`resolve_runner_for_host(host)`): local/no host resolves to the plain local subprocess; a registered remote host (the same `settings.agent_hosts` registry and `remote_spawn.resolve_host_target` resolution the executors use for a remote CLI spawn) resolves to an ssh-wrapped runner (`make_ssh_runner`, `BatchMode=yes`, a bounded connect timeout, `cwd` folded into a `cd ... &&` prefix on the remote command since ssh has no cwd of its own) — so a remote-host task is provisioned on the machine that will actually run the session, never this worker's own filesystem standing in for it. An unregistered host raises `WorktreeError` before any command runs, same fail-closed contract as a git failure.
 
@@ -680,7 +845,13 @@ Finalization runs entirely through `resolve_runner_for_host(host)` — the same 
 
 `finalize_worktree_session` always runs the same first two steps once a linked worktree is confirmed: commit anything the session itself left uncommitted (`git add -A` — honors `.gitignore` — then `git commit -m "chore: worker safety-net commit for uncommitted session changes"`, only when `git status --porcelain` reports something), then `git push -u origin <branch>` — no `--no-verify`, ever. A failed or timed-out `git status --porcelain` itself raises rather than being read as "the tree is clean" — `_has_uncommitted_changes` surfaces that as `FinalizeResult.error` instead of silently pushing whatever HEAD already had and dropping real uncommitted work. Every subprocess this module runs, provisioning and finalization alike, goes through `_run()`, which catches `TimeoutExpired`/`OSError` itself and turns either into an ordinary non-zero `CompletedProcess` rather than letting it escape — so a hung hook or a dead remote can never crash the dispatch path, only surface as an error like any other git failure. Plain status/rev-parse-shaped calls use `DEFAULT_TIMEOUT` (60s); commit/add/push — the operations a pre-commit/pre-push hook can run against — use the more generous `COMMIT_PUSH_TIMEOUT` (300s).
 
-When `open_pr` is True and the push succeeded: `git rev-list --count origin/<base>..<branch>` decides whether there's anything to open a PR for (`nothing_to_push=True`, no `gh` call, when the branch carries zero commits beyond its own base — never an empty PR); otherwise `gh pr view <branch> --json url` checks for one that already exists for the branch (reused, no `gh pr create` call) before opening a new one. The pull request body (`_build_pr_body`) leads with the card title, then the session's own completion summary, then the branch's commit list (`git log --oneline base..branch`) — the assembled body is passed through `_scrub_secrets` (a fixed set of credential *shapes*: Telegram bot tokens, `sk-`/`ghp_`/`github_pat_`/AWS `AKIA...` key prefixes, `Bearer <token>`, and any other 32+-char hex/base64-ish run — not a personal-data scanner) and then `_bounded()` (`MAX_PR_BODY_CHARS`, 4000, with a `…(truncated — N chars total)` note when cut). The body is delivered to `gh pr create --body-file -` over stdin rather than a temp file or argv — works identically whether the runner is local or ssh-wrapped (ssh forwards local stdin to the remote command), and leaves nothing to clean up on either side. `base_branch` defaults to the same default-branch detection `ensure_worktree` uses.
+When `open_pr` is True and the push succeeded: `git rev-list --count origin/<base>..<branch>` decides whether there's anything to open a PR for (`nothing_to_push=True`, no `gh` call, when the branch carries zero commits beyond its own base — never an empty PR); otherwise `gh pr view <branch> --json url` checks for one that already exists for the branch (reused, no `gh pr create` call) before opening a new one. The pull request body (`_build_pr_body`) leads with the card title, then the session's own completion summary, then the branch's commit list (`git log --oneline base..branch`) — the assembled body is passed through `_scrub_secrets` (a fixed set of credential *shapes*: Telegram bot tokens, `sk-`/`ghp_`/`github_pat_`/AWS `AKIA...` key prefixes, `Bearer <token>`, and any other 32+-char hex/base64-ish run — not a personal-data scanner) and then `_bounded()` (`MAX_PR_BODY_CHARS`, 4000, with a `…(truncated — N chars total)` note when cut). The body is delivered to `gh pr create --body-file -` over stdin rather than a temp file or argv — works identically whether the runner is local or ssh-wrapped (ssh forwards local stdin to the remote command), and leaves nothing to clean up on either side. The base for both the pull request and the commits-ahead check is resolved in order: an explicit `base_branch` argument, then the `base_branch` recorded in the worktree's own ownership marker (the same one `ensure_worktree` wrote at provisioning, e.g. a project's integration branch), then the same default-branch detection `ensure_worktree` uses when neither is present — a worktree provisioned with no `base_branch` (an ordinary task, or a project with nothing recorded) carries `base_branch: null` in its marker and finalizes against the detected default exactly as before.
+
+### Merge-on-accept and the integration-branch completion gate
+
+`git_worktree.py` also exposes a second, URL/slug-based `gh` seam alongside `finalize_worktree_session`'s working-directory-based one, used only by the project owner's `lifeos_agent_project_owner` tool (see the tool table above) — there is no local checkout to run these against, since the caller is the owner's own (non-coding) session, not a child's worktree: `repo_slug_from_pr_url(pr_url)` parses `"owner/repo"` out of a full GitHub PR URL with no repository context needed; `pr_base_and_state(pr_url, host=...)` and `merge_pull_request(pr_url, host=...)` are `gh pr view`/`gh pr merge` by full URL, which `gh` resolves the repository from itself; `repo_branch_exists(repo_slug, branch, host=...)` is `gh api repos/{slug}/branches/{branch}`, returning `(False, None)` only for a confirmed 404 on the branch endpoint itself (matched on `gh`'s own `(HTTP 404)` error-text suffix, never any other failure shape) and `(None, error)` for anything else — this is the signal that distinguishes "the branch is gone because it was merged and deleted" from a genuinely broken check; `repo_default_branch(repo_slug, host=...)` and `repo_compare_ahead_by(repo_slug, base, head, host=...)` are `gh api repos/{slug}` and `gh api repos/{slug}/compare/{base}...{head}`'s `ahead_by`, the same generic "is this branch fully merged" check the completion gate and the wake reconciler's `_integration_branch_wake_state` both use. Every one of these returns `(value, error)` rather than raising, resolves its runner through the same `resolve_runner_for_host` used everywhere else in this module (an unresolvable host or a missing `gh` binary — surfaced by `_run` as an ordinary non-zero result — becomes an `error` string, never a silent `None`/success), and takes no `cwd` at all.
+
+Both the completion gate and the wake-state check call these in the same fixed order — `repo_default_branch`, then `repo_branch_exists`, then (only when the branch still exists) `repo_compare_ahead_by` — because comparing a base against an already-deleted head ref 404s exactly the way a genuinely broken check would, and this repository's own documented merge process deletes the integration branch on merge (`scripts/candidate_publisher.py`'s `delete_source`, default on). Resolving the default branch first serves double duty: the compare needs it either way, and its success independently proves the repository itself exists, so a 404 from `repo_branch_exists` right after can only mean the branch is gone — never that the repository is (which 404s on the branches endpoint too, and must never read as "fully merged"). Without this check, the moment the owner does exactly what the guidance tells it to, `complete_project` would refuse forever with an unrecoverable `integration_unmerged`, and the wake reconciler would never fire the `merged` event at all (the merge and the delete happen in the same run, so there is no observable "merged but still present" window to catch). A branch confirmed gone is instead the terminal `"merged"` state for both.
 
 ### Reopened top-level CLI sessions
 
@@ -873,6 +1044,7 @@ The worker is signal-safe and crash-resumable. `resume_pending()` runs on startu
 
 - `YIELDED` with a `sleeps` row → leave alone (sleeps loop wakes it on schedule).
 - `BLOCKED` → leave alone (waiting on Telegram reply or operator unblock).
+- `CLAIMED`, operator-origin, with an undelivered `pending_messages` row → leave alone. This is a native CLI resume (a follow-up reply, or a persistent-project-owner wake — see [Inter-agent coordination](#inter-agent-coordination)) that was queued but never actually launched before the crash/restart; `_dispatch_spawned_sessions` picks it up normally on a later tick the same way it would have if the worker hadn't restarted, because a resume peeks its pending message rather than draining it, so nothing is lost either way.
 - Anything else (`CLAIMED` / `RUNNING` mid-execution) → undo the claim tag (swap `#agent-running` → `#agent` when the card had no engine assignee; otherwise remove `#agent-running` alone so an engine-only card is not injected with `#agent`), mark session `FAILED` in the DB, notify operator.
 
 A managed session's `managed_agent_session_id` is durable across worker restarts — on resume the worker reattaches via `GET /v1/sessions/{id}` and continues polling from `managed_cursor.last_event_id`.

@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-09-20
+> **Last Updated:** 2026-09-22
 
 LifeOS includes an external **agent worker** that picks up engine-assigned tasks and completes them autonomously — running locally on a self-hosted LLM or on Anthropic's Managed Agents cloud, with budget caps you can specify in the task title and full audit transcripts on every run. When the agent finishes (or gets stuck), it notifies you on Telegram. If it has a question mid-run, it asks via Telegram and waits for your reply.
 
@@ -82,7 +82,13 @@ or independent execution pause.
 Projects are never claimed or opened as ordinary worker tasks. Their assignee
 is the owner, while every child keeps its own assignment and normal execution
 and review lifecycle. Creating or attaching a child does not inherit the
-parent's engine tags. When the worker starts a child, its bounded execution
+parent's engine tags. A child created or updated by an agent can never be
+assigned `#hermes` — only the operator can, from the board — and can only be
+put on a paid model route (`#cloud`/`#cloud-haiku`/`#cloud-sonnet`) when the
+project's own owner already carries that same route. A child created this
+way is marked internally as agent-created, distinct from an operator-created
+child, so later features can tell them apart; that marker cannot be forged
+or cleared through an ordinary edit. When the worker starts a child, its bounded execution
 context contains that child's instructions plus the parent ID, title,
 objective/acceptance notes, and a compact sibling-status summary; unrelated
 tasks are not copied into the prompt. When the optional Jev destructive gate
@@ -116,10 +122,39 @@ fallback selects only an existing local directory on the API host; remote CLI
 coordinators start in the remote host's default directory unless they have an
 explicit path.
 
+The first time a project gets a persistent owner — its first **Plan and
+delegate**, or `lifeos_agent_project_handoff` activation — it also records a
+deterministic integration branch name, following the same branch-naming
+convention every other coding change in the repository uses. Every coding
+child of that project then branches off, and opens its pull request into,
+that integration branch instead of `main` — see [Isolated worktree for coding
+sessions](#safety-model) below. A project with no recorded integration branch
+(including any operator-owned project, which never gets one) behaves exactly
+as before: children branch off and PR into `main`.
+
 Project completion is explicit. All children must be done or cancelled, no
 review may remain unaccepted, no coordinator may be live, and no cancellation
-may be pending. Cancelled children require acknowledgement of reduced scope;
-they are never counted as successful completion. Cancelling a project is also
+may be pending — except that a project's own attested owner session may
+complete its own project through `lifeos_agent_project_owner` while its own
+turn is still live; an operator completion is still refused while the
+coordinator is live. The same tool also lets that owner accept or reject a
+review-pending child of its own project — sharing the operator board's own
+Accept/Reject logic, so an owner acceptance is recorded distinctly from an
+operator one and a rejection (which requires a note and resumes the child's
+session with it) is refused while the project is paused. When the project
+has a recorded integration branch, accepting a child whose pull request
+targets exactly that branch also merges it into the branch first, by
+default; a failed merge fails the whole acceptance instead, so the card
+stays in review, unmerged and unaccepted, and the owner can reject it with a
+rebase instruction. Operator Accept from the board never merges. Completing
+a project with a recorded integration branch additionally requires that
+branch to already have nothing left unmerged into the default branch — the
+owner merges it there itself, through the repository's own documented merge
+process, before completion succeeds; the product only checks and reports
+that state, and never performs the merge on the owner's behalf. Operator
+Complete from the board is not gated by this check. Cancelled children
+require acknowledgement of reduced scope; they are never counted as
+successful completion. Cancelling a project is also
 explicit and two-step: the preview names unfinished, running and
 awaiting-review work, then a confirmed operation stops controllable sessions,
 cancels unfinished children, and records review output as abandoned rather
@@ -127,17 +162,40 @@ than accepted. A failed or unverifiable stop leaves cancellation pending and
 reports the remaining session so the same operation can be retried. Cancelling
 one child never cancels siblings or its parent.
 
+Pause and resume give a project a temporary hold, distinct from cancellation:
+pausing blocks every child's worker claim and interactive Open, and refuses
+Plan and delegate, without stopping anything already running — a child that's
+mid-turn when the pause takes effect finishes normally and its result still
+lands in Review. Cancel and operator Complete remain available while paused.
+An agent may pause a project (for example, ahead of an automatic pause after
+repeated owner failures); only the operator may resume one, so a pause an
+agent applies can't be silently undone by agent action.
+
 An ordinary top-level task currently owned by an executor can be converted into
 a project with `lifeos_agent_project_handoff`. This is a terminal action for
 that exact executor turn, not ordinary child attachment: the caller submits a
 stable operation ID and 1–20 uniquely keyed child requests, then stops. The
 worker records the source turn's stop before activating the staged children and
-bounded coordinator. A stop it cannot verify leaves the handoff pending; it
-does not mark the original task complete or release any staged work. Existing
+owner. A stop it cannot verify leaves the handoff pending; it
+does not mark the original task complete or release any staged work. A staged
+child can never be assigned `#hermes` as its assignee or executor. Existing
 projects use **Plan and delegate**, not this conversion. Session-agent
 delegation (`lifeos_agent_spawn`) remains separate from durable project
-children. A child never becomes a project, and a coordinator is one bounded
-run rather than an always-on monitor.
+children. A child never becomes a project. A project's owner is a persistent
+session, not a single bounded run: the worker wakes it automatically —
+natively continuing its own thread on whichever route it already runs on —
+whenever a child reaches awaiting-review, blocked, failed, done, or
+cancelled, coalescing several such events into one wake. If that thread's
+native handle is unusable (a missing CLI session id, an unrecognized
+Managed sandbox, or a Hermes owner with no stored conversation), the owner
+instead gets a fresh
+turn on that same route, briefed with its objective, notes, current children
+and its own last result — the execution route an owner runs on never
+changes. Requesting **Plan and delegate** again for a project that already
+has a finished, resumable owner wakes that same owner instead of starting a
+second, competing one; a retried request with the same operation ID wakes it
+at most once. Managed Agents owners are woken only while the project still
+carries its explicit cloud-consent tag.
 
 A pending handoff remains fenced through worker recovery. The source stays
 paused and staged work stays blocked until its matching source turn is known
@@ -151,6 +209,17 @@ the source or releasing staged work, and the same cancellation operation can
 then finish. A staged intent with no children is still an ordinary task, not a
 project, and is shown as a pending handoff rather than as successful project
 work.
+
+The moment a handoff activates — not when it's merely staged — you get a
+one-time Telegram notice naming the project title, child count, owner, and a
+board-card link. A staged handoff that's cancelled before activating never
+sends one. Separately, you get a one-time notice the first time an
+agent-owned project's agent-created children exceed five, listing the child
+titles (operator-created children don't count toward this). A handoff that
+activates with more than five agent-created children already present sends
+one combined notice instead of two. Each notice fires exactly once per
+project per trigger, even across a worker restart; a notice that fails to
+send is retried on a later poll rather than lost.
 
 ---
 
@@ -268,7 +337,7 @@ The agent runs with the operator's full filesystem and shell access — no sandb
 2. **Daily $-cap** — backstop against runaway loops; pauses all new claims when crossed.
 3. **Per-task budgets** — enforced from outside the agent loop, so the model can't override them.
 4. **Telegram notification on every terminal state** — you find out quickly if something runs that shouldn't have.
-5. **Isolated worktree for coding sessions** — a Claude Code or Codex task that touches a git repository always runs in its own worktree on a fresh branch, off the current `main`, never in your primary checkout — the same working tree the production server runs from — even when the task is pinned to a remote host, where the worktree lives (and gets pushed/opened as a PR) on that host, not silently skipped. The session is told this and expected to commit its work; its completion summary becomes the public pull request description, so it's told that must carry no personal data — the worker also scrubs anything shaped like a bot token, API key, or other credential from it before publishing, as a backstop. When it reports the task fully done, the worker pushes the branch and opens a pull request for you — the completion notification carries its PR link, or says plainly if the push/PR failed or there was nothing to push. When it pauses to ask you something first — Claude Code's own question convention, or Codex's `[CLARIFY]` marker — the worker pushes what's committed so far (no pull request yet), the branch name rides along with the question, and the card moves to your Human queue until you answer. If the session itself leaves anything uncommitted when it stops for any reason, the worker commits and pushes that too, rather than letting it sit lost in a directory you'll never look at.
+5. **Isolated worktree for coding sessions** — a Claude Code or Codex task that touches a git repository always runs in its own worktree on a fresh branch, off the current `main`, never in your primary checkout — the same working tree the production server runs from — even when the task is pinned to a remote host, where the worktree lives (and gets pushed/opened as a PR) on that host, not silently skipped. A coding child of a project with a recorded integration branch (see [Projects and independently assigned children](#projects-and-independently-assigned-children)) branches off that branch instead of `main`, and opens its pull request into it — lazily created on the remote the first time a child needs it, so two children provisioned at nearly the same moment both succeed. The session is told this and expected to commit its work; its completion summary becomes the public pull request description, so it's told that must carry no personal data — the worker also scrubs anything shaped like a bot token, API key, or other credential from it before publishing, as a backstop. When it reports the task fully done, the worker pushes the branch and opens a pull request for you — the completion notification carries its PR link, or says plainly if the push/PR failed or there was nothing to push. When it pauses to ask you something first — Claude Code's own question convention, or Codex's `[CLARIFY]` marker — the worker pushes what's committed so far (no pull request yet), the branch name rides along with the question, and the card moves to your Human queue until you answer. If the session itself leaves anything uncommitted when it stops for any reason, the worker commits and pushes that too, rather than letting it sit lost in a directory you'll never look at.
 6. **Private, short-lived session files** — every board session receives its own private temporary directory instead of sharing a general-purpose temp location with other processes. Files created there, including copied authentication material, are removed when the session completes, fails, exceeds its budget, is killed or cancelled, or times out waiting for clarification. Coding worktrees are removed after their pull request merges or their card is accepted/cancelled. Cleanup commits and pushes any leftover work before removal, never removes the primary checkout or an operator-created worktree, and leaves remote branch deletion to the git host's policy.
 
 Operators should still audit handed-off tasks before they reach the worker (your task list is the queue), keep budgets set, and treat agent-touchable secrets the same as operator-touchable secrets.

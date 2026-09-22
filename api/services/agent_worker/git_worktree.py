@@ -4,8 +4,11 @@ A board-dispatched Claude Code or Codex session must never run directly
 inside the primary checkout — the working tree the production API server
 runs from. Before such a session starts, :func:`ensure_worktree` gives it
 an isolated worktree on a fresh branch, off a freshly-fetched
-``origin/<default-branch>``, so the session can commit, push, and open a
-pull request the way every other change in this project is made.
+``origin/<default-branch>`` — or, for a coding child of a project with a
+recorded integration branch, off that branch instead, lazily creating it
+on origin first if it doesn't exist yet — so the session can commit, push,
+and open a pull request the way every other change in this project is
+made.
 
 Provisioning is deterministic on (repository, task id): both the worktree
 path and the branch name are pure functions of the two. Re-provisioning
@@ -439,6 +442,42 @@ def _local_branch_exists(toplevel: str, branch: str, *, runner: Optional[Runner]
     return result.returncode == 0
 
 
+def _remote_branch_exists(toplevel: str, branch: str, *, runner: Optional[Runner], timeout: int) -> bool:
+    """True when ``origin/<branch>`` is present in this checkout's own
+    remote-tracking refs (checked after a fetch, so this reflects origin's
+    current state, not a stale local view)."""
+    result = _run(
+        ["git", "rev-parse", "--verify", "-q", f"origin/{branch}"],
+        cwd=toplevel, runner=runner, timeout=timeout,
+    )
+    return result.returncode == 0
+
+
+def _ensure_remote_branch(
+    toplevel: str, branch: str, default_branch: str, *, runner: Optional[Runner], timeout: int,
+) -> None:
+    """Make sure ``origin/<branch>`` exists — a project's integration
+    branch — creating it off the current ``origin/<default_branch>`` when
+    it doesn't. Two callers racing to create the same branch at nearly the
+    same moment both succeed: the push itself is allowed to fail (the ref
+    already exists, or a concurrent push wins the race) — only "the ref is
+    still missing after a re-fetch" is treated as a real failure, since
+    that's the only outcome a genuine push-rights or connectivity problem
+    produces.
+    """
+    if _remote_branch_exists(toplevel, branch, runner=runner, timeout=timeout):
+        return
+    _run(
+        ["git", "push", "origin", f"origin/{default_branch}:refs/heads/{branch}"],
+        cwd=toplevel, runner=runner, timeout=timeout,
+    )
+    fetch = _run(["git", "fetch", "origin"], cwd=toplevel, runner=runner, timeout=timeout)
+    if fetch.returncode != 0:
+        raise WorktreeError(f"git fetch origin failed: {fetch.stderr.strip()}")
+    if not _remote_branch_exists(toplevel, branch, runner=runner, timeout=timeout):
+        raise WorktreeError(f"could not create or find integration branch {branch!r} on origin")
+
+
 def _registered_worktree_branch(
     toplevel: str, worktree_dir: str, *, runner: Optional[Runner], timeout: int,
 ) -> Optional[str]:
@@ -523,6 +562,7 @@ def ensure_worktree(
     title: str,
     *,
     host: Optional[str] = None,
+    base_branch: Optional[str] = None,
     timeout: int = DEFAULT_TIMEOUT,
 ) -> WorktreeResult:
     """Provision (or reuse) an isolated worktree+branch for a CLI-routed
@@ -535,6 +575,17 @@ def ensure_worktree(
     on the machine that will actually run the session — never this
     worker's own filesystem standing in for a remote one. An unregistered
     host raises :class:`WorktreeError` before any command runs.
+
+    ``base_branch``, when given (a project's recorded integration branch),
+    is used as the worktree's base instead of the repository's detected
+    default branch: on fresh provisioning, ``origin/<base_branch>`` is
+    created off the current default branch first if origin doesn't already
+    have it — concurrent callers racing to create it never fail, since only
+    a ref still missing after a re-fetch counts as a real error — and the
+    branch is recorded in the worktree's ownership marker so a later
+    finalize (and any reuse of this same worktree) can recover it. None
+    (the default) preserves today's behavior exactly: the worktree is based
+    on the detected default branch and nothing is recorded.
 
     Returns unchanged behavior (``is_git=False``) when ``working_dir``
     isn't inside a git repository at all. Raises :class:`WorktreeError` on
@@ -569,12 +620,16 @@ def ensure_worktree(
 
     default_branch = _detect_default_branch(toplevel, runner=runner, timeout=timeout)
 
+    if base_branch:
+        _ensure_remote_branch(toplevel, base_branch, default_branch, runner=runner, timeout=timeout)
+    effective_base = base_branch or default_branch
+
     _run(["mkdir", "-p", str(Path(worktree_dir).parent)], runner=runner, timeout=timeout)
 
     if _local_branch_exists(toplevel, branch, runner=runner, timeout=timeout):
         add_cmd = ["git", "worktree", "add", worktree_dir, branch]
     else:
-        add_cmd = ["git", "worktree", "add", "-b", branch, worktree_dir, f"origin/{default_branch}"]
+        add_cmd = ["git", "worktree", "add", "-b", branch, worktree_dir, f"origin/{effective_base}"]
     add = _run(add_cmd, cwd=toplevel, runner=runner, timeout=timeout)
     if add.returncode != 0:
         # Race tolerance: re-read the registry before giving up — see
@@ -601,6 +656,7 @@ def ensure_worktree(
             "worktree_dir": worktree_dir,
             "branch": branch,
             "host": host,
+            "base_branch": base_branch,
             "state": "ready",
             "created_at": int(time.time()),
         },
@@ -758,8 +814,12 @@ def finalize_worktree_session(
     treated as "nothing to commit".
 
     When ``open_pr`` is True and the push succeeded: open a pull request
-    against ``base_branch`` (auto-detected when omitted) whose body leads
-    with the card title, a secret-scrubbed and bounded copy of ``pr_body``
+    against a base branch — ``base_branch`` when the caller passes one,
+    else the base branch recorded in the worktree's own ownership marker
+    (set by `ensure_worktree`'s `base_branch`, e.g. a project's integration
+    branch) when there is one, else the repository's detected default
+    branch — whose body leads with the card title, a secret-scrubbed and
+    bounded copy of ``pr_body``
     (the session's own completion summary), and the branch's commit list —
     reusing one that already exists for the branch, or reporting
     ``nothing_to_push`` when the branch carries no commits beyond its base
@@ -816,8 +876,14 @@ def finalize_worktree_session(
         return result
 
     toplevel = repo_toplevel(working_dir, runner=runner, timeout=timeout)
+    marker = _read_worker_marker(working_dir, runner=runner, timeout=timeout)
+    recorded_base = marker.get("base_branch") if marker else None
     try:
-        base = base_branch or (_detect_default_branch(toplevel, runner=runner, timeout=timeout) if toplevel else None)
+        base = (
+            base_branch
+            or recorded_base
+            or (_detect_default_branch(toplevel, runner=runner, timeout=timeout) if toplevel else None)
+        )
     except WorktreeError as exc:
         return dataclasses.replace(result, error=str(exc))
     if not base:
@@ -858,6 +924,164 @@ def pull_request_state(
     )
     state = result.stdout.strip().upper() if result.returncode == 0 else ""
     return state if state in {"OPEN", "MERGED", "CLOSED"} else None
+
+
+_PR_URL_RE = re.compile(r"^https?://[^/]+/([^/]+/[^/]+)/pull/\d+/?$")
+
+
+def repo_slug_from_pr_url(pr_url: str) -> Optional[str]:
+    """``"owner/repo"`` parsed out of a full GitHub pull request URL, or
+    None when it doesn't look like one. The only way the functions below
+    learn which repository to call `gh api` against without a local git
+    checkout to read a remote from — a project owner's own session (the
+    caller of `merge_pull_request`/`repo_compare_ahead_by`) has no
+    worktree of its own, so the repository comes from a child's already-
+    recorded pull request URL instead."""
+    match = _PR_URL_RE.match((pr_url or "").strip())
+    return match.group(1) if match else None
+
+
+def pr_base_and_state(
+    pr_url: str, *, host: Optional[str] = None, runner: Optional[Runner] = None,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> tuple[Optional[dict], Optional[str]]:
+    """``{"baseRefName": ..., "state": ...}`` for one pull request,
+    identified by its full URL rather than a branch name — works with no
+    local checkout at all, since `gh pr view <url>` resolves the
+    repository from the URL itself. Returns ``(None, error)`` on any
+    failure: an unresolvable host, a missing `gh` binary (surfaced by
+    `_run` as a non-zero return carrying the `OSError` text), or `gh`
+    itself refusing the lookup."""
+    try:
+        active = runner or resolve_runner_for_host(host)
+    except WorktreeError as exc:
+        return None, str(exc)
+    result = _run(
+        ["gh", "pr", "view", pr_url, "--json", "baseRefName,state"],
+        runner=active, timeout=timeout,
+    )
+    if result.returncode != 0:
+        return None, (result.stderr or f"gh pr view failed (exit {result.returncode})").strip()
+    try:
+        data = json.loads(result.stdout)
+    except (TypeError, ValueError):
+        return None, "gh pr view returned invalid JSON"
+    if not isinstance(data, dict):
+        return None, "gh pr view returned an unexpected response shape"
+    return data, None
+
+
+def merge_pull_request(
+    pr_url: str, *, host: Optional[str] = None, runner: Optional[Runner] = None,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> tuple[bool, Optional[str]]:
+    """``gh pr merge <url> --merge``, by full URL so no local checkout is
+    needed. ``(True, None)`` on success; ``(False, error)`` otherwise —
+    an unresolvable host, a missing `gh` binary, or `gh` itself refusing
+    the merge (conflicts, a required check still red, branch protection).
+    Never falls back to any other merge method."""
+    try:
+        active = runner or resolve_runner_for_host(host)
+    except WorktreeError as exc:
+        return False, str(exc)
+    result = _run(["gh", "pr", "merge", pr_url, "--merge"], runner=active, timeout=timeout)
+    if result.returncode != 0:
+        return False, (result.stderr or f"gh pr merge failed (exit {result.returncode})").strip()
+    return True, None
+
+
+def repo_default_branch(
+    repo_slug: str, *, host: Optional[str] = None, runner: Optional[Runner] = None,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> tuple[Optional[str], Optional[str]]:
+    """The repository's default branch name, via `gh api` rather than a
+    local `origin/HEAD` read (`_detect_default_branch`) — there is no
+    local checkout for the completion-time "is the integration branch
+    merged" check this feeds. ``(None, error)`` on any failure."""
+    try:
+        active = runner or resolve_runner_for_host(host)
+    except WorktreeError as exc:
+        return None, str(exc)
+    result = _run(
+        ["gh", "api", f"repos/{repo_slug}", "--jq", ".default_branch"],
+        runner=active, timeout=timeout,
+    )
+    if result.returncode != 0:
+        return None, (result.stderr or f"gh api repos/{repo_slug} failed (exit {result.returncode})").strip()
+    branch = result.stdout.strip()
+    if not branch:
+        return None, f"gh api repos/{repo_slug} returned an empty default branch"
+    return branch, None
+
+
+# The consistent structural marker `gh api` appends to any GitHub API error
+# it surfaces (`gh: <message> (HTTP <status>)`), regardless of the message
+# text itself -- GitHub's own message for a missing branch varies by
+# endpoint ("Branch not found", a bare "Not Found", ...), so matching this
+# suffix is the reliable signal rather than any particular wording. This is
+# never confused with a missing `gh` binary or a timeout: `_run` reports
+# those as its own synthetic stderr (an `OSError`/`TimeoutExpired` message),
+# which never contains this shape.
+_GH_HTTP_404_MARKER = "(HTTP 404)"
+
+
+def repo_branch_exists(
+    repo_slug: str, branch: str, *, host: Optional[str] = None, runner: Optional[Runner] = None,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> tuple[Optional[bool], Optional[str]]:
+    """Whether ``branch`` currently exists in the remote repository
+    (``gh api repos/{slug}/branches/{branch}``) — the terminal "this
+    repository's documented merge process already deleted the branch"
+    signal a caller comparing an integration branch against the default
+    branch needs: a branch that's gone reads as fully merged, not as a
+    failed check, and a plain commits-ahead compare against a deleted head
+    ref 404s the exact same way a genuinely broken check would.
+
+    ``(True, None)`` when the branch exists; ``(False, None)`` only for a
+    confirmed 404 on the branch endpoint itself (`_GH_HTTP_404_MARKER` in
+    `gh`'s own error text); ``(None, error)`` for anything else — an
+    unresolvable host, a missing `gh` binary, or any other failure — the
+    same fail-closed contract every other helper in this module uses.
+    """
+    try:
+        active = runner or resolve_runner_for_host(host)
+    except WorktreeError as exc:
+        return None, str(exc)
+    result = _run(
+        ["gh", "api", f"repos/{repo_slug}/branches/{branch}"],
+        runner=active, timeout=timeout,
+    )
+    if result.returncode == 0:
+        return True, None
+    stderr = (result.stderr or "").strip()
+    if _GH_HTTP_404_MARKER in stderr:
+        return False, None
+    return None, stderr or f"gh api repos/{repo_slug}/branches/{branch} failed (exit {result.returncode})"
+
+
+def repo_compare_ahead_by(
+    repo_slug: str, base: str, head: str, *, host: Optional[str] = None,
+    runner: Optional[Runner] = None, timeout: int = DEFAULT_TIMEOUT,
+) -> tuple[Optional[int], Optional[str]]:
+    """How many commits ``head`` is ahead of ``base`` in the remote
+    repository (`gh api repos/{slug}/compare/{base}...{head}`'s own
+    ``ahead_by``) — a generic, repository-agnostic "is this branch fully
+    merged" check with no PR of its own involved on either side.
+    ``(None, error)`` on any failure, including a missing `gh` binary."""
+    try:
+        active = runner or resolve_runner_for_host(host)
+    except WorktreeError as exc:
+        return None, str(exc)
+    result = _run(
+        ["gh", "api", f"repos/{repo_slug}/compare/{base}...{head}", "--jq", ".ahead_by"],
+        runner=active, timeout=timeout,
+    )
+    if result.returncode != 0:
+        return None, (result.stderr or f"gh api compare failed (exit {result.returncode})").strip()
+    try:
+        return int(result.stdout.strip()), None
+    except ValueError:
+        return None, "gh api compare returned a non-numeric ahead_by"
 
 
 def list_worker_worktrees(
@@ -974,6 +1198,12 @@ __all__ = [
     "ensure_worktree",
     "finalize_worktree_session",
     "pull_request_state",
+    "repo_slug_from_pr_url",
+    "pr_base_and_state",
+    "merge_pull_request",
+    "repo_default_branch",
+    "repo_branch_exists",
+    "repo_compare_ahead_by",
     "list_worker_worktrees",
     "remove_worker_worktree",
 ]

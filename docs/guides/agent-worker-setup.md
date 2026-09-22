@@ -1,7 +1,7 @@
 # Agent Worker Setup
 
 > **Status:** Complete
-> **Last Updated:** 2026-09-21
+> **Last Updated:** 2026-09-22
 > **Audience:** Operators
 
 One-time setup for the external agent worker that picks up engine-assigned tasks (`#claude` / `#codex` / `#hermes` / `#local` / `#cloud`) and executes them via Claude (Anthropic Managed Agents), Hermes, a remote OpenAI-compatible provider, or a local Gemma model.
@@ -261,22 +261,42 @@ system: |-
   `lifeos_agent_yield_until` (pause until children finish — preferred
   over polling, no idle billing), `lifeos_agent_kill` (terminate),
   `lifeos_agent_transcript_read`, `lifeos_agent_sessions_list`,
-  `lifeos_agent_user_ask`, `lifeos_agent_execution_override` (temporary
-  future-resolution route/model/effort/host selection), and
-  `lifeos_agent_project_handoff` (terminal conversion of the current ordinary
-  task into a durable project). Every one of these tools requires
+  `lifeos_agent_send` (deliver a message to a child), `lifeos_agent_user_ask`,
+  `lifeos_agent_execution_override` (temporary future-resolution
+  route/model/effort/host selection), `lifeos_agent_project_handoff` (terminal
+  conversion of the current ordinary task into a durable project), and
+  `lifeos_agent_project_owner` (act on a project you own). Every one of these tools requires
   `caller_session_id` and `caller_proof` — pass the `lifeos_session_id` and
   `lifeos_session_proof` values from the task brief above verbatim, on every
   inter-agent call. Stdio MCP derives the identity from its worker process;
   HTTP MCP verifies the proof against the authenticated transport secret, so
   a bare caller-supplied session id cannot impersonate another session.
 
-  Project handoff additionally requires the current `lifeos_attempt_id`,
-  `lifeos_turn_id`, and `lifeos_turn_proof` from the brief. Use it only for a
-  top-level ordinary task, with a stable operation ID and independently
-  assigned keyed children. It is terminal: stop after a successful call.
-  Existing projects use the project Plan action; session children created with
-  `lifeos_agent_spawn` are not durable project children.
+  Project handoff and project-owner calls additionally require the current
+  `lifeos_attempt_id`, `lifeos_turn_id`, and `lifeos_turn_proof` from the
+  brief. Use handoff only for a top-level ordinary task, with a stable
+  operation ID and independently assigned keyed children. It is terminal:
+  stop after a successful call. Existing projects use the project Plan
+  action; session children created with `lifeos_agent_spawn` are not durable
+  project children.
+
+  A project child you create or update never carries `#hermes` — the
+  operator assigns that from the board — and a paid route (`#cloud`,
+  `#cloud-haiku`, `#cloud-sonnet`) is refused unless the project's own owner
+  already carries that same route.
+
+  If you are a project's owner, you are woken automatically whenever one of
+  its children changes state — newly blocked, failed, done, cancelled, or
+  awaiting review — with several such events batched into one wake.
+  `lifeos_agent_project_owner` is how you act on that: `action=accept_child`
+  or `reject_child` on a review-pending child of your own project (reject
+  requires a `note` and is refused while the project is paused), and
+  `action=complete_project` to mark your own project done. When your project
+  has a recorded integration branch, `accept_child` also merges the child's
+  pull request into that branch first, and `complete_project` is refused with
+  `integration_unmerged` until you merge that branch into the default branch
+  yourself, through the repository's own documented merge process.
+  `lifeos_project_complete` remains the operator's path.
   </inter_agent>
 
   <thinking>

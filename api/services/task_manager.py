@@ -352,19 +352,25 @@ class TaskManager:
         fields: Optional[dict[str, str]] = None,
         _log_content: bool = True,
         _project_handoff_operation: Optional[str] = None,
+        _project_child_creator_session: Optional[str] = None,
     ) -> Task:
         """Create a new task at the top of its context file, update index.
 
         Raises `ValueError` (-> HTTP 422 at the route layer) for an
         unrecognized `status`, or for `description`/`notes`/`fields` content
         that would corrupt the task line or hijack another task's id — see
-        `_validate_text_fields`.
+        `_validate_text_fields`. `_project_child_creator_session`, when the
+        new task carries `fields.parent_id`, stamps it as agent-created —
+        see `CHILD_ORIGIN_FIELD` in `api.services.task_projects`; it is
+        never accepted through the caller-supplied `fields` dict itself.
         """
         if fields:
             from api.services.task_projects import (
                 ABANDONED_AT_FIELD,
                 CANCEL_OPERATION_FIELD,
                 CANCEL_REQUESTED_AT_FIELD,
+                CHILD_CREATOR_SESSION_FIELD,
+                CHILD_ORIGIN_FIELD,
                 COORDINATOR_REQUEST_FIELD,
                 COORDINATOR_SESSION_FIELD,
                 EXECUTION_PAUSED_FIELD,
@@ -377,9 +383,13 @@ class TaskManager:
                 HANDOFF_SOURCE_ATTEMPT_FIELD,
                 HANDOFF_SOURCE_SESSION_FIELD,
                 HANDOFF_SOURCE_TURN_FIELD,
+                INTEGRATION_BRANCH_FIELD,
                 LAST_ABORTED_HANDOFF_FIELD,
                 LAST_CANCEL_OPERATION_FIELD,
                 LAST_HANDOFF_OPERATION_FIELD,
+                PROJECT_PAUSED_AT_FIELD,
+                PROJECT_PAUSED_FIELD,
+                PROJECT_PAUSE_REASON_FIELD,
                 ProjectConflictError,
             )
             internal_fields = {
@@ -392,6 +402,9 @@ class TaskManager:
                 HANDOFF_REQUEST_HASH_FIELD, HANDOFF_REQUESTED_AT_FIELD,
                 HANDOFF_READY_AT_FIELD, LAST_HANDOFF_OPERATION_FIELD,
                 HANDOFF_ACTIVATED_AT_FIELD, LAST_ABORTED_HANDOFF_FIELD,
+                CHILD_ORIGIN_FIELD, CHILD_CREATOR_SESSION_FIELD,
+                INTEGRATION_BRANCH_FIELD,
+                PROJECT_PAUSED_FIELD, PROJECT_PAUSED_AT_FIELD, PROJECT_PAUSE_REASON_FIELD,
             }
             if set(fields) & internal_fields:
                 raise ProjectConflictError(
@@ -417,6 +430,15 @@ class TaskManager:
                 notes=notes,
                 fields=dict(fields) if fields else {},
             )
+            if _project_child_creator_session and (task.fields.get("parent_id") or "").strip():
+                from api.services.task_projects import (
+                    CHILD_CREATOR_SESSION_FIELD,
+                    CHILD_ORIGIN_AGENT,
+                    CHILD_ORIGIN_FIELD,
+                )
+
+                task.fields[CHILD_ORIGIN_FIELD] = CHILD_ORIGIN_AGENT
+                task.fields[CHILD_CREATOR_SESSION_FIELD] = _project_child_creator_session
             parent_id = (task.fields.get("parent_id") or "").strip()
             if parent_id:
                 # Refresh from Markdown after acquiring the cross-process
@@ -504,6 +526,7 @@ class TaskManager:
         notes: Optional[str] = None,
         fields: Optional[dict[str, str]] = None,
         _project_handoff_operation: Optional[str] = None,
+        _project_child_creator_session: Optional[str] = None,
     ) -> tuple[Task, bool]:
         """Atomically find or create a task for a durable source operation.
 
@@ -543,6 +566,7 @@ class TaskManager:
                 fields=merged_fields,
                 _log_content=False,
                 _project_handoff_operation=_project_handoff_operation,
+                _project_child_creator_session=_project_child_creator_session,
             ), True
 
     def find_by_operation(self, operation_key: str) -> Optional[Task]:
@@ -591,6 +615,14 @@ class TaskManager:
         project_action = bool(kwargs.pop("_project_action", False) or project_operation)
         acknowledge_cancelled_children = bool(
             kwargs.pop("_acknowledge_cancelled_children", False)
+        )
+        # Set only by `ProjectTaskService.complete_project(owner_session=...)`
+        # for the attested project owner's own completion call. Exempts the
+        # live-coordinator completion guard, but only when this exact session
+        # id is the project's own recorded coordinator — see
+        # `_guard_project_update`.
+        owner_turn_completion_session_id = kwargs.pop(
+            "_owner_turn_completion_session_id", None
         )
         notes_merge = kwargs.pop("_notes_merge", None)
         expected_updated_at = kwargs.pop("_expected_updated_at", None)
@@ -647,6 +679,7 @@ class TaskManager:
                     project_action=project_action,
                     project_operation=project_operation,
                     acknowledge_cancelled_children=acknowledge_cancelled_children,
+                    owner_turn_completion_session_id=owner_turn_completion_session_id,
                 )
 
             if relationship_change and not skip_project_validation:
@@ -904,13 +937,31 @@ class TaskManager:
         here, not only in the worker's own listing, so a direct claim
         attempt against a snoozed task is refused the same way a stale
         listing would be.
+
+        Raises `ProjectConflictError` (-> HTTP 409 at the route layer) when
+        the specific reason is a paused parent project — distinct from every
+        other ineligibility reason, which returns `(False, False)` instead,
+        so a worker can tell "this project is paused" apart from "someone
+        else got there first" without a second lookup.
         """
+        from api.services.task_projects import (
+            PROJECT_PAUSED_FIELD,
+            ProjectConflictError,
+            clean_parent_id,
+            field_truthy,
+        )
+
         pickup = {tag.lstrip("#").lower() for tag in pickup_tags}
         excluded = {tag.lstrip("#").lower() for tag in exclusion_tags}
         statuses = {status.lower() for status in eligible_statuses}
         queue = queue_tag.lstrip("#").lower()
         running = running_tag.lstrip("#")
         consumed_queue_tag = False
+
+        def parent_paused(task: Task) -> bool:
+            parent_id = clean_parent_id(task.fields.get("parent_id"))
+            parent = self._tasks.get(parent_id) if parent_id else None
+            return bool(parent and field_truthy(parent.fields.get(PROJECT_PAUSED_FIELD)))
 
         def is_claimable(task: Task) -> bool:
             tags = {tag.lstrip("#").lower() for tag in task.tags}
@@ -926,7 +977,11 @@ class TaskManager:
         with self._lock, exclusive_operation_lock(self.index_path.parent / ".task-operation.lock"):
             self.rebuild_index()
             current = self._tasks.get(task_id)
-            if not current or not is_claimable(current):
+            if not current:
+                return False, False
+            if parent_paused(current):
+                raise ProjectConflictError("project is paused")
+            if not is_claimable(current):
                 return False, False
 
             path = Path(current.source_file)
@@ -934,6 +989,8 @@ class TaskManager:
             def compute() -> Task:
                 nonlocal consumed_queue_tag
                 t = self._tasks[task_id]
+                if parent_paused(t):
+                    raise ProjectConflictError("project is paused")
                 if not is_claimable(t):
                     raise _TaskNotClaimableError()
                 new_task = copy.copy(t)
@@ -1213,11 +1270,14 @@ class TaskManager:
         project_action: bool,
         project_operation: Optional[str],
         acknowledge_cancelled_children: bool,
+        owner_turn_completion_session_id: Optional[str] = None,
     ) -> None:
         from api.services.task_projects import (
             ABANDONED_AT_FIELD,
             CANCEL_OPERATION_FIELD,
             CANCEL_REQUESTED_AT_FIELD,
+            CHILD_CREATOR_SESSION_FIELD,
+            CHILD_ORIGIN_FIELD,
             COORDINATOR_SESSION_FIELD,
             COORDINATOR_REQUEST_FIELD,
             EXECUTION_PAUSED_FIELD,
@@ -1231,8 +1291,12 @@ class TaskManager:
             HANDOFF_SOURCE_ATTEMPT_FIELD,
             HANDOFF_SOURCE_SESSION_FIELD,
             HANDOFF_SOURCE_TURN_FIELD,
+            INTEGRATION_BRANCH_FIELD,
             LAST_ABORTED_HANDOFF_FIELD,
             LAST_HANDOFF_OPERATION_FIELD,
+            PROJECT_PAUSED_AT_FIELD,
+            PROJECT_PAUSED_FIELD,
+            PROJECT_PAUSE_REASON_FIELD,
             ProjectConflictError,
             build_task_hierarchy,
             clean_parent_id,
@@ -1259,6 +1323,12 @@ class TaskManager:
             LAST_HANDOFF_OPERATION_FIELD,
             HANDOFF_ACTIVATED_AT_FIELD,
             LAST_ABORTED_HANDOFF_FIELD,
+            CHILD_ORIGIN_FIELD,
+            CHILD_CREATOR_SESSION_FIELD,
+            INTEGRATION_BRANCH_FIELD,
+            PROJECT_PAUSED_FIELD,
+            PROJECT_PAUSED_AT_FIELD,
+            PROJECT_PAUSE_REASON_FIELD,
         }
         if not project_action and fields_patch and set(fields_patch) & internal_fields:
             raise ProjectConflictError("use the explicit project lifecycle action for internal fields")
@@ -1308,7 +1378,16 @@ class TaskManager:
         if cancellation_pending:
             raise ProjectConflictError("project cancellation is pending")
         if coordinator_live:
-            raise ProjectConflictError("project coordinator is live")
+            # The attested project owner may complete its own project while
+            # its own turn is still live — but only when the recorded
+            # coordinator is exactly this attested session, never any other
+            # live session (including a different in-flight owner turn).
+            owner_turn_exempt = bool(
+                owner_turn_completion_session_id
+                and current.fields.get(COORDINATOR_SESSION_FIELD) == owner_turn_completion_session_id
+            )
+            if not owner_turn_exempt:
+                raise ProjectConflictError("project coordinator is live")
         unresolved = [
             child for child in hierarchy.children(current.id)
             if hierarchy.child_state(child) not in {"done", "cancelled"}
@@ -1358,6 +1437,7 @@ class TaskManager:
             EXECUTION_PAUSED_FIELD,
             EXECUTION_RESERVATION_FIELD,
             HANDOFF_OPERATION_FIELD,
+            PROJECT_PAUSED_FIELD,
             build_task_hierarchy,
             clean_parent_id,
             field_timestamp_future,
@@ -1378,6 +1458,8 @@ class TaskManager:
         if parent and parent.fields.get(CANCEL_OPERATION_FIELD):
             return False
         if parent and parent.fields.get(HANDOFF_OPERATION_FIELD):
+            return False
+        if parent and field_truthy(parent.fields.get(PROJECT_PAUSED_FIELD)):
             return False
         return True
 
