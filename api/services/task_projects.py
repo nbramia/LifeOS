@@ -25,6 +25,7 @@ from api.services.agent_worker.execution import (
     ExecutionSpec,
     parse_legacy_route_alias,
 )
+from api.services.agent_worker.git_worktree import derive_branch_name
 from api.services.agent_worker.session_store import (
     STATUS_BLOCKED,
     STATUS_CLAIMED,
@@ -58,6 +59,7 @@ HANDOFF_READY_AT_FIELD = "project_handoff_ready_at"
 LAST_HANDOFF_OPERATION_FIELD = "project_last_handoff_operation_id"
 HANDOFF_ACTIVATED_AT_FIELD = "project_handoff_activated_at"
 LAST_ABORTED_HANDOFF_FIELD = "project_last_aborted_handoff_operation_id"
+INTEGRATION_BRANCH_FIELD = "project_integration_branch"
 
 HANDOFF_REQUEST_EVENT = "project_handoff_requested"
 HANDOFF_QUIESCENT_EVENT = "project_handoff_quiescent"
@@ -714,6 +716,11 @@ class ProjectTaskService:
                 LAST_HANDOFF_OPERATION_FIELD: operation_id,
                 HANDOFF_ACTIVATED_AT_FIELD: datetime.now(timezone.utc).isoformat(),
             }
+            if not task.fields.get(INTEGRATION_BRANCH_FIELD):
+                # First persistent owner for this project: record its
+                # deterministic integration branch name, following the same
+                # convention a coding child's own branch uses.
+                cleared[INTEGRATION_BRANCH_FIELD] = derive_branch_name(task.description, task.id)
             task = self.manager.update(
                 task.id,
                 status="in_progress",
@@ -1140,14 +1147,20 @@ class ProjectTaskService:
             ):
                 raise ProjectConflictError("project coordinator is already live")
 
+        plan_fields = {
+            EXECUTION_PAUSED_FIELD: "true",
+            COORDINATOR_SESSION_FIELD: session.session_id,
+            COORDINATOR_REQUEST_FIELD: operation_id,
+        }
+        if not task.fields.get(INTEGRATION_BRANCH_FIELD):
+            # First persistent owner for this project: record its
+            # deterministic integration branch name, following the same
+            # convention a coding child's own branch uses.
+            plan_fields[INTEGRATION_BRANCH_FIELD] = derive_branch_name(task.description, task_id)
         linked = self.manager.update(
             task_id,
             status="in_progress",
-            fields={
-                EXECUTION_PAUSED_FIELD: "true",
-                COORDINATOR_SESSION_FIELD: session.session_id,
-                COORDINATOR_REQUEST_FIELD: operation_id,
-            },
+            fields=plan_fields,
             _project_operation="plan",
             _precondition=link_precondition,
         )

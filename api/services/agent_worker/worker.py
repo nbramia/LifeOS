@@ -125,6 +125,7 @@ from api.services.task_projects import (
     HANDOFF_SOURCE_ATTEMPT_FIELD,
     HANDOFF_SOURCE_SESSION_FIELD,
     HANDOFF_SOURCE_TURN_FIELD,
+    INTEGRATION_BRANCH_FIELD,
     LAST_HANDOFF_OPERATION_FIELD,
 )
 from config.settings import settings
@@ -5565,6 +5566,7 @@ class Worker:
                 "host": parent_fields.get("host"),
                 "working_dir": parent_fields.get("working_dir"),
                 "project_affinity": parent_fields.get("project"),
+                "integration_branch": parent_fields.get(INTEGRATION_BRANCH_FIELD),
             },
         }
 
@@ -6125,6 +6127,7 @@ class Worker:
                 try:
                     provisioned = ensure_worktree(
                         candidate_working_dir, task_id, title, host=assignment.host,
+                        base_branch=project_location.get("integration_branch"),
                     )
                 except WorktreeError as exc:
                     self._mark_failed(session, task, f"worktree provisioning failed: {exc}")

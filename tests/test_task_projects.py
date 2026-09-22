@@ -444,6 +444,60 @@ def test_plan_and_delegate_is_idempotent_and_links_before_claim(
     assert service.coordinator_view(linked)["result"] == "Synthetic coordination result."
 
 
+def test_plan_and_delegate_records_the_integration_branch(
+    manager: TaskManager, stores, monkeypatch, tmp_path: Path,
+):
+    from api.services.agent_worker.git_worktree import derive_branch_name
+    from api.services.task_projects import INTEGRATION_BRANCH_FIELD
+
+    sessions, transcripts = stores
+    service = ProjectTaskService(manager, sessions, transcripts)
+    parent = manager.create("Synthetic branch-recording project", tags=["codex"])
+    manager.create("Synthetic branch-recording child", fields={"parent_id": parent.id})
+
+    service.plan_and_delegate(parent.id, operation_id="op-branch-1")
+
+    linked = manager.get(parent.id)
+    assert linked.fields[INTEGRATION_BRANCH_FIELD] == derive_branch_name(
+        parent.description, parent.id,
+    )
+
+
+def test_plan_and_delegate_does_not_overwrite_an_existing_integration_branch(
+    manager: TaskManager, stores,
+):
+    from api.services.task_projects import INTEGRATION_BRANCH_FIELD
+
+    sessions, transcripts = stores
+    service = ProjectTaskService(manager, sessions, transcripts)
+    parent = manager.create("Synthetic preset-branch project", tags=["codex"])
+    manager.create("Synthetic preset-branch child", fields={"parent_id": parent.id})
+    manager.update(
+        parent.id,
+        fields={INTEGRATION_BRANCH_FIELD: "feat/operator-chosen-deadbeef"},
+        _skip_project_validation=True,
+    )
+
+    service.plan_and_delegate(parent.id, operation_id="op-branch-2")
+
+    linked = manager.get(parent.id)
+    assert linked.fields[INTEGRATION_BRANCH_FIELD] == "feat/operator-chosen-deadbeef"
+
+
+def test_integration_branch_field_is_guarded_from_ordinary_updates(manager: TaskManager):
+    from api.services.task_projects import INTEGRATION_BRANCH_FIELD
+
+    task = manager.create("Synthetic guarded task", tags=["codex"])
+
+    with pytest.raises(ProjectConflictError, match="explicit project lifecycle"):
+        manager.update(task.id, fields={INTEGRATION_BRANCH_FIELD: "feat/forged-deadbeef"})
+    with pytest.raises(ProjectConflictError, match="explicit project lifecycle"):
+        manager.create(
+            "Synthetic guarded create",
+            fields={INTEGRATION_BRANCH_FIELD: "feat/forged-deadbeef"},
+        )
+
+
 def test_coordinator_view_streams_only_the_bounded_transcript_tail(
     manager: TaskManager, stores, monkeypatch,
 ):
