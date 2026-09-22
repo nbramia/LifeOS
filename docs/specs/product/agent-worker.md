@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-09-20
+> **Last Updated:** 2026-09-22
 
 LifeOS includes an external **agent worker** that picks up engine-assigned tasks and completes them autonomously — running locally on a self-hosted LLM or on Anthropic's Managed Agents cloud, with budget caps you can specify in the task title and full audit transcripts on every run. When the agent finishes (or gets stuck), it notifies you on Telegram. If it has a question mid-run, it asks via Telegram and waits for your reply.
 
@@ -115,6 +115,16 @@ coordinator `working_dir` remains authoritative. Its optional project-affinity
 fallback selects only an existing local directory on the API host; remote CLI
 coordinators start in the remote host's default directory unless they have an
 explicit path.
+
+The first time a project gets a persistent owner — its first **Plan and
+delegate**, or `lifeos_agent_project_handoff` activation — it also records a
+deterministic integration branch name, following the same branch-naming
+convention every other coding change in the repository uses. Every coding
+child of that project then branches off, and opens its pull request into,
+that integration branch instead of `main` — see [Isolated worktree for coding
+sessions](#what-the-agent-cant-do) above. A project with no recorded integration branch
+(including any operator-owned project, which never gets one) behaves exactly
+as before: children branch off and PR into `main`.
 
 Project completion is explicit. All children must be done or cancelled, no
 review may remain unaccepted, no coordinator may be live, and no cancellation
@@ -268,7 +278,7 @@ The agent runs with the operator's full filesystem and shell access — no sandb
 2. **Daily $-cap** — backstop against runaway loops; pauses all new claims when crossed.
 3. **Per-task budgets** — enforced from outside the agent loop, so the model can't override them.
 4. **Telegram notification on every terminal state** — you find out quickly if something runs that shouldn't have.
-5. **Isolated worktree for coding sessions** — a Claude Code or Codex task that touches a git repository always runs in its own worktree on a fresh branch, off the current `main`, never in your primary checkout — the same working tree the production server runs from — even when the task is pinned to a remote host, where the worktree lives (and gets pushed/opened as a PR) on that host, not silently skipped. The session is told this and expected to commit its work; its completion summary becomes the public pull request description, so it's told that must carry no personal data — the worker also scrubs anything shaped like a bot token, API key, or other credential from it before publishing, as a backstop. When it reports the task fully done, the worker pushes the branch and opens a pull request for you — the completion notification carries its PR link, or says plainly if the push/PR failed or there was nothing to push. When it pauses to ask you something first — Claude Code's own question convention, or Codex's `[CLARIFY]` marker — the worker pushes what's committed so far (no pull request yet), the branch name rides along with the question, and the card moves to your Human queue until you answer. If the session itself leaves anything uncommitted when it stops for any reason, the worker commits and pushes that too, rather than letting it sit lost in a directory you'll never look at.
+5. **Isolated worktree for coding sessions** — a Claude Code or Codex task that touches a git repository always runs in its own worktree on a fresh branch, off the current `main`, never in your primary checkout — the same working tree the production server runs from — even when the task is pinned to a remote host, where the worktree lives (and gets pushed/opened as a PR) on that host, not silently skipped. A coding child of a project with a recorded integration branch (see [Projects and independently assigned children](#projects-and-independently-assigned-children)) branches off that branch instead of `main`, and opens its pull request into it — lazily created on the remote the first time a child needs it, so two children provisioned at nearly the same moment both succeed. The session is told this and expected to commit its work; its completion summary becomes the public pull request description, so it's told that must carry no personal data — the worker also scrubs anything shaped like a bot token, API key, or other credential from it before publishing, as a backstop. When it reports the task fully done, the worker pushes the branch and opens a pull request for you — the completion notification carries its PR link, or says plainly if the push/PR failed or there was nothing to push. When it pauses to ask you something first — Claude Code's own question convention, or Codex's `[CLARIFY]` marker — the worker pushes what's committed so far (no pull request yet), the branch name rides along with the question, and the card moves to your Human queue until you answer. If the session itself leaves anything uncommitted when it stops for any reason, the worker commits and pushes that too, rather than letting it sit lost in a directory you'll never look at.
 6. **Private, short-lived session files** — every board session receives its own private temporary directory instead of sharing a general-purpose temp location with other processes. Files created there, including copied authentication material, are removed when the session completes, fails, exceeds its budget, is killed or cancelled, or times out waiting for clarification. Coding worktrees are removed after their pull request merges or their card is accepted/cancelled. Cleanup commits and pushes any leftover work before removal, never removes the primary checkout or an operator-created worktree, and leaves remote branch deletion to the git host's policy.
 
 Operators should still audit handed-off tasks before they reach the worker (your task list is the queue), keep budgets set, and treat agent-touchable secrets the same as operator-touchable secrets.

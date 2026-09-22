@@ -4,8 +4,11 @@ A board-dispatched Claude Code or Codex session must never run directly
 inside the primary checkout — the working tree the production API server
 runs from. Before such a session starts, :func:`ensure_worktree` gives it
 an isolated worktree on a fresh branch, off a freshly-fetched
-``origin/<default-branch>``, so the session can commit, push, and open a
-pull request the way every other change in this project is made.
+``origin/<default-branch>`` — or, for a coding child of a project with a
+recorded integration branch, off that branch instead, lazily creating it
+on origin first if it doesn't exist yet — so the session can commit, push,
+and open a pull request the way every other change in this project is
+made.
 
 Provisioning is deterministic on (repository, task id): both the worktree
 path and the branch name are pure functions of the two. Re-provisioning
@@ -439,6 +442,42 @@ def _local_branch_exists(toplevel: str, branch: str, *, runner: Optional[Runner]
     return result.returncode == 0
 
 
+def _remote_branch_exists(toplevel: str, branch: str, *, runner: Optional[Runner], timeout: int) -> bool:
+    """True when ``origin/<branch>`` is present in this checkout's own
+    remote-tracking refs (checked after a fetch, so this reflects origin's
+    current state, not a stale local view)."""
+    result = _run(
+        ["git", "rev-parse", "--verify", "-q", f"origin/{branch}"],
+        cwd=toplevel, runner=runner, timeout=timeout,
+    )
+    return result.returncode == 0
+
+
+def _ensure_remote_branch(
+    toplevel: str, branch: str, default_branch: str, *, runner: Optional[Runner], timeout: int,
+) -> None:
+    """Make sure ``origin/<branch>`` exists — a project's integration
+    branch — creating it off the current ``origin/<default_branch>`` when
+    it doesn't. Two callers racing to create the same branch at nearly the
+    same moment both succeed: the push itself is allowed to fail (the ref
+    already exists, or a concurrent push wins the race) — only "the ref is
+    still missing after a re-fetch" is treated as a real failure, since
+    that's the only outcome a genuine push-rights or connectivity problem
+    produces.
+    """
+    if _remote_branch_exists(toplevel, branch, runner=runner, timeout=timeout):
+        return
+    _run(
+        ["git", "push", "origin", f"origin/{default_branch}:refs/heads/{branch}"],
+        cwd=toplevel, runner=runner, timeout=timeout,
+    )
+    fetch = _run(["git", "fetch", "origin"], cwd=toplevel, runner=runner, timeout=timeout)
+    if fetch.returncode != 0:
+        raise WorktreeError(f"git fetch origin failed: {fetch.stderr.strip()}")
+    if not _remote_branch_exists(toplevel, branch, runner=runner, timeout=timeout):
+        raise WorktreeError(f"could not create or find integration branch {branch!r} on origin")
+
+
 def _registered_worktree_branch(
     toplevel: str, worktree_dir: str, *, runner: Optional[Runner], timeout: int,
 ) -> Optional[str]:
@@ -523,6 +562,7 @@ def ensure_worktree(
     title: str,
     *,
     host: Optional[str] = None,
+    base_branch: Optional[str] = None,
     timeout: int = DEFAULT_TIMEOUT,
 ) -> WorktreeResult:
     """Provision (or reuse) an isolated worktree+branch for a CLI-routed
@@ -535,6 +575,17 @@ def ensure_worktree(
     on the machine that will actually run the session — never this
     worker's own filesystem standing in for a remote one. An unregistered
     host raises :class:`WorktreeError` before any command runs.
+
+    ``base_branch``, when given (a project's recorded integration branch),
+    is used as the worktree's base instead of the repository's detected
+    default branch: on fresh provisioning, ``origin/<base_branch>`` is
+    created off the current default branch first if origin doesn't already
+    have it — concurrent callers racing to create it never fail, since only
+    a ref still missing after a re-fetch counts as a real error — and the
+    branch is recorded in the worktree's ownership marker so a later
+    finalize (and any reuse of this same worktree) can recover it. None
+    (the default) preserves today's behavior exactly: the worktree is based
+    on the detected default branch and nothing is recorded.
 
     Returns unchanged behavior (``is_git=False``) when ``working_dir``
     isn't inside a git repository at all. Raises :class:`WorktreeError` on
@@ -569,12 +620,16 @@ def ensure_worktree(
 
     default_branch = _detect_default_branch(toplevel, runner=runner, timeout=timeout)
 
+    if base_branch:
+        _ensure_remote_branch(toplevel, base_branch, default_branch, runner=runner, timeout=timeout)
+    effective_base = base_branch or default_branch
+
     _run(["mkdir", "-p", str(Path(worktree_dir).parent)], runner=runner, timeout=timeout)
 
     if _local_branch_exists(toplevel, branch, runner=runner, timeout=timeout):
         add_cmd = ["git", "worktree", "add", worktree_dir, branch]
     else:
-        add_cmd = ["git", "worktree", "add", "-b", branch, worktree_dir, f"origin/{default_branch}"]
+        add_cmd = ["git", "worktree", "add", "-b", branch, worktree_dir, f"origin/{effective_base}"]
     add = _run(add_cmd, cwd=toplevel, runner=runner, timeout=timeout)
     if add.returncode != 0:
         # Race tolerance: re-read the registry before giving up — see
@@ -601,6 +656,7 @@ def ensure_worktree(
             "worktree_dir": worktree_dir,
             "branch": branch,
             "host": host,
+            "base_branch": base_branch,
             "state": "ready",
             "created_at": int(time.time()),
         },
@@ -758,8 +814,12 @@ def finalize_worktree_session(
     treated as "nothing to commit".
 
     When ``open_pr`` is True and the push succeeded: open a pull request
-    against ``base_branch`` (auto-detected when omitted) whose body leads
-    with the card title, a secret-scrubbed and bounded copy of ``pr_body``
+    against a base branch — ``base_branch`` when the caller passes one,
+    else the base branch recorded in the worktree's own ownership marker
+    (set by `ensure_worktree`'s `base_branch`, e.g. a project's integration
+    branch) when there is one, else the repository's detected default
+    branch — whose body leads with the card title, a secret-scrubbed and
+    bounded copy of ``pr_body``
     (the session's own completion summary), and the branch's commit list —
     reusing one that already exists for the branch, or reporting
     ``nothing_to_push`` when the branch carries no commits beyond its base
@@ -816,8 +876,14 @@ def finalize_worktree_session(
         return result
 
     toplevel = repo_toplevel(working_dir, runner=runner, timeout=timeout)
+    marker = _read_worker_marker(working_dir, runner=runner, timeout=timeout)
+    recorded_base = marker.get("base_branch") if marker else None
     try:
-        base = base_branch or (_detect_default_branch(toplevel, runner=runner, timeout=timeout) if toplevel else None)
+        base = (
+            base_branch
+            or recorded_base
+            or (_detect_default_branch(toplevel, runner=runner, timeout=timeout) if toplevel else None)
+        )
     except WorktreeError as exc:
         return dataclasses.replace(result, error=str(exc))
     if not base:

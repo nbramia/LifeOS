@@ -341,6 +341,109 @@ def test_quiescence_finalization_keeps_parent_in_progress_without_fake_outcome(h
     assert retry["source_session_id"] == source.session_id
 
 
+def test_finalize_handoff_records_the_integration_branch(handoff):
+    from api.services.task_projects import INTEGRATION_BRANCH_FIELD, _integration_branch_name
+
+    manager, store, transcripts, source, ctx = handoff
+    staged = dispatch(ctx, "lifeos_agent_project_handoff", _request())
+    transcripts.append(source.session_id, HANDOFF_QUIESCENT_EVENT, {
+        "operation_id": staged["operation_id"],
+        "attempt_id": source.attempt_id,
+        "turn_id": source.turn_id,
+    })
+    assert store.update_status(
+        source.task_id,
+        STATUS_COMPLETED,
+        attempt_id=source.attempt_id,
+        turn_id=source.turn_id,
+        project=False,
+    )
+
+    result = ProjectTaskService(manager, store, transcripts).finalize_handoff(
+        source.task_id,
+        operation_id=staged["operation_id"],
+        source_session_id=source.session_id,
+        source_attempt_id=source.attempt_id,
+        source_turn_id=source.turn_id,
+    )
+
+    assert result["state"] == "activated"
+    parent = manager.get(source.task_id)
+    assert parent.fields[INTEGRATION_BRANCH_FIELD] == _integration_branch_name(parent)
+
+
+def test_finalize_handoff_integration_branch_never_collides_with_the_sources_own_work_branch(handoff):
+    """The source task keeps its own id after handoff activation, so its
+    own CLI worktree branch (derived from `(description, task.id)`
+    directly) must never equal the recorded integration branch — a
+    collision would hand children the source's own in-flight WIP instead of
+    a fresh branch off the default."""
+    from api.services.agent_worker.git_worktree import derive_branch_name
+    from api.services.task_projects import INTEGRATION_BRANCH_FIELD
+
+    manager, store, transcripts, source, ctx = handoff
+    staged = dispatch(ctx, "lifeos_agent_project_handoff", _request())
+    transcripts.append(source.session_id, HANDOFF_QUIESCENT_EVENT, {
+        "operation_id": staged["operation_id"],
+        "attempt_id": source.attempt_id,
+        "turn_id": source.turn_id,
+    })
+    assert store.update_status(
+        source.task_id,
+        STATUS_COMPLETED,
+        attempt_id=source.attempt_id,
+        turn_id=source.turn_id,
+        project=False,
+    )
+
+    ProjectTaskService(manager, store, transcripts).finalize_handoff(
+        source.task_id,
+        operation_id=staged["operation_id"],
+        source_session_id=source.session_id,
+        source_attempt_id=source.attempt_id,
+        source_turn_id=source.turn_id,
+    )
+
+    parent = manager.get(source.task_id)
+    sources_own_worktree_branch = derive_branch_name(parent.description, parent.id)
+    assert parent.fields[INTEGRATION_BRANCH_FIELD] != sources_own_worktree_branch
+
+
+def test_finalize_handoff_does_not_overwrite_an_existing_integration_branch(handoff):
+    from api.services.task_projects import INTEGRATION_BRANCH_FIELD
+
+    manager, store, transcripts, source, ctx = handoff
+    manager.update(
+        source.task_id,
+        fields={INTEGRATION_BRANCH_FIELD: "feat/operator-chosen-cafebabe"},
+        _skip_project_validation=True,
+    )
+    staged = dispatch(ctx, "lifeos_agent_project_handoff", _request())
+    transcripts.append(source.session_id, HANDOFF_QUIESCENT_EVENT, {
+        "operation_id": staged["operation_id"],
+        "attempt_id": source.attempt_id,
+        "turn_id": source.turn_id,
+    })
+    assert store.update_status(
+        source.task_id,
+        STATUS_COMPLETED,
+        attempt_id=source.attempt_id,
+        turn_id=source.turn_id,
+        project=False,
+    )
+
+    ProjectTaskService(manager, store, transcripts).finalize_handoff(
+        source.task_id,
+        operation_id=staged["operation_id"],
+        source_session_id=source.session_id,
+        source_attempt_id=source.attempt_id,
+        source_turn_id=source.turn_id,
+    )
+
+    parent = manager.get(source.task_id)
+    assert parent.fields[INTEGRATION_BRANCH_FIELD] == "feat/operator-chosen-cafebabe"
+
+
 def test_existing_project_uses_plan_and_cannot_handoff(handoff):
     manager, _store, _transcripts, source, ctx = handoff
     child = manager.create("Pre-existing synthetic child")

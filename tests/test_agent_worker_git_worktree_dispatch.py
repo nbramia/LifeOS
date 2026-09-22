@@ -280,6 +280,95 @@ def test_worktree_provisioning_failure_fails_the_task_closed(tmp_path, monkeypat
     assert session.status == STATUS_FAILED
 
 
+def test_project_child_dispatch_provisions_a_worktree_based_on_the_integration_branch(tmp_path, monkeypatch):
+    """A coding child of a project with a recorded integration branch gets
+    its worktree based on that branch — lazily created on origin off the
+    default branch — instead of the repository's detected default branch."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_hosts", {}, raising=False)
+
+    repo = _init_repo_with_origin(tmp_path, name="repo-project-int")
+    capture = _TaskCaptureExecutor(ExecutorOutcome(status=STATUS_COMPLETED, final_text="done", notifications_sent=1))
+    child_task = {
+        "id": "board-int-child",
+        "description": "fix the thing",
+        "tags": ["agent", "claude"],
+        "fields": {"working_dir": str(repo), "parent_id": "board-int-parent"},
+    }
+    backing_child = {**child_task, "tags": ["agent-running", "claude"]}
+    parent_task = {
+        "id": "board-int-parent",
+        "description": "Synthetic coding project",
+        "notes": "",
+        "child_count": 1,
+        "fields": {"project_integration_branch": "feat/synthetic-project-integration"},
+    }
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        if req.method == "GET" and req.url.path == "/api/tasks/board-int-child":
+            return httpx.Response(200, json=backing_child)
+        if req.method == "GET" and req.url.path == "/api/tasks/board-int-parent":
+            return httpx.Response(200, json=parent_task)
+        if req.method == "GET" and req.url.path == "/api/tasks/board-int-parent/children":
+            return httpx.Response(200, json={"tasks": [backing_child], "total": 1})
+        return httpx.Response(200, json={"tasks": []})
+
+    transport = httpx.MockTransport(handler)
+    client = httpx.Client(transport=transport, base_url="http://api")
+    worker = Worker(
+        api_base="http://api",
+        session_store=SessionStore(db_path=tmp_path / "sessions.db"),
+        conversation_store=ConversationStore(db_path=str(tmp_path / "conversations.db")),
+        transcript_store=TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
+        spend_tracker=SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=100.0),
+        poll_seconds=0.01,
+        telegram_send=lambda text, chat_id=None: True,
+        telegram_send_with_id=lambda text: [1],
+        http_client=client,
+        preflight_caller=lambda prompt: _golden_preflight_reply("claude_code"),
+        claude_code_executor=capture,
+        cli_pool=_SynchronousPool(),
+    )
+    worker.session_store.create(task_id="board-int-child", status="claimed")
+
+    worker._dispatch(child_task)
+
+    assert len(capture.tasks) == 1
+    working_dir = capture.tasks[0]["working_dir"]
+    assert working_dir == worktree_dir_for(str(repo), "board-int-child")
+    ls_remote = _git(repo, "ls-remote", "--heads", "origin", "feat/synthetic-project-integration").stdout
+    assert "feat/synthetic-project-integration" in ls_remote
+    head = _git(Path(working_dir), "rev-parse", "HEAD").stdout.strip()
+    origin_integration = _git(repo, "rev-parse", "origin/feat/synthetic-project-integration").stdout.strip()
+    assert head == origin_integration
+
+
+def test_non_project_child_dispatch_is_unaffected_by_the_integration_branch_feature(tmp_path, monkeypatch):
+    """A task with no parent (or a project with no recorded integration
+    branch) provisions off the detected default branch exactly as today."""
+    from config.settings import settings
+    monkeypatch.setattr(settings, "agent_hosts", {}, raising=False)
+
+    repo = _init_repo_with_origin(tmp_path, name="repo-plain-int")
+    capture = _TaskCaptureExecutor(ExecutorOutcome(status=STATUS_COMPLETED, final_text="done", notifications_sent=1))
+    task = {
+        "id": "board-plain-int",
+        "description": "fix the thing",
+        "tags": ["agent", "claude"],
+        "fields": {"working_dir": str(repo)},
+    }
+    backing_task = {**task, "tags": ["agent-running", "claude"]}
+    worker = _make_worker(tmp_path, backing_task=backing_task, routing="claude_code", claude_code_executor=capture)
+    worker.session_store.create(task_id="board-plain-int", status="claimed")
+
+    worker._dispatch(task)
+
+    working_dir = capture.tasks[0]["working_dir"]
+    head = _git(Path(working_dir), "rev-parse", "HEAD").stdout.strip()
+    origin_main = _git(repo, "rev-parse", "origin/main").stdout.strip()
+    assert head == origin_main
+
+
 def test_resumed_dispatch_reuses_the_same_worktree(tmp_path, monkeypatch):
     """An operator follow-up on an already-branched session reuses the
     worktree/branch recorded on the session's own execution spec — it
