@@ -914,7 +914,7 @@ class Worker:
         # rather than working directory -- the check it guards has no
         # working directory of its own (it runs entirely through `gh api`
         # by repository slug, derived from a child's recorded PR url).
-        self._integration_ahead_cache: dict[str, tuple[float, str]] = {}
+        self._integration_ahead_cache: dict[str, tuple[float, str | None]] = {}
         self._warn_deprecated_settings()
 
     def _project_session_status(
@@ -7260,6 +7260,11 @@ class Worker:
         the owner exactly like any other child event, including the
         diff's own built-in re-baseline (`stale_active`) if the branch
         later gets ahead again -- no separate mechanism needed for either.
+        A branch this repository's documented merge process has already
+        deleted (`repo_branch_exists` returning `False`) is also "merged" --
+        the terminal state, not a check failure -- since a plain compare
+        against an already-deleted head 404s exactly like a genuinely
+        broken check would.
 
         None when there's no coding child pull request recorded yet to
         derive the repository from (nothing was ever merged onto the
@@ -7268,10 +7273,11 @@ class Worker:
         either case this contributes no event this tick, never a false
         "merged", and tries again on a later one.
 
-        Cached per project for `_INTEGRATION_AHEAD_CACHE_SECONDS`: this
-        runs every reconciler tick for every in-flight agent-owned project
-        with a recorded integration branch, and its merge state has no
-        realistic reason to shift within that window.
+        Cached per project for `_INTEGRATION_AHEAD_CACHE_SECONDS`, success
+        or failure alike -- a stuck check (`gh` unavailable, a network
+        outage) redone every tick would otherwise cost a paused or
+        perpetually-busy project two synchronous `gh api` round trips
+        (`DEFAULT_TIMEOUT` each) per tick, forever.
         """
         now = time.time()
         cached = self._integration_ahead_cache.get(project_id)
@@ -7279,7 +7285,7 @@ class Worker:
             return cached[1]
 
         from api.services.agent_worker.git_worktree import (
-            repo_compare_ahead_by, repo_default_branch, repo_slug_from_pr_url,
+            repo_branch_exists, repo_compare_ahead_by, repo_default_branch, repo_slug_from_pr_url,
         )
 
         repo_slug = None
@@ -7300,11 +7306,28 @@ class Worker:
         if repo_slug is None:
             return None
 
+        # `repo_default_branch` runs first, always -- see
+        # `_integration_unmerged_error` (inter_agent.py) for why: its
+        # success independently confirms the repository itself exists,
+        # which is what makes a subsequent 404 from `repo_branch_exists`
+        # unambiguous ("the branch is gone", never "the repository is
+        # gone", which also 404s on the branches endpoint).
         default_branch, error = repo_default_branch(repo_slug, host=host)
         if error or not default_branch:
+            self._integration_ahead_cache[project_id] = (now, None)
             return None
+
+        exists, error = repo_branch_exists(repo_slug, integration_branch, host=host)
+        if error:
+            self._integration_ahead_cache[project_id] = (now, None)
+            return None
+        if exists is False:
+            self._integration_ahead_cache[project_id] = (now, "merged")
+            return "merged"
+
         ahead_by, error = repo_compare_ahead_by(repo_slug, default_branch, integration_branch, host=host)
         if error or ahead_by is None:
+            self._integration_ahead_cache[project_id] = (now, None)
             return None
 
         state = "merged" if ahead_by <= 0 else "active"
@@ -7326,15 +7349,17 @@ class Worker:
         """One project's pass through the wake reconciler's steps 1-6 (see
         `_reconcile_project_owners`). Returns whether an owner wake was
         actually dispatched this pass."""
+        # Only the children part is built here -- cheap, no I/O, already in
+        # hand from this tick's `/api/tasks` fetch. The integration branch's
+        # own state (`_integration_branch_wake_state`) is added further
+        # below, after the paused/owner-live short-circuits: it's a
+        # synchronous `gh api` round trip (or two), and neither a paused
+        # project nor one whose owner is still mid-turn can act on it this
+        # pass regardless -- checking it here would pay that cost every
+        # tick, forever, for a stuck or paused project.
         current_snapshot = {
             child["id"]: owner_state(child) for child in children if child.get("id")
         }
-        if integration_branch:
-            integration_state = self._integration_branch_wake_state(
-                project_id, integration_branch, children=children, outcomes=outcomes,
-            )
-            if integration_state is not None:
-                current_snapshot[_INTEGRATION_PR_EVENT_KEY] = integration_state
         state = self.session_store.ensure_project_owner_state(
             project_id, owner_session_id=owner_session_id, baseline_states=current_snapshot,
         )
@@ -7368,6 +7393,13 @@ class Worker:
                     self._pause_project_for_owner_failure(project_id, title, "owner_failed")
                     return False
                 state = self.session_store.get_project_owner_state(project_id) or state
+
+        if integration_branch:
+            integration_state = self._integration_branch_wake_state(
+                project_id, integration_branch, children=children, outcomes=outcomes,
+            )
+            if integration_state is not None:
+                current_snapshot[_INTEGRATION_PR_EVENT_KEY] = integration_state
 
         acked = state.get("acked_states") or {}
         # A child observed back at `active` re-baselines its acked entry

@@ -1014,6 +1014,51 @@ def repo_default_branch(
     return branch, None
 
 
+# The consistent structural marker `gh api` appends to any GitHub API error
+# it surfaces (`gh: <message> (HTTP <status>)`), regardless of the message
+# text itself -- GitHub's own message for a missing branch varies by
+# endpoint ("Branch not found", a bare "Not Found", ...), so matching this
+# suffix is the reliable signal rather than any particular wording. This is
+# never confused with a missing `gh` binary or a timeout: `_run` reports
+# those as its own synthetic stderr (an `OSError`/`TimeoutExpired` message),
+# which never contains this shape.
+_GH_HTTP_404_MARKER = "(HTTP 404)"
+
+
+def repo_branch_exists(
+    repo_slug: str, branch: str, *, host: Optional[str] = None, runner: Optional[Runner] = None,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> tuple[Optional[bool], Optional[str]]:
+    """Whether ``branch`` currently exists in the remote repository
+    (``gh api repos/{slug}/branches/{branch}``) — the terminal "this
+    repository's documented merge process already deleted the branch"
+    signal a caller comparing an integration branch against the default
+    branch needs: a branch that's gone reads as fully merged, not as a
+    failed check, and a plain commits-ahead compare against a deleted head
+    ref 404s the exact same way a genuinely broken check would.
+
+    ``(True, None)`` when the branch exists; ``(False, None)`` only for a
+    confirmed 404 on the branch endpoint itself (`_GH_HTTP_404_MARKER` in
+    `gh`'s own error text); ``(None, error)`` for anything else — an
+    unresolvable host, a missing `gh` binary, or any other failure — the
+    same fail-closed contract every other helper in this module uses.
+    """
+    try:
+        active = runner or resolve_runner_for_host(host)
+    except WorktreeError as exc:
+        return None, str(exc)
+    result = _run(
+        ["gh", "api", f"repos/{repo_slug}/branches/{branch}"],
+        runner=active, timeout=timeout,
+    )
+    if result.returncode == 0:
+        return True, None
+    stderr = (result.stderr or "").strip()
+    if _GH_HTTP_404_MARKER in stderr:
+        return False, None
+    return None, stderr or f"gh api repos/{repo_slug}/branches/{branch} failed (exit {result.returncode})"
+
+
 def repo_compare_ahead_by(
     repo_slug: str, base: str, head: str, *, host: Optional[str] = None,
     runner: Optional[Runner] = None, timeout: int = DEFAULT_TIMEOUT,
@@ -1157,6 +1202,7 @@ __all__ = [
     "pr_base_and_state",
     "merge_pull_request",
     "repo_default_branch",
+    "repo_branch_exists",
     "repo_compare_ahead_by",
     "list_worker_worktrees",
     "remove_worker_worktree",

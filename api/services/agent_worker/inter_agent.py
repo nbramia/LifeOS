@@ -973,14 +973,29 @@ def _owner_facing_code(code: str) -> str:
 
 
 def _merge_child_pr_into_integration_branch(
-    ctx: InterAgentContext, child: "Task", integration_branch: str,
+    ctx: InterAgentContext, child: "Task", integration_branch: str, project_id: str,
 ) -> dict | None:
     """None when there's nothing to merge (the child recorded no pull
-    request, its base isn't exactly ``integration_branch``, or it's
-    already merged) or a targeted merge just succeeded; an
-    ``_err(..., code="merge_failed")`` payload when a targeted merge was
-    attempted and failed. Never touches a pull request whose base isn't
-    exactly the project's own recorded integration branch."""
+    request, its base isn't exactly ``integration_branch``, it's already
+    merged, or it's closed without having been merged) or a targeted merge
+    just succeeded; an ``_err(..., code="merge_failed")`` payload when a
+    targeted merge was attempted and failed. Never touches a pull request
+    whose base isn't exactly the project's own recorded integration
+    branch.
+
+    A closed-but-unmerged PR (superseded, abandoned) is treated as nothing
+    to merge, not as a failure: `gh` would refuse to merge a closed PR, and
+    returning `merge_failed` for it would make a default `accept_child`
+    call permanently unable to accept that card unless the owner remembers
+    to pass `merge_pull_request=false` every time.
+
+    A successful merge is recorded to the transcript here, independent of
+    whatever the caller's subsequent `accept_review` call does with the
+    card -- a merge that lands and is then followed by an accept failure
+    (a stale card, a store error) must still leave a durable record that
+    the pull request was actually merged, rather than that fact living
+    only in the return value of a call whose accept half then failed.
+    """
     from api.services.agent_worker.git_worktree import merge_pull_request, pr_base_and_state
 
     if ctx.session_store is None:
@@ -998,7 +1013,7 @@ def _merge_child_pr_into_integration_branch(
         return _err(f"could not read {pr_url}: {error}", code="merge_failed")
     if (data or {}).get("baseRefName") != integration_branch:
         return None
-    if (data or {}).get("state") == "MERGED":
+    if (data or {}).get("state") in {"MERGED", "CLOSED"}:
         return None
 
     merged, error = merge_pull_request(pr_url, host=host)
@@ -1007,6 +1022,11 @@ def _merge_child_pr_into_integration_branch(
             f"could not merge {pr_url} into {integration_branch!r}: {error}",
             code="merge_failed",
         )
+    if ctx.transcript_store is not None:
+        ctx.transcript_store.append(ctx.caller_session_id, "project_owner_merge", {
+            "project_id": project_id, "child_task_id": child.id,
+            "pr_url": pr_url, "integration_branch": integration_branch,
+        })
     return None
 
 
@@ -1023,9 +1043,20 @@ def _integration_unmerged_error(
     failure) -- that it couldn't be confirmed. Failing that check closed
     (refusing completion) rather than open matches the contract: it must
     never let a project complete over integration work nobody actually
-    verified merged."""
+    verified merged.
+
+    Checks whether the branch still exists before comparing it against the
+    default branch: this repository's own documented merge process deletes
+    the source branch on merge, and a plain commits-ahead compare against
+    an already-deleted head ref 404s exactly the way a genuinely broken
+    check would. Treating that 404 as an ordinary check failure would
+    refuse completion forever the moment the owner does exactly what the
+    guidance tells it to -- a branch confirmed gone (`repo_branch_exists`
+    returning `False`, never merely a failed check) is instead the
+    terminal "fully merged" state.
+    """
     from api.services.agent_worker.git_worktree import (
-        repo_compare_ahead_by, repo_default_branch, repo_slug_from_pr_url,
+        repo_branch_exists, repo_compare_ahead_by, repo_default_branch, repo_slug_from_pr_url,
     )
     from api.services.task_projects import PARENT_ID_FIELD, clean_parent_id
 
@@ -1048,6 +1079,12 @@ def _integration_unmerged_error(
     if repo_slug is None:
         return None
 
+    # `repo_default_branch` runs first, always -- besides being needed for
+    # the compare below, its success independently confirms the repository
+    # itself exists, which is what makes a subsequent 404 from
+    # `repo_branch_exists` unambiguous ("the branch is gone", never "the
+    # repository is gone", which also 404s on the branches endpoint and
+    # must never be read as "fully merged").
     default_branch, error = repo_default_branch(repo_slug, host=host)
     if error or not default_branch:
         return _err(
@@ -1055,6 +1092,16 @@ def _integration_unmerged_error(
             f"{integration_branch!r} is merged: {error or 'no branch returned'}",
             code="integration_unmerged",
         )
+
+    exists, error = repo_branch_exists(repo_slug, integration_branch, host=host)
+    if error:
+        return _err(
+            f"could not confirm whether {integration_branch!r} still exists in {repo_slug}: {error}",
+            code="integration_unmerged",
+        )
+    if exists is False:
+        return None
+
     ahead_by, error = repo_compare_ahead_by(repo_slug, default_branch, integration_branch, host=host)
     if error or ahead_by is None:
         return _err(
@@ -1183,7 +1230,9 @@ def project_owner(ctx: InterAgentContext, args: dict) -> dict:
         merge_pull_request_flag = True if merge_pull_request_flag is None else bool(merge_pull_request_flag)
         integration_branch = (project.fields.get(INTEGRATION_BRANCH_FIELD) or "").strip()
         if merge_pull_request_flag and integration_branch:
-            merge_error = _merge_child_pr_into_integration_branch(ctx, child, integration_branch)
+            merge_error = _merge_child_pr_into_integration_branch(
+                ctx, child, integration_branch, project_id,
+            )
             if merge_error is not None:
                 return merge_error
 

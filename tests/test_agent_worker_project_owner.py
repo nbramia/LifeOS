@@ -976,6 +976,10 @@ class TestIntegrationBranchMergeWakesTheOwner:
             lambda slug, **kw: ("main", None),
         )
         monkeypatch.setattr(
+            "api.services.agent_worker.git_worktree.repo_branch_exists",
+            lambda slug, branch, **kw: (True, None),
+        )
+        monkeypatch.setattr(
             "api.services.agent_worker.git_worktree.repo_compare_ahead_by",
             lambda slug, base, head, **kw: (2, None),
         )
@@ -996,6 +1000,10 @@ class TestIntegrationBranchMergeWakesTheOwner:
         monkeypatch.setattr(
             "api.services.agent_worker.git_worktree.repo_default_branch",
             lambda slug, **kw: ("main", None),
+        )
+        monkeypatch.setattr(
+            "api.services.agent_worker.git_worktree.repo_branch_exists",
+            lambda slug, branch, **kw: (True, None),
         )
         monkeypatch.setattr(
             "api.services.agent_worker.git_worktree.repo_compare_ahead_by",
@@ -1019,6 +1027,51 @@ class TestIntegrationBranchMergeWakesTheOwner:
         assert "feat/integration-abc123" in pending[0]["content"]
         assert "→merged" in pending[0]["content"]
 
+    def test_branch_deleted_wakes_the_owner_as_merged(self, tmp_path, monkeypatch):
+        """This repository's documented merge process deletes the source
+        branch once it's merged. A confirmed-deleted branch is the
+        terminal "merged" state and must still produce the wake event --
+        the merge and the delete happen in the same run, so there is no
+        separate "merged but still present" tick to catch."""
+        w, api, owner = _setup(tmp_path, children=[
+            _child("c1", "p1", "Coding child", status="done", tags=["codex", "accepted"]),
+        ])
+        self._seed(w, api)
+        monkeypatch.setattr(
+            "api.services.agent_worker.git_worktree.repo_default_branch",
+            lambda slug, **kw: ("main", None),
+        )
+        monkeypatch.setattr(
+            "api.services.agent_worker.git_worktree.repo_branch_exists",
+            lambda slug, branch, **kw: (True, None),
+        )
+        monkeypatch.setattr(
+            "api.services.agent_worker.git_worktree.repo_compare_ahead_by",
+            lambda slug, base, head, **kw: (2, None),
+        )
+        # Baseline pass: still ahead, branch still present.
+        assert w._reconcile_project_owners() == 0
+
+        w._integration_ahead_cache.clear()
+        monkeypatch.setattr(
+            "api.services.agent_worker.git_worktree.repo_branch_exists",
+            lambda slug, branch, **kw: (False, None),
+        )
+
+        def unexpected_compare(*args, **kwargs):
+            raise AssertionError("a confirmed-deleted branch has nothing left to compare")
+
+        monkeypatch.setattr(
+            "api.services.agent_worker.git_worktree.repo_compare_ahead_by", unexpected_compare,
+        )
+        assert w._reconcile_project_owners() == 0  # anchor just set, window not elapsed
+        _age_anchor(w, "p1", 31)
+
+        assert w._reconcile_project_owners() == 1
+        pending = w.session_store.peek_pending_messages(owner.session_id)
+        assert len(pending) == 1
+        assert "→merged" in pending[0]["content"]
+
     def test_no_coding_child_pr_recorded_yet_never_wakes(self, tmp_path, monkeypatch):
         from api.services.task_projects import INTEGRATION_BRANCH_FIELD
 
@@ -1027,17 +1080,30 @@ class TestIntegrationBranchMergeWakesTheOwner:
         ])
         api.tasks["p1"]["fields"][INTEGRATION_BRANCH_FIELD] = "feat/integration-abc123"
 
-        def unexpected_call(*args, **kwargs):
-            raise AssertionError("no coding-child PR on record -- must never call gh at all")
+        # `_reconcile_project_owners()` catches and logs any exception one
+        # project's reconciliation raises rather than letting it propagate
+        # (see `TestReconcilerIsolatesPerProjectFailures`) -- an
+        # exception-raising stub here would be silently swallowed and this
+        # test would pass whether or not the forbidden call actually
+        # happened. A call-count list is the binding check.
+        calls: list[str] = []
+
+        def record_call(*args, **kwargs):
+            calls.append("called")
+            return None, "should never run"
 
         monkeypatch.setattr(
-            "api.services.agent_worker.git_worktree.repo_default_branch", unexpected_call,
+            "api.services.agent_worker.git_worktree.repo_default_branch", record_call,
         )
         monkeypatch.setattr(
-            "api.services.agent_worker.git_worktree.repo_compare_ahead_by", unexpected_call,
+            "api.services.agent_worker.git_worktree.repo_branch_exists", record_call,
+        )
+        monkeypatch.setattr(
+            "api.services.agent_worker.git_worktree.repo_compare_ahead_by", record_call,
         )
 
         assert w._reconcile_project_owners() == 0
+        assert calls == []
         state = w.session_store.get_project_owner_state("p1")
         assert "_integration_pr" not in (state["acked_states"] or {})
 
@@ -1055,6 +1121,141 @@ class TestIntegrationBranchMergeWakesTheOwner:
         assert not w.session_store.has_pending_messages(owner.session_id)
         state = w.session_store.get_project_owner_state("p1")
         assert "_integration_pr" not in (state["acked_states"] or {})
+
+    def test_network_error_confirming_branch_existence_contributes_no_event(
+        self, tmp_path, monkeypatch,
+    ):
+        """The default branch resolves fine, but the branch-existence probe
+        itself fails (a network blip, not a confirmed 404) -- this must
+        never fall through to compare, and must never claim "merged"."""
+        w, api, owner = _setup(tmp_path, children=[
+            _child("c1", "p1", "Coding child", status="done", tags=["codex", "accepted"]),
+        ])
+        self._seed(w, api)
+        monkeypatch.setattr(
+            "api.services.agent_worker.git_worktree.repo_default_branch",
+            lambda slug, **kw: ("main", None),
+        )
+        monkeypatch.setattr(
+            "api.services.agent_worker.git_worktree.repo_branch_exists",
+            lambda slug, branch, **kw: (None, "connection reset by peer"),
+        )
+
+        # A raising stub would be silently swallowed by the per-project
+        # try/except in `_reconcile_project_owners()` (it logs and
+        # continues, contributing 0 to the woken count either way) --
+        # a call-count list is the only binding way to assert "never
+        # reached", the same reasoning as `test_no_coding_child_pr_
+        # recorded_yet_never_wakes`.
+        compare_calls: list[str] = []
+
+        def record_compare(*args, **kwargs):
+            compare_calls.append("called")
+            return None, "should never run"
+
+        monkeypatch.setattr(
+            "api.services.agent_worker.git_worktree.repo_compare_ahead_by", record_compare,
+        )
+
+        assert w._reconcile_project_owners() == 0
+        assert compare_calls == []
+        assert not w.session_store.has_pending_messages(owner.session_id)
+        state = w.session_store.get_project_owner_state("p1")
+        assert "_integration_pr" not in (state["acked_states"] or {})
+
+    def test_a_failed_check_is_cached_for_the_same_window(self, tmp_path, monkeypatch):
+        """A stuck check (`gh` unavailable, a network outage) must not be
+        retried every tick -- caching a failure the same way a success is
+        cached is what keeps a paused or perpetually-busy project from
+        paying two synchronous `gh api` round trips per tick forever."""
+        w, api, owner = _setup(tmp_path, children=[
+            _child("c1", "p1", "Coding child", status="done", tags=["codex", "accepted"]),
+        ])
+        self._seed(w, api)
+        calls = []
+
+        def failing_default_branch(slug, **kw):
+            calls.append(slug)
+            return None, "gh: command not found"
+
+        monkeypatch.setattr(
+            "api.services.agent_worker.git_worktree.repo_default_branch", failing_default_branch,
+        )
+
+        assert w._reconcile_project_owners() == 0
+        assert len(calls) == 1
+
+        # A second reconcile pass within the cache window must not re-check,
+        # even though nothing about the owner/child state changed.
+        assert w._reconcile_project_owners() == 0
+        assert len(calls) == 1
+
+    def test_integration_check_is_skipped_while_the_owner_is_still_mid_turn(
+        self, tmp_path, monkeypatch,
+    ):
+        """A busy owner can't act on a wake this pass regardless -- the
+        expensive remote check must not run until the owner is idle, so a
+        perpetually-busy project never pays it every tick."""
+        w, api, owner = _setup(
+            tmp_path, children=[
+                _child("c1", "p1", "Coding child", status="done", tags=["codex", "accepted"]),
+            ],
+            owner_status=STATUS_CLAIMED,
+        )
+        self._seed(w, api)
+
+        # See `test_no_coding_child_pr_recorded_yet_never_wakes` -- a
+        # raising stub here would be silently swallowed by the per-project
+        # try/except in `_reconcile_project_owners()`, so a call-count list
+        # is the only binding way to assert "never called."
+        calls: list[str] = []
+
+        def record_call(*args, **kwargs):
+            calls.append("called")
+            return None, "should never run"
+
+        monkeypatch.setattr(
+            "api.services.agent_worker.git_worktree.repo_default_branch", record_call,
+        )
+        monkeypatch.setattr(
+            "api.services.agent_worker.git_worktree.repo_branch_exists", record_call,
+        )
+        monkeypatch.setattr(
+            "api.services.agent_worker.git_worktree.repo_compare_ahead_by", record_call,
+        )
+
+        assert w._reconcile_project_owners() == 0
+        assert calls == []
+
+    def test_integration_check_is_skipped_while_the_project_is_paused(
+        self, tmp_path, monkeypatch,
+    ):
+        w, api, owner = _setup(
+            tmp_path, children=[
+                _child("c1", "p1", "Coding child", status="done", tags=["codex", "accepted"]),
+            ],
+            paused=True,
+        )
+        self._seed(w, api)
+
+        calls: list[str] = []
+
+        def record_call(*args, **kwargs):
+            calls.append("called")
+            return None, "should never run"
+
+        monkeypatch.setattr(
+            "api.services.agent_worker.git_worktree.repo_default_branch", record_call,
+        )
+        monkeypatch.setattr(
+            "api.services.agent_worker.git_worktree.repo_branch_exists", record_call,
+        )
+        monkeypatch.setattr(
+            "api.services.agent_worker.git_worktree.repo_compare_ahead_by", record_call,
+        )
+
+        assert w._reconcile_project_owners() == 0
+        assert calls == []
 
 
 # ---------------------------------------------------------------------------

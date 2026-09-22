@@ -2,7 +2,8 @@
 the project owner's merge-on-accept and completion gate (see
 `test_agent_project_owner_review.py`, which exercises them through
 `lifeos_agent_project_owner`): `repo_slug_from_pr_url`, `pr_base_and_state`,
-`merge_pull_request`, `repo_default_branch`, and `repo_compare_ahead_by`.
+`merge_pull_request`, `repo_default_branch`, `repo_branch_exists`, and
+`repo_compare_ahead_by`.
 
 None of these need a local git checkout — every `gh` call is either given a
 full pull request URL (which `gh` resolves the repository from itself) or an
@@ -18,6 +19,7 @@ import pytest
 from api.services.agent_worker.git_worktree import (
     merge_pull_request,
     pr_base_and_state,
+    repo_branch_exists,
     repo_compare_ahead_by,
     repo_default_branch,
     repo_slug_from_pr_url,
@@ -123,6 +125,42 @@ def test_repo_default_branch_empty_output_is_an_error():
     assert error
 
 
+def test_repo_branch_exists_true_on_success():
+    runner = _FakeRunner(result=subprocess.CompletedProcess([], returncode=0, stdout="{}", stderr=""))
+    exists, error = repo_branch_exists("acme/widgets", "feat/integration-abc123", runner=runner)
+    assert exists is True
+    assert error is None
+    assert runner.calls[0][:2] == ["gh", "api"]
+    assert runner.calls[0][2] == "repos/acme/widgets/branches/feat/integration-abc123"
+
+
+def test_repo_branch_exists_false_on_confirmed_404():
+    runner = _FakeRunner(result=subprocess.CompletedProcess(
+        [], returncode=1, stdout="", stderr="gh: Branch not found (HTTP 404)",
+    ))
+    exists, error = repo_branch_exists("acme/widgets", "feat/integration-abc123", runner=runner)
+    assert exists is False
+    assert error is None
+
+
+def test_repo_branch_exists_other_failure_is_a_genuine_error_not_false():
+    """A non-404 failure (auth, rate limit, a generic 500) must surface as
+    an error -- never silently read as "the branch doesn't exist"."""
+    runner = _FakeRunner(result=subprocess.CompletedProcess(
+        [], returncode=1, stdout="", stderr="gh: Bad credentials (HTTP 401)",
+    ))
+    exists, error = repo_branch_exists("acme/widgets", "feat/integration-abc123", runner=runner)
+    assert exists is None
+    assert error
+
+
+def test_repo_branch_exists_missing_gh_fails_closed():
+    runner = _FakeRunner(raise_missing=True)
+    exists, error = repo_branch_exists("acme/widgets", "feat/integration-abc123", runner=runner)
+    assert exists is None
+    assert error
+
+
 def test_repo_compare_ahead_by_parses_int():
     runner = _FakeRunner(result=subprocess.CompletedProcess([], returncode=0, stdout="3\n", stderr=""))
     ahead_by, error = repo_compare_ahead_by("acme/widgets", "main", "feat/integration-abc123", runner=runner)
@@ -152,4 +190,7 @@ def test_unresolvable_host_fails_closed_before_any_command_runs():
     back to a local runner that would operate on the wrong machine."""
     merged, error = merge_pull_request("https://github.com/acme/widgets/pull/9", host="nonexistent-host")
     assert merged is False
+    assert error
+    exists, error = repo_branch_exists("acme/widgets", "feat/integration-abc123", host="nonexistent-host")
+    assert exists is None
     assert error

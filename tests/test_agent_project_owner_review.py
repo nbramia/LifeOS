@@ -609,6 +609,63 @@ class TestMergeOnAccept:
 
         assert result["ok"] is True
 
+    def test_closed_unmerged_pr_is_treated_as_nothing_to_merge(self, env, monkeypatch):
+        """`gh` would refuse to merge a closed PR -- treating that as
+        `merge_failed` would make a default `accept_child` call
+        permanently unable to accept the card unless the owner remembered
+        `merge_pull_request=false` every time."""
+        manager, store, transcripts = env
+        project_id, child_id, owner = _make_project(manager, store)
+        _set_integration_branch(manager, project_id, "feat/integration-abc123")
+        _record_pr(store, child_id, "https://github.com/acme/widgets/pull/9")
+
+        monkeypatch.setattr(
+            git_worktree, "pr_base_and_state",
+            lambda pr_url, **kw: ({"baseRefName": "feat/integration-abc123", "state": "CLOSED"}, None),
+        )
+
+        def unexpected_merge(pr_url, **kw):
+            raise AssertionError("a closed, unmerged PR must never be merged")
+
+        monkeypatch.setattr(git_worktree, "merge_pull_request", unexpected_merge)
+        ctx = _ctx(store, transcripts, manager, owner)
+
+        result = _call(ctx, action="accept_child", project_id=project_id, child_task_id=child_id)
+
+        assert result["ok"] is True
+        assert manager.get(child_id).status == "done"
+        assert "accepted" in manager.get(child_id).tags
+
+    def test_a_successful_merge_is_recorded_independent_of_the_accept_outcome(
+        self, env, monkeypatch,
+    ):
+        """A merge that lands must leave a durable transcript record even
+        when the accept step right after it somehow fails -- the record of
+        the pull request actually being merged must never live only in the
+        return value of a call whose accept half then failed."""
+        manager, store, transcripts = env
+        project_id, child_id, owner = _make_project(manager, store)
+        _set_integration_branch(manager, project_id, "feat/integration-abc123")
+        _record_pr(store, child_id, "https://github.com/acme/widgets/pull/9")
+
+        monkeypatch.setattr(
+            git_worktree, "pr_base_and_state",
+            lambda pr_url, **kw: ({"baseRefName": "feat/integration-abc123", "state": "OPEN"}, None),
+        )
+        monkeypatch.setattr(git_worktree, "merge_pull_request", lambda pr_url, **kw: (True, None))
+        ctx = _ctx(store, transcripts, manager, owner)
+
+        result = _call(ctx, action="accept_child", project_id=project_id, child_task_id=child_id)
+
+        assert result["ok"] is True
+        events = [e for e in transcripts.iter_events(owner.session_id) if e.get("kind") == "project_owner_merge"]
+        assert len(events) == 1
+        payload = events[0]["payload"]
+        assert payload["project_id"] == project_id
+        assert payload["child_task_id"] == child_id
+        assert payload["pr_url"] == "https://github.com/acme/widgets/pull/9"
+        assert payload["integration_branch"] == "feat/integration-abc123"
+
 
 class TestIntegrationUnmergedCompletionGate:
     def test_refuses_completion_while_the_integration_branch_is_ahead(self, env, monkeypatch):
@@ -619,6 +676,7 @@ class TestIntegrationUnmergedCompletionGate:
         accept_review(manager, child_id, reviewer=f"owner:{owner.session_id}")
 
         monkeypatch.setattr(git_worktree, "repo_default_branch", lambda slug, **kw: ("main", None))
+        monkeypatch.setattr(git_worktree, "repo_branch_exists", lambda slug, branch, **kw: (True, None))
         monkeypatch.setattr(
             git_worktree, "repo_compare_ahead_by", lambda slug, base, head, **kw: (3, None),
         )
@@ -639,9 +697,37 @@ class TestIntegrationUnmergedCompletionGate:
         accept_review(manager, child_id, reviewer=f"owner:{owner.session_id}")
 
         monkeypatch.setattr(git_worktree, "repo_default_branch", lambda slug, **kw: ("main", None))
+        monkeypatch.setattr(git_worktree, "repo_branch_exists", lambda slug, branch, **kw: (True, None))
         monkeypatch.setattr(
             git_worktree, "repo_compare_ahead_by", lambda slug, base, head, **kw: (0, None),
         )
+        ctx = _ctx(store, transcripts, manager, owner)
+
+        result = _call(ctx, action="complete_project", project_id=project_id)
+
+        assert result["ok"] is True
+        assert manager.get(project_id).status == "done"
+
+    def test_completes_once_the_integration_branch_has_been_deleted(self, env, monkeypatch):
+        """This repository's documented merge process deletes the source
+        branch once it's merged (`scripts/candidate_publisher.py`'s
+        `delete_source`). A branch confirmed gone is the terminal "fully
+        merged" state, not a check failure -- otherwise the moment the
+        owner does exactly what the guidance tells it to, completion would
+        refuse forever with an unrecoverable `integration_unmerged`."""
+        manager, store, transcripts = env
+        project_id, child_id, owner = _make_project(manager, store)
+        _set_integration_branch(manager, project_id, "feat/integration-abc123")
+        _record_pr(store, child_id, "https://github.com/acme/widgets/pull/9")
+        accept_review(manager, child_id, reviewer=f"owner:{owner.session_id}")
+
+        monkeypatch.setattr(git_worktree, "repo_default_branch", lambda slug, **kw: ("main", None))
+        monkeypatch.setattr(git_worktree, "repo_branch_exists", lambda slug, branch, **kw: (False, None))
+
+        def unexpected_compare(*args, **kwargs):
+            raise AssertionError("a confirmed-deleted branch has nothing left to compare")
+
+        monkeypatch.setattr(git_worktree, "repo_compare_ahead_by", unexpected_compare)
         ctx = _ctx(store, transcripts, manager, owner)
 
         result = _call(ctx, action="complete_project", project_id=project_id)
@@ -662,6 +748,7 @@ class TestIntegrationUnmergedCompletionGate:
             raise AssertionError("no coding-child PR on record -- the gate must not call gh at all")
 
         monkeypatch.setattr(git_worktree, "repo_default_branch", unexpected_call)
+        monkeypatch.setattr(git_worktree, "repo_branch_exists", unexpected_call)
         monkeypatch.setattr(git_worktree, "repo_compare_ahead_by", unexpected_call)
         ctx = _ctx(store, transcripts, manager, owner)
 
@@ -689,6 +776,35 @@ class TestIntegrationUnmergedCompletionGate:
         assert result["error"] == "integration_unmerged"
         assert manager.get(project_id).status != "done"
 
+    def test_network_error_confirming_branch_existence_still_refuses(self, env, monkeypatch):
+        """The default branch resolves fine (the repository exists), but
+        the branch-existence probe itself fails (a network blip, not a
+        confirmed 404) -- this must still refuse, never quietly treat an
+        unconfirmed check as "the branch is gone"."""
+        manager, store, transcripts = env
+        project_id, child_id, owner = _make_project(manager, store)
+        _set_integration_branch(manager, project_id, "feat/integration-abc123")
+        _record_pr(store, child_id, "https://github.com/acme/widgets/pull/9")
+        accept_review(manager, child_id, reviewer=f"owner:{owner.session_id}")
+
+        monkeypatch.setattr(git_worktree, "repo_default_branch", lambda slug, **kw: ("main", None))
+        monkeypatch.setattr(
+            git_worktree, "repo_branch_exists",
+            lambda slug, branch, **kw: (None, "connection reset by peer"),
+        )
+
+        def unexpected_compare(*args, **kwargs):
+            raise AssertionError("an unconfirmed existence check must not fall through to compare")
+
+        monkeypatch.setattr(git_worktree, "repo_compare_ahead_by", unexpected_compare)
+        ctx = _ctx(store, transcripts, manager, owner)
+
+        result = _call(ctx, action="complete_project", project_id=project_id)
+
+        assert result["ok"] is False
+        assert result["error"] == "integration_unmerged"
+        assert manager.get(project_id).status != "done"
+
     def test_no_integration_branch_skips_the_gate(self, env, monkeypatch):
         """A project with no recorded integration branch at all is
         unaffected by this gate."""
@@ -700,6 +816,7 @@ class TestIntegrationUnmergedCompletionGate:
             raise AssertionError("a project with no integration branch has nothing to check")
 
         monkeypatch.setattr(git_worktree, "repo_default_branch", unexpected_call)
+        monkeypatch.setattr(git_worktree, "repo_branch_exists", unexpected_call)
         monkeypatch.setattr(git_worktree, "repo_compare_ahead_by", unexpected_call)
         ctx = _ctx(store, transcripts, manager, owner)
 
