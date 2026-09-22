@@ -240,6 +240,87 @@ def test_operator_kill_signals_local_claude_code_subprocess(client, stores, monk
     assert "local_subprocess_killed" in child_kinds
 
 
+@pytest.mark.unit
+def test_operator_kill_resolves_a_worker_spawned_cli_session_by_its_transcript_id(
+    client, stores, monkeypatch,
+):
+    """A worker-spawned `claude_code`/`codex` session runs headless (no
+    wezterm pane), so it never registers a `cli_sessions` row — the board
+    shows it under its CLI transcript's own `cc:`/`cx:`-prefixed id instead
+    (`session_ingest.CC_PREFIX`). Killing THAT id must resolve back to the
+    `sessions` row that actually owns the subprocess (via
+    `claude_code_session_id`) and tear it down exactly like killing the
+    `sessions` row directly would — same subprocess signal, same terminal
+    state, same transcript events."""
+    import signal as _signal
+
+    session_store, transcript_store = stores
+    parent = session_store.create(task_id="cc-worker", status=STATUS_RUNNING, routing="claude_code")
+    session_store.set_claude_code_session_id(parent.task_id, "transcript-uuid-1")
+    transcript_store.append(parent.session_id, "claude_code_pid", {"pid": 6161, "pgid": 6161})
+
+    killpg_calls: list[tuple[int, int]] = []
+    # Same seam `test_operator_kill_signals_local_claude_code_subprocess`
+    # stubs: `os.kill`/`os.killpg` are the only OS-level calls the local
+    # subprocess teardown makes, so stubbing them is enough to prove the
+    # process-kill path actually ran without needing a real subprocess.
+    monkeypatch.setattr(inter_agent.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(inter_agent.os, "killpg", lambda pgid, sig: killpg_calls.append((pgid, sig)))
+    monkeypatch.setattr(inter_agent, "_LOCAL_KILL_GRACE_S", 0.0)
+
+    r = client.post("/api/agents/sessions/cc:transcript-uuid-1/kill", json={"reason": "runaway"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["killed"] == [parent.session_id]
+    assert body["failures"] == []
+
+    signalled_pgids = {pgid for pgid, _sig in killpg_calls}
+    assert signalled_pgids == {6161}
+    assert _signal.SIGTERM in {sig for _pgid, sig in killpg_calls}
+    assert _signal.SIGKILL in {sig for _pgid, sig in killpg_calls}
+
+    # Same terminal state + lifecycle event a killed local session gets.
+    assert session_store.get_by_session_id(parent.session_id).status == STATUS_FAILED
+    kinds = [e["kind"] for e in transcript_store.read(parent.session_id)]
+    assert "operator_killed" in kinds
+    assert "local_subprocess_killed" in kinds
+
+
+@pytest.mark.unit
+def test_operator_kill_reports_already_terminal_for_a_resolved_cli_transcript_id(
+    client, stores, monkeypatch,
+):
+    """The resolved worker session may already be terminal (the subprocess
+    finished between the board's last snapshot and the kill click) — the
+    same `already <status>` short-circuit the direct `sessions`-row path
+    takes, with no kill attempted."""
+    session_store, _transcript_store = stores
+    parent = session_store.create(task_id="cc-done", status=STATUS_COMPLETED, routing="codex")
+    session_store.set_claude_code_session_id(parent.task_id, "transcript-uuid-2")
+
+    killpg_calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(inter_agent.os, "killpg", lambda pgid, sig: killpg_calls.append((pgid, sig)))
+
+    r = client.post("/api/agents/sessions/cx:transcript-uuid-2/kill")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["killed"] == []
+    assert body["reason"] == f"already {STATUS_COMPLETED}"
+    assert killpg_calls == []
+
+
+@pytest.mark.unit
+def test_operator_kill_404s_for_a_cli_transcript_id_with_no_linked_worker_session(
+    client, stores,
+):
+    """A `cc:`/`cx:`-prefixed id with no matching `cli_sessions` row AND no
+    `sessions` row recorded that `claude_code_session_id` (a manually-run
+    CLI session LifeOS never spawned, or one whose worker row already
+    expired) has nothing this endpoint can tear down."""
+    r = client.post("/api/agents/sessions/cc:no-such-transcript/kill")
+    assert r.status_code == 404
+
+
 # ---------------------------------------------------------------------------
 # Shared helper — used by both inter_agent.kill (agent-to-agent) and the
 # operator kill HTTP endpoint. Confirms the agent path still works.

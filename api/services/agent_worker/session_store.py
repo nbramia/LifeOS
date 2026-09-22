@@ -1076,6 +1076,25 @@ class SessionStore:
             ).fetchone()
         return self._row_to_session(row) if row else None
 
+    def get_by_claude_code_session_id(self, claude_code_session_id: str) -> Session | None:
+        """Reverse lookup: the `sessions` row whose `claude_code_session_id`
+        matches a Claude Code / Codex CLI transcript's own id — the bare id
+        under a board `cc:`/`cx:`-prefixed session_id (`CLI_ENGINE_PREFIXES`,
+        `session_ingest.CC_PREFIX`). Lets a caller holding only that
+        transcript id (a worker-spawned CLI session never registers a
+        `cli_sessions` row, since it runs headless with no wezterm pane to
+        bind) find the row that actually owns the subprocess. Most recent
+        activity wins on the rare chance more than one row ever recorded the
+        same CLI session id.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM sessions WHERE claude_code_session_id = ? "
+                "ORDER BY last_activity_at DESC LIMIT 1",
+                (claude_code_session_id,),
+            ).fetchone()
+        return self._row_to_session(row) if row else None
+
     # ------------------------------------------------------------------
     # Schedule occurrence ledger
     # ------------------------------------------------------------------

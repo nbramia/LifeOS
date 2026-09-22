@@ -2686,6 +2686,18 @@ async def _kill_session_subtree(target: Session, reason: str) -> tuple[list[str]
                 pass
 
 
+def _strip_cli_session_prefix(session_id: str) -> str | None:
+    """Undo a board `cc:`/`cx:` session_id prefix (`CLI_ENGINE_PREFIXES`,
+    mirrored by `session_ingest.CC_PREFIX`), returning the bare Claude Code /
+    Codex CLI transcript id it carries — or None when it carries neither.
+    """
+    for prefix in CLI_ENGINE_PREFIXES.values():
+        marker = f"{prefix}:"
+        if session_id.startswith(marker):
+            return session_id[len(marker):]
+    return None
+
+
 @router.post("/sessions/{session_id}/kill")
 async def operator_kill_session(session_id: str, body: KillRequest | None = None) -> dict[str, Any]:
     """Operator-initiated kill: stop the target session and all descendants
@@ -2705,12 +2717,26 @@ async def operator_kill_session(session_id: str, body: KillRequest | None = None
         # subtree — an interactive terminal spawns no tracked children — so it
         # is torn down directly rather than through `_kill_session_subtree`.
         cli = session_store.get_cli_session(session_id)
-        if cli is None:
+        if cli is not None:
+            if cli.status == CLI_STATUS_ENDED:
+                return {"killed": [], "failures": [], "reason": "already ended"}
+            killed, failures = await _kill_cli_sessions([cli], reason or "killed by the operator")
+            return {"killed": killed, "failures": failures}
+        # A worker-spawned `claude_code`/`codex` session never registers a
+        # `cli_sessions` row at all — it runs headless, with no wezterm pane
+        # for the SessionStart hook to bind. The board still shows it, under
+        # its CLI transcript's own `cc:`/`cx:`-prefixed id (see
+        # `session_ingest.CC_PREFIX`), because that id is neither a
+        # `sessions` row nor a `cli_sessions` row. Resolve it back to the
+        # `sessions` row that actually owns the subprocess — the same raw id
+        # under the prefix is what `claude_code_session_id` was set to — and
+        # fall through to the normal subtree teardown below: the exact
+        # mechanism project cancellation already uses for a task's own live
+        # CLI-routed session (`TaskProjectService._stop_session`).
+        raw_cli_id = _strip_cli_session_prefix(session_id)
+        target = session_store.get_by_claude_code_session_id(raw_cli_id) if raw_cli_id else None
+        if target is None:
             raise HTTPException(status_code=404, detail=f"session {session_id} not found")
-        if cli.status == CLI_STATUS_ENDED:
-            return {"killed": [], "failures": [], "reason": "already ended"}
-        killed, failures = await _kill_cli_sessions([cli], reason or "killed by the operator")
-        return {"killed": killed, "failures": failures}
     if target.status in TERMINAL_STATUSES:
         return {"killed": [], "failures": [], "reason": f"already {target.status}"}
 

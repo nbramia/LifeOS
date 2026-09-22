@@ -108,8 +108,8 @@ class TestDecideActions:
         # don't need one.
         assert _ids(out) == ["rename", "focus", "resume", "kill"], out
         kill = next(d for d in out if d["id"] == "kill")
-        assert kill["enabled"] is False
-        assert "claude code" in kill["reason"].lower()
+        assert kill["enabled"] is True
+        assert kill["reason"] is None
 
     def test_routing_derived_subagent_offers_neither_focus_nor_resume(self, page: Page, web_base_url):
         """A routing-derived subagent (no `is_subagent` flag, but
@@ -140,9 +140,9 @@ class TestDecideActions:
         out = _decide(page, session, None)
         resume = next(d for d in out if d["id"] == "resume")
         assert resume["visible"] is False, resume
-        # And still offers Kill, disabled, for the same live CLI session.
+        # And still offers Kill, enabled, for the same live CLI session.
         kill = next(d for d in out if d["id"] == "kill")
-        assert kill["enabled"] is False
+        assert kill["enabled"] is True
 
     def test_non_cli_live_session_offers_enabled_kill_no_resume_no_focus(self, page: Page, web_base_url):
         _load_actions_module(page, web_base_url)
@@ -987,15 +987,16 @@ class TestResumeRowMountedOnce:
         assert kill["enabled"] is True
         assert kill["reason"] is None
 
-    def test_kill_stays_refused_for_a_worker_spawned_cli_session(self, page: Page, web_base_url):
-        """Same source, no pane handle — this one still has no teardown path,
-        and says so rather than offering a button that cannot work."""
+    def test_kill_is_offered_for_a_worker_spawned_cli_session(self, page: Page, web_base_url):
+        """Same source, no pane handle — the kill endpoint resolves this one
+        back to the `sessions` row that owns the subprocess instead, so Kill
+        is live here too rather than disabled-and-explained."""
         _load_actions_module(page, web_base_url)
         session = dict(_BARE_SESSION, session_id="cc:worker", status="running")
         out = _decide(page, session, None)
         kill = next(d for d in out if d["id"] == "kill")
-        assert kill["enabled"] is False
-        assert "isn't supported yet" in kill["reason"]
+        assert kill["enabled"] is True
+        assert kill["reason"] is None
 
 
 # ---------------------------------------------------------------------------
