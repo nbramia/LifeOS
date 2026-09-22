@@ -370,16 +370,17 @@ operation ID, and child role.
 
 #### Agent-session attribution and project-child guards
 
-Both `POST /api/tasks` and `PUT /api/tasks/{id}` accept an optional
-`X-LifeOS-Agent-Session` request header. The curated MCP proxy
-(`mcp_server.py`) sends it on every task create/update when it has a worker
-identity — a stdio worker session, the in-process local executor, or the
-agent-only HTTP transport (which always sends the literal value
-`unattested`, since it has no per-call identity of its own). Interactive
-operator MCP sends no header, and the API treats its absence exactly as it
-always has — this is additive, caller-asserted identity, the same trust
-model as the existing `actor` and `fields.assigned_by` fields, not
-cryptographic attestation.
+`POST /api/tasks`, `PUT /api/tasks/{id}`, and `POST /api/tasks/{id}/project/resume`
+accept an optional `X-LifeOS-Agent-Session` request header. The curated MCP
+proxy (`mcp_server.py`) sends it on every task create/update and on
+`lifeos_project_resume` when it has a worker identity — a stdio worker
+session, the in-process local executor, or the agent-only HTTP transport
+(which always sends the literal value `unattested`, since it has no
+per-call identity of its own). Interactive operator MCP sends no header,
+and the API treats its absence exactly as it always has — this is
+additive, caller-asserted identity, the same trust model as the existing
+`actor` and `fields.assigned_by` fields, not cryptographic attestation.
+`lifeos_project_pause` does not send it: an agent may pause a project.
 
 When the header is present and the task being written is, or would become,
 a project child (`fields.parent_id` set, or already parented):

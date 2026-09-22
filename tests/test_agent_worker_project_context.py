@@ -60,10 +60,16 @@ def test_candidate_filter_excludes_projects_paused_and_invalid(tmp_path: Path):
     assert [task["id"] for task in worker._list_agent_tasks()] == ["plain001"]
 
 
-def test_claim_current_checks_reject_a_paused_project_parent(tmp_path: Path):
+def test_claim_current_checks_do_not_reject_a_paused_project_parent(tmp_path: Path):
     """`_task_claim_is_current`/`_claim_is_current`/`_revalidate_task_resume`
-    all fail closed for a child whose parent project is paused — the same
-    shape as an existing pending cancellation/handoff."""
+    gate every tick of continuing ALREADY in-flight work (Managed polling,
+    sleeping-session wakes, spawned-child waits, operator replies) — unlike
+    a pending cancellation or handoff, a pause must never fail these closed,
+    or a running child would be stranded and its remote session abandoned
+    instead of finishing into Review (D5, AC3). Pause is enforced only at
+    NEW claims (`_list_agent_tasks`, the server's `_project_claim_allowed`),
+    covered by `test_candidate_filter_excludes_projects_paused_and_invalid`
+    above."""
     task = {
         "id": "child01", "status": "in_progress", "tags": ["codex", "agent-running"],
         "fields": {}, "is_project": False, "hierarchy_valid": True,
@@ -76,8 +82,8 @@ def test_claim_current_checks_reject_a_paused_project_parent(tmp_path: Path):
         return httpx.Response(404)
 
     worker = _worker(tmp_path, handler)
-    assert worker._task_claim_is_current(task) is False
-    assert worker._claim_is_current("child01") is False
+    assert worker._task_claim_is_current(task) is True
+    assert worker._claim_is_current("child01") is True
 
     from api.services.agent_worker.session_store import Session
 
@@ -85,7 +91,75 @@ def test_claim_current_checks_reject_a_paused_project_parent(tmp_path: Path):
         task_id="child01", session_id="sess-child01",
         status="blocked", started_at=0, last_activity_at=0,
     )
-    assert worker._revalidate_task_resume(session, "phase", {"codex"}) is None
+    assert worker._revalidate_task_resume(session, "phase", {"codex"}) == task
+
+
+def test_paused_parent_does_not_stop_managed_polling_of_a_running_child(tmp_path: Path):
+    """A live `#cloud` child of a paused project keeps being polled — Pause
+    must not mark it FAILED out from under an in-flight remote session."""
+    from api.services.agent_worker.local_executor import ExecutorOutcome
+    from api.services.agent_worker.session_store import STATUS_RUNNING
+
+    task = {
+        "id": "child01", "status": "in_progress", "tags": ["cloud", "agent-running"],
+        "fields": {}, "is_project": False, "hierarchy_valid": True,
+        "parent_project_paused": True,
+    }
+    polled: list[str] = []
+
+    def handler(request: httpx.Request):
+        if request.url.path == "/api/tasks/child01":
+            return httpx.Response(200, json=task)
+        return httpx.Response(404)
+
+    worker = _worker(tmp_path, handler)
+    worker.session_store.create("child01", status=STATUS_RUNNING, routing="claude")
+    worker.session_store.set_managed_session_id("child01", "managed-child01")
+
+    class _StubManagedExecutor:
+        def poll(self, session):
+            polled.append(session.task_id)
+            return ExecutorOutcome(
+                status=STATUS_RUNNING,
+                session_id=session.session_id,
+                attempt_id=session.attempt_id,
+                turn_id=session.turn_id,
+            )
+
+    worker._get_managed_executor = lambda: _StubManagedExecutor()
+
+    worker._poll_managed_sessions()
+
+    assert polled == ["child01"]
+    assert worker.session_store.get("child01").status == STATUS_RUNNING
+
+
+def test_paused_parent_does_not_block_an_operator_answer_to_a_blocked_child(tmp_path: Path):
+    """Resuming an existing turn (an operator answer to a blocked question)
+    continues in-flight work rather than making a new claim, so it must
+    still be processed for a child of a paused project."""
+    from api.services.agent_worker.session_store import STATUS_BLOCKED, Session
+
+    task = {
+        "id": "child01", "status": "blocked", "tags": ["codex", "agent-blocked"],
+        "fields": {}, "is_project": False, "hierarchy_valid": True,
+        "parent_project_paused": True,
+    }
+
+    def handler(request: httpx.Request):
+        if request.url.path == "/api/tasks/child01":
+            return httpx.Response(200, json=task)
+        return httpx.Response(404)
+
+    worker = _worker(tmp_path, handler)
+    session = Session(
+        task_id="child01", session_id="sess-child01",
+        status=STATUS_BLOCKED, started_at=0, last_activity_at=0,
+    )
+
+    revalidated = worker._revalidate_task_resume(session, "answer", {"agent-blocked"})
+
+    assert revalidated == task
 
 
 def test_child_dispatch_context_is_bounded_to_its_project(tmp_path: Path):

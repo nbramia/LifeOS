@@ -3844,7 +3844,17 @@ class Worker:
         return {str(t).lstrip("#").lower() for t in ((task or {}).get("tags") or [])}
 
     def _task_claim_is_current(self, task: dict[str, Any] | None) -> bool:
-        """Return whether a fetched task still carries this worker's claim."""
+        """Return whether a fetched task still carries this worker's claim.
+
+        Deliberately does NOT check `parent_project_paused` — unlike a
+        pending cancellation or handoff, a pause never interrupts a child's
+        already-running turn (see D5). This gates every tick of continuing
+        in-flight work (Managed polling, sleeping-session wakes, spawned-
+        child waits, operator replies), so failing it closed on a paused
+        parent would strand a running claim and abandon the session instead
+        of letting it finish into Review. Pause is enforced only at new
+        claims (`_list_agent_tasks`, the server's `_project_claim_allowed`).
+        """
         tags = self._norm_task_tags(task)
         fields = (task or {}).get("fields") or {}
         return (
@@ -3855,12 +3865,15 @@ class Worker:
             and task.get("hierarchy_valid") is not False
             and not task.get("parent_cancellation_pending")
             and not task.get("parent_handoff_pending")
-            and not task.get("parent_project_paused")
             and str(fields.get("execution_paused", "")).lower() not in {"1", "true", "yes", "on"}
         )
 
     def _claim_is_current(self, task_id: str, *, allow_reassigned: bool = False) -> bool:
-        """Confirm the worker still owns the lifecycle claim before acting."""
+        """Confirm the worker still owns the lifecycle claim before acting.
+
+        See `_task_claim_is_current` — `parent_project_paused` is
+        deliberately not checked here either, for the same reason.
+        """
         task = self._fetch_task(task_id)
         tags = self._norm_task_tags(task)
         fields = (task or {}).get("fields") or {}
@@ -3872,7 +3885,6 @@ class Worker:
             and task.get("hierarchy_valid") is not False
             and not task.get("parent_cancellation_pending")
             and not task.get("parent_handoff_pending")
-            and not task.get("parent_project_paused")
             and str(fields.get("execution_paused", "")).lower() not in {"1", "true", "yes", "on"}
         )
 
@@ -3889,7 +3901,14 @@ class Worker:
         phase: str,
         resumable_tags: set[str],
     ) -> dict[str, Any] | None:
-        """Fetch and validate a backing task before mutating resume state."""
+        """Fetch and validate a backing task before mutating resume state.
+
+        See `_task_claim_is_current` — `parent_project_paused` is
+        deliberately not checked here either: resuming an existing session
+        (an operator answer, a budget-resume, a spawned-child wait ending)
+        continues in-flight work rather than starting a new claim, and a
+        pause must never interrupt or fail that.
+        """
         try:
             task = self._fetch_task(session.task_id)
         except Exception as exc:
@@ -3905,7 +3924,6 @@ class Worker:
             or task.get("hierarchy_valid") is False
             or task.get("parent_cancellation_pending")
             or task.get("parent_handoff_pending")
-            or task.get("parent_project_paused")
             or str(fields.get("execution_paused", "")).lower() in {"1", "true", "yes", "on"}
         ):
             self._fail_closed_task_resume(session, phase)
