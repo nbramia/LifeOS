@@ -69,6 +69,16 @@ _SNAPSHOT_LIMIT = 200
 # or queue two resumes before the next board tick observes the first write.
 _BOARD_REVIEW_ACTION_LOCK = threading.RLock()
 
+# HTTP status for each `board_review.BoardReviewError.code` this route
+# surfaces. Preserves the pre-extraction mapping: a missing card is 404, a
+# bad-input code (the ValueError branch the old inline reject/accept code
+# raised 422 for) is 422, and every other card-state conflict is 409.
+_BOARD_REVIEW_HTTP_STATUS = {"not_found": 404, "invalid_arg": 422}
+
+
+def _board_review_status(code: str) -> int:
+    return _BOARD_REVIEW_HTTP_STATUS.get(code, 409)
+
 
 # Event kinds that count as errors. Includes operator/peer-initiated kills
 # because the frontend renders them as failures and the count chip should
@@ -1713,8 +1723,7 @@ async def accept_board_card(card_id: str) -> dict[str, Any]:
     try:
         result = accept_review(task_manager, card_id, reviewer="operator")
     except BoardReviewError as exc:
-        status_code = 404 if exc.code == "not_found" else 409
-        raise HTTPException(status_code=status_code, detail=exc.message) from exc
+        raise HTTPException(status_code=_board_review_status(exc.code), detail=exc.message) from exc
     task = result.task
     _invalidate_board_cache()
 
@@ -1736,6 +1745,7 @@ async def undo_accept_board_card(card_id: str, body: UndoAcceptRequest | None = 
     Review. All unrelated tags and fields are left untouched.
     """
     from api.services import agent_board
+    from api.services.board_review import REVIEW_ACCEPTED_BY_FIELD
     from api.services.task_manager import get_task_manager, TaskConflictError
 
     task_manager = get_task_manager()
@@ -1772,6 +1782,7 @@ async def undo_accept_board_card(card_id: str, body: UndoAcceptRequest | None = 
 
         task = task_manager.update(
             card_id, _tags_merge=remove_accepted,
+            fields={REVIEW_ACCEPTED_BY_FIELD: None},
             _expected_updated_at=body.token if body and body.token is not None else None,
         )
     except TaskConflictError as exc:
@@ -1835,8 +1846,9 @@ async def review_board_card_action(card_id: str, body: ReviewActionRequest) -> d
             try:
                 result = reject_review(task_manager, session_store, card_id, note, reviewer="operator")
             except BoardReviewError as exc:
-                status_code = 404 if exc.code == "not_found" else 409
-                raise HTTPException(status_code=status_code, detail=exc.message) from exc
+                raise HTTPException(
+                    status_code=_board_review_status(exc.code), detail=exc.message,
+                ) from exc
             updated = result.task
             _invalidate_board_cache()
             return {

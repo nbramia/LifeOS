@@ -205,7 +205,10 @@ def reject_review(
     try:
         updated = manager.update(
             card_id, status=plan.status, _tags_merge=merge_review_tags,
-            _notes_merge=merge_note, fields={agent_board.SNOOZED_UNTIL_FIELD: None},
+            _notes_merge=merge_note, fields={
+                agent_board.SNOOZED_UNTIL_FIELD: None,
+                REVIEW_ACCEPTED_BY_FIELD: None,
+            },
         )
     except (TaskConflictError, ValueError) as exc:
         raise BoardReviewError(

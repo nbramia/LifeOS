@@ -20,9 +20,10 @@ import pytest
 from api.services.agent_worker.inter_agent import Caps, InterAgentContext, dispatch
 from api.services.agent_worker.session_store import STATUS_CLAIMED, STATUS_COMPLETED, SessionStore
 from api.services.agent_worker.transcript_store import TranscriptStore
-from api.services.board_review import BoardReviewError, accept_review, reject_review
+from api.services.board_review import BoardReviewError, REVIEW_ACCEPTED_BY_FIELD, accept_review, reject_review
 from api.services.task_manager import TaskManager
 from api.services.task_projects import (
+    CANCEL_OPERATION_FIELD,
     COORDINATOR_SESSION_FIELD,
     ProjectConflictError,
     ProjectTaskService,
@@ -360,3 +361,89 @@ class TestBoardReviewSharedLogic:
         with pytest.raises(BoardReviewError) as excinfo:
             reject_review(manager, store, task.id, "Retry.", reviewer="owner:sess-9")
         assert excinfo.value.code == "no_session"
+
+    def test_reject_review_clears_a_stale_acceptance_stamp(self, env):
+        """A card can carry a stale `review_accepted_by` from an earlier
+        acceptance round (e.g. reassigned and completed again) without
+        currently being accepted. Rejecting it must not leave that stamp
+        behind for the new round."""
+        manager, store, _transcripts = env
+        task = manager.create("Synthetic re-reviewed card", tags=["codex", "agent-completed"], status="done")
+        store.create(task_id=task.id, status=STATUS_COMPLETED, routing="codex")
+        accept_review(manager, task.id, reviewer="owner:sess-1")
+        # Simulate a fresh round landing back in Review while the stale
+        # stamp from the first acceptance lingers on the task's fields.
+        manager.update(task.id, tags=["codex", "agent-completed"])
+        assert manager.get(task.id).fields.get(REVIEW_ACCEPTED_BY_FIELD) == "owner:sess-1"
+
+        result = reject_review(manager, store, task.id, "Retry.", reviewer="operator")
+
+        assert result.task.fields.get(REVIEW_ACCEPTED_BY_FIELD) is None
+
+
+# ---------------------------------------------------------------------------
+# Owner-facing error codes stay within the documented closed set
+# ---------------------------------------------------------------------------
+
+class TestOwnerFacingErrorCodesAreDocumented:
+    def test_reject_child_with_no_prior_session_maps_to_a_documented_code(self, env):
+        """`board_review.reject_review` raises its own granular `no_session`
+        code; the tool must fold that onto a documented code
+        (`invalid_arg`/`not_found`/`stale_turn`/`not_owner`/`not_review`/
+        `paused`/`forbidden`/`conflict`) rather than forward it verbatim."""
+        manager, store, transcripts = env
+        project_id, _child_id, owner = _make_project(manager, store)
+        # A second review-pending child that never got a session row, so
+        # reject_review's own lookup finds nothing to resume.
+        orphan_child = manager.create(
+            "Synthetic orphan child", tags=["codex", "agent-completed"], status="done",
+            fields={"parent_id": project_id},
+        )
+        ctx = _ctx(store, transcripts, manager, owner)
+
+        result = _call(
+            ctx, action="reject_child", project_id=project_id, child_task_id=orphan_child.id,
+            note="Retry.",
+        )
+
+        assert result["ok"] is False
+        assert result["error"] in {
+            "invalid_arg", "not_found", "stale_turn", "not_owner",
+            "not_review", "paused", "forbidden", "conflict",
+        }
+        assert result["error"] != "no_session"
+
+
+# ---------------------------------------------------------------------------
+# Project-state guards the tool enforces before ever touching a child
+# ---------------------------------------------------------------------------
+
+class TestProjectStateGuards:
+    def test_cancellation_pending_is_refused_forbidden_not_crashed(self, env):
+        """Without this guard, `accept_review`'s own task write raises a bare
+        `ProjectConflictError` (the child's parent has cancellation pending)
+        that `accept_review` does not catch — it would otherwise escape
+        `project_owner()` entirely and surface as `dispatch()`'s generic
+        `crashed` result instead of a clean refusal."""
+        manager, store, transcripts = env
+        project_id, child_id, owner = _make_project(manager, store)
+        manager.update(project_id, fields={CANCEL_OPERATION_FIELD: "op-1"}, _project_action=True)
+        ctx = _ctx(store, transcripts, manager, owner)
+
+        result = _call(ctx, action="accept_child", project_id=project_id, child_task_id=child_id)
+
+        assert result == {
+            "ok": False, "error": "forbidden",
+            "message": "project cancellation or handoff is pending",
+        }
+
+    def test_operator_owned_project_is_refused_forbidden(self, env):
+        manager, store, transcripts = env
+        project_id, child_id, owner = _make_project(manager, store, tags=("me",))
+        ctx = _ctx(store, transcripts, manager, owner)
+
+        result = _call(ctx, action="accept_child", project_id=project_id, child_task_id=child_id)
+
+        assert result == {
+            "ok": False, "error": "forbidden", "message": "project is not agent-owned",
+        }

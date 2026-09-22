@@ -930,6 +930,24 @@ def _project_is_agent_owned(tags: list[str]) -> bool:
     return any(tag in normalized for tag in agent_board.MANAGED_AGENT_ASSIGNEES)
 
 
+# `board_review`'s errors are shared with the operator board routes and
+# carry their own, more granular codes. Only the closed set documented on
+# `lifeos_agent_project_owner` (`invalid_arg`, `not_found`, `stale_turn`,
+# `not_owner`, `not_review`, `paused`, `forbidden`, `conflict`) may reach an
+# owner caller; anything else is folded onto the nearest documented code
+# here rather than forwarded verbatim.
+_BOARD_REVIEW_CODE_MAP = {
+    "no_session": "not_found",
+    "session_running": "conflict",
+    "hermes_conversation_missing": "conflict",
+    "followup_failed": "conflict",
+}
+
+
+def _owner_facing_code(code: str) -> str:
+    return _BOARD_REVIEW_CODE_MAP.get(code, code)
+
+
 def project_owner(ctx: InterAgentContext, args: dict) -> dict:
     """Attested project-owner review and completion.
 
@@ -1020,7 +1038,7 @@ def project_owner(ctx: InterAgentContext, args: dict) -> dict:
                     manager, ctx.session_store, child_task_id, note, reviewer=reviewer,
                 )
             except BoardReviewError as exc:
-                return _err(exc.message, code=exc.code)
+                return _err(exc.message, code=_owner_facing_code(exc.code))
             ctx.transcript_store.append(caller.session_id, "project_owner_reject", {
                 "project_id": project_id, "child_task_id": child_task_id,
             })
@@ -1032,7 +1050,7 @@ def project_owner(ctx: InterAgentContext, args: dict) -> dict:
         try:
             result = accept_review(manager, child_task_id, reviewer=reviewer)
         except BoardReviewError as exc:
-            return _err(exc.message, code=exc.code)
+            return _err(exc.message, code=_owner_facing_code(exc.code))
         ctx.transcript_store.append(caller.session_id, "project_owner_accept", {
             "project_id": project_id, "child_task_id": child_task_id,
         })
