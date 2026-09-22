@@ -1313,9 +1313,8 @@ def _jev_structured_tasks(
 
     Falls back to the single-task shape (`_jev_plain_task`) when `structure`
     is missing, below `_STRUCTURE_CONFIDENCE_FLOOR`, or not a recognized
-    choice -- this is the strong default, unchanged from before this shape
-    existed. A `project` answer whose named parent isn't itself a requested
-    fragment falls back to `separate`.
+    choice -- this is the strong default. A `project` answer whose named
+    parent isn't itself a requested fragment falls back to `separate`.
     """
     fragments = {key: value for key, value in item_criteria.items() if key != "none"}
     structure_answer = answers.get("structure") or {}
