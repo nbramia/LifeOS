@@ -116,7 +116,7 @@ def test_dispatch_records_assignment_fields_on_session_before_cli_executor_runs(
     # directory the task title happens to resolve to on the host machine.
     monkeypatch.setattr(
         "api.services.agent_worker.git_worktree.ensure_worktree",
-        lambda working_dir, task_id, title, host=None: WorktreeResult(
+        lambda working_dir, task_id, title, host=None, base_branch=None: WorktreeResult(
             working_dir=working_dir, is_git=False,
         ),
     )
@@ -150,7 +150,7 @@ def test_dispatch_records_host_field_on_session(tmp_path, monkeypatch):
     # to, over ssh to the registered (but unreachable in tests) host.
     monkeypatch.setattr(
         "api.services.agent_worker.git_worktree.ensure_worktree",
-        lambda working_dir, task_id, title, host=None: WorktreeResult(
+        lambda working_dir, task_id, title, host=None, base_branch=None: WorktreeResult(
             working_dir=working_dir, is_git=False,
         ),
     )
@@ -252,7 +252,7 @@ def test_no_model_pin_falls_back_to_catalog_default(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "agent_hosts", {}, raising=False)
     monkeypatch.setattr(
         "api.services.agent_worker.git_worktree.ensure_worktree",
-        lambda working_dir, task_id, title, host=None: WorktreeResult(
+        lambda working_dir, task_id, title, host=None, base_branch=None: WorktreeResult(
             working_dir=working_dir, is_git=False,
         ),
     )
@@ -283,7 +283,7 @@ def test_explicit_model_pin_wins_over_catalog_default(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "agent_hosts", {}, raising=False)
     monkeypatch.setattr(
         "api.services.agent_worker.git_worktree.ensure_worktree",
-        lambda working_dir, task_id, title, host=None: WorktreeResult(
+        lambda working_dir, task_id, title, host=None, base_branch=None: WorktreeResult(
             working_dir=working_dir, is_git=False,
         ),
     )
@@ -315,7 +315,7 @@ def test_null_catalog_default_keeps_no_model_flag_behavior(tmp_path, monkeypatch
     monkeypatch.setattr(settings, "agent_hosts", {}, raising=False)
     monkeypatch.setattr(
         "api.services.agent_worker.git_worktree.ensure_worktree",
-        lambda working_dir, task_id, title, host=None: WorktreeResult(
+        lambda working_dir, task_id, title, host=None, base_branch=None: WorktreeResult(
             working_dir=working_dir, is_git=False,
         ),
     )
@@ -348,7 +348,7 @@ def test_codex_no_model_pin_falls_back_to_catalog_default(tmp_path, monkeypatch)
     monkeypatch.setattr(settings, "agent_hosts", {}, raising=False)
     monkeypatch.setattr(
         "api.services.agent_worker.git_worktree.ensure_worktree",
-        lambda working_dir, task_id, title, host=None: WorktreeResult(
+        lambda working_dir, task_id, title, host=None, base_branch=None: WorktreeResult(
             working_dir=working_dir, is_git=False,
         ),
     )
