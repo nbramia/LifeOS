@@ -44,6 +44,7 @@ from api.services.agent_worker.session_store import (
     STATUS_CLAIMED,
     STATUS_COMPLETED,
     STATUS_FAILED,
+    STATUS_RUNNING,
     Session,
     SessionStore,
 )
@@ -127,9 +128,17 @@ def _make_worker(
         sent.append(text)
         return True
 
+    session_store = SessionStore(db_path=tmp_path / "sessions.db")
+    # Every stub executor in this file honors the real contract of calling
+    # `begin_executor_turn` itself -- wire the store into any that need it
+    # (it doesn't exist yet at stub-construction time).
+    for stub in (local_executor, remote_executor, hermes_executor, managed_executor):
+        if stub is not None and getattr(stub, "session_store", "unset") is None:
+            stub.session_store = session_store
+
     w = Worker(
         api_base="http://api",
-        session_store=SessionStore(db_path=tmp_path / "sessions.db"),
+        session_store=session_store,
         transcript_store=TranscriptStore(transcripts_dir=tmp_path / "transcripts"),
         spend_tracker=SpendTracker(db_path=tmp_path / "sessions.db", daily_cap_dollars=daily_cap_dollars),
         poll_seconds=0.01,
@@ -942,10 +951,23 @@ class TestWakeMessageDoesNotPromiseAnUnusableTool:
 # ---------------------------------------------------------------------------
 
 class _StubLocalExecutor:
+    """`session_store` is wired by `_make_worker` after construction (the
+    real store doesn't exist yet when a test builds this stub) -- every
+    stub in this section honors the real executors' own
+    `begin_executor_turn` call before doing anything else, so a caller
+    that hands it a stale (already-turn-rotated) session raises exactly
+    like `LocalExecutor.execute`/`HermesExecutor.execute`/
+    `ManagedExecutor.start` would, instead of silently succeeding and
+    hiding a real defect a looser stub would let through unnoticed."""
+
     def __init__(self):
+        self.session_store = None
         self.calls: list[dict] = []
 
     def execute(self, session, task):
+        session = self.session_store.begin_executor_turn(
+            session.task_id, "execute", session=session,
+        )
         self.calls.append({"session": session, "task": task})
         return ExecutorOutcome(
             status=STATUS_COMPLETED, final_text="local turn done",
@@ -956,9 +978,13 @@ class _StubLocalExecutor:
 
 class _StubHermesExecutor:
     def __init__(self):
+        self.session_store = None
         self.calls: list[dict] = []
 
     def execute(self, session, task, prompt=None):
+        session = self.session_store.begin_executor_turn(
+            session.task_id, "execute", session=session,
+        )
         self.calls.append({
             "session": session, "task": task, "prompt": prompt,
             "conversation_id": session.conversation_id,
@@ -984,10 +1010,20 @@ class _StubManagedDriver:
 
 class _StubManagedExecutor:
     def __init__(self, driver: "_StubManagedDriver | None" = None):
+        self.session_store = None
         self.driver = driver if driver is not None else _StubManagedDriver()
         self.start_calls: list[dict] = []
 
     def start(self, session, task):
+        session = self.session_store.begin_executor_turn(
+            session.task_id, "start", session=session,
+        )
+        # Mirrors real `ManagedExecutor.start`, which flips the row to
+        # RUNNING right after minting its turn, before any remote call.
+        self.session_store.update_status(
+            session.task_id, STATUS_RUNNING,
+            attempt_id=session.attempt_id, turn_id=session.turn_id,
+        )
         self.start_calls.append({"session": session, "task": task})
         return ExecutorOutcome(
             status=STATUS_COMPLETED, final_text="managed fresh start done",
@@ -1184,6 +1220,112 @@ class TestManagedContinuation:
         assert w._reconcile_project_owners() == 0
         assert driver.posted == []
         assert managed.start_calls == []
+
+
+class TestManagedWakeDoesNotDoubleStart:
+    """`tick()` runs `_reconcile_project_owners()` immediately before
+    `_dispatch_spawned_sessions()`. A successful native
+    Managed continuation that left the owner at CLAIMED (whatever
+    `begin_new_execution`'s CAS set it to) would still be sitting right
+    there for the dispatcher's `list_by_status(STATUS_CLAIMED)` scan --
+    origin='operator' with no parent doesn't hit that dispatcher's skip
+    guard -- so it would reach `_execute_start` -> `ManagedExecutor.start`
+    and spin up a SECOND remote sandbox in the same tick, overwriting
+    `managed_agent_session_id` and orphaning the one just posted to."""
+
+    def test_reconcile_then_dispatch_in_one_tick_starts_at_most_one_sandbox(self, tmp_path):
+        driver = _StubManagedDriver()
+        managed = _StubManagedExecutor(driver=driver)
+        w, api, owner = _setup(
+            tmp_path, children=[_child("c1", "p1", "Design")],
+            owner_routing="claude", execution_request={"executor": "claude"},
+            managed_executor=managed, cli_pool=_SynchronousPool(),
+            managed_agent_session_id="remote-sess-1",
+            project_tags=("cloud-sonnet",),
+        )
+        api.tasks["c1"]["status"] = "blocked"
+        api.tasks["c1"]["tags"] = ["agent-blocked"]
+        _age_anchor(w, "p1", 31)
+
+        # Step 1 of tick(): the reconciler wakes the owner natively.
+        assert w._reconcile_project_owners() == 1
+        assert len(driver.posted) == 1
+        assert managed.start_calls == []  # no fresh sandbox from the native path itself
+        after_reconcile = w.session_store.get(_OWNER_TASK_ID)
+        assert after_reconcile.status == STATUS_RUNNING
+        assert after_reconcile.managed_agent_session_id == "remote-sess-1"
+
+        # Step 2 of the SAME tick: the dispatcher must find nothing left to
+        # claim for this owner -- exactly one managed sandbox this tick.
+        w._dispatch_spawned_sessions()
+        assert managed.start_calls == []
+        final = w.session_store.get(_OWNER_TASK_ID)
+        assert final.managed_agent_session_id == "remote-sess-1"  # never overwritten
+
+
+class TestLocalRemoteWakeUsesUserRole:
+    """`append_message`'s 2nd positional argument is the conversation ROLE
+    an LLM provider sees, not a sender label --
+    passing the default `sender_id` ("operator") there would reach the
+    provider as `role="operator"`, which every real provider rejects,
+    failing the owner turn and (after two such failures) auto-pausing the
+    project."""
+
+    def test_wake_diff_is_appended_with_role_user(self, tmp_path):
+        local = _StubLocalExecutor()
+        w, api, owner = _setup(
+            tmp_path, children=[_child("c1", "p1", "Design")],
+            owner_routing="local", execution_request={"executor": "local"},
+            local_executor=local, cli_pool=_SynchronousPool(),
+        )
+        api.tasks["c1"]["status"] = "blocked"
+        api.tasks["c1"]["tags"] = ["agent-blocked"]
+        _age_anchor(w, "p1", 31)
+
+        assert w._reconcile_project_owners() == 1
+        messages = w.session_store.get_messages(owner.session_id)
+        assert messages, "expected the wake diff to be appended to history"
+        assert messages[-1]["role"] == "user"
+        assert "c1" in messages[-1]["content"]
+
+
+class TestUndeliveredWakeIsMarkedFailed:
+    """Every delivery path (native continuation AND the fresh-start
+    fallback) failing outright must not leave the reopened
+    owner stuck live forever -- `_reconcile_one_project_owner`'s
+    `if not delivered: self._mark_failed(...)` is what lets the NEXT tick's
+    outcome check (`wake_attempt_id == owner.attempt_id`) recognize this as
+    a failed turn and feed the consecutive-failure/auto-pause counter."""
+
+    def test_fully_undelivered_wake_is_marked_failed_and_counted(self, tmp_path):
+        # No managed_executor injected: `_get_managed_executor()` returns
+        # None (Managed Agents isn't configured in this test process), so
+        # neither the native post nor the fresh-start fallback can deliver
+        # anything at all.
+        w, api, owner = _setup(
+            tmp_path, children=[_child("c1", "p1", "Design")],
+            owner_routing="claude", execution_request={"executor": "claude"},
+            cli_pool=_SynchronousPool(),
+            managed_agent_session_id=None,
+            project_tags=("cloud-sonnet",),
+        )
+        api.tasks["c1"]["status"] = "blocked"
+        api.tasks["c1"]["tags"] = ["agent-blocked"]
+        _age_anchor(w, "p1", 31)
+
+        assert w._reconcile_project_owners() == 1
+        after = w.session_store.get(_OWNER_TASK_ID)
+        assert after.status == STATUS_FAILED  # never left stuck live
+
+        state = w.session_store.get_project_owner_state("p1")
+        assert state["wake_attempt_id"] == after.attempt_id
+        assert state["consecutive_failures"] == 0  # not yet counted this pass
+
+        # The next pass recognizes the failed turn against the recorded
+        # wake_attempt_id and counts it toward auto-pause.
+        assert w._reconcile_project_owners() == 0
+        state_after = w.session_store.get_project_owner_state("p1")
+        assert state_after["consecutive_failures"] == 1
 
 
 class TestCliFallbackBriefing:

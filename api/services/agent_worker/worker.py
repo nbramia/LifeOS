@@ -2786,8 +2786,13 @@ class Worker:
             return bool(enqueued)
 
         if session.routing in (ROUTE_LOCAL, ROUTE_REMOTE):
+            # append_message's 2nd positional arg is the conversation ROLE
+            # the LLM provider sees, not a sender label -- every other
+            # local/remote append in this file hardcodes "user" for exactly
+            # this reason (`sender_id` here is meaningful only for the
+            # claude_code/codex enqueue branch above).
             if self.session_store.append_message(
-                session.session_id, sender_id, message,
+                session.session_id, "user", message,
                 attempt_id=session.attempt_id, turn_id=session.turn_id,
             ) is None:
                 return False
@@ -2849,6 +2854,22 @@ class Worker:
                     remote_id, exc,
                 )
                 return False
+            # A CAS reopen leaves the session CLAIMED, and CLAIMED is exactly
+            # what `_dispatch_spawned_sessions` (run later this same tick)
+            # scans for -- an operator-origin session is never skipped by its
+            # parentless-session guard, so a still-CLAIMED owner would reach
+            # `_execute_start` -> `ManagedExecutor.start` and spin up a
+            # SECOND remote sandbox, overwriting `managed_agent_session_id`
+            # and orphaning the one just posted to. Flip to RUNNING now,
+            # same as `ManagedExecutor.start` does right after its own
+            # `begin_executor_turn` -- the dispatcher only claims CLAIMED
+            # rows, and `_poll_managed_sessions` (keyed on "has a managed id,
+            # not terminal") picks this turn up regardless of the exact
+            # non-terminal status.
+            self.session_store.update_status(
+                session.task_id, STATUS_RUNNING,
+                attempt_id=session.attempt_id, turn_id=session.turn_id,
+            )
             return True
 
         raise NotImplementedError(
@@ -7162,10 +7183,25 @@ class Worker:
         (never had one, or the recorded id is unrecognized) — launches a
         brand-new Managed session on the SAME route, seeded
         with a bounded owner briefing instead of the terse wake message
-        (there is no prior remote thread to append the wake diff onto)."""
+        (there is no prior remote thread to append the wake diff onto).
+
+        Re-reads the session before starting: a native attempt on the same
+        pass (`_continue_session`'s claude branch) may already have called
+        `begin_executor_turn` against the DB row before failing (a stale
+        remote id 404ing `post_user_message`) -- that call rotates `turn_id`
+        on ITS OWN local variable, which never reaches the caller's
+        `reopened`. `ManagedExecutor.start`'s own `begin_executor_turn` call
+        compares the row it's about to mint against the exact object it's
+        given, so handing it the now-stale `reopened` (still `turn_id=None`)
+        would raise "stale session attempt/turn" instead of starting the
+        fresh session this fallback exists to provide."""
         managed = self._get_managed_executor()
         if managed is None or managed.driver is None:
             return False
+        current = self.session_store.get(reopened.task_id)
+        if current is None:
+            return False
+        reopened = current
         task = {**owner_task, "notes": briefing}
         try:
             outcome = self._execute_start(reopened, task)
