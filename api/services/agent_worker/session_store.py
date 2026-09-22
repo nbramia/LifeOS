@@ -4545,6 +4545,18 @@ class SessionStore:
             ).fetchone()
         return self._row_to_project_owner_state(row) if row is not None else None
 
+    def is_project_owner_session(self, session_id: str) -> bool:
+        """True when `session_id` is (currently) some project's persistent
+        owner -- distinguishes a stale-reply drop worth explaining (an
+        owner wake raced an operator's reply) from the ordinary, silent
+        stale-reply cases (a reassigned/retried session)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM project_owner_state WHERE owner_session_id = ? LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        return row is not None
+
     def ensure_project_owner_state(
         self, project_id: str, *, owner_session_id: str, baseline_states: dict,
     ) -> dict:
@@ -4552,12 +4564,19 @@ class SessionStore:
         current child-state snapshot as the baseline `acked_states` and
         nothing delivered — so the diff against it is empty and this
         creation itself never counts as an event (see the reconciler's
-        step 1). A no-op if the row already exists."""
+        step 1). If the row already exists, `acked_states`/the rest of the
+        wake bookkeeping is left untouched, but `owner_session_id` is kept
+        in sync with the caller's current value -- a re-Plan can create a
+        new owner session for the same project, and this column is read
+        directly (e.g. by the board) rather than only through the
+        reconciler's own fresh per-tick lookups."""
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO project_owner_state "
                 "(project_id, owner_session_id, acked_states_json, updated_at) "
-                "VALUES (?, ?, ?, ?) ON CONFLICT(project_id) DO NOTHING",
+                "VALUES (?, ?, ?, ?) ON CONFLICT(project_id) DO UPDATE SET "
+                "owner_session_id = excluded.owner_session_id, "
+                "updated_at = excluded.updated_at",
                 (project_id, owner_session_id, json.dumps(baseline_states), _now()),
             )
         return self.get_project_owner_state(project_id)
@@ -4633,6 +4652,39 @@ class SessionStore:
                 "wake_attempt_id = NULL, wake_turn_id = NULL, updated_at = ? "
                 "WHERE project_id = ?",
                 (_now(), project_id),
+            )
+
+    def correct_project_owner_baseline(self, project_id: str, *, corrections: dict) -> None:
+        """Patch specific keys in `acked_states_json` in place, leaving
+        every other column (and every other key already in the map) alone.
+
+        Re-baselines a child that has returned to `active` while
+        `acked_states` is still holding a stale non-`active` value for it
+        (see `Worker._reconcile_one_project_owner`) -- a wake only ever
+        moves `acked_states` at ack time, so without this, a child that
+        cycles e.g. failed -> active -> failed again would never re-diff
+        as a new event on the second failure; `acked_states` would still
+        read the first failure's value, matching the repeat exactly."""
+        if not corrections:
+            return
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT acked_states_json FROM project_owner_state WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            if row is None:
+                return
+            try:
+                acked = json.loads(row["acked_states_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                acked = {}
+            if not isinstance(acked, dict):
+                acked = {}
+            acked.update(corrections)
+            conn.execute(
+                "UPDATE project_owner_state SET acked_states_json = ?, updated_at = ? "
+                "WHERE project_id = ?",
+                (json.dumps(acked), _now(), project_id),
             )
 
     def reset_project_owner_failures(self, project_id: str) -> None:

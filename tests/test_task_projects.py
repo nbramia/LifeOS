@@ -765,6 +765,24 @@ def test_resume_project_gives_the_owner_a_fresh_failure_budget(manager: TaskMana
     assert session_store.get_project_owner_state(parent.id)["consecutive_failures"] == 0
 
 
+def test_coordination_prompt_describes_a_persistent_owner_to_the_owner_itself(manager: TaskManager):
+    """`_coordination_prompt` is what Plan and delegate actually sends the
+    owner session -- `PROJECT_TASK_GUIDANCE` only ever describes the
+    mechanism to a *caller* deciding whether to use `lifeos_project_plan`,
+    third-person, so the owner's own prompt needs its own persistent-owner
+    wording."""
+    service = ProjectTaskService(manager)
+    parent = manager.create("Synthetic coordination project", tags=["codex"])
+    manager.create("Synthetic coordination child", tags=["codex"], fields={"parent_id": parent.id})
+    hierarchy = service.hierarchy()
+
+    prompt = service._coordination_prompt(hierarchy.tasks[parent.id], hierarchy, "op-1")
+
+    assert "persistent owner" in prompt
+    assert "woken automatically" in prompt
+    assert "bounded" not in prompt
+
+
 def test_pause_rejects_an_unrecognized_reason(manager: TaskManager):
     service = ProjectTaskService(manager)
     parent = manager.create("Synthetic reason project")

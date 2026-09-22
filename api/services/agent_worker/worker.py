@@ -2090,6 +2090,24 @@ class Worker:
                 # without identity are legacy/unbound and are rejected too:
                 # accepting them would let an answer arrive after a reopen
                 # and attach to the replacement execution.
+                if (
+                    (q.get("kind") or "clarification") == "followup"
+                    and self.session_store.is_project_owner_session(session_id)
+                ):
+                    # A persistent-project-owner wake (see
+                    # _reconcile_project_owners) rotated this session's
+                    # attempt between its completion notice and this reply
+                    # — surface that rather than silently discarding it, so
+                    # it doesn't look like the reply just worked.
+                    self.transcript_store.append(session_id, "owner_followup_reply_stale", {
+                        "question_id": q["id"], "reply_attempt_id": q_attempt,
+                        "reply_turn_id": q_turn, "current_attempt_id": session.attempt_id,
+                    })
+                    self._notify(
+                        "A reply to a project owner's completion notice arrived after "
+                        "the owner had already been woken by a newer project event, so "
+                        "it wasn't applied. Reply again if it's still relevant."
+                    )
                 self.session_store.mark_question_processed(q["id"])
                 continue
 
@@ -6878,9 +6896,11 @@ class Worker:
         if integration_branch:
             lines.append(f"Integration branch: {integration_branch}")
         lines.append(
-            f"Use `{_OWNER_TOOL_TASK_CHILDREN}` to inspect the full child list, create or "
-            f"assign children as needed, and `{_OWNER_TOOL_PROJECT_COMPLETE}`/"
-            f"`{_OWNER_TOOL_PROJECT_CANCEL}` once the project is finished or must stop."
+            f"Use `{_OWNER_TOOL_TASK_CHILDREN}` to inspect the full child list, and create or "
+            f"assign children as needed. `{_OWNER_TOOL_PROJECT_COMPLETE}` refuses while this "
+            "turn is live, so report readiness in your final response and let the operator "
+            f"complete the project from the board, or call `{_OWNER_TOOL_PROJECT_CANCEL}` if "
+            "it must stop instead."
         )
         message = "\n".join(lines)
         if len(message) > _OWNER_WAKE_MESSAGE_MAX_CHARS:
@@ -6939,6 +6959,23 @@ class Worker:
                 state = self.session_store.get_project_owner_state(project_id) or state
 
         acked = state.get("acked_states") or {}
+        # A child observed back at `active` re-baselines its acked entry
+        # immediately, even though `active` is never itself an event: a
+        # wake only ever moves `acked` at ack time, so without this, a
+        # child that goes e.g. failed -> (acked "failed") -> active ->
+        # failed again would never re-diff as a new event -- the acked
+        # value would still read "failed" from the first round, matching
+        # the repeat exactly. This also runs on an otherwise-empty diff, not
+        # only when some other child has a live event this same pass.
+        stale_active = {
+            cid: "active" for cid, new_state in current_snapshot.items()
+            if new_state == "active" and acked.get(cid, "active") != "active"
+        }
+        if stale_active:
+            self.session_store.correct_project_owner_baseline(
+                project_id, corrections=stale_active,
+            )
+            acked = {**acked, **stale_active}
         events = {
             cid: new_state for cid, new_state in current_snapshot.items()
             if new_state != "active" and acked.get(cid) != new_state
@@ -6975,6 +7012,17 @@ class Worker:
         # lost. Enqueuing after the CAS instead could deliver an empty
         # resume with no message at all if a crash landed in that gap.
         if not self._continue_session(owner, message):
+            # The owner's identity moved on underneath us -- most commonly
+            # a lingering `cancellation_guards` row for its current
+            # attempt/turn (e.g. an operator-cancelled live CLI session,
+            # see telegram.py) that will match forever since nothing here
+            # ever rotates the attempt without a successful enqueue. Count
+            # this as a wake failure (same threshold/auto-pause path as a
+            # turn that actually ran and failed) rather than silently
+            # retrying forever with no visible signal.
+            failures = self.session_store.record_project_owner_wake_failure(project_id)
+            if failures >= _OWNER_WAKE_FAILURE_PAUSE_THRESHOLD:
+                self._pause_project_for_owner_failure(project_id, title, "owner_failed")
             return False
         try:
             reopened = self.session_store.begin_new_execution(
@@ -7043,14 +7091,24 @@ class Worker:
                 continue
             if not self._project_is_agent_owned(task):
                 continue
-            if self._reconcile_one_project_owner(
-                project_id, owner_session_id,
-                children=children_by_parent.get(project_id, []),
-                paused=field_truthy(fields.get(PROJECT_PAUSED_FIELD)),
-                integration_branch=fields.get(INTEGRATION_BRANCH_FIELD),
-                title=task.get("description") or project_id,
-                outcomes=outcomes,
-            ):
+            try:
+                woke = self._reconcile_one_project_owner(
+                    project_id, owner_session_id,
+                    children=children_by_parent.get(project_id, []),
+                    paused=field_truthy(fields.get(PROJECT_PAUSED_FIELD)),
+                    integration_branch=fields.get(INTEGRATION_BRANCH_FIELD),
+                    title=task.get("description") or project_id,
+                    outcomes=outcomes,
+                )
+            except Exception as exc:
+                # One project's reconciliation must never abort the whole
+                # tick -- a non-CLI-routed owner reaches `_continue_session`
+                # today and raises `NotImplementedError`, which would
+                # otherwise propagate out of `tick()` and skip every later
+                # step, including claim dispatch, for every other project.
+                logger.warning("project owner reconciliation failed for %s: %s", project_id, exc)
+                continue
+            if woke:
                 woken += 1
         return woken
 

@@ -299,9 +299,12 @@ def owner_state(task: dict[str, Any]) -> str:
     (`agent-failed`/`agent-budget-exceeded` -- both leave the task's own
     status at `cancelled`, so this must be checked before the plain
     `cancelled` case below) beats `cancelled` beats `done` beats `blocked`
-    (needs input) beats `active` (everything else: unassigned, assigned, or
-    genuinely running). Only a non-`active` state is ever an owner-wake
-    event.
+    (needs a human) beats `active` (everything else: unassigned, assigned,
+    genuinely running, or a machine wait -- `agent-wait-provider`/
+    `agent-wait-dependency` are worker-owned and self-clearing;
+    `natural_lane` routes them to In progress, not Human queue, and an
+    owner wake would just burn a paid turn on a transient provider
+    rate-limit). Only a non-`active` state is ever an owner-wake event.
     """
     raw_tags = task.get("tags") or []
     tags = agent_board.normalize_tags(raw_tags)
@@ -318,7 +321,6 @@ def owner_state(task: dict[str, Any]) -> str:
         status == "blocked"
         or agent_board.BLOCKED_TAG in tags
         or agent_board.HUMAN_TAG in tags
-        or bool(tags & agent_board.MACHINE_WAIT_TAGS)
     ):
         return "blocked"
     return "active"
@@ -1657,7 +1659,11 @@ class ProjectTaskService:
             + "\nUse task hierarchy, not session ancestry. Preserve explicit child assignments "
             "and do not expand provider/cloud consent beyond this delegated scope. When creating "
             "a child, derive one stable operation_key from this project ID, operation ID, and the "
-            "child's role; reuse that key on retry so the task tool recovers the same child."
+            "child's role; reuse that key on retry so the task tool recovers the same child.\n"
+            "You are this project's persistent owner: you are woken automatically when a "
+            "child's state changes -- newly blocked, failed, done, cancelled, or awaiting "
+            "review -- with several such events batched into one wake. The project ends only "
+            "through the explicit project completion/cancellation actions."
         )
 
 

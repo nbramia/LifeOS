@@ -50,7 +50,9 @@ from api.services.agent_worker.spend_tracker import SpendTracker
 from api.services.agent_worker.transcript_store import TranscriptStore
 from api.services.agent_worker.worker import Worker
 from api.services.task_projects import (
+    CANCEL_OPERATION_FIELD,
     COORDINATOR_SESSION_FIELD,
+    HANDOFF_OPERATION_FIELD,
     PARENT_ID_FIELD,
     PROJECT_PAUSE_REASON_FIELD,
     PROJECT_PAUSED_FIELD,
@@ -143,6 +145,11 @@ def _setup(
     execution_request: dict | None = None,
     paused: bool = False,
     daily_cap_dollars: float = 100.0,
+    project_tags: tuple[str, ...] = ("claude",),
+    project_status: str = "in_progress",
+    owner_routing: str = "claude_code",
+    cancel_pending: bool = False,
+    handoff_pending: bool = False,
 ) -> tuple[Worker, FakeApi, Session]:
     """Build a worker with one agent-owned project, its persistent owner
     session (`owner.session_id` is what `COORDINATOR_SESSION_FIELD` stores —
@@ -150,14 +157,22 @@ def _setup(
     api = FakeApi(tasks=[])
     w = _make_worker(tmp_path, api, daily_cap_dollars=daily_cap_dollars)
     owner = w.session_store.create(
-        task_id=_OWNER_TASK_ID, routing="claude_code", status=owner_status, origin="operator",
+        task_id=_OWNER_TASK_ID, routing=owner_routing, status=owner_status, origin="operator",
         execution_request=execution_request or {"executor": "claude_code", "working_dir": "/repo/wt-1"},
     )
-    w.session_store.set_claude_code_session_id(_OWNER_TASK_ID, "cli-owner-1")
+    if owner_routing in ("claude_code", "codex"):
+        w.session_store.set_claude_code_session_id(_OWNER_TASK_ID, "cli-owner-1")
     owner = w.session_store.get(_OWNER_TASK_ID)
-    api.tasks[project_id] = _project(
-        project_id, project_description, owner_session_id=owner.session_id, paused=paused,
+    project = _project(
+        project_id, project_description, owner_session_id=owner.session_id,
+        paused=paused, tags=project_tags,
     )
+    project["status"] = project_status
+    if cancel_pending:
+        project["fields"][CANCEL_OPERATION_FIELD] = "op-cancel-1"
+    if handoff_pending:
+        project["fields"][HANDOFF_OPERATION_FIELD] = "op-handoff-1"
+    api.tasks[project_id] = project
     for child in children:
         api.tasks[child["id"]] = child
     # Seed the durable baseline while every child is still in its initial
@@ -215,6 +230,15 @@ class TestOwnerStateClassification:
     def test_active_covers_unassigned_assigned_and_running(self):
         for status, tags in (("todo", []), ("todo", ["claude"]), ("in_progress", ["agent-running"])):
             assert owner_state({"id": "c1", "status": status, "tags": tags}) == "active"
+
+    def test_machine_waits_are_active_not_blocked(self):
+        """`agent-wait-provider`/`agent-wait-dependency` are worker-owned,
+        self-clearing waits -- `natural_lane` routes them to In progress,
+        not Human queue, and an owner shouldn't burn a paid turn on a
+        transient provider rate-limit."""
+        for tag in ("agent-wait-provider", "agent-wait-dependency"):
+            task = {"id": "c1", "status": "in_progress", "tags": [tag]}
+            assert owner_state(task) == "active"
 
 
 # ---------------------------------------------------------------------------
@@ -565,3 +589,314 @@ class TestOwnerGuidanceWording:
         assert "persistent owner" in prompt
         assert "bounded coordinator run" not in prompt
         assert "not a persistent monitor" not in prompt
+
+
+# ---------------------------------------------------------------------------
+# A1: a repeated non-active state must wake again (reject/rework, reassign)
+# ---------------------------------------------------------------------------
+
+class TestRepeatedNonActiveEventsWakeAgain:
+    def test_reject_rework_awaiting_review_wakes_again(self, tmp_path):
+        w, api, owner = _setup(tmp_path, children=[_child("c1", "p1", "Design")])
+        api.tasks["c1"]["status"] = "done"
+        api.tasks["c1"]["tags"] = ["agent-completed"]
+
+        _age_anchor(w, "p1", 31)
+        assert w._reconcile_project_owners() == 1
+        w.session_store.update_status(_OWNER_TASK_ID, STATUS_COMPLETED)
+        assert w._reconcile_project_owners() == 0  # ack: acked[c1] = "awaiting_review"
+
+        # Operator rejects -- the child resumes as ordinary work.
+        api.tasks["c1"]["status"] = "in_progress"
+        api.tasks["c1"]["tags"] = []
+        assert w._reconcile_project_owners() == 0  # re-baselines c1 -> active, no wake
+        assert w.session_store.get_project_owner_state("p1")["acked_states"]["c1"] == "active"
+
+        # The child reaches awaiting_review again.
+        api.tasks["c1"]["status"] = "done"
+        api.tasks["c1"]["tags"] = ["agent-completed"]
+        _age_anchor(w, "p1", 31)
+        assert w._reconcile_project_owners() == 1  # wakes again for the repeat
+
+    def test_failed_reassign_failed_wakes_again(self, tmp_path):
+        w, api, owner = _setup(tmp_path, children=[_child("c1", "p1", "Design")])
+        api.tasks["c1"]["status"] = "cancelled"
+        api.tasks["c1"]["tags"] = ["agent-failed"]
+
+        _age_anchor(w, "p1", 31)
+        assert w._reconcile_project_owners() == 1
+        w.session_store.update_status(_OWNER_TASK_ID, STATUS_COMPLETED)
+        assert w._reconcile_project_owners() == 0  # ack: acked[c1] = "failed"
+
+        # Reassigned/reworked -- back to ordinary active work.
+        api.tasks["c1"]["status"] = "todo"
+        api.tasks["c1"]["tags"] = ["claude"]
+        assert w._reconcile_project_owners() == 0  # re-baselines c1 -> active
+
+        # Fails again.
+        api.tasks["c1"]["status"] = "cancelled"
+        api.tasks["c1"]["tags"] = ["agent-failed"]
+        _age_anchor(w, "p1", 31)
+        assert w._reconcile_project_owners() == 1
+
+
+# ---------------------------------------------------------------------------
+# A2: a refused enqueue counts as a wake failure (never a silent, permanent
+# wedge)
+# ---------------------------------------------------------------------------
+
+class TestRefusedEnqueueCountsAsFailure:
+    def test_a_refused_enqueue_counts_as_a_wake_failure_and_eventually_auto_pauses(self, tmp_path):
+        w, api, owner = _setup(tmp_path, children=[_child("c1", "p1", "Design")])
+        api.tasks["c1"]["status"] = "blocked"
+        api.tasks["c1"]["tags"] = ["agent-blocked"]
+
+        # Simulate an operator cancelling the owner's (already-terminal)
+        # last turn from Telegram (see telegram.py): a cancellation_guards
+        # row lands for its exact current attempt/turn without changing
+        # its (already terminal) status -- enqueue_message refuses forever
+        # afterward, since nothing rotates the attempt without a
+        # successful enqueue.
+        w.session_store.mark_cancelled(
+            _OWNER_TASK_ID, attempt_id=owner.attempt_id, turn_id=owner.turn_id, reason="operator_cancel",
+        )
+
+        _age_anchor(w, "p1", 31)
+        assert w._reconcile_project_owners() == 0
+        assert w.session_store.get_project_owner_state("p1")["consecutive_failures"] == 1
+        assert not w.session_store.has_pending_messages(owner.session_id)
+        assert api.pause_calls == []
+        # The enqueue failure never reached the CAS: no new attempt, no
+        # in-flight wake bookkeeping recorded.
+        after_first = w.session_store.get(_OWNER_TASK_ID)
+        assert after_first.attempt_number == owner.attempt_number
+        assert after_first.status == owner.status
+        state = w.session_store.get_project_owner_state("p1")
+        assert state["wake_attempt_id"] is None
+        assert state["delivered_states"] is None
+
+        assert w._reconcile_project_owners() == 0
+        assert api.pause_calls == [("p1", {"reason": "owner_failed"})]
+        assert len(w._sent) == 1
+
+
+# ---------------------------------------------------------------------------
+# A3: ack is pinned -- a successful wake must not repeat forever
+# ---------------------------------------------------------------------------
+
+class TestAckIsPinnedToDeliveredStates:
+    def test_successful_ack_prevents_further_wakes_for_unchanged_states(self, tmp_path):
+        w, api, owner = _setup(tmp_path, children=[_child("c1", "p1", "Design")])
+        api.tasks["c1"]["status"] = "blocked"
+        api.tasks["c1"]["tags"] = ["agent-blocked"]
+
+        _age_anchor(w, "p1", 31)
+        assert w._reconcile_project_owners() == 1
+        w.session_store.update_status(_OWNER_TASK_ID, STATUS_COMPLETED)
+        assert w._reconcile_project_owners() == 0  # processes the ack
+
+        for _ in range(5):
+            _age_anchor(w, "p1", 31)
+            assert w._reconcile_project_owners() == 0
+        after = w.session_store.get(_OWNER_TASK_ID)
+        assert after.attempt_number == 2  # never rotated again
+        assert after.status == STATUS_COMPLETED
+
+
+# ---------------------------------------------------------------------------
+# Pin: a wake_attempt_id that doesn't match the owner's current attempt is
+# never treated as this pass's outcome
+# ---------------------------------------------------------------------------
+
+class TestWakeAttemptIdPinning:
+    def test_a_foreign_wake_attempt_id_is_not_treated_as_this_owners_outcome(self, tmp_path):
+        w, api, owner = _setup(tmp_path, children=[_child("c1", "p1", "Design")])
+        api.tasks["c1"]["status"] = "blocked"
+        api.tasks["c1"]["tags"] = ["agent-blocked"]
+        # A stale/foreign wake_attempt_id -- the owner never actually
+        # resumed for it; it's still sitting on its original attempt.
+        w.session_store.record_project_owner_wake(
+            "p1", delivered_states={"c1": "blocked"}, wake_attempt_id="attempt_not_real", wake_turn_id=None,
+        )
+        _age_anchor(w, "p1", 31)
+
+        assert w._reconcile_project_owners() == 1  # wakes normally, ignoring the mismatched id
+        assert w.session_store.get_project_owner_state("p1")["consecutive_failures"] == 0
+
+
+# ---------------------------------------------------------------------------
+# B3: selection gates
+# ---------------------------------------------------------------------------
+
+class TestSelectionGates:
+    def test_done_project_is_never_reconciled(self, tmp_path):
+        w, api, owner = _setup(
+            tmp_path,
+            children=[_child("c1", "p1", "Design", status="blocked", tags=["agent-blocked"])],
+            project_status="done",
+        )
+        assert w._reconcile_project_owners() == 0
+        assert w.session_store.get_project_owner_state("p1") is None
+
+    def test_cancelled_project_is_never_reconciled(self, tmp_path):
+        w, api, owner = _setup(
+            tmp_path,
+            children=[_child("c1", "p1", "Design", status="blocked", tags=["agent-blocked"])],
+            project_status="cancelled",
+        )
+        assert w._reconcile_project_owners() == 0
+        assert w.session_store.get_project_owner_state("p1") is None
+
+    def test_cancellation_pending_project_is_skipped(self, tmp_path):
+        w, api, owner = _setup(
+            tmp_path,
+            children=[_child("c1", "p1", "Design", status="blocked", tags=["agent-blocked"])],
+            cancel_pending=True,
+        )
+        assert w._reconcile_project_owners() == 0
+        assert w.session_store.get_project_owner_state("p1") is None
+
+    def test_handoff_pending_project_is_skipped(self, tmp_path):
+        w, api, owner = _setup(
+            tmp_path,
+            children=[_child("c1", "p1", "Design", status="blocked", tags=["agent-blocked"])],
+            handoff_pending=True,
+        )
+        assert w._reconcile_project_owners() == 0
+        assert w.session_store.get_project_owner_state("p1") is None
+
+    def test_operator_owned_me_project_never_wakes(self, tmp_path):
+        w, api, owner = _setup(
+            tmp_path,
+            children=[_child("c1", "p1", "Design", status="blocked", tags=["agent-blocked"])],
+            project_tags=("me",),
+        )
+        assert w._reconcile_project_owners() == 0
+        assert w.session_store.get_project_owner_state("p1") is None
+
+    def test_non_cli_routed_owner_is_not_woken(self, tmp_path, monkeypatch):
+        w, api, owner = _setup(
+            tmp_path, children=[_child("c1", "p1", "Design")], owner_routing="hermes",
+        )
+        api.tasks["c1"]["status"] = "blocked"
+        api.tasks["c1"]["tags"] = ["agent-blocked"]
+        _age_anchor(w, "p1", 31)
+
+        calls = []
+        orig = w._continue_session
+        monkeypatch.setattr(
+            w, "_continue_session",
+            lambda *a, **kw: (calls.append(1), orig(*a, **kw))[1],
+        )
+
+        assert w._reconcile_project_owners() == 0
+        # The explicit route gate short-circuits before ever reaching
+        # delivery -- not merely surviving a NotImplementedError raised
+        # from inside it.
+        assert calls == []
+        after = w.session_store.get(_OWNER_TASK_ID)
+        assert after.status == STATUS_COMPLETED  # unchanged -- no CAS attempted
+        assert after.attempt_number == 1
+
+
+# ---------------------------------------------------------------------------
+# B3: one project's reconciliation failure must never abort the whole tick
+# ---------------------------------------------------------------------------
+
+class TestReconcilerIsolatesPerProjectFailures:
+    def test_one_projects_exception_does_not_stop_another_from_waking(self, tmp_path, monkeypatch):
+        w, api, owner1 = _setup(tmp_path, project_id="p1", children=[_child("c1", "p1", "Design")])
+        owner2 = w.session_store.create(
+            task_id="project_p2_op1", routing="claude_code", status=STATUS_COMPLETED, origin="operator",
+            execution_request={"executor": "claude_code", "working_dir": "/repo/wt-2"},
+        )
+        w.session_store.set_claude_code_session_id("project_p2_op1", "cli-owner-2")
+        owner2 = w.session_store.get("project_p2_op1")
+        api.tasks["p2"] = _project("p2", "Second project", owner_session_id=owner2.session_id)
+        api.tasks["c2"] = _child("c2", "p2", "Other work")
+        w._reconcile_project_owners()  # seed p2's baseline too
+
+        api.tasks["c1"]["status"] = "blocked"
+        api.tasks["c1"]["tags"] = ["agent-blocked"]
+        api.tasks["c2"]["status"] = "blocked"
+        api.tasks["c2"]["tags"] = ["agent-blocked"]
+        _age_anchor(w, "p1", 31)
+        _age_anchor(w, "p2", 31)
+
+        orig = w._reconcile_one_project_owner
+
+        def _boom(project_id, *a, **kw):
+            if project_id == "p1":
+                raise RuntimeError("boom")
+            return orig(project_id, *a, **kw)
+
+        monkeypatch.setattr(w, "_reconcile_one_project_owner", _boom)
+
+        assert w._reconcile_project_owners() == 1  # p1 blew up; p2 still woke
+        assert w.session_store.get("project_p2_op1").status == STATUS_CLAIMED
+
+
+# ---------------------------------------------------------------------------
+# B4: a reply arriving after an owner wake rotated the attempt is not silent
+# ---------------------------------------------------------------------------
+
+class TestStaleOwnerFollowupReply:
+    def test_reply_after_a_wake_rotated_the_attempt_is_recorded_and_notified(self, tmp_path):
+        w, api, owner = _setup(tmp_path, children=[_child("c1", "p1", "Design")])
+        qid = w.session_store.register_completion_followup(
+            owner.session_id, _OWNER_TASK_ID, [12345], label="Big migration",
+        )
+        w.session_store.deposit_answer_by_id(qid, "looks good, keep going")
+
+        # An owner wake rotates the attempt before the reply is processed.
+        w.session_store.begin_new_execution(_OWNER_TASK_ID, request=owner.execution_request)
+
+        w._process_clarification_answers()
+
+        events = w.transcript_store.read(owner.session_id)
+        assert any(e.get("kind") == "owner_followup_reply_stale" for e in events)
+        assert any("arrived after" in text for text in w._sent)
+        assert w.session_store.claim_answered_unprocessed_questions() == []
+
+
+# ---------------------------------------------------------------------------
+# B6: project_owner_state.owner_session_id stays fresh across a re-Plan
+# ---------------------------------------------------------------------------
+
+class TestOwnerSessionIdStaysFreshOnReplan:
+    def test_ensure_project_owner_state_updates_a_stale_owner_session_id(self, tmp_path):
+        w, api, owner = _setup(tmp_path, children=[_child("c1", "p1", "Design")])
+        state = w.session_store.get_project_owner_state("p1")
+        assert state["owner_session_id"] == owner.session_id
+
+        new_owner = w.session_store.create(
+            task_id="project_p1_op2", routing="claude_code", status=STATUS_COMPLETED, origin="operator",
+        )
+        w.session_store.ensure_project_owner_state(
+            "p1", owner_session_id=new_owner.session_id, baseline_states={"c1": "active"},
+        )
+
+        refreshed = w.session_store.get_project_owner_state("p1")
+        assert refreshed["owner_session_id"] == new_owner.session_id
+        # Everything else -- acked_states in particular -- is untouched by
+        # a re-observation's owner_session_id sync.
+        assert refreshed["acked_states"] == state["acked_states"]
+
+
+# ---------------------------------------------------------------------------
+# B1: the wake message must not point the owner at a tool call that always
+# refuses mid-wake
+# ---------------------------------------------------------------------------
+
+class TestWakeMessageDoesNotPromiseAnUnusableTool:
+    def test_wake_message_explains_complete_refuses_mid_turn(self, tmp_path):
+        w, api, owner = _setup(tmp_path, children=[_child("c1", "p1", "Design")])
+        api.tasks["c1"]["status"] = "blocked"
+        api.tasks["c1"]["tags"] = ["agent-blocked"]
+        _age_anchor(w, "p1", 31)
+
+        assert w._reconcile_project_owners() == 1
+        pending = w.session_store.peek_pending_messages(owner.session_id)
+        body = pending[0]["content"]
+        assert "refuses while this turn is live" in body
+        assert "operator" in body
