@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Platform
-> **Last Updated:** 2026-09-20
+> **Last Updated:** 2026-09-22
 
 LifeOS exposes the orchestrator to **HTTP consumers** — thin clients that submit text and consume SSE without importing LifeOS Python modules. Endpoint and event **shapes** are defined in [api-reference.md](../product/api-reference.md); this doc covers **who consumes them**, **whisper-relay integration**, and **breaking-change policy**.
 
@@ -446,7 +446,7 @@ through each surface's existing adapter:
 | Telegram chat and LifeOS voice | The same native chat loop and `agent_tools` catalog/prompt | Inherits the native behavior, including a non-mutating cancellation preview and explicit-confirmation second call. Telegram's resume handler has one surface-specific reopen mutation, while voice has none; that handler still uses the shared `TaskManager` guards. |
 | Hermes text/personas | `lifeos_context.turn` plus the LifeOS MCP task catalog | The envelope carries `task_hierarchy_instruction`; Hermes's `lifeos_adapter/envelope.py` parses the field and renders it into the outgoing model context. MCP descriptions and responses expose the same project consequences and HTTP action guards. |
 | Hermes voice | Current whisper-relay `src/voice_gateway/adapters/hermes_backend.py` posts directly to the Hermes harness | The configured LifeOS MCP task tools remain hierarchy-aware and enforce the same server guards. The direct route does not traverse the LifeOS Hermes proxy, so it has tool-schema awareness rather than the proxy's proactive `lifeos_context.turn` instruction. |
-| Direct MCP clients (Claude Code, Codex, managed agents) | `mcp_server.py` → task HTTP endpoints | Reads enriched tasks/children and uses explicit project actions. Project cancellation is preview/confirm and reports durable partial failures. |
+| Direct MCP clients (Claude Code, Codex, managed agents) | `mcp_server.py` → task HTTP endpoints | Reads enriched tasks/children and uses explicit project actions. Project cancellation is preview/confirm and reports durable partial failures. Curated task create/update carries a caller-asserted `X-LifeOS-Agent-Session` header whenever this server has a worker identity — never from interactive operator MCP — and the API refuses `#hermes` and an out-of-scope paid route on an agent-attributed project child. See [API Reference — Agent-session attribution and project-child guards](../product/api-reference.md#agent-session-attribution-and-project-child-guards). |
 | Board worker/executors | HTTP task payload and worker dispatch | Project parents are not claimable; child execution receives bounded parent objective/acceptance and sibling-state context. |
 | Scheduler, journal capture and other automation producers | Existing TaskManager or task-create adapters | Produce ordinary tasks by default. A task becomes a child only when the producer explicitly supplies a valid `fields.parent_id`; serialization and retry paths preserve that field and shared guards validate it. |
 

@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** API Gateway
-> **Last Updated:** 2026-09-20
+> **Last Updated:** 2026-09-22
 
 MCP (Model Context Protocol) server that exposes LifeOS capabilities to AI assistants like Claude Code.
 
@@ -115,14 +115,30 @@ reports unfinished, running, and awaiting-review work; confirmation abandons
 pending-review output without accepting it, and a partial result remains
 pending until retried with the same `operation_id`.
 
+`lifeos_task_create`/`lifeos_task_update` carry a caller-asserted worker
+identity (an `X-LifeOS-Agent-Session` header, invisible to the tool
+schema — the stdio and local-executor MCP transports add it automatically,
+and the agent-only HTTP transport always sends the literal `unattested`,
+since it has no per-call identity of its own) whenever this server has one;
+interactive operator MCP sends none. On a
+project-child create or update, an agent-attributed request can never
+assign `#hermes`, and a paid route (`#cloud`/`#cloud-haiku`/`#cloud-sonnet`)
+is refused unless the project's own owner already carries it. An
+agent-attributed create is stamped internally as agent-created; an
+operator create is not, and neither stamp can be forged or cleared through
+an ordinary update. See [API Reference — Agent-session attribution and
+project-child guards](api-reference.md#agent-session-attribution-and-project-child-guards).
+
 `lifeos_agent_project_handoff` is distinct from ordinary child attachment and
 from `lifeos_agent_spawn`. It accepts an attested current executor turn, a
 stable operation ID, and 1–20 keyed child requests. The server derives the
 source task and session; it rejects a child, an existing project, a stale turn,
-or a caller that tries to broaden provider consent. Each durable child retains
-its own explicit assignment and execution request; omitted assignment remains
-unassigned. A successful staging response tells the caller to stop, and work
-does not become runnable until the worker observes and records that terminal
+or a caller that tries to broaden provider consent. `#hermes` is not a valid
+child assignee or executor — the schema omits it, and the handler rejects it
+outright. Each durable child retains its own explicit assignment and
+execution request; omitted assignment remains unassigned. A successful
+staging response tells the caller to stop, and work does not become runnable
+until the worker observes and records that terminal
 turn boundary. If termination cannot be verified, the handoff remains visibly
 pending rather than reporting the parent complete. Recovery retains that fence
 across restarts: it does not release staged work until the matching source turn

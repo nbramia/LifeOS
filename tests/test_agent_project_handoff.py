@@ -41,6 +41,8 @@ from api.services.agent_worker.spend_tracker import SpendTracker
 from api.services.agent_worker.worker import PROJECT_HANDOFF_RETURN_PENDING_EVENT, Worker
 from api.services.task_manager import TaskManager
 from api.services.task_projects import (
+    CHILD_CREATOR_SESSION_FIELD,
+    CHILD_ORIGIN_FIELD,
     HANDOFF_OPERATION_FIELD,
     HANDOFF_QUIESCENT_EVENT,
     HANDOFF_READY_AT_FIELD,
@@ -226,6 +228,72 @@ def test_handoff_stages_fenced_children_and_blocked_coordinator(handoff):
         manager.update(parent.id, fields={HANDOFF_OPERATION_FIELD: "forged"})
     with pytest.raises(ProjectConflictError, match="handoff is pending"):
         manager.update(children[0].id, tags=["codex"])
+
+
+def test_handoff_staged_children_are_stamped_agent_origin(handoff):
+    manager, _store, _transcripts, source, ctx = handoff
+
+    result = dispatch(ctx, "lifeos_agent_project_handoff", _request())
+
+    assert result["ok"] is True
+    for item in result["child_tasks"]:
+        child = manager.get(item["task_id"])
+        assert child.fields[CHILD_ORIGIN_FIELD] == "agent"
+        assert child.fields[CHILD_CREATOR_SESSION_FIELD] == source.session_id
+
+
+def test_handoff_rejects_hermes_assignee_before_any_write(handoff):
+    manager, store, transcripts, source, ctx = handoff
+    request = _request()
+    request["children"][0]["assignee"] = "hermes"
+    del request["children"][0]["execution"]
+
+    result = dispatch(ctx, "lifeos_agent_project_handoff", request)
+
+    assert result == {
+        "ok": False,
+        "error": "hermes_delegation_forbidden",
+        "message": (
+            "child research cannot be assigned to hermes; the operator can "
+            "assign it from the board"
+        ),
+    }
+    assert [task.id for task in manager.list_tasks()] == [source.task_id]
+    assert store.list_sessions() == [source]
+    assert HANDOFF_OPERATION_FIELD not in manager.get(source.task_id).fields
+    assert transcripts.read(source.session_id) == []
+
+
+def test_handoff_rejects_hermes_executor_before_any_write(handoff):
+    manager, store, transcripts, source, ctx = handoff
+    request = _request()
+    request["children"][0]["assignee"] = None
+    request["children"][0]["execution"] = {"executor": "hermes"}
+
+    result = dispatch(ctx, "lifeos_agent_project_handoff", request)
+
+    assert result == {
+        "ok": False,
+        "error": "hermes_delegation_forbidden",
+        "message": (
+            "child research cannot execute on hermes; the operator can "
+            "assign it from the board"
+        ),
+    }
+    assert [task.id for task in manager.list_tasks()] == [source.task_id]
+    assert HANDOFF_OPERATION_FIELD not in manager.get(source.task_id).fields
+
+
+def test_handoff_schema_omits_hermes_from_assignee_and_executor_enums():
+    from api.services.agent_worker.inter_agent import INTER_AGENT_TOOL_SCHEMAS
+
+    schema = next(
+        item for item in INTER_AGENT_TOOL_SCHEMAS
+        if item["name"] == "lifeos_agent_project_handoff"
+    )
+    child_schema = schema["input_schema"]["properties"]["children"]["items"]["properties"]
+    assert "hermes" not in child_schema["assignee"]["enum"]
+    assert "hermes" not in child_schema["execution"]["properties"]["executor"]["enum"]
 
 
 def test_handoff_is_hash_idempotent_and_mismatch_is_stable(handoff):

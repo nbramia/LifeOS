@@ -352,19 +352,25 @@ class TaskManager:
         fields: Optional[dict[str, str]] = None,
         _log_content: bool = True,
         _project_handoff_operation: Optional[str] = None,
+        _project_child_creator_session: Optional[str] = None,
     ) -> Task:
         """Create a new task at the top of its context file, update index.
 
         Raises `ValueError` (-> HTTP 422 at the route layer) for an
         unrecognized `status`, or for `description`/`notes`/`fields` content
         that would corrupt the task line or hijack another task's id — see
-        `_validate_text_fields`.
+        `_validate_text_fields`. `_project_child_creator_session`, when the
+        new task carries `fields.parent_id`, stamps it as agent-created —
+        see `CHILD_ORIGIN_FIELD` in `api.services.task_projects`; it is
+        never accepted through the caller-supplied `fields` dict itself.
         """
         if fields:
             from api.services.task_projects import (
                 ABANDONED_AT_FIELD,
                 CANCEL_OPERATION_FIELD,
                 CANCEL_REQUESTED_AT_FIELD,
+                CHILD_CREATOR_SESSION_FIELD,
+                CHILD_ORIGIN_FIELD,
                 COORDINATOR_REQUEST_FIELD,
                 COORDINATOR_SESSION_FIELD,
                 EXECUTION_PAUSED_FIELD,
@@ -393,6 +399,7 @@ class TaskManager:
                 HANDOFF_REQUEST_HASH_FIELD, HANDOFF_REQUESTED_AT_FIELD,
                 HANDOFF_READY_AT_FIELD, LAST_HANDOFF_OPERATION_FIELD,
                 HANDOFF_ACTIVATED_AT_FIELD, LAST_ABORTED_HANDOFF_FIELD,
+                CHILD_ORIGIN_FIELD, CHILD_CREATOR_SESSION_FIELD,
                 INTEGRATION_BRANCH_FIELD,
             }
             if set(fields) & internal_fields:
@@ -419,6 +426,15 @@ class TaskManager:
                 notes=notes,
                 fields=dict(fields) if fields else {},
             )
+            if _project_child_creator_session and (task.fields.get("parent_id") or "").strip():
+                from api.services.task_projects import (
+                    CHILD_CREATOR_SESSION_FIELD,
+                    CHILD_ORIGIN_AGENT,
+                    CHILD_ORIGIN_FIELD,
+                )
+
+                task.fields[CHILD_ORIGIN_FIELD] = CHILD_ORIGIN_AGENT
+                task.fields[CHILD_CREATOR_SESSION_FIELD] = _project_child_creator_session
             parent_id = (task.fields.get("parent_id") or "").strip()
             if parent_id:
                 # Refresh from Markdown after acquiring the cross-process
@@ -506,6 +522,7 @@ class TaskManager:
         notes: Optional[str] = None,
         fields: Optional[dict[str, str]] = None,
         _project_handoff_operation: Optional[str] = None,
+        _project_child_creator_session: Optional[str] = None,
     ) -> tuple[Task, bool]:
         """Atomically find or create a task for a durable source operation.
 
@@ -545,6 +562,7 @@ class TaskManager:
                 fields=merged_fields,
                 _log_content=False,
                 _project_handoff_operation=_project_handoff_operation,
+                _project_child_creator_session=_project_child_creator_session,
             ), True
 
     def find_by_operation(self, operation_key: str) -> Optional[Task]:
@@ -1220,6 +1238,8 @@ class TaskManager:
             ABANDONED_AT_FIELD,
             CANCEL_OPERATION_FIELD,
             CANCEL_REQUESTED_AT_FIELD,
+            CHILD_CREATOR_SESSION_FIELD,
+            CHILD_ORIGIN_FIELD,
             COORDINATOR_SESSION_FIELD,
             COORDINATOR_REQUEST_FIELD,
             EXECUTION_PAUSED_FIELD,
@@ -1262,6 +1282,8 @@ class TaskManager:
             LAST_HANDOFF_OPERATION_FIELD,
             HANDOFF_ACTIVATED_AT_FIELD,
             LAST_ABORTED_HANDOFF_FIELD,
+            CHILD_ORIGIN_FIELD,
+            CHILD_CREATOR_SESSION_FIELD,
             INTEGRATION_BRANCH_FIELD,
         }
         if not project_action and fields_patch and set(fields_patch) & internal_fields:
