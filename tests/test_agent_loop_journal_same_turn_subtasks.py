@@ -36,11 +36,12 @@ def tm(tmp_path, monkeypatch):
 
 
 class _CreateParentThenChildClient:
-    """Round 1 creates a parent task with no `parent_id`. Round 2 creates a
-    child naming, as its `parent_id`, the id `_format_native_task` printed
-    in round 1's tool result -- read straight out of the appended tool
-    result message rather than assumed, since a real TaskManager assigns it.
-    Round 3 answers with plain text so the loop terminates.
+    """The first model turn creates a parent task with no `parent_id`. The
+    second turn creates a child naming, as its `parent_id`, the id
+    `_format_native_task` printed in the first turn's tool result -- read
+    straight out of the appended tool result message rather than assumed,
+    since a real TaskManager assigns it. The third turn answers with plain
+    text so the loop terminates.
     """
 
     def __init__(self, child_description: str = "Clear the synthetic shelves"):

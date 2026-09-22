@@ -446,8 +446,7 @@ class TestExecuteToolParallelSameTurnParentAttestation:
         assert created == after_first
 
     async def test_no_set_keeps_todays_stripping_behavior(self, tm):
-        # created_task_ids=None (the default) is indistinguishable from the
-        # behavior before this param existed: an unattested parent_id is
+        # With no created_task_ids (the default), an unattested parent_id is
         # always stripped.
         out = await execute_tool_parallel(
             "manage_tasks",
