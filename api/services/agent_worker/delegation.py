@@ -34,7 +34,10 @@ inspect them with `{TASK_CHILDREN}` and give each an explicit, independent
 assignment and execution request. Never assume a child inherits your route,
 model, host, working directory, or provider consent; omitted assignment stays
 unassigned, and cloud/provider access is allowed only within the already
-authorized lineage scope.
+authorized lineage scope. A project-child create or update from an agent
+never carries #hermes — the operator assigns that from the board — and a
+paid route (#cloud/#cloud-haiku/#cloud-sonnet) is refused unless the
+project's own owner already carries that same route.
 
 A durable hierarchy has exactly one child level. Use stable child keys and
 inspect the existing children before retrying or creating work. A child cannot

@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-09-20
+**Last Updated:** 2026-09-22
 
 Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Four adjacent catalogs split out for size:
 
@@ -368,6 +368,40 @@ description or parent returns the original task unchanged. Project coordinators
 derive a distinct key for each intended child from the project ID, planning
 operation ID, and child role.
 
+#### Agent-session attribution and project-child guards
+
+Both `POST /api/tasks` and `PUT /api/tasks/{id}` accept an optional
+`X-LifeOS-Agent-Session` request header. The curated MCP proxy
+(`mcp_server.py`) sends it on every task create/update when it has a worker
+identity — a stdio worker session, the in-process local executor, or the
+agent-only HTTP transport (which always sends the literal value
+`unattested`, since it has no per-call identity of its own). Interactive
+operator MCP sends no header, and the API treats its absence exactly as it
+always has — this is additive, caller-asserted identity, the same trust
+model as the existing `actor` and `fields.assigned_by` fields, not
+cryptographic attestation.
+
+When the header is present and the task being written is, or would become,
+a project child (`fields.parent_id` set, or already parented):
+- Assigning the `#hermes` tag is refused with **422**
+  `{"code": "hermes_delegation_forbidden", ...}`. The operator can still
+  assign `#hermes` to a project child from the board (no header, or an
+  operator write) — that path is unaffected.
+- Assigning a paid model route (`#cloud`, `#cloud-haiku`, `#cloud-sonnet`)
+  is refused with **422** `{"code": "api_billing_blocked", ...}` unless the
+  project's own owner (its `project_coordinator_session_id`) already
+  carries that same route — mirrors the equivalent rule on
+  `lifeos_agent_project_handoff`.
+
+An agent-attributed create that carries `fields.parent_id` is stamped with
+two internal fields — `project_child_origin: "agent"` and
+`project_child_creator_session: <session id or "unattested">` — so later
+readers can tell an agent-created child from an operator-created one (which
+carries neither field). A handoff-staged child is stamped the same way,
+with the handoff's source session as the creator. Both fields are
+internal: an ordinary `fields` patch on create or update can never set or
+clear either one.
+
 ### GET /api/tasks
 
 List/filter tasks.
@@ -421,6 +455,10 @@ field-edit path too — **409** on a card the worker has claimed, with no
 write. Requests that carry neither a `tags` key nor the board marker are
 unaffected. See [Agent Viz —
 Product](agent-viz.md#human-moves-on-agent-owned-cards).
+
+See "Agent-session attribution and project-child guards" above `POST
+/api/tasks` — the same `X-LifeOS-Agent-Session` header, `#hermes` refusal,
+and paid-route scope check apply here on a `tags` patch to a project child.
 
 ### PUT /api/tasks/{id}/complete
 

@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Task Management
-> **Last Updated:** 2026-09-20
+> **Last Updated:** 2026-09-22
 
 LifeOS stores tasks as markdown checkboxes in your vault, in a format the Obsidian Tasks plugin can query and display, and manages them via chat, API, or Obsidian. Any checkbox line in `LifeOS/Tasks/*.md` counts as a task — you don't need to type LifeOS's own conventions by hand, and a plain hand-written checklist item is picked up on the next reindex. LifeOS's non-standard statuses (In Progress, Deferred, Blocked, Urgent — see below) render as generic checkboxes in Obsidian until you add them under the Tasks plugin's own "Custom statuses" settings; the plugin doesn't know about them out of the box.
 
@@ -183,6 +183,15 @@ clearing that pause; use `POST /api/tasks/{id}/resume-execution` when the
 ordinary task should become executable again. Parent assignment is project
 ownership and does not copy to children. Each child keeps its own assignee and
 normal execution/review lifecycle.
+
+A child created or updated by an agent — as opposed to the operator — can
+never be assigned the external-routing persona (`#hermes`); the operator can
+still assign it from the board. An agent-attributed child can only be put on
+a paid model route (`#cloud`, `#cloud-haiku`, `#cloud-sonnet`) when the
+project's own owner already carries that same route. An agent-created child
+is marked internally so later features (board display, notices) can tell it
+apart from an operator-created one; that marker cannot be set or cleared
+through an ordinary edit.
 
 Projects use explicit lifecycle actions:
 

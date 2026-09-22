@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-09-20
+> **Last Updated:** 2026-09-22
 
 LifeOS includes an external **agent worker** that picks up engine-assigned tasks and completes them autonomously — running locally on a self-hosted LLM or on Anthropic's Managed Agents cloud, with budget caps you can specify in the task title and full audit transcripts on every run. When the agent finishes (or gets stuck), it notifies you on Telegram. If it has a question mid-run, it asks via Telegram and waits for your reply.
 
@@ -82,7 +82,13 @@ or independent execution pause.
 Projects are never claimed or opened as ordinary worker tasks. Their assignee
 is the owner, while every child keeps its own assignment and normal execution
 and review lifecycle. Creating or attaching a child does not inherit the
-parent's engine tags. When the worker starts a child, its bounded execution
+parent's engine tags. A child created or updated by an agent can never be
+assigned `#hermes` — only the operator can, from the board — and can only be
+put on a paid model route (`#cloud`/`#cloud-haiku`/`#cloud-sonnet`) when the
+project's own owner already carries that same route. A child created this
+way is marked internally as agent-created, distinct from an operator-created
+child, so later features can tell them apart; that marker cannot be forged
+or cleared through an ordinary edit. When the worker starts a child, its bounded execution
 context contains that child's instructions plus the parent ID, title,
 objective/acceptance notes, and a compact sibling-status summary; unrelated
 tasks are not copied into the prompt. When the optional Jev destructive gate
@@ -133,7 +139,8 @@ that exact executor turn, not ordinary child attachment: the caller submits a
 stable operation ID and 1–20 uniquely keyed child requests, then stops. The
 worker records the source turn's stop before activating the staged children and
 bounded coordinator. A stop it cannot verify leaves the handoff pending; it
-does not mark the original task complete or release any staged work. Existing
+does not mark the original task complete or release any staged work. A staged
+child can never be assigned `#hermes` as its assignee or executor. Existing
 projects use **Plan and delegate**, not this conversion. Session-agent
 delegation (`lifeos_agent_spawn`) remains separate from durable project
 children. A child never becomes a project, and a coordinator is one bounded

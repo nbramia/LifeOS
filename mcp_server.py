@@ -41,16 +41,27 @@ AGENT_TRANSCRIPTS_DIR = _REPO_ROOT / "data" / "agent_transcripts"
 API_BASE = os.environ.get("LIFEOS_API_URL", "http://localhost:8000")
 OPENAPI_URL = f"{API_BASE}/openapi.json"
 TURN_ID_HEADER = "X-LifeOS-Turn-ID"
+# Caller-asserted worker identity, sent on curated task create/update when
+# this server has one (stdio worker env, an in-process local executor
+# context, or the agent-only HTTP transport). Never sent by interactive
+# operator MCP. See `LifeOSMCPServer._resolve_agent_session_header`.
+AGENT_SESSION_HEADER = "X-LifeOS-Agent-Session"
 
 _TASK_CREATE_FIELDS_DESCRIPTION = (
     "Operator-editable inline fields (e.g. host, effort, model, key) plus "
     "custom fields. Set parent_id to a stable task ID to create a durable "
-    "child relationship; this is task hierarchy, not agent-session ancestry."
+    "child relationship; this is task hierarchy, not agent-session ancestry. "
+    "An agent-attributed create refuses #hermes on a project child, and a "
+    "paid route (#cloud/#cloud-haiku/#cloud-sonnet) unless the project owner "
+    "already carries it."
 )
 _TASK_UPDATE_FIELDS_DESCRIPTION = (
     "Merged into operator/unknown fields, not replaced: a string sets a field, "
     "null removes it. Set fields.parent_id to attach/reparent by stable task ID "
-    "or null to detach; project hierarchy is independent of agent-session ancestry."
+    "or null to detach; project hierarchy is independent of agent-session ancestry. "
+    "An agent-attributed update refuses #hermes on a project child, and a paid "
+    "route (#cloud/#cloud-haiku/#cloud-sonnet) unless the project owner already "
+    "carries it."
 )
 
 
@@ -1533,7 +1544,33 @@ class LifeOSMCPServer:
             return False
         return cfg.get("method", "").upper() == "GET"
 
-    def _call_api(self, tool_name: str, arguments: dict, session_id: str | None = None) -> dict:
+    def _resolve_agent_session_header(self, explicit: str | None) -> str:
+        """Resolve the caller-asserted worker identity for `AGENT_SESSION_HEADER`.
+
+        Precedence: an explicit override (the in-process local executor
+        passes its `InterAgentContext.caller_session_id`), else the stdio
+        worker identity this process inherited via `LIFEOS_AGENT_SESSION_ID`,
+        else `"unattested"` when this server is the agent-only HTTP
+        transport (bearer bound, never used by an interactive operator).
+        Returns "" for interactive operator MCP — stdio with no worker env
+        and no HTTP transport bearer — which sends no header at all.
+        """
+        explicit = (explicit or "").strip()
+        if explicit:
+            return explicit
+        if self._trusted_session_id:
+            return self._trusted_session_id
+        if self._mcp_transport_secret:
+            return "unattested"
+        return ""
+
+    def _call_api(
+        self,
+        tool_name: str,
+        arguments: dict,
+        session_id: str | None = None,
+        agent_session_id: str | None = None,
+    ) -> dict:
         """Call the LifeOS API based on tool name and arguments.
 
         `session_id` (optional) enables the per-session result cache:
@@ -1541,6 +1578,10 @@ class LifeOSMCPServer:
         are served from a 60s LRU instead of round-tripping to the API. Writes
         (POST/PUT/DELETE) are never cached. The cache also skips inter-agent
         tools and the sync trigger (both sensitive to fresh state).
+
+        `agent_session_id` (optional) is the in-process local executor's own
+        caller identity override for `AGENT_SESSION_HEADER` — see
+        `_resolve_agent_session_header`.
         """
         # Custom handlers for tools that don't map 1:1 to endpoints
         if tool_name == "lifeos_sync_trigger":
@@ -1596,6 +1637,14 @@ class LifeOSMCPServer:
             request_key = (arguments.pop(request_key_header_arg, None) or "").strip()
             if request_key:
                 headers["X-Request-Key"] = request_key
+        # Curated task writes carry the caller-asserted worker identity, so
+        # the API can tell an agent-attributed project-child write from an
+        # operator's. Scoped to exactly these two tools — see
+        # `_resolve_agent_session_header`.
+        if tool_name in ("lifeos_task_create", "lifeos_task_update"):
+            resolved_agent_session = self._resolve_agent_session_header(agent_session_id)
+            if resolved_agent_session:
+                headers[AGENT_SESSION_HEADER] = resolved_agent_session
 
         # Handle path parameters
         if "{" in endpoint_path:

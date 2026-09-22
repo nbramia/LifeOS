@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-09-21
+> **Last Updated:** 2026-09-22
 
 Engineering view of the agent worker — the stand-alone process that consumes engine-assigned tasks and runs them on either a local LLM or Anthropic Managed Agents. For consumer-facing behavior, see [product/agent-worker.md](../product/agent-worker.md). For operator setup, see [guides/agent-worker-setup.md](../../guides/agent-worker-setup.md).
 
@@ -626,7 +626,7 @@ Local agents can spawn child sessions and coordinate via the `lifeos_agent_*` to
 
 | Tool | Purpose |
 |---|---|
-| `lifeos_agent_project_handoff` | Stage 1–20 uniquely keyed durable children from the exact current ordinary-task turn. It is terminal for that turn; staged work remains fenced until the worker proves quiescence and finalizes it. |
+| `lifeos_agent_project_handoff` | Stage 1–20 uniquely keyed durable children from the exact current ordinary-task turn. It is terminal for that turn; staged work remains fenced until the worker proves quiescence and finalizes it. `hermes` is not a valid child `assignee` or `execution.executor` — the schema omits it and the handler rejects it with `hermes_delegation_forbidden`; a metered `execution.executor` (`claude`/`remote`) is refused outside the source turn's own already-authorized scope (`inter_agent.metered_target_out_of_scope`). Staged children are stamped `project_child_origin=agent` plus the source session as `project_child_creator_session`. |
 | `lifeos_agent_spawn` | Create a child on `local`, `remote`, `claude`, `hermes`, `claude_code`, or `codex`. Legacy `model=<executor>` and Claude-Code `tier` remain valid; the strict `execution` object carries canonical route/model/effort/location/budget choices. Omitting the route inherits an active bounded override or the caller route. |
 | `lifeos_agent_send` | Post a message to a child session's queue. Also a lifecycle transition: a direct parent sending to its own COMPLETED `claude_code`/`codex` child with a persisted CLI session id **reopens** it — the message is enqueued as the child's next turn *before* the status flips back to `claimed` (so a dispatch tick can never claim an empty resume prompt), and the spawned-session dispatcher resumes the CLI session via `-r` with full prior context. All other terminal sends still reject. |
 | `lifeos_agent_check` | Poll a child's current state. |

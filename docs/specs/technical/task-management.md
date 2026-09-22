@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Task Management
-> **Last Updated:** 2026-09-20
+> **Last Updated:** 2026-09-22
 
 Engineering view of the task store — how a task is located, written, and
 reindexed. For the product-facing feature description, statuses, and API
@@ -437,8 +437,25 @@ delete/claim and lifecycle-tag swaps. A swap cannot manufacture worker
 lifecycle state on a task that fails project claim admission, while a card
 that already carries `agent-running` or `agent-blocked` can still complete,
 fail, block, or resume through the worker's atomic transition. The route maps
-an admission conflict to HTTP 409. `ProjectTaskService` composes the slower
-explicit actions:
+an admission conflict to HTTP 409.
+
+Create/update on `/api/tasks` also read an optional, caller-asserted
+`X-LifeOS-Agent-Session` header — the same trust model as `actor` and
+`fields.assigned_by`, not cryptographic attestation. When present and the
+write is, or would become, a project child, `_enforce_agent_child_tag_guard`
+(`api/routes/tasks.py`) refuses `#hermes` outright and refuses a paid route
+(`#cloud`/`#cloud-haiku`/`#cloud-sonnet`) unless the project's owner
+(`project_coordinator_session_id`) already resolves to that same executor —
+`inter_agent.metered_target_out_of_scope`, the same function the handoff
+handler uses for its own source-turn scope check. A create that carries
+`fields.parent_id` under that header stamps `project_child_origin=agent`
+and `project_child_creator_session=<id>` on the new task; `stage_handoff`
+stamps its children the same way, with the handoff's source session as the
+creator. Both fields are in `TaskManager.create`'s and
+`_guard_project_update`'s `internal_fields` sets, so neither create's raw
+`fields` dict nor an ordinary update can set or clear them.
+
+`ProjectTaskService` composes the slower explicit actions:
 
 - start and completion mutate the ordinary parent without forging agent tags;
 - plan/delegate stages a separate operator-origin session as non-dispatchable,

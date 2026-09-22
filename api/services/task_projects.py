@@ -59,6 +59,15 @@ LAST_HANDOFF_OPERATION_FIELD = "project_last_handoff_operation_id"
 HANDOFF_ACTIVATED_AT_FIELD = "project_handoff_activated_at"
 LAST_ABORTED_HANDOFF_FIELD = "project_last_aborted_handoff_operation_id"
 
+# Stamped on a project child created by an agent-attributed request (the
+# curated `lifeos_task_create` proxy carrying `X-LifeOS-Agent-Session`) or by
+# a handoff. Internal — see `internal_fields` in `TaskManager.create` and
+# `_guard_project_update` — so an ordinary create/update can never set or
+# clear either field itself; only the create-time stamping paths do.
+CHILD_ORIGIN_FIELD = "project_child_origin"
+CHILD_ORIGIN_AGENT = "agent"
+CHILD_CREATOR_SESSION_FIELD = "project_child_creator_session"
+
 HANDOFF_REQUEST_EVENT = "project_handoff_requested"
 HANDOFF_QUIESCENT_EVENT = "project_handoff_quiescent"
 
@@ -576,6 +585,7 @@ class ProjectTaskService:
                 notes=child.get("notes"),
                 fields=fields,
                 _project_handoff_operation=operation_id,
+                _project_child_creator_session=source.session_id,
             )
             if (
                 child_task.fields.get(PARENT_ID_FIELD) != task.id

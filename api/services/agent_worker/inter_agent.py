@@ -107,6 +107,35 @@ SPAWN_MODELS = ("claude", "local", "remote", "hermes", *CLI_ROUTINGS)
 NON_API_BILLED_ROOT_ROUTINGS = CLI_ROUTINGS + (HERMES_ROUTING,)
 
 
+def metered_target_out_of_scope(
+    session_store: SessionStore, session: Session, target_executor: str,
+) -> bool:
+    """True when `session` is not already authorized for `target_executor`
+    ('claude' or 'remote' — the two metered engines).
+
+    A lineage rooted in a subscription-billed CLI/Hermes session can never
+    unlock a metered target, and the session's own resolved execution must
+    already match the requested executor exactly — an agent can only reach
+    a metered route its own already-authorized scope already carries, never
+    a new one it merely names. Shared by the handoff handler (checked
+    against the source turn's own caller session) and the project-child
+    write guard in `api/routes/tasks.py` (checked against the project
+    owner's session).
+    """
+    from api.services.agent_worker.execution import ExecutionSpec
+
+    root = session_store.get_by_session_id(
+        session.root_session_id or session.session_id,
+    ) or session
+    source_executor = None
+    if session.execution_spec:
+        try:
+            source_executor = ExecutionSpec.from_dict(session.execution_spec).executor
+        except (TypeError, ValueError):
+            source_executor = None
+    return root.routing in NON_API_BILLED_ROOT_ROUTINGS or source_executor != target_executor
+
+
 # Caps enforced on spawn. Operator overrides via settings (see `Caps` dataclass).
 DEFAULT_MAX_SPAWN_DEPTH = 3
 DEFAULT_MAX_DESCENDANTS_PER_ROOT = 50
@@ -260,12 +289,12 @@ INTER_AGENT_TOOL_SCHEMAS: list[dict[str, Any]] = [
                             "notes": {"type": "string", "maxLength": 6000},
                             "assignee": {
                                 "type": ["string", "null"],
-                                "enum": [None, "me", "claude", "codex", "hermes", "local", "cloud", "cloud-haiku", "cloud-sonnet"],
+                                "enum": [None, "me", "claude", "codex", "local", "cloud", "cloud-haiku", "cloud-sonnet"],
                             },
                             "execution": {
                                 "type": "object", "additionalProperties": False,
                                 "properties": {
-                                    "executor": {"type": "string", "enum": ["local", "remote", "claude", "hermes", "claude_code", "codex"]},
+                                    "executor": {"type": "string", "enum": ["local", "remote", "claude", "claude_code", "codex"]},
                                     "model_id": {"type": "string"},
                                     "effort": {"type": "string", "enum": ["low", "medium", "high", "max"]},
                                     "host": {"type": "string"},
@@ -682,7 +711,6 @@ def project_handoff(ctx: InterAgentContext, args: dict) -> dict:
 
     from api.services import agent_board
     from api.services.agent_worker.execution import (
-        ExecutionSpec,
         parse_execution_request,
         parse_legacy_route_alias,
         unsupported_explicit_fields,
@@ -736,6 +764,12 @@ def project_handoff(ctx: InterAgentContext, args: dict) -> dict:
             if not isinstance(assignee, str):
                 return _err(f"child {key} assignee is invalid", code="invalid_assignment")
             assignee = assignee.strip().lower().lstrip("#")
+        if assignee == "hermes":
+            return _err(
+                f"child {key} cannot be assigned to hermes; the operator can "
+                "assign it from the board",
+                code="hermes_delegation_forbidden",
+            )
         allowed_assignees = {"me", *agent_board.AGENT_EXECUTOR_TAGS}
         if assignee is not None and assignee not in allowed_assignees:
             return _err(f"child {key} assignee is invalid", code="invalid_assignment")
@@ -746,6 +780,12 @@ def project_handoff(ctx: InterAgentContext, args: dict) -> dict:
         if raw_execution is not None:
             if not isinstance(raw_execution, dict) or set(raw_execution) - allowed_execution:
                 return _err(f"child {key} execution has unsupported fields", code="invalid_execution")
+            if str(raw_execution.get("executor", "")).strip().lower() == "hermes":
+                return _err(
+                    f"child {key} cannot execute on hermes; the operator can "
+                    "assign it from the board",
+                    code="hermes_delegation_forbidden",
+                )
             parsed = parse_execution_request(raw_execution)
             if not parsed.ok or parsed.request is None or not parsed.request.executor:
                 return _err(
@@ -797,21 +837,13 @@ def project_handoff(ctx: InterAgentContext, args: dict) -> dict:
         target_executor = request.executor if request else (
             alias_request.executor if alias_request else None
         )
-        if target_executor in {"claude", "remote"}:
-            root = ctx.session_store.get_by_session_id(
-                caller.root_session_id or caller.session_id,
-            ) or caller
-            source_executor = None
-            if caller.execution_spec:
-                try:
-                    source_executor = ExecutionSpec.from_dict(caller.execution_spec).executor
-                except (TypeError, ValueError):
-                    source_executor = None
-            if root.routing in NON_API_BILLED_ROOT_ROUTINGS or source_executor != target_executor:
-                return _err(
-                    f"child {key} requests metered executor {target_executor} outside the source turn's explicit target",
-                    code="api_billing_blocked",
-                )
+        if target_executor in {"claude", "remote"} and metered_target_out_of_scope(
+            ctx.session_store, caller, target_executor,
+        ):
+            return _err(
+                f"child {key} requests metered executor {target_executor} outside the source turn's explicit target",
+                code="api_billing_blocked",
+            )
 
         child = {"key": key, "description": description, "assignee": assignee}
         if notes is not None:
