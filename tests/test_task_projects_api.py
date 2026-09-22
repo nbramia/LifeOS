@@ -616,3 +616,106 @@ def test_valid_agent_session_header_values_accepted(project_api):
         )
         assert response.status_code == 200
         assert response.json()["fields"][CHILD_CREATOR_SESSION_FIELD] == header_value
+
+
+# ---------------------------------------------------------------------------
+# Project pause / resume
+# ---------------------------------------------------------------------------
+
+
+def test_pause_and_resume_round_trip_through_the_api(project_api):
+    client, manager, _sessions = project_api
+    parent = manager.create("Synthetic project", tags=["codex"])
+    child = manager.create("Synthetic child", tags=["codex"], fields={"parent_id": parent.id})
+
+    paused = client.post(f"/api/tasks/{parent.id}/project/pause", json={"reason": "operator"})
+    assert paused.status_code == 200
+    assert paused.json()["fields"]["project_paused"] == "true"
+    assert paused.json()["fields"]["project_pause_reason"] == "operator"
+
+    child_view = client.get(f"/api/tasks/{child.id}")
+    assert child_view.json()["parent_project_paused"] is True
+    assert paused.json()["project"]["paused"] is True
+    assert paused.json()["project"]["pause_reason"] == "operator"
+
+    claim = client.post(f"/api/tasks/{child.id}/claim-agent")
+    assert claim.status_code == 409
+
+    resumed = client.post(f"/api/tasks/{parent.id}/project/resume")
+    assert resumed.status_code == 200
+    assert "project_paused" not in resumed.json()["fields"]
+    assert resumed.json()["project"]["paused"] is False
+
+    claim = client.post(f"/api/tasks/{child.id}/claim-agent")
+    assert claim.status_code == 200
+    assert claim.json()["claimed"] is True
+
+
+def test_pause_defaults_reason_to_operator(project_api):
+    client, manager, _sessions = project_api
+    parent = manager.create("Synthetic default-reason project")
+    manager.create("Synthetic default-reason child", fields={"parent_id": parent.id})
+
+    response = client.post(f"/api/tasks/{parent.id}/project/pause", json={})
+    assert response.status_code == 200
+    assert response.json()["fields"]["project_pause_reason"] == "operator"
+
+
+def test_pause_rejects_an_unrecognized_reason_with_422(project_api):
+    client, manager, _sessions = project_api
+    parent = manager.create("Synthetic bad-reason project")
+    manager.create("Synthetic bad-reason child", fields={"parent_id": parent.id})
+
+    response = client.post(
+        f"/api/tasks/{parent.id}/project/pause", json={"reason": "not_a_real_reason"},
+    )
+    assert response.status_code == 422
+
+
+def test_pause_is_allowed_for_an_agent_attributed_caller(project_api):
+    client, manager, _sessions = project_api
+    parent = manager.create("Synthetic agent-pausable project", tags=["codex"])
+    manager.create("Synthetic agent-pausable child", fields={"parent_id": parent.id})
+
+    response = client.post(
+        f"/api/tasks/{parent.id}/project/pause",
+        headers={"X-LifeOS-Agent-Session": "sess-pauser-1"},
+        json={},
+    )
+    assert response.status_code == 200
+    assert response.json()["fields"]["project_paused"] == "true"
+
+
+def test_resume_is_refused_for_an_agent_attributed_caller(project_api):
+    client, manager, _sessions = project_api
+    parent = manager.create("Synthetic agent-resume project", tags=["codex"])
+    manager.create("Synthetic agent-resume child", fields={"parent_id": parent.id})
+    client.post(f"/api/tasks/{parent.id}/project/pause", json={})
+
+    response = client.post(
+        f"/api/tasks/{parent.id}/project/resume",
+        headers={"X-LifeOS-Agent-Session": "sess-resumer-1"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"]["code"] == "agent_resume_forbidden"
+    assert manager.get(parent.id).fields["project_paused"] == "true"
+
+    operator_response = client.post(f"/api/tasks/{parent.id}/project/resume")
+    assert operator_response.status_code == 200
+    assert "project_paused" not in operator_response.json()["fields"]
+
+
+def test_pause_and_resume_return_404_for_a_missing_task(project_api):
+    client, _manager, _sessions = project_api
+
+    assert client.post("/api/tasks/missing00/project/pause", json={}).status_code == 404
+    assert client.post("/api/tasks/missing00/project/resume").status_code == 404
+
+
+def test_pause_and_resume_refuse_an_ordinary_task(project_api):
+    client, manager, _sessions = project_api
+    task = manager.create("Synthetic ordinary task")
+
+    assert client.post(f"/api/tasks/{task.id}/project/pause", json={}).status_code == 409
+    assert client.post(f"/api/tasks/{task.id}/project/resume").status_code == 409

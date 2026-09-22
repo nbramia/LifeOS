@@ -145,6 +145,70 @@ def test_legacy_cancel_rechecks_hierarchy_before_write(tmp_path: Path, monkeypat
     assert reads >= 2
 
 
+def test_paused_project_policy_offers_resume_not_pause(tmp_path: Path):
+    sessions = SessionStore(tmp_path / "sessions.db")
+    manager = TaskManager(
+        vault_path=tmp_path / "vault",
+        index_path=tmp_path / "index" / "tasks.json",
+        live_session_checker=lambda *_args: False,
+    )
+    service = ProjectTaskService(manager, sessions)
+    parent = manager.create("Synthetic pausable project", tags=["codex"])
+    manager.create("Synthetic pausable child", fields={"parent_id": parent.id})
+    service.pause_project(parent.id)
+    hierarchy = build_task_hierarchy(manager.list_tasks())
+    fields = hierarchy.read_fields(parent.id, service.coordinator_view(manager.get(parent.id)))
+
+    card = _task_card(manager.get(parent.id), {}, {}, sessions, {}, {}, fields)
+
+    assert card["project"]["paused"] is True
+    assert card["project"]["pause_reason"] == "operator"
+    assert card["policy"]["can_pause_project"] is False
+    assert card["policy"]["can_resume_project"] is True
+    assert card["policy"]["can_plan_project"] is False
+    assert card["policy"]["can_cancel_project"] is True
+    assert card["policy"]["can_complete_project"] is False
+
+
+def test_unpaused_project_policy_offers_pause_not_resume(tmp_path: Path):
+    sessions = SessionStore(tmp_path / "sessions.db")
+    manager = TaskManager(
+        vault_path=tmp_path / "vault",
+        index_path=tmp_path / "index" / "tasks.json",
+        live_session_checker=lambda *_args: False,
+    )
+    service = ProjectTaskService(manager, sessions)
+    parent = manager.create("Synthetic unpaused project", tags=["codex"])
+    manager.create("Synthetic unpaused child", fields={"parent_id": parent.id})
+    hierarchy = build_task_hierarchy(manager.list_tasks())
+    fields = hierarchy.read_fields(parent.id, service.coordinator_view(parent))
+
+    card = _task_card(parent, {}, {}, sessions, {}, {}, fields)
+
+    assert card["project"]["paused"] is False
+    assert card["policy"]["can_pause_project"] is True
+    assert card["policy"]["can_resume_project"] is False
+
+
+def test_child_card_reports_parent_project_paused(tmp_path: Path):
+    sessions = SessionStore(tmp_path / "sessions.db")
+    manager = TaskManager(
+        vault_path=tmp_path / "vault",
+        index_path=tmp_path / "index" / "tasks.json",
+        live_session_checker=lambda *_args: False,
+    )
+    service = ProjectTaskService(manager, sessions)
+    parent = manager.create("Synthetic paused-parent project", tags=["codex"])
+    child = manager.create("Synthetic paused-parent child", fields={"parent_id": parent.id})
+    service.pause_project(parent.id)
+    hierarchy = build_task_hierarchy(manager.list_tasks())
+    fields = hierarchy.read_fields(child.id, None)
+
+    card = _task_card(manager.get(child.id), {}, {}, sessions, {}, {}, fields)
+
+    assert card["parent_project_paused"] is True
+
+
 def test_lane_move_refuses_project_without_writing_assignee(tmp_path: Path, monkeypatch):
     manager = TaskManager(tmp_path / "vault", tmp_path / "task-index.json")
     sessions = SessionStore(tmp_path / "sessions.db")

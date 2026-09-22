@@ -387,6 +387,9 @@ class TaskManager:
                 LAST_ABORTED_HANDOFF_FIELD,
                 LAST_CANCEL_OPERATION_FIELD,
                 LAST_HANDOFF_OPERATION_FIELD,
+                PROJECT_PAUSED_AT_FIELD,
+                PROJECT_PAUSED_FIELD,
+                PROJECT_PAUSE_REASON_FIELD,
                 ProjectConflictError,
             )
             internal_fields = {
@@ -401,6 +404,7 @@ class TaskManager:
                 HANDOFF_ACTIVATED_AT_FIELD, LAST_ABORTED_HANDOFF_FIELD,
                 CHILD_ORIGIN_FIELD, CHILD_CREATOR_SESSION_FIELD,
                 INTEGRATION_BRANCH_FIELD,
+                PROJECT_PAUSED_FIELD, PROJECT_PAUSED_AT_FIELD, PROJECT_PAUSE_REASON_FIELD,
             }
             if set(fields) & internal_fields:
                 raise ProjectConflictError(
@@ -924,13 +928,31 @@ class TaskManager:
         here, not only in the worker's own listing, so a direct claim
         attempt against a snoozed task is refused the same way a stale
         listing would be.
+
+        Raises `ProjectConflictError` (-> HTTP 409 at the route layer) when
+        the specific reason is a paused parent project — distinct from every
+        other ineligibility reason, which returns `(False, False)` instead,
+        so a worker can tell "this project is paused" apart from "someone
+        else got there first" without a second lookup.
         """
+        from api.services.task_projects import (
+            PROJECT_PAUSED_FIELD,
+            ProjectConflictError,
+            clean_parent_id,
+            field_truthy,
+        )
+
         pickup = {tag.lstrip("#").lower() for tag in pickup_tags}
         excluded = {tag.lstrip("#").lower() for tag in exclusion_tags}
         statuses = {status.lower() for status in eligible_statuses}
         queue = queue_tag.lstrip("#").lower()
         running = running_tag.lstrip("#")
         consumed_queue_tag = False
+
+        def parent_paused(task: Task) -> bool:
+            parent_id = clean_parent_id(task.fields.get("parent_id"))
+            parent = self._tasks.get(parent_id) if parent_id else None
+            return bool(parent and field_truthy(parent.fields.get(PROJECT_PAUSED_FIELD)))
 
         def is_claimable(task: Task) -> bool:
             tags = {tag.lstrip("#").lower() for tag in task.tags}
@@ -946,7 +968,11 @@ class TaskManager:
         with self._lock, exclusive_operation_lock(self.index_path.parent / ".task-operation.lock"):
             self.rebuild_index()
             current = self._tasks.get(task_id)
-            if not current or not is_claimable(current):
+            if not current:
+                return False, False
+            if parent_paused(current):
+                raise ProjectConflictError("project is paused")
+            if not is_claimable(current):
                 return False, False
 
             path = Path(current.source_file)
@@ -954,6 +980,8 @@ class TaskManager:
             def compute() -> Task:
                 nonlocal consumed_queue_tag
                 t = self._tasks[task_id]
+                if parent_paused(t):
+                    raise ProjectConflictError("project is paused")
                 if not is_claimable(t):
                     raise _TaskNotClaimableError()
                 new_task = copy.copy(t)
@@ -1256,6 +1284,9 @@ class TaskManager:
             INTEGRATION_BRANCH_FIELD,
             LAST_ABORTED_HANDOFF_FIELD,
             LAST_HANDOFF_OPERATION_FIELD,
+            PROJECT_PAUSED_AT_FIELD,
+            PROJECT_PAUSED_FIELD,
+            PROJECT_PAUSE_REASON_FIELD,
             ProjectConflictError,
             build_task_hierarchy,
             clean_parent_id,
@@ -1285,6 +1316,9 @@ class TaskManager:
             CHILD_ORIGIN_FIELD,
             CHILD_CREATOR_SESSION_FIELD,
             INTEGRATION_BRANCH_FIELD,
+            PROJECT_PAUSED_FIELD,
+            PROJECT_PAUSED_AT_FIELD,
+            PROJECT_PAUSE_REASON_FIELD,
         }
         if not project_action and fields_patch and set(fields_patch) & internal_fields:
             raise ProjectConflictError("use the explicit project lifecycle action for internal fields")
@@ -1384,6 +1418,7 @@ class TaskManager:
             EXECUTION_PAUSED_FIELD,
             EXECUTION_RESERVATION_FIELD,
             HANDOFF_OPERATION_FIELD,
+            PROJECT_PAUSED_FIELD,
             build_task_hierarchy,
             clean_parent_id,
             field_timestamp_future,
@@ -1404,6 +1439,8 @@ class TaskManager:
         if parent and parent.fields.get(CANCEL_OPERATION_FIELD):
             return False
         if parent and parent.fields.get(HANDOFF_OPERATION_FIELD):
+            return False
+        if parent and field_truthy(parent.fields.get(PROJECT_PAUSED_FIELD)):
             return False
         return True
 

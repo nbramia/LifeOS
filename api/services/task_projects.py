@@ -61,6 +61,17 @@ HANDOFF_ACTIVATED_AT_FIELD = "project_handoff_activated_at"
 LAST_ABORTED_HANDOFF_FIELD = "project_last_aborted_handoff_operation_id"
 INTEGRATION_BRANCH_FIELD = "project_integration_branch"
 
+# Set/cleared only by `ProjectTaskService.pause_project`/`resume_project` —
+# see `internal_fields` in `TaskManager.create` and `_guard_project_update`,
+# which refuse an ordinary create/update that touches any of the three.
+# While set, `TaskManager._project_claim_allowed` refuses every child's
+# worker claim and interactive Open; a running child's current turn is
+# unaffected and its result still lands in Review.
+PROJECT_PAUSED_FIELD = "project_paused"
+PROJECT_PAUSED_AT_FIELD = "project_paused_at"
+PROJECT_PAUSE_REASON_FIELD = "project_pause_reason"
+PROJECT_PAUSE_REASONS = frozenset({"operator", "owner_failed", "owner_budget"})
+
 # Stamped on a project child created by an agent-attributed request (the
 # curated `lifeos_task_create` proxy carrying `X-LifeOS-Agent-Session`) or by
 # a handoff. Internal — see `internal_fields` in `TaskManager.create` and
@@ -211,6 +222,8 @@ class TaskHierarchy:
             "execution_paused": field_truthy(task.fields.get(EXECUTION_PAUSED_FIELD)),
             "cancellation_pending": bool(task.fields.get(CANCEL_OPERATION_FIELD)),
             "handoff_pending": bool(task.fields.get(HANDOFF_OPERATION_FIELD)),
+            "paused": field_truthy(task.fields.get(PROJECT_PAUSED_FIELD)),
+            "pause_reason": task.fields.get(PROJECT_PAUSE_REASON_FIELD),
             "coordinator": coordinator,
         }
 
@@ -229,6 +242,9 @@ class TaskHierarchy:
             ),
             "parent_handoff_pending": bool(
                 parent and parent.fields.get(HANDOFF_OPERATION_FIELD)
+            ),
+            "parent_project_paused": bool(
+                parent and field_truthy(parent.fields.get(PROJECT_PAUSED_FIELD))
             ),
             "project": self.project_summary(task_id, coordinator),
         }
@@ -453,6 +469,65 @@ class ProjectTaskService:
             _project_operation="resume",
             _precondition=precondition,
         )
+
+    def pause_project(self, task_id: str, *, reason: str = "operator") -> "Task":
+        """Set the durable paused state on a project.
+
+        Blocks every child's worker claim and interactive Open (see
+        `TaskManager._project_claim_allowed`) without touching a child's
+        current run — an already-running turn finishes and its result still
+        lands in Review. Idempotent: pausing an already-paused project just
+        refreshes its reason and timestamp.
+        """
+        if reason not in PROJECT_PAUSE_REASONS:
+            raise ValueError(f"invalid pause reason: {reason!r}")
+        hierarchy = self.hierarchy()
+        task = hierarchy.tasks.get(task_id)
+        if task is None:
+            raise KeyError(task_id)
+        self._require_project_current(task)
+
+        def precondition(current: "Task") -> None:
+            self._require_project_current(current)
+
+        updated = self.manager.update(
+            task_id,
+            fields={
+                PROJECT_PAUSED_FIELD: "true",
+                PROJECT_PAUSED_AT_FIELD: datetime.now(timezone.utc).isoformat(),
+                PROJECT_PAUSE_REASON_FIELD: reason,
+            },
+            _project_operation="pause",
+            _precondition=precondition,
+        )
+        if updated is None:
+            raise KeyError(task_id)
+        return updated
+
+    def resume_project(self, task_id: str) -> "Task":
+        """Clear the durable paused state, re-enabling child claims and Open."""
+        hierarchy = self.hierarchy()
+        task = hierarchy.tasks.get(task_id)
+        if task is None:
+            raise KeyError(task_id)
+        self._require_project_current(task)
+
+        def precondition(current: "Task") -> None:
+            self._require_project_current(current)
+
+        updated = self.manager.update(
+            task_id,
+            fields={
+                PROJECT_PAUSED_FIELD: None,
+                PROJECT_PAUSED_AT_FIELD: None,
+                PROJECT_PAUSE_REASON_FIELD: None,
+            },
+            _project_operation="resume-project",
+            _precondition=precondition,
+        )
+        if updated is None:
+            raise KeyError(task_id)
+        return updated
 
     def stage_handoff(
         self,
@@ -1058,6 +1133,8 @@ class ProjectTaskService:
             raise ProjectConflictError("task is not a project")
         if task.fields.get(CANCEL_OPERATION_FIELD):
             raise ProjectConflictError("project cancellation is pending")
+        if field_truthy(task.fields.get(PROJECT_PAUSED_FIELD)):
+            raise ProjectConflictError("project is paused")
         owner = agent_board.derive_assignee(task.tags)
         normalized_tags = agent_board.normalize_tags(task.tags)
         if owner is None:
@@ -1148,6 +1225,8 @@ class ProjectTaskService:
             pending = current.fields.get(CANCEL_OPERATION_FIELD)
             if pending:
                 raise ProjectConflictError("project cancellation is pending")
+            if field_truthy(current.fields.get(PROJECT_PAUSED_FIELD)):
+                raise ProjectConflictError("project is paused")
             current_request = current.fields.get(COORDINATOR_REQUEST_FIELD)
             if (
                 current_request

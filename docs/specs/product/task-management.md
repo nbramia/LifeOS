@@ -219,6 +219,16 @@ Cancelling one child never cancels its siblings or parent. Completing or
 reopening a parent never fabricates child completion or restarts cancelled
 children.
 
+- **Pause project** and **Resume project** toggle a durable paused state,
+  recorded with a reason (`operator`, or `owner_failed`/`owner_budget` for a
+  future automatic pause). While paused, every child's worker claim and
+  interactive Open are refused, and Plan and delegate is refused. A child
+  already mid-turn when the pause takes effect finishes normally and its
+  result still lands in Review — pause never interrupts running work. Cancel
+  and operator Complete remain available while paused. An agent may pause a
+  project; only the operator may resume one — a resume request carrying the
+  caller-asserted `X-LifeOS-Agent-Session` header is refused.
+
 ## Task-Reminder Linking
 
 Create a task with an associated reminder in one command:
@@ -278,6 +288,8 @@ it by hand.
 | POST | `/api/tasks/{id}/project/complete` | acknowledge_cancelled_children | Complete a resolved project |
 | POST | `/api/tasks/{id}/project/plan` | operation_id | Start or recover an idempotent coordinator run |
 | POST | `/api/tasks/{id}/project/cancel` | confirm, operation_id | Preview or execute resumable cascade cancellation |
+| POST | `/api/tasks/{id}/project/pause` | reason | Pause a project — blocks child claims, Open, and Plan and delegate |
+| POST | `/api/tasks/{id}/project/resume` | - | Resume a paused project; 403 for an agent-attributed caller |
 | POST | `/api/tasks/{id}/resume-execution` | - | Resume an execution-paused ordinary task |
 | POST | `/api/tasks/human-queue` | title, notes, key, done_when, source_host, source_cwd, source_session | File (or dedupe-update) a Human-queue card |
 | GET | `/api/tasks/human-queue` | - | List open Human-queue cards |
@@ -287,9 +299,11 @@ A task response also includes `updated_at` (an ISO-8601 timestamp with a UTC
 offset, stamped on every create/update/complete/swap-tag) and additive
 hierarchy fields: `parent_id`, `parent_title`, `is_project`, `child_count`,
 `hierarchy_valid`, `hierarchy_error`, and a compact `project` progress and
-coordination summary. A child also reports `parent_cancellation_pending` so
-clients can freeze writes during a cascade. Summaries are computed from the complete task set before
-list filters, so a filtered response does not undercount hidden children.
+coordination summary. A child also reports `parent_cancellation_pending`,
+`parent_handoff_pending`, and `parent_project_paused` so clients can freeze
+writes, or refuse claim/Open, appropriately. Summaries are computed from the
+complete task set before list filters, so a filtered response does not
+undercount hidden children.
 
 ## Technical Details
 

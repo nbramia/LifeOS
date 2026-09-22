@@ -2836,12 +2836,16 @@ export function initBoard() {
           ${project.execution_paused ? '<div class="project-coordination">Parent execution is paused while children own the work.</div>' : ''}
           ${project.cancellation_pending ? '<div class="project-error">Cancellation is still being reconciled. Retry cancellation after resolving any listed failures.</div>' : ''}
           ${pendingHandoff ? '<div class="project-error" data-field="handoff-pending">Handoff pending. Child execution is blocked until the source agent stop is verified. You can cancel the handoff; cancellation stays pending until that stop is verified.</div>' : ''}
+          ${project.paused ? `<div class="project-error" data-field="project-paused">Paused (${escapeHtml(project.pause_reason || 'operator')}). Child claims, Open, and Plan and delegate are blocked; a child already mid-turn still finishes into Review.</div>` : ''}
           ${coordination}
           <div class="drawer-actions">
             <button type="button" class="drawer-action" data-action="project-start">Start project</button>
             <button type="button" class="drawer-action" data-action="project-plan">Plan and delegate</button>
             <button type="button" class="drawer-action" data-action="project-complete">Complete project</button>
             <button type="button" class="drawer-action danger" data-action="project-cancel">Cancel project</button>
+            ${project.paused
+              ? '<button type="button" class="drawer-action" data-action="project-resume">Resume project</button>'
+              : '<button type="button" class="drawer-action" data-action="project-pause">Pause project</button>'}
             <button type="button" class="drawer-action" data-action="project-add-child">Add child</button>
             <button type="button" class="drawer-action" data-action="project-attach-child">Attach existing</button>
           </div>
@@ -3218,18 +3222,31 @@ export function initBoard() {
         if (cancelled && !window.confirm(`Close this project with ${cancelled} cancelled child${cancelled === 1 ? '' : 'ren'}?`)) return null;
         return projectRequest(`/api/tasks/${encodeURIComponent(card.id)}/project/complete`, { acknowledge_cancelled_children: cancelled > 0 });
       },
+      'project-pause': async () => projectRequest(`/api/tasks/${encodeURIComponent(card.id)}/project/pause`, {}),
+      'project-resume': async () => projectRequest(`/api/tasks/${encodeURIComponent(card.id)}/project/resume`, {}),
+    };
+    const actionPolicyNames = {
+      'project-start': 'can_start_project',
+      'project-plan': 'can_plan_project',
+      'project-complete': 'can_complete_project',
+      'project-pause': 'can_pause_project',
+      'project-resume': 'can_resume_project',
+    };
+    const actionToasts = {
+      'project-plan': 'Coordination started.',
+      'project-pause': 'Project paused.',
+      'project-resume': 'Project resumed.',
     };
     Object.entries(actions).forEach(([action, request]) => {
       const button = drawerEl.querySelector(`[data-action="${action}"]`);
       if (!button) return;
-      const policyName = action === 'project-start' ? 'can_start_project'
-        : action === 'project-plan' ? 'can_plan_project' : 'can_complete_project';
+      const policyName = actionPolicyNames[action];
       if ((card.policy && card.policy[policyName] === false) || pendingHandoff) button.disabled = true;
       button.onclick = async () => {
         button.disabled = true;
         try {
           const result = await request();
-          if (result !== null) { await fetchBoard(); showToast(action === 'project-plan' ? 'Coordination started.' : 'Project updated.', false); }
+          if (result !== null) { await fetchBoard(); showToast(actionToasts[action] || 'Project updated.', false); }
         } catch (error) { showToast(`Couldn't update project: ${error.message}`, true); }
         finally { if (button.isConnected) button.disabled = false; }
       };

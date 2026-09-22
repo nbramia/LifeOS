@@ -370,16 +370,17 @@ operation ID, and child role.
 
 #### Agent-session attribution and project-child guards
 
-Both `POST /api/tasks` and `PUT /api/tasks/{id}` accept an optional
-`X-LifeOS-Agent-Session` request header. The curated MCP proxy
-(`mcp_server.py`) sends it on every task create/update when it has a worker
-identity — a stdio worker session, the in-process local executor, or the
-agent-only HTTP transport (which always sends the literal value
-`unattested`, since it has no per-call identity of its own). Interactive
-operator MCP sends no header, and the API treats its absence exactly as it
-always has — this is additive, caller-asserted identity, the same trust
-model as the existing `actor` and `fields.assigned_by` fields, not
-cryptographic attestation.
+`POST /api/tasks`, `PUT /api/tasks/{id}`, and `POST /api/tasks/{id}/project/resume`
+accept an optional `X-LifeOS-Agent-Session` request header. The curated MCP
+proxy (`mcp_server.py`) sends it on every task create/update and on
+`lifeos_project_resume` when it has a worker identity — a stdio worker
+session, the in-process local executor, or the agent-only HTTP transport
+(which always sends the literal value `unattested`, since it has no
+per-call identity of its own). Interactive operator MCP sends no header,
+and the API treats its absence exactly as it always has — this is
+additive, caller-asserted identity, the same trust model as the existing
+`actor` and `fields.assigned_by` fields, not cryptographic attestation.
+`lifeos_project_pause` does not send it: an agent may pause a project.
 
 When the header is present and the task being written is, or would become,
 a project child (`fields.parent_id` set, or already parented):
@@ -415,10 +416,12 @@ List/filter tasks.
 
 Every task item includes additive hierarchy fields: `parent_id`,
 `parent_title`, `is_project`, `child_count`, `hierarchy_valid`,
-`hierarchy_error`, `parent_cancellation_pending`, and `project`. `project` is `null` for an ordinary task;
+`hierarchy_error`, `parent_cancellation_pending`, `parent_handoff_pending`,
+`parent_project_paused`, and `project`. `project` is `null` for an ordinary task;
 for a derived project it contains full-set progress counts,
-`ready_to_close`, execution-pause/cancellation state, and the linked
-coordinator status/result. Counts are computed before these query filters.
+`ready_to_close`, execution-pause/cancellation/handoff/paused state (`paused`,
+`pause_reason`), and the linked coordinator status/result. Counts are
+computed before these query filters.
 
 ### GET /api/tasks/conflicts
 
@@ -526,6 +529,31 @@ The response reports `complete`, `pending`, cancelled/preserved/abandoned child
 IDs, stopped session IDs, and exact failures. A partial result keeps the
 operation pending; retry with the same ID after resolving the reported stop.
 A different ID returns **409** while intent is pending.
+
+### POST /api/tasks/{id}/project/pause
+
+Pause a project:
+
+```json
+{ "reason": "operator" }
+```
+
+`reason` is optional (defaults to `operator`; the only other recognized
+values are `owner_failed` and `owner_budget`, both reserved for automatic
+pauses). Returns the enriched parent task. While paused, every child's
+worker claim returns **409** and interactive Open and Plan and delegate are
+refused; a child already mid-turn is unaffected and its result still lands
+in Review. Cancel and operator Complete remain available. Returns **409**
+for an ordinary task or pending cancellation/handoff, **422** for an
+unrecognized `reason`.
+
+### POST /api/tasks/{id}/project/resume
+
+Clear a project's paused state, so claims, Open, and Plan and delegate
+succeed again. Refused with **403**
+`{"code": "agent_resume_forbidden", ...}` for a caller that carries
+`X-LifeOS-Agent-Session` — only the operator (no header) may resume a
+project an agent paused.
 
 ### POST /api/tasks/{id}/resume-execution
 

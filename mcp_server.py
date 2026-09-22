@@ -469,6 +469,18 @@ CURATED_ENDPOINTS = {
         "method": "POST",
         "path": "/api/tasks/{task_id}/project/cancel"
     },
+    "/api/tasks/{task_id}/project/pause:POST": {
+        "name": "lifeos_project_pause",
+        "description": "Pause a project: blocks new child claims, Open, and Plan and delegate until resumed. A child already mid-turn still finishes into Review; Cancel and Complete remain available.",
+        "method": "POST",
+        "path": "/api/tasks/{task_id}/project/pause"
+    },
+    "/api/tasks/{task_id}/project/resume:POST": {
+        "name": "lifeos_project_resume",
+        "description": "Resume a paused project so claims and Open succeed again. Refused with 403 for an agent-attributed caller — only the operator can resume.",
+        "method": "POST",
+        "path": "/api/tasks/{task_id}/project/resume"
+    },
     "/api/tasks/{task_id}/resume-execution:POST": {
         "name": "lifeos_task_resume_execution",
         "description": "Resume automatic execution for a formerly-project task after its final child link was removed. Refuses current projects and tasks with pending cancellation.",
@@ -541,9 +553,9 @@ CURATED_ENDPOINTS = {
     },
 }
 
-# Contract count for the source catalog. The live fallback catalog is 69
-# curated tools plus 10 lifeos_agent_* tools = 79.
-CURATED_TOOL_COUNT = 69
+# Contract count for the source catalog. The live fallback catalog is 71
+# curated tools plus 10 lifeos_agent_* tools = 81.
+CURATED_TOOL_COUNT = 71
 
 
 class LifeOSMCPServer:
@@ -1290,6 +1302,19 @@ class LifeOSMCPServer:
                 },
                 "required": ["task_id"]
             },
+            "lifeos_project_pause": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "Stable project task ID"},
+                    "reason": {"type": "string", "description": "operator | owner_failed | owner_budget. Defaults to operator."}
+                },
+                "required": ["task_id"]
+            },
+            "lifeos_project_resume": {
+                "type": "object",
+                "properties": {"task_id": {"type": "string", "description": "Stable project task ID"}},
+                "required": ["task_id"]
+            },
             "lifeos_task_resume_execution": {
                 "type": "object",
                 "properties": {"task_id": {"type": "string", "description": "Stable ordinary task ID"}},
@@ -1639,9 +1664,12 @@ class LifeOSMCPServer:
                 headers["X-Request-Key"] = request_key
         # Curated task writes carry the caller-asserted worker identity, so
         # the API can tell an agent-attributed project-child write from an
-        # operator's. Scoped to exactly these two tools — see
-        # `_resolve_agent_session_header`.
-        if tool_name in ("lifeos_task_create", "lifeos_task_update"):
+        # operator's — see `_resolve_agent_session_header`.
+        # `lifeos_project_resume` gets the same header so the API can refuse
+        # an agent-attributed resume (403) — see
+        # `POST /api/tasks/{id}/project/resume`. `lifeos_project_pause` does
+        # not need it: agents are allowed to pause a project.
+        if tool_name in ("lifeos_task_create", "lifeos_task_update", "lifeos_project_resume"):
             resolved_agent_session = self._resolve_agent_session_header(agent_session_id)
             if resolved_agent_session:
                 headers[AGENT_SESSION_HEADER] = resolved_agent_session
@@ -2424,6 +2452,13 @@ class LifeOSMCPServer:
             if not complete:
                 text += "\nCancellation remains pending; retry with the same operation_id after resolving the failures."
             return text
+
+        elif tool_name == "lifeos_project_pause":
+            reason = data.get("fields", {}).get("project_pause_reason", "operator")
+            return f"Project paused ({reason}): **{data.get('description', '')}** (ID: {data.get('id', '')})"
+
+        elif tool_name == "lifeos_project_resume":
+            return f"Project resumed: **{data.get('description', '')}** (ID: {data.get('id', '')})"
 
         elif tool_name == "lifeos_task_resume_execution":
             return f"Task execution resumed: **{data.get('description', '')}** (ID: {data.get('id', '')})"
