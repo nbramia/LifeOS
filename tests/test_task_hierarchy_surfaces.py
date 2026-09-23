@@ -108,6 +108,42 @@ def test_journal_persona_preserves_operator_attested_parent_relationship():
     assert filtered["parent_id"] == "project-1"
 
 
+def test_journal_persona_preserves_a_parent_created_earlier_this_turn():
+    filtered, error = _journal_tool_gate(
+        "manage_tasks",
+        {"action": "create", "description": "Clear the shelves", "parent_id": "project-1"},
+        "Make a project to renovate the synthetic garage with subtasks clear the shelves",
+        {"project-1"},
+    )
+    assert error is None
+    assert filtered["parent_id"] == "project-1"
+
+
+def test_journal_persona_strips_a_parent_id_from_a_different_turns_set():
+    filtered, error = _journal_tool_gate(
+        "manage_tasks",
+        {"action": "create", "description": "Clear the shelves", "parent_id": "project-1"},
+        "Make a project to renovate the synthetic garage with subtasks clear the shelves",
+        {"some-other-turns-task-id"},
+    )
+    assert error is None
+    assert "parent_id" not in filtered
+
+
+def test_journal_persona_strips_a_parent_id_only_named_in_prose_even_with_a_turn_set():
+    # The id merely appears in the message's own text (not as a
+    # `parent_id:<id>` attestation and not in this turn's created set) --
+    # still stripped, matching the existing prose-only case.
+    filtered, error = _journal_tool_gate(
+        "manage_tasks",
+        {"action": "create", "description": "Clear the shelves", "parent_id": "project-1"},
+        "This follows from project-1, the garage renovation",
+        set(),
+    )
+    assert error is None
+    assert "parent_id" not in filtered
+
+
 def test_mcp_catalog_exposes_every_project_action_endpoint():
     module = _load_mcp_module()
     by_name = {config["name"]: config for config in module.CURATED_ENDPOINTS.values()}

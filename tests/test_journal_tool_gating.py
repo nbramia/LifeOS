@@ -15,6 +15,7 @@ import pytest
 from api.services.agent_tools import (
     JOURNAL_EXCLUDED_TOOLS,
     TOOL_DEFINITIONS,
+    _journal_created_task_id,
     execute_tool_parallel,
     tools_for_persona,
 )
@@ -348,3 +349,177 @@ class TestExecuteToolParallelJournalGate:
         unchanged = sched.get(entry.id)
         assert unchanged.message_content == "do work"
         assert unchanged.executor == "claude_code"
+
+
+class TestJournalCreatedTaskIdExtraction:
+    """`_journal_created_task_id` pulls the newly created task's own id out
+    of a `manage_tasks` create result, for `execute_tool_parallel` to add to
+    the per-turn set a same-turn child create can then name as its parent."""
+
+    def test_extracts_the_id_of_a_plain_created_task(self):
+        result = "Task created:\n[ ] Renovate the synthetic garage [id:abcd1234]"
+        assert _journal_created_task_id(result) == "abcd1234"
+
+    def test_picks_the_own_id_not_a_later_parent_line(self):
+        result = (
+            "Task created:\n[ ] Clear the synthetic shelves [id:efgh5678]\n"
+            "  Parent: Renovate the synthetic garage [id:abcd1234]"
+        )
+        assert _journal_created_task_id(result) == "efgh5678"
+
+    def test_a_recovered_task_yields_no_id(self):
+        result = "Task recovered:\n[ ] Renovate the synthetic garage [id:abcd1234]"
+        assert _journal_created_task_id(result) is None
+
+    def test_an_error_result_yields_no_id(self):
+        result = "Error: description is required"
+        assert _journal_created_task_id(result) is None
+
+    def test_an_id_pattern_in_the_due_date_does_not_poison_extraction(self):
+        # This extractor has no knowledge of the journal gate's own_task_id
+        # filter — it only reasons about the rendered line — so it must
+        # still pick the anchored, trailing [id:...] over one that a
+        # due_date rendered earlier on the same line happens to contain
+        # ("... (due <due_date>) [id:<own id>]").
+        result = "Task created:\n[ ] Renovate the synthetic garage (due [id:other]) [id:abcd1234]"
+        assert _journal_created_task_id(result) == "abcd1234"
+
+
+class TestExecuteToolParallelSameTurnParentAttestation:
+    """`execute_tool_parallel`'s `created_task_ids` param, mirroring the
+    per-turn set `run_agent_loop` binds for the journal persona."""
+
+    async def test_a_successful_create_adds_its_own_id_to_the_set(self, tm):
+        created: set = set()
+        out = await execute_tool_parallel(
+            "manage_tasks",
+            {"action": "create", "description": "Renovate the synthetic garage"},
+            persona_id="journal",
+            user_message="Make a project to renovate the synthetic garage",
+            created_task_ids=created,
+        )
+        assert out.startswith("Task created")
+        parent = tm.list_tasks()[0]
+        assert created == {parent.id}
+
+    async def test_a_same_turn_child_create_keeps_the_parents_id(self, tm):
+        created: set = set()
+        await execute_tool_parallel(
+            "manage_tasks",
+            {"action": "create", "description": "Renovate the synthetic garage"},
+            persona_id="journal",
+            user_message="Make a project to renovate the synthetic garage with subtasks clear the shelves",
+            created_task_ids=created,
+        )
+        parent = tm.list_tasks()[0]
+
+        out = await execute_tool_parallel(
+            "manage_tasks",
+            {"action": "create", "description": "Clear the shelves", "parent_id": parent.id},
+            persona_id="journal",
+            user_message="Make a project to renovate the synthetic garage with subtasks clear the shelves",
+            created_task_ids=created,
+        )
+
+        assert out.startswith("Task created")
+        child = next(t for t in tm.list_tasks() if t.description == "Clear the shelves")
+        assert child.fields.get("parent_id") == parent.id
+        assert created == {parent.id, child.id}
+
+    async def test_a_recovered_task_does_not_add_a_duplicate_or_new_id(self, tm):
+        created: set = set()
+        first = await execute_tool_parallel(
+            "manage_tasks",
+            {"action": "create", "description": "x", "operation_key": "op-1"},
+            persona_id="journal", user_message="x", created_task_ids=created,
+        )
+        assert first.startswith("Task created")
+        after_first = set(created)
+
+        second = await execute_tool_parallel(
+            "manage_tasks",
+            {"action": "create", "description": "x", "operation_key": "op-1"},
+            persona_id="journal", user_message="x", created_task_ids=created,
+        )
+
+        assert second.startswith("Task recovered")
+        assert created == after_first
+
+    async def test_no_set_keeps_todays_stripping_behavior(self, tm):
+        # With no created_task_ids (the default), an unattested parent_id is
+        # always stripped.
+        out = await execute_tool_parallel(
+            "manage_tasks",
+            {"action": "create", "description": "Clear the shelves", "parent_id": "some-parent"},
+            persona_id="journal",
+            user_message="Make a project to renovate the synthetic garage with subtasks clear the shelves",
+        )
+        assert out.startswith("Task created")
+        assert tm.list_tasks()[0].fields.get("parent_id") is None
+
+
+class TestExecuteToolParallelDueDatePoisoning:
+    """A `due_date` is only kept when it is a strict `YYYY-MM-DD` date
+    (`_journal_filter_task_create_input`), so a `due_date` that itself
+    contains `[id:...]` text — or, worse, a newline that could relocate a
+    forged `[id:...]` onto the own-task line — is stripped before it ever
+    reaches `_task_create`. A stripped/poisoned `due_date` must not be
+    recorded as a same-turn created id, and a later create naming the
+    poisoned id as `parent_id` must not attach to it."""
+
+    @pytest.mark.parametrize("poisoned_due_date", [
+        "[id:{existing_id}]",
+        "[id:{existing_id}]\nX",
+        "X) [id:{existing_id}]\n",
+    ])
+    async def test_a_poisoned_due_date_does_not_survive_or_poison_extraction(self, tm, poisoned_due_date):
+        existing_out = await execute_tool_parallel(
+            "manage_tasks",
+            {"action": "create", "description": "Existing task"},
+            persona_id="journal", user_message="x",
+        )
+        assert existing_out.startswith("Task created")
+        existing_id = tm.list_tasks()[0].id
+
+        created: set = set()
+        out = await execute_tool_parallel(
+            "manage_tasks",
+            {
+                "action": "create",
+                "description": "Poisoned due date task",
+                "due_date": poisoned_due_date.format(existing_id=existing_id),
+            },
+            persona_id="journal", user_message="x",
+            created_task_ids=created,
+        )
+        assert out.startswith("Task created")
+        new_task = next(t for t in tm.list_tasks() if t.description == "Poisoned due date task")
+
+        assert created == {new_task.id}
+        assert existing_id not in created
+        assert new_task.due_date is None
+
+        # A same-turn create naming the pre-existing task as parent is not
+        # attested and not in created_task_ids, so parent_id is stripped and
+        # the existing task's own fields are left untouched.
+        child_out = await execute_tool_parallel(
+            "manage_tasks",
+            {"action": "create", "description": "Should not attach", "parent_id": existing_id},
+            persona_id="journal", user_message="x",
+            created_task_ids=created,
+        )
+        assert child_out.startswith("Task created")
+        child = next(t for t in tm.list_tasks() if t.description == "Should not attach")
+        assert child.fields.get("parent_id") is None
+
+        existing_task_after = next(t for t in tm.list_tasks() if t.id == existing_id)
+        assert existing_task_after.fields.get("parent_id") is None
+
+    async def test_a_valid_iso_due_date_is_kept(self, tm):
+        out = await execute_tool_parallel(
+            "manage_tasks",
+            {"action": "create", "description": "call mom", "due_date": "2030-01-02"},
+            persona_id="journal", user_message="x",
+        )
+        assert out.startswith("Task created")
+        assert tm.list_tasks()[0].due_date == "2030-01-02"
