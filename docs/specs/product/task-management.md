@@ -315,7 +315,7 @@ it by hand.
 | DELETE | `/api/tasks/{id}` | - | Delete a task |
 | POST | `/api/tasks/{id}/project/start` | - | Start a project without worker lifecycle tags |
 | POST | `/api/tasks/{id}/project/complete` | acknowledge_cancelled_children | Complete a resolved project |
-| POST | `/api/tasks/{id}/project/plan` | operation_id | Start or recover an idempotent coordinator run |
+| POST | `/api/tasks/{id}/project/plan` | operation_id | Start the project's persistent owner session, or wake the existing one (`wake_requested`) |
 | POST | `/api/tasks/{id}/project/cancel` | confirm, operation_id | Preview or execute resumable cascade cancellation |
 | POST | `/api/tasks/{id}/project/pause` | reason | Pause a project — blocks child claims, Open, and Plan and delegate |
 | POST | `/api/tasks/{id}/project/resume` | - | Resume a paused project; 403 for an agent-attributed caller |

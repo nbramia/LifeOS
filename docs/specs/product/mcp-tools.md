@@ -100,7 +100,7 @@ Tasks can also be managed via natural language chat. See [Task Management spec](
 | `lifeos_task_children` | Retrieve the actual children of a project by stable parent ID, with pagination; partial pages state their displayed count and offset |
 | `lifeos_project_start` | Mark an open project active without launching the parent as an ordinary worker task |
 | `lifeos_project_complete` | Complete a project after every child and coordination guard passes; cancelled children require explicit reduced-scope acknowledgement |
-| `lifeos_project_plan` | Start or recover an idempotent agent-owner planning/delegation run |
+| `lifeos_project_plan` | Start the project's persistent agent-owner session, or wake the one it already has; idempotent per operation ID |
 | `lifeos_project_cancel` | Preview cancellation scope, then confirm a resumable cascading cancellation with a stable operation ID |
 | `lifeos_project_pause` | Pause a project: blocks child claims, Open, and Plan and delegate until resumed; a mid-turn child still finishes into Review |
 | `lifeos_project_resume` | Resume a paused project; refused with 403 for an agent-attributed caller — only the operator can resume |
