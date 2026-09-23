@@ -259,6 +259,20 @@ _OWNER_WAKE_MAX_REASONS = 50
 # cap so a long vault note can't crowd out the child table.
 _OWNER_FALLBACK_NOTES_MAX_CHARS = 2000
 
+# Synthetic `current_snapshot`/`acked_states` key the owner wake reconciler
+# uses for a project's integration branch merge state, alongside the real
+# child ids (see `_reconcile_one_project_owner`/`_integration_branch_wake_
+# state`) -- never a real task id (see `_coordinator_task_id`'s hash-suffix
+# shape), so it can never collide with one.
+_INTEGRATION_PR_EVENT_KEY = "_integration_pr"
+# How long `_integration_branch_wake_state` trusts a cached ahead/merged
+# result before checking again -- same window `_cleanup_session_resources`
+# uses for a child's own PR state, for the same reason: this runs on every
+# reconciler tick for every in-flight agent-owned project with a recorded
+# integration branch, and its merge state has no realistic reason to shift
+# that quickly.
+_INTEGRATION_AHEAD_CACHE_SECONDS = _RESOURCE_CLEANUP_INTERVAL_SECONDS
+
 # A recurring (cron) schedule stamps its handed-off #agent task with a
 # `sched-<id>` tag (see scheduler_store._hand_off_to_agent). The worker reads
 # it on completion to append every fire's output to one shared note per
@@ -896,6 +910,11 @@ class Worker:
         self._executor_registry = ExecutorRegistry(session_store=self.session_store)
         self._last_resource_cleanup = 0.0
         self._pr_state_cache: dict[str, tuple[float, str | None]] = {}
+        # `_integration_branch_wake_state`'s own cache, keyed by project id
+        # rather than working directory -- the check it guards has no
+        # working directory of its own (it runs entirely through `gh api`
+        # by repository slug, derived from a child's recorded PR url).
+        self._integration_ahead_cache: dict[str, tuple[float, str | None]] = {}
         self._warn_deprecated_settings()
 
     def _project_session_status(
@@ -7039,8 +7058,14 @@ class Worker:
         `_OWNER_WAKE_MESSAGE_MAX_CHARS`."""
         reason_lines = []
         for child_id, new_state in list(events.items())[:_OWNER_WAKE_MAX_REASONS]:
-            child = children_by_id.get(child_id) or {}
             prev_state = acked.get(child_id, "new")
+            if child_id == _INTEGRATION_PR_EVENT_KEY:
+                reason_lines.append(
+                    f"- Integration branch {integration_branch or '(unknown)'} | "
+                    f"{prev_state}→{new_state}"
+                )
+                continue
+            child = children_by_id.get(child_id) or {}
             outcome = outcomes.get(child_id) or {}
             summary = str(outcome.get("summary") or "").strip()[:500]
             pr_urls = outcome.get("pr_urls") or []
@@ -7054,7 +7079,9 @@ class Worker:
                 line += f" | {pr_urls[0]}"
             reason_lines.append(line)
         tally: dict[str, int] = {}
-        for state in counts.values():
+        for child_id, state in counts.items():
+            if child_id == _INTEGRATION_PR_EVENT_KEY:
+                continue
             tally[state] = tally.get(state, 0) + 1
         counts_line = ", ".join(f"{k}={v}" for k, v in sorted(tally.items()))
         lines = [
@@ -7215,6 +7242,98 @@ class Worker:
         self._handle_outcome(reopened, task, outcome)
         return True
 
+    def _integration_branch_wake_state(
+        self,
+        project_id: str,
+        integration_branch: str,
+        *,
+        children: list[dict[str, Any]],
+        outcomes: dict[str, dict[str, Any]],
+    ) -> str | None:
+        """"active" while `integration_branch` still has commits the
+        default branch doesn't (the same non-event baseline value
+        `owner_state()` uses for a child with nothing to report), "merged"
+        once it doesn't -- feeding the exact same event-diff
+        `current_snapshot` drives for children in
+        `_reconcile_one_project_owner` under the synthetic
+        `_INTEGRATION_PR_EVENT_KEY`, so a completed integration merge wakes
+        the owner exactly like any other child event, including the
+        diff's own built-in re-baseline (`stale_active`) if the branch
+        later gets ahead again -- no separate mechanism needed for either.
+        A branch this repository's documented merge process has already
+        deleted (`repo_branch_exists` returning `False`) is also "merged" --
+        the terminal state, not a check failure -- since a plain compare
+        against an already-deleted head 404s exactly like a genuinely
+        broken check would.
+
+        None when there's no coding child pull request recorded yet to
+        derive the repository from (nothing was ever merged onto the
+        branch, so there's nothing to check), or when the remote check
+        itself fails (`gh` missing, network, an unresolvable host) -- in
+        either case this contributes no event this tick, never a false
+        "merged", and tries again on a later one.
+
+        Cached per project for `_INTEGRATION_AHEAD_CACHE_SECONDS`, success
+        or failure alike -- a stuck check (`gh` unavailable, a network
+        outage) redone every tick would otherwise cost a paused or
+        perpetually-busy project two synchronous `gh api` round trips
+        (`DEFAULT_TIMEOUT` each) per tick, forever.
+        """
+        now = time.time()
+        cached = self._integration_ahead_cache.get(project_id)
+        if cached and now - cached[0] < _INTEGRATION_AHEAD_CACHE_SECONDS:
+            return cached[1]
+
+        from api.services.agent_worker.git_worktree import (
+            repo_branch_exists, repo_compare_ahead_by, repo_default_branch, repo_slug_from_pr_url,
+        )
+
+        repo_slug = None
+        host = None
+        for child in children:
+            child_id = child.get("id")
+            if not child_id:
+                continue
+            outcome = outcomes.get(child_id) or {}
+            for url in outcome.get("pr_urls") or []:
+                slug = repo_slug_from_pr_url(url)
+                if slug:
+                    repo_slug = slug
+                    host = (child.get("fields") or {}).get("host")
+                    break
+            if repo_slug:
+                break
+        if repo_slug is None:
+            return None
+
+        # `repo_default_branch` runs first, always -- see
+        # `_integration_unmerged_error` (inter_agent.py) for why: its
+        # success independently confirms the repository itself exists,
+        # which is what makes a subsequent 404 from `repo_branch_exists`
+        # unambiguous ("the branch is gone", never "the repository is
+        # gone", which also 404s on the branches endpoint).
+        default_branch, error = repo_default_branch(repo_slug, host=host)
+        if error or not default_branch:
+            self._integration_ahead_cache[project_id] = (now, None)
+            return None
+
+        exists, error = repo_branch_exists(repo_slug, integration_branch, host=host)
+        if error:
+            self._integration_ahead_cache[project_id] = (now, None)
+            return None
+        if exists is False:
+            self._integration_ahead_cache[project_id] = (now, "merged")
+            return "merged"
+
+        ahead_by, error = repo_compare_ahead_by(repo_slug, default_branch, integration_branch, host=host)
+        if error or ahead_by is None:
+            self._integration_ahead_cache[project_id] = (now, None)
+            return None
+
+        state = "merged" if ahead_by <= 0 else "active"
+        self._integration_ahead_cache[project_id] = (now, state)
+        return state
+
     def _reconcile_one_project_owner(
         self,
         project_id: str,
@@ -7230,6 +7349,14 @@ class Worker:
         """One project's pass through the wake reconciler's steps 1-6 (see
         `_reconcile_project_owners`). Returns whether an owner wake was
         actually dispatched this pass."""
+        # Only the children part is built here -- cheap, no I/O, already in
+        # hand from this tick's `/api/tasks` fetch. The integration branch's
+        # own state (`_integration_branch_wake_state`) is added further
+        # below, after the paused/owner-live short-circuits: it's a
+        # synchronous `gh api` round trip (or two), and neither a paused
+        # project nor one whose owner is still mid-turn can act on it this
+        # pass regardless -- checking it here would pay that cost every
+        # tick, forever, for a stuck or paused project.
         current_snapshot = {
             child["id"]: owner_state(child) for child in children if child.get("id")
         }
@@ -7266,6 +7393,13 @@ class Worker:
                     self._pause_project_for_owner_failure(project_id, title, "owner_failed")
                     return False
                 state = self.session_store.get_project_owner_state(project_id) or state
+
+        if integration_branch:
+            integration_state = self._integration_branch_wake_state(
+                project_id, integration_branch, children=children, outcomes=outcomes,
+            )
+            if integration_state is not None:
+                current_snapshot[_INTEGRATION_PR_EVENT_KEY] = integration_state
 
         acked = state.get("acked_states") or {}
         # A child observed back at `active` re-baselines its acked entry

@@ -1246,6 +1246,37 @@ def _card_outcome_view(
     }
 
 
+def _project_integration_prs(
+    hierarchy, project_id: str, outcomes_by_task: dict[str, dict[str, Any]],
+    pr_status_by_url: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """One entry per pull request a coding child of ``project_id`` has
+    already merged, for the project drawer's integration-branch section
+    ("links to the child pull requests merged into it"). Restricted to
+    ``state == "MERGED"`` (from the background-refreshed
+    ``pr_status_cache``, never a live `gh` call from a board build): a
+    board build has no persisted record of any PR's *base* branch, only
+    its cached merge state, so this can't distinguish a PR merged into the
+    project's own integration branch from one merged straight into the
+    default branch by an unrelated path — filtering to merged-only at
+    least drops every still-open or closed-unmerged PR, which is never
+    "merged into it" regardless of base. A child dispatched while the
+    project carried no recorded integration branch yet (see
+    `git_worktree.ensure_worktree`'s `base_branch`) is the one case a
+    listed PR's actual base might not be the branch named above it.
+    """
+    entries: list[dict[str, Any]] = []
+    for child in hierarchy.children(project_id):
+        outcome = _card_outcome_view(outcomes_by_task.get(child.id), pr_status_by_url)
+        if not outcome:
+            continue
+        for pr in outcome["prs"]:
+            if pr.get("state") != "MERGED":
+                continue
+            entries.append({**pr, "child_id": child.id, "title": child.description})
+    return entries
+
+
 def _task_card(task, sessions_by_task: dict[str, list[dict[str, Any]]],
                 open_question_by_task: dict[str, dict[str, Any]],
                 session_store: SessionStore,
@@ -1363,6 +1394,11 @@ def _build_board() -> dict[str, Any]:
             task.id,
             project_service.coordinator_view(task),
         )
+        project = hierarchy_fields.get("project")
+        if project and project.get("integration_branch"):
+            project["integration_prs"] = _project_integration_prs(
+                hierarchy, task.id, outcomes_by_task, pr_status_by_url,
+            )
         lanes[lane].append(_task_card(
             task, sessions_by_task, open_question_by_task, session_store,
             outcomes_by_task, pr_status_by_url,
