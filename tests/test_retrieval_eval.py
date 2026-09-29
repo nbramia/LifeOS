@@ -198,7 +198,8 @@ def test_main_prints_per_signal_counts_only(tmp_path, capsys):
     assert mine_pairs.main(["--db", str(db), "--out", str(out), "--vault", str(vault)]) == 0
     printed = capsys.readouterr().out.strip()
     assert printed == ("mined=0 cited=1 manual=0 skipped_truncated_ambiguous=0 "
-                       "skipped_truncated_nomatch=0 kept=0")
+                       "skipped_truncated_nomatch=0 kept=1")
+    assert len(out.read_text().splitlines()) == 1
 
 
 def test_filter_pairs_excludes_sources():

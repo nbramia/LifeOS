@@ -204,7 +204,7 @@ def main(argv=None) -> int:
     n = lambda s: sum(1 for p in pairs if p["source"] == s)  # noqa: E731
     print(f"mined={n('mined')} cited={n('cited')} manual={len(manual)} "
           f"skipped_truncated_ambiguous={stats['skipped_truncated_ambiguous']} "
-          f"skipped_truncated_nomatch={stats['skipped_truncated_nomatch']} kept={len(kept)}")
+          f"skipped_truncated_nomatch={stats['skipped_truncated_nomatch']} kept={len(kept) + len(pairs) + len(manual)}")
     return 0
 
 
