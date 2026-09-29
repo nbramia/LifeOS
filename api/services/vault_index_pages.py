@@ -94,7 +94,7 @@ def write_index_pages(
 
     Notes inside the index folder are not counted or listed. Summaries come
     from the keyword index; if it is unavailable pages fall back to titles
-    only. Pages whose folder no longer exists are removed when they carry the
+    only. Pages for folders absent from the vault are removed when they carry the
     generated-page frontmatter. A file whose name collides with a page but which
     lacks that frontmatter is left untouched and counted in `skipped_collision`. If the index folder resolves outside the vault
     nothing is written. Returns `{written, unchanged, skipped_collision,

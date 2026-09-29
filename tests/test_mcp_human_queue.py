@@ -46,7 +46,7 @@ class TestCuratedEndpointsRegistration:
         """65 pre-trigger tools + 3 eero home tools + 1 schedule trigger tool
         + 2 project pause/resume tools."""
         module = _load_mcp_module()
-        assert len(module.CURATED_ENDPOINTS) == 71
+        assert len(module.CURATED_ENDPOINTS) == 72
 
     def test_three_tools_in_curated_endpoints(self):
         module = _load_mcp_module()
@@ -153,7 +153,7 @@ class TestHttpTransportRegistration:
         mcp_server.py row."""
         module = _load_mcp_module()
         server = _server_built_from_live_spec(module)
-        assert len(server.tools) == 82
+        assert len(server.tools) == 83
 
 
 def _server_built_from_fallback(module):

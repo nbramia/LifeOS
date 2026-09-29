@@ -206,7 +206,7 @@ class TestNoUnrelatedChange:
     def test_curated_endpoint_count(self):
         """The curated catalog contains the expected number of tools."""
         module = _load_mcp_module()
-        assert len(module.CURATED_ENDPOINTS) == 71
+        assert len(module.CURATED_ENDPOINTS) == 72
 
     def test_other_tools_unaffected(self):
         module = _load_mcp_module()
@@ -218,7 +218,7 @@ class TestNoUnrelatedChange:
     def test_agentic_loop_tool_count_unchanged(self):
         """The native agentic-loop tool catalog contains the expected tools."""
         from api.services.agent_tools import TOOL_DEFINITIONS
-        assert len(TOOL_DEFINITIONS) == 25
+        assert len(TOOL_DEFINITIONS) == 26
 
 
 # ---------------------------------------------------------------------------
