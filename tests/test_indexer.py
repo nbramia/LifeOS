@@ -106,6 +106,19 @@ We talked about Q1 targets.
         assert "file_path" in result
         assert result["file_name"].endswith(".md")
 
+    def test_scalar_frontmatter_tags_are_indexed_as_a_list(self, indexer, temp_vault):
+        """A comma-separated tags scalar reaches the vector store as a clean list."""
+        from unittest.mock import MagicMock
+
+        note = temp_vault / "scalar_tags.md"
+        note.write_text("---\ntags: alpha, beta\n---\n\n# Scalar Tags\n\nSynthetic body text.\n")
+        indexer.vector_store = MagicMock()
+
+        indexer.index_file(str(note))
+
+        _chunks, metadata = indexer.vector_store.update_document.call_args.args
+        assert metadata["tags"] == ["alpha", "beta"]
+
     def test_chunks_granola_notes_by_headers(self, indexer, temp_vault):
         """Granola/meeting notes should be chunked by headers."""
         # Create a Granola-style note

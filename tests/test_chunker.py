@@ -9,6 +9,7 @@ from pathlib import Path
 from api.services.chunker import (
     count_tokens,
     extract_frontmatter,
+    normalize_tags,
     parse_markdown,
     chunk_by_headers,
     chunk_by_tokens,
@@ -786,3 +787,42 @@ Follow up meeting scheduled for next week.
         for i, chunk in enumerate(contextualized):
             assert chunk["has_context"]
             assert f"Part {i+1}" in chunk["content"]
+
+
+@pytest.mark.unit
+class TestNormalizeTags:
+    """normalize_tags turns any frontmatter tags value into a clean list."""
+
+    @pytest.mark.parametrize("value", [
+        ["work", "meeting"],
+        "work, meeting",
+        "work meeting",
+        "#work, #meeting",
+        [" work ", "meeting", ""],
+        ["work, meeting"],
+        ["#work", "#meeting"],
+        "work,meeting",
+    ])
+    def test_forms_normalize_to_list(self, value):
+        assert normalize_tags(value) == ["work", "meeting"]
+
+    @pytest.mark.parametrize("value", [None, "", "   ", [], [None, ""], ",,"])
+    def test_empty_values(self, value):
+        assert normalize_tags(value) == []
+
+    def test_single_word(self):
+        assert normalize_tags("work") == ["work"]
+
+    def test_non_string_scalar(self):
+        assert normalize_tags(42) == ["42"]
+        assert normalize_tags([42, True]) == ["42", "True"]
+
+    def test_nested_tags_stay_intact(self):
+        assert normalize_tags("people/jane, #projects/alpha") == ["people/jane", "projects/alpha"]
+
+    def test_duplicates_removed_in_first_seen_order(self):
+        assert normalize_tags("b a b #a c") == ["b", "a", "c"]
+
+    def test_frontmatter_scalar_round_trip(self):
+        fm, _ = extract_frontmatter("---\ntags: alpha, beta\n---\n\nBody\n")
+        assert normalize_tags(fm.get("tags")) == ["alpha", "beta"]

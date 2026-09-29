@@ -46,6 +46,32 @@ def extract_frontmatter(content: str) -> tuple[dict, str]:
         return {}, content
 
 
+def normalize_tags(value) -> list[str]:
+    """
+    Normalize a frontmatter ``tags`` value into a clean list of strings.
+
+    Accepts a list, a comma- and/or whitespace-separated string, a single word,
+    None, or any other scalar. Leading ``#`` is stripped, whitespace trimmed,
+    empty entries dropped, and duplicates removed keeping first-seen order.
+    Nested tags such as ``people/jane`` are kept intact. Never raises.
+    """
+    if value is None:
+        return []
+    items = value if isinstance(value, (list, tuple, set)) else [value]
+    if isinstance(value, set):
+        items = sorted(str(item) for item in value)
+
+    tags: list[str] = []
+    for item in items:
+        if item is None:
+            continue
+        for part in re.split(r"[,\s]+", str(item)):
+            tag = part.lstrip("#").strip()
+            if tag and tag not in tags:
+                tags.append(tag)
+    return tags
+
+
 def parse_markdown(content: str) -> list[dict]:
     """
     Parse markdown into sections by headers.
