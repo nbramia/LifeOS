@@ -7,7 +7,7 @@ NOTE: Heavy dependencies (chromadb, embeddings) are imported lazily
 to speed up pytest collection for unit tests.
 """
 from typing import Optional
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 import json
 import math
@@ -28,8 +28,9 @@ TAG_KEY_PREFIX = "tag:"
 # A ``file_path $in`` list is split into batches of this many paths so no
 # single query carries an oversized parameter list.
 FILE_PATH_BATCH = 2000
-# Largest candidate pool a date-windowed search widens to while filling.
-DATE_FETCH_CAP = 6400
+# ``modified_day`` value of a chunk whose ``modified_date`` cannot be parsed;
+# date windows keep such chunks, matching the undated-passes contract.
+UNDATED_DAY = -1_000_000
 
 
 def tag_key(tag: str) -> str:
@@ -37,13 +38,34 @@ def tag_key(tag: str) -> str:
     return TAG_KEY_PREFIX + tag.strip().lstrip("#").lower()
 
 
-def _date_in_window(metadata: Optional[dict], date_from: Optional[str], date_to: Optional[str]) -> bool:
-    """Whether a chunk's ``modified_date`` (first 10 chars) is in the inclusive
-    window; a chunk without a date passes."""
-    d = ((metadata or {}).get("modified_date") or "")[:10]
-    if not d:
-        return True
-    return not ((date_from and d < date_from) or (date_to and d > date_to))
+def modified_day(date_str: Optional[str]) -> int:
+    """Days since 1970-01-01 of a ``YYYY-MM-DD`` (or ISO timestamp) string;
+    ``UNDATED_DAY`` when it does not parse."""
+    try:
+        return (datetime.strptime(str(date_str or "")[:10], "%Y-%m-%d").date() - date(1970, 1, 1)).days
+    except ValueError:
+        return UNDATED_DAY
+
+
+def _date_where(date_from: Optional[str], date_to: Optional[str]) -> Optional[dict]:
+    """Chroma ``where`` admitting chunks inside the inclusive window, plus
+    undated chunks. None when no bound is given (or a bound does not parse)."""
+    bounds = []
+    if date_from and modified_day(date_from) != UNDATED_DAY:
+        bounds.append({"modified_day": {"$gte": modified_day(date_from)}})
+    if date_to and modified_day(date_to) != UNDATED_DAY:
+        bounds.append({"modified_day": {"$lte": modified_day(date_to)}})
+    if not bounds:
+        return None
+    window = bounds[0] if len(bounds) == 1 else {"$and": bounds}
+    return {"$or": [window, {"modified_day": UNDATED_DAY}]}
+
+
+def _all_of(conds: list[dict]) -> Optional[dict]:
+    """One Chroma ``where`` requiring every clause (None when there are none)."""
+    if not conds:
+        return None
+    return conds[0] if len(conds) == 1 else {"$and": conds}
 
 
 class VectorStore:
@@ -140,6 +162,7 @@ class VectorStore:
                 "file_path": metadata["file_path"],
                 "file_name": metadata["file_name"],
                 "modified_date": metadata.get("modified_date", ""),
+                "modified_day": modified_day(metadata.get("modified_date")),
                 "note_type": metadata.get("note_type", ""),
                 "chunk_index": chunk["chunk_index"],
                 # Store lists as JSON strings
@@ -239,10 +262,9 @@ class VectorStore:
                 (pre-filter inside the vector query); an empty list matches
                 nothing. Large lists run as batched queries whose candidates
                 are merged by distance.
-            date_from / date_to: Inclusive ``YYYY-MM-DD`` window on the chunk's
-                ``modified_date`` (undated chunks pass). The candidate pool
-                widens (doubling, up to ``DATE_FETCH_CAP``) until it holds as
-                many in-window chunks as an unwindowed search would fetch.
+            date_from / date_to: Inclusive ``YYYY-MM-DD`` window, applied as a
+                ``modified_day`` clause inside the vector query; chunks
+                without a parseable date pass.
 
         Returns:
             List of result dicts with content, metadata, and score
@@ -251,45 +273,24 @@ class VectorStore:
         query_embedding = self._embedding_service.embed_text(query)
 
         # Build where clause for filters
-        where = None
-        if filters:
-            where = {}
-            for key, value in filters.items():
-                if value is not None:
-                    where[key] = value
+        conds = [{k: v} for k, v in (filters or {}).items() if v is not None]
+        window = _date_where(date_from, date_to)
+        if window:
+            conds.append(window)
 
         # Fetch more results to re-rank with recency bias
         fetch_count = min(top_k * 5, 100)
 
         # Query collection
-        def run_query(n_results: int) -> dict:
-            if file_paths is None:
-                return self._collection.query(
-                    query_embeddings=[query_embedding],
-                    n_results=n_results,
-                    where=where if where else None,
-                    include=["documents", "metadatas", "distances"]
-                )
-            return self._query_restricted(query_embedding, n_results, where, file_paths)
-
-        if not (date_from or date_to):
-            results = run_query(fetch_count)
+        if file_paths is None:
+            results = self._collection.query(
+                query_embeddings=[query_embedding],
+                n_results=fetch_count,
+                where=_all_of(conds),
+                include=["documents", "metadatas", "distances"]
+            )
         else:
-            want = fetch_count
-            while True:
-                results = run_query(fetch_count)
-                returned = len(results["ids"][0]) if results["ids"] else 0
-                keep = [
-                    i for i in range(returned)
-                    if _date_in_window(results["metadatas"][0][i], date_from, date_to)
-                ]
-                if len(keep) >= want or returned < fetch_count or fetch_count >= DATE_FETCH_CAP:
-                    results = {
-                        k: [[results[k][0][i] for i in keep]]
-                        for k in ("ids", "documents", "metadatas", "distances")
-                    }
-                    break
-                fetch_count = min(fetch_count * 2, DATE_FETCH_CAP)
+            results = self._query_restricted(query_embedding, fetch_count, conds, file_paths)
 
         # Format and score results
         formatted = []
@@ -343,7 +344,7 @@ class VectorStore:
         self,
         query_embedding,
         fetch_count: int,
-        filters_where: Optional[dict],
+        conds: list[dict],
         file_paths: list[str],
     ) -> dict:
         """Nearest-neighbour query limited to chunks of ``file_paths``.
@@ -358,12 +359,11 @@ class VectorStore:
         rows = []
         for i in range(0, len(file_paths), FILE_PATH_BATCH):
             batch = file_paths[i:i + FILE_PATH_BATCH]
-            conds = [{k: v} for k, v in (filters_where or {}).items()]
-            conds.append({"file_path": {"$in": batch}})
+            batch_conds = [*conds, {"file_path": {"$in": batch}}]
             res = self._collection.query(
                 query_embeddings=[query_embedding],
                 n_results=fetch_count,
-                where=conds[0] if len(conds) == 1 else {"$and": conds},
+                where=_all_of(batch_conds),
                 include=["documents", "metadatas", "distances"],
             )
             if res["ids"] and res["ids"][0]:
@@ -382,14 +382,15 @@ class VectorStore:
             "distances": [[r[0] for r in rows]],
         }
 
-    def backfill_tag_keys(self, batch_size: int = 500) -> int:
-        """Write the ``tag:<name>`` boolean keys for chunks indexed without them.
+    def backfill_search_keys(self, batch_size: int = 500) -> int:
+        """Write the search metadata keys chunks are missing.
 
-        A chunk qualifies when its JSON ``tags`` metadata is non-empty and it
-        carries no ``tag:`` key. Only metadata is written (``update`` with the
-        full existing metadata plus the new keys); documents and embeddings
-        are untouched. Returns the number of chunks updated; a second run
-        returns 0.
+        Scans every chunk. A chunk gets the ``tag:<name>`` boolean keys for its
+        non-empty JSON ``tags`` when it carries none, and ``modified_day`` when
+        it lacks it. Only metadata is written (``update`` with the full
+        existing metadata plus the new keys); documents and embeddings are
+        untouched, and an already-complete chunk is not written. Returns the
+        number of chunks updated; a second run returns 0.
         """
         updated = 0
         offset = 0
@@ -402,35 +403,21 @@ class VectorStore:
             write_ids, write_metas = [], []
             for chunk_id, meta in zip(ids, page["metadatas"]):
                 meta = meta or {}
-                if any(k.startswith(TAG_KEY_PREFIX) for k in meta):
-                    continue
-                try:
-                    tags = json.loads(meta.get("tags") or "[]")
-                except (TypeError, ValueError):
-                    continue
-                keys = {tag_key(str(t)): True for t in tags if str(t).strip()}
-                if keys:
+                add: dict = {}
+                if "modified_day" not in meta:
+                    add["modified_day"] = modified_day(meta.get("modified_date"))
+                if not any(k.startswith(TAG_KEY_PREFIX) for k in meta):
+                    try:
+                        tags = json.loads(meta.get("tags") or "[]")
+                    except (TypeError, ValueError):
+                        tags = []
+                    add.update({tag_key(str(t)): True for t in tags if str(t).strip()})
+                if add:
                     write_ids.append(chunk_id)
-                    write_metas.append({**meta, **keys})
+                    write_metas.append({**meta, **add})
             if write_ids:
                 self._collection.update(ids=write_ids, metadatas=write_metas)
                 updated += len(write_ids)
-
-    def has_unbackfilled_tags(self, sample: int = 20) -> bool:
-        """Whether a small sample of chunks with non-empty JSON ``tags`` lacks
-        ``tag:`` keys (a collection written before the keys existed)."""
-        page = self._collection.get(
-            where={"tags": {"$ne": "[]"}}, include=["metadatas"], limit=sample
-        )
-        for meta in page["metadatas"] or []:
-            meta = meta or {}
-            try:
-                has_tags = bool(json.loads(meta.get("tags") or "[]"))
-            except (TypeError, ValueError):
-                continue
-            if has_tags and not any(k.startswith(TAG_KEY_PREFIX) for k in meta):
-                return True
-        return False
 
     def file_paths_with_people(self, file_paths, names: list[str]) -> set[str]:
         """Subset of ``file_paths`` having a chunk whose ``people`` list holds one

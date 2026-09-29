@@ -349,7 +349,7 @@ def test_file_paths_matching_reads_chunk_ids():
     assert vs.file_paths_matching() == {"/a.md", "/b::c.md"}
 
 
-def test_add_document_writes_scalar_tag_keys():
+def test_add_document_writes_scalar_tag_keys_and_modified_day():
     vs = _vector_store([])
     vs._collection.add = MagicMock()
     vs._embedding_service.embed_texts.return_value = [[0.0]]
@@ -360,6 +360,12 @@ def test_add_document_writes_scalar_tag_keys():
     meta = vs._collection.add.call_args.kwargs["metadatas"][0]
     assert meta["tag:project/x"] is True and meta["tag:plain"] is True
     assert meta["tags"] == '["#Project/X", "plain"]'
+    assert meta["modified_day"] == -1_000_000
+    vs.add_document(
+        [{"content": "c", "chunk_index": 0}],
+        {"file_path": "/a.md", "file_name": "a.md", "modified_date": "1970-01-11T08:00:00"},
+    )
+    assert vs._collection.add.call_args.kwargs["metadatas"][0]["modified_day"] == 10
 
 
 # -- Tag key backfill (real Chroma) --------------------------------------------
@@ -378,10 +384,10 @@ def real_store(tmp_path):
         embeddings=[[1.0, 0.0], [0.5, 0.5], [0.0, 1.0], [0.3, 0.7]],
         documents=["alpha", "beta", "gamma", "delta"],
         metadatas=[
-            {"file_path": "/v/a.md", "note_type": "Work", "chunk_index": 0, "tags": '["Project/X", "plain"]'},
-            {"file_path": "/v/a.md", "note_type": "Work", "chunk_index": 1, "tags": '["Project/X", "plain"]'},
-            {"file_path": "/v/b.md", "note_type": "Work", "chunk_index": 0, "tags": "[]"},
-            {"file_path": "/v/c.md", "note_type": "Work", "chunk_index": 0, "tags": '["Hashed"]',
+            {"file_path": "/v/a.md", "note_type": "Work", "chunk_index": 0, "modified_day": -1, "tags": '["Project/X", "plain"]'},
+            {"file_path": "/v/a.md", "note_type": "Work", "chunk_index": 1, "modified_day": -1, "tags": '["Project/X", "plain"]'},
+            {"file_path": "/v/b.md", "note_type": "Work", "chunk_index": 0, "modified_day": -1, "tags": "[]"},
+            {"file_path": "/v/c.md", "note_type": "Work", "chunk_index": 0, "modified_day": -1, "tags": '["Hashed"]',
              "tag:hashed": True},
         ],
     )
@@ -391,7 +397,7 @@ def real_store(tmp_path):
 def test_backfill_adds_keys_and_preserves_metadata_documents_and_embeddings(real_store):
     col = real_store._collection
     before = col.get(include=["embeddings", "metadatas", "documents"])
-    assert real_store.backfill_tag_keys(batch_size=2) == 2
+    assert real_store.backfill_search_keys(batch_size=2) == 2
     after = col.get(include=["embeddings", "metadatas", "documents"])
     assert before["ids"] == after["ids"]
     assert before["embeddings"].tolist() == after["embeddings"].tolist()
@@ -408,48 +414,65 @@ def test_backfill_adds_keys_and_preserves_metadata_documents_and_embeddings(real
 
 
 def test_backfill_is_idempotent(real_store):
-    assert real_store.backfill_tag_keys() == 2
-    assert real_store.backfill_tag_keys() == 0
+    assert real_store.backfill_search_keys() == 2
+    assert real_store.backfill_search_keys() == 0
 
 
 def test_tags_facet_finds_a_chunk_indexed_without_keys_once_backfilled(real_store):
     facets = SearchFacets(tags=["project/x"])
     assert resolve_allowed_paths(facets, real_store, None) == set()
-    real_store.backfill_tag_keys()
+    real_store.backfill_search_keys()
     assert resolve_allowed_paths(facets, real_store, None) == {"/v/a.md"}
 
 
-def _reindex_script(tmp_path, monkeypatch):
+def test_reindex_script_reports_the_count_and_a_second_run_writes_nothing(real_store):
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
-    import sync_vault_reindex
+    import sync_vault_reindex as script
 
-    monkeypatch.setattr(settings, "chroma_path", tmp_path / "data" / "chroma")
-    return sync_vault_reindex
-
-
-def test_reindex_script_backfills_once_and_reports_the_count(real_store, tmp_path, monkeypatch):
-    script = _reindex_script(tmp_path, monkeypatch)
     indexer = MagicMock()
     indexer.vector_store = real_store
-    assert script.backfill_tag_keys_once(indexer) == 2
-    real_store.backfill_tag_keys = MagicMock()
-    assert script.backfill_tag_keys_once(indexer) == 0
-    real_store.backfill_tag_keys.assert_not_called()
+    assert script.backfill_search_keys(indexer) == 2
+    assert script.backfill_search_keys(indexer) == 0
 
 
-def test_reindex_script_backfills_a_replaced_legacy_collection_despite_the_marker(
-    real_store, tmp_path, monkeypatch
-):
-    script = _reindex_script(tmp_path, monkeypatch)
-    indexer = MagicMock()
-    indexer.vector_store = real_store
-    assert script.backfill_tag_keys_once(indexer) == 2
-    # Replace the collection with one written before the keys existed.
-    legacy = _legacy_store(tmp_path)
-    indexer.vector_store = legacy
-    assert script.backfill_tag_keys_once(indexer) == 1
-    assert resolve_allowed_paths(SearchFacets(tags=["project/x"]), legacy, None) == {"/v/z.md"}
+def _tagged_chunks(store, migrated, legacy):
+    """``migrated`` complete tagged chunks, then ``legacy`` without keys."""
+    ids, metas = [], []
+    for i in range(migrated + legacy):
+        meta = {"file_path": f"/v/t{i}.md", "modified_date": "2025-01-01", "tags": '["Project/X"]'}
+        if i < migrated:
+            meta.update({"tag:project/x": True, "modified_day": 20089})
+        ids.append(f"/v/t{i}.md::0")
+        metas.append(meta)
+    store._collection.add(
+        ids=ids, embeddings=[[1.0, 0.0]] * len(ids), documents=["d"] * len(ids), metadatas=metas
+    )
+
+
+def test_backfill_scans_every_chunk_so_a_late_legacy_chunk_is_repaired(tmp_path):
+    vs = _legacy_store(tmp_path)
+    vs._collection.delete(ids=["/v/z.md::0"])
+    _tagged_chunks(vs, migrated=20, legacy=1)
+    assert vs.backfill_search_keys(batch_size=5) == 1
+    legacy = vs._collection.get(ids=["/v/t20.md::0"], include=["metadatas"])["metadatas"][0]
+    assert legacy["tag:project/x"] is True and legacy["modified_day"] == 20089
+    assert vs.backfill_search_keys(batch_size=5) == 0
+
+
+def test_backfill_writes_modified_day_on_untagged_legacy_chunks(tmp_path):
+    vs = _legacy_store(tmp_path)
+    vs._collection.add(
+        ids=["/v/u.md::0", "/v/n.md::0"], embeddings=[[0.0, 1.0]] * 2, documents=["a", "b"],
+        metadatas=[
+            {"file_path": "/v/u.md", "tags": "[]", "modified_date": "2025-01-01"},
+            {"file_path": "/v/n.md", "tags": "[]", "modified_date": ""},
+        ],
+    )
+    vs.backfill_search_keys()
+    got = vs._collection.get(include=["metadatas"])
+    days = {m["file_path"]: m["modified_day"] for m in got["metadatas"]}
+    assert days["/v/u.md"] == 20089 and days["/v/n.md"] == -1_000_000
 
 
 def _legacy_store(tmp_path):
@@ -550,26 +573,44 @@ def test_bm25_date_window_applies_before_the_limit(tmp_path):
     } | {"/v/undated.md_0"}
 
 
-def test_vector_date_window_widens_the_pool_before_the_top_k_cut(tmp_path):
+def _dated_store(tmp_path, n_new):
     import chromadb
-    from api.services.vectorstore import VectorStore
+    from api.services.vectorstore import VectorStore, modified_day
     vs = VectorStore.__new__(VectorStore)
     vs._collection = chromadb.PersistentClient(path=str(tmp_path / "chroma")).create_collection(
         "dates_col", metadata={"hnsw:space": "cosine"}
     )
     vs._embedding_service = MagicMock()
     vs._embedding_service.embed_text.return_value = [1.0, 0.0]
-    n = 150
-    vs._collection.add(
-        ids=[f"/v/new{i}.md::0" for i in range(n)] + ["/v/old.md::0"],
-        embeddings=[[1.0, 0.001 * i] for i in range(n)] + [[0.0, 1.0]],
-        documents=["x"] * (n + 1),
-        metadatas=[{"file_path": f"/v/new{i}.md", "modified_date": "2026-05-01"} for i in range(n)]
-        + [{"file_path": "/v/old.md", "modified_date": "2025-01-01"}],
-    )
+    rows = [(f"/v/new{i}.md", "2026-05-01", [1.0, 0.0001 * i]) for i in range(n_new)]
+    rows += [("/v/old.md", "2025-01-01", [0.0, 1.0]), ("/v/undated.md", "", [0.1, 1.0])]
+    for i in range(0, len(rows), 2000):
+        part = rows[i:i + 2000]
+        vs._collection.add(
+            ids=[f"{p}::0" for p, _, _ in part],
+            embeddings=[e for _, _, e in part],
+            documents=["x"] * len(part),
+            metadatas=[
+                {"file_path": p, "modified_date": d, "modified_day": modified_day(d)}
+                for p, d, _ in part
+            ],
+        )
+    return vs
+
+
+def test_vector_date_window_restricts_eligibility_inside_the_query(tmp_path):
+    vs = _dated_store(tmp_path, 6400)
     got = vs.search("q", top_k=1, recency_weight=0.0, date_to="2025-12-31")
-    assert [r["file_path"] for r in got] == ["/v/old.md"]
+    assert [r["file_path"] for r in got] and got[0]["file_path"] in {"/v/old.md", "/v/undated.md"}
     assert vs.search("q", top_k=1, recency_weight=0.0)[0]["file_path"].startswith("/v/new")
+
+
+def test_vector_date_window_bounds_and_undated_pass(tmp_path):
+    vs = _dated_store(tmp_path, 3)
+    both = vs.search("q", top_k=10, recency_weight=0.0, date_from="2025-01-01", date_to="2025-12-31")
+    assert {r["file_path"] for r in both} == {"/v/old.md", "/v/undated.md"}
+    later = vs.search("q", top_k=10, recency_weight=0.0, date_from="2026-01-01")
+    assert {r["file_path"] for r in later} == {f"/v/new{i}.md" for i in range(3)} | {"/v/undated.md"}
 
 
 def test_hybrid_top_k_one_with_facet_and_date_returns_the_eligible_note(tmp_path, monkeypatch):
