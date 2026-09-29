@@ -1,0 +1,118 @@
+# Controlled vocabulary for vault tagging. Generic on purpose: operator-specific
+# additions, replacements, and removals go in config/vault_taxonomy.local.yaml
+# (git-ignored), which is merged over this file at load time.
+version: "1"
+
+doc_types:
+  - meeting_notes
+  - journal
+  - ambient_transcript
+  - task_record
+  - reference
+  - project_doc
+  - book_notes
+  - message_copy
+  - creative
+  - log
+  - research
+  - other
+
+domains:
+  - work
+  - money_admin
+  - home_food
+  - relationships
+  - health
+  - growth
+  - tech_projects
+  - mixed
+
+# Each topic is `parent/child`; the parent must be a declared domain.
+topics:
+  - name: work/hiring
+    description: Recruiting, interviews, offers, and onboarding of team members.
+  - name: work/management
+    description: One-on-ones, feedback, performance, and team leadership.
+  - name: work/strategy
+    description: Planning, priorities, roadmaps, and organizational direction.
+  - name: work/operations
+    description: Day-to-day running of the business, processes, and vendors.
+  - name: work/meetings
+    description: Agendas, notes, and follow-ups from working meetings.
+  - name: work/communications
+    description: Announcements, presentations, and stakeholder updates.
+  - name: money_admin/budgeting
+    description: Household budgets, spending plans, and cash flow.
+  - name: money_admin/investing
+    description: Investment accounts, allocations, and market research.
+  - name: money_admin/taxes
+    description: Tax preparation, filings, and deductions.
+  - name: money_admin/insurance
+    description: Policies, claims, and coverage reviews.
+  - name: money_admin/legal_paperwork
+    description: Contracts, official documents, and government forms.
+  - name: money_admin/purchases
+    description: Major purchases, receipts, warranties, and comparisons.
+  - name: home_food/cooking
+    description: Recipes, meal ideas, and kitchen techniques.
+  - name: home_food/meal_planning
+    description: Weekly menus, grocery lists, and dietary planning.
+  - name: home_food/home_maintenance
+    description: Repairs, upkeep, contractors, and appliance care.
+  - name: home_food/household
+    description: Chores, supplies, and routines for running the home.
+  - name: home_food/travel
+    description: Trip planning, itineraries, bookings, and packing lists.
+  - name: relationships/family
+    description: Family events, planning, and shared responsibilities.
+  - name: relationships/friends
+    description: Friendships, get-togethers, and staying in touch.
+  - name: relationships/parenting
+    description: Raising children, school, activities, and milestones.
+  - name: relationships/partnership
+    description: Couple planning, dates, and shared goals.
+  - name: relationships/social_events
+    description: Gatherings, celebrations, gifts, and invitations.
+  - name: health/fitness
+    description: Workouts, training plans, and physical activity logs.
+  - name: health/nutrition
+    description: Diet, supplements, and eating habits as they relate to health.
+  - name: health/medical
+    description: Appointments, conditions, medications, and test results.
+  - name: health/sleep
+    description: Sleep tracking, routines, and recovery.
+  - name: health/mental_health
+    description: Mood, stress, therapy reflections, and emotional wellbeing.
+  - name: growth/learning
+    description: Courses, study notes, and skill development.
+  - name: growth/reading
+    description: Books and articles read, highlights, and takeaways.
+  - name: growth/habits
+    description: Routines, habit tracking, and personal systems.
+  - name: growth/goals
+    description: Long-term goals, reviews, and life planning.
+  - name: growth/reflection
+    description: Self-assessment, lessons learned, and values.
+  - name: tech_projects/software_development
+    description: Code, architecture, debugging, and engineering notes.
+  - name: tech_projects/ai_tooling
+    description: AI assistants, models, prompts, and agent workflows.
+  - name: tech_projects/infrastructure
+    description: Servers, networking, devices, and deployment.
+  - name: tech_projects/automation
+    description: Scripts, schedules, integrations, and personal workflows.
+  - name: tech_projects/data_systems
+    description: Databases, indexing, search, and data pipelines.
+  - name: tech_projects/writing_and_creative
+    description: Fiction, worldbuilding, drafts, and creative experiments.
+  - name: mixed/general
+    description: Notes spanning several life areas with no dominant theme.
+  - name: mixed/inbox
+    description: Unsorted captures, quick thoughts, and scratch notes.
+
+# Kinds of live lists the tagger may pull project names from. These are
+# declarative names only; the tagger resolves them at run time.
+project_sources:
+  - project_owners
+  - tasks_projects
+  - work_subfolders

@@ -167,3 +167,6 @@ scripts/clear-caches.sh
 
 # Per-install persona selection; the tracked telegram_bots.json is the template.
 config/telegram_bots.local.json
+
+# Operator-specific taxonomy override (merged over config/vault_taxonomy.yaml)
+config/vault_taxonomy.local.yaml

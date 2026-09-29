@@ -335,6 +335,14 @@ Both binary settings resolve the same way (`api/services/agent_worker/binary_res
 | `LIFEOS_RELATIONSHIP_FOLDER` | str | `Relationship` | Relationship folder name. |
 | `LIFEOS_VAULT_MTIME_TRUSTED_AFTER` | date | — | For undated notes, trust the file's mtime as the interaction date only when the mtime is strictly later than this `YYYY-MM-DD` cutoff; otherwise the note falls back to the 1970 "undated" sentinel. Set to a date after your last bulk migration (clone/restore/mass-rename) so migration-era mtimes don't show up as recent activity. Leave unset to keep all undated notes on the sentinel. Read directly from the environment by `api/services/indexer.py` (not a Pydantic Setting). |
 
+## Vault Taxonomy
+
+`config/vault_taxonomy.yaml` is the committed, generic controlled vocabulary for vault tagging: `doc_types`, `domains`, `topics` (each `parent/child` with a one-line description, the parent being a declared domain), and `project_sources` (kinds of live lists project names come from). It carries a `version` string.
+
+`config/vault_taxonomy.local.yaml` is an optional operator override that version control ignores (see `config/vault_taxonomy.local.yaml.example`). It is merged over the committed file at load: list entries are added, topics are replaced by name, and a `remove:` mapping (facet to values) deletes entries.
+
+`api.services.vault_taxonomy.load_taxonomy()` returns the merged facets and `vocab_version`, the first 12 hex characters of the SHA-256 of the merged content in canonical form (sorted keys and lists). Formatting and ordering changes keep the version; any vocabulary change alters it. Loading raises `TaxonomyError` for duplicate values within a facet, a topic that is not `parent/child`, or a topic whose parent is not a declared domain. `scripts/taxonomy_bootstrap.py` proposes topics for the operator to edit into the override file.
+
 ## Gmail Send Safety
 
 | Variable | Type | Default | Sets |

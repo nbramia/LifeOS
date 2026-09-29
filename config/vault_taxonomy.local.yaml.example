@@ -1,0 +1,17 @@
+# Copy to config/vault_taxonomy.local.yaml (git-ignored) and edit.
+# Merged over vault_taxonomy.yaml at load: entries are added, or replace
+# same-keyed entries (topics are keyed by name); `remove` deletes by value.
+doc_types:
+  - field_report
+domains:
+  - hobbies
+topics:
+  - name: hobbies/gardening
+    description: Garden layouts, planting schedules, and plant care.
+  - name: work/hiring
+    description: Sourcing and interviewing candidates for the example team.
+remove:
+  topics:
+    - mixed/inbox
+project_sources:
+  - work_subfolders

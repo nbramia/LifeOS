@@ -297,6 +297,7 @@ Example:
 | `create-lifeos-app.sh` | Create the `LifeOS.app` Full Disk Access wrapper bundle in `/Applications` (macOS only), the FDA container cron/launchd route through for protected databases. |
 | `lifeos-agent-hook.sh` | Claude Code / Codex session-lifecycle hook — posts session_start/user_prompt_submit/stop/session_end to `POST /api/agents/cli-sessions/events` from any machine, so `/agents` shows sessions from every machine, not just this one. Installed by `install-agent-hooks.sh`; see [agents-go-to.md § 4](agents-go-to.md#4-cross-machine-session-registration). |
 | `install-agent-hooks.sh` | Idempotently installs `lifeos-agent-hook.sh` into `~/.claude/settings.json` and `~/.codex/hooks.json`. Run once per machine; safe to re-run. |
+| `taxonomy_bootstrap.py` | Proposes vault taxonomy topics: samples `--sample N` notes (default 200) stratified by top-level folder, collects their frontmatter tags and folder names, and asks the specialist LLM backend (Anthropic, else local, else remote) for `parent/child` topics in the shape of `config/vault_taxonomy.yaml`. Writes `data/taxonomy_proposal.yaml` only, never `config/`; the operator edits it into `config/vault_taxonomy.local.yaml`. Note titles, tags, and short excerpts go to the configured backend. `--dry-run` prints sample sizes and a prompt token estimate without calling the LLM. |
 | `preflight.sh` | Pre-flight checks (called by server.sh) |
 | `run_sync_wrapper.sh` | NVMe wake + pre-flight for nightly sync |
 | `run_sync_with_fda.sh` | FDA wrapper for phone/iMessage sync (macOS) |
