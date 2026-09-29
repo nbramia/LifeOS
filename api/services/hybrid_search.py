@@ -469,15 +469,19 @@ class HybridSearch:
             bm25_index = self._get_bm25_index()
             bm25_doc_ids = []
             bm25_results_by_id = {}
+            bm25_match_mode = "none"
 
             if bm25_index:
                 try:
                     bm25_results = bm25_index.search(expanded_query, limit=fetch_k)
+                    if bm25_results:
+                        bm25_match_mode = bm25_results[0].get("match_mode") or "none"
                     bm25_doc_ids = [r["doc_id"] for r in bm25_results]
                     # Store BM25 results for later lookup
                     bm25_results_by_id = {r["doc_id"]: r for r in bm25_results}
                 except Exception as e:
                     logger.warning(f"BM25 search failed: {e}")
+                    bm25_match_mode = "error"
                     from api.services.service_health import record_degradation
                     record_degradation("bm25_index", "hybrid_search", "vector_only", "BM25 search failed")
 
@@ -492,7 +496,13 @@ class HybridSearch:
                 vector_results = [
                     r for r in vector_results if in_date_range(r, date_from, date_to)
                 ]
-            return vector_results[:top_k]
+            vector_results = vector_results[:top_k]
+            for r in vector_results:
+                r["found_by"] = "vector"
+            self._record_attribution(
+                query, top_k, len(vector_doc_ids), 0, bm25_match_mode, vector_results
+            )
+            return vector_results
 
         # Apply RRF fusion + boosting
         with trace_span("search_rrf_boost", parent="tool_search_vault"):
@@ -547,6 +557,12 @@ class HybridSearch:
                 else:
                     # Unknown result, create minimal
                     result = {"id": doc_id, "content": "", "metadata": {}}
+
+                in_vector = doc_id in results_by_id
+                in_bm25 = doc_id in bm25_results_by_id
+                result["found_by"] = (
+                    "both" if in_vector and in_bm25 else "bm25" if in_bm25 else "vector"
+                )
 
                 match_mode = bm25_results_by_id.get(doc_id, {}).get("match_mode")
                 if match_mode:
@@ -620,7 +636,43 @@ class HybridSearch:
             else:
                 final_results = final_results[:top_k]
 
+        self._record_attribution(
+            query, top_k, len(vector_doc_ids), len(bm25_doc_ids),
+            bm25_match_mode, final_results,
+        )
         return final_results
+
+    @staticmethod
+    def _record_attribution(
+        query: str,
+        top_k: int,
+        vector_candidates: int,
+        bm25_candidates: int,
+        bm25_match_mode: str,
+        final_results: list[dict],
+    ) -> None:
+        """Record the tool query and per-arm attribution of the returned
+        results as a ``search_attribution`` span (no-op without a trace).
+
+        Only counts and the query are recorded; result content never is."""
+        counts = {"vector_only": 0, "bm25_only": 0, "both": 0}
+        for r in final_results:
+            key = {"vector": "vector_only", "bm25": "bm25_only"}.get(
+                r.get("found_by"), r.get("found_by")
+            )
+            if key in counts:
+                counts[key] += 1
+        with trace_span(
+            "search_attribution",
+            parent="tool_search_vault",
+            query=query,
+            vector_candidates=vector_candidates,
+            bm25_candidates=bm25_candidates,
+            bm25_match_mode=bm25_match_mode,
+            attribution=counts,
+            top_k=top_k,
+        ):
+            pass
 
 
 # Singleton instance
