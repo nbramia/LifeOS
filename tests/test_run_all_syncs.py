@@ -1449,6 +1449,15 @@ class TestSyncOrderInvariants:
         """
         assert self._pos("strengths") > self._pos("vault_reindex")
 
+    def test_vault_tag_follows_vault_reindex_and_is_not_an_embedding_source(self):
+        """vault_tag runs immediately after vault_reindex, has a script and a
+        timeout, and must not pause the local LLM like an embedding source."""
+        from scripts.run_all_syncs import EMBEDDING_SOURCES, SYNC_SCRIPTS, SYNC_TIMEOUTS
+        assert self._pos("vault_tag") == self._pos("vault_reindex") + 1
+        assert "vault_tag" not in EMBEDDING_SOURCES
+        assert SYNC_SCRIPTS["vault_tag"][0] == "scripts/sync_vault_tag.py"
+        assert SYNC_TIMEOUTS["vault_tag"] > 0
+
     def test_strengths_runs_before_crm_vectorstore(self):
         """People indexed for semantic search should carry fresh scores."""
         assert self._pos("strengths") < self._pos("crm_vectorstore")

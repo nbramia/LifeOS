@@ -260,6 +260,7 @@ Example:
 | Script | Purpose |
 |--------|---------|
 | `sync_vault_reindex.py` | Reindex vault to ChromaDB + BM25 |
+| `sync_vault_tag.py` | Tag changed vault notes (`--execute`, or `--dry-run` to count only; skipped when tagging is unconfigured) |
 | `sync_crm_to_vectorstore.py` | Index CRM people for search |
 
 #### Content Sync

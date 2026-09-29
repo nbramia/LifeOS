@@ -255,6 +255,13 @@ SYNC_SOURCES = {
         "phase": 4,
         "depends_on": ["strengths"],  # Run after all CRM processing
     },
+    "vault_tag": {
+        "description": "Tag changed vault notes (Jev, incremental, hash-keyed)",
+        "script": "scripts/sync_vault_tag.py",
+        "frequency": "daily",
+        "phase": 4,
+        "depends_on": ["vault_reindex"],
+    },
     "crm_vectorstore": {
         "description": "Index CRM people to vector store for semantic search",
         "script": "scripts/sync_crm_to_vectorstore.py",

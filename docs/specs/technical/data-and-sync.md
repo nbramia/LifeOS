@@ -309,7 +309,10 @@ Runs in this order (see [iMessage Sync Ordering](#imessage-sync-ordering) below)
 | Script | Purpose | Data Source |
 |--------|---------|-------------|
 | `sync_vault_reindex.py` | Reindex vault to ChromaDB + BM25 | Vault files |
+| `sync_vault_tag.py` | Tag changed vault notes into the tag store (`data/vault_tags.db`) | Vault files |
 | `sync_crm_to_vectorstore.py` | Index CRM people for semantic search | `data/crm.db` |
+
+**Vault tagging.** After the reindex, `sync_vault_tag.py` walks every vault `.md` file (excluding `.obsidian/`, `.trash/` and `Wiki/Vault Map/`), tags only notes whose content hash or taxonomy vocabulary version differs from the stored row (`VaultTagStore.needs_tagging`), and prunes rows for notes that no longer exist (`delete_missing`). It is not an embedding source: it uses no GPU and does not pause the local LLM, and it never runs in the file watcher. Up to 8 notes are tagged concurrently. A per-note failure is counted in `errors` and the run still exits 0. When `LIFEOS_JEV_VAULT_TAGGING` is `off` or no TypeSafe API key is configured, the source emits `SYNC_SKIPPED` with zero counts and changes nothing. It emits one `SYNC_STATS` line with `tagged`, `skipped_unchanged`, `skipped_not_allowlisted` (tagged from code facets only because the folder is not allowlisted), `code_only` (records built from code facets alone, including restricted notes), `restricted` (notes the on-box sensitivity rules class as restricted; never sent to Jev), `low_confidence` (topic confidence below 0.6), `errors` and `vocab_version`. `--dry-run` reports how many notes would be tagged and sends nothing.
 
 **Generated index pages.** After indexing, `sync_vault_reindex.py` writes `Wiki/Vault Map/<top-level-folder>.md` for every top-level vault folder (creating the folder if missing), plus `Wiki/Vault Map/index.md` listing each folder page with its note count and last-30-days change count; the hand-maintained `Wiki/index.md` is never modified and needs only one link to the map. Each page carries the wiki's frontmatter keys (`type: index`, `date:` the newest note date on the page, or across all folder pages for `index.md`) plus `generated: true` and the ownership marker `source: lifeos-index`, and opens with a `Part of [[Wiki/index|Wiki Index]] → Vault map.` wikilink under its heading. A folder page lists the folder's note count, its last-30-days change count, and up to 30 most-recent notes with the one-line summary stored in the BM25 index (`<path>::summary`) where one exists, otherwise the title alone. Output is deterministic (stable ordering, dates only) and a page is rewritten only when its bytes change; changed pages are indexed immediately so they are searchable the same night. Ownership is keyed on `source: lifeos-index`: pages whose folder no longer exists are deleted when they carry it, other files in the folder are never touched, and a handwritten file sharing a page name is left as is. Generated pages left in the legacy `LifeOS/Index/` folder are deleted the same way (and the folder is removed once empty); nothing is written if `Wiki/Vault Map` resolves outside the vault. Notes under `Wiki/Vault Map/` are excluded from the pages' counts and are never LLM-summarized (`summarizer.SKIP_PATH_PREFIXES`).
 
@@ -531,18 +534,19 @@ The unified sync runner (`run_all_syncs.py`) executes `SYNC_ORDER` in this order
 
 **Phase 4: Vector Store Indexing**
 18. `vault_reindex` - Reindex vault to ChromaDB + BM25
-19. `crm_vectorstore` - Index CRM people for semantic search
+19. `vault_tag` - Tag changed vault notes (incremental, hash-keyed; skipped when unconfigured)
+20. `crm_vectorstore` - Index CRM people for semantic search
 
 **Phase 5: Content Sync**
-20. `google_docs` - Sync Google Docs to vault
-21. `google_sheets` - Sync Google Sheets to vault
-22. `monarch_money` - Monarch Money financial data (monthly, runs on 1st)
+21. `google_docs` - Sync Google Docs to vault
+22. `google_sheets` - Sync Google Sheets to vault
+23. `monarch_money` - Monarch Money financial data (monthly, runs on 1st)
 
 **Phase 6: Post-Sync Cleanup**
-23. `entity_cleanup` - Auto-hide obvious non-human entities
+24. `entity_cleanup` - Auto-hide obvious non-human entities
 
 **Phase 7: Consistency Verification**
-24. `consistency_verify` - Cross-store consistency check (orphans, stale merged IDs, cached counts, vault files that moved or vanished) and auto-fix
+25. `consistency_verify` - Cross-store consistency check (orphans, stale merged IDs, cached counts, vault files that moved or vanished) and auto-fix
 
 **Automated via systemd (Linux) / launchd (macOS):**
 - Service: `lifeos-sync` (systemd) or `com.lifeos.crm-sync` (launchd)
