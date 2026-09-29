@@ -776,6 +776,9 @@ class LifeOSMCPServer:
                 }
                 if "items" in param_schema:
                     properties[name]["items"] = param_schema["items"]
+                for constraint in ("minimum", "maximum", "default"):
+                    if constraint in param_schema:
+                        properties[name][constraint] = param_schema[constraint]
                 if param.get("required"):
                     required.append(name)
 
@@ -877,8 +880,8 @@ class LifeOSMCPServer:
                 "properties": {
                     "path": {"type": "string", "description": "Vault-relative folder; omit or '' for the vault root.", "default": ""},
                     "glob": {"type": "string", "description": "Glob relative to path (default '**/*.md')."},
-                    "limit": {"type": "integer", "description": "Entries per page, 1-200 (default 50).", "default": 50},
-                    "offset": {"type": "integer", "description": "Entries to skip for the next page (default 0).", "default": 0}
+                    "limit": {"type": "integer", "description": "Entries per page, 1-200 (default 50).", "minimum": 1, "maximum": 200, "default": 50},
+                    "offset": {"type": "integer", "description": "Entries to skip for the next page (default 0).", "minimum": 0, "default": 0}
                 },
                 "required": []
             },

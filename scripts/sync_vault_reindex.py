@@ -99,7 +99,7 @@ def sync_vault_reindex(dry_run: bool = True, force: bool = False, skip_summaries
             indexer.delete_file(page)
         logger.info(
             f"  Index pages: {index_pages['written']} written, {index_pages['unchanged']} unchanged, "
-            f"{len(index_pages['removed'])} removed"
+            f"{len(index_pages['removed'])} removed, {index_pages['skipped_collision']} skipped (name collision)"
         )
         index_pages = {k: v for k, v in index_pages.items() if k not in ("changed", "removed")}
     except Exception as e:

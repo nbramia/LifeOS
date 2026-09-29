@@ -733,10 +733,15 @@ TOOL_DEFINITIONS = [
                 "limit": {
                     "type": "integer",
                     "description": "Entries per page, 1-200 (default 50).",
+                    "minimum": 1,
+                    "maximum": 200,
+                    "default": 50,
                 },
                 "offset": {
                     "type": "integer",
                     "description": "Entries to skip for the next page (default 0).",
+                    "minimum": 0,
+                    "default": 0,
                 },
             },
             "required": [],

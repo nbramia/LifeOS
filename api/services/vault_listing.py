@@ -46,13 +46,16 @@ def resolve_vault_dir(vault_root: Path, rel_path: str) -> tuple[Path, Path]:
     rel = (rel_path or "").strip()
     if rel.startswith(("/", "~")) or Path(rel).is_absolute():
         raise VaultListError("path must be vault-relative")
-    root = vault_root.resolve()
-    target = (root / rel).resolve()
     try:
+        root = vault_root.resolve()
+        target = (root / rel).resolve()
         target.relative_to(root)
+        is_dir = target.is_dir()
     except ValueError:
         raise VaultListError("path resolves outside the vault")
-    if not target.is_dir():
+    except OSError:
+        raise VaultListError("cannot read folder")
+    if not is_dir:
         raise VaultListError(f"folder '{rel or '.'}' not found in vault")
     return root, target
 

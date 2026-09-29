@@ -221,3 +221,41 @@ def test_nightly_script_generates_and_indexes_changed_pages(vault, monkeypatch):
     (vault / "Personal").rename(vault / "Renamed")
     sync_vault_reindex.sync_vault_reindex(dry_run=False)
     assert [Path(p).name for p in calls["delete_file"]] == ["Personal.md"]
+
+
+def test_handwritten_file_with_page_name_survives_byte_for_byte(vault):
+    index_dir = vault / INDEX_FOLDER
+    index_dir.mkdir(parents=True)
+    mine = b"---\nsource: handwritten\n---\nMy own Work page\n"
+    (index_dir / "Work.md").write_bytes(mine)
+    stats = write_index_pages(vault, today=TODAY, summary_lookup=_no_summaries)
+    assert (index_dir / "Work.md").read_bytes() == mine
+    assert stats["skipped_collision"] == 1
+    assert str(index_dir / "Work.md") not in stats["changed"]
+    assert (index_dir / "Personal.md").exists()
+
+
+def test_generated_page_is_indexed_without_any_summary_call(vault, tmp_path, monkeypatch):
+    from unittest.mock import MagicMock
+
+    from api.services.bm25_index import BM25Index
+    from api.services.indexer import IndexerService
+
+    monkeypatch.setattr(settings, "vault_path", vault)
+    write_index_pages(vault, today=TODAY, summary_lookup=_no_summaries)
+    page = vault / INDEX_FOLDER / "Work.md"
+
+    indexer = IndexerService.__new__(IndexerService)
+    indexer.vault_path = vault
+    indexer._interaction_store = indexer._source_entity_store = indexer._entity_resolver = None
+    indexer.vector_store = MagicMock()
+    indexer.bm25_index = BM25Index(db_path=str(tmp_path / "bm25.db"))
+    indexer._sync_people_to_v2 = MagicMock(return_value=set())
+
+    summary = MagicMock(return_value=("never", True))
+    monkeypatch.setattr("api.services.summarizer.generate_summary", summary)
+    indexer.index_file(str(page), skip_summaries=False)
+
+    indexer.vector_store.update_document.assert_called_once()
+    assert summary.call_count == 0
+    assert indexer.bm25_index.get_summaries([str(page.resolve())]) == {}

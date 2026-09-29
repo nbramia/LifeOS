@@ -201,8 +201,8 @@ class VaultListResponse(BaseModel):
 async def vault_list(
     path: str = Query("", description="Vault-relative folder; empty for the vault root."),
     glob: str | None = Query(None, description="Glob relative to `path` (default `**/*.md`)."),
-    limit: int = Query(50, ge=1, le=200),
-    offset: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200, description="Entries per page, 1-200 (default 50)."),
+    offset: int = Query(0, ge=0, description="Entries to skip for the next page (default 0)."),
 ) -> VaultListResponse:
     try:
         return VaultListResponse(**list_vault_entries(settings.vault_path, path, glob, limit, offset))

@@ -95,9 +95,10 @@ def write_index_pages(
     Notes inside the index folder are not counted or listed. Summaries come
     from the keyword index; if it is unavailable pages fall back to titles
     only. Pages whose folder no longer exists are removed when they carry the
-    generated-page frontmatter. If the index folder resolves outside the vault
-    nothing is written. Returns `{written, unchanged, folders, changed,
-    removed}`, where `changed` and `removed` are absolute file paths.
+    generated-page frontmatter. A file whose name collides with a page but which
+    lacks that frontmatter is left untouched and counted in `skipped_collision`. If the index folder resolves outside the vault
+    nothing is written. Returns `{written, unchanged, skipped_collision,
+    folders, changed, removed}`, where `changed` and `removed` are absolute file paths.
     """
     root = vault_root.resolve()
     today = today or date.today()
@@ -107,11 +108,11 @@ def write_index_pages(
         index_dir.relative_to(root)
     except ValueError:
         logger.warning("Index folder resolves outside the vault; skipping index pages")
-        return {"written": 0, "unchanged": 0, "folders": 0, "changed": [], "removed": []}
+        return {"written": 0, "unchanged": 0, "skipped_collision": 0, "folders": 0, "changed": [], "removed": []}
     index_dir.mkdir(parents=True, exist_ok=True)
     index_prefix = INDEX_FOLDER + "/"
 
-    written = unchanged = 0
+    written = unchanged = skipped_collision = 0
     changed: list[str] = []
     folders = sorted(
         d for d in root.iterdir()
@@ -147,9 +148,16 @@ def write_index_pages(
         content = render_index_page(folder.name, entries, summaries, today=today)
         target = index_dir / f"{folder.name}.md"
         data = content.encode("utf-8")
-        if target.exists() and target.read_bytes() == data:
-            unchanged += 1
-            continue
+        if target.exists():
+            existing = target.read_bytes()
+            if existing == data:
+                unchanged += 1
+                continue
+            meta, _ = extract_frontmatter(existing.decode("utf-8", errors="replace"))
+            if meta.get("source") != "lifeos-index":
+                logger.warning("Index page %s collides with a non-generated file; skipping", target.name)
+                skipped_collision += 1
+                continue
         tmp = target.with_name(f".{target.name}.tmp")
         tmp.write_bytes(data)
         os.replace(tmp, target)
@@ -159,6 +167,7 @@ def write_index_pages(
     return {
         "written": written,
         "unchanged": unchanged,
+        "skipped_collision": skipped_collision,
         "folders": len(folders),
         "changed": changed,
         "removed": removed,

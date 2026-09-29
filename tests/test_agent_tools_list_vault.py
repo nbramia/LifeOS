@@ -187,3 +187,44 @@ def test_unreadable_folder_is_error_not_exception(vault):
             list_vault_entries(vault, "Locked")
     finally:
         locked.chmod(0o755)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_child_of_unreadable_folder_is_error_not_exception(vault):
+    locked = vault / "Locked"
+    (locked / "Child").mkdir(parents=True)
+    locked.chmod(0)
+    try:
+        assert _call(path="Locked/Child").startswith("Error:")
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        from api.routes.vault import router
+
+        app = FastAPI()
+        app.include_router(router)
+        assert TestClient(app).get("/api/vault/list", params={"path": "Locked/Child"}).status_code == 400
+    finally:
+        locked.chmod(0o755)
+
+
+def test_numeric_constraints_agree_across_tool_mcp_and_openapi(vault):
+    import mcp_server
+    from fastapi import FastAPI
+
+    from api.routes.vault import router
+
+    tool = next(t for t in agent_tools.TOOL_DEFINITIONS if t["name"] == "list_vault")["input_schema"]["properties"]
+    server = mcp_server.LifeOSMCPServer.__new__(mcp_server.LifeOSMCPServer)
+    mcp = server._get_fallback_schema("lifeos_vault_list")["properties"]
+    app = FastAPI()
+    app.include_router(router)
+    spec = app.openapi()
+    op = spec["paths"]["/api/vault/list"]["get"]
+    live = server._build_input_schema(op, spec.get("components", {}).get("schemas", {}), "get", "/api/vault/list")["properties"]
+    for name, lo, hi, default in (("limit", 1, 200, 50), ("offset", 0, None, 0)):
+        for schema in (tool[name], mcp[name], live[name]):
+            assert schema.get("minimum") == lo
+            assert schema.get("maximum") == hi
+            assert schema.get("default") == default
+            assert schema["description"] and not schema["description"].startswith("Query parameter")
