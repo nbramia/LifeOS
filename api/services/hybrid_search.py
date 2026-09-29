@@ -548,6 +548,10 @@ class HybridSearch:
                     # Unknown result, create minimal
                     result = {"id": doc_id, "content": "", "metadata": {}}
 
+                match_mode = bm25_results_by_id.get(doc_id, {}).get("match_mode")
+                if match_mode:
+                    result["match_mode"] = match_mode
+
                 # Drop results outside the requested date window.
                 if not in_date_range(result, date_from, date_to):
                     continue

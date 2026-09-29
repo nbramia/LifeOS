@@ -387,6 +387,31 @@ class TestHybridSearch:
         )
         assert [r.get("id") for r in results] == ["undated"]
 
+    def test_or_fallback_candidates_are_fused_and_keep_match_mode(self, temp_db):
+        """BM25 any-term candidates enter fusion and surface match_mode."""
+        from api.services.hybrid_search import HybridSearch
+        from api.services.bm25_index import BM25Index
+        from unittest.mock import MagicMock
+
+        bm25 = BM25Index(db_path=temp_db)
+        bm25.add_document("only_bm25", "hiring plans", "Hiring.md")
+        bm25.add_document("shared", "roadmap owner", "Roadmap.md")
+        mock_vector_store = MagicMock()
+        mock_vector_store.search.return_value = [
+            {"id": "shared", "content": "roadmap owner", "metadata": {}},
+            {"id": "vec_only", "content": "unrelated", "metadata": {}},
+        ]
+
+        hybrid = HybridSearch(vector_store=mock_vector_store, bm25_index=bm25)
+        # "hiring" and "roadmap" never co-occur, so BM25 answers in OR mode.
+        results = hybrid.search("hiring roadmap", top_k=5)
+
+        by_id = {r["id"]: r for r in results}
+        assert by_id["only_bm25"]["match_mode"] == "or"
+        assert by_id["shared"]["match_mode"] == "or"
+        assert "match_mode" not in by_id["vec_only"]
+        assert by_id["only_bm25"]["rrf_score"] > 0
+
     def test_bm25_exception_records_degradation(self):
         """A raising BM25 index degrades to vector-only and records it."""
         from api.services.hybrid_search import HybridSearch

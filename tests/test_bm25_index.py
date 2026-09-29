@@ -213,3 +213,48 @@ class TestStrictThenLenient:
 
     def test_no_matching_terms_returns_empty(self, seeded):
         assert seeded.search("zzzunknown qqqmissing") == []
+
+
+class TestUnicodeQueries:
+    def test_decomposed_query_matches_composed_content(self, bm25):
+        import unicodedata
+        composed = "résumé"
+        bm25.add_document("d1", f"updated {composed} draft", "Doc.md")
+        decomposed = unicodedata.normalize("NFD", composed)
+        assert decomposed != composed
+        results = bm25.search(decomposed)
+        assert [r["doc_id"] for r in results] == ["d1"]
+        assert results[0]["match_mode"] == "and"
+
+    def test_composed_query_matches_decomposed_content(self, bm25):
+        import unicodedata
+        composed = "résumé"
+        bm25.add_document("d1", unicodedata.normalize("NFD", composed), "Doc.md")
+        assert [r["doc_id"] for r in bm25.search(composed)] == ["d1"]
+
+    def test_combining_marks_survive_term_extraction(self, bm25):
+        # Devanagari vowel signs are combining marks with no precomposed form.
+        term = "किताब"
+        assert bm25._sanitize_query(term) == f'"{term}"'
+
+
+class TestLiteralOperatorWords:
+    @pytest.fixture
+    def operator_index(self, bm25):
+        bm25.bulk_add([
+            {"doc_id": "all3", "content": "alpha or beta comparison", "file_name": "A.md"},
+            {"doc_id": "without", "content": "alpha and beta comparison", "file_name": "B.md"},
+            {"doc_id": "choice", "content": "choose one or the other", "file_name": "C.md"},
+        ])
+        return bm25
+
+    def test_uppercase_or_is_a_required_term_in_strict_mode(self, operator_index):
+        results = operator_index.search("alpha OR beta")
+        assert [r["doc_id"] for r in results] == ["all3"]
+        assert results[0]["match_mode"] == "and"
+
+    def test_or_alone_is_a_plain_term(self, operator_index, caplog):
+        with caplog.at_level("WARNING"):
+            results = operator_index.search("OR")
+        assert "BM25 search error" not in caplog.text
+        assert {r["doc_id"] for r in results} == {"all3", "choice"}

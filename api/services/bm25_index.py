@@ -18,6 +18,7 @@ Finds exact matches for names, IDs, and codes that vector search may miss.
 """
 import sqlite3
 import logging
+import unicodedata
 from pathlib import Path
 from typing import Optional
 
@@ -190,11 +191,26 @@ class BM25Index:
         'for', 'of', 'with', 'by',
     })
 
+    @staticmethod
+    def _extract_terms(query: str) -> list[str]:
+        """Split text into runs of letters, digits and combining marks (NFC-normalized)."""
+        terms: list[str] = []
+        current: list[str] = []
+        for ch in unicodedata.normalize("NFC", query) + " ":
+            if ch.isalnum() or unicodedata.category(ch).startswith("M"):
+                current.append(ch)
+                continue
+            if any(c.isalnum() for c in current):
+                terms.append("".join(current))
+            current = []
+        return terms
+
     def _sanitize_query(self, query: str, use_or: bool = False) -> str:
         """
         Turn arbitrary text into a valid FTS5 MATCH expression.
 
-        Every run of letters/digits becomes a double-quoted term, so no
+        Every run of letters, digits and combining marks (after NFC
+        normalization) becomes a double-quoted term, so no
         character in the input (punctuation, symbols, emoji, a leading ``-``
         or ``^``, ``col:`` filters) and no uppercase ``AND``/``OR``/``NOT``/
         ``NEAR`` word can act as FTS5 syntax. Quoted terms still pass through
@@ -208,8 +224,7 @@ class BM25Index:
         Returns:
             FTS5 expression, or an empty string when the query has no terms.
         """
-        import re
-        terms = re.findall(r"[^\W_]+", query)
+        terms = self._extract_terms(query)
         if use_or:
             informative = [t for t in terms if t.lower() not in self._STOP_WORDS]
             terms = informative or terms
