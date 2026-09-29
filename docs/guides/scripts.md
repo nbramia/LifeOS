@@ -283,10 +283,10 @@ Example:
 
 | Script | Purpose |
 |--------|---------|
-| `mine_pairs.py` | Reads `data/conversations.db` (`--db` to override) and writes `{query, relevant_files, source}` pairs for turns whose routing lists `search_vault` and whose persisted `sources` record a `read_vault_file` call with a recoverable path. `--manual FILE` appends operator-written pairs from YAML or JSONL (`--manual-only` skips mining). Prints counts only. |
-| `score.py` | `--arm hybrid\|bm25\|vector --k 10` prints recall@k, recall@40 and MRR over the pairs; `--verbose` lists the missed queries. `hybrid` calls `/api/search` on `LIFEOS_SERVER_URL`; `bm25` runs `BM25Index.search` on `--bm25-db` (point it at a copy, the index creates tables on open); `vector` runs `VectorStore.search` in-process and loads the embedding model, so set `HIP_VISIBLE_DEVICES=""`. |
+| `mine_pairs.py` | Reads `data/conversations.db` (`--db` to override) and writes `{query, relevant_files, source}` pairs: `mined` for turns whose routing lists `search_vault` and whose persisted `sources` record a `read_vault_file` call, `cited` for vault files the answer cited. `--manual FILE` appends operator-written pairs from YAML or JSONL (`--manual-only` skips mining). Prints per-signal counts only. |
+| `score.py` | `--arm hybrid\|bm25\|vector --k 10` prints recall@k, recall@40 and MRR over the pairs; `--exclude-source mined\|cited\|manual` (repeatable) drops a signal; `--verbose` lists the missed queries. `hybrid` calls `/api/search` on `LIFEOS_SERVER_URL`; `bm25` runs `BM25Index.search` on `--bm25-db` (point it at a copy, the index creates tables on open); `vector` runs `VectorStore.search` in-process and loads the embedding model, so set `HIP_VISIBLE_DEVICES=""`. |
 
-The display `sources` column stores each call as `tool(json-args)` cut to 80 characters, so a `read_vault_file` path longer than that is unrecoverable and its turn is skipped.
+The display `sources` column stores each call as `tool(json-args)` cut to 80 characters; the miner resolves a cut-off path or file name by unique prefix match against the `.md` files under `--vault` (default `settings.vault_path`) and skips zero or ambiguous matches. Cited pairs are biased toward whatever the live retriever returned, so exclude them when comparing retrieval arms.
 
 ---
 

@@ -85,33 +85,127 @@ def _user(mid, conv, ts, text):
     return (mid, conv, "user", text, None, None, ts)
 
 
-def test_miner_extracts_read_files_from_synthetic_db(tmp_path):
+def _make_vault(tmp_path: Path) -> Path:
+    vault = tmp_path / "vault"
+    for rel in [
+        "notes/alpha-project-plan.md",
+        "notes/beta-meeting-one.md",
+        "notes/beta-meeting-two.md",
+        ".obsidian/beta-meeting-hidden.md",
+        ".trash/alpha-project-old.md",
+        "notes/readme.txt",
+    ]:
+        f = vault / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("x")
+    return vault
+
+
+def _read_call(prefix: str, closed: bool = False):
+    body = '{"path": "' + prefix + ('"}' if closed else "")
+    return {"file_name": f"read_vault_file({body}", "source_type": "vault"}
+
+
+def test_resolver_unique_ambiguous_nomatch_relative(tmp_path):
+    vault = _make_vault(tmp_path)
+    r = mine_pairs.VaultResolver(vault)
+    # unique absolute prefix; the .trash/ copy of the same stem is excluded
+    assert r.resolve(f"{vault}/notes/alpha-pro") == ("match", f"{vault}/notes/alpha-project-plan.md")
+    # two files share the prefix; the .obsidian/ copy does not count as a third
+    assert r.resolve(f"{vault}/notes/beta-meeting") == ("ambiguous", None)
+    assert r.resolve(f"{vault}/notes/gamma") == ("nomatch", None)
+    # relative prefix resolves under the vault
+    assert r.resolve("notes/beta-meeting-tw") == ("match", f"{vault}/notes/beta-meeting-two.md")
+    # hidden and trashed files are not candidates
+    assert r.resolve(f"{vault}/.obsidian/beta") == ("nomatch", None)
+    assert r.resolve(f"{vault}/.trash/alpha") == ("nomatch", None)
+    # a match must start at the beginning of the path, not appear inside it
+    assert r.resolve("/notes/alpha-pro") == ("nomatch", None)
+    # a bare truncated file name matches on basename
+    assert r.resolve("alpha-project") == ("match", f"{vault}/notes/alpha-project-plan.md")
+    assert r.resolve("beta-meeting") == ("ambiguous", None)
+    # non-.md files are not candidates
+    assert r.resolve(f"{vault}/notes/readme") == ("nomatch", None)
+
+
+def test_files_read_resolves_truncated_and_counts_skips(tmp_path):
+    vault = _make_vault(tmp_path)
+    stats = mine_pairs.new_stats()
+    sources = [
+        _read_call(f"{vault}/notes/alpha-pro"),
+        _read_call(f"{vault}/notes/beta-meeting"),
+        _read_call(f"{vault}/notes/gamma"),
+        _read_call("notes/other.md", closed=True),
+    ]
+    out = mine_pairs.files_read(sources, mine_pairs.VaultResolver(vault), stats)
+    assert out == [f"{vault}/notes/alpha-project-plan.md", "notes/other.md"]
+    assert stats == {"skipped_truncated_ambiguous": 1, "skipped_truncated_nomatch": 1}
+
+
+def test_files_read_accepts_filename_key_and_appends_extension(tmp_path):
+    vault = _make_vault(tmp_path)
+    sources = [
+        {"file_name": 'read_vault_file({"filename": "Some Note"})', "source_type": "vault"},
+        {"file_name": 'read_vault_file({"filename": "Other Note.md"})', "source_type": "vault"},
+        {"file_name": 'read_vault_file({"filename": "alpha-project', "source_type": "vault"},
+    ]
+    out = mine_pairs.files_read(sources, mine_pairs.VaultResolver(vault), mine_pairs.new_stats())
+    assert out == ["Some Note.md", "Other Note.md", f"{vault}/notes/alpha-project-plan.md"]
+
+
+def test_miner_mined_and_cited_signals(tmp_path):
+    vault = _make_vault(tmp_path)
     db = tmp_path / "conversations.db"
-    read_alpha = {"file_name": 'read_vault_file({"path": "notes/alpha.md"})', "source_type": "vault"}
-    read_truncated = {"file_name": 'read_vault_file({"path": "notes/a-very-long-dire', "source_type": "vault"}
     search_call = {"file_name": 'search_vault({"query": "synthetic"})', "source_type": "vault"}
-    file_path_entry = {"file_name": "beta.md", "file_path": "/vault/notes/beta.md", "source_type": "vault"}
+    cited = {"file_name": "beta.md", "file_path": "/vault/notes/beta.md", "source_type": "vault"}
+    cited_obsidian = {"file_name": "c.md", "obsidian_path": "notes/c.md", "source_type": "vault"}
     _build_db(db, [
         _user("u1", "c1", "2026-01-01 00:00:01", "find alpha"),
-        _assistant("a1", "c1", "2026-01-01 00:00:02", ["search_vault", "read_vault_file"], [search_call, read_alpha]),
-        # search without a read: no pair
+        _assistant("a1", "c1", "2026-01-01 00:00:02", ["search_vault", "read_vault_file"],
+                   [search_call, _read_call(f"{vault}/notes/alpha-pro")]),
+        # search without a read or citation: no pair
         _user("u2", "c1", "2026-01-01 00:00:03", "find nothing"),
         _assistant("a2", "c1", "2026-01-01 00:00:04", ["search_vault"], [search_call]),
-        # read but no search_vault in routing: no pair
+        # read but no search_vault in routing: no mined pair
         _user("u3", "c1", "2026-01-01 00:00:05", "read without search"),
-        _assistant("a3", "c1", "2026-01-01 00:00:06", ["read_vault_file"], [read_alpha]),
-        # truncated path is unrecoverable: no pair
+        _assistant("a3", "c1", "2026-01-01 00:00:06", ["read_vault_file"], [_read_call("notes/a.md", closed=True)]),
+        # ambiguous truncated path: counted, no pair
         _user("u4", "c2", "2026-01-01 00:00:07", "truncated"),
-        _assistant("a4", "c2", "2026-01-01 00:00:08", ["search_vault", "read_vault_file"], [read_truncated]),
-        # explicit file_path entry is used
+        _assistant("a4", "c2", "2026-01-01 00:00:08", ["search_vault", "read_vault_file"],
+                   [_read_call(f"{vault}/notes/beta-meeting")]),
+        # cited files form a separate signal
         _user("u5", "c2", "2026-01-01 00:00:09", "find beta"),
-        _assistant("a5", "c2", "2026-01-01 00:00:10", ["search_vault"], [file_path_entry]),
+        _assistant("a5", "c2", "2026-01-01 00:00:10", ["search_vault"], [cited, cited_obsidian]),
     ])
-    pairs = mine_pairs.mine(db)
+    stats = mine_pairs.new_stats()
+    pairs = mine_pairs.mine(db, mine_pairs.VaultResolver(vault), stats)
     assert pairs == [
-        {"query": "find alpha", "relevant_files": ["notes/alpha.md"], "source": "mined"},
-        {"query": "find beta", "relevant_files": ["/vault/notes/beta.md"], "source": "mined"},
+        {"query": "find alpha", "relevant_files": [f"{vault}/notes/alpha-project-plan.md"], "source": "mined"},
+        {"query": "find beta", "relevant_files": ["/vault/notes/beta.md", "notes/c.md"], "source": "cited"},
     ]
+    assert stats == {"skipped_truncated_ambiguous": 1, "skipped_truncated_nomatch": 0}
+
+
+def test_main_prints_per_signal_counts_only(tmp_path, capsys):
+    vault = _make_vault(tmp_path)
+    db = tmp_path / "c.db"
+    _build_db(db, [
+        _user("u1", "c1", "2026-01-01 00:00:01", "secret synthetic query"),
+        _assistant("a1", "c1", "2026-01-01 00:00:02", ["search_vault"],
+                   [{"file_name": "b.md", "file_path": "/v/b.md", "source_type": "vault"}]),
+    ])
+    out = tmp_path / "pairs.jsonl"
+    assert mine_pairs.main(["--db", str(db), "--out", str(out), "--vault", str(vault)]) == 0
+    printed = capsys.readouterr().out.strip()
+    assert printed == ("mined=0 cited=1 manual=0 skipped_truncated_ambiguous=0 "
+                       "skipped_truncated_nomatch=0 kept=0")
+
+
+def test_filter_pairs_excludes_sources():
+    pairs = [{"source": "mined"}, {"source": "cited"}, {"source": "manual"}, {"source": "cited"}]
+    assert _match.filter_pairs(pairs, ["cited"]) == [{"source": "mined"}, {"source": "manual"}]
+    assert _match.filter_pairs(pairs, ["cited", "mined"]) == [{"source": "manual"}]
+    assert _match.filter_pairs(pairs) == pairs
 
 
 def test_manual_pairs_appended_and_no_output_of_content(tmp_path, capsys):

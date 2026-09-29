@@ -55,3 +55,9 @@ def score_queries(rankings: list[tuple[list[str], list[str]]], k: int = 10, k_wi
         f"recall@{k_wide}": sum(recall_at_k(r, rel, k_wide) for r, rel in rankings) / n,
         "mrr": sum(reciprocal_rank(r, rel) for r, rel in rankings) / n,
     }
+
+
+def filter_pairs(pairs: list[dict], exclude_sources: list[str] | None = None) -> list[dict]:
+    """Drop pairs whose `source` is in `exclude_sources`."""
+    excluded = set(exclude_sources or [])
+    return [p for p in pairs if p.get("source") not in excluded]

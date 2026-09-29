@@ -3,7 +3,8 @@
 
 Usage:
     python scripts/retrieval_eval/score.py --arm hybrid|bm25|vector [--k 10]
-        [--pairs data/retrieval_eval/pairs.jsonl] [--bm25-db PATH] [--verbose]
+        [--pairs data/retrieval_eval/pairs.jsonl] [--bm25-db PATH]
+        [--exclude-source mined|cited|manual ...] [--verbose]
 
 Arms:
   hybrid  POST /api/search on LIFEOS_SERVER_URL (default http://localhost:8000).
@@ -66,13 +67,16 @@ def main(argv=None) -> int:
     ap.add_argument("--k", type=int, default=10)
     ap.add_argument("--pairs", default=str(REPO / "data/retrieval_eval/pairs.jsonl"))
     ap.add_argument("--bm25-db", default=str(REPO / "data/bm25_index.db"))
+    ap.add_argument("--exclude-source", action="append", default=[],
+                    choices=["mined", "cited", "manual"],
+                    help="drop pairs with this source (repeatable), e.g. cited to avoid retriever bias")
     ap.add_argument("--verbose", "--show-queries", action="store_true",
                     help="list queries (and their relevant files) that miss at top-k")
     args = ap.parse_args(argv)
 
-    from _match import recall_at_k, score_queries
+    from _match import filter_pairs, recall_at_k, score_queries
 
-    pairs = load_pairs(Path(args.pairs))
+    pairs = filter_pairs(load_pairs(Path(args.pairs)), args.exclude_source)
     search = make_searcher(args.arm, args.bm25_db)
     rankings = [(search(p["query"], WIDE_K), p["relevant_files"]) for p in pairs]
     res = score_queries(rankings, k=args.k, k_wide=WIDE_K)
