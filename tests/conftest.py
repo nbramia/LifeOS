@@ -710,6 +710,13 @@ def _isolate_vault_indexer_stores(tmp_path, monkeypatch):
         indexer_mod, "BM25Index", lambda *a, **k: BM25Index(db_path=bm25_db)
     )
 
+    from api.services import vault_tag_store as tag_store_mod
+
+    tags_db = str(tmp_path / "vault_tags.db")
+    monkeypatch.setattr(
+        tag_store_mod, "get_vault_tags_db_path", lambda: tags_db
+    )
+
     collection = "test_vault_" + re.sub(r"[^A-Za-z0-9]", "_", tmp_path.name)[:400]
     created: list = []
 

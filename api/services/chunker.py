@@ -316,12 +316,55 @@ def _infer_topic(file_name: str, content: str) -> str:
     return topic if topic else "general notes"
 
 
+TAG_PHRASE_MIN_CONF = 0.6
+
+
+def _readable_tag(value: str) -> str:
+    """Tag value as plain words: ``meeting_notes`` -> ``meeting notes``, ``work/hiring`` -> ``work hiring``."""
+    return re.sub(r"[_/\s]+", " ", value).strip()
+
+
+def tag_phrase_key(tags) -> tuple | None:
+    """The ``(doc_type, domain, topic, project)`` tuple that shapes the tag phrase.
+
+    ``None`` when ``tags`` is absent or its document type is below the
+    confidence floor (no phrase is produced). The project is ``None`` unless
+    its confidence clears the floor and it is not ``none``.
+    """
+    if tags is None or not tags.doc_type or (tags.doc_type_conf or 0.0) < TAG_PHRASE_MIN_CONF:
+        return None
+    project = tags.project
+    if not project or project == "none" or (tags.project_conf or 0.0) < TAG_PHRASE_MIN_CONF:
+        project = None
+    return (tags.doc_type, tags.domain or None, tags.topic or None, project)
+
+
+def build_tag_phrase(tags) -> str:
+    """``"<doc_type> in the <domain> domain about <topic> for project <project>"``, or ``""``.
+
+    Parts without a value are left out. Never contains people names.
+    """
+    key = tag_phrase_key(tags)
+    if key is None:
+        return ""
+    doc_type, domain, topic, project = key
+    phrase = _readable_tag(doc_type)
+    if domain:
+        phrase += f" in the {_readable_tag(domain)} domain"
+    if topic:
+        phrase += f" about {_readable_tag(topic)}"
+    if project:
+        phrase += f" for project {_readable_tag(project)}"
+    return phrase
+
+
 def generate_chunk_context(
     file_path: Path,
     metadata: dict,
     chunk_content: str,
     chunk_index: int,
-    total_chunks: int
+    total_chunks: int,
+    tags=None,
 ) -> str:
     """
     Generate contextual prefix for a chunk.
@@ -336,6 +379,9 @@ def generate_chunk_context(
         chunk_content: The actual chunk content
         chunk_index: Position of this chunk (0-indexed)
         total_chunks: Total number of chunks in document
+        tags: Optional TagRecord; when its document type is confident, a
+            tag phrase is added so keyword and vector search can reach the
+            chunk by what the note is about
 
     Returns:
         Context string to prepend to chunk
@@ -391,6 +437,10 @@ def generate_chunk_context(
         topic = _infer_topic(file_name, chunk_content)
         context = f"This chunk is from {file_name} in {folder}/, containing notes about {topic}."
 
+    tag_phrase = build_tag_phrase(tags)
+    if tag_phrase:
+        context += f" Classified as {tag_phrase}."
+
     # Add chunk position for multi-chunk docs
     if total_chunks > 1:
         context += f" (Part {chunk_index + 1} of {total_chunks})"
@@ -401,7 +451,8 @@ def generate_chunk_context(
 def add_context_to_chunks(
     chunks: list[dict],
     file_path: Path,
-    metadata: dict
+    metadata: dict,
+    tags=None,
 ) -> list[dict]:
     """
     Add contextual prefix to each chunk.
@@ -413,6 +464,7 @@ def add_context_to_chunks(
         chunks: List of chunk dicts from chunk_document()
         file_path: Path to source file
         metadata: Document metadata
+        tags: Optional TagRecord for the file (see generate_chunk_context)
 
     Returns:
         Chunks with context prepended to content
@@ -425,7 +477,8 @@ def add_context_to_chunks(
             metadata=metadata,
             chunk_content=chunk["content"],
             chunk_index=i,
-            total_chunks=total_chunks
+            total_chunks=total_chunks,
+            tags=tags,
         )
         # Prepend context with blank line separator
         chunk["content"] = f"{context}\n\n{chunk['content']}"

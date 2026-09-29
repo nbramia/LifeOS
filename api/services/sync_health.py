@@ -260,7 +260,7 @@ SYNC_SOURCES = {
         "script": "scripts/sync_vault_tag.py",
         "frequency": "daily",
         "phase": 4,
-        "depends_on": ["vault_reindex"],
+        "depends_on": [],  # Reads markdown directly; runs before vault_reindex so the reindex sees fresh tags
     },
     "crm_vectorstore": {
         "description": "Index CRM people to vector store for semantic search",

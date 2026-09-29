@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler, FileSystemEvent
 
-from api.services.chunker import chunk_document, extract_frontmatter, add_context_to_chunks, normalize_tags
+from api.services.chunker import chunk_document, extract_frontmatter, add_context_to_chunks, normalize_tags, tag_phrase_key
 from api.services.vectorstore import VectorStore
 from api.services.bm25_index import BM25Index
 from api.services.people import extract_people_from_text
@@ -155,6 +155,10 @@ class VaultEventHandler(FileSystemEventHandler):
                 self._queue(event.dest_path, "index")
 
 
+# Reserved key in the index state: file path -> tag tuple used at index time.
+TAG_STATE_KEY = "__tag_phrase_keys__"
+
+
 class IndexerService:
     """
     Main indexer service.
@@ -173,6 +177,7 @@ class IndexerService:
         interaction_store=None,
         source_entity_store=None,
         entity_resolver=None,
+        tag_store=None,
     ):
         """
         Initialize indexer.
@@ -183,6 +188,8 @@ class IndexerService:
             interaction_store: Optional InteractionStore (uses singleton if None)
             source_entity_store: Optional SourceEntityStore (uses singleton if None)
             entity_resolver: Optional EntityResolver (uses singleton if None)
+            tag_store: Optional VaultTagStore whose tags feed chunk context
+                (opened lazily from the default location if None)
         """
         self.vault_path = Path(vault_path)
         self.db_path = Path(db_path)
@@ -191,6 +198,8 @@ class IndexerService:
         self._interaction_store = interaction_store
         self._source_entity_store = source_entity_store
         self._entity_resolver = entity_resolver
+        self._tag_store = tag_store
+        self._tag_store_failed = False
 
         # Initialize vector store
         self.vector_store = VectorStore()
@@ -201,6 +210,28 @@ class IndexerService:
         # File watcher
         self._observer: Observer | None = None
         self._watching = False
+
+    def _tag_for(self, path: Path):
+        """The file's TagRecord, or None when the store or the row is missing.
+
+        Rows are keyed by vault-relative POSIX path, the same key
+        ``scripts/sync_vault_tag.py`` writes.
+        """
+        if self._tag_store is None:
+            if self._tag_store_failed:
+                return None
+            try:
+                from api.services.vault_tag_store import VaultTagStore
+                self._tag_store = VaultTagStore()
+            except Exception as e:
+                logger.warning(f"Tag store unavailable, indexing without tag phrases: {e}")
+                self._tag_store_failed = True
+                return None
+        try:
+            key = Path(path).relative_to(self.vault_path).as_posix()
+            return self._tag_store.get(key)
+        except Exception:
+            return None
 
     def _load_index_state(self) -> dict:
         """Load the index state (file paths -> last indexed mtime)."""
@@ -242,22 +273,33 @@ class IndexerService:
         all_md_files = list(self.vault_path.rglob("*.md"))
         current_files = {str(f): f.stat().st_mtime for f in all_md_files}
 
+        # Tag tuples used at index time live under a reserved key beside the
+        # per-file mtimes. A file whose current tuple differs is re-indexed
+        # even when its bytes did not change; no row and no phrase is None on
+        # both sides, so untagged files are never re-indexed for it.
+        tag_keys: dict = index_state.get(TAG_STATE_KEY) or {}
+        index_state[TAG_STATE_KEY] = tag_keys
+        current_tag_key: dict[str, list | None] = {}
+
         # Determine which files need indexing
         files_to_index = []
         for file_path, mtime in current_files.items():
             prev_mtime = index_state.get(file_path)
+            key = tag_phrase_key(self._tag_for(Path(file_path)))
+            current_tag_key[file_path] = list(key) if key else None
+            tags_changed = current_tag_key[file_path] != tag_keys.get(file_path)
             if force:
                 # In force mode, reindex if not yet indexed in this run
                 # (allows resuming a force reindex after crash)
                 if prev_mtime is None or prev_mtime < mtime:
                     files_to_index.append((file_path, mtime))
             else:
-                # Normal incremental: only if file changed since last index
-                if prev_mtime is None or mtime > prev_mtime:
+                # Normal incremental: only if file or its tag phrase changed
+                if prev_mtime is None or mtime > prev_mtime or tags_changed:
                     files_to_index.append((file_path, mtime))
 
         # Determine deleted files (in old state but not in current files)
-        deleted_files = set(index_state.keys()) - set(current_files.keys())
+        deleted_files = set(index_state.keys()) - set(current_files.keys()) - {TAG_STATE_KEY}
 
         if force:
             already_done = len(all_md_files) - len(files_to_index)
@@ -274,6 +316,7 @@ class IndexerService:
                 self.delete_file(file_path)
                 # Remove from state
                 index_state.pop(file_path, None)
+                tag_keys.pop(file_path, None)
                 logger.info(f"Removed deleted file from index: {file_path}")
             except Exception as e:
                 logger.error(f"Failed to remove {file_path} from index: {e}")
@@ -291,6 +334,10 @@ class IndexerService:
 
                 # Update state for this file
                 index_state[file_path] = mtime
+                if current_tag_key[file_path] is None:
+                    tag_keys.pop(file_path, None)
+                else:
+                    tag_keys[file_path] = current_tag_key[file_path]
                 count += 1
 
                 # Save progress and clean up memory periodically
@@ -429,7 +476,7 @@ class IndexerService:
         }
 
         # Add contextual prefixes to chunks (P9.1 - boosts retrieval accuracy)
-        chunks = add_context_to_chunks(chunks, path, metadata)
+        chunks = add_context_to_chunks(chunks, path, metadata, tags=self._tag_for(path))
 
         # Update in vector store (handles deletion of old chunks)
         self.vector_store.update_document(chunks, metadata)

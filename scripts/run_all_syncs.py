@@ -994,8 +994,8 @@ SYNC_ORDER = [
 
     # === Phase 4: Vector Store Indexing ===
     # Index content with fresh people data available for entity resolution
+    "vault_tag",                # Incremental Jev tagging of changed notes (no GPU, not an embedding source); before the reindex so chunk context carries fresh tag phrases
     "vault_reindex",            # Full reindex with LLM summaries (no timeout)
-    "vault_tag",                # Incremental Jev tagging of changed notes (no GPU, not an embedding source)
     # `strengths` runs AFTER vault_reindex, not with the other Phase 3
     # relationship work, because vault_reindex *creates people* from vault
     # mentions. Ranked before it, those people are never scored: they get a

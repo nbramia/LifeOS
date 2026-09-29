@@ -70,6 +70,8 @@ The query classifier (`api/services/query_classifier.py`) determines whether a q
 
 `api/services/vault_tagger.py` derives per-note facets (document type, domain, primary and secondary topics, project, actionability, has-decision, sensitivity) into `data/vault_tags.db` via `api/services/vault_tag_store.py`, a database separate from `bm25_index.db`. Rows are keyed by file path and current while the content hash and the taxonomy `vocab_version` match; modification time never triggers re-tagging. Closed-set facets come from one Jev call per note, gated by `LIFEOS_JEV_VAULT_TAGGING`, a folder allowlist, and an on-box sensitivity rule; raw probabilities are stored so thresholds can change without re-inference. Tags are never written to frontmatter. See [configuration.md](../../guides/configuration.md) for the privacy contract.
 
+**Tag phrase in chunk context.** Each chunk's contextual prefix (`generate_chunk_context`) carries a tag phrase when the file's tag row has `doc_type_conf` of 0.6 or above: `Classified as <doc_type> in the <domain> domain about <topic>`, plus ` for project <project>` when `project_conf` is 0.6 or above and the project is not `none`. Underscores and `/` in tag values become spaces (`work/hiring` reads `work hiring`), parts without a value are omitted, and no people names appear. The prefix is embedded and keyword-indexed with the chunk, so a note is reachable by what it is about even when its body never uses the word. The indexer looks the row up by vault-relative POSIX path, the key `sync_vault_tag.py` writes; a missing store or row leaves the prefix unchanged. A change to a file's phrase tuple re-embeds it on the next reindex — see [data-and-sync.md](data-and-sync.md).
+
 ## Key Files
 
 | File | Purpose |

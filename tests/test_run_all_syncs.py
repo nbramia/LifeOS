@@ -1449,14 +1449,21 @@ class TestSyncOrderInvariants:
         """
         assert self._pos("strengths") > self._pos("vault_reindex")
 
-    def test_vault_tag_follows_vault_reindex_and_is_not_an_embedding_source(self):
-        """vault_tag runs immediately after vault_reindex, has a script and a
-        timeout, and must not pause the local LLM like an embedding source."""
+    def test_vault_tag_runs_immediately_before_vault_reindex_and_is_not_an_embedding_source(self):
+        """vault_tag runs immediately before vault_reindex so chunk context is
+        built from fresh tags; it has a script and a timeout, and must not
+        pause the local LLM like an embedding source."""
         from scripts.run_all_syncs import EMBEDDING_SOURCES, SYNC_SCRIPTS, SYNC_TIMEOUTS
-        assert self._pos("vault_tag") == self._pos("vault_reindex") + 1
+        assert self._pos("vault_tag") == self._pos("vault_reindex") - 1
         assert "vault_tag" not in EMBEDDING_SOURCES
         assert SYNC_SCRIPTS["vault_tag"][0] == "scripts/sync_vault_tag.py"
         assert SYNC_TIMEOUTS["vault_tag"] > 0
+
+    def test_vault_reindex_does_not_depend_on_vault_tag(self):
+        """A tagging failure must not skip the reindex, and tagging needs nothing upstream."""
+        from api.services.sync_health import SYNC_SOURCES
+        assert "vault_tag" not in SYNC_SOURCES["vault_reindex"].get("depends_on", [])
+        assert SYNC_SOURCES["vault_tag"]["depends_on"] == []
 
     def test_strengths_runs_before_crm_vectorstore(self):
         """People indexed for semantic search should carry fresh scores."""
