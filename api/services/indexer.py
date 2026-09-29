@@ -6,7 +6,6 @@ Supports incremental indexing based on file modification times.
 """
 import gc
 import os
-import re
 import json
 import threading
 import logging
@@ -568,62 +567,10 @@ class IndexerService:
         return success_count
 
     def _extract_note_date(self, path: Path, frontmatter: dict, body: str = "") -> str:
-        """
-        Extract note date using priority cascade.
+        """Extract the note date; see `api.utils.date_parser.extract_note_date`."""
+        from api.utils.date_parser import extract_note_date
 
-        Priority:
-        1. Filename patterns (YYYY-MM-DD, YYYYMMDD)
-        2. Frontmatter fields: created, date, created_at, creation_date
-        3. Body text: "Created: ...", "Date: ..."
-        4. Return empty string (NO file timestamp fallback)
-
-        Args:
-            path: Path to the file
-            frontmatter: Parsed frontmatter dict
-            body: Note body content (for searching date patterns)
-
-        Returns:
-            ISO format date string or empty string if no date found
-        """
-        from api.utils.date_parser import parse_note_date
-
-        filename = path.stem  # filename without extension
-
-        # 1. Look for YYYY-MM-DD pattern in filename
-        match = re.search(r"(\d{4})-(\d{2})-(\d{2})", filename)
-        if match:
-            return f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
-
-        # 2. Look for YYYYMMDD pattern in filename (e.g., "Meeting 20250925.md")
-        match = re.search(r"(\d{4})(\d{2})(\d{2})", filename)
-        if match:
-            year, month, day = int(match.group(1)), int(match.group(2)), int(match.group(3))
-            if 2000 <= year <= 2100 and 1 <= month <= 12 and 1 <= day <= 31:
-                return f"{year:04d}-{month:02d}-{day:02d}"
-
-        # 3. Frontmatter fields
-        for field in ['created', 'date', 'created_at', 'creation_date']:
-            if field in frontmatter:
-                value = frontmatter[field]
-                if isinstance(value, datetime):
-                    return value.strftime("%Y-%m-%d")
-                if isinstance(value, str):
-                    parsed = parse_note_date(value)
-                    if parsed:
-                        return parsed
-
-        # 4. Body text patterns (first 2000 chars)
-        body_sample = body[:2000] if body else ""
-        for pattern in [r"Created:\s*(.+?)(?:\n|$)", r"Date:\s*(.+?)(?:\n|$)"]:
-            match = re.search(pattern, body_sample, re.IGNORECASE)
-            if match:
-                parsed = parse_note_date(match.group(1).strip())
-                if parsed:
-                    return parsed
-
-        # 5. No reliable date found - return empty string
-        # The vector store will give these a neutral recency score
-        return ""
+        return extract_note_date(path, frontmatter, body)
 
     def _infer_note_type(self, path: Path) -> str:
         """

@@ -1,6 +1,7 @@
 """Date parsing utilities for vault notes."""
 import re
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Optional, Union
 
 MONTH_NAMES = {
@@ -227,3 +228,60 @@ def _validate_and_format(year: int, month: int, day: int, today: date) -> Option
         return f"{year:04d}-{month:02d}-{day:02d}"
     except ValueError:
         return None
+
+
+def extract_note_date(path: Path, frontmatter: dict, body: str = "") -> str:
+    """
+    Extract note date using priority cascade.
+
+    Priority:
+    1. Filename patterns (YYYY-MM-DD, YYYYMMDD)
+    2. Frontmatter fields: created, date, created_at, creation_date
+    3. Body text: "Created: ...", "Date: ..."
+    4. Return empty string (NO file timestamp fallback)
+
+    Args:
+        path: Path to the file
+        frontmatter: Parsed frontmatter dict
+        body: Note body content (for searching date patterns)
+
+    Returns:
+        ISO format date string or empty string if no date found
+    """
+    filename = path.stem  # filename without extension
+
+    # 1. Look for YYYY-MM-DD pattern in filename
+    match = re.search(r"(\d{4})-(\d{2})-(\d{2})", filename)
+    if match:
+        return f"{match.group(1)}-{match.group(2)}-{match.group(3)}"
+
+    # 2. Look for YYYYMMDD pattern in filename (e.g., "Meeting 20250925.md")
+    match = re.search(r"(\d{4})(\d{2})(\d{2})", filename)
+    if match:
+        year, month, day = int(match.group(1)), int(match.group(2)), int(match.group(3))
+        if 2000 <= year <= 2100 and 1 <= month <= 12 and 1 <= day <= 31:
+            return f"{year:04d}-{month:02d}-{day:02d}"
+
+    # 3. Frontmatter fields
+    for field in ['created', 'date', 'created_at', 'creation_date']:
+        if field in frontmatter:
+            value = frontmatter[field]
+            if isinstance(value, datetime):
+                return value.strftime("%Y-%m-%d")
+            if isinstance(value, str):
+                parsed = parse_note_date(value)
+                if parsed:
+                    return parsed
+
+    # 4. Body text patterns (first 2000 chars)
+    body_sample = body[:2000] if body else ""
+    for pattern in [r"Created:\s*(.+?)(?:\n|$)", r"Date:\s*(.+?)(?:\n|$)"]:
+        match = re.search(pattern, body_sample, re.IGNORECASE)
+        if match:
+            parsed = parse_note_date(match.group(1).strip())
+            if parsed:
+                return parsed
+
+    # 5. No reliable date found - return empty string
+    # The vector store will give these a neutral recency score
+    return ""

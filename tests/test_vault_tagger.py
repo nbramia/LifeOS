@@ -1,0 +1,183 @@
+"""VaultTagger: gating matrix, topic thresholds, error fallback (synthetic notes, mocked Jev)."""
+import json
+from unittest.mock import patch
+
+import pytest
+
+from api.services.jev_client import JevClient, JevError
+from api.services.vault_tag_store import VaultTagStore
+from api.services.vault_tagger import VaultTagger, classify_sensitivity, is_allowlisted
+from api.services.vault_taxonomy import load_taxonomy
+from config.settings import settings
+
+pytestmark = pytest.mark.unit
+
+TX = load_taxonomy()
+TOPIC_A, TOPIC_B, TOPIC_C, TOPIC_D = list(TX.topics)[:4]
+DOC = TX.doc_types[0]
+DOMAIN = TX.domains[0]
+
+
+def _choice(probs):
+    best = max(probs, key=probs.get)
+    return {"choice": best, "probabilities": probs, "confidence": probs[best]}
+
+
+def _answers(topic_probs=None):
+    topic_probs = topic_probs or {TOPIC_A: 0.9, TOPIC_B: 0.1}
+    return {
+        "doc_type": _choice({DOC: 0.8, TX.doc_types[1]: 0.2}),
+        "domain": _choice({DOMAIN: 0.7, TX.domains[1]: 0.3}),
+        "topic": _choice(topic_probs),
+        "project": _choice({"Alpha": 0.9, "none": 0.1}),
+        "actionability": {"score": 1.2},
+        "has_decision": {"noul": 0.4},
+    }
+
+
+@pytest.fixture
+def vault(tmp_path):
+    root = tmp_path / "vault"
+    (root / "Work" / "Alpha").mkdir(parents=True)
+    (root / "Notes").mkdir()
+    (root / "Therapy").mkdir()
+    (root / "Work" / "Alpha" / "plan.md").write_text("---\ntags: [x]\n---\n# Plan\nWe decided to ship.\n")
+    (root / "Notes" / "idea.md").write_text("# Idea\nSome text.\n")
+    (root / "Therapy" / "session.md").write_text("# Session\nPrivate text.\n")
+    (root / "Notes" / "tagged.md").write_text("---\ntags: [therapy]\n---\nBody\n")
+    return root
+
+
+def _set(monkeypatch, mode="on", paths="*", key="k"):
+    monkeypatch.setattr(settings, "jev_vault_tagging", mode)
+    monkeypatch.setattr(settings, "jev_vault_tag_paths", paths)
+    monkeypatch.setattr(settings, "typesafe_api_key", key)
+
+
+def _tagger(vault, store=None):
+    return VaultTagger(store=store, client=JevClient(api_key="k"), taxonomy=TX, vault_root=vault)
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "on"])
+@pytest.mark.parametrize("allowlisted", [False, True])
+@pytest.mark.parametrize("restricted", [False, True])
+@pytest.mark.parametrize("key", ["", "k"])
+def test_gating_matrix(vault, monkeypatch, mode, allowlisted, restricted, key):
+    _set(monkeypatch, mode=mode, paths="Notes,Therapy" if allowlisted else "Elsewhere", key=key)
+    rel = "Therapy/session.md" if restricted else "Notes/idea.md"
+    with patch.object(JevClient, "ask", return_value=_answers()) as ask:
+        rec = _tagger(vault).tag_file(vault / rel)
+    should_call = mode != "off" and allowlisted and not restricted and key == "k"
+    assert ask.called is should_call
+    assert rec.backend == ("jev" if should_call else "code")
+    assert rec.sensitivity == ("restricted" if restricted else "private")
+    if not should_call:
+        assert rec.doc_type is None and rec.topic is None and rec.content_sha256
+
+
+def test_default_settings_send_nothing(vault):
+    with patch.object(JevClient, "ask", return_value=_answers()) as ask:
+        rec = _tagger(vault).tag_file(vault / "Notes" / "idea.md")
+    assert not ask.called and rec.backend == "code"
+
+
+def test_allowlist_prefixes_and_star():
+    with patch.object(settings, "jev_vault_tag_paths", "Work, Notes/Sub"):
+        assert is_allowlisted("Work/Alpha/x.md")
+        assert is_allowlisted("Notes/Sub/x.md")
+        assert not is_allowlisted("Workshop/x.md")
+        assert not is_allowlisted("Notes/x.md")
+    with patch.object(settings, "jev_vault_tag_paths", "*"):
+        assert is_allowlisted("Anything/x.md")
+    with patch.object(settings, "jev_vault_tag_paths", ""):
+        assert not is_allowlisted("Work/x.md")
+
+
+def test_restricted_by_human_tag(vault, monkeypatch):
+    _set(monkeypatch)
+    with patch.object(JevClient, "ask", return_value=_answers()) as ask:
+        rec = _tagger(vault).tag_file(vault / "Notes" / "tagged.md")
+    assert not ask.called and rec.sensitivity == "restricted"
+    assert classify_sensitivity("Notes/x.md", ["Therapy"]) == "restricted"
+
+
+def test_jev_facets_and_question_set(vault, monkeypatch):
+    _set(monkeypatch)
+    with patch.object(JevClient, "ask", return_value=_answers()) as ask:
+        rec = _tagger(vault).tag_file(vault / "Work" / "Alpha" / "plan.md")
+    state, questions = ask.call_args.args
+    assert set(questions) == {"doc_type", "domain", "topic", "project", "actionability", "has_decision"}
+    assert "none" in questions["project"]["criteria"] and "Alpha" in questions["project"]["criteria"]
+    assert set(state) == {"path", "title", "frontmatter", "headings", "body"}
+    assert state["path"] == "Work/Alpha/plan.md" and state["headings"] == ["# Plan"]
+    assert rec.doc_type == DOC and rec.domain == DOMAIN and rec.project == "Alpha"
+    assert rec.topic == TOPIC_A and rec.topic_conf == 0.9
+    assert rec.actionability == 1.2 and rec.has_decision == 0.4 and rec.backend == "jev"
+    assert json.loads(rec.topics_json)["topic"][TOPIC_A] == 0.9
+
+
+def test_body_capped_at_8000_tokens(vault, monkeypatch):
+    _set(monkeypatch)
+    big = vault / "Notes" / "big.md"
+    big.write_text("word " * 30000)
+    with patch.object(JevClient, "ask", return_value=_answers()) as ask:
+        _tagger(vault).tag_file(big)
+    from api.services.chunker import count_tokens
+
+    assert count_tokens(ask.call_args.args[0]["body"]) <= 8000
+
+
+def test_secondary_topics_threshold_and_cap(vault, monkeypatch):
+    _set(monkeypatch)
+    probs = {TOPIC_A: 0.5, TOPIC_B: 0.2, TOPIC_C: 0.16, TOPIC_D: 0.14}
+    with patch.object(JevClient, "ask", return_value=_answers(probs)):
+        rec = _tagger(vault).tag_file(vault / "Notes" / "idea.md")
+    assert json.loads(rec.topics_json)["secondary"] == [TOPIC_B, TOPIC_C]
+    probs = {TOPIC_A: 0.6, TOPIC_B: 0.15, TOPIC_C: 0.14, TOPIC_D: 0.11}
+    with patch.object(JevClient, "ask", return_value=_answers(probs)):
+        rec = _tagger(vault).tag_file(vault / "Notes" / "idea.md")
+    assert json.loads(rec.topics_json)["secondary"] == [TOPIC_B]
+
+
+def test_low_topic_confidence_stores_parent_only(vault, monkeypatch):
+    _set(monkeypatch)
+    with patch.object(JevClient, "ask", return_value=_answers({TOPIC_A: 0.59, TOPIC_B: 0.41})):
+        rec = _tagger(vault).tag_file(vault / "Notes" / "idea.md")
+    assert rec.topic == TOPIC_A.split("/")[0] and rec.topic_conf == 0.59
+    with patch.object(JevClient, "ask", return_value=_answers({TOPIC_A: 0.6, TOPIC_B: 0.4})):
+        rec = _tagger(vault).tag_file(vault / "Notes" / "idea.md")
+    assert rec.topic == TOPIC_A
+
+
+def test_project_none_maps_to_null(vault, monkeypatch):
+    _set(monkeypatch)
+    answers = _answers()
+    answers["project"] = _choice({"none": 0.9, "Alpha": 0.1})
+    with patch.object(JevClient, "ask", return_value=answers):
+        rec = _tagger(vault).tag_file(vault / "Notes" / "idea.md")
+    assert rec.project is None
+
+
+def test_error_falls_back_to_code_record(vault, monkeypatch):
+    _set(monkeypatch)
+    with patch.object(JevClient, "ask", side_effect=JevError("status 500")):
+        rec = _tagger(vault).tag_file(vault / "Notes" / "idea.md")
+    assert rec.backend == "code" and rec.doc_type is None and rec.file_path == "Notes/idea.md"
+
+
+def test_error_returns_previous_record(vault, monkeypatch, tmp_path):
+    _set(monkeypatch)
+    store = VaultTagStore(str(tmp_path / "tags.db"))
+    with patch.object(JevClient, "ask", return_value=_answers()):
+        first = _tagger(vault, store).tag_file(vault / "Notes" / "idea.md")
+    store.upsert(first)
+    (vault / "Notes" / "idea.md").write_text("# Idea\nChanged.\n")
+    with patch.object(JevClient, "ask", side_effect=RuntimeError("boom")):
+        rec = _tagger(vault, store).tag_file(vault / "Notes" / "idea.md")
+    assert rec == first and rec.backend == "jev"
+
+
+def test_unreadable_file_never_raises(vault, monkeypatch):
+    _set(monkeypatch)
+    rec = _tagger(vault).tag_file(vault / "Notes" / "gone.md")
+    assert rec.backend == "code"

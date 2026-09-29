@@ -680,6 +680,22 @@ class Settings(BaseSettings):
                     "warning and is treated as `off`."
     )
 
+    jev_vault_tagging: str = Field(
+        default="off",
+        alias="LIFEOS_JEV_VAULT_TAGGING",
+        description="Controls Jev-backed vault tagging (`api/services/vault_tagger.py`). "
+                    "One of `off` (default), `shadow`, `on`. Effectively `off` without "
+                    "a TypeSafe key. Only notes under `LIFEOS_JEV_VAULT_TAG_PATHS` and "
+                    "not classed restricted on-box are sent."
+    )
+    jev_vault_tag_paths: str = Field(
+        default="",
+        alias="LIFEOS_JEV_VAULT_TAG_PATHS",
+        description="Comma-separated vault-relative folder prefixes whose notes may be "
+                    "sent to Jev for tagging. Empty (default) sends nothing; `*` allows "
+                    "every folder."
+    )
+
     # Lets the agent worker's `local` route fall back to the remote
     # OpenAI-compatible provider above when the local llama-server isn't
     # reachable. Exists for a real deployment with NO other #agent executor

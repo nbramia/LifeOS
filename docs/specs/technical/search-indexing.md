@@ -66,6 +66,10 @@ The query classifier (`api/services/query_classifier.py`) determines whether a q
 
 ---
 
+### Vault Tags
+
+`api/services/vault_tagger.py` derives per-note facets (document type, domain, primary and secondary topics, project, actionability, has-decision, sensitivity) into `data/vault_tags.db` via `api/services/vault_tag_store.py`, a database separate from `bm25_index.db`. Rows are keyed by file path and current while the content hash and the taxonomy `vocab_version` match; modification time never triggers re-tagging. Closed-set facets come from one Jev call per note, gated by `LIFEOS_JEV_VAULT_TAGGING`, a folder allowlist, and an on-box sensitivity rule; raw probabilities are stored so thresholds can change without re-inference. Tags are never written to frontmatter. See [configuration.md](../../guides/configuration.md) for the privacy contract.
+
 ## Key Files
 
 | File | Purpose |
@@ -76,6 +80,7 @@ The query classifier (`api/services/query_classifier.py`) determines whether a q
 | `api/services/query_classifier.py` | Factual vs semantic detection |
 | `api/services/reranker.py` | Cross-encoder re-ranking service |
 | `api/services/query_router.py` | LLM-based source routing + person name extraction |
+| `api/services/vault_tagger.py`, `api/services/vault_tag_store.py` | Per-note facet tagging and its rebuildable store |
 
 ## Related Documents
 
