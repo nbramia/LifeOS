@@ -869,7 +869,7 @@ class LifeOSMCPServer:
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Search query"},
-                    "top_k": {"type": "integer", "description": "Number of results (1-100)", "default": 10},
+                    "top_k": {"type": "integer", "description": "Number of results (1-100, default 20)", "default": 20},
                     "date_from": {"type": "string", "description": "Only return notes on/after this date (YYYY-MM-DD). Resolve relative phrases like 'last week' against today's date before passing."},
                     "date_to": {"type": "string", "description": "Only return notes on/before this date (YYYY-MM-DD)."}
                 },
@@ -959,7 +959,7 @@ class LifeOSMCPServer:
                 "type": "object",
                 "properties": {
                     "q": {"type": "string", "description": "Name or email to search"},
-                    "limit": {"type": "integer", "description": "Max results (default: 10)", "default": 10, "maximum": 50}
+                    "limit": {"type": "integer", "description": "Max results (default: 20)", "default": 20, "maximum": 200}
                 },
                 "required": ["q"]
             },
@@ -1026,7 +1026,7 @@ class LifeOSMCPServer:
                 "type": "object",
                 "properties": {
                     "person_id": {"type": "string", "description": "The person's entity_id from lifeos_people_search"},
-                    "days_back": {"type": "integer", "description": "Days of history to include (default: 365)", "default": 365},
+                    "days_back": {"type": "integer", "description": "Days to look back (default 3650, max 3660)", "minimum": 1, "maximum": 3660, "default": 3650},
                     "source_type": {"type": "string", "description": "Filter by source type (e.g., 'imessage', 'gmail,slack')"},
                     "limit": {"type": "integer", "description": "Max results (default: 50)", "default": 50}
                 },

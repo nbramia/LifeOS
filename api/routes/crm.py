@@ -1741,7 +1741,7 @@ def get_person_timeline(
         default=InteractionConfig.DEFAULT_WINDOW_DAYS,
         ge=1,
         le=InteractionConfig.MAX_WINDOW_DAYS,
-        description="Days to look back (default 365, max 3650)"
+        description="Days to look back (default 3650, max 3660)"
     ),
     date: Optional[str] = Query(default=None, description="Filter to specific date (YYYY-MM-DD)"),
     offset: int = Query(default=0, ge=0, description="Offset for pagination"),
