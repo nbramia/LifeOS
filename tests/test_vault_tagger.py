@@ -339,3 +339,24 @@ def test_restricted_value_without_valid_entry_falls_back_to_default(monkeypatch,
 def test_whitespace_only_restricted_value_disables_path_restriction(monkeypatch):
     monkeypatch.setattr(settings, "jev_vault_restricted_paths", "   ")
     assert classify_sensitivity("Lifelogs/day.md", []) == "private"
+
+
+def test_dot_dot_dot_frontmatter_closer_is_restricted(vault, monkeypatch):
+    (vault / "Notes" / "dots.md").write_text("---\ntags: [private]\n...\nbody\n")
+    ask, rec = _send(vault, monkeypatch, "Notes/dots.md")
+    assert not ask.called and rec.sensitivity == "restricted"
+
+
+def test_parser_dropping_a_raw_tags_key_is_restricted(vault, monkeypatch):
+    import frontmatter
+
+    (vault / "Notes" / "drop.md").write_text("---\ntags: [private]\n---\nbody\n")
+    with patch("api.services.vault_tagger.frontmatter.loads", return_value=frontmatter.Post("body")):
+        ask, rec = _send(vault, monkeypatch, "Notes/drop.md")
+    assert not ask.called and rec.sensitivity == "restricted"
+
+
+def test_empty_tags_key_with_matching_parse_is_not_restricted(vault, monkeypatch):
+    (vault / "Notes" / "fine.md").write_text("---\ntitle: x\ntags: [work]\n---\nbody\n")
+    ask, rec = _send(vault, monkeypatch, "Notes/fine.md")
+    assert ask.called and rec.sensitivity == "private"

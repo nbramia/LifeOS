@@ -156,17 +156,26 @@ def classify_sensitivity(rel_path: str, human_tags: list[str]) -> str:
     return "private"
 
 
+_RAW_TAGS_KEY = re.compile(r"^tags\s*:\s*(\S|\n\s*-)", re.M)
+
+
 def parse_note(content: str) -> tuple[dict, str, bool]:
-    """(frontmatter, body, parsed_ok). A frontmatter fence that fails to parse
-    or has no closing fence yields ok=False so the caller can treat the note as restricted."""
+    """(frontmatter, body, parsed_ok). A `---` frontmatter block that has no
+    closing `---` line (a `...` closer is not recognized), fails to parse, or
+    whose raw text carries a `tags` key the parser did not return yields
+    ok=False so the caller can treat the note as restricted."""
     content = content.removeprefix("\ufeff")
     lines = content.splitlines()
     if lines and lines[0].rstrip() == "---":
-        if not any(line.rstrip() in ("---", "...") for line in lines[1:]):
+        closers = [i for i, line in enumerate(lines[1:], 1) if line.rstrip() == "---"]
+        if not closers:
             return {}, content, False
         try:
             post = frontmatter.loads(content)
         except Exception:  # noqa: BLE001 - any parse failure
+            return {}, content, False
+        raw_block = "\n".join(lines[1 : closers[0]])
+        if _RAW_TAGS_KEY.search(raw_block) and not post.metadata.get("tags"):
             return {}, content, False
         return dict(post.metadata), post.content, True
     return {}, content, True
