@@ -43,6 +43,31 @@ def clear_vector_store():
     logger.info("Vector store cleared")
 
 
+def _tag_keys_marker() -> Path:
+    from config.settings import settings
+    return Path(settings.chroma_path).parent / "vault_tag_keys_backfilled"
+
+
+def backfill_tag_keys_once(indexer) -> int:
+    """Backfill ``tag:`` metadata keys on chunks indexed before they existed.
+
+    Every chunk indexed since carries the keys, so one completed pass is
+    enough; a marker file next to the vector data records it and later runs
+    return 0 without reading the collection.
+    """
+    marker = _tag_keys_marker()
+    if marker.exists():
+        return 0
+    try:
+        count = indexer.vector_store.backfill_tag_keys()
+    except Exception as e:
+        logger.warning(f"Tag key backfill failed: {e}")
+        return 0
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(str(count))
+    return count
+
+
 def sync_vault_reindex(dry_run: bool = True, force: bool = False, skip_summaries: bool = False) -> dict:
     """
     Reindex the Obsidian vault.
@@ -105,16 +130,20 @@ def sync_vault_reindex(dry_run: bool = True, force: bool = False, skip_summaries
     except Exception as e:
         logger.warning(f"Index page generation failed: {e}")
 
+    tag_keys_backfilled = backfill_tag_keys_once(indexer)
+
     elapsed = time.time() - start_time
 
     logger.info("\n=== Vault Reindex Results ===")
     logger.info(f"  Files indexed: {files_indexed}")
+    logger.info(f"  Tag keys backfilled: {tag_keys_backfilled}")
     logger.info(f"  Time elapsed: {elapsed:.1f}s ({elapsed/60:.1f} min)")
 
     return {
         "status": "success",
         "files_indexed": files_indexed,
         "index_pages": index_pages,
+        "tag_keys_backfilled": tag_keys_backfilled,
         "elapsed_seconds": round(elapsed, 1),
     }
 
@@ -154,4 +183,5 @@ if __name__ == '__main__':
     from api.services.sync_health import emit_sync_stats
     emit_sync_stats({
         "processed": int(result.get("files_indexed", 0) or 0),
+        "tag_keys_backfilled": int(result.get("tag_keys_backfilled", 0) or 0),
     })

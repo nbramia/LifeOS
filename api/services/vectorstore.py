@@ -348,6 +348,40 @@ class VectorStore:
             "distances": [[r[0] for r in rows]],
         }
 
+    def backfill_tag_keys(self, batch_size: int = 500) -> int:
+        """Write the ``tag:<name>`` boolean keys for chunks indexed without them.
+
+        A chunk qualifies when its JSON ``tags`` metadata is non-empty and it
+        carries no ``tag:`` key. Only metadata is written (``update`` with the
+        full existing metadata plus the new keys); documents and embeddings
+        are untouched. Returns the number of chunks updated; a second run
+        returns 0.
+        """
+        updated = 0
+        offset = 0
+        while True:
+            page = self._collection.get(include=["metadatas"], limit=batch_size, offset=offset)
+            ids = page["ids"]
+            if not ids:
+                return updated
+            offset += len(ids)
+            write_ids, write_metas = [], []
+            for chunk_id, meta in zip(ids, page["metadatas"]):
+                meta = meta or {}
+                if any(k.startswith(TAG_KEY_PREFIX) for k in meta):
+                    continue
+                try:
+                    tags = json.loads(meta.get("tags") or "[]")
+                except (TypeError, ValueError):
+                    continue
+                keys = {tag_key(str(t)): True for t in tags if str(t).strip()}
+                if keys:
+                    write_ids.append(chunk_id)
+                    write_metas.append({**meta, **keys})
+            if write_ids:
+                self._collection.update(ids=write_ids, metadatas=write_metas)
+                updated += len(write_ids)
+
     def file_paths_matching(self, where: Optional[dict] = None) -> set[str]:
         """Distinct file paths of chunks matching a Chroma ``where`` (all when None).
 

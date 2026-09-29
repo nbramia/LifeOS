@@ -352,3 +352,74 @@ def test_add_document_writes_scalar_tag_keys():
     meta = vs._collection.add.call_args.kwargs["metadatas"][0]
     assert meta["tag:project/x"] is True and meta["tag:plain"] is True
     assert meta["tags"] == '["#Project/X", "plain"]'
+
+
+# -- Tag key backfill (real Chroma) --------------------------------------------
+
+@pytest.fixture
+def real_store(tmp_path):
+    import chromadb
+    from api.services.vectorstore import VectorStore
+    vs = VectorStore.__new__(VectorStore)
+    vs._collection = chromadb.PersistentClient(path=str(tmp_path / "chroma")).create_collection(
+        "backfill_col", metadata={"hnsw:space": "cosine"}
+    )
+    vs._embedding_service = MagicMock()
+    vs._collection.add(
+        ids=["/v/a.md::0", "/v/a.md::1", "/v/b.md::0", "/v/c.md::0"],
+        embeddings=[[1.0, 0.0], [0.5, 0.5], [0.0, 1.0], [0.3, 0.7]],
+        documents=["alpha", "beta", "gamma", "delta"],
+        metadatas=[
+            {"file_path": "/v/a.md", "note_type": "Work", "chunk_index": 0, "tags": '["Project/X", "plain"]'},
+            {"file_path": "/v/a.md", "note_type": "Work", "chunk_index": 1, "tags": '["Project/X", "plain"]'},
+            {"file_path": "/v/b.md", "note_type": "Work", "chunk_index": 0, "tags": "[]"},
+            {"file_path": "/v/c.md", "note_type": "Work", "chunk_index": 0, "tags": '["Hashed"]',
+             "tag:hashed": True},
+        ],
+    )
+    return vs
+
+
+def test_backfill_adds_keys_and_preserves_metadata_documents_and_embeddings(real_store):
+    col = real_store._collection
+    before = col.get(include=["embeddings", "metadatas", "documents"])
+    assert real_store.backfill_tag_keys(batch_size=2) == 2
+    after = col.get(include=["embeddings", "metadatas", "documents"])
+    assert before["ids"] == after["ids"]
+    assert before["embeddings"].tolist() == after["embeddings"].tolist()
+    assert before["documents"] == after["documents"]
+    for b, a in zip(before["metadatas"], after["metadatas"]):
+        assert {k: v for k, v in a.items() if not k.startswith("tag:")} == {
+            k: v for k, v in b.items() if not k.startswith("tag:")
+        }
+    a0 = after["metadatas"][after["ids"].index("/v/a.md::0")]
+    assert a0["tag:project/x"] is True and a0["tag:plain"] is True
+    assert not any(
+        k.startswith("tag:") for k in after["metadatas"][after["ids"].index("/v/b.md::0")]
+    )
+
+
+def test_backfill_is_idempotent(real_store):
+    assert real_store.backfill_tag_keys() == 2
+    assert real_store.backfill_tag_keys() == 0
+
+
+def test_tags_facet_finds_a_chunk_indexed_without_keys_once_backfilled(real_store):
+    facets = SearchFacets(tags=["project/x"])
+    assert resolve_allowed_paths(facets, real_store, None) == set()
+    real_store.backfill_tag_keys()
+    assert resolve_allowed_paths(facets, real_store, None) == {"/v/a.md"}
+
+
+def test_reindex_script_backfills_once_and_reports_the_count(real_store, tmp_path, monkeypatch):
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    import sync_vault_reindex
+
+    monkeypatch.setattr(settings, "chroma_path", tmp_path / "data" / "chroma")
+    indexer = MagicMock()
+    indexer.vector_store = real_store
+    assert sync_vault_reindex.backfill_tag_keys_once(indexer) == 2
+    indexer.vector_store = MagicMock()
+    assert sync_vault_reindex.backfill_tag_keys_once(indexer) == 0
+    indexer.vector_store.backfill_tag_keys.assert_not_called()

@@ -82,7 +82,7 @@ Facets resolve to a set of allowed absolute file paths that both arms use as a p
 |-------|--------|
 | `doc_type`, `domain`, `topic`, `project` | Vault tag store. It keys vault-relative paths; they are joined to `settings.vault_path` to match the absolute paths the indexes use. A missing or empty store matches nothing. A parent `topic` matches its `parent/child` topics. |
 | `note_type` | Vector-store chunk metadata (`note_type`), read as chunk ids only |
-| `tags` | Vector-store chunk metadata: each tag is also stored as a boolean key `tag:<lowercased tag>` (the JSON `tags` string remains). Chunks indexed before the keys existed match no tag until re-indexed. |
+| `tags` | Vector-store chunk metadata: each tag is also stored as a boolean key `tag:<lowercased tag>` (the JSON `tags` string remains). The nightly vault reindex runs a one-time, metadata-only pass (`VectorStore.backfill_tag_keys`, no re-embedding) that writes the keys onto chunks whose JSON `tags` are non-empty; a marker file next to the vector data records completion, and the run reports `tag_keys_backfilled`. |
 | `people` | BM25 `people` column |
 | `folder` | Vault-relative directory, matched on a path-segment boundary (`Work/Meetings` never matches `Work/Meetings-old`); a value that escapes the vault matches nothing. Applied as a prefix test on the other facets' sets, or as a prefix scan of the BM25 catalog when it is the only facet. |
 
