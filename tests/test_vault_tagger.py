@@ -181,3 +181,39 @@ def test_unreadable_file_never_raises(vault, monkeypatch):
     _set(monkeypatch)
     rec = _tagger(vault).tag_file(vault / "Notes" / "gone.md")
     assert rec.backend == "code"
+
+
+def _lifelog(vault):
+    (vault / "Lifelogs").mkdir()
+    (vault / "Lifelogs" / "day.md").write_text("# Day\nText.\n")
+    return vault / "Lifelogs" / "day.md"
+
+
+def test_default_restricted_paths_include_lifelogs(vault, monkeypatch):
+    _set(monkeypatch)
+    with patch.object(JevClient, "ask", return_value=_answers()) as ask:
+        rec = _tagger(vault).tag_file(_lifelog(vault))
+    assert not ask.called and rec.sensitivity == "restricted"
+
+
+def test_empty_restricted_paths_sends_allowlisted_lifelogs(vault, monkeypatch):
+    _set(monkeypatch)
+    monkeypatch.setattr(settings, "jev_vault_restricted_paths", "")
+    with patch.object(JevClient, "ask", return_value=_answers()) as ask:
+        rec = _tagger(vault).tag_file(_lifelog(vault))
+    assert ask.called and rec.backend == "jev" and rec.sensitivity == "private"
+
+
+def test_tag_restriction_survives_empty_restricted_paths(vault, monkeypatch):
+    _set(monkeypatch)
+    monkeypatch.setattr(settings, "jev_vault_restricted_paths", "")
+    with patch.object(JevClient, "ask", return_value=_answers()) as ask:
+        rec = _tagger(vault).tag_file(vault / "Notes" / "tagged.md")
+    assert not ask.called and rec.sensitivity == "restricted"
+
+
+def test_restricted_prefix_entry_matches_by_path(monkeypatch):
+    monkeypatch.setattr(settings, "jev_vault_restricted_paths", "Personal/Diary")
+    assert classify_sensitivity("Personal/Diary/a.md", []) == "restricted"
+    assert classify_sensitivity("Personal/Other/a.md", []) == "private"
+    assert classify_sensitivity("Diary/a.md", []) == "private"

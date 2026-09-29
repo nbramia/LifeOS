@@ -48,7 +48,6 @@ MAX_SECONDARY_TOPICS = 2
 TOPIC_PARENT_ONLY_BELOW = 0.6
 ACTIONABILITY_LEVELS = ["informational", "may need follow-up", "needs action"]
 
-RESTRICTED_FOLDERS = frozenset({"lifelogs", "omi", "therapy", "relationship", "finance"})
 RESTRICTED_TAGS = frozenset({"therapy", "private", "finance", "confidential"})
 
 _MODES = {"off", "shadow", "on"}
@@ -75,10 +74,29 @@ def is_allowlisted(rel_path: str) -> bool:
     return False
 
 
+def _path_restricted(rel_path: str) -> bool:
+    """True when the path matches an entry of `LIFEOS_JEV_VAULT_RESTRICTED_PATHS`.
+
+    An entry without a slash matches any folder of that name (case-insensitive);
+    an entry with a slash matches as a vault-relative prefix.
+    """
+    rel = rel_path.strip("/")
+    folders = {part.lower() for part in Path(rel).parts[:-1]}
+    for entry in (settings.jev_vault_restricted_paths or "").split(","):
+        entry = entry.strip().strip("/")
+        if not entry:
+            continue
+        if "/" in entry:
+            if rel.lower() == entry.lower() or rel.lower().startswith(entry.lower() + "/"):
+                return True
+        elif entry.lower() in folders:
+            return True
+    return False
+
+
 def classify_sensitivity(rel_path: str, human_tags: list[str]) -> str:
-    """``restricted`` on a restricted folder name or human tag, else ``private``. Code only."""
-    folders = {part.lower() for part in Path(rel_path).parts[:-1]}
-    if folders & RESTRICTED_FOLDERS:
+    """``restricted`` on a restricted path or human tag, else ``private``. Code only."""
+    if _path_restricted(rel_path):
         return "restricted"
     if {t.lower() for t in human_tags} & RESTRICTED_TAGS:
         return "restricted"

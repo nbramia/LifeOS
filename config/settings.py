@@ -696,6 +696,14 @@ class Settings(BaseSettings):
                     "every folder."
     )
 
+    jev_vault_restricted_paths: str = Field(
+        default="Lifelogs,Omi,Therapy,Relationship,Finance",
+        alias="LIFEOS_JEV_VAULT_RESTRICTED_PATHS",
+        description="Comma-separated folder names or vault-relative prefixes whose "
+                    "notes are classed restricted and never sent to Jev for tagging. "
+                    "An explicitly empty value disables path-based restriction; "
+                    "tag-based restriction stays in effect."
+    )
     # Lets the agent worker's `local` route fall back to the remote
     # OpenAI-compatible provider above when the local llama-server isn't
     # reachable. Exists for a real deployment with NO other #agent executor
