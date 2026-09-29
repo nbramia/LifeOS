@@ -298,3 +298,32 @@ class TestFillWithOr:
         results = filled.search("kiwi mango zzzunknown", limit=5)
         assert len(results) == 5
         assert set(self._modes(results)) == {"or"}
+
+
+class TestIntraWordJoiners:
+    @pytest.fixture
+    def joined(self, bm25):
+        bm25.bulk_add([
+            {"doc_id": "poss", "content": "Name's launch plan", "file_name": "P.md"},
+            {"doc_id": "lone_s", "content": "s", "file_name": "S.md"},
+            {"doc_id": "hyph", "content": "weekly follow-up notes", "file_name": "H.md"},
+            {"doc_id": "spaced", "content": "a follow up call", "file_name": "F.md"},
+            {"doc_id": "only_follow", "content": "follow the leader", "file_name": "O.md"},
+        ])
+        return bm25
+
+    @pytest.mark.parametrize("apostrophe", ["'", "\u2019"])
+    def test_possessive_is_one_term_and_ignores_lone_s(self, joined, apostrophe):
+        query = f"name{apostrophe}s"
+        assert joined._extract_terms(query) == [query]
+        assert [r["doc_id"] for r in joined.search(query)] == ["poss"]
+
+    def test_hyphenated_term_matches_phrase_not_partial(self, joined):
+        assert joined._extract_terms("follow-up") == ["follow-up"]
+        ids = {r["doc_id"] for r in joined.search("follow-up")}
+        assert ids == {"hyph", "spaced"}
+
+    @pytest.mark.parametrize("query", ["-alpha", "'alpha'", "\u2019alpha\u2019", "alpha-"])
+    def test_leading_and_trailing_joiners_are_separators(self, bm25, query):
+        assert bm25._extract_terms(query) == ["alpha"]
+        assert bm25._sanitize_query(query) == '"alpha"'

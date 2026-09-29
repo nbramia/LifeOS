@@ -191,25 +191,42 @@ class BM25Index:
         'for', 'of', 'with', 'by',
     })
 
+    _JOINERS = frozenset("'\u2019-")
+
     @staticmethod
     def _extract_terms(query: str) -> list[str]:
-        """Split text into runs of letters, digits and combining marks (NFC-normalized)."""
+        """
+        Split text into terms (NFC-normalized).
+
+        A term is a run of letters, digits and combining marks that may contain
+        apostrophes (``'``, U+2019) and hyphens between them, so ``name's`` and
+        ``follow-up`` stay single terms. Leading and trailing joiners are
+        separators.
+        """
         terms: list[str] = []
         current: list[str] = []
+
+        def flush() -> None:
+            while current and current[-1] in BM25Index._JOINERS:
+                current.pop()
+            if current:
+                terms.append("".join(current))
+            current.clear()
+
         for ch in unicodedata.normalize("NFC", query) + " ":
             if ch.isalnum() or unicodedata.category(ch).startswith("M"):
                 current.append(ch)
-                continue
-            if any(c.isalnum() for c in current):
-                terms.append("".join(current))
-            current = []
+            elif ch in BM25Index._JOINERS and current:
+                current.append(ch)
+            else:
+                flush()
         return terms
 
     def _sanitize_query(self, query: str, use_or: bool = False) -> str:
         """
         Turn arbitrary text into a valid FTS5 MATCH expression.
 
-        Every run of letters, digits and combining marks (after NFC
+        Every term from ``_extract_terms`` (after NFC
         normalization) becomes a double-quoted term, so no
         character in the input (punctuation, symbols, emoji, a leading ``-``
         or ``^``, ``col:`` filters) and no uppercase ``AND``/``OR``/``NOT``/
