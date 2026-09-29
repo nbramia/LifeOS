@@ -32,6 +32,7 @@ from typing import Optional, TYPE_CHECKING
 from config.settings import settings
 from api.services.query_classifier import classify_query
 from api.services.perf_trace import trace_span
+from api.services.search_facets import SearchFacets, resolve_allowed_paths
 
 # Lazy imports to avoid slow ChromaDB initialization at import time
 if TYPE_CHECKING:
@@ -367,7 +368,8 @@ class HybridSearch:
     def __init__(
         self,
         vector_store: Optional["VectorStore"] = None,
-        bm25_index: Optional["BM25Index"] = None
+        bm25_index: Optional["BM25Index"] = None,
+        tag_store=None,
     ):
         """
         Initialize hybrid search.
@@ -375,9 +377,12 @@ class HybridSearch:
         Args:
             vector_store: Vector store instance (default creates new)
             bm25_index: BM25 index instance (default uses singleton)
+            tag_store: Vault tag store for machine facets (default opens the
+                tag database when it exists)
         """
         self.vector_store = vector_store
         self.bm25_index = bm25_index
+        self.tag_store = tag_store
 
     def _get_vector_store(self):
         """Lazy-load vector store."""
@@ -407,6 +412,7 @@ class HybridSearch:
         rerank_candidates: int = 50,
         date_from: str | None = None,
         date_to: str | None = None,
+        facets: SearchFacets | None = None,
     ) -> list[dict]:
         """
         Perform hybrid search combining vector and BM25 with optional cross-encoder re-ranking.
@@ -430,6 +436,10 @@ class HybridSearch:
             rerank_candidates: Number of candidates to fetch for re-ranking (default 50)
             date_from: Optional inclusive lower bound (YYYY-MM-DD) on doc date
             date_to: Optional inclusive upper bound (YYYY-MM-DD) on doc date
+            facets: Optional structured facets. By default they pre-filter both
+                arms to the files that satisfy them (zero matching files
+                returns []). With ``facets.boost`` they instead multiply the
+                score of matching results by ``settings.search_facet_boost``.
 
         Returns:
             List of dicts with id, content, file_path, file_name, hybrid_score
@@ -446,10 +456,33 @@ class HybridSearch:
             if expanded_query != query:
                 logger.debug(f"Expanded query: '{query}' -> '{expanded_query}'")
 
+        # Resolve facets to the set of allowed files. A filter restricts both
+        # arms before ranking; a boost only rewards matching results.
+        facet_names = facets.active() if facets else []
+        allowed_paths: set[str] | None = None
+        boost_paths: set[str] = set()
+        if facet_names:
+            with trace_span("search_facets", parent="tool_search_vault"):
+                resolved = resolve_allowed_paths(
+                    facets, self._get_vector_store(), self._get_bm25_index(),
+                    tag_store=self.tag_store,
+                )
+            if facets.boost:
+                boost_paths = resolved
+            else:
+                if not resolved:
+                    self._record_attribution(query, top_k, 0, 0, "none", [], facet_names)
+                    return []
+                allowed_paths = resolved
+        arm_kwargs = {} if allowed_paths is None else {"file_paths": allowed_paths}
+
         # Get vector results (use expanded query for better semantic matching)
         with trace_span("search_vector", parent="tool_search_vault"):
             vector_store = self._get_vector_store()
-            vector_results = vector_store.search(query=expanded_query, top_k=fetch_k)
+            vector_kwargs = {} if allowed_paths is None else {"file_paths": sorted(allowed_paths)}
+            vector_results = vector_store.search(
+                query=expanded_query, top_k=fetch_k, **vector_kwargs
+            )
 
         # Fusion keys are normalized (vector_fusion_id) so a chunk found by
         # both vector and BM25 fuses into one RRF entry; the result dict's
@@ -473,7 +506,7 @@ class HybridSearch:
 
             if bm25_index:
                 try:
-                    bm25_results = bm25_index.search(expanded_query, limit=fetch_k)
+                    bm25_results = bm25_index.search(expanded_query, limit=fetch_k, **arm_kwargs)
                     if bm25_results:
                         bm25_match_mode = dict(
                             Counter(r.get("match_mode") or "unknown" for r in bm25_results)
@@ -498,11 +531,17 @@ class HybridSearch:
                 vector_results = [
                     r for r in vector_results if in_date_range(r, date_from, date_to)
                 ]
+            if boost_paths:
+                for r in vector_results:
+                    if r.get("file_path") in boost_paths:
+                        r["score"] = r.get("score", 0.0) * settings.search_facet_boost
+                vector_results.sort(key=lambda r: r.get("score", 0.0), reverse=True)
             vector_results = vector_results[:top_k]
             for r in vector_results:
                 r["found_by"] = "vector"
             self._record_attribution(
-                query, top_k, len(vector_doc_ids), 0, bm25_match_mode, vector_results
+                query, top_k, len(vector_doc_ids), 0, bm25_match_mode, vector_results,
+                facet_names,
             )
             return vector_results
 
@@ -597,6 +636,9 @@ class HybridSearch:
                             logger.debug(f"Filename boost applied: {file_name} contains {person_name}")
                             break
 
+                if boost_paths and result.get("file_path") in boost_paths:
+                    final_score *= settings.search_facet_boost
+
                 result["hybrid_score"] = final_score
                 result["rrf_score"] = rrf_score
                 final_results.append(result)
@@ -640,7 +682,7 @@ class HybridSearch:
 
         self._record_attribution(
             query, top_k, len(vector_doc_ids), len(bm25_doc_ids),
-            bm25_match_mode, final_results,
+            bm25_match_mode, final_results, facet_names,
         )
         return final_results
 
@@ -652,11 +694,13 @@ class HybridSearch:
         bm25_candidates: int,
         bm25_match_mode: str | dict,
         final_results: list[dict],
+        facet_names: list[str] | None = None,
     ) -> None:
         """Record the tool query and per-arm attribution of the returned
         results as a ``search_attribution`` span (no-op without a trace).
 
-        Only counts and the query are recorded; result content never is."""
+        Only counts, the query and the names of the facets used (never their
+        values) are recorded; result content never is."""
         counts = {"vector_only": 0, "bm25_only": 0, "both": 0}
         for r in final_results:
             key = {"vector": "vector_only", "bm25": "bm25_only"}.get(
@@ -673,6 +717,7 @@ class HybridSearch:
             bm25_match_mode=bm25_match_mode,
             attribution=counts,
             top_k=top_k,
+            **({"facets": facet_names} if facet_names else {}),
         ):
             pass
 

@@ -149,6 +149,20 @@ def _format_task_collection(
             text += "\nScope: filtered task list; results include only matching tasks.\n"
     return text
 
+# Optional narrowing parameters of lifeos_search. They are flat tool arguments;
+# the call folds them into the API's `filters` object. Same names and
+# semantics as the orchestrator's search_vault tool.
+_SEARCH_FACET_PROPERTIES = {
+    "folder": {"type": "string", "description": "Only notes under this vault-relative folder (e.g. 'Work/Meetings')."},
+    "note_type": {"type": "array", "items": {"type": "string"}, "description": "Only these note types (e.g. 'Granola' meeting transcripts, 'Personal', 'Work', 'ML', 'LifeOS')."},
+    "people": {"type": "array", "items": {"type": "string"}, "description": "Only notes that mention any of these people."},
+    "tags": {"type": "array", "items": {"type": "string"}, "description": "Only notes carrying any of these human tags (frontmatter tags)."},
+    "doc_type": {"type": "array", "items": {"type": "string"}, "description": "Only these machine-tagged document types (e.g. 'meeting', 'journal')."},
+    "domain": {"type": "array", "items": {"type": "string"}, "description": "Only these machine-tagged life domains."},
+    "topic": {"type": "array", "items": {"type": "string"}, "description": "Only these machine-tagged topics; a parent topic also matches its children."},
+    "project": {"type": "array", "items": {"type": "string"}, "description": "Only notes tagged with these projects."},
+}
+
 # Curated list of endpoints to expose as tools (path -> tool config)
 # This allows us to control which endpoints are exposed and how they're described
 CURATED_ENDPOINTS = {
@@ -159,7 +173,7 @@ CURATED_ENDPOINTS = {
     },
     "/api/search": {
         "name": "lifeos_search",
-        "description": "Search the vault without synthesis. Returns raw document chunks with relevance scores. Use when you need specific documents or want to process results yourself. For synthesized answers, use lifeos_ask instead.",
+        "description": "Raw vault chunks with scores, no synthesis. Narrow with facets (doc_type, topic, folder, people, dates) applied before ranking, e.g. hiring meetings since July. For answers use lifeos_ask.",
         "method": "POST"
     },
     "/api/calendar/upcoming": {
@@ -712,6 +726,8 @@ class LifeOSMCPServer:
                 input_schema.get("properties", {}).get("fields", {})["description"] = (
                     _TASK_UPDATE_FIELDS_DESCRIPTION
                 )
+            if config["name"] == "lifeos_search":
+                self._apply_search_facet_schema(input_schema)
             self._add_turn_header_arg(input_schema, config)
             self._add_request_key_header_arg(input_schema, config)
             tool = {
@@ -720,6 +736,31 @@ class LifeOSMCPServer:
                 "inputSchema": input_schema,
             }
             self.tools.append(tool)
+
+    @staticmethod
+    def _apply_search_facet_schema(input_schema: dict) -> None:
+        """Advertise lifeos_search's facets as flat arguments (no nested `filters`)."""
+        props = input_schema.setdefault("properties", {})
+        props.pop("filters", None)
+        props.update({k: dict(v) for k, v in _SEARCH_FACET_PROPERTIES.items()})
+
+    @staticmethod
+    def _fold_search_facets(arguments: dict) -> None:
+        """Move flat facet arguments of lifeos_search into the API's `filters`."""
+        filters = dict(arguments.get("filters") or {})
+        for key in _SEARCH_FACET_PROPERTIES:
+            if key not in arguments:
+                continue
+            value = arguments.pop(key)
+            if value in (None, "", []):
+                continue
+            if key != "folder" and isinstance(value, str):
+                value = [value]
+            filters[key] = value
+        if filters:
+            arguments["filters"] = filters
+        else:
+            arguments.pop("filters", None)
 
     def _find_spec_path(self, curated_path: str, paths: dict) -> str | None:
         """Find the matching OpenAPI spec path for a curated path."""
@@ -871,7 +912,8 @@ class LifeOSMCPServer:
                     "query": {"type": "string", "description": "Search query"},
                     "top_k": {"type": "integer", "description": "Number of results (1-100, default 20)", "default": 20},
                     "date_from": {"type": "string", "description": "Only return notes on/after this date (YYYY-MM-DD). Resolve relative phrases like 'last week' against today's date before passing."},
-                    "date_to": {"type": "string", "description": "Only return notes on/before this date (YYYY-MM-DD)."}
+                    "date_to": {"type": "string", "description": "Only return notes on/before this date (YYYY-MM-DD)."},
+                    **{k: dict(v) for k, v in _SEARCH_FACET_PROPERTIES.items()}
                 },
                 "required": ["query"]
             },
@@ -1647,6 +1689,8 @@ class LifeOSMCPServer:
         # like a fresh, uncached request.
         if tool_name == "lifeos_people_search":
             arguments.setdefault("limit", 10)
+        if tool_name == "lifeos_search":
+            self._fold_search_facets(arguments)
 
         # Cache check for read-only tools when the caller is session-aware.
         cache_key_args = arguments

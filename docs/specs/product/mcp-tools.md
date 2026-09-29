@@ -336,6 +336,14 @@ Search the vault without synthesis. Returns raw search results.
 |------|------|----------|-------------|
 | query | string | Yes | Search query |
 | top_k | integer | No | Number of results (1-100, default: 10) |
+| date_from, date_to | string | No | Inclusive date window (YYYY-MM-DD) |
+| folder | string | No | Only notes under this vault-relative folder |
+| note_type | string[] | No | Only these note types |
+| people | string[] | No | Only notes mentioning any of these people |
+| tags | string[] | No | Only notes carrying any of these human tags |
+| doc_type, domain, topic, project | string[] | No | Machine-tagged facets; a parent `topic` also matches its children |
+
+The facets are flat arguments with the same names and meaning as the orchestrator's `search_vault` tool and the `/api/search` `filters` object (the call folds them into `filters`). Values within one facet match any; different facets must all match. They apply before ranking, so a selective facet still returns its best matches. See [Search and Indexing — Facets](../technical/search-indexing.md#facets).
 
 ### lifeos_calendar_upcoming
 

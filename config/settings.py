@@ -1286,6 +1286,11 @@ class Settings(BaseSettings):
         alias="LIFEOS_RERANKER_ENABLED"
     )
     reranker_candidates: int = 50
+    search_facet_boost: float = Field(
+        default=1.2,
+        alias="LIFEOS_SEARCH_FACET_BOOST",
+        description="Score multiplier for results matching facets requested with boost=True"
+    )
 
     # Notifications
     alert_email: str = Field(

@@ -241,6 +241,19 @@ Vector similarity search across indexed content.
 }
 ```
 
+`filters` fields are all optional:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `note_type` | string[] | Only these note types |
+| `people` | string[] | Only notes mentioning any of these people |
+| `folder` | string | Only notes under this vault-relative folder |
+| `tags` | string[] | Only notes carrying any of these human tags |
+| `doc_type`, `domain`, `topic`, `project` | string[] | Machine-tagged facets; a parent `topic` also matches its children |
+| `date_from`, `date_to` | string | Inclusive date bounds on already-ranked results |
+
+Values within one field match any; different fields must all match. The facets (everything except `date_from`/`date_to` inside `filters`) restrict both search arms before ranking, so a selective filter returns its best matches instead of an emptied top-k. A filter that matches no file returns an empty `results` list. Omitting `filters` leaves search unchanged. The top-level `date_from`/`date_to` request fields window the search itself. See [Search and Indexing — Facets](../technical/search-indexing.md#facets).
+
 ---
 
 ## Google Integration

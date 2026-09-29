@@ -72,6 +72,24 @@ The query classifier (`api/services/query_classifier.py`) determines whether a q
 
 **Tag phrase in chunk context.** Each chunk's contextual prefix (`generate_chunk_context`) carries a tag phrase when the file's tag row has `doc_type_conf` of 0.6 or above: `Classified as <doc_type> in the <domain> domain about <topic>`, plus ` for project <project>` when `project_conf` is 0.6 or above and the project is not `none`. Underscores and `/` in tag values become spaces (`work/hiring` reads `work hiring`), parts without a value are omitted, and no people names appear. The prefix is embedded and keyword-indexed with the chunk, so a note is reachable by what it is about even when its body never uses the word. The indexer looks the row up by vault-relative POSIX path, the key `sync_vault_tag.py` writes; a missing store or row leaves the prefix unchanged. A change to a file's phrase tuple re-embeds it on the next reindex — see [data-and-sync.md](data-and-sync.md).
 
+### Facets
+
+`HybridSearch.search(..., facets=SearchFacets(...))` (`api/services/search_facets.py`) narrows a search by `folder`, `note_type`, `people`, `tags` (human tags), and the machine facets `doc_type`, `domain`, `topic`, `project`. A list matches any of its items; different facets must all match. The `/api/search` `filters`, the `search_vault` orchestrator tool, and the `lifeos_search` MCP tool expose the same fields.
+
+Facets resolve to a set of allowed absolute file paths that both arms use as a pre-filter before ranking:
+
+| Facet | Source |
+|-------|--------|
+| `doc_type`, `domain`, `topic`, `project` | Vault tag store. It keys vault-relative paths; they are joined to `settings.vault_path` to match the absolute paths the indexes use. A missing or empty store matches nothing. A parent `topic` matches its `parent/child` topics. |
+| `note_type` | Vector-store chunk metadata (`note_type`), read as chunk ids only |
+| `tags` | Vector-store chunk metadata: each tag is also stored as a boolean key `tag:<lowercased tag>` (the JSON `tags` string remains). Chunks indexed before the keys existed match no tag until re-indexed. |
+| `people` | BM25 `people` column |
+| `folder` | Vault-relative directory, matched on a path-segment boundary (`Work/Meetings` never matches `Work/Meetings-old`); a value that escapes the vault matches nothing. Applied as a prefix test on the other facets' sets, or as a prefix scan of the BM25 catalog when it is the only facet. |
+
+The vector arm restricts with a Chroma `where` on `file_path` (`$in`). Allowed sets longer than 2,000 paths run as batched queries whose candidates are merged by distance, so the result equals one unbounded query without an oversized parameter list. On a synthetic 48,000-chunk, 9,600-file collection (1,536 dimensions) a restricted vector query costs about 40 ms up to 2,000 files, about 70 ms for 4,000 and about 190 ms for the whole set, against 4 ms unrestricted. The BM25 arm restricts inside the FTS query with a per-row path check, applied before `LIMIT`, so a selective restriction still fills the candidate list.
+
+A facet set that matches zero files returns `[]` immediately; nothing is recorded as a degradation. With no facets the arms are called exactly as without this feature. With `SearchFacets(..., boost=True)` nothing is filtered; results whose file matches the facets have their fused score multiplied by `LIFEOS_SEARCH_FACET_BOOST` (default 1.2). The `search_attribution` span records the names of the facets used, never their values.
+
 ## Key Files
 
 | File | Purpose |
@@ -79,6 +97,7 @@ The query classifier (`api/services/query_classifier.py`) determines whether a q
 | `api/services/hybrid_search.py` | Main search logic |
 | `api/services/vectorstore.py` | ChromaDB wrapper |
 | `api/services/bm25_index.py` | BM25 index |
+| `api/services/search_facets.py` | Facet model and facet-to-allowed-paths resolution |
 | `api/services/query_classifier.py` | Factual vs semantic detection |
 | `api/services/reranker.py` | Cross-encoder re-ranking service |
 | `api/services/query_router.py` | LLM-based source routing + person name extraction |

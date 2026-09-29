@@ -103,7 +103,14 @@ TOOL_DEFINITIONS = [
         "description": (
             f"Search {_user}'s Obsidian vault (notes, meeting transcripts, journals, project docs). "
             "Returns relevance-ranked text chunks with file names. "
-            "Good for written records, decisions, project details. Returns chunks, not full files."
+            "Good for written records, decisions, project details. Returns chunks, not full files. "
+            "Narrow with the optional filters instead of a broader query when the request names a "
+            "kind of note, time window, place or person: they apply before ranking, so a selective "
+            "filter still returns its best matches. E.g. 'meeting notes about hiring since July' -> "
+            "doc_type=meeting, topic=hiring, date_from=<July 1>; 'what did I journal last week' -> "
+            "doc_type=journal + dates; notes under a folder -> folder; notes mentioning someone -> "
+            "people. List values match any of the items; different filters must all match. "
+            "Omit filters to search everything."
         ),
         "input_schema": {
             "type": "object",
@@ -115,6 +122,46 @@ TOOL_DEFINITIONS = [
                 "top_k": {
                     "type": "integer",
                     "description": "Number of results to return (default 40). A capped result says so — raise this to reach past it.",
+                },
+                "date_from": {
+                    "type": "string",
+                    "description": "Only notes on/after this date (YYYY-MM-DD). Resolve relative phrases against today's date.",
+                },
+                "date_to": {
+                    "type": "string",
+                    "description": "Only notes on/before this date (YYYY-MM-DD).",
+                },
+                "folder": {
+                    "type": "string",
+                    "description": "Only notes under this vault-relative folder (e.g. 'Work/Meetings').",
+                },
+                "note_type": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Only these note types (e.g. 'Granola' meeting transcripts, 'Personal', 'Work', 'ML', 'LifeOS').",
+                },
+                "people": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Only notes that mention any of these people.",
+                },
+                "tags": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Only notes carrying any of these human tags (frontmatter tags).",
+                },
+                "doc_type": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Only these machine-tagged document types (e.g. 'meeting', 'journal').",
+                },
+                "domain": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Only these machine-tagged life domains.",
+                },
+                "topic": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Only these machine-tagged topics; a parent topic also matches its children.",
+                },
+                "project": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Only notes tagged with these projects.",
                 },
             },
             "required": ["query"],
@@ -1417,11 +1464,29 @@ def _tool_search_vault(inp: dict) -> str:
         except (TypeError, ValueError):
             pass
     query = inp["query"]
-    results = hs.search(query, top_k=top_k)
+    search_kwargs = {}
+    for key in ("date_from", "date_to"):
+        value = inp.get(key)
+        if isinstance(value, str) and value.strip():
+            search_kwargs[key] = value.strip()
+    from api.services.search_facets import SearchFacets
+    facets = SearchFacets(**{
+        k: inp.get(k) for k in (
+            "folder", "note_type", "people", "tags",
+            "doc_type", "domain", "topic", "project",
+        )
+    })
+    if not facets.is_empty():
+        search_kwargs["facets"] = facets
+    results = hs.search(query, top_k=top_k, **search_kwargs)
     if not results:
         # Echo the query: an empty here is a fact about this wording, and the
         # model needs to see what was asked to try a different one.
-        return f"No vault results found for query {query!r}.{reduced_note}"
+        filter_note = (
+            f" with filters {', '.join(facets.active())}"
+            if not facets.is_empty() else ""
+        )
+        return f"No vault results found for query {query!r}{filter_note}.{reduced_note}"
     lines = []
     used = 0
     for i, r in enumerate(results, 1):

@@ -21,6 +21,19 @@ from config.settings import settings
 # never be mistaken for a vault-root sample.
 _NON_VAULT_NOTE_TYPES = ["calendar_event", "slack_message"]
 
+# Chroma has no metadata operator for "list contains", so each human tag is
+# also stored as a boolean key ``tag:<lowercased tag>`` a ``where`` can match.
+TAG_KEY_PREFIX = "tag:"
+
+# A ``file_path $in`` list is split into batches of this many paths so no
+# single query carries an oversized parameter list.
+FILE_PATH_BATCH = 2000
+
+
+def tag_key(tag: str) -> str:
+    """Metadata key that marks a chunk as carrying ``tag``."""
+    return TAG_KEY_PREFIX + tag.strip().lstrip("#").lower()
+
 
 class VectorStore:
     """ChromaDB-backed vector store for document chunks."""
@@ -130,6 +143,8 @@ class VectorStore:
                         chunk_meta[key] = value
                     elif value is None:
                         chunk_meta[key] = ""
+            for tag in metadata.get("tags") or []:
+                chunk_meta.setdefault(tag_key(str(tag)), True)
             metadatas.append(chunk_meta)
 
         # Add to collection
@@ -196,7 +211,8 @@ class VectorStore:
         query: str,
         top_k: int = 20,
         filters: Optional[dict] = None,
-        recency_weight: float = 0.6
+        recency_weight: float = 0.6,
+        file_paths: Optional[list[str]] = None,
     ) -> list[dict]:
         """
         Search for similar chunks with heavy recency bias.
@@ -206,6 +222,10 @@ class VectorStore:
             top_k: Number of results to return
             filters: Optional metadata filters
             recency_weight: Weight for recency vs semantic similarity (0.6 = 60% recency)
+            file_paths: When given, only chunks of these files are candidates
+                (pre-filter inside the vector query); an empty list matches
+                nothing. Large lists run as batched queries whose candidates
+                are merged by distance.
 
         Returns:
             List of result dicts with content, metadata, and score
@@ -225,12 +245,17 @@ class VectorStore:
         fetch_count = min(top_k * 5, 100)
 
         # Query collection
-        results = self._collection.query(
-            query_embeddings=[query_embedding],
-            n_results=fetch_count,
-            where=where if where else None,
-            include=["documents", "metadatas", "distances"]
-        )
+        if file_paths is None:
+            results = self._collection.query(
+                query_embeddings=[query_embedding],
+                n_results=fetch_count,
+                where=where if where else None,
+                include=["documents", "metadatas", "distances"]
+            )
+        else:
+            results = self._query_restricted(
+                query_embedding, fetch_count, where, file_paths
+            )
 
         # Format and score results
         formatted = []
@@ -279,6 +304,56 @@ class VectorStore:
         formatted.sort(key=lambda x: x["score"], reverse=True)
 
         return formatted[:top_k]
+
+    def _query_restricted(
+        self,
+        query_embedding,
+        fetch_count: int,
+        filters_where: Optional[dict],
+        file_paths: list[str],
+    ) -> dict:
+        """Nearest-neighbour query limited to chunks of ``file_paths``.
+
+        The path restriction is a ``file_path $in`` clause inside the vector
+        query (a pre-filter). Lists longer than ``FILE_PATH_BATCH`` run as one
+        query per batch; each batch returns its own nearest ``fetch_count``
+        and the union is cut back to the overall nearest ``fetch_count``, so
+        the merged result equals a single unbounded query.
+        """
+        empty = {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
+        rows = []
+        for i in range(0, len(file_paths), FILE_PATH_BATCH):
+            batch = file_paths[i:i + FILE_PATH_BATCH]
+            conds = [{k: v} for k, v in (filters_where or {}).items()]
+            conds.append({"file_path": {"$in": batch}})
+            res = self._collection.query(
+                query_embeddings=[query_embedding],
+                n_results=fetch_count,
+                where=conds[0] if len(conds) == 1 else {"$and": conds},
+                include=["documents", "metadatas", "distances"],
+            )
+            if res["ids"] and res["ids"][0]:
+                rows.extend(zip(
+                    res["distances"][0], res["ids"][0],
+                    res["documents"][0], res["metadatas"][0],
+                ))
+        if not rows:
+            return empty
+        rows.sort(key=lambda r: r[0])
+        rows = rows[:fetch_count]
+        return {
+            "ids": [[r[1] for r in rows]],
+            "documents": [[r[2] for r in rows]],
+            "metadatas": [[r[3] for r in rows]],
+            "distances": [[r[0] for r in rows]],
+        }
+
+    def file_paths_matching(self, where: Optional[dict] = None) -> set[str]:
+        """Distinct file paths of chunks matching a Chroma ``where`` (all when None).
+
+        Reads chunk ids only (``{path}::{chunk}``), never documents or vectors."""
+        res = self._collection.get(where=where, include=[])
+        return {i.rpartition("::")[0] if "::" in i else i for i in res["ids"]}
 
     def delete_document(self, file_path: str) -> None:
         """
