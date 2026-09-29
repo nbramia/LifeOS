@@ -198,8 +198,62 @@ def test_main_prints_per_signal_counts_only(tmp_path, capsys):
     assert mine_pairs.main(["--db", str(db), "--out", str(out), "--vault", str(vault)]) == 0
     printed = capsys.readouterr().out.strip()
     assert printed == ("mined=0 cited=1 manual=0 skipped_truncated_ambiguous=0 "
-                       "skipped_truncated_nomatch=0 kept=1")
+                       "skipped_truncated_nomatch=0 deduped=0 kept=1")
     assert len(out.read_text().splitlines()) == 1
+
+
+def test_miner_dedupes_repeated_turns_and_records_count(tmp_path, capsys):
+    vault = _make_vault(tmp_path)
+    db = tmp_path / "c.db"
+    cite_a = {"file_name": "a.md", "file_path": "/v/a.md", "source_type": "vault"}
+    cite_b = {"file_name": "b.md", "file_path": "/v/b.md", "source_type": "vault"}
+    _build_db(db, [
+        _user("u1", "c1", "2026-01-01 00:00:01", "Where is the plan"),
+        _assistant("a1", "c1", "2026-01-01 00:00:02", ["search_vault"], [cite_a]),
+        # same query modulo case and whitespace, same files: merged
+        _user("u2", "c1", "2026-01-01 00:00:03", "  where is the PLAN "),
+        _assistant("a2", "c1", "2026-01-01 00:00:04", ["search_vault"], [cite_a]),
+        # same query, different files: kept separate
+        _user("u3", "c2", "2026-01-01 00:00:05", "where is the plan"),
+        _assistant("a3", "c2", "2026-01-01 00:00:06", ["search_vault"], [cite_b]),
+        _user("u4", "c2", "2026-01-01 00:00:07", "where is the plan"),
+        _assistant("a4", "c2", "2026-01-01 00:00:08", ["search_vault"], [cite_a]),
+    ])
+    out = tmp_path / "pairs.jsonl"
+    assert mine_pairs.main(["--db", str(db), "--out", str(out), "--vault", str(vault)]) == 0
+    recs = [json.loads(line) for line in out.read_text().splitlines()]
+    assert [(r["relevant_files"], r["count"]) for r in recs] == [(["/v/a.md"], 3), (["/v/b.md"], 1)]
+    assert "deduped=2 kept=2" in capsys.readouterr().out
+
+
+def _score_main(monkeypatch, capsys, tmp_path, *extra):
+    import score
+
+    ranked = {"q hot": ["x.md", "a.md"], "q cold": ["y.md"]}
+    monkeypatch.setattr(score, "make_searcher", lambda arm, db: (lambda q, k: ranked[q]))
+    pairs = tmp_path / "p.jsonl"
+    pairs.write_text("\n".join(json.dumps(r) for r in [
+        {"query": "q hot", "relevant_files": ["a.md"], "source": "mined", "count": 3},
+        {"query": "q cold", "relevant_files": ["b.md"], "source": "mined"},
+    ]))
+    assert score.main(["--arm", "bm25", "--pairs", str(pairs), *extra]) == 0
+    return capsys.readouterr().out
+
+
+def test_score_default_counts_each_record_once(monkeypatch, capsys, tmp_path):
+    # q hot: a.md at rank 2 -> recall@10 1, RR 1/2. q cold: b.md absent -> 0, 0.
+    # Unweighted: recall@10 = (1 + 0) / 2 = 0.5; MRR = (1/2 + 0) / 2 = 0.25.
+    out = _score_main(monkeypatch, capsys, tmp_path)
+    assert "n=2" in out and "weight=" not in out
+    assert "recall@10=0.500" in out and "mrr=0.250" in out
+
+
+def test_score_weighted_uses_count(monkeypatch, capsys, tmp_path):
+    # Weights 3 (count=3) and 1 (count absent). Total weight 4.
+    # recall@10 = (3*1 + 1*0) / 4 = 0.75; MRR = (3*1/2 + 0) / 4 = 0.375.
+    out = _score_main(monkeypatch, capsys, tmp_path, "--weighted")
+    assert "n=2" in out and "weight=4" in out
+    assert "recall@10=0.750" in out and "mrr=0.375" in out
 
 
 def test_filter_pairs_excludes_sources():

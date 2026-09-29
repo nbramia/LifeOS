@@ -4,7 +4,7 @@
 Usage:
     python scripts/retrieval_eval/score.py --arm hybrid|bm25|vector [--k 10]
         [--pairs data/retrieval_eval/pairs.jsonl] [--bm25-db PATH]
-        [--exclude-source mined|cited|manual ...] [--verbose]
+        [--exclude-source mined|cited|manual ...] [--weighted] [--verbose]
 
 Arms:
   hybrid  POST /api/search on LIFEOS_SERVER_URL (default http://localhost:8000).
@@ -12,6 +12,8 @@ Arms:
           so point this at a COPY of data/bm25_index.db, never the live file.
   vector  VectorStore.search directly. Loads the embedding model in this
           process; run with HIP_VISIBLE_DEVICES="" (CPU) to avoid GPU contention.
+
+Each record counts once; --weighted weights it by its `count` (1 when absent).
 
 Queries and file names are never printed unless --verbose is given.
 """
@@ -70,6 +72,8 @@ def main(argv=None) -> int:
     ap.add_argument("--exclude-source", action="append", default=[],
                     choices=["mined", "cited", "manual"],
                     help="drop pairs with this source (repeatable), e.g. cited to avoid retriever bias")
+    ap.add_argument("--weighted", action="store_true",
+                    help="weight each record by its `count` field (default 1) instead of once each")
     ap.add_argument("--verbose", "--show-queries", action="store_true",
                     help="list queries (and their relevant files) that miss at top-k")
     args = ap.parse_args(argv)
@@ -79,8 +83,9 @@ def main(argv=None) -> int:
     pairs = filter_pairs(load_pairs(Path(args.pairs)), args.exclude_source)
     search = make_searcher(args.arm, args.bm25_db)
     rankings = [(search(p["query"], WIDE_K), p["relevant_files"]) for p in pairs]
-    res = score_queries(rankings, k=args.k, k_wide=WIDE_K)
-    print(f"arm={args.arm} n={res['n']}")
+    weights = [p.get("count", 1) for p in pairs] if args.weighted else None
+    res = score_queries(rankings, k=args.k, k_wide=WIDE_K, weights=weights)
+    print(f"arm={args.arm} n={res['n']}" + (f" weight={sum(weights)}" if weights else ""))
     print(f"recall@{args.k}={res[f'recall@{args.k}']:.3f} "
           f"recall@{WIDE_K}={res[f'recall@{WIDE_K}']:.3f} mrr={res['mrr']:.3f}")
     if args.verbose:

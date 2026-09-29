@@ -44,16 +44,22 @@ def reciprocal_rank(ranked_refs: list[str], relevant: list[str]) -> float:
     return 0.0
 
 
-def score_queries(rankings: list[tuple[list[str], list[str]]], k: int = 10, k_wide: int = 40) -> dict:
-    """Average recall@k, recall@k_wide and MRR over (ranked_refs, relevant) pairs."""
+def score_queries(rankings: list[tuple[list[str], list[str]]], k: int = 10, k_wide: int = 40,
+                  weights: list[float] | None = None) -> dict:
+    """Average recall@k, recall@k_wide and MRR over (ranked_refs, relevant) pairs.
+
+    `weights` (one per pair, default 1 each) makes each average a weighted mean.
+    """
     n = len(rankings)
-    if n == 0:
-        return {"n": 0, f"recall@{k}": 0.0, f"recall@{k_wide}": 0.0, "mrr": 0.0}
+    w = weights if weights is not None else [1.0] * n
+    total = float(sum(w))
+    if n == 0 or total == 0:
+        return {"n": n, f"recall@{k}": 0.0, f"recall@{k_wide}": 0.0, "mrr": 0.0}
     return {
         "n": n,
-        f"recall@{k}": sum(recall_at_k(r, rel, k) for r, rel in rankings) / n,
-        f"recall@{k_wide}": sum(recall_at_k(r, rel, k_wide) for r, rel in rankings) / n,
-        "mrr": sum(reciprocal_rank(r, rel) for r, rel in rankings) / n,
+        f"recall@{k}": sum(x * recall_at_k(r, rel, k) for x, (r, rel) in zip(w, rankings)) / total,
+        f"recall@{k_wide}": sum(x * recall_at_k(r, rel, k_wide) for x, (r, rel) in zip(w, rankings)) / total,
+        "mrr": sum(x * reciprocal_rank(r, rel) for x, (r, rel) in zip(w, rankings)) / total,
     }
 
 

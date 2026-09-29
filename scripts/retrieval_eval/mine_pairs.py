@@ -20,6 +20,9 @@ Usage:
         [--out data/retrieval_eval/pairs.jsonl] [--vault DIR]
         [--manual FILE.yaml|FILE.jsonl] [--manual-only]
 
+Records with the same source, query and relevant files collapse into one
+carrying `count`, the number of turns that produced it.
+
 Prints counts only. The output file holds real queries and file names; it lives
 under data/ and is never committed.
 """
@@ -155,6 +158,21 @@ def mine(db_path: Path, resolver: VaultResolver | None = None, stats: dict | Non
     return pairs
 
 
+def dedupe(pairs: list[dict]) -> list[dict]:
+    """Collapse records with the same source, query and file set into one with a `count`.
+
+    Queries compare stripped and case-folded; the first-seen record and order win.
+    """
+    merged: dict[tuple, dict] = {}
+    for p in pairs:
+        key = (p["source"], p["query"].strip().lower(), tuple(sorted(p["relevant_files"])))
+        if key in merged:
+            merged[key]["count"] += 1
+        else:
+            merged[key] = {**p, "count": 1}
+    return list(merged.values())
+
+
 def load_manual(path: Path) -> list[dict]:
     text = path.read_text()
     if path.suffix in (".yaml", ".yml"):
@@ -184,6 +202,7 @@ def main(argv=None) -> int:
 
     stats = new_stats()
     pairs: list[dict] = []
+    deduped = 0
     if not args.manual_only:
         vault = args.vault
         if not vault:
@@ -191,7 +210,9 @@ def main(argv=None) -> int:
             from config.settings import settings
 
             vault = settings.vault_path
-        pairs = mine(Path(args.db), VaultResolver(Path(vault)), stats)
+        raw = mine(Path(args.db), VaultResolver(Path(vault)), stats)
+        pairs = dedupe(raw)
+        deduped = len(raw) - len(pairs)
     manual = load_manual(Path(args.manual)) if args.manual else []
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -204,7 +225,7 @@ def main(argv=None) -> int:
     n = lambda s: sum(1 for p in pairs if p["source"] == s)  # noqa: E731
     print(f"mined={n('mined')} cited={n('cited')} manual={len(manual)} "
           f"skipped_truncated_ambiguous={stats['skipped_truncated_ambiguous']} "
-          f"skipped_truncated_nomatch={stats['skipped_truncated_nomatch']} kept={len(kept) + len(pairs) + len(manual)}")
+          f"skipped_truncated_nomatch={stats['skipped_truncated_nomatch']} deduped={deduped} kept={len(kept) + len(pairs) + len(manual)}")
     return 0
 
 
