@@ -387,6 +387,26 @@ class TestHybridSearch:
         )
         assert [r.get("id") for r in results] == ["undated"]
 
+    def test_bm25_exception_records_degradation(self):
+        """A raising BM25 index degrades to vector-only and records it."""
+        from api.services.hybrid_search import HybridSearch
+        from unittest.mock import MagicMock, patch
+
+        mock_vector_store = MagicMock()
+        mock_vector_store.search.return_value = [
+            {"id": "chunk1", "content": "Test content", "metadata": {}},
+        ]
+        broken_bm25 = MagicMock()
+        broken_bm25.search.side_effect = RuntimeError("index unreadable")
+
+        hybrid = HybridSearch(vector_store=mock_vector_store, bm25_index=broken_bm25)
+        with patch("api.services.service_health.record_degradation") as record:
+            results = hybrid.search("test", top_k=5)
+
+        assert [r["id"] for r in results] == ["chunk1"]
+        record.assert_called_once()
+        assert record.call_args.args[:3] == ("bm25_index", "hybrid_search", "vector_only")
+
     def test_fallback_to_vector_only(self, temp_db):
         """Should fallback to vector search if BM25 returns no results."""
         from api.services.hybrid_search import HybridSearch

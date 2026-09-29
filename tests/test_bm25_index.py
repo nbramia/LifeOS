@@ -135,3 +135,81 @@ class TestDocDates:
         bm25.clear()
         bm25.add_document("d1", "budget", "a.md")
         assert bm25.search("budget")[0]["modified_date"] == ""
+
+
+@pytest.fixture
+def seeded(bm25):
+    bm25.bulk_add([
+        {"doc_id": "d1", "content": "we discussed hiring plans for the platform team", "file_name": "Hiring.md"},
+        {"doc_id": "d2", "content": "the roadmap owner is the platform lead", "file_name": "Roadmap.md"},
+        {"doc_id": "d3", "content": "cloud costs are rising while local inference is cheap", "file_name": "Infra.md"},
+        {"doc_id": "d4", "content": "alpha and beta rollout notes", "file_name": "Rollout.md"},
+        {"doc_id": "d5", "content": "project tag planning session", "file_name": "Tags.md"},
+        {"doc_id": "d6", "content": "gamma launch checklist", "file_name": "Gamma.md"},
+        {"doc_id": "d7", "content": "delta budget summary", "file_name": "Delta.md"},
+    ])
+    return bm25
+
+
+class TestQuerySanitizing:
+    @pytest.mark.parametrize("query,expected_doc", [
+        ("what did we decide about hiring, and who owns it?", "d1"),
+        ("alpha/beta rollout", "d4"),
+        ("platform = lead", "d2"),
+        ("cloud OR local costs", "d3"),
+        ("/roadmap", "d2"),
+        ("alpha & beta", "d4"),
+        ("#tag planning", "d5"),
+        ('\U0001F680 "gamma" launch', "d6"),
+        ("-budget ^delta", "d7"),
+        ("notes:rollout", "d4"),
+    ])
+    def test_query_shapes_return_results_without_error(self, seeded, caplog, query, expected_doc):
+        with caplog.at_level("WARNING"):
+            results = seeded.search(query)
+        assert "BM25 search error" not in caplog.text
+        assert expected_doc in [r["doc_id"] for r in results]
+
+    @pytest.mark.parametrize("char", list(",/=&|+#@<>'\"()[]{}*^~.:;?!"))
+    def test_every_syntax_character_is_safe(self, seeded, caplog, char):
+        with caplog.at_level("WARNING"):
+            results = seeded.search(f"platform {char} lead {char}")
+        assert "BM25 search error" not in caplog.text
+        assert "d2" in [r["doc_id"] for r in results]
+
+    def test_symbol_only_query_returns_empty(self, seeded):
+        assert seeded.search("&&& ,,, //") == []
+
+    def test_uppercase_operator_words_are_plain_terms(self, seeded):
+        # As an FTS5 operator, NOT would exclude d2 (contains "lead"); as a
+        # plain term the query has no co-occurring match and falls back to OR.
+        results = seeded.search("platform NOT lead")
+        assert "d2" in [r["doc_id"] for r in results]
+
+    def test_quoted_terms_are_stemmed(self, seeded):
+        results = seeded.search("discussing plan")
+        assert [r["doc_id"] for r in results] == ["d1"]
+        assert results[0]["match_mode"] == "and"
+
+
+class TestStrictThenLenient:
+    def test_cooccurring_terms_return_and_matches_only(self, seeded):
+        results = seeded.search("platform team hiring")
+        assert [r["doc_id"] for r in results] == ["d1"]
+        assert all(r["match_mode"] == "and" for r in results)
+
+    def test_non_cooccurring_terms_fall_back_to_or(self, seeded):
+        results = seeded.search("hiring roadmap")
+        assert {r["doc_id"] for r in results} == {"d1", "d2"}
+        assert all(r["match_mode"] == "or" for r in results)
+
+    def test_fallback_drops_stop_words(self, seeded):
+        # "the" appears in d1 and d2; as an OR term it would pull in d2.
+        results = seeded.search("the hiring gamma")
+        assert {r["doc_id"] for r in results} == {"d1", "d6"}
+
+    def test_stop_word_only_query_still_searches(self, seeded):
+        assert {r["doc_id"] for r in seeded.search("the")} == {"d1", "d2"}
+
+    def test_no_matching_terms_returns_empty(self, seeded):
+        assert seeded.search("zzzunknown qqqmissing") == []

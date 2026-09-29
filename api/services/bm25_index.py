@@ -184,41 +184,65 @@ class BM25Index:
         finally:
             conn.close()
 
-    def _sanitize_query(self, query: str, use_or: bool = True) -> str:
-        """
-        Sanitize query for FTS5 MATCH syntax.
+    _STOP_WORDS = frozenset({
+        'a', 'an', 'the', 'is', 'are', 'was', 'were', 'what', 'when', 'where',
+        'who', 'which', 'how', 'and', 'or', 'but', 'in', 'on', 'at', 'to',
+        'for', 'of', 'with', 'by',
+    })
 
-        FTS5 has special characters that cause syntax errors:
-        - Quotes, apostrophes, parentheses need removal
-        - Reserved words (AND, OR, NOT, NEAR) are handled by FTS5
+    def _sanitize_query(self, query: str, use_or: bool = False) -> str:
+        """
+        Turn arbitrary text into a valid FTS5 MATCH expression.
+
+        Every run of letters/digits becomes a double-quoted term, so no
+        character in the input (punctuation, symbols, emoji, a leading ``-``
+        or ``^``, ``col:`` filters) and no uppercase ``AND``/``OR``/``NOT``/
+        ``NEAR`` word can act as FTS5 syntax. Quoted terms still pass through
+        the porter tokenizer, so stemming applies.
 
         Args:
             query: Raw query string
-            use_or: If True, join terms with OR (any term matches).
-                   If False, use default AND (all terms must match).
+            use_or: If True, join terms with OR (any term matches) after
+                   removing stop words. If False, terms are implicitly ANDed.
 
         Returns:
-            Sanitized query safe for FTS5
+            FTS5 expression, or an empty string when the query has no terms.
         """
         import re
-        # Remove characters that break FTS5 syntax
-        # Periods in filenames (like .md), question marks, etc cause issues
-        # Keep alphanumeric, spaces, hyphens, underscores
-        sanitized = re.sub(r"['\"\(\)\[\]\{\}\*\^\~\.\:\;\?\!]", " ", query)
-        # Collapse multiple spaces
-        sanitized = re.sub(r"\s+", " ", sanitized).strip()
+        terms = re.findall(r"[^\W_]+", query)
+        if use_or:
+            informative = [t for t in terms if t.lower() not in self._STOP_WORDS]
+            terms = informative or terms
+        quoted = [f'"{t}"' for t in terms]
+        return (" OR " if use_or else " ").join(quoted)
 
-        if use_or and sanitized:
-            # Join terms with OR for more lenient matching
-            # Filter out common stop words that add noise
-            stop_words = {'a', 'an', 'the', 'is', 'are', 'was', 'were', 'what',
-                         'when', 'where', 'who', 'which', 'how', 'and', 'or',
-                         'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by'}
-            terms = [t for t in sanitized.split() if t.lower() not in stop_words]
-            if terms:
-                sanitized = " OR ".join(terms)
-
-        return sanitized
+    def _match(self, conn: sqlite3.Connection, match_expr: str, limit: int, match_mode: str) -> list[dict]:
+        """Run one FTS5 MATCH expression and tag each row with its match mode."""
+        cursor = conn.execute(
+            """
+            SELECT chunks_fts.doc_id, chunks_fts.content,
+                   chunks_fts.file_name, chunks_fts.people,
+                   bm25(chunks_fts) as score, doc_dates.modified_date
+            FROM chunks_fts
+            LEFT JOIN doc_dates ON doc_dates.doc_id = chunks_fts.doc_id
+            WHERE chunks_fts MATCH ?
+            ORDER BY score
+            LIMIT ?
+            """,
+            (match_expr, limit)
+        )
+        return [
+            {
+                "doc_id": row[0],
+                "content": row[1],
+                "file_name": row[2],
+                "people": row[3].split(",") if row[3] else [],
+                "bm25_score": row[4],  # BM25 scores are negative, lower is better
+                "modified_date": row[5] or "",
+                "match_mode": match_mode,
+            }
+            for row in cursor.fetchall()
+        ]
 
     def search(
         self,
@@ -228,6 +252,10 @@ class BM25Index:
         """
         Search the index using BM25.
 
+        Runs a strict query (every term must match) first; when that yields
+        no rows, re-runs it with any-term semantics. Each result carries
+        ``match_mode`` of ``"and"`` or ``"or"`` accordingly.
+
         Args:
             query: Search query string
             limit: Maximum number of results
@@ -235,48 +263,20 @@ class BM25Index:
         Returns:
             List of matching documents with doc_id and BM25 score
         """
-        if not query.strip():
-            return []
-
-        # Sanitize query for FTS5 syntax
-        sanitized_query = self._sanitize_query(query)
-        if not sanitized_query:
+        strict_query = self._sanitize_query(query)
+        if not strict_query:
             return []
 
         conn = sqlite3.connect(self.db_path)
         try:
-            # FTS5 MATCH query with BM25 ranking
-            # Search across content, file_name, and people
-            # Return all columns for full result data
-            cursor = conn.execute(
-                """
-                SELECT chunks_fts.doc_id, chunks_fts.content,
-                       chunks_fts.file_name, chunks_fts.people,
-                       bm25(chunks_fts) as score, doc_dates.modified_date
-                FROM chunks_fts
-                LEFT JOIN doc_dates ON doc_dates.doc_id = chunks_fts.doc_id
-                WHERE chunks_fts MATCH ?
-                ORDER BY score
-                LIMIT ?
-                """,
-                (sanitized_query, limit)
-            )
-
-            results = []
-            for row in cursor.fetchall():
-                results.append({
-                    "doc_id": row[0],
-                    "content": row[1],
-                    "file_name": row[2],
-                    "people": row[3].split(",") if row[3] else [],
-                    "bm25_score": row[4],  # Note: BM25 scores are negative, lower is better
-                    "modified_date": row[5] or ""
-                })
-
-            return results
-
+            results = self._match(conn, strict_query, limit, "and")
+            if results:
+                return results
+            lenient_query = self._sanitize_query(query, use_or=True)
+            if lenient_query == strict_query:
+                return []
+            return self._match(conn, lenient_query, limit, "or")
         except sqlite3.OperationalError as e:
-            # Handle invalid FTS query syntax
             logger.warning(f"BM25 search error for query '{query}': {e}")
             return []
         finally:
