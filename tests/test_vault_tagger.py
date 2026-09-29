@@ -259,10 +259,16 @@ def test_malformed_frontmatter_is_restricted(vault, monkeypatch):
     assert not ask.called and rec.sensitivity == "restricted"
 
 
-def test_horizontal_rule_without_frontmatter_is_not_restricted(vault, monkeypatch):
-    (vault / "Notes" / "rule.md").write_text("---\nJust a rule, no closing fence\n")
-    ask, rec = _send(vault, monkeypatch, "Notes/rule.md")
-    assert ask.called and rec.sensitivity == "private"
+def test_unclosed_frontmatter_fence_is_restricted(vault, monkeypatch):
+    (vault / "Notes" / "open.md").write_text("---\ntags: [private]\n\nBody with no closing fence\n")
+    ask, rec = _send(vault, monkeypatch, "Notes/open.md")
+    assert not ask.called and rec.sensitivity == "restricted"
+
+
+def test_bom_before_frontmatter_still_reads_tags(vault, monkeypatch):
+    (vault / "Notes" / "bom.md").write_text("\ufeff---\ntags: [private]\n---\nBody\n", encoding="utf-8")
+    ask, rec = _send(vault, monkeypatch, "Notes/bom.md")
+    assert not ask.called and rec.sensitivity == "restricted"
 
 
 @pytest.mark.parametrize("body", [
@@ -288,12 +294,48 @@ def test_headings_and_code_blocks_are_not_tags(vault, monkeypatch):
     assert ask.called and rec.sensitivity == "private"
 
 
-def test_body_cap_without_tokenizer_is_characters(vault, monkeypatch):
+def test_body_cap_without_tokenizer_is_bytes(vault, monkeypatch):
     from api.services import chunker
 
     monkeypatch.setattr(chunker, "TOKENIZER", None)
-    (vault / "Notes" / "cjk.md").write_text("字" * 32000)
+    (vault / "Notes" / "cjk.md").write_text("漢" * 32000)
     _set(monkeypatch)
     with patch.object(JevClient, "ask", return_value=_answers()) as ask:
         _tagger(vault).tag_file(vault / "Notes" / "cjk.md")
-    assert len(ask.call_args.args[0]["body"]) <= 8000
+    body = ask.call_args.args[0]["body"]
+    assert 0 < len(body.encode("utf-8")) <= 8000
+
+
+def test_allowlist_applies_to_symlink_target(vault, monkeypatch):
+    _set(monkeypatch, paths="Work")
+    (vault / "Work" / "alias.md").symlink_to(vault / "Notes" / "idea.md")
+    with patch.object(JevClient, "ask", return_value=_answers()) as ask:
+        rec = _tagger(vault).tag_file(vault / "Work" / "alias.md")
+    assert not ask.called and rec.backend == "code"
+
+
+def test_dotdot_segments_are_never_sent(vault, monkeypatch):
+    _set(monkeypatch, paths="Work,Notes")
+    with patch.object(JevClient, "ask", return_value=_answers()) as ask:
+        rec = _tagger(vault).tag_file(vault / "Work" / ".." / "Notes" / "idea.md")
+    assert not ask.called and rec.backend == "code"
+    assert not is_allowlisted("Work/../Notes/idea.md")
+
+
+@pytest.mark.parametrize("entry", ["./Work/Private", "Work//Private", " 'work/private/' ", "WORK/PRIVATE"])
+def test_restricted_entry_is_normalized(monkeypatch, entry):
+    monkeypatch.setattr(settings, "jev_vault_restricted_paths", entry)
+    assert classify_sensitivity("Work/Private/session.md", []) == "restricted"
+    assert classify_sensitivity("Work/Privateer/session.md", []) == "private"
+    assert classify_sensitivity("Other/Work/Private/session.md", []) == "private"
+
+
+@pytest.mark.parametrize("value", ["/", "''", ",,", " , "])
+def test_restricted_value_without_valid_entry_falls_back_to_default(monkeypatch, value):
+    monkeypatch.setattr(settings, "jev_vault_restricted_paths", value)
+    assert classify_sensitivity("Lifelogs/day.md", []) == "restricted"
+
+
+def test_whitespace_only_restricted_value_disables_path_restriction(monkeypatch):
+    monkeypatch.setattr(settings, "jev_vault_restricted_paths", "   ")
+    assert classify_sensitivity("Lifelogs/day.md", []) == "private"

@@ -29,6 +29,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import posixpath
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -64,35 +65,69 @@ def _mode() -> str:
     return mode
 
 
-def _allowed_prefixes() -> list[str]:
-    return [p.strip().strip("/") for p in (settings.jev_vault_tag_paths or "").split(",") if p.strip()]
+def _segments(value: str, *, fold: bool) -> list[str] | None:
+    """Normalized path segments of a path or configured entry, or None when it
+    contains a `..` segment (never trusted). Whitespace and surrounding quotes
+    are stripped; `.` segments and repeated or edge slashes disappear."""
+    value = value.strip().strip("'\"").strip()
+    if ".." in value.split("/"):
+        return None
+    norm = posixpath.normpath(value) if value else "."
+    parts = [p for p in norm.split("/") if p and p != "."]
+    return [p.casefold() for p in parts] if fold else parts
+
+
+def _entries(raw: str, *, fold: bool) -> list[list[str]]:
+    out = []
+    for item in (raw or "").split(","):
+        segs = _segments(item, fold=fold)
+        if segs:
+            out.append(segs)
+    return out
+
+
+def _starts_with(path: list[str], prefix: list[str]) -> bool:
+    return len(path) >= len(prefix) and path[: len(prefix)] == prefix
 
 
 def is_allowlisted(rel_path: str) -> bool:
-    """True when the vault-relative path lies under an allowlisted folder prefix."""
-    rel = rel_path.strip("/")
-    for prefix in _allowed_prefixes():
-        if prefix == "*" or rel == prefix or rel.startswith(prefix + "/"):
-            return True
-    return False
+    """True when the vault-relative path lies under an allowlisted folder prefix
+    (whole path segments; `*` allows everything; a `..` segment never matches)."""
+    path = _segments(rel_path, fold=False)
+    if path is None:
+        return False
+    return any(e == ["*"] or _starts_with(path, e) for e in _entries(settings.jev_vault_tag_paths, fold=False))
+
+
+def _restricted_entries() -> list[list[str]]:
+    """Normalized entries of `LIFEOS_JEV_VAULT_RESTRICTED_PATHS`. A value that is
+    empty after stripping means no path restriction; a non-empty value with no
+    valid entry falls back to the default list."""
+    raw = settings.jev_vault_restricted_paths or ""
+    if not raw.strip():
+        return []
+    entries = _entries(raw, fold=True)
+    if not entries:
+        logger.warning("LIFEOS_JEV_VAULT_RESTRICTED_PATHS has no valid entry; using the default list")
+        default = type(settings).model_fields["jev_vault_restricted_paths"].default
+        entries = _entries(default, fold=True)
+    return entries
 
 
 def _path_restricted(rel_path: str) -> bool:
     """True when the path matches an entry of `LIFEOS_JEV_VAULT_RESTRICTED_PATHS`.
 
-    An entry without a slash matches any folder of that name (case-insensitive);
-    an entry with a slash matches as a vault-relative prefix.
+    An entry of one segment matches any folder of that name; a multi-segment
+    entry matches as a vault-relative prefix, by whole segments.
     """
-    rel = rel_path.strip("/")
-    folders = {part.lower() for part in Path(rel).parts[:-1]}
-    for entry in (settings.jev_vault_restricted_paths or "").split(","):
-        entry = entry.strip().strip("/")
-        if not entry:
-            continue
-        if "/" in entry:
-            if rel.lower() == entry.lower() or rel.lower().startswith(entry.lower() + "/"):
+    path = _segments(rel_path, fold=True)
+    if path is None:
+        return True
+    for entry in _restricted_entries():
+        if len(entry) == 1:
+            if entry[0] in path[:-1]:
                 return True
-        elif entry.lower() in folders:
+        elif _starts_with(path, entry):
             return True
     return False
 
@@ -123,8 +158,12 @@ def classify_sensitivity(rel_path: str, human_tags: list[str]) -> str:
 
 def parse_note(content: str) -> tuple[dict, str, bool]:
     """(frontmatter, body, parsed_ok). A frontmatter fence that fails to parse
-    yields ok=False so the caller can treat the note as restricted."""
-    if content.lstrip("\ufeff").startswith("---"):
+    or has no closing fence yields ok=False so the caller can treat the note as restricted."""
+    content = content.removeprefix("\ufeff")
+    lines = content.splitlines()
+    if lines and lines[0].rstrip() == "---":
+        if not any(line.rstrip() in ("---", "...") for line in lines[1:]):
+            return {}, content, False
         try:
             post = frontmatter.loads(content)
         except Exception:  # noqa: BLE001 - any parse failure
@@ -135,7 +174,8 @@ def parse_note(content: str) -> tuple[dict, str, bool]:
 
 def _cap_tokens(text: str, limit: int = MAX_BODY_TOKENS) -> str:
     if chunker.TOKENIZER is None:
-        return text[:limit]  # one character is at least one token: a safe upper bound
+        # a token is at least one UTF-8 byte, so limit bytes bound limit tokens
+        return text.encode("utf-8")[:limit].decode("utf-8", errors="ignore")
     if chunker.count_tokens(text) <= limit:
         return text
     return chunker.TOKENIZER.decode(chunker.TOKENIZER.encode(text)[:limit])
@@ -248,11 +288,15 @@ class VaultTagger:
         except ValueError:
             return None
 
-    def jev_allowed(self, rel_path: str, sensitivity: str) -> bool:
+    def jev_allowed(self, rel_path: str, resolved_rel: str | None, sensitivity: str) -> bool:
+        """Both the path as supplied and the symlink-resolved target must be
+        allowlisted, and the note must not be restricted."""
         return (
             _mode() in ("shadow", "on")
             and settings.jev_configured
+            and resolved_rel is not None
             and is_allowlisted(rel_path)
+            and is_allowlisted(resolved_rel)
             and sensitivity != "restricted"
         )
 
@@ -348,7 +392,7 @@ class VaultTagger:
                 tagged_at=datetime.now(timezone.utc).isoformat(),
                 sensitivity=sensitivity,
             )
-            if not self.jev_allowed(rel, sensitivity):
+            if not self.jev_allowed(rel, resolved, sensitivity):
                 return record
             projects = _project_options(self.vault_root, self.taxonomy)
             client = self._client or JevClient()
