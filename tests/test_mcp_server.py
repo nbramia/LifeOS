@@ -134,8 +134,9 @@ class TestMCPServerToolDiscovery:
 
     @pytest.mark.unit
     def test_fallback_and_live_schema_constraints_agree(self, openapi_spec):
-        """Any default/minimum/maximum present in both a tool's fallback schema
-        and its OpenAPI-built schema must be equal."""
+        """Any default/minimum/maximum present in both a tool's fallback-built
+        and OpenAPI-built schema must be equal, comparing the schemas as
+        advertised (after the people-search limit override on each path)."""
         import importlib.util
         from unittest.mock import patch
         spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
@@ -145,13 +146,26 @@ class TestMCPServerToolDiscovery:
         with patch.object(module.LifeOSMCPServer, "_load_openapi_spec", lambda self: None):
             server = module.LifeOSMCPServer()
         server.openapi_spec = openapi_spec
+
+        server.tools = []
         server._build_tools_from_spec()
+        server._cap_people_search_limit()
         live = {t["name"]: t["inputSchema"].get("properties", {}) for t in server.tools}
-        fallback = server._fallback_schemas()
+
+        server.tools = []
+        server._build_tools_fallback()
+        raw_people_limit = dict(
+            next(t for t in server.tools if t["name"] == "lifeos_people_search")["inputSchema"]["properties"]["limit"]
+        )
+        server._cap_people_search_limit()
+        fallback = {t["name"]: t["inputSchema"].get("properties", {}) for t in server.tools}
+
+        # The fallback documents the advertised override itself.
+        assert (raw_people_limit["default"], raw_people_limit["maximum"]) == (10, 50)
 
         mismatches = []
-        for name, schema in fallback.items():
-            for prop, fb in schema.get("properties", {}).items():
+        for name, props in fallback.items():
+            for prop, fb in props.items():
                 lv = live.get(name, {}).get(prop)
                 if not lv:
                     continue

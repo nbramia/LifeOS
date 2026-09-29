@@ -959,7 +959,8 @@ class LifeOSMCPServer:
                 "type": "object",
                 "properties": {
                     "q": {"type": "string", "description": "Name or email to search"},
-                    "limit": {"type": "integer", "description": "Max results (default: 20)", "default": 20, "maximum": 200}
+                    # 10/50 is the deliberate LLM-facing override applied by _cap_people_search_limit
+                    "limit": {"type": "integer", "description": "Max results (default: 10)", "default": 10, "maximum": 50}
                 },
                 "required": ["q"]
             },
