@@ -1,0 +1,3 @@
+{"query": "synthetic query one", "relevant_files": ["notes/alpha.md"], "source": "mined"}
+{"query": "synthetic query two", "relevant_files": ["notes/gamma.md", "notes/delta.md"], "source": "manual"}
+{"query": "synthetic query three", "relevant_files": ["notes/epsilon.md"], "source": "manual"}

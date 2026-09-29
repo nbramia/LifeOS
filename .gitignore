@@ -170,3 +170,6 @@ config/telegram_bots.local.json
 
 # Operator-specific taxonomy override (merged over config/vault_taxonomy.yaml)
 config/vault_taxonomy.local.yaml
+
+# Retrieval eval labeled set (real queries and file names)
+data/retrieval_eval/

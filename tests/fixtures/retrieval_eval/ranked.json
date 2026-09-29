@@ -1,0 +1,5 @@
+{
+ "synthetic query one": ["vault/beta.md::0", "vault/alpha.md::1", "vault/alpha.md::2"],
+ "synthetic query two": ["vault/gamma.md_2", "vault/gamma.md_5", "vault/filler0.md", "vault/filler1.md", "vault/filler2.md", "vault/filler3.md", "vault/filler4.md", "vault/filler5.md", "vault/filler6.md", "vault/filler7.md", "vault/delta.md_0"],
+ "synthetic query three": ["vault/other0.md", "vault/other1.md", "vault/other2.md", "vault/other3.md", "vault/other4.md", "vault/other5.md", "vault/other6.md", "vault/other7.md", "vault/other8.md", "vault/other9.md", "vault/other10.md", "vault/epsilon.md::4"]
+}
