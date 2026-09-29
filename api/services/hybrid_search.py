@@ -25,7 +25,7 @@ Reciprocal Rank Fusion (RRF).
 """
 import re
 import logging
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime
 from typing import Optional, TYPE_CHECKING
 
@@ -469,13 +469,15 @@ class HybridSearch:
             bm25_index = self._get_bm25_index()
             bm25_doc_ids = []
             bm25_results_by_id = {}
-            bm25_match_mode = "none"
+            bm25_match_mode: str | dict = "none"
 
             if bm25_index:
                 try:
                     bm25_results = bm25_index.search(expanded_query, limit=fetch_k)
                     if bm25_results:
-                        bm25_match_mode = bm25_results[0].get("match_mode") or "none"
+                        bm25_match_mode = dict(
+                            Counter(r.get("match_mode") or "unknown" for r in bm25_results)
+                        )
                     bm25_doc_ids = [r["doc_id"] for r in bm25_results]
                     # Store BM25 results for later lookup
                     bm25_results_by_id = {r["doc_id"]: r for r in bm25_results}
@@ -648,7 +650,7 @@ class HybridSearch:
         top_k: int,
         vector_candidates: int,
         bm25_candidates: int,
-        bm25_match_mode: str,
+        bm25_match_mode: str | dict,
         final_results: list[dict],
     ) -> None:
         """Record the tool query and per-arm attribution of the returned

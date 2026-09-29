@@ -1011,7 +1011,7 @@ class TestSearchAttribution:
         assert meta["query"] == "zebra budget"
         assert meta["vector_candidates"] == 2
         assert meta["bm25_candidates"] == 2
-        assert meta["bm25_match_mode"] == "and"
+        assert meta["bm25_match_mode"] == {"and": 2}
         assert meta["attribution"] == {"vector_only": 1, "bm25_only": 1, "both": 1}
         assert meta["top_k"] == 10
 
@@ -1022,7 +1022,22 @@ class TestSearchAttribution:
             bm25_index=self._bm25(temp_db),
         )
         hybrid.search("zebra nonexistentterm", top_k=10, use_reranker=False)
-        assert self._attribution_span(trace)["bm25_match_mode"] == "or"
+        assert self._attribution_span(trace)["bm25_match_mode"] == {"or": 2}
+
+    def test_mixed_match_modes_are_counted(self, trace):
+        from unittest.mock import MagicMock
+        from api.services.hybrid_search import HybridSearch
+        bm25 = MagicMock()
+        bm25.search.return_value = [
+            {"doc_id": "a", "content": "a", "file_name": "A.md", "match_mode": "and"},
+            {"doc_id": "b", "content": "b", "file_name": "B.md", "match_mode": "or"},
+            {"doc_id": "c", "content": "c", "file_name": "C.md", "match_mode": "or"},
+        ]
+        hybrid = HybridSearch(vector_store=self._vector_store(["a"]), bm25_index=bm25)
+        hybrid.search("anything", top_k=10, use_reranker=False)
+        meta = self._attribution_span(trace)
+        assert meta["bm25_match_mode"] == {"and": 1, "or": 2}
+        assert meta["bm25_candidates"] == 3
 
     def test_vector_only_early_return_records_attribution(self, temp_db, trace):
         from api.services.hybrid_search import HybridSearch

@@ -31,13 +31,13 @@ def db(tmp_path):
     conn = sqlite3.connect(path)
     rows = [
         ("t1", "2026-09-10T10:00:00", [
-            _span("secret alpha", 10, 5, "and", {"vector_only": 2, "bm25_only": 1, "both": 1}, 4),
+            _span("secret alpha", 10, 5, {"and": 5}, {"vector_only": 2, "bm25_only": 1, "both": 1}, 4),
             {"name": "search_vector", "duration_ms": 1, "parent": None, "metadata": {}},
         ]),
         ("t2", "2026-09-11T10:00:00", [
             _span("secret beta", 10, 0, "none", {"vector_only": 4, "bm25_only": 0, "both": 0}, 4)]),
         ("t3", "2026-09-12T10:00:00", [
-            _span("secret gamma", 0, 3, "or", {"vector_only": 0, "bm25_only": 2, "both": 0}, 2)]),
+            _span("secret gamma", 0, 3, {"and": 1, "or": 2}, {"vector_only": 0, "bm25_only": 2, "both": 0}, 2)]),
         ("old", "2026-01-01T10:00:00", [
             _span("secret old", 1, 1, "and", {"vector_only": 0, "bm25_only": 0, "both": 1}, 1)]),
         ("plain", "2026-09-13T10:00:00", [
@@ -61,7 +61,7 @@ def test_report_aggregates_searches_since_date(db, capsys):
     assert "mean 50.0%, median 50.0%" in out
     assert "zero BM25 candidates: 33.3% (1/3)" in out
     assert "zero vector candidates: 33.3% (1/3)" in out
-    assert "and=1, none=1, or=1" in out
+    assert "and=1, and+or=1, none=1" in out
     assert "top_k distribution: 2=1, 4=2" in out
 
 

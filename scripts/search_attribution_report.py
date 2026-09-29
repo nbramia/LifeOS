@@ -52,6 +52,14 @@ def _bm25_share(meta: dict) -> float | None:
     return (attr.get("bm25_only", 0) + attr.get("both", 0)) / total
 
 
+def _mode_label(mode) -> str:
+    """One label per search: a string mode as-is, a count dict as its sorted
+    mode names joined with ``+`` (``and``, ``or``, or ``and+or`` when mixed)."""
+    if isinstance(mode, dict):
+        return "+".join(sorted(mode)) or "none"
+    return str(mode) if mode else "unknown"
+
+
 def build_report(searches: list[dict], show_queries: bool = False) -> str:
     n = len(searches)
     lines = [f"Searches counted: {n}"]
@@ -70,7 +78,7 @@ def build_report(searches: list[dict], show_queries: bool = False) -> str:
     zero_vec = sum(1 for m in searches if m.get("vector_candidates") == 0)
     lines.append(f"Searches with zero BM25 candidates: {zero_bm25 / n:.1%} ({zero_bm25}/{n})")
     lines.append(f"Searches with zero vector candidates: {zero_vec / n:.1%} ({zero_vec}/{n})")
-    modes = Counter(m.get("bm25_match_mode", "unknown") for m in searches)
+    modes = Counter(_mode_label(m.get("bm25_match_mode")) for m in searches)
     lines.append("BM25 match mode: " + ", ".join(f"{k}={v}" for k, v in sorted(modes.items())))
     top_ks = Counter(m.get("top_k") for m in searches)
     lines.append(
