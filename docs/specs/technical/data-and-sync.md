@@ -311,6 +311,8 @@ Runs in this order (see [iMessage Sync Ordering](#imessage-sync-ordering) below)
 | `sync_vault_reindex.py` | Reindex vault to ChromaDB + BM25 | Vault files |
 | `sync_crm_to_vectorstore.py` | Index CRM people for semantic search | `data/crm.db` |
 
+**Generated index pages.** After indexing, `sync_vault_reindex.py` writes `LifeOS/Index/<top-level-folder>.md` for every top-level vault folder (creating the index folder if missing). Each page carries frontmatter `generated: true` and `source: lifeos-index` and lists the folder's note count, its last-30-days change count, and up to 30 most-recent notes with the one-line summary stored in the BM25 index (`<path>::summary`) where one exists, otherwise the title alone. Output is deterministic (stable ordering, dates only) and a page is rewritten only when its bytes change. Notes under `LifeOS/Index/` are excluded from the pages' counts and are never LLM-summarized (`summarizer.SKIP_PATH_PREFIXES`).
+
 ### Phase 5: Content Sync
 
 | Script | Purpose | Data Source |

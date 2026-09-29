@@ -88,6 +88,15 @@ def sync_vault_reindex(dry_run: bool = True, force: bool = False, skip_summaries
     indexer = IndexerService(vault_path=vault_path)
     files_indexed = indexer.index_all(force=force, skip_summaries=skip_summaries)
 
+    index_pages = None
+    try:
+        from api.services.vault_index_pages import write_index_pages
+
+        index_pages = write_index_pages(Path(vault_path))
+        logger.info(f"  Index pages: {index_pages}")
+    except Exception as e:
+        logger.warning(f"Index page generation failed: {e}")
+
     elapsed = time.time() - start_time
 
     logger.info("\n=== Vault Reindex Results ===")
@@ -97,6 +106,7 @@ def sync_vault_reindex(dry_run: bool = True, force: bool = False, skip_summaries
     return {
         "status": "success",
         "files_indexed": files_indexed,
+        "index_pages": index_pages,
         "elapsed_seconds": round(elapsed, 1),
     }
 

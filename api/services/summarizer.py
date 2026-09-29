@@ -56,6 +56,13 @@ SKIP_DIRECTORIES = {
     "attachments",
 }
 
+# Nested folders (vault-relative, lowercase) that are never summarized. The
+# generated index pages live here; summarizing them would only describe
+# generated text.
+SKIP_PATH_PREFIXES = (
+    "lifeos/index",
+)
+
 HIGH_DIRECTORIES = {
     "personal",
     "work",
@@ -84,6 +91,9 @@ def get_summary_tier(file_path: str) -> SummaryTier:
         relative = file_str[len(vault_str):].strip("/")
         top_dir = relative.split("/")[0].lower() if "/" in relative else ""
         if top_dir in SKIP_DIRECTORIES:
+            return SummaryTier.SKIP
+        rel_lower = relative.lower()
+        if any(rel_lower == p or rel_lower.startswith(p + "/") for p in SKIP_PATH_PREFIXES):
             return SummaryTier.SKIP
 
     # Default: summarize (HIGH tier)

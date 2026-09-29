@@ -144,6 +144,32 @@ class BM25Index:
         finally:
             conn.close()
 
+    def get_summaries(self, file_paths: list[str]) -> dict[str, str]:
+        """Return the stored one-line summary text for each indexed path that has one.
+
+        Keys are the given paths; the "Document summary for <name>: " prefix
+        written at index time is stripped.
+        """
+        if not file_paths:
+            return {}
+        by_id = {f"{p}::summary": p for p in file_paths}
+        conn = sqlite3.connect(self.db_path)
+        try:
+            found: dict[str, str] = {}
+            ids = list(by_id)
+            for start in range(0, len(ids), 500):
+                batch = ids[start:start + 500]
+                marks = ",".join("?" * len(batch))
+                rows = conn.execute(
+                    f"SELECT doc_id, content FROM chunks_fts WHERE doc_id IN ({marks})", batch
+                ).fetchall()
+                for doc_id, content in rows:
+                    text = content.split(": ", 1)[1] if content.startswith("Document summary for ") and ": " in content else content
+                    found[by_id[doc_id]] = text
+            return found
+        finally:
+            conn.close()
+
     def delete_by_path(self, file_path: str) -> int:
         """Delete every chunk indexed for ``file_path`` (chunks + summary).
 

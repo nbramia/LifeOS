@@ -98,7 +98,18 @@ def test_symlinked_vault_root_still_lists(tmp_path):
 
 def test_escape_raises_list_error(vault):
     with pytest.raises(VaultListError):
-        list_vault_entries(vault, "../x")
+        list_vault_entries(vault, "..")
+    with pytest.raises(VaultListError):
+        list_vault_entries(vault, "Work/../..")
+
+
+def test_file_symlink_pointing_outside_is_dropped(vault, tmp_path):
+    outside = tmp_path / "outside.md"
+    _touch(outside, "secret", 1_700_000_000)
+    (vault / "Work" / "leak.md").symlink_to(outside)
+    data = json.loads(_call(path="Work"))
+    assert "leak.md" not in {e["name"] for e in data["entries"]}
+    assert data["total"] == 3
 
 
 def test_normalize_tags():
