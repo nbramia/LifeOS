@@ -713,6 +713,36 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "list_vault",
+        "description": (
+            "List notes in an Obsidian vault folder (or a glob match), newest first, with modified date, "
+            "note type and tags. Use for 'what's in folder X', 'recent notes in Y', or to browse the vault's "
+            "structure before searching. Also returns the folder's subfolders and a total count; page with offset."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Vault-relative folder (e.g. 'Work' or 'Personal/Notes'); '' for the vault root.",
+                },
+                "glob": {
+                    "type": "string",
+                    "description": "Optional glob relative to path (default '**/*.md'), e.g. '2026-09-*.md'.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Entries per page (default 50, max 200).",
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Entries to skip for the next page (default 0).",
+                },
+            },
+            "required": ["path"],
+        },
+    },
+    {
         "name": "search_finances",
         "description": (
             "Query live financial data. "
@@ -1130,7 +1160,7 @@ async def execute_tool(name: str, tool_input: dict) -> str:
 
 
 # Sync handlers to wrap in to_thread for parallel execution
-_SYNC_HANDLERS = {"search_vault", "read_vault_file", "search_slack", "get_message_history", "person_info", "manage_tasks", "manage_human_queue", "manage_reminders", "manage_schedules", "create_calendar_event", "update_calendar_event", "delete_calendar_event", "search_memories"}
+_SYNC_HANDLERS = {"search_vault", "read_vault_file", "list_vault", "search_slack", "get_message_history", "person_info", "manage_tasks", "manage_human_queue", "manage_reminders", "manage_schedules", "create_calendar_event", "update_calendar_event", "delete_calendar_event", "search_memories"}
 
 
 _MESSAGE_TAG_RE = re.compile(r"#[\w-]+")
@@ -3846,6 +3876,23 @@ def _tool_read_vault_file(inp: dict) -> str:
         return f"Error reading {match.name}: {e}"
 
 
+def _tool_list_vault(inp: dict) -> str:
+    import json
+    from config.settings import settings
+    from api.services.vault_listing import VaultListError, list_vault_entries
+    try:
+        result = list_vault_entries(
+            settings.vault_path,
+            path=inp.get("path") or "",
+            glob=inp.get("glob") or None,
+            limit=inp.get("limit") or 50,
+            offset=inp.get("offset") or 0,
+        )
+    except (VaultListError, TypeError, ValueError) as e:
+        return f"Error: {e}"
+    return json.dumps(result, ensure_ascii=False)
+
+
 # Widening ladder for transactions when the caller gave no start_date.
 # None = all history (the Monarch client omits start_date entirely).
 _TXN_LADDER_DAYS = (90, 365, None)
@@ -4280,6 +4327,7 @@ async def _tool_internet_status(inp: dict) -> str:
 _TOOL_HANDLERS = {
     "search_vault": _tool_search_vault,
     "read_vault_file": _tool_read_vault_file,
+    "list_vault": _tool_list_vault,
     "search_calendar": _tool_search_calendar,
     "search_email": _tool_search_email,
     "search_drive": _tool_search_drive,
@@ -4309,6 +4357,7 @@ _TOOL_HANDLERS = {
 TOOL_STATUS_MESSAGES = {
     "search_vault": "Searching notes...",
     "read_vault_file": "Reading vault file...",
+    "list_vault": "Listing vault folder...",
     "search_calendar": "Checking calendar...",
     "search_email": "Searching email...",
     "search_drive": "Searching Drive...",

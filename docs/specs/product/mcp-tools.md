@@ -33,10 +33,10 @@ The LifeOS MCP server dynamically discovers endpoints from the LifeOS OpenAPI sp
 - Formatted responses for human readability
 - Fallback schemas when API unavailable
 
-The source catalog contains 71 curated LifeOS endpoint tools. It also
+The source catalog contains 72 curated LifeOS endpoint tools. It also
 registers 11 worker coordination tools (`lifeos_agent_*`), including
 `lifeos_agent_project_handoff`, `lifeos_agent_project_owner`, and
-`lifeos_agent_execution_override`, for an 82-tool fallback catalog. When the
+`lifeos_agent_execution_override`, for an 83-tool fallback catalog. When the
 OpenAPI document omits an unavailable endpoint, the live list may be smaller;
 the inter-agent tools remain registered as a separate contract.
 
@@ -55,6 +55,7 @@ Claude Code  ←→  MCP Protocol  ←→  mcp_server.py  ←→  LifeOS API
 |------|-------------|
 | `lifeos_ask` | Query knowledge base with synthesized answer |
 | `lifeos_search` | Search vault without synthesis (raw results) |
+| `lifeos_vault_list` | List notes in a vault folder or glob match, newest first, with modified date, note type and tags |
 | `lifeos_turn_context` | Per-turn context (date/time, relative-time guidance, existing task tags, task-hierarchy guidance) — read at the start of a turn |
 
 ### Calendar & Meeting Tools

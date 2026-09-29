@@ -187,6 +187,11 @@ CURATED_ENDPOINTS = {
         "description": "Write a text file into the Obsidian vault. Use for any task needing a `.md` deliverable. `path` is vault-relative; parents auto-created. `mode`: `create` (default), `overwrite`, `append`.",
         "method": "POST"
     },
+    "/api/vault/list": {
+        "name": "lifeos_vault_list",
+        "description": "List vault notes in a folder or glob, newest first, with date, note type, tags and total. Use to browse structure before searching. `path` is vault-relative; page with `limit`/`offset`.",
+        "method": "GET"
+    },
     "/api/conversations": {
         "name": "lifeos_conversations_list",
         "description": "List recent LifeOS conversations. Returns conversation IDs and titles for continuing previous chats.",
@@ -555,7 +560,7 @@ CURATED_ENDPOINTS = {
 
 # Contract count for the source catalog. The live fallback catalog is 71
 # curated tools plus 11 lifeos_agent_* tools = 82.
-CURATED_TOOL_COUNT = 71
+CURATED_TOOL_COUNT = 72
 
 
 class LifeOSMCPServer:

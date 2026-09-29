@@ -1,0 +1,157 @@
+"""Vault structure listing: folder/glob browsing with path safety.
+
+Shared by the `list_vault` orchestrator tool, `GET /api/vault/list`, and the
+generated index pages. Only reads file metadata and frontmatter; never the
+vector store.
+"""
+from __future__ import annotations
+
+import re
+from datetime import date, datetime
+from pathlib import Path
+
+from api.services.chunker import extract_frontmatter
+
+DEFAULT_LIMIT = 50
+MAX_LIMIT = 200
+DEFAULT_GLOB = "**/*.md"
+
+
+class VaultListError(ValueError):
+    """The requested path or glob cannot be listed."""
+
+
+def infer_note_type(path: Path | str) -> str:
+    """Infer a note type from where the file lives in the vault path."""
+    path_str_orig = str(path)
+    path_str = path_str_orig.lower()
+    if "/ML/" in path_str_orig or "\\ML\\" in path_str_orig:
+        return "ML"
+    if "granola" in path_str:
+        return "Granola"
+    if "personal" in path_str:
+        return "Personal"
+    if "work" in path_str:
+        return "Work"
+    if "lifeos" in path_str:
+        return "LifeOS"
+    return "Other"
+
+
+def normalize_frontmatter_tags(raw) -> list[str]:
+    """Coerce a frontmatter `tags` value (list, string, or None) to a list of strings."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        items = re.split(r"[,\s]+", raw)
+    elif isinstance(raw, (list, tuple, set)):
+        items = [str(item) for item in raw if item is not None]
+    else:
+        items = [str(raw)]
+    cleaned = [item.strip().lstrip("#") for item in items]
+    return [item for item in cleaned if item]
+
+
+def resolve_vault_dir(vault_root: Path, rel_path: str) -> tuple[Path, Path]:
+    """Resolve `rel_path` under the vault root, returning (resolved_root, resolved_dir).
+
+    Both sides are resolved so a symlinked vault root still contains its own
+    children. Raises VaultListError on escapes, absolute paths, or a missing folder.
+    """
+    rel = (rel_path or "").strip()
+    if rel.startswith(("/", "~")) or Path(rel).is_absolute():
+        raise VaultListError("path must be vault-relative")
+    root = vault_root.resolve()
+    target = (root / rel).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError:
+        raise VaultListError("path resolves outside the vault")
+    if not target.is_dir():
+        raise VaultListError(f"folder '{rel or '.'}' not found in vault")
+    return root, target
+
+
+def is_hidden(rel_parts: tuple[str, ...]) -> bool:
+    return any(part.startswith(".") for part in rel_parts)
+
+
+def scan_notes(root: Path, folder: Path, glob: str = DEFAULT_GLOB) -> list[dict]:
+    """Return `{path, relative_path, name, mtime}` for matching files, newest first.
+
+    Hidden path components are excluded and files whose real location is
+    outside the vault (symlink escapes) are dropped. Ties on mtime break on
+    relative path so the order is stable.
+    """
+    found = []
+    try:
+        matches = list(folder.glob(glob))
+    except (ValueError, NotImplementedError) as exc:
+        raise VaultListError(f"invalid glob: {exc}")
+    for p in matches:
+        try:
+            if not p.is_file():
+                continue
+            p.resolve().relative_to(root)
+            rel = p.relative_to(root)
+            if is_hidden(rel.parts):
+                continue
+            mtime = p.stat().st_mtime
+        except (OSError, ValueError):
+            continue
+        found.append({"path": p, "relative_path": rel.as_posix(), "name": p.name, "mtime": mtime})
+    found.sort(key=lambda e: (-e["mtime"], e["relative_path"]))
+    return found
+
+
+def mtime_date(mtime: float) -> date:
+    return datetime.fromtimestamp(mtime).date()
+
+
+def _tags_for(path: Path) -> list[str]:
+    try:
+        meta, _ = extract_frontmatter(path.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        return []
+    return normalize_frontmatter_tags(meta.get("tags"))
+
+
+def list_vault_entries(
+    vault_root: Path,
+    path: str = "",
+    glob: str | None = None,
+    limit: int = DEFAULT_LIMIT,
+    offset: int = 0,
+) -> dict:
+    """List notes under `path` (recursively, or matching `glob`), newest first.
+
+    Returns `{path, total, offset, limit, folders, entries}` where each entry is
+    `{name, relative_path, modified_date, note_type, tags}`. Raises VaultListError.
+    """
+    root, folder = resolve_vault_dir(vault_root, path)
+    limit = max(1, min(int(limit), MAX_LIMIT))
+    offset = max(0, int(offset))
+    notes = scan_notes(root, folder, glob or DEFAULT_GLOB)
+    page = notes[offset:offset + limit]
+    entries = [
+        {
+            "name": n["name"],
+            "relative_path": n["relative_path"],
+            "modified_date": mtime_date(n["mtime"]).isoformat(),
+            "note_type": infer_note_type(n["path"]),
+            "tags": _tags_for(n["path"]),
+        }
+        for n in page
+    ]
+    folders = sorted(
+        d.name for d in folder.iterdir()
+        if d.is_dir() and not d.name.startswith(".")
+    )
+    return {
+        "path": folder.relative_to(root).as_posix() if folder != root else "",
+        "total": len(notes),
+        "offset": offset,
+        "limit": limit,
+        "folders": folders,
+        "entries": entries,
+    }

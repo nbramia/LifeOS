@@ -921,6 +921,26 @@ Comprehensive health check. Tests all services (ChromaDB, vault search, calendar
 
 Real-time external service health. Returns per-service status, degradation events (last 24h), and critical issues.
 
+### GET /api/vault/list
+
+List notes in a vault folder, newest first. Hidden folders (`.obsidian`, `.trash`) are excluded. A `path` that resolves outside the vault returns 400.
+
+**Query parameters:** `path` (vault-relative folder; empty for the root), `glob` (relative to `path`; default `**/*.md`), `limit` (1-200, default 50), `offset` (default 0).
+
+**Response:**
+```json
+{
+  "path": "Work",
+  "total": 42,
+  "offset": 0,
+  "limit": 50,
+  "folders": ["Projects"],
+  "entries": [
+    {"name": "Example.md", "relative_path": "Work/Example.md", "modified_date": "2026-09-01", "note_type": "Work", "tags": ["example"]}
+  ]
+}
+```
+
 ### POST /api/admin/reindex
 
 Enqueue a vault reindex job. Returns immediately with a job ID. Use `GET /api/jobs/{job_id}` to check progress. Prevents duplicates (won't enqueue if already pending/running).

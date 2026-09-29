@@ -1,0 +1,130 @@
+"""list_vault tool, GET /api/vault/list, and the shared listing service."""
+import json
+import os
+from pathlib import Path
+
+import pytest
+
+from api.services import agent_tools
+from api.services.vault_listing import VaultListError, list_vault_entries, normalize_frontmatter_tags
+from config.settings import settings
+
+pytestmark = pytest.mark.unit
+
+
+def _touch(path: Path, text: str, mtime: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    os.utime(path, (mtime, mtime))
+
+
+@pytest.fixture
+def vault(tmp_path, monkeypatch):
+    root = tmp_path / "vault"
+    _touch(root / "Work" / "old.md", "---\ntags: [alpha, beta]\n---\nbody", 1_700_000_000)
+    _touch(root / "Work" / "new.md", "---\ntags: solo\n---\nbody", 1_760_000_000)
+    _touch(root / "Work" / "Sub" / "mid.md", "no frontmatter", 1_730_000_000)
+    _touch(root / "Work" / ".obsidian" / "hidden.md", "x", 1_770_000_000)
+    _touch(root / ".trash" / "gone.md", "x", 1_770_000_000)
+    _touch(root / "Work" / "notes.txt", "not markdown", 1_770_000_000)
+    monkeypatch.setattr(settings, "vault_path", root)
+    return root
+
+
+def _call(**inp):
+    return agent_tools._tool_list_vault(inp)
+
+
+def test_sorted_newest_first_with_total_and_metadata(vault):
+    data = json.loads(_call(path="Work"))
+    assert data["total"] == 3
+    assert [e["relative_path"] for e in data["entries"]] == ["Work/new.md", "Work/Sub/mid.md", "Work/old.md"]
+    by_name = {e["name"]: e for e in data["entries"]}
+    assert by_name["old.md"]["tags"] == ["alpha", "beta"]
+    assert by_name["new.md"]["tags"] == ["solo"]
+    assert by_name["mid.md"]["tags"] == []
+    assert set(by_name["old.md"]) == {"name", "relative_path", "modified_date", "note_type", "tags"}
+    assert by_name["old.md"]["modified_date"].startswith("2023-11-")
+    assert data["folders"] == ["Sub"]
+
+
+def test_hidden_directories_excluded_at_root(vault):
+    data = json.loads(_call(path=""))
+    assert data["total"] == 3
+    assert all(".obsidian" not in e["relative_path"] and ".trash" not in e["relative_path"] for e in data["entries"])
+    assert data["folders"] == ["Work"]
+
+
+def test_pagination(vault):
+    first = json.loads(_call(path="Work", limit=2))
+    second = json.loads(_call(path="Work", limit=2, offset=2))
+    assert first["total"] == second["total"] == 3
+    assert [e["name"] for e in first["entries"]] == ["new.md", "mid.md"]
+    assert [e["name"] for e in second["entries"]] == ["old.md"]
+
+
+def test_glob(vault):
+    data = json.loads(_call(path="Work", glob="o*.md"))
+    assert [e["name"] for e in data["entries"]] == ["old.md"]
+
+
+@pytest.mark.parametrize("bad", ["..", "../outside", "Work/../..", "/etc", "~"])
+def test_escaping_paths_return_error_string(vault, bad):
+    result = _call(path=bad)
+    assert isinstance(result, str) and result.startswith("Error:")
+
+
+def test_missing_folder_is_error_string(vault):
+    assert _call(path="Nope").startswith("Error:")
+
+
+def test_symlink_escape_is_rejected(vault, tmp_path):
+    outside = tmp_path / "outside"
+    _touch(outside / "secret.md", "secret", 1_700_000_000)
+    (vault / "link").symlink_to(outside)
+    assert _call(path="link").startswith("Error:")
+    data = json.loads(_call(path=""))
+    assert all("secret" not in e["name"] for e in data["entries"])
+
+
+def test_symlinked_vault_root_still_lists(tmp_path):
+    real = tmp_path / "real"
+    _touch(real / "A" / "n.md", "x", 1_700_000_000)
+    link = tmp_path / "linkroot"
+    link.symlink_to(real)
+    result = list_vault_entries(link, "A")
+    assert [e["relative_path"] for e in result["entries"]] == ["A/n.md"]
+
+
+def test_escape_raises_list_error(vault):
+    with pytest.raises(VaultListError):
+        list_vault_entries(vault, "../x")
+
+
+def test_normalize_tags():
+    assert normalize_frontmatter_tags(None) == []
+    assert normalize_frontmatter_tags("a, #b c") == ["a", "b", "c"]
+    assert normalize_frontmatter_tags(["x", None, 3]) == ["x", "3"]
+
+
+def test_registered_as_sync_tool():
+    names = {t["name"] for t in agent_tools.TOOL_DEFINITIONS}
+    assert "list_vault" in names
+    assert "list_vault" in agent_tools._TOOL_HANDLERS
+    assert "list_vault" in agent_tools._SYNC_HANDLERS
+
+
+def test_route_returns_entries_and_400(vault):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from api.routes.vault import router
+
+    app = FastAPI()
+    app.include_router(router)
+    client = TestClient(app)
+    ok = client.get("/api/vault/list", params={"path": "Work", "limit": 1})
+    assert ok.status_code == 200
+    body = ok.json()
+    assert body["total"] == 3 and body["entries"][0]["name"] == "new.md"
+    assert client.get("/api/vault/list", params={"path": "../x"}).status_code == 400

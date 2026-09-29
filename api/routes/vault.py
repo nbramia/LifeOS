@@ -41,10 +41,11 @@ import logging
 from pathlib import Path
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from api.services.gsheet_sync import journal_notes_configured
+from api.services.vault_listing import VaultListError, list_vault_entries
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -177,3 +178,33 @@ async def vault_write(request: VaultWriteRequest) -> VaultWriteResponse:
         mode=request.mode,
         created=not existed,
     )
+
+
+class VaultListEntry(BaseModel):
+    name: str
+    relative_path: str
+    modified_date: str
+    note_type: str
+    tags: list[str]
+
+
+class VaultListResponse(BaseModel):
+    path: str
+    total: int
+    offset: int
+    limit: int
+    folders: list[str]
+    entries: list[VaultListEntry]
+
+
+@router.get("/list", response_model=VaultListResponse)
+async def vault_list(
+    path: str = Query("", description="Vault-relative folder; empty for the vault root."),
+    glob: str | None = Query(None, description="Glob relative to `path` (default `**/*.md`)."),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+) -> VaultListResponse:
+    try:
+        return VaultListResponse(**list_vault_entries(settings.vault_path, path, glob, limit, offset))
+    except VaultListError as e:
+        raise HTTPException(400, str(e))
