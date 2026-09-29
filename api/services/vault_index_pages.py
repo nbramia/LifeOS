@@ -39,13 +39,18 @@ def _one_line(text: str) -> str:
     return line
 
 
-def _frontmatter(today: date) -> list[str]:
-    return ["---", "type: index", f"source: {OWNER}", f"date: {today.isoformat()}", "generated: true", "---"]
+def _frontmatter(latest: str | None) -> list[str]:
+    """Frontmatter whose `date` is the newest note date on the page (none when empty)."""
+    lines = ["---", "type: index", f"source: {OWNER}"]
+    if latest:
+        lines.append(f"date: {latest}")
+    return lines + ["generated: true", "---"]
 
 
-def render_map_index(rows: list[tuple[str, int, int]], *, today: date) -> str:
-    """Render `Wiki/Vault Map/index.md`; `rows` are `(folder, notes, recent)`."""
-    lines = _frontmatter(today) + [
+def render_map_index(rows: list[tuple[str, int, int, str | None]]) -> str:
+    """Render `Wiki/Vault Map/index.md`; `rows` are `(folder, notes, recent, latest_date)`."""
+    latest = max((r[3] for r in rows if r[3]), default=None)
+    lines = _frontmatter(latest) + [
         "# Vault map",
         "",
         WIKI_INDEX_LINK,
@@ -53,7 +58,7 @@ def render_map_index(rows: list[tuple[str, int, int]], *, today: date) -> str:
         "Generated list of the per-folder index pages, rebuilt during the nightly reindex. Do not edit.",
         "",
     ]
-    for name, total, recent in sorted(rows):
+    for name, total, recent, _ in sorted(rows):
         lines.append(f"- [[{INDEX_FOLDER}/{name}|{name}]] — {total} notes, {recent} changed in {RECENT_DAYS} days")
     if not rows:
         lines.append("_No folders yet._")
@@ -76,7 +81,7 @@ def render_index_page(
     ordered = list(entries)
     cutoff = today - timedelta(days=RECENT_DAYS)
     recent_count = sum(1 for e in ordered if date.fromisoformat(e["modified_date"]) >= cutoff)
-    lines = _frontmatter(today) + [
+    lines = _frontmatter(max((e["modified_date"] for e in ordered), default=None)) + [
         f"# {folder_name} index",
         "",
         WIKI_INDEX_LINK,
@@ -140,7 +145,7 @@ def write_index_pages(
 
     written = unchanged = skipped_collision = 0
     changed: list[str] = []
-    rows: list[tuple[str, int, int]] = []
+    rows: list[tuple[str, int, int, str | None]] = []
     folders = sorted(
         d for d in root.iterdir()
         if d.is_dir() and not is_hidden((d.name,))
@@ -168,6 +173,7 @@ def write_index_pages(
             folder.name,
             len(entries),
             sum(1 for e in entries if date.fromisoformat(e["modified_date"]) >= cutoff),
+            max((e["modified_date"] for e in entries), default=None),
         ))
         top = notes[:MAX_RECENT]
         real_paths = {str(n["path"].resolve()): n["relative_path"] for n in top}
@@ -189,7 +195,7 @@ def write_index_pages(
             written += 1
             changed.append(str(target))
     map_index = index_dir / "index.md"
-    status = _write_owned(map_index, render_map_index(rows, today=today).encode("utf-8"))
+    status = _write_owned(map_index, render_map_index(rows).encode("utf-8"))
     if status == "unchanged":
         unchanged += 1
     elif status == "collision":

@@ -1,6 +1,6 @@
 """Generated per-folder index pages."""
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -46,7 +46,7 @@ def test_render_counts_order_and_frontmatter():
     ]
     page = render_index_page("W", entries, {"W/a.md": "About  A\nthing"}, today=TODAY)
     assert page.startswith(
-        "---\ntype: index\nsource: lifeos-index\ndate: 2026-09-29\ngenerated: true\n---\n# W index\n\n"
+        "---\ntype: index\nsource: lifeos-index\ndate: 2026-09-28\ngenerated: true\n---\n# W index\n\n"
         "Part of [[Wiki/index|Wiki Index]] → Vault map.\n"
     )
     assert "- Notes: 3" in page
@@ -269,7 +269,7 @@ def test_pages_link_back_to_wiki_index_and_map_index_lists_folders(vault):
     work = (vault / INDEX_FOLDER / "Work.md").read_text()
     assert "Part of [[Wiki/index|Wiki Index]] → Vault map." in work
     index = (vault / INDEX_FOLDER / "index.md").read_text()
-    assert index.startswith("---\ntype: index\nsource: lifeos-index\ndate: 2026-09-29\ngenerated: true\n---\n")
+    assert index.startswith("---\ntype: index\nsource: lifeos-index\ndate: 2026-09-28\ngenerated: true\n---\n")
     assert "- [[Wiki/Vault Map/Work|Work]] — 3 notes, 2 changed in 30 days" in index
     assert "- [[Wiki/Vault Map/Personal|Personal]] — 1 notes, 1 changed in 30 days" in index
     assert "[[Wiki/Vault Map/Wiki|Wiki]] — 0 notes, 0 changed in 30 days" in index
@@ -301,3 +301,12 @@ def test_legacy_index_folder_removed_when_emptied(vault):
     stats = write_index_pages(vault, today=TODAY, summary_lookup=_no_summaries)
     assert stats["removed_legacy"] == 1 and not legacy.exists()
     assert write_index_pages(vault, today=TODAY, summary_lookup=_no_summaries)["removed_legacy"] == 0
+
+
+def test_unchanged_vault_writes_nothing_on_a_later_day(vault):
+    write_index_pages(vault, today=TODAY, summary_lookup=_no_summaries)
+    stats = write_index_pages(vault, today=TODAY + timedelta(days=1), summary_lookup=_no_summaries)
+    assert stats["changed"] == [] and stats["written"] == 0 and stats["unchanged"] == 4
+    work = (vault / INDEX_FOLDER / "Work.md").read_text()
+    assert "\ndate: 2026-09-28\n" in work
+    assert "\ndate: 2026-09-20\n" in (vault / INDEX_FOLDER / "Personal.md").read_text()
