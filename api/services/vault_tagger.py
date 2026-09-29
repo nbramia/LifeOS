@@ -29,9 +29,12 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+import frontmatter
 
 from api.services import chunker
 from api.services.jev_client import JevClient
@@ -94,20 +97,47 @@ def _path_restricted(rel_path: str) -> bool:
     return False
 
 
+_INLINE_TAG = re.compile(r"(?<![\w/&#])#([A-Za-z][\w/-]*)")
+_FENCED_CODE = re.compile(r"^(```|~~~).*?^\1", re.S | re.M)
+
+
+def inline_tags(body: str) -> list[str]:
+    """Obsidian inline tags (`#tag`, `#tag/sub`) outside fenced code blocks."""
+    return _INLINE_TAG.findall(_FENCED_CODE.sub("", body))
+
+
+def _tag_restricted(tag: str) -> bool:
+    """A restricted tag or any of its children (`private/session`), case-insensitive."""
+    parts = tag.lstrip("#").lower().split("/")
+    return any("/".join(parts[: i + 1]) in RESTRICTED_TAGS for i in range(len(parts)))
+
+
 def classify_sensitivity(rel_path: str, human_tags: list[str]) -> str:
     """``restricted`` on a restricted path or human tag, else ``private``. Code only."""
     if _path_restricted(rel_path):
         return "restricted"
-    if {t.lower() for t in human_tags} & RESTRICTED_TAGS:
+    if any(_tag_restricted(t) for t in human_tags):
         return "restricted"
     return "private"
 
 
+def parse_note(content: str) -> tuple[dict, str, bool]:
+    """(frontmatter, body, parsed_ok). A frontmatter fence that fails to parse
+    yields ok=False so the caller can treat the note as restricted."""
+    if content.lstrip("\ufeff").startswith("---"):
+        try:
+            post = frontmatter.loads(content)
+        except Exception:  # noqa: BLE001 - any parse failure
+            return {}, content, False
+        return dict(post.metadata), post.content, True
+    return {}, content, True
+
+
 def _cap_tokens(text: str, limit: int = MAX_BODY_TOKENS) -> str:
+    if chunker.TOKENIZER is None:
+        return text[:limit]  # one character is at least one token: a safe upper bound
     if chunker.count_tokens(text) <= limit:
         return text
-    if chunker.TOKENIZER is None:
-        return text[: limit * 4]
     return chunker.TOKENIZER.decode(chunker.TOKENIZER.encode(text)[:limit])
 
 
@@ -131,18 +161,18 @@ def deterministic_facets(path: Path, content: str | None = None, rel_path: str |
     """Code-derived facets: folder, note_date, human_tags, people, sensitivity."""
     if content is None:
         content = path.read_text(encoding="utf-8", errors="replace")
-    fm, body = chunker.extract_frontmatter(content)
+    fm, body, parsed = parse_note(content)
     from api.services.people import extract_people_from_text
 
     rel = rel_path if rel_path is not None else path.name
-    tags = chunker.normalize_tags(fm.get("tags"))
+    tags = chunker.normalize_tags(fm.get("tags")) + inline_tags(body)
     people = sorted(set(extract_people_from_text(body)) | set(chunker.normalize_tags(fm.get("people"))))
     return {
         "folder": str(Path(rel).parent) if Path(rel).parent != Path(".") else "",
         "note_date": extract_note_date(path, fm, body),
         "human_tags": tags,
         "people": people,
-        "sensitivity": classify_sensitivity(rel, tags),
+        "sensitivity": classify_sensitivity(rel, tags) if parsed else "restricted",
     }
 
 
@@ -199,10 +229,24 @@ class VaultTagger:
         return self._taxonomy
 
     def _rel(self, path: Path) -> str:
+        """Vault-relative path as supplied (symlinks not followed)."""
+        root = self.vault_root
+        for base in (root, root.resolve()):
+            try:
+                return str(path.relative_to(base))
+            except ValueError:
+                pass
+        try:
+            return str(path.absolute().relative_to(root.resolve()))
+        except ValueError:
+            return path.name
+
+    def _resolved_rel(self, path: Path) -> str | None:
+        """Vault-relative path of the symlink-resolved target, None when outside the vault."""
         try:
             return str(path.resolve().relative_to(self.vault_root.resolve()))
         except ValueError:
-            return path.name
+            return None
 
     def jev_allowed(self, rel_path: str, sensitivity: str) -> bool:
         return (
@@ -284,14 +328,19 @@ class VaultTagger:
 
     def tag_file(self, path: str | Path) -> TagRecord:
         path = Path(path)
-        rel = self._rel(path)
+        rel = path.name
         previous = None
         try:
+            rel = self._rel(path)
             previous = self.store.get(rel) if self.store else None
             content = path.read_text(encoding="utf-8", errors="replace")
             sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
-            fm, body = chunker.extract_frontmatter(content)
-            sensitivity = classify_sensitivity(rel, chunker.normalize_tags(fm.get("tags")))
+            fm, body, parsed = parse_note(content)
+            tags = chunker.normalize_tags(fm.get("tags")) + inline_tags(body)
+            resolved = self._resolved_rel(path)
+            sensitivity = classify_sensitivity(rel, tags)
+            if resolved is None or not parsed or classify_sensitivity(resolved, tags) == "restricted":
+                sensitivity = "restricted"
             record = TagRecord(
                 file_path=rel,
                 content_sha256=sha,

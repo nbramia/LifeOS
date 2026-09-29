@@ -217,3 +217,83 @@ def test_restricted_prefix_entry_matches_by_path(monkeypatch):
     assert classify_sensitivity("Personal/Diary/a.md", []) == "restricted"
     assert classify_sensitivity("Personal/Other/a.md", []) == "private"
     assert classify_sensitivity("Diary/a.md", []) == "private"
+
+
+def _send(vault, monkeypatch, rel):
+    _set(monkeypatch)
+    with patch.object(JevClient, "ask", return_value=_answers()) as ask:
+        rec = _tagger(vault).tag_file(vault / rel)
+    return ask, rec
+
+
+def test_symlink_to_outside_vault_is_never_sent(vault, monkeypatch, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.md").write_text("# Secret\nText.\n")
+    (vault / "Work" / "external.md").symlink_to(outside / "secret.md")
+    ask, rec = _send(vault, monkeypatch, "Work/external.md")
+    assert not ask.called and rec.backend == "code" and rec.sensitivity == "restricted"
+
+
+def test_symlink_into_restricted_folder_is_restricted(vault, monkeypatch):
+    (vault / "Work" / "alias.md").symlink_to(vault / "Therapy" / "session.md")
+    ask, rec = _send(vault, monkeypatch, "Work/alias.md")
+    assert not ask.called and rec.sensitivity == "restricted"
+
+
+def test_restricted_lexical_path_to_plain_target_is_restricted(vault, monkeypatch):
+    (vault / "Therapy" / "alias.md").symlink_to(vault / "Notes" / "idea.md")
+    ask, rec = _send(vault, monkeypatch, "Therapy/alias.md")
+    assert not ask.called and rec.sensitivity == "restricted"
+
+
+def test_self_referencing_symlink_never_raises(vault, monkeypatch):
+    (vault / "Notes" / "loop.md").symlink_to(vault / "Notes" / "loop.md")
+    ask, rec = _send(vault, monkeypatch, "Notes/loop.md")
+    assert not ask.called and rec.backend == "code"
+
+
+def test_malformed_frontmatter_is_restricted(vault, monkeypatch):
+    (vault / "Notes" / "bad.md").write_text("---\ntags: [private]\nkey: [unclosed\n---\nBody\n")
+    ask, rec = _send(vault, monkeypatch, "Notes/bad.md")
+    assert not ask.called and rec.sensitivity == "restricted"
+
+
+def test_horizontal_rule_without_frontmatter_is_not_restricted(vault, monkeypatch):
+    (vault / "Notes" / "rule.md").write_text("---\nJust a rule, no closing fence\n")
+    ask, rec = _send(vault, monkeypatch, "Notes/rule.md")
+    assert ask.called and rec.sensitivity == "private"
+
+
+@pytest.mark.parametrize("body", [
+    "Body with #Therapy tag\n",
+    "Body #private/session here\n",
+    "#finance\n",
+])
+def test_inline_restricted_tags(vault, monkeypatch, body):
+    (vault / "Notes" / "inline.md").write_text("# Title\n" + body)
+    ask, rec = _send(vault, monkeypatch, "Notes/inline.md")
+    assert not ask.called and rec.sensitivity == "restricted"
+
+
+def test_nested_frontmatter_tag_is_restricted(vault, monkeypatch):
+    (vault / "Notes" / "nested.md").write_text("---\ntags: [Private/Session]\n---\nBody\n")
+    ask, rec = _send(vault, monkeypatch, "Notes/nested.md")
+    assert not ask.called and rec.sensitivity == "restricted"
+
+
+def test_headings_and_code_blocks_are_not_tags(vault, monkeypatch):
+    (vault / "Notes" / "ok.md").write_text("# Private\n## Therapy notes\n```\n#private\n```\nx#therapy\n")
+    ask, rec = _send(vault, monkeypatch, "Notes/ok.md")
+    assert ask.called and rec.sensitivity == "private"
+
+
+def test_body_cap_without_tokenizer_is_characters(vault, monkeypatch):
+    from api.services import chunker
+
+    monkeypatch.setattr(chunker, "TOKENIZER", None)
+    (vault / "Notes" / "cjk.md").write_text("字" * 32000)
+    _set(monkeypatch)
+    with patch.object(JevClient, "ask", return_value=_answers()) as ask:
+        _tagger(vault).tag_file(vault / "Notes" / "cjk.md")
+    assert len(ask.call_args.args[0]["body"]) <= 8000
