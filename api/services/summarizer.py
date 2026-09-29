@@ -60,7 +60,7 @@ SKIP_DIRECTORIES = {
 # generated index pages live here; summarizing them would only describe
 # generated text.
 SKIP_PATH_PREFIXES = (
-    "lifeos/index",
+    "wiki/vault map",
 )
 
 HIGH_DIRECTORIES = {

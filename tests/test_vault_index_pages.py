@@ -45,7 +45,10 @@ def test_render_counts_order_and_frontmatter():
         {"relative_path": "W/old.md", "name": "old.md", "modified_date": "2026-01-01"},
     ]
     page = render_index_page("W", entries, {"W/a.md": "About  A\nthing"}, today=TODAY)
-    assert page.startswith("---\ngenerated: true\nsource: lifeos-index\n---\n")
+    assert page.startswith(
+        "---\ntype: index\nsource: lifeos-index\ndate: 2026-09-29\ngenerated: true\n---\n# W index\n\n"
+        "Part of [[Wiki/index|Wiki Index]] → Vault map.\n"
+    )
     assert "- Notes: 3" in page
     assert "- Changed in the last 30 days: 2" in page
     bullets = [line for line in page.splitlines() if line.startswith("- [[")]
@@ -70,8 +73,8 @@ def test_render_caps_at_30_and_is_deterministic():
 def test_write_creates_folder_pages_and_excludes_hidden_and_index(vault):
     stats = write_index_pages(vault, today=TODAY, summary_lookup=_no_summaries)
     assert (vault / INDEX_FOLDER).is_dir()
-    assert sorted(p.name for p in (vault / INDEX_FOLDER).iterdir()) == ["LifeOS.md", "Personal.md", "Work.md"]
-    assert (stats["written"], stats["unchanged"], stats["folders"]) == (3, 0, 3)
+    assert sorted(p.name for p in (vault / INDEX_FOLDER).iterdir()) == ["Personal.md", "Wiki.md", "Work.md", "index.md"]
+    assert (stats["written"], stats["unchanged"], stats["folders"]) == (4, 0, 3)
     work = (vault / INDEX_FOLDER / "Work.md").read_text()
     assert "- Notes: 3" in work
     assert ".trash" not in work and ".obsidian" not in work
@@ -82,16 +85,16 @@ def test_second_run_is_byte_identical_and_skips_write(vault):
     target = vault / INDEX_FOLDER / "Work.md"
     before = target.stat().st_mtime_ns
     stats = write_index_pages(vault, today=TODAY, summary_lookup=_no_summaries)
-    assert stats["written"] == 0 and stats["unchanged"] == 3
+    assert stats["written"] == 0 and stats["unchanged"] == 4
     assert target.stat().st_mtime_ns == before
 
 
-def test_index_notes_do_not_count_toward_lifeos_page(tmp_path):
+def test_map_notes_do_not_count_toward_wiki_page(tmp_path):
     root = tmp_path / "vault"
-    _touch(root / "LifeOS" / "n.md", "n", "2026-09-28")
+    _touch(root / "Wiki" / "n.md", "n", "2026-09-28")
     write_index_pages(root, today=TODAY, summary_lookup=_no_summaries)
     write_index_pages(root, today=TODAY, summary_lookup=_no_summaries)
-    assert "- Notes: 1" in (root / INDEX_FOLDER / "LifeOS.md").read_text()
+    assert "- Notes: 1" in (root / INDEX_FOLDER / "Wiki.md").read_text()
 
 
 def test_summaries_are_used_and_lookup_failure_falls_back_to_titles(vault):
@@ -121,8 +124,8 @@ def test_bm25_get_summaries_round_trip(tmp_path):
 
 def test_index_folder_is_never_summarized(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "vault_path", tmp_path)
-    assert get_summary_tier(str(tmp_path / "LifeOS" / "Index" / "Work.md")) == SummaryTier.SKIP
-    assert get_summary_tier(str(tmp_path / "LifeOS" / "Indexes" / "x.md")) == SummaryTier.HIGH
+    assert get_summary_tier(str(tmp_path / "Wiki" / "Vault Map" / "Work.md")) == SummaryTier.SKIP
+    assert get_summary_tier(str(tmp_path / "Wiki" / "Vault Maps" / "x.md")) == SummaryTier.HIGH
     assert get_summary_tier(str(tmp_path / "LifeOS" / "note.md")) == SummaryTier.HIGH
 
 
@@ -158,8 +161,7 @@ def test_symlinked_index_dir_outside_vault_is_refused(tmp_path):
     _touch(root / "Work" / "a.md", "a", "2026-09-28")
     outside = tmp_path / "outside"
     outside.mkdir()
-    (root / "LifeOS").mkdir()
-    (root / "LifeOS" / "Index").symlink_to(outside)
+    (root / "Wiki").symlink_to(outside)
     stats = write_index_pages(root, today=TODAY, summary_lookup=_no_summaries)
     assert stats["written"] == 0 and stats["changed"] == []
     assert list(outside.iterdir()) == []
@@ -173,6 +175,7 @@ def test_stale_generated_pages_removed_but_handwritten_kept(vault):
     stats = write_index_pages(vault, today=TODAY, summary_lookup=_no_summaries)
     names = sorted(p.name for p in (vault / INDEX_FOLDER).iterdir())
     assert "Personal.md" not in names and "Renamed.md" in names
+    assert "index.md" in names
     assert "Custom.md" in names and "Gone.md" in names
     assert stats["removed"] == [str(vault / INDEX_FOLDER / "Personal.md")]
 
@@ -211,7 +214,7 @@ def test_nightly_script_generates_and_indexes_changed_pages(vault, monkeypatch):
     result = sync_vault_reindex.sync_vault_reindex(dry_run=False)
     assert result["status"] == "success" and calls["index_all"] == 1
     indexed = sorted(Path(p).name for p, _ in calls["index_file"])
-    assert indexed == ["LifeOS.md", "Personal.md", "Work.md"]
+    assert indexed == ["Personal.md", "Wiki.md", "Work.md", "index.md"]
     assert all(kw.get("skip_summaries") is True for _, kw in calls["index_file"])
 
     calls["index_file"].clear()
@@ -259,3 +262,42 @@ def test_generated_page_is_indexed_without_any_summary_call(vault, tmp_path, mon
     indexer.vector_store.update_document.assert_called_once()
     assert summary.call_count == 0
     assert indexer.bm25_index.get_summaries([str(page.resolve())]) == {}
+
+
+def test_pages_link_back_to_wiki_index_and_map_index_lists_folders(vault):
+    write_index_pages(vault, today=TODAY, summary_lookup=_no_summaries)
+    work = (vault / INDEX_FOLDER / "Work.md").read_text()
+    assert "Part of [[Wiki/index|Wiki Index]] → Vault map." in work
+    index = (vault / INDEX_FOLDER / "index.md").read_text()
+    assert index.startswith("---\ntype: index\nsource: lifeos-index\ndate: 2026-09-29\ngenerated: true\n---\n")
+    assert "- [[Wiki/Vault Map/Work|Work]] — 3 notes, 2 changed in 30 days" in index
+    assert "- [[Wiki/Vault Map/Personal|Personal]] — 1 notes, 1 changed in 30 days" in index
+    assert "[[Wiki/Vault Map/Wiki|Wiki]] — 0 notes, 0 changed in 30 days" in index
+
+
+def test_handwritten_wiki_index_is_never_modified(vault):
+    _touch(vault / "Wiki" / "index.md", "# Wiki\n", "2026-09-20")
+    before = (vault / "Wiki" / "index.md").read_bytes()
+    write_index_pages(vault, today=TODAY, summary_lookup=_no_summaries)
+    assert (vault / "Wiki" / "index.md").read_bytes() == before
+    assert "- Notes: 1" in (vault / INDEX_FOLDER / "Wiki.md").read_text()
+
+
+def test_legacy_index_folder_generated_pages_removed_handwritten_kept(vault):
+    legacy = vault / "LifeOS" / "Index"
+    legacy.mkdir(parents=True)
+    (legacy / "Work.md").write_text("---\ngenerated: true\nsource: lifeos-index\n---\nold\n", encoding="utf-8")
+    (legacy / "Mine.md").write_text("---\nsource: handwritten\n---\nkeep\n", encoding="utf-8")
+    stats = write_index_pages(vault, today=TODAY, summary_lookup=_no_summaries)
+    assert stats["removed_legacy"] == 1
+    assert [p.name for p in legacy.iterdir()] == ["Mine.md"]
+    assert (legacy / "Mine.md").read_text() == "---\nsource: handwritten\n---\nkeep\n"
+
+
+def test_legacy_index_folder_removed_when_emptied(vault):
+    legacy = vault / "LifeOS" / "Index"
+    legacy.mkdir(parents=True)
+    (legacy / "Work.md").write_text("---\nsource: lifeos-index\n---\nold\n", encoding="utf-8")
+    stats = write_index_pages(vault, today=TODAY, summary_lookup=_no_summaries)
+    assert stats["removed_legacy"] == 1 and not legacy.exists()
+    assert write_index_pages(vault, today=TODAY, summary_lookup=_no_summaries)["removed_legacy"] == 0
