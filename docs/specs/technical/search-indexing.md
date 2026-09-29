@@ -25,7 +25,7 @@ Nicknames are expanded to canonical names (e.g., "Al" → "Alex") before search.
 ### 2. Dual Search
 
 - **Vector Search**: Semantic similarity via ChromaDB embeddings
-- **BM25 Search**: Keyword matching via SQLite FTS5; every query term is quoted so no input character is FTS5 syntax. A strict all-terms query runs first, and only if it returns nothing does an any-term (stop words removed) query run; results carry `match_mode` (`and` or `or`)
+- **BM25 Search**: Keyword matching via SQLite FTS5; every query term is quoted so no input character is FTS5 syntax. A strict all-terms query runs first; any remaining slots up to the limit are filled with any-term (stop words removed) matches not already returned, unless the strict query already filled the limit; results carry `match_mode` (`and` rows first, then `or`)
 
 Both searches run in parallel and their results are combined.
 

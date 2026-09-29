@@ -188,15 +188,14 @@ class TestQuerySanitizing:
 
     def test_quoted_terms_are_stemmed(self, seeded):
         results = seeded.search("discussing plan")
-        assert [r["doc_id"] for r in results] == ["d1"]
+        assert results[0]["doc_id"] == "d1"
         assert results[0]["match_mode"] == "and"
 
 
 class TestStrictThenLenient:
-    def test_cooccurring_terms_return_and_matches_only(self, seeded):
+    def test_cooccurring_terms_rank_and_matches_first(self, seeded):
         results = seeded.search("platform team hiring")
-        assert [r["doc_id"] for r in results] == ["d1"]
-        assert all(r["match_mode"] == "and" for r in results)
+        assert [(r["doc_id"], r["match_mode"]) for r in results] == [("d1", "and"), ("d2", "or")]
 
     def test_non_cooccurring_terms_fall_back_to_or(self, seeded):
         results = seeded.search("hiring roadmap")
@@ -250,7 +249,7 @@ class TestLiteralOperatorWords:
 
     def test_uppercase_or_is_a_required_term_in_strict_mode(self, operator_index):
         results = operator_index.search("alpha OR beta")
-        assert [r["doc_id"] for r in results] == ["all3"]
+        assert results[0]["doc_id"] == "all3"
         assert results[0]["match_mode"] == "and"
 
     def test_or_alone_is_a_plain_term(self, operator_index, caplog):
@@ -258,3 +257,44 @@ class TestLiteralOperatorWords:
             results = operator_index.search("OR")
         assert "BM25 search error" not in caplog.text
         assert {r["doc_id"] for r in results} == {"all3", "choice"}
+
+
+class TestFillWithOr:
+    @pytest.fixture
+    def filled(self, bm25):
+        bm25.bulk_add(
+            [{"doc_id": f"both{i}", "content": "kiwi mango", "file_name": f"B{i}.md"} for i in range(2)]
+            + [{"doc_id": f"kiwi{i}", "content": "kiwi only", "file_name": f"K{i}.md"} for i in range(4)]
+            + [{"doc_id": f"mango{i}", "content": "mango only", "file_name": f"M{i}.md"} for i in range(4)]
+        )
+        return bm25
+
+    @staticmethod
+    def _modes(results):
+        return [r["match_mode"] for r in results]
+
+    def test_and_rows_first_then_or_fill_without_duplicates(self, filled):
+        results = filled.search("kiwi mango", limit=6)
+        ids = [r["doc_id"] for r in results]
+        assert len(results) == 6
+        assert len(set(ids)) == 6
+        assert self._modes(results) == ["and"] * 2 + ["or"] * 4
+        assert set(ids[:2]) == {"both0", "both1"}
+
+    def test_or_query_is_skipped_when_and_fills_limit(self, filled, monkeypatch):
+        modes_run = []
+        original = filled._match
+
+        def spy(conn, match_expr, limit, match_mode):
+            modes_run.append(match_mode)
+            return original(conn, match_expr, limit, match_mode)
+
+        monkeypatch.setattr(filled, "_match", spy)
+        results = filled.search("kiwi mango", limit=2)
+        assert self._modes(results) == ["and", "and"]
+        assert modes_run == ["and"]
+
+    def test_zero_and_matches_equals_or_only(self, filled):
+        results = filled.search("kiwi mango zzzunknown", limit=5)
+        assert len(results) == 5
+        assert set(self._modes(results)) == {"or"}

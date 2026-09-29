@@ -267,9 +267,11 @@ class BM25Index:
         """
         Search the index using BM25.
 
-        Runs a strict query (every term must match) first; when that yields
-        no rows, re-runs it with any-term semantics. Each result carries
-        ``match_mode`` of ``"and"`` or ``"or"`` accordingly.
+        Runs a strict query (every term must match) first, then fills any
+        remaining slots up to ``limit`` with any-term matches (stop words
+        removed) not already returned. The any-term query is skipped when the
+        strict one already fills ``limit``. Each result carries ``match_mode``
+        of ``"and"`` or ``"or"``; strict rows come first.
 
         Args:
             query: Search query string
@@ -285,12 +287,20 @@ class BM25Index:
         conn = sqlite3.connect(self.db_path)
         try:
             results = self._match(conn, strict_query, limit, "and")
-            if results:
+            if len(results) >= limit:
                 return results
             lenient_query = self._sanitize_query(query, use_or=True)
             if lenient_query == strict_query:
-                return []
-            return self._match(conn, lenient_query, limit, "or")
+                return results
+            seen = {r["doc_id"] for r in results}
+            # Over-fetch by the strict count so its rows can't crowd out the fill.
+            for row in self._match(conn, lenient_query, limit + len(results), "or"):
+                if row["doc_id"] not in seen:
+                    seen.add(row["doc_id"])
+                    results.append(row)
+                    if len(results) >= limit:
+                        break
+            return results
         except sqlite3.OperationalError as e:
             logger.warning(f"BM25 search error for query '{query}': {e}")
             return []
