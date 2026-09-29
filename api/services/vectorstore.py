@@ -28,11 +28,22 @@ TAG_KEY_PREFIX = "tag:"
 # A ``file_path $in`` list is split into batches of this many paths so no
 # single query carries an oversized parameter list.
 FILE_PATH_BATCH = 2000
+# Largest candidate pool a date-windowed search widens to while filling.
+DATE_FETCH_CAP = 6400
 
 
 def tag_key(tag: str) -> str:
     """Metadata key that marks a chunk as carrying ``tag``."""
     return TAG_KEY_PREFIX + tag.strip().lstrip("#").lower()
+
+
+def _date_in_window(metadata: Optional[dict], date_from: Optional[str], date_to: Optional[str]) -> bool:
+    """Whether a chunk's ``modified_date`` (first 10 chars) is in the inclusive
+    window; a chunk without a date passes."""
+    d = ((metadata or {}).get("modified_date") or "")[:10]
+    if not d:
+        return True
+    return not ((date_from and d < date_from) or (date_to and d > date_to))
 
 
 class VectorStore:
@@ -213,6 +224,8 @@ class VectorStore:
         filters: Optional[dict] = None,
         recency_weight: float = 0.6,
         file_paths: Optional[list[str]] = None,
+        date_from: Optional[str] = None,
+        date_to: Optional[str] = None,
     ) -> list[dict]:
         """
         Search for similar chunks with heavy recency bias.
@@ -226,6 +239,10 @@ class VectorStore:
                 (pre-filter inside the vector query); an empty list matches
                 nothing. Large lists run as batched queries whose candidates
                 are merged by distance.
+            date_from / date_to: Inclusive ``YYYY-MM-DD`` window on the chunk's
+                ``modified_date`` (undated chunks pass). The candidate pool
+                widens (doubling, up to ``DATE_FETCH_CAP``) until it holds as
+                many in-window chunks as an unwindowed search would fetch.
 
         Returns:
             List of result dicts with content, metadata, and score
@@ -245,17 +262,34 @@ class VectorStore:
         fetch_count = min(top_k * 5, 100)
 
         # Query collection
-        if file_paths is None:
-            results = self._collection.query(
-                query_embeddings=[query_embedding],
-                n_results=fetch_count,
-                where=where if where else None,
-                include=["documents", "metadatas", "distances"]
-            )
+        def run_query(n_results: int) -> dict:
+            if file_paths is None:
+                return self._collection.query(
+                    query_embeddings=[query_embedding],
+                    n_results=n_results,
+                    where=where if where else None,
+                    include=["documents", "metadatas", "distances"]
+                )
+            return self._query_restricted(query_embedding, n_results, where, file_paths)
+
+        if not (date_from or date_to):
+            results = run_query(fetch_count)
         else:
-            results = self._query_restricted(
-                query_embedding, fetch_count, where, file_paths
-            )
+            want = fetch_count
+            while True:
+                results = run_query(fetch_count)
+                returned = len(results["ids"][0]) if results["ids"] else 0
+                keep = [
+                    i for i in range(returned)
+                    if _date_in_window(results["metadatas"][0][i], date_from, date_to)
+                ]
+                if len(keep) >= want or returned < fetch_count or fetch_count >= DATE_FETCH_CAP:
+                    results = {
+                        k: [[results[k][0][i] for i in keep]]
+                        for k in ("ids", "documents", "metadatas", "distances")
+                    }
+                    break
+                fetch_count = min(fetch_count * 2, DATE_FETCH_CAP)
 
         # Format and score results
         formatted = []
@@ -381,6 +415,42 @@ class VectorStore:
             if write_ids:
                 self._collection.update(ids=write_ids, metadatas=write_metas)
                 updated += len(write_ids)
+
+    def has_unbackfilled_tags(self, sample: int = 20) -> bool:
+        """Whether a small sample of chunks with non-empty JSON ``tags`` lacks
+        ``tag:`` keys (a collection written before the keys existed)."""
+        page = self._collection.get(
+            where={"tags": {"$ne": "[]"}}, include=["metadatas"], limit=sample
+        )
+        for meta in page["metadatas"] or []:
+            meta = meta or {}
+            try:
+                has_tags = bool(json.loads(meta.get("tags") or "[]"))
+            except (TypeError, ValueError):
+                continue
+            if has_tags and not any(k.startswith(TAG_KEY_PREFIX) for k in meta):
+                return True
+        return False
+
+    def file_paths_with_people(self, file_paths, names: list[str]) -> set[str]:
+        """Subset of ``file_paths`` having a chunk whose ``people`` list holds one
+        of ``names`` as a whole value (case-insensitive, no stemming)."""
+        wanted = {n.strip().casefold() for n in names if n and n.strip()}
+        paths = sorted(file_paths)
+        found: set[str] = set()
+        for i in range(0, len(paths), FILE_PATH_BATCH):
+            batch = paths[i:i + FILE_PATH_BATCH]
+            res = self._collection.get(
+                where={"file_path": {"$in": batch}}, include=["metadatas"]
+            )
+            for meta in res["metadatas"] or []:
+                try:
+                    people = json.loads((meta or {}).get("people") or "[]")
+                except (TypeError, ValueError):
+                    continue
+                if any(str(p).strip().casefold() in wanted for p in people):
+                    found.add(meta["file_path"])
+        return found
 
     def file_paths_matching(self, where: Optional[dict] = None) -> set[str]:
         """Distinct file paths of chunks matching a Chroma ``where`` (all when None).

@@ -475,11 +475,19 @@ class HybridSearch:
                     return []
                 allowed_paths = resolved
         arm_kwargs = {} if allowed_paths is None else {"file_paths": allowed_paths}
+        date_kwargs = {}
+        if date_from:
+            date_kwargs["date_from"] = date_from
+        if date_to:
+            date_kwargs["date_to"] = date_to
+        arm_kwargs.update(date_kwargs)
 
         # Get vector results (use expanded query for better semantic matching)
         with trace_span("search_vector", parent="tool_search_vault"):
             vector_store = self._get_vector_store()
-            vector_kwargs = {} if allowed_paths is None else {"file_paths": sorted(allowed_paths)}
+            vector_kwargs = dict(date_kwargs)
+            if allowed_paths is not None:
+                vector_kwargs["file_paths"] = sorted(allowed_paths)
             vector_results = vector_store.search(
                 query=expanded_query, top_k=fetch_k, **vector_kwargs
             )

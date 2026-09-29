@@ -205,3 +205,24 @@ class TestSearchRequestValidation:
             "filters": None
         })
         assert response.status_code == 200
+
+
+class _CapturingHybridSearch(_StubHybridSearch):
+    def __init__(self):
+        super().__init__()
+        self.seen = {}
+
+    def search(self, query, top_k=20, **kwargs):
+        self.seen = kwargs
+        return []
+
+
+def test_nested_date_filters_reach_hybrid_search_as_the_pre_filter_window(monkeypatch):
+    stub = _CapturingHybridSearch()
+    monkeypatch.setattr(search_route_mod, "get_hybrid_search", lambda: stub)
+    client = TestClient(app)
+    client.post("/api/search", json={
+        "query": "test", "date_from": "2025-03-01",
+        "filters": {"date_from": "2025-01-01", "date_to": "2025-12-31"},
+    })
+    assert (stub.seen["date_from"], stub.seen["date_to"]) == ("2025-03-01", "2025-12-31")

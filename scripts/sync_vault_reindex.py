@@ -52,12 +52,19 @@ def backfill_tag_keys_once(indexer) -> int:
     """Backfill ``tag:`` metadata keys on chunks indexed before they existed.
 
     Every chunk indexed since carries the keys, so one completed pass is
-    enough; a marker file next to the vector data records it and later runs
-    return 0 without reading the collection.
+    enough; a marker file next to the vector data records it. The marker does
+    not identify the collection, so a run that finds it also samples chunks
+    with tags and backfills anyway when any lacks the keys (a replaced or
+    restored collection). Steady state costs one small read.
     """
     marker = _tag_keys_marker()
     if marker.exists():
-        return 0
+        try:
+            if not indexer.vector_store.has_unbackfilled_tags():
+                return 0
+        except Exception as e:
+            logger.warning(f"Tag key sample check failed: {e}")
+            return 0
     try:
         count = indexer.vector_store.backfill_tag_keys()
     except Exception as e:

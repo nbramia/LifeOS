@@ -1,4 +1,5 @@
 """Facet pre-filtering across hybrid search, the BM25 index and the vector store."""
+import json
 import os
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -51,6 +52,13 @@ class FakeVectorStore:
             })
         self.candidates.append([r["file_path"] for r in rows])
         return rows
+
+    def file_paths_with_people(self, file_paths, names):
+        wanted = {n.casefold() for n in names}
+        return {
+            p for p in file_paths
+            if any(x.casefold() in wanted for _, _, people in [FILES[p[len(VAULT) + 1:]]] for x in people)
+        }
 
     def file_paths_matching(self, where=None):
         if where and "note_type" in where:
@@ -411,15 +419,170 @@ def test_tags_facet_finds_a_chunk_indexed_without_keys_once_backfilled(real_stor
     assert resolve_allowed_paths(facets, real_store, None) == {"/v/a.md"}
 
 
-def test_reindex_script_backfills_once_and_reports_the_count(real_store, tmp_path, monkeypatch):
+def _reindex_script(tmp_path, monkeypatch):
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
     import sync_vault_reindex
 
     monkeypatch.setattr(settings, "chroma_path", tmp_path / "data" / "chroma")
+    return sync_vault_reindex
+
+
+def test_reindex_script_backfills_once_and_reports_the_count(real_store, tmp_path, monkeypatch):
+    script = _reindex_script(tmp_path, monkeypatch)
     indexer = MagicMock()
     indexer.vector_store = real_store
-    assert sync_vault_reindex.backfill_tag_keys_once(indexer) == 2
-    indexer.vector_store = MagicMock()
-    assert sync_vault_reindex.backfill_tag_keys_once(indexer) == 0
-    indexer.vector_store.backfill_tag_keys.assert_not_called()
+    assert script.backfill_tag_keys_once(indexer) == 2
+    real_store.backfill_tag_keys = MagicMock()
+    assert script.backfill_tag_keys_once(indexer) == 0
+    real_store.backfill_tag_keys.assert_not_called()
+
+
+def test_reindex_script_backfills_a_replaced_legacy_collection_despite_the_marker(
+    real_store, tmp_path, monkeypatch
+):
+    script = _reindex_script(tmp_path, monkeypatch)
+    indexer = MagicMock()
+    indexer.vector_store = real_store
+    assert script.backfill_tag_keys_once(indexer) == 2
+    # Replace the collection with one written before the keys existed.
+    legacy = _legacy_store(tmp_path)
+    indexer.vector_store = legacy
+    assert script.backfill_tag_keys_once(indexer) == 1
+    assert resolve_allowed_paths(SearchFacets(tags=["project/x"]), legacy, None) == {"/v/z.md"}
+
+
+def _legacy_store(tmp_path):
+    import chromadb
+    from api.services.vectorstore import VectorStore
+    vs = VectorStore.__new__(VectorStore)
+    vs._collection = chromadb.PersistentClient(path=str(tmp_path / "chroma2")).create_collection("legacy_col")
+    vs._embedding_service = MagicMock()
+    vs._collection.add(
+        ids=["/v/z.md::0"], embeddings=[[1.0, 0.0]], documents=["zeta"],
+        metadatas=[{"file_path": "/v/z.md", "tags": '["Project/X"]'}],
+    )
+    return vs
+
+
+# -- People facet: whole person values -----------------------------------------
+
+@pytest.fixture
+def people_env(tmp_path):
+    import chromadb
+    from api.services.vectorstore import VectorStore
+    vs = VectorStore.__new__(VectorStore)
+    vs._collection = chromadb.PersistentClient(path=str(tmp_path / "chroma")).create_collection("people_col")
+    vs._embedding_service = MagicMock()
+    bm25 = BM25Index(db_path=str(tmp_path / "bm25.db"))
+    people_by_file = {
+        "/v/roberts.md": ["Roberts"],
+        "/v/split.md": ["Avery Stone", "Blake Reed"],
+        "/v/exact.md": ["Stone Blake"],
+        "/v/robert.md": ["robert"],
+    }
+    for path, people in people_by_file.items():
+        vs._collection.add(
+            ids=[f"{path}::0"], embeddings=[[1.0, 0.0]], documents=["notes"],
+            metadatas=[{"file_path": path, "people": json.dumps(people)}],
+        )
+        bm25.add_document(f"{path}_0", "notes", Path(path).name, people=people)
+    return vs, bm25
+
+
+def _people(env, *names):
+    vs, bm25 = env
+    return resolve_allowed_paths(SearchFacets(people=list(names)), vs, bm25)
+
+
+def test_people_facet_does_not_stem_a_name_onto_a_longer_one(people_env):
+    assert _people(people_env, "Robert") == {"/v/robert.md"}
+
+
+def test_people_facet_does_not_match_across_adjacent_people(people_env):
+    assert _people(people_env, "Stone Blake") == {"/v/exact.md"}
+
+
+def test_people_facet_exact_and_multi_value_matches(people_env):
+    assert _people(people_env, "Avery Stone") == {"/v/split.md"}
+    assert _people(people_env, "blake reed", "ROBERTS") == {"/v/split.md", "/v/roberts.md"}
+
+
+# -- Symlinked vault root --------------------------------------------------------
+
+def test_machine_and_folder_facets_find_files_under_a_symlinked_vault_root(tmp_path, monkeypatch):
+    real = tmp_path / "real_vault"
+    (real / "Work").mkdir(parents=True)
+    note = real / "Work" / "sync.md"
+    note.write_text("budget")
+    link = tmp_path / "vault_link"
+    link.symlink_to(real)
+    monkeypatch.setattr(settings, "vault_path", link)
+    indexed = str(note.resolve())
+    bm25 = BM25Index(db_path=str(tmp_path / "bm25.db"))
+    bm25.add_document(f"{indexed}_0", "budget", "sync.md")
+    store = VaultTagStore(str(tmp_path / "tags.db"))
+    store.upsert(TagRecord(
+        file_path="Work/sync.md", content_sha256="x", vocab_version="v1", doc_type="meeting",
+    ))
+    vec = FakeVectorStore()
+    assert resolve_allowed_paths(
+        SearchFacets(doc_type="meeting"), vec, bm25, tag_store=store
+    ) == {indexed}
+    assert resolve_allowed_paths(SearchFacets(folder="Work"), vec, bm25) == {indexed}
+    assert resolve_allowed_paths(
+        SearchFacets(folder="Work", doc_type="meeting"), vec, bm25, tag_store=store
+    ) == {indexed}
+
+
+# -- Date window before candidate limits ------------------------------------------
+
+def test_bm25_date_window_applies_before_the_limit(tmp_path):
+    bm25 = BM25Index(db_path=str(tmp_path / "bm25.db"))
+    for i in range(5):
+        bm25.add_document(f"/v/new{i}.md_0", "budget budget budget", "n.md", modified_date="2026-05-01")
+    bm25.add_document("/v/old.md_0", "budget", "o.md", modified_date="2025-01-01")
+    bm25.add_document("/v/undated.md_0", "budget budget", "u.md")
+    got = bm25.search("budget", limit=1, date_to="2025-12-31")
+    assert got and got[0]["doc_id"] in {"/v/old.md_0", "/v/undated.md_0"}
+    assert {r["doc_id"] for r in bm25.search("budget", limit=10, date_from="2026-01-01")} == {
+        f"/v/new{i}.md_0" for i in range(5)
+    } | {"/v/undated.md_0"}
+
+
+def test_vector_date_window_widens_the_pool_before_the_top_k_cut(tmp_path):
+    import chromadb
+    from api.services.vectorstore import VectorStore
+    vs = VectorStore.__new__(VectorStore)
+    vs._collection = chromadb.PersistentClient(path=str(tmp_path / "chroma")).create_collection(
+        "dates_col", metadata={"hnsw:space": "cosine"}
+    )
+    vs._embedding_service = MagicMock()
+    vs._embedding_service.embed_text.return_value = [1.0, 0.0]
+    n = 150
+    vs._collection.add(
+        ids=[f"/v/new{i}.md::0" for i in range(n)] + ["/v/old.md::0"],
+        embeddings=[[1.0, 0.001 * i] for i in range(n)] + [[0.0, 1.0]],
+        documents=["x"] * (n + 1),
+        metadatas=[{"file_path": f"/v/new{i}.md", "modified_date": "2026-05-01"} for i in range(n)]
+        + [{"file_path": "/v/old.md", "modified_date": "2025-01-01"}],
+    )
+    got = vs.search("q", top_k=1, recency_weight=0.0, date_to="2025-12-31")
+    assert [r["file_path"] for r in got] == ["/v/old.md"]
+    assert vs.search("q", top_k=1, recency_weight=0.0)[0]["file_path"].startswith("/v/new")
+
+
+def test_hybrid_top_k_one_with_facet_and_date_returns_the_eligible_note(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "vault_path", Path(VAULT))
+    bm25 = BM25Index(db_path=str(tmp_path / "bm25.db"))
+    for i in range(5):
+        bm25.add_document(f"{_abs(f'n{i}.md')}_0", "budget budget budget", "n.md", modified_date="2026-05-01")
+    bm25.add_document(f"{_abs('old.md')}_0", "budget", "old.md", modified_date="2025-01-01")
+    vec = FakeVectorStore(note_types={_abs(f"n{i}.md"): "Work" for i in range(5)} | {_abs("old.md"): "Work"})
+    vec.search = lambda *a, **k: []
+    hs = HybridSearch(vector_store=vec, bm25_index=bm25)
+    got = hs.search(
+        "budget", top_k=1, use_reranker=False, date_to="2025-12-31",
+        facets=SearchFacets(note_type=["Work"]),
+    )
+    assert [r["file_path"] for r in got] == [_abs("old.md")]

@@ -10,7 +10,8 @@ Each facet is resolved by the cheapest store that holds it:
   (keyed by vault-relative path; mapped to the absolute paths the indexes use).
 - ``note_type`` and ``tags``: vector-store chunk metadata (scalar ``note_type``
   and per-tag ``tag:<name>`` boolean keys), reading chunk ids only.
-- ``people``: the BM25 ``people`` column.
+- ``people``: BM25 ``people`` column for candidates, confirmed by whole-value
+  comparison against the vector store's per-chunk ``people`` lists.
 - ``folder``: a vault-relative directory; a path-prefix test on the sets above,
   or a prefix scan of the BM25 catalog when it is the only facet.
 
@@ -69,8 +70,8 @@ def _folder_prefix(folder: str, vault_root: str) -> Optional[str]:
     """Absolute ``<vault>/<folder>/`` prefix, or None when it escapes the vault."""
     if os.path.isabs(folder):
         return None
-    root = os.path.normpath(vault_root)
-    target = os.path.normpath(os.path.join(root, folder))
+    root = os.path.realpath(vault_root)
+    target = os.path.realpath(os.path.join(root, folder))
     if target != root and not target.startswith(root + os.sep):
         return None
     return target.rstrip(os.sep) + os.sep
@@ -104,7 +105,9 @@ def resolve_allowed_paths(
     """Absolute file paths satisfying every active facet (empty set: no match)."""
     from api.services.vectorstore import tag_key
 
-    vault_root = os.path.normpath(vault_root or str(settings.vault_path))
+    # The indexes key files by ``Path.resolve()``, so the root is resolved once
+    # here and every relative key or folder is joined to the resolved root.
+    vault_root = os.path.realpath(vault_root or str(settings.vault_path))
     sets: list[set[str]] = []
 
     if any(getattr(facets, n) for n in MACHINE_FACETS):
@@ -117,8 +120,9 @@ def resolve_allowed_paths(
             clauses[0] if len(clauses) == 1 else {"$or": clauses}
         ))
     if facets.people:
+        candidates = bm25_index.paths_with_people(facets.people) if bm25_index is not None else set()
         sets.append(
-            bm25_index.paths_with_people(facets.people) if bm25_index is not None else set()
+            vector_store.file_paths_with_people(candidates, facets.people) if candidates else set()
         )
 
     if facets.folder:

@@ -6,7 +6,6 @@ POST /api/search - Search the indexed vault for relevant content.
 import logging
 import time
 from typing import Optional
-from datetime import datetime
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
@@ -122,17 +121,21 @@ async def search(request: SearchRequest) -> SearchResponse:
         if facets.is_empty():
             facets = None
 
-    # Resolve the effective date window: explicit params win; otherwise try to
-    # infer one from a bounded relative-time phrase in the query ("last week")
-    # against the current date. Keeps recency working even when the caller
-    # didn't pass explicit bounds.
-    #
-    # NOTE: independent of the legacy ``request.filters.date_from/to`` post-filter
-    # below. Two separate knobs — the top-level params push the window down into
-    # hybrid_search (pre-ranking); ``filters`` filters already-ranked results
-    # here. Both let undated docs pass through, so they compose without conflict.
+    # Resolve the effective date window. The top-level params and the nested
+    # ``filters.date_from/to`` are both explicit bounds and are intersected; the
+    # window constrains candidates inside both search arms, before their limits.
+    # With no explicit bound, a bounded relative-time phrase in the query
+    # ("last week") is resolved against the current date. Undated docs pass.
+    explicit_from = max(
+        (d for d in (request.date_from, request.filters and request.filters.date_from) if d),
+        default=None,
+    )
+    explicit_to = min(
+        (d for d in (request.date_to, request.filters and request.filters.date_to) if d),
+        default=None,
+    )
     date_from, date_to = resolve_effective_dates(
-        request.query, request.date_from, request.date_to
+        request.query, explicit_from, explicit_to
     )
 
     # Search using hybrid search (vector + BM25 keyword)
@@ -152,26 +155,6 @@ async def search(request: SearchRequest) -> SearchResponse:
     # Post-process results
     results = []
     for r in raw_results:
-        # Apply additional filters that ChromaDB can't handle natively
-        if request.filters:
-            # Filter by date range
-            if request.filters.date_from or request.filters.date_to:
-                result_date = r.get("modified_date", "")
-                if result_date:
-                    try:
-                        # Parse result date (ISO format)
-                        result_dt = datetime.fromisoformat(result_date.replace("Z", "+00:00"))
-                        result_date_str = result_dt.strftime("%Y-%m-%d")
-
-                        if request.filters.date_from:
-                            if result_date_str < request.filters.date_from:
-                                continue
-                        if request.filters.date_to:
-                            if result_date_str > request.filters.date_to:
-                                continue
-                    except (ValueError, TypeError):
-                        pass  # Skip date filtering for invalid dates
-
         # Build result object
         people = r.get("people", [])
         if isinstance(people, str):
