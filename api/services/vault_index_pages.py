@@ -15,6 +15,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Callable
 
+from api.services.chunker import extract_frontmatter
 from api.services.vault_listing import is_hidden, mtime_date, scan_notes
 
 logger = logging.getLogger(__name__)
@@ -44,10 +45,10 @@ def render_index_page(
     """Render one index page.
 
     `entries` are every note in the folder as `{relative_path, name,
-    modified_date}` (ISO date string); `summaries` maps relative_path to a
-    one-line summary. Ordering is modified date descending, then path.
+    modified_date}` (ISO date string), already ordered newest first; the
+    first 30 are listed. `summaries` maps relative_path to a one-line summary.
     """
-    ordered = sorted(entries, key=lambda e: (-date.fromisoformat(e["modified_date"]).toordinal(), e["relative_path"]))
+    ordered = list(entries)
     cutoff = today - timedelta(days=RECENT_DAYS)
     recent_count = sum(1 for e in ordered if date.fromisoformat(e["modified_date"]) >= cutoff)
     lines = [
@@ -93,16 +94,25 @@ def write_index_pages(
 
     Notes inside the index folder are not counted or listed. Summaries come
     from the keyword index; if it is unavailable pages fall back to titles
-    only. Returns `{written, unchanged, folders}`.
+    only. Pages whose folder no longer exists are removed when they carry the
+    generated-page frontmatter. If the index folder resolves outside the vault
+    nothing is written. Returns `{written, unchanged, folders, changed,
+    removed}`, where `changed` and `removed` are absolute file paths.
     """
     root = vault_root.resolve()
     today = today or date.today()
     lookup = summary_lookup or _bm25_summary_lookup
-    index_dir = root / INDEX_FOLDER
+    index_dir = (root / INDEX_FOLDER).resolve()
+    try:
+        index_dir.relative_to(root)
+    except ValueError:
+        logger.warning("Index folder resolves outside the vault; skipping index pages")
+        return {"written": 0, "unchanged": 0, "folders": 0, "changed": [], "removed": []}
     index_dir.mkdir(parents=True, exist_ok=True)
     index_prefix = INDEX_FOLDER + "/"
 
     written = unchanged = 0
+    changed: list[str] = []
     folders = sorted(
         d for d in root.iterdir()
         if d.is_dir() and not is_hidden((d.name,))
@@ -144,4 +154,29 @@ def write_index_pages(
         tmp.write_bytes(data)
         os.replace(tmp, target)
         written += 1
-    return {"written": written, "unchanged": unchanged, "folders": len(folders)}
+        changed.append(str(target))
+    removed = _remove_stale_pages(index_dir, {f.name for f in folders})
+    return {
+        "written": written,
+        "unchanged": unchanged,
+        "folders": len(folders),
+        "changed": changed,
+        "removed": removed,
+    }
+
+
+def _remove_stale_pages(index_dir: Path, folder_names: set[str]) -> list[str]:
+    """Delete generated pages whose folder is gone; never touches other files."""
+    removed = []
+    for page in sorted(index_dir.glob("*.md")):
+        if page.stem in folder_names or page.is_symlink() or not page.is_file():
+            continue
+        try:
+            meta, _ = extract_frontmatter(page.read_text(encoding="utf-8"))
+            if meta.get("source") != "lifeos-index":
+                continue
+            page.unlink()
+        except OSError:
+            continue
+        removed.append(str(page))
+    return removed

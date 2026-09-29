@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from api.services import agent_tools
-from api.services.vault_listing import VaultListError, list_vault_entries, normalize_frontmatter_tags
+from api.services.vault_listing import MAX_LIMIT, VaultListError, list_vault_entries
 from config.settings import settings
 
 pytestmark = pytest.mark.unit
@@ -112,12 +112,6 @@ def test_file_symlink_pointing_outside_is_dropped(vault, tmp_path):
     assert data["total"] == 3
 
 
-def test_normalize_tags():
-    assert normalize_frontmatter_tags(None) == []
-    assert normalize_frontmatter_tags("a, #b c") == ["a", "b", "c"]
-    assert normalize_frontmatter_tags(["x", None, 3]) == ["x", "3"]
-
-
 def test_registered_as_sync_tool():
     names = {t["name"] for t in agent_tools.TOOL_DEFINITIONS}
     assert "list_vault" in names
@@ -139,3 +133,57 @@ def test_route_returns_entries_and_400(vault):
     body = ok.json()
     assert body["total"] == 3 and body["entries"][0]["name"] == "new.md"
     assert client.get("/api/vault/list", params={"path": "../x"}).status_code == 400
+
+
+def test_service_enforces_pagination_bounds(vault):
+    assert list_vault_entries(vault, "Work", limit=MAX_LIMIT)["limit"] == MAX_LIMIT == 200
+    for bad in (0, MAX_LIMIT + 1, -1):
+        with pytest.raises(VaultListError):
+            list_vault_entries(vault, "Work", limit=bad)
+    with pytest.raises(VaultListError):
+        list_vault_entries(vault, "Work", offset=-1)
+
+
+def test_tool_rejects_out_of_range_limit_instead_of_clamping(vault):
+    assert _call(path="Work", limit=0).startswith("Error:")
+    assert _call(path="Work", limit=201).startswith("Error:")
+    assert json.loads(_call(path="Work"))["limit"] == 50
+
+
+def test_route_rejects_out_of_range_limit(vault):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from api.routes.vault import router
+
+    app = FastAPI()
+    app.include_router(router)
+    client = TestClient(app)
+    assert client.get("/api/vault/list", params={"limit": 201}).status_code == 422
+    assert client.get("/api/vault/list", params={"limit": 0}).status_code == 422
+
+
+def test_tool_and_mcp_schemas_agree(vault):
+    import mcp_server
+
+    tool = next(t for t in agent_tools.TOOL_DEFINITIONS if t["name"] == "list_vault")["input_schema"]
+    server = mcp_server.LifeOSMCPServer.__new__(mcp_server.LifeOSMCPServer)
+    mcp = server._get_fallback_schema("lifeos_vault_list")
+    assert mcp["properties"], "fallback schema missing"
+    assert set(mcp["properties"]) == set(tool["properties"]) == {"path", "glob", "limit", "offset"}
+    assert mcp["required"] == tool["required"] == []
+    for schema in (tool, mcp):
+        assert "1-200" in schema["properties"]["limit"]["description"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+def test_unreadable_folder_is_error_not_exception(vault):
+    locked = vault / "Locked"
+    locked.mkdir()
+    locked.chmod(0)
+    try:
+        assert _call(path="Locked").startswith("Error:")
+        with pytest.raises(VaultListError):
+            list_vault_entries(vault, "Locked")
+    finally:
+        locked.chmod(0o755)

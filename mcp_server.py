@@ -872,6 +872,16 @@ class LifeOSMCPServer:
                 },
                 "required": ["query"]
             },
+            "lifeos_vault_list": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Vault-relative folder; omit or '' for the vault root.", "default": ""},
+                    "glob": {"type": "string", "description": "Glob relative to path (default '**/*.md')."},
+                    "limit": {"type": "integer", "description": "Entries per page, 1-200 (default 50).", "default": 50},
+                    "offset": {"type": "integer", "description": "Entries to skip for the next page (default 0).", "default": 0}
+                },
+                "required": []
+            },
             "lifeos_calendar_upcoming": {
                 "type": "object",
                 "properties": {

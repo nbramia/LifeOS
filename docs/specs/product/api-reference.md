@@ -925,7 +925,7 @@ Real-time external service health. Returns per-service status, degradation event
 
 List notes in a vault folder, newest first. Hidden folders (`.obsidian`, `.trash`) are excluded. A `path` that resolves outside the vault returns 400.
 
-**Query parameters:** `path` (vault-relative folder; empty for the root), `glob` (relative to `path`; default `**/*.md`), `limit` (1-200, default 50), `offset` (default 0).
+**Query parameters:** `path` (vault-relative folder; empty for the root), `glob` (relative to `path`; default `**/*.md`), `limit` (1-200, default 50; out-of-range values are rejected), `offset` (default 0).
 
 **Response:**
 ```json

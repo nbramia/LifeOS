@@ -40,9 +40,9 @@ def vault(tmp_path):
 
 def test_render_counts_order_and_frontmatter():
     entries = [
-        {"relative_path": "W/old.md", "name": "old.md", "modified_date": "2026-01-01"},
-        {"relative_path": "W/b.md", "name": "b.md", "modified_date": "2026-09-28"},
         {"relative_path": "W/a.md", "name": "a.md", "modified_date": "2026-09-28"},
+        {"relative_path": "W/b.md", "name": "b.md", "modified_date": "2026-09-28"},
+        {"relative_path": "W/old.md", "name": "old.md", "modified_date": "2026-01-01"},
     ]
     page = render_index_page("W", entries, {"W/a.md": "About  A\nthing"}, today=TODAY)
     assert page.startswith("---\ngenerated: true\nsource: lifeos-index\n---\n")
@@ -64,14 +64,14 @@ def test_render_caps_at_30_and_is_deterministic():
     page = render_index_page("W", entries, {}, today=TODAY)
     assert sum(1 for line in page.splitlines() if line.startswith("- [[")) == 30
     assert "- Notes: 45" in page
-    assert page == render_index_page("W", list(reversed(entries)), {}, today=TODAY)
+    assert page == render_index_page("W", entries, {}, today=TODAY)
 
 
 def test_write_creates_folder_pages_and_excludes_hidden_and_index(vault):
     stats = write_index_pages(vault, today=TODAY, summary_lookup=_no_summaries)
     assert (vault / INDEX_FOLDER).is_dir()
     assert sorted(p.name for p in (vault / INDEX_FOLDER).iterdir()) == ["LifeOS.md", "Personal.md", "Work.md"]
-    assert stats == {"written": 3, "unchanged": 0, "folders": 3}
+    assert (stats["written"], stats["unchanged"], stats["folders"]) == (3, 0, 3)
     work = (vault / INDEX_FOLDER / "Work.md").read_text()
     assert "- Notes: 3" in work
     assert ".trash" not in work and ".obsidian" not in work
@@ -124,3 +124,100 @@ def test_index_folder_is_never_summarized(tmp_path, monkeypatch):
     assert get_summary_tier(str(tmp_path / "LifeOS" / "Index" / "Work.md")) == SummaryTier.SKIP
     assert get_summary_tier(str(tmp_path / "LifeOS" / "Indexes" / "x.md")) == SummaryTier.HIGH
     assert get_summary_tier(str(tmp_path / "LifeOS" / "note.md")) == SummaryTier.HIGH
+
+
+def _set_mtime(path: Path, ts: int) -> None:
+    os.utime(path, (ts, ts))
+
+
+def test_selection_and_summaries_follow_full_mtime_not_filename(tmp_path):
+    root = tmp_path / "vault"
+    base = int(datetime(2026, 9, 28, 0, 0).timestamp())
+    for i in range(31):
+        f = root / "Work" / f"n{i:02d}.md"
+        _touch(f, "x", "2026-09-28")
+        _set_mtime(f, base + i * 60)  # n30 is newest, n00 oldest, all the same day
+    seen = []
+
+    def lookup(paths):
+        seen.extend(paths)
+        return {p: "sum " + Path(p).stem for p in paths}
+
+    write_index_pages(root, today=TODAY, summary_lookup=lookup)
+    page = (root / INDEX_FOLDER / "Work.md").read_text()
+    bullets = [line for line in page.splitlines() if line.startswith("- [[")]
+    assert len(bullets) == 30
+    assert bullets[0].startswith("- [[Work/n30|n30]]") and "sum n30" in bullets[0]
+    assert not any("n00" in b for b in bullets)
+    assert len(seen) == 30 and all("n00" not in p for p in seen)
+    assert all("— sum " in b for b in bullets)
+
+
+def test_symlinked_index_dir_outside_vault_is_refused(tmp_path):
+    root = tmp_path / "vault"
+    _touch(root / "Work" / "a.md", "a", "2026-09-28")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "LifeOS").mkdir()
+    (root / "LifeOS" / "Index").symlink_to(outside)
+    stats = write_index_pages(root, today=TODAY, summary_lookup=_no_summaries)
+    assert stats["written"] == 0 and stats["changed"] == []
+    assert list(outside.iterdir()) == []
+
+
+def test_stale_generated_pages_removed_but_handwritten_kept(vault):
+    write_index_pages(vault, today=TODAY, summary_lookup=_no_summaries)
+    (vault / "Personal").rename(vault / "Renamed")
+    (vault / INDEX_FOLDER / "Custom.md").write_text("# mine\n", encoding="utf-8")
+    (vault / INDEX_FOLDER / "Gone.md").write_text("---\nsource: other\n---\nx\n", encoding="utf-8")
+    stats = write_index_pages(vault, today=TODAY, summary_lookup=_no_summaries)
+    names = sorted(p.name for p in (vault / INDEX_FOLDER).iterdir())
+    assert "Personal.md" not in names and "Renamed.md" in names
+    assert "Custom.md" in names and "Gone.md" in names
+    assert stats["removed"] == [str(vault / INDEX_FOLDER / "Personal.md")]
+
+
+def test_nightly_script_generates_and_indexes_changed_pages(vault, monkeypatch):
+    import sys
+
+    import api.services.indexer as indexer_mod
+    import api.services.vault_index_pages as pages_mod
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    import sync_vault_reindex
+
+    calls = {"index_file": [], "delete_file": [], "index_all": 0}
+
+    class FakeIndexer:
+        INDEX_STATE_FILE = "unused"
+
+        def __init__(self, vault_path=None):
+            pass
+
+        def index_all(self, force=False, skip_summaries=False):
+            calls["index_all"] += 1
+            return 0
+
+        def index_file(self, path, **kw):
+            calls["index_file"].append((path, kw))
+
+        def delete_file(self, path):
+            calls["delete_file"].append(path)
+
+    monkeypatch.setattr(indexer_mod, "IndexerService", FakeIndexer)
+    monkeypatch.setattr(pages_mod, "_bm25_summary_lookup", _no_summaries)
+    monkeypatch.setattr(settings, "vault_path", vault)
+
+    result = sync_vault_reindex.sync_vault_reindex(dry_run=False)
+    assert result["status"] == "success" and calls["index_all"] == 1
+    indexed = sorted(Path(p).name for p, _ in calls["index_file"])
+    assert indexed == ["LifeOS.md", "Personal.md", "Work.md"]
+    assert all(kw.get("skip_summaries") is True for _, kw in calls["index_file"])
+
+    calls["index_file"].clear()
+    sync_vault_reindex.sync_vault_reindex(dry_run=False)
+    assert calls["index_file"] == []  # unchanged pages are not re-indexed
+
+    (vault / "Personal").rename(vault / "Renamed")
+    sync_vault_reindex.sync_vault_reindex(dry_run=False)
+    assert [Path(p).name for p in calls["delete_file"]] == ["Personal.md"]

@@ -93,7 +93,15 @@ def sync_vault_reindex(dry_run: bool = True, force: bool = False, skip_summaries
         from api.services.vault_index_pages import write_index_pages
 
         index_pages = write_index_pages(Path(vault_path))
-        logger.info(f"  Index pages: {index_pages}")
+        for page in index_pages["changed"]:
+            indexer.index_file(page, skip_summaries=True)
+        for page in index_pages["removed"]:
+            indexer.delete_file(page)
+        logger.info(
+            f"  Index pages: {index_pages['written']} written, {index_pages['unchanged']} unchanged, "
+            f"{len(index_pages['removed'])} removed"
+        )
+        index_pages = {k: v for k, v in index_pages.items() if k not in ("changed", "removed")}
     except Exception as e:
         logger.warning(f"Index page generation failed: {e}")
 

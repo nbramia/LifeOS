@@ -6,11 +6,10 @@ vector store.
 """
 from __future__ import annotations
 
-import re
 from datetime import date, datetime
 from pathlib import Path
 
-from api.services.chunker import extract_frontmatter
+from api.services.chunker import extract_frontmatter, normalize_tags
 
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 200
@@ -36,20 +35,6 @@ def infer_note_type(path: Path | str) -> str:
     if "lifeos" in path_str:
         return "LifeOS"
     return "Other"
-
-
-def normalize_frontmatter_tags(raw) -> list[str]:
-    """Coerce a frontmatter `tags` value (list, string, or None) to a list of strings."""
-    if raw is None:
-        return []
-    if isinstance(raw, str):
-        items = re.split(r"[,\s]+", raw)
-    elif isinstance(raw, (list, tuple, set)):
-        items = [str(item) for item in raw if item is not None]
-    else:
-        items = [str(raw)]
-    cleaned = [item.strip().lstrip("#") for item in items]
-    return [item for item in cleaned if item]
 
 
 def resolve_vault_dir(vault_root: Path, rel_path: str) -> tuple[Path, Path]:
@@ -88,6 +73,8 @@ def scan_notes(root: Path, folder: Path, glob: str = DEFAULT_GLOB) -> list[dict]
         matches = list(folder.glob(glob))
     except (ValueError, NotImplementedError) as exc:
         raise VaultListError(f"invalid glob: {exc}")
+    except OSError:
+        raise VaultListError("cannot read folder")
     for p in matches:
         try:
             if not p.is_file():
@@ -113,7 +100,7 @@ def _tags_for(path: Path) -> list[str]:
         meta, _ = extract_frontmatter(path.read_text(encoding="utf-8", errors="replace"))
     except OSError:
         return []
-    return normalize_frontmatter_tags(meta.get("tags"))
+    return normalize_tags(meta.get("tags"))
 
 
 def list_vault_entries(
@@ -129,8 +116,10 @@ def list_vault_entries(
     `{name, relative_path, modified_date, note_type, tags}`. Raises VaultListError.
     """
     root, folder = resolve_vault_dir(vault_root, path)
-    limit = max(1, min(int(limit), MAX_LIMIT))
-    offset = max(0, int(offset))
+    if not 1 <= limit <= MAX_LIMIT:
+        raise VaultListError(f"limit must be between 1 and {MAX_LIMIT}")
+    if offset < 0:
+        raise VaultListError("offset must be 0 or greater")
     notes = scan_notes(root, folder, glob or DEFAULT_GLOB)
     page = notes[offset:offset + limit]
     entries = [
@@ -143,10 +132,13 @@ def list_vault_entries(
         }
         for n in page
     ]
-    folders = sorted(
-        d.name for d in folder.iterdir()
-        if d.is_dir() and not d.name.startswith(".")
-    )
+    try:
+        folders = sorted(
+            d.name for d in folder.iterdir()
+            if d.is_dir() and not d.name.startswith(".")
+        )
+    except OSError:
+        raise VaultListError("cannot read folder")
     return {
         "path": folder.relative_to(root).as_posix() if folder != root else "",
         "total": len(notes),

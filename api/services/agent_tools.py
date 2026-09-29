@@ -724,7 +724,7 @@ TOOL_DEFINITIONS = [
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Vault-relative folder (e.g. 'Work' or 'Personal/Notes'); '' for the vault root.",
+                    "description": "Vault-relative folder (e.g. 'Work' or 'Personal/Notes'); omit or '' for the vault root.",
                 },
                 "glob": {
                     "type": "string",
@@ -732,14 +732,14 @@ TOOL_DEFINITIONS = [
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Entries per page (default 50, max 200).",
+                    "description": "Entries per page, 1-200 (default 50).",
                 },
                 "offset": {
                     "type": "integer",
                     "description": "Entries to skip for the next page (default 0).",
                 },
             },
-            "required": ["path"],
+            "required": [],
         },
     },
     {
@@ -3885,7 +3885,7 @@ def _tool_list_vault(inp: dict) -> str:
             settings.vault_path,
             path=inp.get("path") or "",
             glob=inp.get("glob") or None,
-            limit=inp.get("limit") or 50,
+            limit=50 if inp.get("limit") is None else inp["limit"],
             offset=inp.get("offset") or 0,
         )
     except (VaultListError, TypeError, ValueError) as e:
