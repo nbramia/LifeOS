@@ -127,6 +127,7 @@ Encoder model selection and search-pipeline knobs. Decision recorded in [ADR-012
 | `LIFEOS_EMBEDDING_CACHE` | path | — | Embedding cache directory (empty = HuggingFace default `~/.cache/huggingface`). |
 | `LIFEOS_RERANKER_MODEL` | str | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Cross-encoder for the rerank stage. |
 | `LIFEOS_RERANKER_ENABLED` | bool | `true` | Disable to skip the rerank pass (faster, lower precision). |
+| `LIFEOS_SEARCH_FACET_BOOST` | float | `1.2` | Score multiplier applied to search results that match the facets a request passes with `boost=True`. Raise it to favor facet matches more strongly; `1.0` leaves scores unchanged. |
 | `LIFEOS_EMBEDDING_MEMORY_THRESHOLD_MB` | int | `28000` | Pre-flight free-RAM gate before phase 4 (embedding). Below this threshold the phase is skipped to avoid kernel OOM. Read directly from the environment by `scripts/run_all_syncs.py` (not a Pydantic Setting). |
 | `LIFEOS_EMBEDDING_BATCH_SIZE` | int | `8` | Max texts per `model.encode()` batch. Bounds peak VRAM per embedding call so one large document's chunks can't spike GPU memory and exhaust a unified-memory iGPU's SDMA queues, freezing the host. Semantically neutral — only affects peak memory. |
 | `LIFEOS_EMBEDDING_GPU_LOCK_ENABLED` | bool | `true` | Serializes GPU embedding across processes (API server, agent worker, nightly sync, ad-hoc scripts) via a cross-process file lock, so they can't all grab GPU compute queues at once. |

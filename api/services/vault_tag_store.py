@@ -10,10 +10,12 @@ re-inference.
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Iterator
 
+from api.services.sqlite_connect import connect_closing
 from config.settings import settings
 
 
@@ -75,46 +77,35 @@ def get_vault_tags_db_path() -> str:
 class VaultTagStore:
     def __init__(self, db_path: str | None = None):
         self.db_path = db_path or get_vault_tags_db_path()
-        conn = self._connect()
-        try:
+        with self._connect() as conn:
             conn.executescript(_SCHEMA)
-        finally:
-            conn.close()
 
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        with connect_closing(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            yield conn
 
     def upsert(self, record: TagRecord) -> None:
         cols = ", ".join(_COLUMNS)
         marks = ", ".join(f":{c}" for c in _COLUMNS)
-        conn = self._connect()
-        try:
+        with self._connect() as conn:
             with conn:
                 conn.execute(
                     f"INSERT OR REPLACE INTO vault_tags ({cols}) VALUES ({marks})", asdict(record)
                 )
-        finally:
-            conn.close()
 
     def get(self, path: str) -> TagRecord | None:
-        conn = self._connect()
-        try:
+        with self._connect() as conn:
             row = conn.execute("SELECT * FROM vault_tags WHERE file_path = ?", (path,)).fetchone()
-        finally:
-            conn.close()
         return TagRecord(**{c: row[c] for c in _COLUMNS}) if row else None
 
     def needs_tagging(self, path: str, sha: str, vocab_version: str) -> bool:
         """True unless the stored row matches both content hash and vocab version."""
-        conn = self._connect()
-        try:
+        with self._connect() as conn:
             row = conn.execute(
                 "SELECT content_sha256, vocab_version FROM vault_tags WHERE file_path = ?", (path,)
             ).fetchone()
-        finally:
-            conn.close()
         return row is None or row["content_sha256"] != sha or row["vocab_version"] != vocab_version
 
     def paths_matching(self, **facets: str | Iterable[str]) -> list[str]:
@@ -142,24 +133,18 @@ class VaultTagStore:
                     params.append(v + "/%")
             clauses.append("(" + " OR ".join(ors) + ")")
         where = " AND ".join(clauses) or "1"
-        conn = self._connect()
-        try:
+        with self._connect() as conn:
             rows = conn.execute(
                 f"SELECT file_path FROM vault_tags WHERE {where} ORDER BY file_path", params
             ).fetchall()
-        finally:
-            conn.close()
         return [r["file_path"] for r in rows]
 
     def delete_missing(self, existing_paths: Iterable[str]) -> int:
         """Delete rows whose path is not in ``existing_paths``; returns the count."""
         keep = set(existing_paths)
-        conn = self._connect()
-        try:
+        with self._connect() as conn:
             with conn:
                 stored = [r["file_path"] for r in conn.execute("SELECT file_path FROM vault_tags")]
                 gone = [p for p in stored if p not in keep]
                 conn.executemany("DELETE FROM vault_tags WHERE file_path = ?", [(p,) for p in gone])
-        finally:
-            conn.close()
         return len(gone)
