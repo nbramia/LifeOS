@@ -188,3 +188,12 @@ def test_restricted_tag_setting_change_retags_code_only_note(env, monkeypatch):
 
     stats, ask = _run()
     assert not ask.called and stats["tagged"] == 0
+
+
+def test_folded_restricted_tag_is_not_sent_by_nightly_retag(env, monkeypatch):
+    vault, store = env
+    monkeypatch.setattr(settings, "jev_vault_restricted_tags", "straße")
+    (vault / "Notes" / "f.md").write_text("---\ntags: [STRASSE]\n---\nx\n#straße/child\n")
+    _run()
+    stats, ask = _run()
+    assert ask.call_count == 0 and store.get("Notes/f.md").backend == "code"

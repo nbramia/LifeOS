@@ -141,6 +141,11 @@ def inline_tags(body: str) -> list[str]:
     return _INLINE_TAG.findall(_FENCED_CODE.sub("", body))
 
 
+def _fold_tag(tag: str) -> str:
+    """The one normal form for tags, applied to configured entries and note tags."""
+    return tag.strip().lstrip("#").strip().casefold()
+
+
 def _restricted_tags() -> frozenset[str]:
     """Normalized entries of `LIFEOS_JEV_VAULT_RESTRICTED_TAGS`. A value that is
     empty after stripping means no tag restriction; a non-empty value with no
@@ -152,13 +157,13 @@ def _restricted_tags() -> frozenset[str]:
     if not entries:
         logger.warning("LIFEOS_JEV_VAULT_RESTRICTED_TAGS has no valid entry; using the default list")
         entries = _entries(DEFAULT_RESTRICTED_TAGS, fold=True)
-    return frozenset("/".join(e) for e in entries)
+    return frozenset(_fold_tag("/".join(e)) for e in entries)
 
 
 def _tag_restricted(tag: str) -> bool:
     """A restricted tag or any of its children (`private/session`), case-insensitive."""
     restricted = _restricted_tags()
-    parts = tag.lstrip("#").lower().split("/")
+    parts = _fold_tag(tag).split("/")
     return any("/".join(parts[: i + 1]) in restricted for i in range(len(parts)))
 
 

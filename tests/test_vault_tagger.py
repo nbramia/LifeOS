@@ -411,3 +411,15 @@ def test_restricted_tags_without_valid_entry_use_default_and_warn(monkeypatch, c
 def test_unset_restricted_tags_default_matches_built_in_list(monkeypatch):
     for tag in ("therapy", "private", "finance", "confidential", "private/session"):
         assert classify_sensitivity("Notes/a.md", [tag]) == "restricted"
+
+
+@pytest.mark.parametrize("note_tag", ["straße", "STRASSE", "Straße/child"])
+@pytest.mark.parametrize("inline", [False, True])
+def test_restricted_tag_folding_is_shared_by_setting_and_note_tags(vault, monkeypatch, note_tag, inline):
+    _set(monkeypatch)
+    monkeypatch.setattr(settings, "jev_vault_restricted_tags", "straße")
+    note = _note(vault, "fold.md", note_tag, inline)
+    with patch.object(JevClient, "ask", return_value=_answers()) as ask:
+        rec = _tagger(vault).tag_file(note)
+        assert not _tagger(vault).would_send(note)
+    assert not ask.called and rec.sensitivity == "restricted"
