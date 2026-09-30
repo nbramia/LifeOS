@@ -15,9 +15,9 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler, FileSystemEvent
 
 from api.services.chunker import chunk_document, extract_frontmatter, add_context_to_chunks, normalize_tags, tag_phrase_key
-from api.services.vectorstore import VectorStore
+from api.services.vectorstore import VectorStore, is_people_tag
 from api.services.bm25_index import BM25Index
-from api.services.people import extract_people_from_text
+from api.services.people import extract_people_from_text, people_from_tags
 
 # V2 People System integration
 try:
@@ -422,7 +422,8 @@ class IndexerService:
         frontmatter_people = frontmatter.get("people", [])
 
         # Merge people lists (unique)
-        all_people = list(set(extracted_people + frontmatter_people))
+        note_tags = normalize_tags(frontmatter.get("tags"))
+        all_people = list(set(extracted_people + frontmatter_people + people_from_tags(note_tags)))
 
         # Sync to v2 people system if available
         affected_person_ids: set[str] = set()
@@ -471,7 +472,7 @@ class IndexerService:
             "modified_date": self._extract_note_date(path, frontmatter, body),
             "note_type": self._infer_note_type(path),
             "people": all_people,
-            "tags": normalize_tags(frontmatter.get("tags")),
+            "tags": [t for t in note_tags if not is_people_tag(t)],
             "granola_id": frontmatter.get("granola_id"),  # For context generation
         }
 

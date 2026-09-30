@@ -10,8 +10,15 @@ topics:
     description: Garden layouts, planting schedules, and plant care.
   - name: work/hiring
     description: Sourcing and interviewing candidates for the example team.
+# Tag -> topic and `type:` -> document type entries add or replace by key.
+tag_topics:
+  gardening: hobbies/gardening
+type_doc_types:
+  fieldnote: field_report
 remove:
   topics:
     - mixed/inbox
+  tag_topics:
+    - ideas
 project_sources:
   - work_subfolders

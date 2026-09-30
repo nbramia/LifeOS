@@ -105,10 +105,41 @@ topics:
     description: Databases, indexing, search, and data pipelines.
   - name: tech_projects/writing_and_creative
     description: Fiction, worldbuilding, drafts, and creative experiments.
+  - name: growth/ideas
+    description: Brainstorms, half-formed concepts, and things to try someday.
   - name: mixed/general
     description: Notes spanning several life areas with no dominant theme.
   - name: mixed/inbox
     description: Unsorted captures, quick thoughts, and scratch notes.
+
+# Frontmatter `type:` value -> document type. A mapped `type:` sets the note's
+# document type directly (confidence 1.0); Jev is not asked for it.
+type_doc_types:
+  meeting: meeting_notes
+  meeting-notes: meeting_notes
+  meeting_notes: meeting_notes
+  journal: journal
+  daily: journal
+  log: log
+  research: research
+  reference: reference
+  # A synthesis restates and organizes sources for later lookup.
+  synthesis: reference
+  # Transcripts are the raw record of a conversation, not a written summary.
+  transcript: ambient_transcript
+  project: project_doc
+  book: book_notes
+  task: task_record
+
+# Human tag -> topic. A note carrying the tag always has the topic among its
+# stored topics (primary when the classifier only names the topic's domain).
+tag_topics:
+  1-1: work/management
+  hiring: work/hiring
+  strategy: work/strategy
+  recipes: home_food/cooking
+  coding: tech_projects/software_development
+  ideas: growth/ideas
 
 # Kinds of live lists the tagger may pull project names from. These are
 # declarative names only; the tagger resolves them at run time.

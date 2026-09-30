@@ -346,7 +346,9 @@ Both binary settings resolve the same way (`api/services/agent_worker/binary_res
 
 `config/vault_taxonomy.yaml` is the committed, generic controlled vocabulary for vault tagging: `doc_types`, `domains`, `topics` (each `parent/child` with a one-line description, the parent being a declared domain), and `project_sources` (kinds of live lists project names come from). It carries a `version` string.
 
-`config/vault_taxonomy.local.yaml` is an optional operator override that version control ignores (see `config/vault_taxonomy.local.yaml.example`). It is merged over the committed file at load: list entries are added, topics are replaced by name, and a `remove:` mapping (facet to values) deletes entries.
+Two more maps turn the operator's own labels into evidence. `type_doc_types` maps a frontmatter `type:` value to a document type (`meeting`, `journal`, `transcript`, ...). `tag_topics` maps a human tag to a topic (`1-1`, `hiring`, `recipes`, ...). Keys are case-insensitive and ignore a leading `#`; every target must be a declared document type or topic, otherwise loading raises `TaxonomyError`. Both maps are part of `vocab_version`, so editing one re-tags the notes on the next tagging run.
+
+`config/vault_taxonomy.local.yaml` is an optional operator override that version control ignores (see `config/vault_taxonomy.local.yaml.example`). It is merged over the committed file at load: list entries are added, topics are replaced by name, `type_doc_types` and `tag_topics` entries are added or replaced by key, and a `remove:` mapping (facet to values, or map keys) deletes entries.
 
 `api.services.vault_taxonomy.load_taxonomy()` returns the merged facets and `vocab_version`, the first 12 hex characters of the SHA-256 of the merged content in canonical form (sorted keys and lists). Formatting and ordering changes keep the version; any vocabulary change alters it. Loading raises `TaxonomyError` for duplicate values within a facet, a topic that is not `parent/child`, or a topic whose parent is not a declared domain. `scripts/taxonomy_bootstrap.py` proposes topics for the operator to edit into the override file.
 

@@ -33,6 +33,12 @@ FILE_PATH_BATCH = 2000
 UNDATED_DAY = -1_000_000
 
 
+def is_people_tag(tag: str) -> bool:
+    """``people/<slug>`` tags name a person; they are resolved to the ``people``
+    metadata and are not part of the tag vocabulary."""
+    return tag.strip().lstrip("#").casefold().startswith("people/")
+
+
 def tag_key(tag: str) -> str:
     """Metadata key that marks a chunk as carrying ``tag``."""
     return TAG_KEY_PREFIX + tag.strip().lstrip("#").lower()
@@ -178,7 +184,8 @@ class VectorStore:
                     elif value is None:
                         chunk_meta[key] = ""
             for tag in metadata.get("tags") or []:
-                chunk_meta.setdefault(tag_key(str(tag)), True)
+                if not is_people_tag(str(tag)):
+                    chunk_meta.setdefault(tag_key(str(tag)), True)
             metadatas.append(chunk_meta)
 
         # Add to collection
@@ -411,7 +418,7 @@ class VectorStore:
                         tags = json.loads(meta.get("tags") or "[]")
                     except (TypeError, ValueError):
                         tags = []
-                    add.update({tag_key(str(t)): True for t in tags if str(t).strip()})
+                    add.update({tag_key(str(t)): True for t in tags if str(t).strip() and not is_people_tag(str(t))})
                 if add:
                     write_ids.append(chunk_id)
                     write_metas.append({**meta, **add})

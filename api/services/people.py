@@ -9,7 +9,6 @@ import json
 import logging
 from pathlib import Path
 from typing import Optional
-from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +137,30 @@ def resolve_person_name(name: str) -> str:
             return ALIAS_MAP[email_name]
 
     return name
+
+
+PEOPLE_TAG_PREFIX = "people/"
+
+
+def people_from_tags(tags) -> list[str]:
+    """Canonical names for ``people/<slug>`` tags.
+
+    The slug (hyphens and underscores read as spaces) is a candidate name for
+    the same alias resolution body text goes through; excluded people drop out.
+    A tag with a nested path below the slug is not a name and is skipped.
+    """
+    names: list[str] = []
+    for tag in tags or []:
+        tag = str(tag).strip().lstrip("#")
+        if not tag.casefold().startswith(PEOPLE_TAG_PREFIX):
+            continue
+        slug = tag[len(PEOPLE_TAG_PREFIX):]
+        if not slug or "/" in slug:
+            continue
+        name = resolve_person_name(re.sub(r"[-_\s]+", " ", slug).strip().title())
+        if name and not _is_excluded(name) and name not in names:
+            names.append(name)
+    return names
 
 
 def _is_excluded(name: str) -> bool:

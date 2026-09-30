@@ -10,12 +10,17 @@ list entries are added, topics are replaced by name, and a ``remove`` mapping
 ``Taxonomy.vocab_version`` is the first 12 hex characters of the SHA-256 of the
 merged content in canonical form (sorted keys and lists), so formatting and
 ordering changes keep the version while any vocabulary change alters it.
+
+Two maps turn the operator's own labels into evidence: ``type_doc_types``
+(frontmatter ``type:`` value -> document type) and ``tag_topics`` (human tag ->
+topic). Both merge like topics (add or replace by key; ``remove`` deletes by
+key), their targets must be declared, and they are part of ``vocab_version``.
 """
 from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +31,7 @@ DEFAULT_TAXONOMY_PATH = _CONFIG_DIR / "vault_taxonomy.yaml"
 DEFAULT_OVERRIDE_PATH = _CONFIG_DIR / "vault_taxonomy.local.yaml"
 
 _LIST_FACETS = ("doc_types", "domains", "project_sources")
+_MAP_FACETS = ("type_doc_types", "tag_topics")
 
 
 class TaxonomyError(ValueError):
@@ -40,6 +46,8 @@ class Taxonomy:
     topics: dict[str, str]  # "parent/child" -> one-line description
     project_sources: tuple[str, ...]
     vocab_version: str
+    type_doc_types: dict[str, str] = field(default_factory=dict)  # folded `type:` value -> doc_type
+    tag_topics: dict[str, str] = field(default_factory=dict)  # folded human tag -> topic
 
 
 _cache: dict[tuple[str, str | None], Taxonomy] = {}
@@ -90,20 +98,45 @@ def _topic_entries(raw: Any, source: str) -> dict[str, str]:
     return topics
 
 
+def fold_label(value: str) -> str:
+    """The one normal form for `type:` values and tags (map keys and note values)."""
+    return value.strip().lstrip("#").strip().casefold()
+
+
+def _label_map(raw: Any, facet: str, source: str) -> dict[str, str]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) and fold_label(k) and v.strip() for k, v in raw.items()
+    ):
+        raise TaxonomyError(f"{source}: '{facet}' must map non-empty strings to non-empty strings")
+    out: dict[str, str] = {}
+    for k, v in raw.items():
+        key = fold_label(k)
+        if key in out:
+            raise TaxonomyError(f"{source}: duplicate values in '{facet}': {key}")
+        out[key] = v.strip()
+    return out
+
+
 def _parse_layer(data: dict[str, Any], source: str) -> dict[str, Any]:
     layer: dict[str, Any] = {
         facet: _string_list(data.get(facet), facet, source) for facet in _LIST_FACETS
     }
     layer["topics"] = _topic_entries(data.get("topics"), source)
+    for facet in _MAP_FACETS:
+        layer[facet] = _label_map(data.get(facet), facet, source)
     remove = data.get("remove") or {}
     if not isinstance(remove, dict):
         raise TaxonomyError(f"{source}: 'remove' must map facet names to value lists")
-    unknown = set(remove) - set(_LIST_FACETS) - {"topics"}
+    unknown = set(remove) - set(_LIST_FACETS) - set(_MAP_FACETS) - {"topics"}
     if unknown:
         raise TaxonomyError(f"{source}: unknown facet in 'remove': {', '.join(sorted(unknown))}")
     layer["remove"] = {
         facet: _string_list(values, f"remove.{facet}", source) for facet, values in remove.items()
     }
+    for facet in _MAP_FACETS:
+        layer["remove"][facet] = [fold_label(v) for v in layer["remove"].get(facet, [])]
     layer["version"] = str(data.get("version", "")).strip()
     return layer
 
@@ -117,11 +150,21 @@ def _validate_topics(topics: dict[str, str], domains: list[str]) -> None:
             raise TaxonomyError(f"topic '{name}': parent '{parent}' is not a declared domain")
 
 
+def _validate_maps(merged: dict[str, Any]) -> None:
+    for key, target in merged["type_doc_types"].items():
+        if target not in merged["doc_types"]:
+            raise TaxonomyError(f"type_doc_types['{key}']: '{target}' is not a declared document type")
+    for key, target in merged["tag_topics"].items():
+        if target not in merged["topics"]:
+            raise TaxonomyError(f"tag_topics['{key}']: '{target}' is not a declared topic")
+
+
 def _canonical(merged: dict[str, Any]) -> str:
     body = {
         "version": merged["version"],
         **{facet: sorted(merged[facet]) for facet in _LIST_FACETS},
         "topics": merged["topics"],
+        **{facet: merged[facet] for facet in _MAP_FACETS},
     }
     return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
@@ -157,18 +200,23 @@ def load_taxonomy(
         for facet in _LIST_FACETS:
             merged[facet] += [v for v in layer[facet] if v not in merged[facet]]
         merged["topics"].update(layer["topics"])
+        for facet in _MAP_FACETS:
+            merged[facet].update(layer[facet])
         if layer["version"]:
             merged["version"] = layer["version"]
         for facet, values in layer["remove"].items():
             drop = set(values)
             if facet == "topics":
                 merged["topics"] = {k: v for k, v in merged["topics"].items() if k not in drop}
+            elif facet in _MAP_FACETS:
+                merged[facet] = {k: v for k, v in merged[facet].items() if k not in drop}
             else:
                 merged[facet] = [v for v in merged[facet] if v not in drop]
 
     if not merged["version"]:
         raise TaxonomyError(f"{base_path}: 'version' is required")
     _validate_topics(merged["topics"], merged["domains"])
+    _validate_maps(merged)
 
     taxonomy = Taxonomy(
         version=merged["version"],
@@ -176,6 +224,8 @@ def load_taxonomy(
         domains=tuple(merged["domains"]),
         topics=dict(merged["topics"]),
         project_sources=tuple(merged["project_sources"]),
+        type_doc_types=dict(merged["type_doc_types"]),
+        tag_topics=dict(merged["tag_topics"]),
         vocab_version=hashlib.sha256(_canonical(merged).encode("utf-8")).hexdigest()[:12],
     )
     _cache[key] = taxonomy

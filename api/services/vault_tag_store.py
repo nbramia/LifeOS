@@ -39,6 +39,7 @@ class TagRecord:
     has_decision: float | None = None
     sensitivity: str = "private"
     backend: str = "code"  # "jev" | "code"
+    doc_type_source: str | None = "code"  # "frontmatter" | "jev" | "code"; NULL (older rows) reads as "jev"
 
 
 _COLUMNS = [f.name for f in fields(TagRecord)]
@@ -59,13 +60,21 @@ CREATE TABLE IF NOT EXISTS vault_tags (
     actionability REAL,
     has_decision REAL,
     sensitivity TEXT NOT NULL DEFAULT 'private',
-    backend TEXT NOT NULL DEFAULT 'code'
+    backend TEXT NOT NULL DEFAULT 'code',
+    doc_type_source TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_vault_tags_doc_type ON vault_tags(doc_type);
 CREATE INDEX IF NOT EXISTS idx_vault_tags_domain ON vault_tags(domain);
 CREATE INDEX IF NOT EXISTS idx_vault_tags_topic ON vault_tags(topic);
 CREATE INDEX IF NOT EXISTS idx_vault_tags_project ON vault_tags(project);
 """
+
+
+# `topics_json` is written by the tagger, so its `secondary` list is valid JSON.
+_SECONDARY_MATCH = (
+    "EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(topics_json) "
+    "THEN json_extract(topics_json, '$.secondary') END) WHERE value = ? OR value LIKE ?)"
+)
 
 
 def get_vault_tags_db_path() -> str:
@@ -79,6 +88,9 @@ class VaultTagStore:
         self.db_path = db_path or get_vault_tags_db_path()
         with self._connect() as conn:
             conn.executescript(_SCHEMA)
+            columns = {r["name"] for r in conn.execute("PRAGMA table_info(vault_tags)")}
+            if "doc_type_source" not in columns:
+                conn.execute("ALTER TABLE vault_tags ADD COLUMN doc_type_source TEXT")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -98,7 +110,11 @@ class VaultTagStore:
     def get(self, path: str) -> TagRecord | None:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM vault_tags WHERE file_path = ?", (path,)).fetchone()
-        return TagRecord(**{c: row[c] for c in _COLUMNS}) if row else None
+        if not row:
+            return None
+        record = TagRecord(**{c: row[c] for c in _COLUMNS})
+        record.doc_type_source = record.doc_type_source or "jev"
+        return record
 
     def needs_tagging(self, path: str, sha: str, vocab_version: str) -> bool:
         """True unless the stored row matches both content hash and vocab version."""
@@ -131,6 +147,8 @@ class VaultTagStore:
                 if name == "topic":
                     ors.append("topic LIKE ?")
                     params.append(v + "/%")
+                    ors.append(_SECONDARY_MATCH)
+                    params.extend([v, v + "/%"])
             clauses.append("(" + " OR ".join(ors) + ")")
         where = " AND ".join(clauses) or "1"
         with self._connect() as conn:
