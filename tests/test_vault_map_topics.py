@@ -228,3 +228,16 @@ def test_page_count_for_a_50_topic_taxonomy(tmp_path):
     result = write_index_pages(root, TODAY, lambda p: {}, tag_store=store, taxonomy=tax)
     assert (result["domain_pages"], result["topic_pages"]) == (8, 50)
     assert len(list((root / INDEX_FOLDER).rglob("*.md"))) == 8 + 50 + 1 + 2  # domain + topic + index + folder pages (F, Wiki)
+
+
+def test_unchanged_tags_and_notes_write_nothing_on_the_next_day(env):
+    root, store = env
+    write_index_pages(root, TODAY, lambda p: {}, tag_store=store, taxonomy=TAXONOMY)
+    before = _tree(root)
+    mtimes = {p: p.stat().st_mtime_ns for p in (root / INDEX_FOLDER).rglob("*.md")}
+    result = write_index_pages(root, date(2026, 9, 30), lambda p: {}, tag_store=store, taxonomy=TAXONOMY)
+    assert result["written"] == 0 and result["changed"] == [] and result["removed"] == []
+    assert _tree(root) == before
+    assert {p: p.stat().st_mtime_ns for p in (root / INDEX_FOLDER).rglob("*.md")} == mtimes
+    generated = b"".join(v for k, v in before.items() if k.startswith(("Topics/", "Domains/")))
+    assert b"changed in" not in generated
