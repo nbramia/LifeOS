@@ -137,7 +137,7 @@ TOOL_DEFINITIONS = [
                 },
                 "note_type": {
                     "type": "array", "items": {"type": "string"},
-                    "description": "Only these note types (e.g. 'Granola' meeting transcripts, 'Personal', 'Work', 'ML', 'LifeOS').",
+                    "description": "Compatibility alias of folder for a top-level vault folder; use folder.",
                 },
                 "people": {
                     "type": "array", "items": {"type": "string"},

@@ -620,18 +620,14 @@ class IndexerService:
         return extract_note_date(path, frontmatter, body)
 
     def _infer_note_type(self, path: Path) -> str:
-        """
-        Infer note type from folder path.
-
-        Args:
-            path: Path to the file
-
-        Returns:
-            Note type string
-        """
+        """Infer the note type from the file's vault-relative path."""
         from api.services.vault_listing import infer_note_type
 
-        return infer_note_type(path)
+        try:
+            rel = path.resolve().relative_to(self.vault_path.resolve())
+        except ValueError:
+            return "Other"
+        return infer_note_type(rel)
 
     def _sync_people_to_v2(
         self,

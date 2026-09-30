@@ -8,8 +8,11 @@ Each facet is resolved by the cheapest store that holds it:
 
 - ``doc_type`` / ``domain`` / ``topic`` / ``project``: the vault tag store
   (keyed by vault-relative path; mapped to the absolute paths the indexes use).
-- ``note_type`` and ``tags``: vector-store chunk metadata (scalar ``note_type``
-  and per-tag ``tag:<name>`` boolean keys), reading chunk ids only.
+- ``note_type``: an alias for vault folders (``Work``, ``Personal``, ``LifeOS``,
+  ``Granola``, ``ML`` = ``Work/ML``; ``Other`` = the rest), resolved by path.
+  Values that are not vault types match stored chunk metadata.
+- ``tags``: vector-store chunk metadata (per-tag ``tag:<name>`` boolean keys),
+  reading chunk ids only.
 - ``people``: BM25 ``people`` column for candidates, confirmed by whole-value
   comparison against the vector store's per-chunk ``people`` lists.
 - ``folder``: a vault-relative directory; a path-prefix test on the sets above,
@@ -95,6 +98,43 @@ def _tag_store_paths(facets: SearchFacets, tag_store, vault_root: str) -> set[st
     return {p if os.path.isabs(p) else os.path.join(vault_root, p) for p in rel_paths}
 
 
+def _paths_under(prefix: str, vector_store, bm25_index) -> set[str]:
+    if bm25_index is not None:
+        return bm25_index.paths_under(prefix)
+    return {p for p in vector_store.file_paths_matching() if p.startswith(prefix)}
+
+
+def _note_type_paths(values: list[str], vector_store, bm25_index, vault_root: str) -> set[str]:
+    """Paths for ``note_type`` values, resolved through vault folders.
+
+    Vault types (``NOTE_TYPE_FOLDERS``) are aliases for a folder prefix and
+    ``Other`` is every vault file outside all of them, so results never depend
+    on stored chunk metadata. Any other value (e.g. a calendar or Slack type)
+    matches the stored ``note_type`` metadata.
+    """
+    from api.services.vault_listing import NOTE_TYPE_FOLDERS
+
+    known = {k.casefold(): k for k in NOTE_TYPE_FOLDERS}
+    out: set[str] = set()
+    stored: list[str] = []
+    for value in values:
+        name = known.get(value.casefold())
+        if name is not None:
+            prefix = _folder_prefix(NOTE_TYPE_FOLDERS[name], vault_root)
+            out |= _paths_under(prefix, vector_store, bm25_index) if prefix else set()
+        elif value.casefold() == "other":
+            everything = _paths_under(os.path.join(vault_root, ""), vector_store, bm25_index)
+            for folder in NOTE_TYPE_FOLDERS.values():
+                prefix = _folder_prefix(folder, vault_root)
+                everything -= {p for p in everything if p.startswith(prefix)}
+            out |= everything
+        else:
+            stored.append(value)
+    if stored:
+        out |= vector_store.file_paths_matching({"note_type": {"$in": stored}})
+    return out
+
+
 def resolve_allowed_paths(
     facets: SearchFacets,
     vector_store,
@@ -113,7 +153,7 @@ def resolve_allowed_paths(
     if any(getattr(facets, n) for n in MACHINE_FACETS):
         sets.append(_tag_store_paths(facets, tag_store, vault_root))
     if facets.note_type:
-        sets.append(vector_store.file_paths_matching({"note_type": {"$in": facets.note_type}}))
+        sets.append(_note_type_paths(facets.note_type, vector_store, bm25_index, vault_root))
     if facets.tags:
         clauses = [{tag_key(t): True} for t in facets.tags]
         sets.append(vector_store.file_paths_matching(

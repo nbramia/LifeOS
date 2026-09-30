@@ -20,20 +20,25 @@ class VaultListError(ValueError):
     """The requested path or glob cannot be listed."""
 
 
-def infer_note_type(path: Path | str) -> str:
-    """Infer a note type from where the file lives in the vault path."""
-    path_str_orig = str(path)
-    path_str = path_str_orig.lower()
-    if "/ML/" in path_str_orig or "\\ML\\" in path_str_orig:
+# Vault-relative folder that each vault note type names. ``Other`` is every
+# note outside all of them.
+NOTE_TYPE_FOLDERS = {
+    "ML": "Work/ML",
+    "Granola": "Granola",
+    "Personal": "Personal",
+    "Work": "Work",
+    "LifeOS": "LifeOS",
+}
+
+
+def infer_note_type(rel_path: Path | str) -> str:
+    """Infer a note type from a vault-relative path (never an absolute one)."""
+    parts = [p.casefold() for p in Path(str(rel_path).replace("\\", "/")).parts]
+    if parts[:2] == ["work", "ml"]:
         return "ML"
-    if "granola" in path_str:
-        return "Granola"
-    if "personal" in path_str:
-        return "Personal"
-    if "work" in path_str:
-        return "Work"
-    if "lifeos" in path_str:
-        return "LifeOS"
+    for name in ("Granola", "Personal", "Work", "LifeOS"):
+        if parts and parts[0] == name.casefold():
+            return name
     return "Other"
 
 
@@ -130,7 +135,7 @@ def list_vault_entries(
             "name": n["name"],
             "relative_path": n["relative_path"],
             "modified_date": mtime_date(n["mtime"]).isoformat(),
-            "note_type": infer_note_type(n["path"]),
+            "note_type": infer_note_type(n["relative_path"]),
             "tags": _tags_for(n["path"]),
         }
         for n in page

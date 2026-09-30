@@ -154,7 +154,7 @@ def _format_task_collection(
 # semantics as the orchestrator's search_vault tool.
 _SEARCH_FACET_PROPERTIES = {
     "folder": {"type": "string", "description": "Only notes under this vault-relative folder (e.g. 'Work/Meetings')."},
-    "note_type": {"type": "array", "items": {"type": "string"}, "description": "Only these note types (e.g. 'Granola' meeting transcripts, 'Personal', 'Work', 'ML', 'LifeOS')."},
+    "note_type": {"type": "array", "items": {"type": "string"}, "description": "Compatibility alias of folder for a top-level vault folder; use folder."},
     "people": {"type": "array", "items": {"type": "string"}, "description": "Only notes that mention any of these people."},
     "tags": {"type": "array", "items": {"type": "string"}, "description": "Only notes carrying any of these human tags (frontmatter tags)."},
     "doc_type": {"type": "array", "items": {"type": "string"}, "description": "Only these machine-tagged document types (e.g. 'meeting', 'journal')."},

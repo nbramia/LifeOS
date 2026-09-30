@@ -172,6 +172,19 @@ Discussed strategy.
         )
         assert len(personal_results) >= 1
 
+    def test_note_type_ignores_vault_location_named_work(self, tmp_path):
+        """A vault living under a directory named `work` labels notes by their own folder."""
+        from api.services.indexer import IndexerService as Indexer
+        vault = tmp_path / "work" / "vault"
+        (vault / "Personal").mkdir(parents=True)
+        (vault / "Work" / "ML").mkdir(parents=True)
+        idx = Indexer.__new__(Indexer)
+        idx.vault_path = vault
+        assert idx._infer_note_type(vault / "Personal" / "a.md") == "Personal"
+        assert idx._infer_note_type(vault / "Work" / "ML" / "b.md") == "ML"
+        assert idx._infer_note_type(vault / "Work" / "c.md") == "Work"
+        assert idx._infer_note_type(vault / "Inbox.md") == "Other"
+
     def test_handles_file_without_frontmatter(self, indexer, temp_vault):
         """Should handle files without YAML frontmatter."""
         (temp_vault / "plain.md").write_text("""# Simple Note

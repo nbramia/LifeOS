@@ -617,13 +617,63 @@ def test_hybrid_top_k_one_with_facet_and_date_returns_the_eligible_note(tmp_path
     monkeypatch.setattr(settings, "vault_path", Path(VAULT))
     bm25 = BM25Index(db_path=str(tmp_path / "bm25.db"))
     for i in range(5):
-        bm25.add_document(f"{_abs(f'n{i}.md')}_0", "budget budget budget", "n.md", modified_date="2026-05-01")
-    bm25.add_document(f"{_abs('old.md')}_0", "budget", "old.md", modified_date="2025-01-01")
-    vec = FakeVectorStore(note_types={_abs(f"n{i}.md"): "Work" for i in range(5)} | {_abs("old.md"): "Work"})
+        bm25.add_document(f"{_abs(f'Work/n{i}.md')}_0", "budget budget budget", "n.md", modified_date="2026-05-01")
+    bm25.add_document(f"{_abs('Work/old.md')}_0", "budget", "old.md", modified_date="2025-01-01")
+    vec = FakeVectorStore()
     vec.search = lambda *a, **k: []
     hs = HybridSearch(vector_store=vec, bm25_index=bm25)
     got = hs.search(
         "budget", top_k=1, use_reranker=False, date_to="2025-12-31",
         facets=SearchFacets(note_type=["Work"]),
     )
-    assert [r["file_path"] for r in got] == [_abs("old.md")]
+    assert [r["file_path"] for r in got] == [_abs("Work/old.md")]
+
+
+def test_note_type_equals_folder_and_ignores_stale_stored_values(env):
+    hs, vec, _, _ = env
+    # Stored metadata is deliberately wrong: the alias must not read it.
+    vec.note_types = {_abs("Work/Meetings/hiring-sync.md"): "Personal",
+                      _abs("Personal/Journal/day.md"): "Work"}
+    by_type = hs.search("budget", top_k=10, use_reranker=False,
+                        facets=SearchFacets(note_type=["Work"]))
+    by_folder = hs.search("budget", top_k=10, use_reranker=False,
+                          facets=SearchFacets(folder="Work"))
+    assert {r["file_path"] for r in by_type} == {r["file_path"] for r in by_folder}
+    assert {r["file_path"] for r in by_type} == {
+        _abs("Work/Meetings/hiring-sync.md"), _abs("Work/Meetings/budget-sync.md"),
+    }
+
+
+def test_note_type_ml_maps_to_work_ml_and_other_is_the_rest(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "vault_path", Path(VAULT))
+    bm25 = BM25Index(db_path=str(tmp_path / "bm25.db"))
+    rels = ["Work/ML/a.md", "Work/b.md", "Personal/c.md", "Inbox/d.md", "Granola/e.md"]
+    for rel in rels:
+        bm25.add_document(f"{_abs(rel)}_0", "budget", Path(rel).name)
+    vec = FakeVectorStore()
+    got = lambda nt: {  # noqa: E731
+        p[len(VAULT) + 1:] for p in resolve_allowed_paths(
+            SearchFacets(note_type=nt), vec, bm25, vault_root=VAULT)
+    }
+    assert got(["ML"]) == {"Work/ML/a.md"}
+    assert got(["Granola"]) == {"Granola/e.md"}
+    assert got(["Other"]) == {"Inbox/d.md"}
+    assert got(["Personal", "Other"]) == {"Personal/c.md", "Inbox/d.md"}
+
+
+def test_unknown_note_type_still_matches_stored_metadata(env):
+    hs, vec, _, _ = env
+    vec.note_types = {_abs("Work/Meetings/hiring-sync.md"): "calendar_event"}
+    got = resolve_allowed_paths(
+        SearchFacets(note_type=["calendar_event"]), vec, hs.bm25_index, vault_root=VAULT)
+    assert got == {_abs("Work/Meetings/hiring-sync.md")}
+
+
+def test_infer_note_type_is_vault_relative():
+    from api.services.vault_listing import infer_note_type
+    assert infer_note_type("Personal/Journal/day.md") == "Personal"
+    assert infer_note_type("Work/ML/a.md") == "ML"
+    assert infer_note_type("Work/a.md") == "Work"
+    assert infer_note_type("LifeOS/a.md") == "LifeOS"
+    assert infer_note_type("Granola/a.md") == "Granola"
+    assert infer_note_type("Inbox/work-notes.md") == "Other"
