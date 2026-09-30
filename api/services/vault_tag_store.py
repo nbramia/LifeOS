@@ -9,6 +9,7 @@ re-inference.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, fields
@@ -42,6 +43,11 @@ class TagRecord:
     doc_type_source: str | None = "code"  # "frontmatter" | "jev" | "code"; NULL (older rows) reads as "jev"
 
 
+# A requested topic matches a note whose stored topic distribution ranks it
+# within the top TOPIC_MATCH_TOP_K entries or gives it at least TOPIC_MATCH_MIN_P.
+TOPIC_MATCH_TOP_K = 3
+TOPIC_MATCH_MIN_P = 0.10
+
 _COLUMNS = [f.name for f in fields(TagRecord)]
 _FILTERABLE = {"doc_type", "domain", "topic", "project", "sensitivity", "backend"}
 
@@ -63,18 +69,19 @@ CREATE TABLE IF NOT EXISTS vault_tags (
     backend TEXT NOT NULL DEFAULT 'code',
     doc_type_source TEXT
 );
+CREATE TABLE IF NOT EXISTS vault_tag_topics (
+    file_path TEXT NOT NULL,
+    topic TEXT NOT NULL,
+    p REAL NOT NULL,
+    rank INTEGER NOT NULL,
+    PRIMARY KEY (file_path, topic)
+);
+CREATE INDEX IF NOT EXISTS idx_vault_tag_topics_topic ON vault_tag_topics(topic);
 CREATE INDEX IF NOT EXISTS idx_vault_tags_doc_type ON vault_tags(doc_type);
 CREATE INDEX IF NOT EXISTS idx_vault_tags_domain ON vault_tags(domain);
 CREATE INDEX IF NOT EXISTS idx_vault_tags_topic ON vault_tags(topic);
 CREATE INDEX IF NOT EXISTS idx_vault_tags_project ON vault_tags(project);
 """
-
-
-# `topics_json` is written by the tagger, so its `secondary` list is valid JSON.
-_SECONDARY_MATCH = (
-    "EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(topics_json) "
-    "THEN json_extract(topics_json, '$.secondary') END) WHERE value = ? OR value LIKE ?)"
-)
 
 
 def get_vault_tags_db_path() -> str:
@@ -87,10 +94,25 @@ class VaultTagStore:
     def __init__(self, db_path: str | None = None):
         self.db_path = db_path or get_vault_tags_db_path()
         with self._connect() as conn:
+            fresh = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE name = 'vault_tag_topics'"
+            ).fetchone() is None
             conn.executescript(_SCHEMA)
             columns = {r["name"] for r in conn.execute("PRAGMA table_info(vault_tags)")}
             if "doc_type_source" not in columns:
                 conn.execute("ALTER TABLE vault_tags ADD COLUMN doc_type_source TEXT")
+            if fresh:
+                with conn:
+                    for r in conn.execute("SELECT file_path, topics_json FROM vault_tags").fetchall():
+                        self._write_distribution(conn, r["file_path"], r["topics_json"])
+
+    @staticmethod
+    def _write_distribution(conn: sqlite3.Connection, file_path: str, topics_json: str) -> None:
+        conn.execute("DELETE FROM vault_tag_topics WHERE file_path = ?", (file_path,))
+        conn.executemany(
+            "INSERT INTO vault_tag_topics (file_path, topic, p, rank) VALUES (?, ?, ?, ?)",
+            _distribution_rows(file_path, topics_json),
+        )
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -106,6 +128,7 @@ class VaultTagStore:
                 conn.execute(
                     f"INSERT OR REPLACE INTO vault_tags ({cols}) VALUES ({marks})", asdict(record)
                 )
+                self._write_distribution(conn, record.file_path, record.topics_json)
 
     def get(self, path: str) -> TagRecord | None:
         with self._connect() as conn:
@@ -128,8 +151,11 @@ class VaultTagStore:
         """Paths whose row matches every given facet (AND across facets).
 
         A facet value may be a string or a list of strings (OR within the
-        facet). A ``topic`` value matches that exact topic or, given a
-        parent, every ``parent/child`` topic under it.
+        facet). A ``topic`` value matches a note when it is the note's
+        primary or a secondary topic, or sits in the note's stored topic
+        distribution (mirrored in ``vault_tag_topics``) within the top
+        ``TOPIC_MATCH_TOP_K`` or at probability ``TOPIC_MATCH_MIN_P`` or more. A parent value also matches every
+        ``parent/child`` topic under it.
         """
         unknown = set(facets) - _FILTERABLE
         if unknown:
@@ -140,16 +166,13 @@ class VaultTagStore:
             values = [raw] if isinstance(raw, str) else list(raw)
             if not values:
                 return []
-            ors = []
-            for v in values:
-                ors.append(f"{name} = ?")
-                params.append(v)
-                if name == "topic":
-                    ors.append("topic LIKE ?")
-                    params.append(v + "/%")
-                    ors.append(_SECONDARY_MATCH)
-                    params.extend([v, v + "/%"])
-            clauses.append("(" + " OR ".join(ors) + ")")
+            if name == "topic":
+                clause, tparams = _topic_clause(values)
+                clauses.append(clause)
+                params.extend(tparams)
+                continue
+            clauses.append("(" + " OR ".join(f"{name} = ?" for _ in values) + ")")
+            params.extend(values)
         where = " AND ".join(clauses) or "1"
         with self._connect() as conn:
             rows = conn.execute(
@@ -165,4 +188,52 @@ class VaultTagStore:
                 stored = [r["file_path"] for r in conn.execute("SELECT file_path FROM vault_tags")]
                 gone = [p for p in stored if p not in keep]
                 conn.executemany("DELETE FROM vault_tags WHERE file_path = ?", [(p,) for p in gone])
+                conn.executemany(
+                    "DELETE FROM vault_tag_topics WHERE file_path = ?", [(p,) for p in gone]
+                )
         return len(gone)
+
+
+def _distribution_rows(file_path: str, topics_json: str) -> list[tuple[str, str, float, int]]:
+    """Side-table rows ``(file_path, topic, p, rank)`` for one note.
+
+    Every topic with p > 0 gets its 1-based rank by descending probability;
+    a secondary topic without probability mass gets rank 0, and a topic
+    an operator tag mapped to (``from_tags``) gets p = 1.0 at rank 0.
+    """
+    try:
+        data = json.loads(topics_json)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    dist = data.get("topic")
+    dist = dist if isinstance(dist, dict) else {}
+    ranked = sorted(
+        ((lb, float(p)) for lb, p in dist.items()
+         if isinstance(lb, str) and isinstance(p, (int, float)) and p > 0),
+        key=lambda kv: -kv[1],
+    )
+    rows = {lb: (file_path, lb, p, r) for r, (lb, p) in enumerate(ranked, 1)}
+    secondary = data.get("secondary")
+    for lab in secondary if isinstance(secondary, list) else []:
+        if isinstance(lab, str):
+            rows[lab] = (file_path, lab, rows[lab][2] if lab in rows else 0.0, 0)
+    from_tags = data.get("from_tags")
+    for lab in from_tags if isinstance(from_tags, dict) else []:
+        if isinstance(lab, str):
+            rows[lab] = (file_path, lab, 1.0, 0)
+    return list(rows.values())
+
+
+def _topic_clause(requested: list[str]) -> tuple[str, list]:
+    """SQL clause: primary, secondary, or distribution match for any requested topic."""
+    labels = [x for t in requested for x in (t, t + "/%")]
+    like = " OR ".join("(topic = ? OR topic LIKE ?)" for _ in requested)
+    side = " OR ".join("(t.topic = ? OR t.topic LIKE ?)" for _ in requested)
+    clause = (
+        f"({like} OR EXISTS (SELECT 1 FROM vault_tag_topics t "
+        f"WHERE t.file_path = vault_tags.file_path AND ({side}) "
+        "AND (t.rank <= ? OR t.p >= ?)))"
+    )
+    return clause, labels + labels + [TOPIC_MATCH_TOP_K, TOPIC_MATCH_MIN_P]
