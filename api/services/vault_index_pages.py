@@ -1,9 +1,11 @@
-"""Generated per-folder index pages.
+"""Generated Vault Map pages.
 
 For every top-level vault folder, `Wiki/Vault Map/<folder>.md` lists the note
 count, how many notes changed in the last 30 days, and the most recent notes
-with their one-line summaries; `Wiki/Vault Map/index.md` lists every folder
-page. Pages use the wiki's frontmatter keys plus the `source: lifeos-index`
+with their one-line summaries. When the tag store holds tags, `Domains/<domain>.md`
+lists a domain's topics with counts and `Topics/<parent>--<child>.md` lists a
+populated topic's most recent notes (membership matches the topic search facet).
+`Wiki/Vault Map/index.md` links the domain pages, then the folder pages. Pages use the wiki's frontmatter keys plus the `source: lifeos-index`
 ownership marker, are deterministic (stable ordering, dates only), and are only
 rewritten when the rendered bytes differ.
 """
@@ -47,17 +49,43 @@ def _frontmatter(latest: str | None) -> list[str]:
     return lines + ["generated: true", "---"]
 
 
-def render_map_index(rows: list[tuple[str, int, int, str | None]]) -> str:
-    """Render `Wiki/Vault Map/index.md`; `rows` are `(folder, notes, recent, latest_date)`."""
-    latest = max((r[3] for r in rows if r[3]), default=None)
+def _label(name: str) -> str:
+    return name.replace("_", " ")
+
+
+def topic_page_name(topic: str) -> str:
+    """Page name for a `parent/child` topic: `parent--child`."""
+    return topic.replace("/", "--")
+
+
+def render_map_index(
+    rows: list[tuple[str, int, int, str | None]],
+    domains: list[tuple[str, int, str | None]] | None = None,
+) -> str:
+    """Render `Wiki/Vault Map/index.md`; `rows` are `(folder, notes, recent, latest_date)`.
+
+    `domains` are `(domain, notes, latest_date)`; None means no tags are stored.
+    """
+    latest = max(
+        [r[3] for r in rows if r[3]] + [d[2] for d in domains or [] if d[2]],
+        default=None,
+    )
     lines = _frontmatter(latest) + [
         "# Vault map",
         "",
         WIKI_INDEX_LINK,
         "",
-        "Generated list of the per-folder index pages, rebuilt during the nightly reindex. Do not edit.",
+        "Generated list of the domain and per-folder index pages, rebuilt during the nightly reindex. Do not edit.",
+        "",
+        "## By domain",
         "",
     ]
+    if domains is None:
+        lines.append("_No tags stored yet; domain and topic pages appear once notes are tagged._")
+    else:
+        for name, total, _ in domains:
+            lines.append(f"- [[{INDEX_FOLDER}/Domains/{name}|{_label(name)}]] — {total} notes")
+    lines += ["", "## By folder", ""]
     for name, total, recent, _ in sorted(rows):
         lines.append(f"- [[{INDEX_FOLDER}/{name}|{name}]] — {total} notes, {recent} changed in {RECENT_DAYS} days")
     if not rows:
@@ -107,6 +135,100 @@ def render_index_page(
     return "\n".join(lines) + "\n"
 
 
+def _member_lines(notes: list[dict], summaries: dict[str, str]) -> list[str]:
+    lines = []
+    for n in notes:
+        link = n["relative_path"][:-3] if n["relative_path"].endswith(".md") else n["relative_path"]
+        title = n["name"][:-3] if n["name"].endswith(".md") else n["name"]
+        line = f"- [[{link}|{title}]] ({n['modified_date']})"
+        if summaries.get(n["relative_path"]):
+            line += f" — {_one_line(summaries[n['relative_path']])}"
+        lines.append(line)
+    return lines
+
+
+def render_topic_page(topic: str, total: int, notes: list[dict], summaries: dict[str, str]) -> str:
+    """Render a topic page; `notes` are the (already capped) newest members."""
+    parent, _, child = topic.partition("/")
+    lines = _frontmatter(max((n["modified_date"] for n in notes), default=None)) + [
+        f"# {_label(parent)} / {_label(child)}",
+        "",
+        WIKI_INDEX_LINK,
+        "",
+        f"Generated list of notes on `{topic}`, rebuilt during the nightly reindex. Do not edit.",
+        "",
+        f"Total: {total}",
+        "",
+        "## Most recent notes",
+        "",
+    ]
+    return "\n".join(lines + _member_lines(notes, summaries)) + "\n"
+
+
+def render_domain_page(
+    domain: str, topics: list[tuple[str, int]], domain_only: int, latest: str | None
+) -> str:
+    """Render a domain page; `topics` are `(parent/child, count)`."""
+    lines = _frontmatter(latest) + [
+        f"# {_label(domain)}",
+        "",
+        WIKI_INDEX_LINK,
+        "",
+        f"Generated list of the `{domain}` topics, rebuilt during the nightly reindex. Do not edit.",
+        "",
+        "## Topics",
+        "",
+    ]
+    for topic, count in topics:
+        label = _label(topic.partition("/")[2])
+        lines.append(f"- [[{INDEX_FOLDER}/Topics/{topic_page_name(topic)}|{label}]] — {count} notes")
+    if not topics:
+        lines.append("_No populated topics._")
+    lines += ["", f"Notes classified only at the domain level: {domain_only}"]
+    return "\n".join(lines) + "\n"
+
+
+def _tag_membership(notes_by_path: dict[str, dict], tag_store, taxonomy):
+    """Domain and topic membership from the tag store, or None when no tags exist.
+
+    Returns `{domain: (domain members, {topic: members})}`; members are existing,
+    non-restricted notes, newest first. Topic membership is
+    `VaultTagStore.paths_matching(topic=...)`, the matching the search facet uses.
+    """
+    try:
+        if tag_store is None:
+            from api.services.vault_tag_store import VaultTagStore, get_vault_tags_db_path
+
+            if not os.path.exists(get_vault_tags_db_path()):
+                return None
+            tag_store = VaultTagStore()
+        if not tag_store.paths_matching():
+            return None
+        if taxonomy is None:
+            from api.services.vault_taxonomy import load_taxonomy
+
+            taxonomy = load_taxonomy()
+        restricted = set(tag_store.paths_matching(sensitivity="restricted"))
+        order = {p: i for i, p in enumerate(notes_by_path)}
+
+        def members(**facet) -> list[str]:
+            found = {p for p in tag_store.paths_matching(**facet) if p in order and p not in restricted}
+            return sorted(found, key=order.__getitem__)
+
+        out: dict[str, tuple[list[str], dict[str, list[str]]]] = {}
+        for domain in taxonomy.domains:
+            topics = {}
+            for topic in sorted(t for t in taxonomy.topics if t.startswith(domain + "/")):
+                found = members(topic=[topic])
+                if found:
+                    topics[topic] = found
+            out[domain] = (members(domain=[domain]), topics)
+        return out
+    except Exception as e:
+        logger.warning("Tag store unavailable for domain/topic pages: %s", e)
+        return None
+
+
 def _bm25_summary_lookup(paths: list[str]) -> dict[str, str]:
     from api.services.bm25_index import get_bm25_index
 
@@ -117,6 +239,8 @@ def write_index_pages(
     vault_root: Path,
     today: date | None = None,
     summary_lookup: SummaryLookup | None = None,
+    tag_store=None,
+    taxonomy=None,
 ) -> dict:
     """Write `Wiki/Vault Map/<top-level-folder>.md` for each top-level folder,
     plus `Wiki/Vault Map/index.md` listing them.
@@ -130,6 +254,11 @@ def write_index_pages(
     folders, changed, removed, removed_legacy}`, where `changed` and `removed` are absolute file paths.
     Generated pages left in the legacy `LifeOS/Index` folder are deleted (and
     listed in `removed`); other files there are never touched.
+
+    Domain and topic pages come from the tag store (`tag_store`, default the
+    on-disk store; `taxonomy`, default the loaded one). With no stored tags the
+    map index says so and no domain or topic pages are written; owned ones left
+    over are removed. Restricted notes appear on folder pages only.
     """
     root = vault_root.resolve()
     today = today or date.today()
@@ -139,7 +268,7 @@ def write_index_pages(
         index_dir.relative_to(root)
     except ValueError:
         logger.warning("Index folder resolves outside the vault; skipping index pages")
-        return {"written": 0, "unchanged": 0, "skipped_collision": 0, "folders": 0, "changed": [], "removed": [], "removed_legacy": 0}
+        return {"written": 0, "unchanged": 0, "skipped_collision": 0, "folders": 0, "changed": [], "removed": [], "removed_legacy": 0, "domain_pages": 0, "topic_pages": 0}
     index_dir.mkdir(parents=True, exist_ok=True)
     index_prefix = INDEX_FOLDER + "/"
 
@@ -194,16 +323,75 @@ def write_index_pages(
         else:
             written += 1
             changed.append(str(target))
-    map_index = index_dir / "index.md"
-    status = _write_owned(map_index, render_map_index(rows).encode("utf-8"))
-    if status == "unchanged":
-        unchanged += 1
-    elif status == "collision":
-        skipped_collision += 1
-    else:
-        written += 1
-        changed.append(str(map_index))
-    removed = _remove_stale_pages(index_dir, {f.name for f in folders} | {"index"})
+    all_notes = [n for n in scan_notes(root, root) if not n["relative_path"].startswith(index_prefix)]
+    notes_by_path = {
+        n["relative_path"]: {
+            "relative_path": n["relative_path"],
+            "name": n["name"],
+            "modified_date": mtime_date(n["mtime"]).isoformat(),
+            "path": n["path"],
+        }
+        for n in all_notes
+    }
+    order = {p: i for i, p in enumerate(notes_by_path)}
+    membership = _tag_membership(notes_by_path, tag_store, taxonomy)
+    pages: dict[str, dict[str, str]] = {"Domains": {}, "Topics": {}}
+    domain_rows: list[tuple[str, int, str | None]] | None = None
+    if membership is not None:
+        domain_rows = []
+        for domain, (dom_paths, topics) in membership.items():
+            if not dom_paths and not topics:
+                continue
+            in_topics = {p for paths in topics.values() for p in paths}
+            union = set(dom_paths) | in_topics
+            latest = max((notes_by_path[p]["modified_date"] for p in union), default=None)
+            domain_rows.append((domain, len(dom_paths), latest))
+            pages["Domains"][domain] = render_domain_page(
+                domain,
+                [(t, len(ps)) for t, ps in topics.items()],
+                len([p for p in dom_paths if p not in in_topics]),
+                latest,
+            )
+            for topic, paths in topics.items():
+                top = [notes_by_path[p] for p in sorted(paths, key=order.__getitem__)[:MAX_RECENT]]
+                real = {str(n["path"].resolve()): n["relative_path"] for n in top}
+                try:
+                    found = lookup(list(real))
+                except Exception as e:
+                    logger.warning("Index summaries unavailable for %s, using titles only: %s", topic, e)
+                    found = {}
+                summaries = {real[p]: t for p, t in found.items() if p in real}
+                pages["Topics"][topic_page_name(topic)] = render_topic_page(topic, len(paths), top, summaries)
+
+    def emit(target: Path, content: str) -> None:
+        nonlocal written, unchanged, skipped_collision
+        status = _write_owned(target, content.encode("utf-8"))
+        if status == "unchanged":
+            unchanged += 1
+        elif status == "collision":
+            skipped_collision += 1
+        else:
+            written += 1
+            changed.append(str(target))
+
+    emit(index_dir / "index.md", render_map_index(rows, domain_rows))
+    removed: list[str] = []
+    for sub, sub_pages in pages.items():
+        sub_dir = index_dir / sub
+        if sub_dir.is_symlink() or (sub_dir.exists() and not sub_dir.is_dir()):
+            logger.warning("Vault Map %s folder is not a plain directory; skipping", sub)
+            continue
+        if sub_pages:
+            sub_dir.mkdir(exist_ok=True)
+            for name, content in sub_pages.items():
+                emit(sub_dir / f"{name}.md", content)
+        if sub_dir.is_dir():
+            removed += _remove_stale_pages(sub_dir, set(sub_pages))
+            try:
+                sub_dir.rmdir()
+            except OSError:
+                pass
+    removed += _remove_stale_pages(index_dir, {f.name for f in folders} | {"index"})
     legacy = _remove_legacy_pages(root)
     removed += legacy
     return {
@@ -214,6 +402,8 @@ def write_index_pages(
         "changed": changed,
         "removed": removed,
         "removed_legacy": len(legacy),
+        "domain_pages": len(pages["Domains"]),
+        "topic_pages": len(pages["Topics"]),
     }
 
 

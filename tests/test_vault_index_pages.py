@@ -311,3 +311,10 @@ def test_unchanged_vault_writes_nothing_on_a_later_day(vault):
     work = (vault / INDEX_FOLDER / "Work.md").read_text()
     assert "\ndate: 2026-09-28\n" in work
     assert "\ndate: 2026-09-20\n" in (vault / INDEX_FOLDER / "Personal.md").read_text()
+
+
+@pytest.fixture(autouse=True)
+def _no_real_tag_store(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "api.services.vault_tag_store.get_vault_tags_db_path", lambda: str(tmp_path / "absent-tags.db")
+    )
