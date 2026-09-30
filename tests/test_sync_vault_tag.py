@@ -197,3 +197,16 @@ def test_folded_restricted_tag_is_not_sent_by_nightly_retag(env, monkeypatch):
     _run()
     stats, ask = _run()
     assert ask.call_count == 0 and store.get("Notes/f.md").backend == "code"
+
+
+@pytest.mark.parametrize("tag", ["1-1", "_private", "équipe"])
+def test_retag_of_a_previously_sent_row_does_not_send_a_restricted_inline_tag(env, monkeypatch, tag):
+    vault, store = env
+    monkeypatch.setattr(settings, "jev_vault_restricted_tags", tag)
+    _run()
+    assert store.get("Notes/a.md").backend == "jev"
+    (vault / "Notes" / "a.md").write_text(f"# A\nchanged #{tag}\n")
+    stats, ask = _run()
+    assert stats["restricted"] == 1 and ask.call_count == 0
+    rec = store.get("Notes/a.md")
+    assert rec.backend == "code" and rec.sensitivity == "restricted"

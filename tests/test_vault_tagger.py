@@ -423,3 +423,29 @@ def test_restricted_tag_folding_is_shared_by_setting_and_note_tags(vault, monkey
         rec = _tagger(vault).tag_file(note)
         assert not _tagger(vault).would_send(note)
     assert not ask.called and rec.sensitivity == "restricted"
+
+
+NON_ASCII_START_TAGS = ["1-1", "_private", "équipe"]
+
+
+@pytest.mark.parametrize("tag", NON_ASCII_START_TAGS)
+@pytest.mark.parametrize("inline", [False, True])
+def test_restricted_tag_not_starting_with_ascii_letter_blocks_both_forms(vault, monkeypatch, tag, inline):
+    _set(monkeypatch)
+    monkeypatch.setattr(settings, "jev_vault_restricted_tags", tag)
+    note = _note(vault, "odd.md", tag, inline)
+    with patch.object(JevClient, "ask", return_value=_answers()) as ask:
+        tagger = _tagger(vault)
+        assert not tagger.would_send(note)
+        rec = tagger.tag_file(note)
+    assert not ask.called and rec.backend == "code" and rec.sensitivity == "restricted"
+
+
+def test_purely_numeric_hash_is_not_a_tag(vault, monkeypatch):
+    _set(monkeypatch)
+    monkeypatch.setattr(settings, "jev_vault_restricted_tags", "1-1,123")
+    note = vault / "Notes" / "num.md"
+    note.write_text("# N\nissue #123 and `#1-1` and page#1-1 here\n")
+    with patch.object(JevClient, "ask", return_value=_answers()) as ask:
+        rec = _tagger(vault).tag_file(note)
+    assert ask.called and rec.sensitivity == "private"

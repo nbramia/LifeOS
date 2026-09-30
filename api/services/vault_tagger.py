@@ -138,13 +138,20 @@ def _path_restricted(rel_path: str) -> bool:
     return False
 
 
-_INLINE_TAG = re.compile(r"(?<![\w/&#])#([A-Za-z][\w/-]*)")
+_INLINE_TAG = re.compile(r"(?:^|(?<=\s))#([\w/-]+)", re.M)
 _FENCED_CODE = re.compile(r"^(```|~~~).*?^\1", re.S | re.M)
+_INLINE_CODE = re.compile(r"`[^`\n]*`")
 
 
 def inline_tags(body: str) -> list[str]:
-    """Obsidian inline tags (`#tag`, `#tag/sub`) outside fenced code blocks."""
-    return _INLINE_TAG.findall(_FENCED_CODE.sub("", body))
+    """Obsidian inline tags (`#tag`, `#tag/sub`, `#1-1`, `#équipe`) outside code.
+
+    A tag starts at line start or after whitespace and spans Unicode letters,
+    digits, `_`, `-` and `/`. All-digit text after the hash, headings, URL anchors and
+    code spans are excluded.
+    """
+    text = _INLINE_CODE.sub(" ", _FENCED_CODE.sub("", body))
+    return [t for t in _INLINE_TAG.findall(text) if not t.isdigit()]
 
 
 def _fold_tag(tag: str) -> str:
