@@ -79,7 +79,11 @@ def sync_vault_tag(dry_run: bool = True, store=None, tagger=None, vault_path=Non
         try:
             sha = hashlib.sha256(path.read_text(encoding="utf-8", errors="replace").encode("utf-8")).hexdigest()
             if not store.needs_tagging(rel, sha, vocab):
-                return "unchanged", None
+                # A code-only restricted row may have become sendable through a setting change.
+                row = store.get(rel)
+                if not (row and row.backend == "code" and row.sensitivity == "restricted"
+                        and tagger.would_send(path)):
+                    return "unchanged", None
             if dry_run:
                 return "would_tag", None
             record = tagger.tag_file(path)

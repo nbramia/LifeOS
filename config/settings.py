@@ -704,6 +704,14 @@ class Settings(BaseSettings):
                     "An explicitly empty value disables path-based restriction; "
                     "tag-based restriction stays in effect."
     )
+    jev_vault_restricted_tags: str = Field(
+        default="therapy,private,finance,confidential",
+        alias="LIFEOS_JEV_VAULT_RESTRICTED_TAGS",
+        description="Comma-separated note tags (frontmatter or inline) whose notes, "
+                    "and those of their nested children, are classed restricted and "
+                    "never sent to Jev for tagging. An explicitly empty value "
+                    "disables tag-based restriction."
+    )
     # Lets the agent worker's `local` route fall back to the remote
     # OpenAI-compatible provider above when the local llama-server isn't
     # reachable. Exists for a real deployment with NO other #agent executor

@@ -360,3 +360,54 @@ def test_empty_tags_key_with_matching_parse_is_not_restricted(vault, monkeypatch
     (vault / "Notes" / "fine.md").write_text("---\ntitle: x\ntags: [work]\n---\nbody\n")
     ask, rec = _send(vault, monkeypatch, "Notes/fine.md")
     assert ask.called and rec.sensitivity == "private"
+
+
+def _note(vault, name, tag, inline=False):
+    text = f"# N\nbody #{tag}\n" if inline else f"---\ntags: [{tag}]\n---\nbody\n"
+    (vault / "Notes" / name).write_text(text)
+    return vault / "Notes" / name
+
+
+@pytest.mark.parametrize("tag", ["finance", "therapy"])
+@pytest.mark.parametrize("inline", [False, True])
+def test_restricted_tags_setting_sends_notes_outside_the_list(vault, monkeypatch, tag, inline):
+    _set(monkeypatch)
+    monkeypatch.setattr(settings, "jev_vault_restricted_tags", "private,confidential")
+    note = _note(vault, "t.md", tag, inline)
+    with patch.object(JevClient, "ask", return_value=_answers()) as ask:
+        rec = _tagger(vault).tag_file(note)
+    assert ask.called and rec.backend == "jev" and rec.sensitivity == "private"
+
+
+def test_restricted_tags_setting_keeps_nested_children_restricted(vault, monkeypatch):
+    _set(monkeypatch)
+    monkeypatch.setattr(settings, "jev_vault_restricted_tags", "private,confidential")
+    note = _note(vault, "s.md", "private/session")
+    with patch.object(JevClient, "ask", return_value=_answers()) as ask:
+        rec = _tagger(vault).tag_file(note)
+    assert not ask.called and rec.sensitivity == "restricted"
+
+
+def test_restricted_tags_are_case_insensitive_and_normalized(monkeypatch):
+    monkeypatch.setattr(settings, "jev_vault_restricted_tags", " 'Private/' , ./Work ")
+    assert classify_sensitivity("Notes/a.md", ["PRIVATE"]) == "restricted"
+    assert classify_sensitivity("Notes/a.md", ["work/x"]) == "restricted"
+    assert classify_sensitivity("Notes/a.md", ["finance"]) == "private"
+
+
+def test_empty_restricted_tags_disables_tag_restriction(monkeypatch):
+    monkeypatch.setattr(settings, "jev_vault_restricted_tags", "  ")
+    assert classify_sensitivity("Notes/a.md", ["therapy", "private"]) == "private"
+
+
+@pytest.mark.parametrize("value", [",,", "''", " , ", "/"])
+def test_restricted_tags_without_valid_entry_use_default_and_warn(monkeypatch, caplog, value):
+    monkeypatch.setattr(settings, "jev_vault_restricted_tags", value)
+    with caplog.at_level("WARNING"):
+        assert classify_sensitivity("Notes/a.md", ["finance"]) == "restricted"
+    assert sum("RESTRICTED_TAGS" in r.message for r in caplog.records) == 1
+
+
+def test_unset_restricted_tags_default_matches_built_in_list(monkeypatch):
+    for tag in ("therapy", "private", "finance", "confidential", "private/session"):
+        assert classify_sensitivity("Notes/a.md", [tag]) == "restricted"

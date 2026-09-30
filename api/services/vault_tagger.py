@@ -52,7 +52,7 @@ MAX_SECONDARY_TOPICS = 2
 TOPIC_PARENT_ONLY_BELOW = 0.6
 ACTIONABILITY_LEVELS = ["informational", "may need follow-up", "needs action"]
 
-RESTRICTED_TAGS = frozenset({"therapy", "private", "finance", "confidential"})
+DEFAULT_RESTRICTED_TAGS = "therapy,private,finance,confidential"
 
 _MODES = {"off", "shadow", "on"}
 
@@ -141,10 +141,25 @@ def inline_tags(body: str) -> list[str]:
     return _INLINE_TAG.findall(_FENCED_CODE.sub("", body))
 
 
+def _restricted_tags() -> frozenset[str]:
+    """Normalized entries of `LIFEOS_JEV_VAULT_RESTRICTED_TAGS`. A value that is
+    empty after stripping means no tag restriction; a non-empty value with no
+    valid entry falls back to the default list."""
+    raw = settings.jev_vault_restricted_tags or ""
+    if not raw.strip():
+        return frozenset()
+    entries = _entries(raw, fold=True)
+    if not entries:
+        logger.warning("LIFEOS_JEV_VAULT_RESTRICTED_TAGS has no valid entry; using the default list")
+        entries = _entries(DEFAULT_RESTRICTED_TAGS, fold=True)
+    return frozenset("/".join(e) for e in entries)
+
+
 def _tag_restricted(tag: str) -> bool:
     """A restricted tag or any of its children (`private/session`), case-insensitive."""
+    restricted = _restricted_tags()
     parts = tag.lstrip("#").lower().split("/")
-    return any("/".join(parts[: i + 1]) in RESTRICTED_TAGS for i in range(len(parts)))
+    return any("/".join(parts[: i + 1]) in restricted for i in range(len(parts)))
 
 
 def classify_sensitivity(rel_path: str, human_tags: list[str]) -> str:
@@ -154,6 +169,14 @@ def classify_sensitivity(rel_path: str, human_tags: list[str]) -> str:
     if any(_tag_restricted(t) for t in human_tags):
         return "restricted"
     return "private"
+
+
+def _note_sensitivity(rel: str, resolved: str | None, tags: list[str], parsed: bool) -> str:
+    """Sensitivity of a note by its path, symlink-resolved path, and human tags;
+    an escaping symlink or unparsed frontmatter is ``restricted``."""
+    if resolved is None or not parsed or classify_sensitivity(resolved, tags) == "restricted":
+        return "restricted"
+    return classify_sensitivity(rel, tags)
 
 
 _RAW_TAGS_KEY = re.compile(r"^tags\s*:\s*(\S|\n\s*-)", re.M)
@@ -379,6 +402,18 @@ class VaultTagger:
         )
         record.backend = "jev"
 
+    def would_send(self, path: str | Path) -> bool:
+        """True when `tag_file` would send this note to Jev under current settings."""
+        path = Path(path)
+        try:
+            rel = self._rel(path)
+            fm, body, parsed = parse_note(path.read_text(encoding="utf-8", errors="replace"))
+            tags = chunker.normalize_tags(fm.get("tags")) + inline_tags(body)
+            resolved = self._resolved_rel(path)
+            return self.jev_allowed(rel, resolved, _note_sensitivity(rel, resolved, tags, parsed))
+        except Exception:  # noqa: BLE001
+            return False
+
     def tag_file(self, path: str | Path) -> TagRecord:
         path = Path(path)
         rel = path.name
@@ -391,9 +426,7 @@ class VaultTagger:
             fm, body, parsed = parse_note(content)
             tags = chunker.normalize_tags(fm.get("tags")) + inline_tags(body)
             resolved = self._resolved_rel(path)
-            sensitivity = classify_sensitivity(rel, tags)
-            if resolved is None or not parsed or classify_sensitivity(resolved, tags) == "restricted":
-                sensitivity = "restricted"
+            sensitivity = _note_sensitivity(rel, resolved, tags, parsed)
             record = TagRecord(
                 file_path=rel,
                 content_sha256=sha,
