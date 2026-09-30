@@ -10,7 +10,9 @@ topics:
     description: Garden layouts, planting schedules, and plant care.
   - name: work/hiring
     description: Sourcing and interviewing candidates for the example team.
-# Tag -> topic and `type:` -> document type entries add or replace by key.
+# Tag -> topic and `type:` -> document type entries add or replace by key. A
+# committed mapping whose topic this file removes is dropped (with a warning);
+# repoint it here, e.g. `1-1: work/one_on_ones` with that topic declared above.
 tag_topics:
   gardening: hobbies/gardening
 type_doc_types:

@@ -178,6 +178,44 @@ def test_committed_maps_are_generic_and_valid():
     assert all(v in TX.doc_types for v in TX.type_doc_types.values())
 
 
+COMMITTED_OVERRIDE_BASE = BASE + "  gym: health/fitness\n"
+
+
+def test_committed_file_alone_loads_with_every_target_valid():
+    tx = load_taxonomy(DEFAULT_TAXONOMY_PATH)
+    assert all(t in tx.topics for t in tx.tag_topics.values())
+    assert all(t in tx.doc_types for t in tx.type_doc_types.values())
+    assert tx.type_doc_types["transcript"] == "meeting_notes"
+
+
+def test_override_removing_a_committed_target_drops_the_mapping_with_a_warning(tmp_path, caplog):
+    with caplog.at_level("WARNING"):
+        tx = _load(tmp_path, COMMITTED_OVERRIDE_BASE, "remove:\n  topics: [health/fitness]\n")
+    assert "gym" not in tx.tag_topics and "hiring" in tx.tag_topics
+    assert "health/fitness" in caplog.text
+    reset_taxonomy_cache()
+    same = _load(tmp_path, COMMITTED_OVERRIDE_BASE.replace("  gym: health/fitness\n", ""), "remove:\n  topics: [health/fitness]\n")
+    assert same.vocab_version == tx.vocab_version
+
+
+def test_override_can_repoint_a_dropped_mapping_to_its_own_topic(tmp_path):
+    tx = _load(tmp_path, COMMITTED_OVERRIDE_BASE, """
+domains: [work, health]
+topics:
+  - name: health/workouts
+remove:
+  topics: [health/fitness]
+tag_topics:
+  gym: health/workouts
+""")
+    assert tx.tag_topics["gym"] == "health/workouts"
+
+
+def test_override_mapping_to_an_undeclared_topic_raises(tmp_path):
+    with pytest.raises(TaxonomyError):
+        _load(tmp_path, BASE, "tag_topics:\n  gym: health/nowhere\n")
+
+
 def test_map_keys_fold_and_targets_are_validated(tmp_path):
     tx = _load(tmp_path)
     assert tx.type_doc_types == {"diary": "journal"} and tx.tag_topics == {"hiring": "work/hiring"}

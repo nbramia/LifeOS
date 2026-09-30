@@ -125,8 +125,7 @@ type_doc_types:
   reference: reference
   # A synthesis restates and organizes sources for later lookup.
   synthesis: reference
-  # Transcripts are the raw record of a conversation, not a written summary.
-  transcript: ambient_transcript
+  transcript: meeting_notes
   project: project_doc
   book: book_notes
   task: task_record

@@ -20,11 +20,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 _CONFIG_DIR = Path(__file__).resolve().parents[2] / "config"
 DEFAULT_TAXONOMY_PATH = _CONFIG_DIR / "vault_taxonomy.yaml"
@@ -150,13 +153,21 @@ def _validate_topics(topics: dict[str, str], domains: list[str]) -> None:
             raise TaxonomyError(f"topic '{name}': parent '{parent}' is not a declared domain")
 
 
-def _validate_maps(merged: dict[str, Any]) -> None:
-    for key, target in merged["type_doc_types"].items():
-        if target not in merged["doc_types"]:
-            raise TaxonomyError(f"type_doc_types['{key}']: '{target}' is not a declared document type")
-    for key, target in merged["tag_topics"].items():
-        if target not in merged["topics"]:
-            raise TaxonomyError(f"tag_topics['{key}']: '{target}' is not a declared topic")
+def _validate_maps(merged: dict[str, Any], declared: dict[str, set[str]], has_override: bool) -> None:
+    """Check map targets against the merged vocabulary. A committed entry whose
+    target the override removed is dropped with a warning; an entry the override
+    declares, or any entry when there is no override, must resolve."""
+    targets = {"type_doc_types": ("document type", set(merged["doc_types"])),
+               "tag_topics": ("topic", set(merged["topics"]))}
+    for facet, (kind, valid) in targets.items():
+        for key, target in list(merged[facet].items()):
+            if target in valid:
+                continue
+            if has_override and key not in declared[facet]:
+                logger.warning("Dropping committed %s['%s']: '%s' is not a declared %s", facet, key, target, kind)
+                del merged[facet][key]
+            else:
+                raise TaxonomyError(f"{facet}['{key}']: '{target}' is not a declared {kind}")
 
 
 def _canonical(merged: dict[str, Any]) -> str:
@@ -195,6 +206,7 @@ def load_taxonomy(
         return _cache[key]
 
     merged = _parse_layer(_read_yaml(base_path), str(base_path))
+    declared: dict[str, set[str]] = {facet: set() for facet in _MAP_FACETS}
     if local_path is not None:
         layer = _parse_layer(_read_yaml(local_path), str(local_path))
         for facet in _LIST_FACETS:
@@ -202,6 +214,7 @@ def load_taxonomy(
         merged["topics"].update(layer["topics"])
         for facet in _MAP_FACETS:
             merged[facet].update(layer[facet])
+            declared[facet] |= set(layer[facet])
         if layer["version"]:
             merged["version"] = layer["version"]
         for facet, values in layer["remove"].items():
@@ -216,7 +229,7 @@ def load_taxonomy(
     if not merged["version"]:
         raise TaxonomyError(f"{base_path}: 'version' is required")
     _validate_topics(merged["topics"], merged["domains"])
-    _validate_maps(merged)
+    _validate_maps(merged, declared, local_path is not None)
 
     taxonomy = Taxonomy(
         version=merged["version"],
