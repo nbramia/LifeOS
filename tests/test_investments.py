@@ -293,3 +293,49 @@ async def test_search_finances_movers_snapshot_not_synced(monkeypatch):
     monkeypatch.setattr(inv, "_held_tickers", lambda: [])
     out = await _tool_search_finances({"action": "movers"})
     assert "couldn't check" in out.lower() or "isn't available" in out.lower()
+
+
+def test_day_digest_reports_portfolio_vs_ivv_and_movers():
+    from datetime import datetime
+    shares = {"IVV": 10, "NVDA": 5, "O": 20, "AMD": 2, "TSLA": 1, "SCHD": 4, "JEPI": 3}
+    quotes = {"IVV": (101.0, 100.0), "NVDA": (110.0, 100.0), "O": (49.0, 50.0),
+              "AMD": (103.0, 100.0), "TSLA": (204.0, 200.0), "SCHD": (29.7, 30.0),
+              "JEPI": (57.0, 57.0)}
+    now = datetime(2026, 10, 7, 15, 0, tzinfo=inv.NY)
+    msg = inv.day_digest(shares, quotes, now).splitlines()
+    start = 1000 + 500 + 1000 + 200 + 200 + 120 + 171
+    gain = 10 + 50 - 20 + 6 + 4 - 1.2
+    assert msg[0] == f"Portfolio through 3:00pm: +{gain / start * 100:.2f}% (+${gain:,.0f}) vs IVV +1.00%"
+    assert msg[1] == "Top gainers: NVDA +10.00%, AMD +3.00%, TSLA +2.00%"
+    assert msg[2] == "Top losers: O −2.00%, SCHD −1.00%"   # unchanged JEPI is neither
+
+
+def test_day_digest_names_unquoted_and_needs_benchmark():
+    from datetime import datetime
+    now = datetime(2026, 10, 7, 15, 0, tzinfo=inv.NY)
+    msg = inv.day_digest({"IVV": 1, "XYZ": 1}, {"IVV": (99.0, 100.0)}, now)
+    assert msg.endswith("No quote: XYZ") and "IVV −1.00%" in msg
+    assert inv.day_digest({"NVDA": 1}, {"NVDA": (1.0, 1.0)}, now) == ""
+
+
+def test_held_shares_skips_external_mutual_funds_and_blanks(tmp_path, monkeypatch):
+    monkeypatch.setattr(inv, "SYNC_DIR", str(tmp_path))
+    (tmp_path / "summary.json").write_text(
+        '{"positions": [{"symbol": "IVV", "shares": 3, "external": false}, '
+        '{"symbol": "SWPPX", "shares": 9, "external": false}, '
+        '{"symbol": "TSP-C", "shares": 5, "external": true}, '
+        '{"symbol": "NVDA", "shares": 0, "external": false}]}'
+    )
+    assert inv._held_shares() == {"IVV": 3.0}
+
+
+async def test_today_silent_on_non_trading_day(monkeypatch):
+    monkeypatch.setattr(inv, "_traded_today", lambda: False)
+    assert await inv.investments_today() == {"scheduler_message": ""}
+
+
+async def test_today_silent_on_failure(monkeypatch):
+    def boom():
+        raise RuntimeError("yahoo down")
+    monkeypatch.setattr(inv, "_traded_today", boom)
+    assert await inv.investments_today() == {"scheduler_message": ""}
