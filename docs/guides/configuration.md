@@ -505,6 +505,7 @@ Natural-language messages run through the chat pipeline (search, synthesis, tool
 |---|---|---|---|
 | `MONARCH_EMAIL` | str | — | Monarch Money login email. |
 | `MONARCH_PASSWORD` | str | — | Monarch Money password. |
+| `MONARCH_MFA_SECRET_KEY` | str | — | Base32 TOTP setup key for the account's two-factor login. When set, an expired session re-logs in unattended; when unset, re-auth needs a code (see [operations.md](operations.md)). |
 | `LIFEOS_MONARCH_VAULT_DIR` | path | `Personal/Finance/Monarch` | Vault-relative folder where the monthly Monarch summary (`YYYY-MM.md`) lands. |
 
 Auth tokens are cached at `data/monarch_session.pickle` after first login. Re-authenticate when the token expires (401/525) per the steps in the root [AGENTS.md § Monarch Money](../../AGENTS.md#monarch-money-financial-data).
