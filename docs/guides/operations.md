@@ -42,7 +42,11 @@ An expired or missing session also files a [Human queue](human-queue.md)
 card keyed `monarch-reauth`; the worker's next poll resolves it
 automatically once re-auth succeeds.
 
-**Preferred (works in any shell, including agent/non-TTY sessions):** reads
+**Automatic:** with `MONARCH_MFA_SECRET_KEY` set in `.env`, an expired session
+re-logs in on the next Monarch call with no manual step. Without it, that call
+fails with an error naming the manual re-auth below.
+
+**Manual (works in any shell, including agent/non-TTY sessions):** reads
 `MONARCH_EMAIL` / `MONARCH_PASSWORD` from `.env` and takes the MFA code as an
 argument. TOTP codes expire in ~30s, so read the code and run promptly.
 

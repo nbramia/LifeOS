@@ -8,8 +8,10 @@ Provides authenticated access to Monarch Money financial data:
 - Budget status
 - Monthly vault report generation
 
-Session caching avoids repeated login/MFA. First login must be interactive
-(see CLAUDE.md setup instructions), after which the cached session persists.
+Session caching avoids repeated login/MFA. When the cached session expires,
+the client logs back in with MONARCH_EMAIL/MONARCH_PASSWORD, generating the
+two-factor code from MONARCH_MFA_SECRET_KEY when it is set. Without that key,
+re-auth needs a code passed to scripts/monarch_reauth.py.
 """
 import asyncio
 import logging
@@ -123,11 +125,22 @@ class MonarchClient:
                 "Set MONARCH_EMAIL and MONARCH_PASSWORD in .env"
             )
 
-        await mm.login(
-            email=settings.monarch_email,
-            password=settings.monarch_password,
-            save_session=False,
-        )
+        from monarchmoney import RequireMFAException
+
+        try:
+            await mm.login(
+                email=settings.monarch_email,
+                password=settings.monarch_password,
+                use_saved_session=False,
+                save_session=False,
+                mfa_secret_key=settings.monarch_mfa_secret_key or None,
+            )
+        except RequireMFAException as e:
+            raise RuntimeError(
+                "Monarch session expired and login requires a two-factor code. "
+                "Re-authenticate by running `scripts/monarch_reauth.py <current 6-digit code>` "
+                "from the LifeOS repo, or set MONARCH_MFA_SECRET_KEY so re-login is automatic."
+            ) from e
 
         # Save session for future use
         SESSION_PATH.parent.mkdir(parents=True, exist_ok=True)

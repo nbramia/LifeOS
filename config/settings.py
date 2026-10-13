@@ -1632,6 +1632,13 @@ class Settings(BaseSettings):
         alias="MONARCH_PASSWORD",
         description="Monarch Money account password"
     )
+    monarch_mfa_secret_key: str = Field(
+        default="",
+        alias="MONARCH_MFA_SECRET_KEY",
+        description="Base32 TOTP setup key for the Monarch account's two-factor login. "
+                    "When set, an expired session re-logs in unattended; when empty, "
+                    "re-auth needs a code passed to scripts/monarch_reauth.py"
+    )
     monarch_vault_dir: str = Field(
         default="Personal/Finance/Monarch",
         alias="LIFEOS_MONARCH_VAULT_DIR",
