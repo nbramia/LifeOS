@@ -941,6 +941,25 @@ List notes in a vault folder, newest first. Hidden folders (`.obsidian`, `.trash
 }
 ```
 
+### GET /api/vault/read
+
+Return one note's full Markdown content and its list-style metadata. Read-only. The MCP tool is `lifeos_vault_read`.
+
+**Query parameters:** `path` (required; vault-relative path of the note, e.g. from `/api/vault/list`).
+
+**Response:**
+```json
+{
+  "relative_path": "Work/Example.md",
+  "modified_date": "2026-09-01",
+  "note_type": "Work",
+  "tags": ["example"],
+  "content": "---\ntags: [example]\n---\n# Example\n..."
+}
+```
+
+**Errors:** `400` for an absolute path, a `..` component, or a path whose real location (after resolving symlinks) is outside the vault root; `404` (`note not found in vault`) for a missing path, a directory, or a hidden path (`.obsidian`, `.trash`).
+
 ### POST /api/admin/reindex
 
 Enqueue a vault reindex job. Returns immediately with a job ID. Use `GET /api/jobs/{job_id}` to check progress. Prevents duplicates (won't enqueue if already pending/running).
