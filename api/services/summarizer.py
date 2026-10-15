@@ -165,6 +165,10 @@ def generate_summary(
             "temperature": 0.2,
             "max_tokens": 512,
             "stream": False,
+            # A one-sentence summary needs no reasoning. With thinking on, the
+            # model can spend the whole 512-token budget reasoning and return
+            # empty content, which counts as a failure.
+            "chat_template_kwargs": {"enable_thinking": False},
         }
 
         with httpx.Client(timeout=timeout) as client:
