@@ -25,6 +25,8 @@ OAuth is off unless `LIFEOS_OAUTH_OPERATOR_LOGINS` is non-empty and `LIFEOS_OAUT
 | `POST /oauth/revoke` | registered clients | RFC 7009 revocation |
 | `GET /oauth/clients`, `DELETE /oauth/clients/{client_id}` | loopback, non-Funnel, bearer token | Connected apps and per-app revoke |
 
+The bearer-authenticated `/mcp` may also be served to the tailnet only (see [Connected Apps](../../guides/mcp-connected-apps.md#tailnet-route-for-your-own-clients)). `/mcp` has no loopback exemption: a peer on `127.0.0.1`, which is what Tailscale Serve presents, needs a valid token like any other.
+
 An MCP request with no token, or an unknown, expired or revoked one, gets `401` with `WWW-Authenticate: Bearer resource_metadata="<issuer>/.well-known/oauth-protected-resource/mcp"` (plus `error="invalid_token"` when a token was presented).
 
 `scripts/mcp_oauth.py list|revoke <client_id>|prune` reads, revokes and prunes the store directly.
@@ -64,7 +66,7 @@ A **chain** is everything issued from one code exchange. Revoking a token (RFC 7
 
 `OAUTH_TOOL_TIER` in `api/services/mcp_tool_tier.py` classifies every tool the server can build as allowed or denied, with a reason; a tool absent from it is denied, and `tests/test_mcp_oauth.py` fails until a new tool is classified. For an OAuth request, `tools/list` returns only allowed tools, each with `annotations` (`readOnlyHint`, `destructiveHint: false`), and `tools/call` on any other name returns the same `Unknown tool` error (`-32602`) as a nonexistent tool.
 
-- **Allowed reads:** every read-only curated tool, plus `search` and `fetch`.
+- **Allowed reads:** every read-only curated tool (including `lifeos_vault_read`, which returns one note by vault-relative path and is confined to the vault root), plus `search` and `fetch`.
 - **Allowed writes:** `lifeos_task_create`, `lifeos_reminder_create`, `lifeos_memories_create`, `lifeos_gmail_draft`, with argument guards. A task:
   - takes each `tags` entry as one plain tag (the whole string matches `[A-Za-z0-9][A-Za-z0-9_/-]{0,63}`, so no `#`, whitespace or trailing newline);
   - keeps every text field except `notes` on one line without control characters;

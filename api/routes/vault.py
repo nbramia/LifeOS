@@ -45,7 +45,14 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from api.services.gsheet_sync import journal_notes_configured
-from api.services.vault_listing import VaultListError, list_vault_entries
+from api.services.chunker import extract_frontmatter, normalize_tags
+from api.services.vault_listing import (
+    VaultListError,
+    infer_note_type,
+    is_hidden,
+    list_vault_entries,
+    mtime_date,
+)
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -208,3 +215,59 @@ async def vault_list(
         return VaultListResponse(**list_vault_entries(settings.vault_path, path, glob, limit, offset))
     except VaultListError as e:
         raise HTTPException(400, str(e))
+
+
+class VaultReadResponse(BaseModel):
+    relative_path: str
+    modified_date: str
+    note_type: str
+    tags: list[str]
+    content: str
+
+
+@router.get("/read", response_model=VaultReadResponse)
+async def vault_read(
+    path: str = Query(..., min_length=1, description="Vault-relative path of the note (e.g. `Work/Example.md`)."),
+) -> VaultReadResponse:
+    """Return one note's full Markdown content and its list-style metadata.
+
+    Read-only. Absolute paths and `..` are rejected with 400, as is a path
+    whose real location (after resolving symlinks) is outside the vault root.
+    A missing path, a directory, or a hidden path (`.obsidian`, `.trash`)
+    returns 404 with a fixed message.
+    """
+    rel = path.strip()
+    if rel.startswith(("/", "~")) or Path(rel).is_absolute():
+        raise HTTPException(400, "path must be vault-relative (no leading / or ~)")
+    if ".." in Path(rel.replace("\\", "/")).parts:
+        raise HTTPException(400, "path must not contain `..`")
+
+    not_found = HTTPException(404, "note not found in vault")
+    try:
+        vault_root = settings.vault_path.resolve()
+        target = (vault_root / rel).resolve()
+        target.relative_to(vault_root)
+    except ValueError:
+        raise HTTPException(400, "path resolves outside the vault root")
+    except OSError:
+        raise not_found
+    rel_resolved = target.relative_to(vault_root)
+    if is_hidden(rel_resolved.parts) or is_hidden(Path(rel).parts):
+        raise not_found
+    try:
+        if not target.is_file():
+            raise not_found
+        mtime = target.stat().st_mtime
+        text = target.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        raise not_found
+
+    meta, _ = extract_frontmatter(text)
+    rel_posix = rel_resolved.as_posix()
+    return VaultReadResponse(
+        relative_path=rel_posix,
+        modified_date=mtime_date(mtime).isoformat(),
+        note_type=infer_note_type(rel_posix),
+        tags=normalize_tags(meta.get("tags")),
+        content=text,
+    )

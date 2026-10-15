@@ -16,3 +16,8 @@
 # Connected apps (docs/guides/mcp-connected-apps.md): the consent page, tailnet
 # only. The public MCP paths live on a separate node, not in this file.
 # https=8443 path=/oauth/authorize target=http://127.0.0.1:8765/oauth/authorize
+#
+# Operator tailnet MCP endpoint (docs/guides/mcp-connected-apps.md): the
+# bearer-authenticated MCP transport for the operator's own tailnet clients.
+# Tailnet only (no funnel=on), the /mcp path only; never mount / or /oauth/*.
+# https=8443 path=/mcp target=http://127.0.0.1:8765/mcp

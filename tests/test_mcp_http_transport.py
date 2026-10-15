@@ -309,3 +309,68 @@ def test_stdio_notification_returns_none(server: mcp_server.LifeOSMCPServer):
         {"jsonrpc": "2.0", "method": "notifications/initialized"},
     )
     assert response is None
+
+
+# Tailnet-served path: Tailscale Serve proxies tailnet requests from loopback.
+
+LOOPBACK_PEER = ("127.0.0.1", 50000)
+
+
+@pytest.fixture
+def loopback_client(server: mcp_server.LifeOSMCPServer, bearer_token: str) -> TestClient:
+    """A client whose TCP peer is loopback, as a request relayed by Tailscale Serve."""
+    return TestClient(mcp_server.build_http_app(server, bearer_token=bearer_token), client=LOOPBACK_PEER)
+
+
+def _tools_list(client: TestClient, token: str | None):
+    headers = {"Authorization": f"Bearer {token}"} if token is not None else {}
+    return client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, headers=headers)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("token", [None, "", "wrong-token"])
+def test_loopback_peer_without_a_valid_bearer_is_rejected_on_mcp(loopback_client: TestClient, token):
+    assert _tools_list(loopback_client, token).status_code == 401
+    assert loopback_client.get("/mcp").status_code == 401
+
+
+@pytest.mark.unit
+def test_loopback_peer_with_the_bearer_lists_the_full_curated_catalog(
+    monkeypatch, bearer_token: str
+):
+    monkeypatch.setattr(
+        mcp_server.LifeOSMCPServer, "_load_openapi_spec",
+        lambda self: self._build_tools_fallback(),
+    )
+    server = mcp_server.LifeOSMCPServer()
+    loopback_client = TestClient(
+        mcp_server.build_http_app(server, bearer_token=bearer_token), client=LOOPBACK_PEER
+    )
+    resp = _tools_list(loopback_client, bearer_token)
+    assert resp.status_code == 200
+    names = {t["name"] for t in resp.json()["result"]["tools"]}
+    assert names == {t["name"] for t in server.tools}
+    assert {config["name"] for config in mcp_server.CURATED_ENDPOINTS.values()} <= names
+    assert "lifeos_vault_read" in names
+
+
+@pytest.mark.unit
+def test_oauth_tier_includes_vault_read_as_read_only():
+    from api.services.mcp_tool_tier import OAUTH_ALLOWED_TOOLS, OAUTH_TOOL_TIER
+
+    assert OAUTH_TOOL_TIER["lifeos_vault_read"].allowed is True
+    assert OAUTH_TOOL_TIER["lifeos_vault_read"].read_only is True
+    assert "lifeos_vault_read" in OAUTH_ALLOWED_TOOLS
+
+
+@pytest.mark.unit
+def test_public_socket_allowlist_serves_only_the_oauth_paths():
+    assert mcp_server.PUBLIC_SOCKET_PATHS == {
+        "/mcp",
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-protected-resource/mcp",
+        "/.well-known/oauth-authorization-server",
+        "/oauth/register",
+        "/oauth/token",
+        "/oauth/revoke",
+    }

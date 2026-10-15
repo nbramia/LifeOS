@@ -478,6 +478,17 @@ def test_forbidden_tool_call_is_unknown_and_never_reaches_the_api(client, calls)
     assert calls == []
 
 
+def test_vault_read_is_in_the_tier_as_a_read_only_tool(client, calls):
+    _, tokens, _ = _connect(client)
+    listed = _rpc(client, tokens["access_token"], "tools/list").json()["result"]["tools"]
+    by_name = {t["name"]: t for t in listed}
+    assert by_name["lifeos_vault_read"]["annotations"]["readOnlyHint"] is True
+    assert OAUTH_TOOL_TIER["lifeos_vault_read"].read_only is True
+    _rpc(client, tokens["access_token"], "tools/call",
+         {"name": "lifeos_vault_read", "arguments": {"path": "Work/Planning Notes.md"}})
+    assert calls == [("lifeos_vault_read", {"path": "Work/Planning Notes.md"})]
+
+
 def test_bearer_can_still_call_a_tool_outside_the_tier(client, calls):
     body = _rpc(client, BEARER, "tools/call", {"name": "lifeos_gmail_send", "arguments": {"draft_id": "d1"}}).json()
     assert "result" in body
