@@ -508,36 +508,271 @@ class TestStrengthCutoffs:
         context = {"relationship_strength": strength}
         assert QueryRouter()._determine_fetch_depth("how is Robin doing", context) == depth
 
-    @staticmethod
-    def _crm_context(strengths):
-        from types import ModuleType, SimpleNamespace
-        from unittest.mock import MagicMock
+    def test_an_unresolved_name_has_no_strength_to_go_on(self):
         from api.services.query_router import QueryRouter
 
-        candidates = [
-            SimpleNamespace(
-                id=f"p{n}", canonical_name=f"Robin {n}", relationship_strength=s, email_count=0, message_count=0,
-            )
-            for n, s in enumerate(strengths)
-        ]
-        store_module = ModuleType("api.services.person_entity_store")
-        store_module.get_person_entity_store = lambda: SimpleNamespace(search=lambda **kwargs: candidates)
-        resolver = MagicMock()
-        resolver.resolve.return_value = SimpleNamespace(entity=candidates[0], confidence=0.5)
+        context = {"resolution_failed": True, "failure_type": "ambiguous", "candidates": []}
+        assert QueryRouter()._determine_fetch_depth("how is Robin doing", context) == "normal"
+
+
+@pytest.fixture
+def crm(tmp_path, monkeypatch):
+    """Point the real CRM stores at a throwaway database; nothing is stubbed out."""
+    from api.services import entity_resolver, interaction_store, person_entity, person_facts
+    from api.services.entity_resolver import EntityResolver
+    from api.services.interaction_store import InteractionStore
+    from api.services.link_override import LinkOverrideStore
+    from api.services.person_entity import PersonEntityStore
+    from api.services.person_facts import PersonFactStore
+
+    store = PersonEntityStore(str(tmp_path / "crm.db"))
+    overrides = LinkOverrideStore(tmp_path / "crm.db")
+    monkeypatch.setattr(entity_resolver, "get_link_override_store", lambda: overrides)
+    monkeypatch.setattr(person_entity, "_entity_store", store)
+    monkeypatch.setattr(entity_resolver, "_entity_resolver", EntityResolver(store))
+    monkeypatch.setattr(interaction_store, "_interaction_store", InteractionStore(str(tmp_path / "interactions.db")))
+    monkeypatch.setattr(person_facts, "_fact_store", PersonFactStore(str(tmp_path / "crm.db")))
+    return store
+
+
+def _add_person(store, name, strength):
+    from datetime import datetime, timedelta, timezone
+
+    from api.services.person_entity import PersonEntity
+
+    person = PersonEntity(canonical_name=name, last_seen=datetime.now(timezone.utc) - timedelta(days=2))
+    person.relationship_strength = strength
+    return store.add(person)
+
+
+class TestCrmContext:
+    """_fetch_crm_context runs against the real resolver, store and summary modules."""
+
+    def _fetch(self, name):
+        from api.services.query_router import QueryRouter
+
+        return QueryRouter()._fetch_crm_context(name)
+
+    def test_resolved_person_carries_their_strength_and_summary(self, crm):
+        person = _add_person(crm, "Robin Example", 60.0)
+
+        context = self._fetch("Robin Example")
+
+        assert context["entity_id"] == person.id
+        assert context["relationship_strength"] == 60.0
+        assert context["total_interactions_90d"] == 0
+
+    def test_two_close_people_with_a_shared_first_name_need_disambiguation(self, crm):
+        first = _add_person(crm, "Robin Alpha", 30.0)
+        second = _add_person(crm, "Robin Beta", 25.0)
+
+        context = self._fetch("Robin")
+
+        assert context["resolution_failed"] is True
+        assert context["failure_type"] == "ambiguous"
+        assert [c["id"] for c in context["candidates"]] == [first.id, second.id]
+
+    def test_two_people_at_the_close_cutoff_need_disambiguation(self, crm):
+        _add_person(crm, "Robin Alpha", 14.0)
+        _add_person(crm, "Robin Beta", 14.0)
+
+        assert self._fetch("Robin")["failure_type"] == "ambiguous"
+
+    def test_one_person_below_the_close_cutoff_does_not(self, crm):
+        close = _add_person(crm, "Robin Alpha", 14.0)
+        _add_person(crm, "Robin Beta", 13.9)
+
+        assert self._fetch("Robin")["entity_id"] == close.id
+
+    def test_a_clearly_closer_person_is_settled_without_a_question(self, crm):
+        close = _add_person(crm, "Robin Alpha", 90.0)
+        _add_person(crm, "Robin Beta", 20.0)
+
+        context = self._fetch("Robin")
+
+        assert context["entity_id"] == close.id
+        assert "resolution_failed" not in context
+
+    def test_tied_people_who_are_not_close_do_not_need_disambiguation(self, crm):
+        _add_person(crm, "Robin Alpha", 5.0)
+        _add_person(crm, "Robin Beta", 5.0)
+
+        context = self._fetch("Robin")
+
+        assert context is None or context.get("failure_type") != "ambiguous"
+
+    def test_scored_tie_between_close_people_needs_disambiguation(self, crm):
+        _add_person(crm, "Robin Alpha", 30.0)
+        _add_person(crm, "Riley Alpha", 30.0)
+
+        assert self._fetch("R Alpha")["failure_type"] == "ambiguous"
+
+    def test_scored_tie_with_one_close_person_settles_on_them(self, crm):
+        close = _add_person(crm, "Robin Alpha", 30.0)
+        _add_person(crm, "Riley Alpha", 0.0)
+
+        context = self._fetch("R Alpha")
+
+        assert context["entity_id"] == close.id
+        assert "resolution_failed" not in context
+
+    def test_near_miss_gets_suggestions(self, crm):
+        _add_person(crm, "Robin Example", 60.0)
+
+        context = self._fetch("Robyn Exampl")
+
+        assert context["failure_type"] == "no_match"
+        assert context["suggestions"] == ["Robin Example"]
+
+    def test_unknown_name_has_no_context(self, crm):
+        _add_person(crm, "Robin Example", 60.0)
+
+        assert self._fetch("Quillon Zzyx") is None
+
+    def test_candidates_are_capped_at_five(self, crm):
+        for suffix in ("Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta"):
+            _add_person(crm, f"Robin {suffix}", 30.0)
+
+        assert len(self._fetch("Robin")["candidates"]) == 5
+
+    def test_lookup_never_writes_a_person(self, crm):
+        _add_person(crm, "Robin Alpha", 30.0)
+        _add_person(crm, "Robin Beta", 30.0)
+
+        for name in ("Robin", "Quillon", "Quillon Zzyx", "R Alpha"):
+            self._fetch(name)
+
+        assert crm.count() == 2
+
+    def test_failure_returns_none_and_logs_no_name(self, crm, caplog):
+        from api.services import entity_resolver
+
+        secret = "Quillon Zzyx"
+
+        class Broken:
+            def match_name(self, name):
+                raise RuntimeError(f"cannot read {name}")
+
+        with patch.object(entity_resolver, "_entity_resolver", Broken()):
+            assert self._fetch(secret) is None
+
+        assert "RuntimeError" in caplog.text
+        assert secret not in caplog.text
+
+
+class TestRouteWithCrmContext:
+    """route() enriches people queries through the real import path."""
+
+    async def _route(self, question):
+        from api.services.query_router import QueryRouter
+
+        with patch("api.services.query_router.is_local_routing_llm_available", return_value=False):
+            return await QueryRouter().route(question)
+
+    @pytest.mark.asyncio
+    async def test_a_strong_relationship_deepens_the_fetch(self, crm):
+        _add_person(crm, "Robin Example", 60.0)
+
+        result = await self._route("Who is Robin Example?")
+
+        assert result.relationship_context["relationship_strength"] == 60.0
+        assert result.fetch_depth == "deep"
+
+    @pytest.mark.asyncio
+    async def test_a_weak_relationship_narrows_the_fetch(self, crm):
+        _add_person(crm, "Robin Example", 3.0)
+
+        result = await self._route("Who is Robin Example?")
+
+        assert result.fetch_depth == "shallow"
+
+    @pytest.mark.asyncio
+    async def test_an_ambiguous_name_is_reported_at_normal_depth(self, crm):
+        _add_person(crm, "Robin Alpha", 30.0)
+        _add_person(crm, "Robin Beta", 30.0)
+
+        result = await self._route("Who is Robin?")
+
+        assert result.relationship_context["failure_type"] == "ambiguous"
+        assert result.fetch_depth == "normal"
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_name_keeps_the_question_based_depth(self, crm):
+        result = await self._route("Who is Quillon Zzyx?")
+
+        assert result.relationship_context is None
+        assert result.fetch_depth == "normal"
+
+    @pytest.mark.asyncio
+    async def test_a_crm_failure_does_not_fail_routing(self, crm):
+        from api.services import entity_resolver
+
+        class Broken:
+            def match_name(self, name):
+                raise RuntimeError("store unavailable")
+
+        with patch.object(entity_resolver, "_entity_resolver", Broken()):
+            result = await self._route("Who is Robin Example?")
+
+        assert result.sources
+        assert result.relationship_context is None
+        assert result.fetch_depth == "normal"
+
+    @pytest.mark.asyncio
+    async def test_a_slow_lookup_counts_in_latency_and_leaves_the_event_loop_free(self, crm):
+        import asyncio
+        import time
+
+        from api.services.query_router import QueryRouter
 
         router = QueryRouter()
-        with patch.dict("sys.modules", {"api.services.person_entity_store": store_module}), \
-             patch("api.services.entity_resolver.get_entity_resolver", return_value=resolver), \
-             patch("api.services.relationship_summary.get_relationship_summary", return_value=None), \
-             patch.object(router, "_names_match", return_value=True), \
-             patch.object(router, "_get_disambiguation_context", return_value=""):
-            return router._fetch_crm_context("Robin")
 
-    def test_two_people_at_the_close_cutoff_need_disambiguation(self):
-        context = self._crm_context([14, 14])
-        assert context["failure_type"] == "ambiguous"
-        assert len(context["candidates"]) == 2
+        def slow_lookup(name):
+            time.sleep(0.2)
+            return None
 
-    def test_one_person_below_the_close_cutoff_does_not(self):
-        context = self._crm_context([14, 13.9])
-        assert context["entity_id"] == "p0"
+        ticks = []
+
+        async def tick():
+            while True:
+                ticks.append(1)
+                await asyncio.sleep(0.01)
+
+        ticker = asyncio.create_task(tick())
+        with patch("api.services.query_router.is_local_routing_llm_available", return_value=False), \
+             patch.object(router, "_fetch_crm_context", slow_lookup):
+            result = await router.route("Who is Robin Example?")
+        ticker.cancel()
+
+        assert result.latency_ms >= 200
+        assert len(ticks) >= 5
+
+    @pytest.mark.asyncio
+    async def test_routing_logs_no_person_name(self, crm, caplog):
+        import logging
+
+        _add_person(crm, "Robin Example", 60.0)
+
+        with caplog.at_level(logging.INFO, logger="api.services.query_router"):
+            await self._route("Who is Robin Example?")
+
+        assert "CRM context found" in caplog.text
+        assert "Robin" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_llm_extracted_name_is_not_logged(self, crm, caplog):
+        import logging
+
+        from api.services.query_router import QueryRouter
+
+        _add_person(crm, "Robin Example", 60.0)
+        reply = '{"sources": ["people"], "reasoning": "x", "people_mentioned": ["Robin Example"]}'
+
+        with patch("api.services.query_router.is_local_routing_llm_available", return_value=True), \
+             patch("api.services.query_router.generate_text", new_callable=AsyncMock, return_value=reply), \
+             caplog.at_level(logging.INFO, logger="api.services.query_router"):
+            result = await QueryRouter().route("how is that going")
+
+        assert result.extracted_person_name == "Robin Example"
+        assert result.fetch_depth == "deep"
+        assert "Robin" not in caplog.text
