@@ -264,6 +264,16 @@ class TestStaleLinkedinExport:
 
         assert _detect_stale_linkedin_export(tmp_path / "missing.csv", now=NOW) is None
 
+    def test_absent_file_is_silent_without_logging_a_failure(self, tmp_path, caplog):
+        """Absence is an expected state, handled before any stat call rather
+        than by the never-raises fallback."""
+        from scripts.run_all_syncs import _detect_stale_linkedin_export
+
+        with caplog.at_level("WARNING"):
+            _detect_stale_linkedin_export(tmp_path / "missing.csv", now=NOW)
+
+        assert caplog.records == []
+
     def test_default_path_matches_the_linkedin_sync_script(self):
         from scripts.run_all_syncs import LINKEDIN_EXPORT_PATH
         from scripts.sync_linkedin import DEFAULT_CSV_PATH
