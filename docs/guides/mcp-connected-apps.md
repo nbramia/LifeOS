@@ -148,6 +148,16 @@ If the agent still needs a tool outside the connected-app tier, that is a reason
 
 An app can also be given scoped file, command and log access to the host (the host tools), by listing its client id in `LIFEOS_HOST_TOOLS_OAUTH_CLIENTS`. That grant adds those five tools and nothing else. See [Host Tools](host-tools.md).
 
+## Extra tools for one app
+
+An app can be given named catalog tools beyond the connected-app tier. List `client_id:tool_name` pairs, one tool per pair, in `.env` and restart the MCP transport:
+
+```bash
+LIFEOS_MCP_OAUTH_TOOL_GRANTS=<client_id>:lifeos_schedule_create,<client_id>:lifeos_task_complete
+```
+
+Only that client's tool list changes; its calls go through the same audit line, and tools that can reach the agent worker are still logged at WARNING. A pair grants its tool only when the name is a curated catalog tool. Host tools (see above), `lifeos_agent_*` tools, `lifeos_task_update` (see below) and unknown names grant nothing, and neither does a pair missing its colon, client id or tool name. Agent tokens never receive these grants.
+
 ## Task edits for an agent app
 
 A connected app that works tasks for you, such as a chief of staff app, can be given `lifeos_task_update` as a named external agent. Map its client id to the agent's name in `.env` and restart the MCP transport:

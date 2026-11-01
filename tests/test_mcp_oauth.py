@@ -1613,3 +1613,127 @@ def test_mint_script_prints_a_token_whose_hash_is_its_entry(capsys):
     assert "duet=" in capsys.readouterr().out
     with pytest.raises(SystemExit):
         module.main(["new", "claude"])
+
+
+# ── per-app tool grants (LIFEOS_MCP_OAUTH_TOOL_GRANTS) ───────────────────
+
+GRANTED_TOOLS = (
+    "lifeos_schedule_create", "lifeos_schedule_update", "lifeos_schedule_delete",
+    "lifeos_schedule_trigger", "lifeos_reminder_update", "lifeos_reminder_delete",
+    "lifeos_task_complete", "lifeos_task_delete", "lifeos_task_resume_execution",
+    "lifeos_project_start", "lifeos_project_plan", "lifeos_project_resume",
+    "lifeos_project_pause", "lifeos_project_complete", "lifeos_project_cancel",
+    "lifeos_human_queue_add", "lifeos_human_queue_resolve",
+    "lifeos_home_eero_pause", "lifeos_home_eero_resume",
+)
+
+
+def _grant(monkeypatch, value: str) -> None:
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "mcp_oauth_tool_grants", value)
+
+
+def _listed(client: TestClient, token: str) -> dict[str, dict]:
+    return {t["name"]: t for t in _rpc(client, token, "tools/list").json()["result"]["tools"]}
+
+
+def test_tool_grants_parse_pairs_and_grant_nothing_for_bad_entries(monkeypatch):
+    from api.services.mcp_tool_tier import oauth_tool_grants
+
+    _grant(monkeypatch, (
+        " a : lifeos_schedule_create , a:lifeos_task_complete, b:lifeos_task_delete,"
+        "nocolon, :lifeos_task_delete, c:, ,c:lifeos_does_not_exist,"
+        "d:lifeos_fs_write, d:lifeos_shell, d:lifeos_agent_spawn, d:lifeos_task_update"
+    ))
+    assert oauth_tool_grants() == {
+        "a": frozenset({"lifeos_schedule_create", "lifeos_task_complete"}),
+        "b": frozenset({"lifeos_task_delete"}),
+    }
+    _grant(monkeypatch, "")
+    assert oauth_tool_grants() == {}
+
+
+def test_granted_client_sees_exactly_the_tier_plus_its_grants(client, calls, monkeypatch):
+    client_id, tokens, _ = _connect(client)
+    token = tokens["access_token"]
+    before = set(_listed(client, token))
+    _grant(monkeypatch, ",".join(f"{client_id}:{t}" for t in GRANTED_TOOLS))
+    listed = _listed(client, token)
+    assert set(listed) == before | set(GRANTED_TOOLS)
+    assert set(listed) <= OAUTH_ALLOWED_TOOLS | set(GRANTED_TOOLS) | set(mcp_server.CHATGPT_TOOL_NAMES)
+
+
+def test_other_clients_and_agent_tokens_are_unchanged_by_a_grant(client, monkeypatch):
+    client_id, tokens, _ = _connect(client)
+    token = tokens["access_token"]
+    before = set(_listed(client, token))
+    _agent_tokens(monkeypatch, f"muse={_sha(MUSE_TOKEN)}")
+    agent_before = set(_listed(client, MUSE_TOKEN))
+    _grant(monkeypatch, "someone-else:lifeos_task_delete,agent-token:muse:lifeos_task_delete,"
+                        "muse:lifeos_task_delete")
+    assert set(_listed(client, token)) == before
+    assert set(_listed(client, MUSE_TOKEN)) == agent_before
+    assert "lifeos_task_delete" not in agent_before
+
+
+def test_host_agent_and_unknown_names_are_not_granted(client, calls, monkeypatch):
+    client_id, tokens, _ = _connect(client)
+    token = tokens["access_token"]
+    before = set(_listed(client, token))
+    names = [*HOST_TOOL_NAMES, "lifeos_agent_spawn", "lifeos_does_not_exist", "lifeos_task_update"]
+    _grant(monkeypatch, ",".join(f"{client_id}:{n}" for n in names))
+    assert set(_listed(client, token)) == before
+    for name in names:
+        body = _rpc(client, token, "tools/call", {"name": name, "arguments": {}}).json()
+        assert body["error"]["message"] == f"Unknown tool: {name}"
+    assert calls == []
+
+
+def test_granted_tool_dispatches_and_ungranted_tool_is_still_refused(client, calls, monkeypatch):
+    client_id, tokens, _ = _connect(client)
+    token = tokens["access_token"]
+    _grant(monkeypatch, f"{client_id}:lifeos_task_complete")
+    ok = _rpc(client, token, "tools/call", {"name": "lifeos_task_complete", "arguments": {"task_id": "t1"}})
+    assert "isError" not in ok.json()["result"]
+    assert calls == [("lifeos_task_complete", {"task_id": "t1"})]
+    calls.clear()
+    body = _rpc(client, token, "tools/call", {"name": "lifeos_task_delete", "arguments": {"task_id": "t1"}}).json()
+    assert body["error"]["message"] == "Unknown tool: lifeos_task_delete"
+    assert calls == []
+
+
+def test_every_granted_tool_is_callable_and_reaching_tools_log_at_warning(client, calls, monkeypatch, caplog):
+    import logging
+
+    client_id, tokens, _ = _connect(client)
+    token = tokens["access_token"]
+    _grant(monkeypatch, ",".join(f"{client_id}:{t}" for t in GRANTED_TOOLS))
+    caplog.set_level(logging.INFO, logger=mcp_server.logger.name)
+    for name in GRANTED_TOOLS:
+        body = _rpc(client, token, "tools/call", {"name": name, "arguments": {}}).json()
+        assert "isError" not in body["result"], name
+    assert [c[0] for c in calls] == list(GRANTED_TOOLS)
+    audit = {r.getMessage(): r.levelno for r in caplog.records if r.getMessage().startswith("mcp audit:")}
+    assert len(audit) == len(GRANTED_TOOLS)
+    for name in GRANTED_TOOLS:
+        (level,) = [lv for msg, lv in audit.items() if f"tool={name}" in msg and f"caller=oauth:{client_id}" in msg]
+        assert (level == logging.WARNING) == (name in mcp_server.WORKER_REACHING_TOOLS), name
+
+
+def test_granted_write_and_destructive_tools_are_not_annotated_read_only(client, monkeypatch):
+    client_id, tokens, _ = _connect(client)
+    _grant(monkeypatch, ",".join(f"{client_id}:{t}" for t in GRANTED_TOOLS))
+    listed = _listed(client, tokens["access_token"])
+    for name in GRANTED_TOOLS:
+        assert listed[name]["annotations"]["readOnlyHint"] is False, name
+    for name in ("lifeos_task_delete", "lifeos_schedule_delete", "lifeos_reminder_delete", "lifeos_project_cancel"):
+        assert listed[name]["annotations"]["destructiveHint"] is True
+    assert listed["lifeos_task_complete"]["annotations"]["destructiveHint"] is False
+
+
+def test_agent_token_view_ignores_grants_even_for_a_matching_principal(server, monkeypatch):
+    _grant(monkeypatch, "muse:lifeos_task_delete")
+    view = mcp_server.OAuthToolAccess(server, principal="muse", agent_token="muse")
+    assert "lifeos_task_delete" not in {t["name"] for t in view.tools()}
+    assert not view.callable("lifeos_task_delete")

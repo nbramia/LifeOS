@@ -2832,8 +2832,12 @@ class OAuthToolAccess:
             # Operator grant (LIFEOS_HOST_TOOLS_OAUTH_CLIENTS): this client also
             # gets the host tools, and nothing else beyond the tier.
             self.allowed = OAUTH_ALLOWED_TOOLS | HOST_TOOL_NAMES
-        from api.services.mcp_tool_tier import task_agent_clients
+        from api.services.mcp_tool_tier import oauth_tool_grants, task_agent_clients
 
+        # Operator grant (LIFEOS_MCP_OAUTH_TOOL_GRANTS): named catalog tools
+        # added for this client. Agent tokens never receive it.
+        if agent_token is None:
+            self.allowed = self.allowed | oauth_tool_grants().get(principal, frozenset())
         # Operator grant (LIFEOS_TASK_AGENT_OAUTH_CLIENTS): this client acts as
         # a named external agent and may update tasks as that agent.
         # An agent token (LIFEOS_MCP_AGENT_TOKENS) names its agent directly.

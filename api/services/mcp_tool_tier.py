@@ -167,8 +167,12 @@ OAUTH_ALLOWED_TOOLS: frozenset[str] = frozenset(
 )
 
 
-# Overwrites files or runs commands on the host.
-_DESTRUCTIVE_TOOLS = frozenset({"lifeos_fs_write", "lifeos_shell"})
+# Overwrites files or runs commands on the host, or deletes or cancels records.
+_DESTRUCTIVE_TOOLS = frozenset({
+    "lifeos_fs_write", "lifeos_shell",
+    "lifeos_schedule_delete", "lifeos_reminder_delete", "lifeos_task_delete",
+    "lifeos_project_cancel",
+})
 
 
 def tool_annotations(name: str) -> dict:
@@ -318,6 +322,35 @@ def task_agent_clients() -> dict[str, str]:
         seen.add(client_id)
         pairs[client_id] = agent
     return pairs
+
+
+def oauth_tool_grants() -> dict[str, frozenset[str]]:
+    """OAuth client id -> extra curated tools added to its tool view, from settings.
+
+    `LIFEOS_MCP_OAUTH_TOOL_GRANTS` is a comma-separated list of
+    `client_id:tool_name` pairs, one tool per pair. A pair grants its tool only
+    when the name is in OAUTH_TOOL_TIER. Host tools (their own grant),
+    `lifeos_agent_*` tools, `lifeos_task_update` (its own grant) and unknown
+    names grant nothing, and neither does a pair missing the colon, the client
+    id or the tool name.
+    """
+    from api.services.host_tools import HOST_TOOL_NAMES
+    from config.settings import settings
+
+    grants: dict[str, set[str]] = {}
+    for entry in (settings.mcp_oauth_tool_grants or "").split(","):
+        client_id, sep, tool = entry.partition(":")
+        client_id, tool = client_id.strip(), tool.strip()
+        if (
+            not sep or not client_id or not tool
+            or tool not in OAUTH_TOOL_TIER
+            or tool in HOST_TOOL_NAMES
+            or tool == "lifeos_task_update"
+            or tool.startswith("lifeos_agent_")
+        ):
+            continue
+        grants.setdefault(client_id, set()).add(tool)
+    return {client_id: frozenset(tools) for client_id, tools in grants.items()}
 
 
 _SHA256_HEX = re.compile(r"[0-9a-f]{64}")
