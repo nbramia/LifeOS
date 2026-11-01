@@ -645,16 +645,99 @@ class TestAmbiguousNamesNeverCreate:
 
         assert result.entity.id == known.id
 
-    def test_unknown_phone_with_a_tied_name_links_to_no_one(self, temp_store):
+    def test_unknown_phone_still_gets_its_own_person_named_from_the_number(self, temp_store):
         _person(temp_store, "Robin Alpha", 30.0)
         _person(temp_store, "Robin Beta", 30.0)
 
         result = EntityResolver(temp_store).resolve(
-            name="Robin", phone="+12125550173", create_if_missing=True
+            name="Robin", phone="(212) 555-0173", create_if_missing=True
         )
+
+        assert result.is_new is True
+        assert result.match_type == "phone_new"
+        assert result.entity.canonical_name == "+12125550173"
+        assert result.entity.phone_numbers == ["+12125550173"]
+        assert temp_store.get_by_name("Robin") is None
+        assert temp_store.count() == 3
+
+    def test_the_number_finds_that_person_next_time(self, temp_store):
+        _person(temp_store, "Robin Alpha", 30.0)
+        _person(temp_store, "Robin Beta", 30.0)
+        resolver = EntityResolver(temp_store)
+        first = resolver.resolve(name="Robin", phone="+12125550173", create_if_missing=True)
+
+        second = resolver.resolve(name="Robin", phone="+12125550173", create_if_missing=True)
+
+        assert second.entity.id == first.entity.id
+        assert second.match_type == "phone_exact"
+        assert temp_store.count() == 3
+
+    def test_unknown_email_and_phone_are_named_from_the_address(self, temp_store):
+        _person(temp_store, "Robin Alpha", 30.0)
+        _person(temp_store, "Robin Beta", 30.0)
+
+        result = EntityResolver(temp_store).resolve(
+            name="Robin", email="robin.gamma@example.com", phone="+12125550173", create_if_missing=True
+        )
+
+        assert result.match_type == "email_new"
+        assert result.entity.canonical_name == "Robin Gamma"
+        assert result.entity.phone_numbers == ["+12125550173"]
+
+    def test_tied_name_with_no_identifier_never_creates(self, temp_store):
+        _person(temp_store, "Robin Alpha", 30.0)
+        _person(temp_store, "Robin Beta", 30.0)
+
+        assert EntityResolver(temp_store).resolve(name="Robin", create_if_missing=True) is None
+        assert temp_store.count() == 2
+
+    def test_tied_name_with_an_unusable_phone_never_creates(self, temp_store):
+        _person(temp_store, "Robin Alpha", 30.0)
+        _person(temp_store, "Robin Beta", 30.0)
+
+        result = EntityResolver(temp_store).resolve(name="Robin", phone="not a phone", create_if_missing=True)
 
         assert result is None
         assert temp_store.count() == 2
+
+    def test_a_read_only_lookup_never_creates_from_the_phone(self, temp_store):
+        _person(temp_store, "Robin Alpha", 30.0)
+        _person(temp_store, "Robin Beta", 30.0)
+
+        assert EntityResolver(temp_store).resolve(name="Robin", phone="+12125550173") is None
+        assert temp_store.count() == 2
+
+    @pytest.mark.parametrize("name", [None, "", "   "])
+    def test_a_phone_with_no_name_never_creates(self, temp_store, name):
+        _person(temp_store, "Robin Alpha", 30.0)
+
+        result = EntityResolver(temp_store).resolve(name=name, phone="+12125550173", create_if_missing=True)
+
+        assert result is None
+        assert temp_store.count() == 1
+
+    def test_a_blocklisted_phone_links_to_no_one(self, temp_store):
+        _person(temp_store, "Robin Alpha", 30.0)
+        _person(temp_store, "Robin Beta", 30.0)
+        hidden = temp_store.add(PersonEntity(canonical_name="Quillon Example", phone_numbers=["+12125550173"]))
+        temp_store.hide_person(hidden.id)
+        temp_store.delete(hidden.id)
+
+        result = EntityResolver(temp_store).resolve(name="Robin", phone="+12125550173", create_if_missing=True)
+
+        assert result is None
+        assert temp_store.count() == 2
+
+    def test_unknown_name_with_a_phone_is_still_named_from_the_name(self, temp_store):
+        _person(temp_store, "Robin Alpha", 30.0)
+
+        result = EntityResolver(temp_store).resolve(
+            name="Quillon Example", phone="+12125550173", create_if_missing=True
+        )
+
+        assert result.match_type == "new_entity"
+        assert result.entity.canonical_name == "Quillon Example"
+        assert result.entity.phone_numbers == ["+12125550173"]
 
 
 @pytest.mark.unit

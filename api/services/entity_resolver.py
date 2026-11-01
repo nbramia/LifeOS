@@ -755,9 +755,10 @@ class EntityResolver:
         5. Create new entity from email or name (if create_if_missing)
 
         A name that fits several existing people never creates a person from
-        the name. An unknown email still anchors a new person of its own, named
-        from the address so the ambiguous name is not added as another exact
-        match; a phone does not, so a name tie with an unknown phone returns None.
+        the name. An unknown email or phone next to it still anchors a new
+        person of their own, named from the address or number so the tied name
+        is not added as another exact match. A tied name with no identifier
+        returns None.
 
         Phone-only never creates a PersonEntity. A raw phone
         observation with no name or email tells you very little about who the
@@ -863,6 +864,26 @@ class EntityResolver:
                 confidence=0.6,
                 match_type="email_new",
             )
+
+        # A name reaching this point is tied: an unknown one was created above.
+        # The phone anchors a person of their own, named from the number.
+        if name and name.strip() and phone and create_if_missing:
+            from api.services.phone_utils import normalize_phone
+            norm_phone = normalize_phone(phone)
+            if norm_phone:
+                stored = self._store.add(PersonEntity(
+                    canonical_name=norm_phone,
+                    display_name=norm_phone,
+                    phone_numbers=[norm_phone],
+                    phone_primary=norm_phone,
+                ))
+                if stored:
+                    return ResolutionResult(
+                        entity=stored,
+                        is_new=True,
+                        confidence=0.6,
+                        match_type="phone_new",
+                    )
 
         return None
 

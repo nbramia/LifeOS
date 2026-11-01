@@ -39,7 +39,7 @@ The `EntityResolver` uses a multi-pass algorithm. Each pass is tried in order; t
 **Pass 5: Disambiguation**
 - If the top two candidates score within 15 points of each other, the match is ambiguous
 - A lookup that may create a person (`create_if_missing`) returns no link for an ambiguous name and never creates one; a read-only lookup returns the top match with reduced confidence (0.7x), match type `fuzzy_ambiguous`
-- An unknown email alongside an ambiguous name still anchors a new person, named from the address. An unknown phone does not, so the observation stays unlinked
+- An unknown email or phone alongside an ambiguous name still anchors a new person, named from the address or number, so the ambiguous name never becomes another exact match. An ambiguous name with no identifier links to no one
 
 ---
 
