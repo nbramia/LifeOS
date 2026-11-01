@@ -148,6 +148,37 @@ Everyone shared their progress.
         results = indexer.vector_store.search("send report", top_k=5)
         assert len(results) >= 1
 
+    def test_wispr_note_outside_granola_folder_is_meeting(self, indexer, temp_vault):
+        """A wispr_id note filed outside Granola/ is chunked, prefixed and attributed as a meeting."""
+        from unittest.mock import MagicMock, patch
+
+        note = temp_vault / "Work" / "ML" / "Meetings" / "sync.md"
+        note.parent.mkdir(parents=True)
+        note.write_text("""---
+wispr_id: w-123
+wispr_url: https://example.invalid/w-123
+source: wispr
+type: transcript
+people: [Alex]
+---
+
+## Summary
+Synthetic summary text.
+
+## Transcript
+Synthetic transcript text.
+""")
+        indexer.vector_store = MagicMock()
+
+        with patch.object(indexer, "_sync_people_to_v2", return_value=[]) as sync:
+            indexer.index_file(str(note))
+
+        assert sync.call_args.args[3] is True
+        chunks, metadata = indexer.vector_store.update_document.call_args.args
+        assert len(chunks) >= 2
+        assert metadata["wispr_id"] == "w-123"
+        assert "meeting notes" in chunks[0]["content"].lower()
+
     def test_infers_note_type_from_folder(self, indexer, temp_vault):
         """Should infer note_type from folder path."""
         # Create files in different folders

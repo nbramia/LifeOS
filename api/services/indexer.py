@@ -411,6 +411,7 @@ class IndexerService:
         # Determine if Granola note
         is_granola = (
             "granola_id" in frontmatter or
+            "wispr_id" in frontmatter or
             "Granola" in str(path)
         )
 
@@ -474,6 +475,7 @@ class IndexerService:
             "people": all_people,
             "tags": [t for t in note_tags if not is_people_tag(t)],
             "granola_id": frontmatter.get("granola_id"),  # For context generation
+            "wispr_id": frontmatter.get("wispr_id"),  # For context generation
         }
 
         # Add contextual prefixes to chunks (P9.1 - boosts retrieval accuracy)
