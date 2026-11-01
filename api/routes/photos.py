@@ -245,38 +245,43 @@ def get_shared_photos(
     """
     Get photos where two people appear together.
 
-    Returns photos where both people's faces were recognized.
+    Returns photos where both people's faces were recognized. A photo's
+    interaction ``source_id`` is ``<asset_uuid>:<person_pk>``, so the two
+    people are matched on the asset UUID. Reads only the interactions table,
+    so it works without a Photos library.
     """
-    _check_photos_enabled()
-
     from api.services.interaction_store import get_interaction_store
 
     interaction_store = get_interaction_store()
 
-    # Get photo interactions for both people
-    photos_a = interaction_store.get_for_person(person_a_id, source_type="photos")
-    photos_b = interaction_store.get_for_person(person_b_id, source_type="photos")
+    # Get photo interactions for both people (same cap as the per-person route)
+    photos_a = interaction_store.get_for_person(person_a_id, source_type="photos", limit=10000)
+    photos_b = interaction_store.get_for_person(person_b_id, source_type="photos", limit=10000)
 
-    # Find shared photos by source_id (asset UUID)
-    uuids_a = {i.source_id for i in photos_a if i.source_id}
-    shared_uuids = {i.source_id for i in photos_b if i.source_id and i.source_id in uuids_a}
+    uuids_b = {_asset_uuid(i.source_id) for i in photos_b if i.source_id}
 
-    # Get details for shared photos
-    photos = []
+    # One entry per shared asset, in person A's order
+    shared: dict[str, object] = {}
     for interaction in photos_a:
-        if interaction.source_id in shared_uuids and len(photos) < limit:
-            photos.append(PhotoResponse(
-                uuid=interaction.source_id or "",
-                timestamp=interaction.timestamp.isoformat() if interaction.timestamp else None,
-                latitude=None,
-                longitude=None,
-                source_link=interaction.source_link,
-            ))
+        asset_uuid = _asset_uuid(interaction.source_id)
+        if asset_uuid and asset_uuid in uuids_b:
+            shared.setdefault(asset_uuid, interaction)
+
+    photos = [
+        PhotoResponse(
+            uuid=asset_uuid,
+            timestamp=interaction.timestamp.isoformat() if interaction.timestamp else None,
+            latitude=None,
+            longitude=None,
+            source_link=interaction.source_link,
+        )
+        for asset_uuid, interaction in list(shared.items())[:limit]
+    ]
 
     return CoAppearanceResponse(
         person_a_id=person_a_id,
         person_b_id=person_b_id,
-        shared_photo_count=len(shared_uuids),
+        shared_photo_count=len(shared),
         photos=photos,
     )
 
