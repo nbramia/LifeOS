@@ -61,10 +61,10 @@ def sync_env(tmp_path):
          patch("scripts.sync_gmail_calendar_interactions.get_interaction_db_path",
                return_value=interactions_path), \
          patch("scripts.sync_gmail_calendar_interactions.get_source_entity_store",
-               return_value=MagicMock()), \
+               return_value=MagicMock(add_or_update=MagicMock(return_value=(MagicMock(), True)))), \
          patch("scripts.sync_gmail_calendar_interactions.get_entity_resolver") as resolver:
         resolver.return_value.resolve.return_value = MagicMock(
-            entity=MagicMock(id="person1"), confidence=1.0, match_type="email_exact",
+            entity=MagicMock(id="person1", hidden=False), confidence=1.0, match_type="email_exact",
         )
         yield gmail, cache
 

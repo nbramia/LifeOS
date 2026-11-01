@@ -113,6 +113,7 @@ def sync_phone_calls(
         'already_exists': 0,
         'skipped_facetime_email': 0,
         'no_person': 0,
+        'hidden_person': 0,
         'errors': 0,
     }
 
@@ -283,6 +284,12 @@ def sync_phone_calls(
             else:
                 title = f"{direction} {call_type_name} ({status}) - {contact_name}"
 
+            # Hidden people get no interactions (consistency verification
+            # removes them); their source entity is still linked above.
+            if person.hidden:
+                stats['hidden_person'] += 1
+                continue
+
             # Create interaction
             interaction_id = str(uuid.uuid4())
 
@@ -299,9 +306,10 @@ def sync_phone_calls(
             ))
 
             if len(batch) >= batch_size:
-                if not dry_run:
-                    _insert_batch(interaction_conn, batch)
-                stats['interactions_created'] += len(batch)
+                if dry_run:
+                    stats['interactions_created'] += len(batch)
+                else:
+                    stats['interactions_created'] += _insert_batch(interaction_conn, batch)
                 batch = []
 
         except Exception as e:
@@ -310,9 +318,10 @@ def sync_phone_calls(
 
     # Insert remaining batch
     if batch:
-        if not dry_run:
-            _insert_batch(interaction_conn, batch)
-        stats['interactions_created'] += len(batch)
+        if dry_run:
+            stats['interactions_created'] += len(batch)
+        else:
+            stats['interactions_created'] += _insert_batch(interaction_conn, batch)
 
     # Save person store
     if not dry_run:
@@ -331,6 +340,7 @@ def sync_phone_calls(
     logger.info(f"Already exists: {stats['already_exists']}")
     logger.info(f"Skipped FaceTime email: {stats['skipped_facetime_email']}")
     logger.info(f"No person resolved: {stats['no_person']}")
+    logger.info(f"Hidden person (skipped): {stats['hidden_person']}")
     logger.info(f"Errors: {stats['errors']}")
 
     if dry_run:
@@ -354,8 +364,9 @@ def sync_phone_calls(
     return stats
 
 
-def _insert_batch(conn: sqlite3.Connection, batch: list):
-    """Insert a batch of interactions."""
+def _insert_batch(conn: sqlite3.Connection, batch: list) -> int:
+    """Insert a batch of interactions; returns the number of rows actually inserted."""
+    before = conn.total_changes
     conn.executemany(
         """
         INSERT OR IGNORE INTO interactions
@@ -364,7 +375,9 @@ def _insert_batch(conn: sqlite3.Connection, batch: list):
         """,
         batch,
     )
+    inserted = conn.total_changes - before
     conn.commit()
+    return inserted
 
 
 if __name__ == '__main__':
