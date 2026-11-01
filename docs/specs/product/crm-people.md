@@ -148,7 +148,7 @@ Strength is persisted on `PersonEntity`, recalculated nightly, and used as the d
 
 Contacts are assigned to one of 8 Dunbar circles (`0` = closest, `6` = outermost, `7` = peripheral). Circles drive filtering, color coding, and prioritization across the CRM.
 
-- Circles `0–6` are derived from the strength ranking among non-peripheral contacts. Work contacts take the circle their strength qualifies for but don't use up a slot.
+- Circles `0–6` are derived from the strength ranking among non-peripheral contacts. Work contacts take the circle their strength qualifies for but don't use up a slot, and hidden people don't rank at all.
 - Circle `7` is anyone below `PERIPHERAL_THRESHOLD`.
 - Computed in `api/services/relationship_metrics.py`.
 - Operator overrides via `CIRCLE_OVERRIDES_BY_ID` in `config/relationship_weights.py` (the file is gitignored — see [configuration.md](../../guides/configuration.md)).

@@ -482,6 +482,18 @@ class TestDunbarCircles:
         assert store.people["personal-0"].dunbar_circle == 0
         assert store.people["personal-5"].dunbar_circle == 1
 
+    def test_hidden_people_do_not_consume_slots(self):
+        """Hidden people aren't rescored, so their stored strength can be arbitrarily stale."""
+        hidden = self._ranked(5, strength=99.0, hidden=True)
+        for person in hidden:
+            person.id = f"hidden-{person.id}"
+        personal = self._ranked(6)
+        store = _MemoryPersonStore(hidden + personal)
+        rm.compute_all_dunbar_circles(store)
+        assert store.people["personal-0"].dunbar_circle == 1
+        assert store.people["personal-4"].dunbar_circle == 1
+        assert store.people["personal-5"].dunbar_circle == 2
+
 
 class TestStrengthBreakdown:
     """The breakdown endpoint reports the formula actually in use."""

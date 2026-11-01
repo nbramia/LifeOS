@@ -478,7 +478,9 @@ def compute_all_dunbar_circles(store=None) -> dict:
 
     # Get all non-peripheral contacts, sorted by effective strength descending
     # Effective strength = override if defined, else computed strength
-    all_people = store.get_all(include_hidden=True)
+    # Hidden people don't rank: update_all_strengths doesn't rescore them, so their
+    # stored strength can be arbitrarily stale and must not take a slot.
+    all_people = store.get_all()
     non_peripheral = [p for p in all_people if not p.is_peripheral_contact]
     non_peripheral.sort(key=_get_effective_strength, reverse=True)
 
