@@ -495,13 +495,8 @@ the LifeOS orchestrator internals and have no Codex equivalent.
 
 ### Implementation lifecycle skills
 
-`/implement`, `/draft-issue`, `/pr-check`, `/merge-pr`, `/review-pr`, and
-`/address-review` come from the `benjamcalvin/bootstraps` marketplace, not from
-this repo. The marketplace is cross-compatible: its `implement-lifecycle` and
-`issue-management` plugins install in Codex through Codex's plugin browser, and
-in Claude Code at **user scope** (`/plugin` → add the `benjamcalvin/bootstraps`
-marketplace). `scripts/install_codex_skills.py` does not sync them, so a Codex
-machine needs the plugin installed to have them.
+`/implement` and `/draft-issue` are user-scope skills, not part of this repo.
+`scripts/install_codex_skills.py` does not sync them.
 
 ### Route capabilities
 

@@ -116,12 +116,22 @@ def test_runs_freshly_fetched_main_publisher_with_gate_identity_and_pinned_head(
     assert Path(_option(argv, "--repo-path")).resolve() == harness["checkout"].resolve()
 
 
+def test_pins_the_head_it_is_given_without_reading_it(harness):
+    given = "b" * 40
+    result = _run(harness, "1234", given)
+    assert result.returncode == 0, result.stderr
+    assert _option(json.loads(harness["record"].read_text())["argv"], "--expected-head-sha") == given
+    assert not harness["gh_log"].exists()
+
+
 def test_propagates_a_refused_publish(harness):
     result = _run(harness, "1234", MERGE_TEST_PUBLISHER_EXIT="1")
     assert result.returncode == 1
 
 
-@pytest.mark.parametrize("args", [(), ("abc",), ("12", "34"), ("12; echo hi",)])
+@pytest.mark.parametrize("args", [
+    (), ("abc",), ("12", "34"), ("12; echo hi",), ("12", "B" * 40), ("12", "b" * 39), ("12", "b" * 40, "x"),
+])
 def test_rejects_bad_arguments_before_contacting_github(harness, args):
     result = _run(harness, *args)
     assert result.returncode == 2

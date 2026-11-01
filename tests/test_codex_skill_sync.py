@@ -151,10 +151,9 @@ def test_orchestration_skills_excluded_from_allowlist():
 
 
 def test_lifecycle_skills_excluded_from_allowlist():
-    """The implementation lifecycle ships as the `benjamcalvin/bootstraps`
-    plugin, installed in Codex through its own plugin browser. Listing those
-    skills here would point the converter at sources this repo does not hold."""
-    for excluded in ("draft-issue", "pr-check", "merge-pr"):
+    """The implementation lifecycle is user-scope. Listing those skills here
+    would point the converter at sources this repo does not hold."""
+    for excluded in ("implement", "draft-issue"):
         assert excluded not in PORTABLE_SKILLS
 
 
@@ -169,9 +168,8 @@ def test_every_portable_skill_has_a_source_in_the_repo():
 
 def test_native_codex_skill_path_removed():
     """The native-skill install path (NATIVE_CODEX_SKILLS +
-    install_native_codex_skills) must not exist -- Codex gets its
-    lifecycle from the `benjamcalvin/bootstraps` marketplace instead, not
-    from directories copied out of `.agents/skills/`.
+    install_native_codex_skills) must not exist -- the lifecycle skills are
+    user-scope, not directories copied out of `.agents/skills/`.
     Guard against either resurfacing without a source in the repo.
     """
     assert not hasattr(codex_skill_sync, "NATIVE_CODEX_SKILLS")
@@ -180,7 +178,7 @@ def test_native_codex_skill_path_removed():
     agents_skills = Path(__file__).resolve().parent.parent / ".agents" / "skills"
     retired = {"implement", "draft-issue", "pr-check", "merge-pr", "review-pr", "address-review"}
     # A missing `.agents/skills/` (e.g. a future cleanup removes the directory
-    # entirely) satisfies "these six are absent" just as well as an existing
+    # entirely) satisfies "these are absent" just as well as an existing
     # directory that lacks them — don't let iterdir() on a gone path fail the test.
     existing = {p.name for p in agents_skills.iterdir() if p.is_dir()} if agents_skills.is_dir() else set()
     assert not (existing & retired), f"retired lifecycle skills still present: {existing & retired}"

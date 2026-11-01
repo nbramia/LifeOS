@@ -99,6 +99,12 @@ def _run(run: Runner, args: Sequence[str], **kwargs) -> subprocess.CompletedProc
     return result
 
 
+def _push_output(result: subprocess.CompletedProcess) -> str:
+    """Everything a failed push printed. git leaves a pre-push hook's stdout on
+    stdout and writes only its own summary to stderr, so stderr can hide why."""
+    return "\n".join(part.strip() for part in (result.stdout, result.stderr) if part and part.strip())
+
+
 def _git(run: Runner, repo: Path, args: Sequence[str], *, check: bool = True) -> str:
     result = _run(run, ["git", "-C", str(repo), *args])
     if check and result.returncode != 0:
@@ -398,7 +404,7 @@ def push_candidate_for_verification(
     refspec = f"{candidate_sha}:{staging_ref}"
     result = _run(run, ["git", "-C", str(repo), "push", remote, refspec])
     if result.returncode != 0:
-        raise PublisherError(f"could not push candidate to staging ref {staging_ref}: {result.stderr.strip()}")
+        raise PublisherError(f"could not push candidate to staging ref {staging_ref}: {_push_output(result)}")
 
 
 def trigger_trusted_verification(
@@ -641,7 +647,7 @@ def publish_atomic(
     result = _run(run, [*args, remote, *refspecs])
     if result.returncode == 0:
         return PublishOutcome(True, "published", "")
-    stderr = result.stderr.strip()
+    stderr = _push_output(result)
     if "stale info" in stderr or "(fetch first)" in stderr:
         reason = "source or main advanced since it was observed (lease rejected)"
     elif "non-fast-forward" in stderr:
@@ -668,7 +674,7 @@ def cleanup_source_with_lease(
                          remote, f":{source_ref}"])
     if result.returncode == 0:
         return PublishOutcome(True, "source deleted", "")
-    return PublishOutcome(False, "source advanced since merge; retained newer source", result.stderr.strip())
+    return PublishOutcome(False, "source advanced since merge; retained newer source", _push_output(result))
 
 
 # ---------------------------------------------------------------------------
@@ -862,6 +868,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     print(f"candidate: {result.candidate.sha}")
     print(f"publish: {'accepted' if result.publish.accepted else 'REJECTED'} — {result.publish.reason}")
+    if not result.publish.accepted and result.publish.stderr:
+        print(result.publish.stderr)
     if result.cleanup is not None:
         print(f"source cleanup: {'accepted' if result.cleanup.accepted else 'retained'} — {result.cleanup.reason}")
     return 0 if result.publish.accepted else 1

@@ -88,7 +88,7 @@ server; server-dependent tests must use the runner's owned instance contract.
 [`scripts/development_metrics.py`](../../../scripts/development_metrics.py) is
 the one shared local recorder for lifecycle phase timing and evidence-reuse
 observations; a caller records a phase through its `record` subcommand
-(candidate-verification CLIs and canonical lifecycle plugin adapters alike)
+(candidate-verification CLIs and lifecycle harnesses alike)
 rather than hand-rolling a second JSONL format or timing implementation, and
 reads `summary` for aggregate durations, percentile, and per-phase status
 (`unknown` for a phase never observed — never imputed from commit or
