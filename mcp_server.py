@@ -809,8 +809,8 @@ class LifeOSMCPServer:
         A `spec_wait_seconds` > 0 given to the constructor keeps retrying
         while the API refuses connections, for up to that long. The HTTP
         service is restarted right after the API on a deploy, and the API
-        takes several seconds to start listening, so a single attempt usually
-        fell back to the curated schemas."""
+        takes several seconds to start listening, so a single attempt can find
+        nothing listening yet."""
         deadline = time.monotonic() + max(0.0, getattr(self, "_spec_wait_seconds", 0.0))
         delay = 0.5
         while True:
