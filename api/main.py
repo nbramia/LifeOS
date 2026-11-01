@@ -14,7 +14,7 @@ Running uvicorn directly can create ghost processes that bind to different
 interfaces, causing localhost and Tailscale/network access to hit different
 server instances with different code versions.
 
-See CLAUDE.md for full instructions for AI coding agents.
+See AGENTS.md for full instructions for AI coding agents.
 """
 # Load environment variables from .env file first, before any imports.
 #

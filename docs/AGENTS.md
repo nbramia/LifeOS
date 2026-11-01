@@ -33,7 +33,6 @@ Both readers benefit from the same things: short, focused documents; explicit de
 ```
 docs/
 ├── AGENTS.md          # THIS FILE (documentation strategy)
-├── CLAUDE.md          # @AGENTS.md wrapper
 ├── vision/            # WHY — project vision, philosophy
 ├── specs/
 │   ├── product/       # WHAT — features, API contracts, data models (consumer perspective)
@@ -338,19 +337,19 @@ LifeOS is open-source and single-user / self-hosted. That implies two doc rules 
 
 ### Sub-Directory Instruction Files
 
-Every doc subdirectory has an `AGENTS.md` + `CLAUDE.md` pair so any reader (human or agent) can orient inside the subdirectory without re-reading this strategy file.
+Every doc subdirectory has an `AGENTS.md` so any reader (human or agent) can orient inside the subdirectory without re-reading this strategy file.
 
-Existing pairs:
-- `docs/adr/AGENTS.md` + `CLAUDE.md`
-- `docs/guides/AGENTS.md` + `CLAUDE.md`
-- `docs/specs/AGENTS.md` + `CLAUDE.md`
-- `docs/specs/product/AGENTS.md` + `CLAUDE.md`
-- `docs/specs/technical/AGENTS.md` + `CLAUDE.md`
-- `docs/specs/standards/AGENTS.md` + `CLAUDE.md`
-- `docs/vision/AGENTS.md` + `CLAUDE.md`
-- `docs/plans/AGENTS.md` + `CLAUDE.md` (gitignored directory; only the AGENTS pair is tracked)
+Existing files:
+- `docs/adr/AGENTS.md`
+- `docs/guides/AGENTS.md`
+- `docs/specs/AGENTS.md`
+- `docs/specs/product/AGENTS.md`
+- `docs/specs/technical/AGENTS.md`
+- `docs/specs/standards/AGENTS.md`
+- `docs/vision/AGENTS.md`
+- `docs/plans/AGENTS.md` (gitignored directory; only this file is tracked)
 
-**AGENTS.md** is the primary instruction file (universal, works with all AI tools). **CLAUDE.md** is a one-line wrapper: `@AGENTS.md`. The `@` import is relative to the file containing it; since CLAUDE.md and AGENTS.md are always co-located, the import is always literally `@AGENTS.md`.
+**AGENTS.md** is the only instruction file (universal, works with all AI tools).
 
 **AGENTS.md structure (per subdirectory):**
 
@@ -401,7 +400,6 @@ Aim for ≤30 lines. Subdirectory AGENTS.md files are wayfinding, not extended c
 
 ### Project Context
 - [Root AGENTS.md](../AGENTS.md) — Project-level agent reference, development principles, key files
-- [Root CLAUDE.md](../CLAUDE.md) — Claude Code-specific configuration
 
 ### Specifications
 - [vision/philosophy.md](vision/philosophy.md) — The privacy-first, local-first principles that frame doc decisions
