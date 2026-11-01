@@ -123,7 +123,7 @@ All scoring constants are defined in `config/relationship_weights.py`:
 | `MIN_MATCH_SCORE` | 40 | Minimum score for a valid match |
 | `DISAMBIGUATION_THRESHOLD` | 15 | Score gap below which match is ambiguous |
 | `RELATIONSHIP_STRENGTH_BOOST_MAX` | 25 | Max relationship boost points |
-| `RELATIONSHIP_STRENGTH_BOOST_WEIGHT` | 0.25 | Multiplier: strength * weight = points |
+| `RELATIONSHIP_STRENGTH_BOOST_WEIGHT` | 0.40 | Multiplier: strength * weight = points |
 | `FIRST_NAME_ONLY_BOOST_MULTIPLIER` | 1.5 | Extra relationship boost for first-name queries |
 | `CLOSE_RELATIONSHIP_MIN_STRENGTH` | 14 | Strength that makes a first-name candidate "close" |
 | `CLEARLY_CLOSER_MIN_STRENGTH_LEAD` | 30 | Strength lead that settles a tie between close candidates |

@@ -607,6 +607,31 @@ class TestFirstNameStrengthTiebreak:
 
 
 @pytest.mark.unit
+class TestStrengthBoost:
+    """A bare first name needs 40 points: 25 for the name, the rest from strength."""
+
+    def _resolve(self, temp_store, strength):
+        for last, value in (("Alpha", strength), ("Beta", 0.0)):
+            person = PersonEntity(canonical_name=f"Robin {last}")
+            person.relationship_strength = value
+            temp_store.add(person)
+        return EntityResolver(temp_store).resolve_by_name("Robin")
+
+    def test_strength_that_earns_the_missing_points_resolves(self, temp_store):
+        result = self._resolve(temp_store, 25.0)
+        assert result.entity.canonical_name == "Robin Alpha"
+        assert result.match_type == "first_name_context_clear"
+
+    def test_strength_just_short_of_them_does_not(self, temp_store):
+        assert self._resolve(temp_store, 24.9) is None
+
+    def test_the_boost_stops_at_its_cap(self, temp_store):
+        """At the cap a stronger person earns no more: 25 name + 25 * 1.5 boost + 10 clear."""
+        result = self._resolve(temp_store, 100.0)
+        assert result.confidence == pytest.approx(0.725)
+
+
+@pytest.mark.unit
 class TestSingleLetterFirstNameEntity:
     """
     An entity whose first name is a single letter must not swallow every query

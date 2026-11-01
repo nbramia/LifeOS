@@ -223,8 +223,8 @@ MIN_MATCH_SCORE = 40.0           # Minimum score to consider a valid match
 
 # Relationship strength boost for name-only resolution
 # When resolving by name only (no email/phone), prefer people with existing relationship
-RELATIONSHIP_STRENGTH_BOOST_MAX = 25    # Max points for relationship strength boost (0-100 strength -> 0-25 points)
-RELATIONSHIP_STRENGTH_BOOST_WEIGHT = 0.25  # Multiplier: strength * weight = boost points
+RELATIONSHIP_STRENGTH_BOOST_MAX = 25    # Max points for relationship strength boost (reached at strength 62.5)
+RELATIONSHIP_STRENGTH_BOOST_WEIGHT = 0.40  # Multiplier: strength * weight = boost points
 
 # First-name-only boost multiplier
 # When matching just "Ben" instead of "Ben Calvin", apply stronger relationship boost
