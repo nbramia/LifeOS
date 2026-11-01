@@ -203,6 +203,27 @@ class ApprovalStore:
             ).rowcount
         return self.get(row["id"]) if changed == 1 else None
 
+    def find_by_message(self, message_id: int, *, chat_id: str) -> ApprovalRow | None:
+        """The request (in any state) whose Telegram message this is, if any."""
+        with self._connect() as conn:
+            return self._row(conn.execute(
+                "SELECT * FROM host_approval_requests WHERE chat_id = ? "
+                "AND EXISTS (SELECT 1 FROM json_each(message_ids) WHERE value = ?) "
+                "ORDER BY created_at DESC LIMIT 1",
+                (str(chat_id), int(message_id)),
+            ).fetchone())
+
+    def pending_in_chat(self, chat_id: str, now: float | None = None) -> list[ApprovalRow]:
+        """Pending, unexpired requests sent to `chat_id`, oldest first."""
+        now = time.time() if now is None else now
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM host_approval_requests WHERE chat_id = ? AND state = 'pending' "
+                "AND (expires_at IS NULL OR expires_at > ?) ORDER BY created_at",
+                (str(chat_id), now),
+            ).fetchall()
+        return [r for r in (self._row(row) for row in rows) if r is not None]
+
     def consume(self, request_id: str, command_hash: str, now: float | None = None) -> bool:
         """Spend an approval. True only for the one call that wins it."""
         now = time.time() if now is None else now
@@ -371,6 +392,23 @@ class ApprovalGate:
             )
         except Exception as exc:  # noqa: BLE001 — a notice must not fail the call
             logger.warning("host approval run notice failed: %s", exc)
+
+
+def already_decided_text(row: ApprovalRow, now: float | None = None) -> str:
+    """The listener's answer to a reply to a request that is not pending."""
+    state = row.state
+    if state == "pending" and row.expires_at is not None and row.expires_at <= (time.time() if now is None else now):
+        state = "expired"
+    return f"Request {row.short_id} is no longer waiting ({state}). Nothing changed."
+
+
+def unthreaded_approve_text(rows: list[ApprovalRow]) -> str:
+    """The listener's answer to a bare APPROVE that is not a reply to a request."""
+    ids = ", ".join(r.short_id for r in rows)
+    return (
+        "Nothing was approved. To approve a command, reply APPROVE to the request's "
+        f"own message. Waiting: {ids}."
+    )
 
 
 def approval_reply_text(row: ApprovalRow, now: float | None = None) -> str:
