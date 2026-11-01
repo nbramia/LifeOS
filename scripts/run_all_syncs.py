@@ -766,6 +766,7 @@ def send_sync_summary_telegram(result: dict, trigger: str = "unknown"):
         and not result.get("investments_stale")
         and not result.get("repeated_yield_sources")
         and not result.get("apple_agent_sha_drift")
+        and not result.get("results", {}).get("crm_vectorstore", {}).get("removal_skipped")
         else "⚠️"
     )
     lines = [
@@ -836,6 +837,14 @@ def send_sync_summary_telegram(result: dict, trigger: str = "unknown"):
                 lines.append("  Manual review needed — threshold exceeded")
             else:
                 lines.append(f"🔧 *Data Issues:* {total_issues} found, {total_fixed} auto-fixed")
+
+    # People index removal held back by its safety limit: the index keeps stale
+    # people until an operator looks, so this has to reach them.
+    people_index = result.get("results", {}).get("crm_vectorstore", {})
+    if people_index.get("removal_skipped"):
+        lines.append("")
+        lines.append(f"⚠️ *People index not pruned:* {people_index.get('people_stale', 0)} stale entries kept")
+        lines.append("  Safety limit hit — manual review needed")
 
     # Investments-snapshot freshness — surface the stale WARNING here so
     # it reaches the operator (the bare log line does not feed any batched report).
@@ -1417,7 +1426,9 @@ def _recently_warned_never_yielded(source: str, within_days: int = NEVER_YIELDED
 #     before re-adding. Re-indexing the same file twice (which already
 #     happens on ordinary incremental runs) is a no-op in effect.
 #   - crm_vectorstore (person_indexer.index_person_to_vectorstore): same
-#     delete-then-add pattern, keyed by `person:{person.id}`.
+#     delete-then-add pattern, keyed by `person:{person.id}`. Removing people
+#     who left the eligible set deletes by the same key, so a repeat finds
+#     nothing left to remove.
 #   - push_birthdays_to_contacts: sets a single Apple Contacts field
 #     (`setBirthday_`) to an exact value — setting it twice is the same as
 #     setting it once, not an append.
