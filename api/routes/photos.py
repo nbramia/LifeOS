@@ -349,7 +349,7 @@ def _get_thumbnail_path(uuid: str) -> Path | None:
     if not uuid or not photos_origin.UUID_RE.match(uuid):
         return None
 
-    library_path = Path(settings.photos_library_path)
+    library_path = Path(settings.photos_library_path).expanduser()
     derivatives_base = library_path / "resources" / "derivatives"
 
     if not derivatives_base.exists():
@@ -517,7 +517,7 @@ def _get_photo_file_path(uuid: str) -> Path | None:
     if not uuid:
         return None
 
-    library_path = Path(settings.photos_library_path)
+    library_path = Path(settings.photos_library_path).expanduser()
     originals_base = library_path / "originals"
 
     if not originals_base.exists():

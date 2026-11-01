@@ -312,3 +312,29 @@ class TestCrmConfigFlags:
             instance = Settings(LIFEOS_PHOTOS_PATH=str(tmp_path / "no-library"))
             assert instance.photos_enabled is False
             assert instance.photos_thumbnails_available is True
+
+
+class TestLibraryPathExpansion:
+    """A tilde-prefixed LIFEOS_PHOTOS_PATH resolves for the library file
+    lookups the same way settings.photos_db_path resolves it."""
+
+    @pytest.fixture
+    def tilde_library(self, tmp_path, monkeypatch):
+        from config.settings import settings
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr(settings, "photos_library_path", "~/Synthetic.photoslibrary")
+        return tmp_path / "Synthetic.photoslibrary"
+
+    def test_thumbnail_lookup_expands_the_tilde(self, tilde_library):
+        from api.routes.photos import _get_thumbnail_path
+        thumb = tilde_library / "resources" / "derivatives" / UUID_A[0] / f"{UUID_A}_1_105_c.jpeg"
+        thumb.parent.mkdir(parents=True)
+        thumb.write_bytes(FAKE_JPEG)
+        assert _get_thumbnail_path(UUID_A) == thumb
+
+    def test_original_lookup_expands_the_tilde(self, tilde_library):
+        from api.routes.photos import _get_photo_file_path
+        original = tilde_library / "originals" / UUID_A[0] / f"{UUID_A}.jpeg"
+        original.parent.mkdir(parents=True)
+        original.write_bytes(FAKE_JPEG)
+        assert _get_photo_file_path(UUID_A) == original
