@@ -2566,13 +2566,103 @@
             color: var(--text-muted);
             font-size: 0.8rem;
         }
-        .photo-open-btn {
+        .photo-view-btn {
+            background: none;
+            border: none;
+            padding: 0;
+            font: inherit;
             color: var(--people);
-            text-decoration: none;
             font-size: 0.8rem;
+            cursor: pointer;
         }
-        .photo-open-btn:hover {
+        .photo-view-btn:hover {
             text-decoration: underline;
+        }
+
+        /* Photo viewer */
+        .photo-viewer {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.88);
+            z-index: 1100;
+            align-items: center;
+            justify-content: center;
+            padding: calc(1rem + var(--safe-top)) calc(1rem + var(--safe-right))
+                     calc(1rem + var(--safe-bottom)) calc(1rem + var(--safe-left));
+            box-sizing: border-box;
+        }
+        .photo-viewer.visible {
+            display: flex;
+        }
+        .photo-viewer-content {
+            position: relative;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 0.75rem;
+            max-width: 100%;
+            max-height: 100%;
+        }
+        .photo-viewer-img {
+            display: block;
+            max-width: 100%;
+            max-height: calc(100vh - 9rem);
+            object-fit: contain;
+            border-radius: 6px;
+            background: var(--bg-secondary);
+        }
+        .photo-viewer-img.is-hidden {
+            display: none;
+        }
+        .photo-viewer-empty {
+            display: none;
+            color: var(--text-muted);
+            padding: 3rem 1.5rem;
+        }
+        .photo-viewer-empty.visible {
+            display: block;
+        }
+        .photo-viewer-bar {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            justify-content: center;
+            gap: 0.75rem;
+            min-height: 2.5rem;
+        }
+        .photo-viewer-note {
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+        }
+        .photo-viewer-download {
+            padding: 0.5rem 1rem;
+            min-height: 44px;
+            background: var(--people);
+            color: #1a1a2e;
+            border: none;
+            border-radius: 8px;
+            font-size: 0.9rem;
+            cursor: pointer;
+        }
+        .photo-viewer-download:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+        .photo-viewer-close {
+            position: absolute;
+            top: -0.25rem;
+            right: -0.25rem;
+            width: 44px;
+            height: 44px;
+            border: none;
+            border-radius: 50%;
+            background: rgba(0, 0, 0, 0.6);
+            color: var(--text-primary);
+            font-size: 1.5rem;
+            line-height: 1;
+            cursor: pointer;
+            z-index: 1;
         }
 
         /* Graph visualization */
@@ -8669,6 +8759,22 @@
         </div>
     </div>
 
+    <!-- Photo Viewer -->
+    <div class="photo-viewer" id="photoViewer" role="dialog" aria-modal="true" aria-label="Photo viewer"
+         onclick="if (event.target === this) closePhotoViewer()">
+        <div class="photo-viewer-content">
+            <button type="button" class="photo-viewer-close" id="photoViewerClose" aria-label="Close"
+                    onclick="closePhotoViewer()">&times;</button>
+            <img class="photo-viewer-img" id="photoViewerImg" alt="Photo">
+            <div class="photo-viewer-empty" id="photoViewerEmpty">No image available</div>
+            <div class="photo-viewer-bar">
+                <span class="photo-viewer-note" id="photoViewerNote"></span>
+                <button type="button" class="photo-viewer-download" id="photoViewerDownload" hidden
+                        onclick="downloadPhotoOriginal()">Download original</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Split Modal -->
     <div class="split-modal" id="splitModal">
         <div class="split-modal-content">
@@ -9104,6 +9210,10 @@
                 // GET /api/photos/stats, which runs full-library aggregate
                 // queries when Photos is configured.
                 photosEnabled = !!config.photos_enabled;
+                // On-demand originals/previews from the Photos Mac are
+                // configured server-side; without them the photo viewer is
+                // thumbnail-only.
+                photosOriginalsEnabled = !!config.photos_originals_enabled;
             } catch (error) {
                 console.warn('[Config] Failed to load CRM config:', error);
             }
@@ -14014,6 +14124,7 @@
         // an install without Photos configured issues zero photo requests
         // instead of letting every flagged person's <img> fail with a 503.
         let photosEnabled = false;
+        let photosOriginalsEnabled = false;
 
         // Returns the <img> markup for a person-list avatar, or '' when no photo
         // request should be issued at all. Renders only for people the list
@@ -16613,37 +16724,190 @@
             `;
         }
 
+        // Photo viewer state. The token invalidates in-flight origin requests
+        // when the viewer is closed or reopened on another photo.
+        let photoViewerToken = 0;
+        let photoViewerReturnFocus = null;
+
+        function formatPhotoBytes(bytes) {
+            if (typeof bytes !== 'number' || bytes < 0) return '';
+            if (bytes >= 1048576) return `${(bytes / 1048576).toFixed(1)} MB`;
+            return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+        }
+
         /**
-         * Open a photo in the Photos app.
-         * Uses the API endpoint which runs AppleScript to open Photos.
+         * Open the in-page photo viewer: the thumbnail immediately, then a
+         * larger preview from the Photos Mac when on-demand originals are
+         * configured, plus a download button when the original is on the Mac.
          */
-        async function openPhotoInApp(uuid) {
-            try {
-                await fetch(`/api/photos/open/${uuid}`);
-            } catch (err) {
-                console.error('Failed to open photo:', err);
+        function openPhotoViewer(uuid) {
+            if (!uuid) return;
+            const viewer = document.getElementById('photoViewer');
+            const img = document.getElementById('photoViewerImg');
+            const empty = document.getElementById('photoViewerEmpty');
+            const note = document.getElementById('photoViewerNote');
+            const button = document.getElementById('photoViewerDownload');
+            const token = ++photoViewerToken;
+
+            photoViewerReturnFocus = document.activeElement;
+            note.textContent = '';
+            button.hidden = true;
+            button.disabled = true;
+            delete button.dataset.url;
+            delete button.dataset.filename;
+            delete img.dataset.stage;
+            empty.classList.remove('visible');
+            img.classList.remove('is-hidden');
+            img.onerror = () => {
+                if (token !== photoViewerToken) return;
+                img.classList.add('is-hidden');
+                empty.classList.add('visible');
+            };
+            img.dataset.stage = 'thumbnail';
+            img.src = `/api/photos/thumbnail/${encodeURIComponent(uuid)}`;
+
+            viewer.classList.add('visible');
+            document.getElementById('photoViewerClose').focus();
+
+            if (photosOriginalsEnabled) {
+                loadPhotoViewerOrigin(uuid, token);
             }
+        }
+
+        function closePhotoViewer() {
+            const viewer = document.getElementById('photoViewer');
+            if (!viewer.classList.contains('visible')) return;
+            photoViewerToken++;
+            viewer.classList.remove('visible');
+            const img = document.getElementById('photoViewerImg');
+            img.onerror = null;
+            img.removeAttribute('src');
+            if (photoViewerReturnFocus && photoViewerReturnFocus.focus) {
+                photoViewerReturnFocus.focus();
+            }
+            photoViewerReturnFocus = null;
+        }
+
+        document.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && document.getElementById('photoViewer').classList.contains('visible')) {
+                event.preventDefault();
+                closePhotoViewer();
+            }
+        });
+
+        // The note shown when the origin cannot be queried; null means "say
+        // nothing" (feature not configured: the viewer stays thumbnail-only).
+        function photoOriginFailureNote(response) {
+            if (response.status === 404) return "This photo isn't available on the Mac";
+            if (response.status === 503) {
+                const cause = response.headers.get('X-Photos-Origin');
+                if (cause === 'unconfigured') return null;
+                if (cause === 'unreachable') return 'The Mac is offline';
+                if (cause === 'busy') return 'The Mac is busy. Try again in a moment';
+            }
+            return "Couldn't reach the Mac";
+        }
+
+        async function loadPhotoViewerOrigin(uuid, token) {
+            const note = document.getElementById('photoViewerNote');
+            const button = document.getElementById('photoViewerDownload');
+            const encoded = encodeURIComponent(uuid);
+            let info;
+            try {
+                const response = await fetch(`/api/photos/original/${encoded}/info`);
+                if (token !== photoViewerToken) return;
+                if (!response.ok) {
+                    note.textContent = photoOriginFailureNote(response) || '';
+                    return;
+                }
+                info = await response.json();
+            } catch (err) {
+                if (token === photoViewerToken) note.textContent = "Couldn't reach the Mac";
+                return;
+            }
+            if (token !== photoViewerToken) return;
+
+            button.hidden = false;
+            if (info.available) {
+                button.disabled = false;
+                button.dataset.url = `/api/photos/original/${encoded}`;
+                button.dataset.filename = info.filename || '';
+                const size = formatPhotoBytes(info.size_bytes);
+                button.textContent = size ? `Download original (${size})` : 'Download original';
+            } else {
+                button.disabled = true;
+                button.textContent = 'Download original';
+                note.textContent = "Original isn't on the Mac";
+            }
+            // Videos are not played: they keep their thumbnail and the download.
+            if (info.kind !== 'video' && info.previewable) {
+                showPhotoViewerPreview(encoded, token);
+            }
+        }
+
+        function showPhotoViewerPreview(encoded, token) {
+            const loader = new Image();
+            loader.onload = () => {
+                if (token !== photoViewerToken) return;
+                const img = document.getElementById('photoViewerImg');
+                document.getElementById('photoViewerEmpty').classList.remove('visible');
+                img.classList.remove('is-hidden');
+                img.dataset.stage = 'preview';
+                img.src = loader.src;
+            };
+            loader.src = `/api/photos/preview/${encoded}`;
+        }
+
+        function downloadPhotoOriginal() {
+            const button = document.getElementById('photoViewerDownload');
+            if (button.disabled || !button.dataset.url) return;
+            // An anchor with `download` keeps the CRM page in place even if the
+            // transfer fails, which setting location.href would not.
+            const link = document.createElement('a');
+            link.href = button.dataset.url;
+            link.download = button.dataset.filename || '';
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+        }
+
+        function photoPlaceholder(uuid, className, symbol, title) {
+            const placeholder = document.createElement('div');
+            placeholder.className = className;
+            placeholder.textContent = symbol;
+            placeholder.title = title;
+            if (photosOriginalsEnabled) {
+                placeholder.dataset.uuid = uuid;
+                placeholder.style.cursor = 'pointer';
+                placeholder.onclick = () => openPhotoViewer(uuid);
+            }
+            return placeholder;
         }
 
         /**
          * Handle photo thumbnail loading error.
          * Checks if photo is in iCloud (410) vs truly not found (404).
+         * With on-demand originals configured, either placeholder opens the
+         * viewer, which can still show a preview from the Photos Mac.
          */
-        async function handlePhotoError(img, uuid) {
+        async function handlePhotoError(img) {
+            const uuid = img.dataset.uuid;
+            let placeholder;
             try {
                 // Re-fetch to check actual status (the img onerror doesn't give us status code)
-                const response = await fetch(`/api/photos/thumbnail/${uuid}`);
+                const response = await fetch(`/api/photos/thumbnail/${encodeURIComponent(uuid)}`);
                 if (response.status === 410) {
-                    // iCloud only - show cloud icon with click to download
-                    img.outerHTML = `<div class="photo-thumbnail-placeholder icloud-photo" onclick="openPhotoInApp('${uuid}')" title="Photo in iCloud - Click to open in Photos">☁️</div>`;
+                    // iCloud only - show cloud icon
+                    placeholder = photoPlaceholder(uuid, 'photo-thumbnail-placeholder icloud-photo', '☁️', 'Photo in iCloud');
                 } else {
                     // Regular 404 - show camera placeholder
-                    img.outerHTML = '<div class="photo-thumbnail-placeholder">📷</div>';
+                    placeholder = photoPlaceholder(uuid, 'photo-thumbnail-placeholder', '📷', 'Thumbnail not available');
                 }
             } catch (err) {
                 // Network error - show camera placeholder
-                img.outerHTML = '<div class="photo-thumbnail-placeholder">📷</div>';
+                placeholder = photoPlaceholder(uuid, 'photo-thumbnail-placeholder', '📷', 'Thumbnail not available');
             }
+            img.replaceWith(placeholder);
         }
 
         /**
@@ -16669,14 +16933,16 @@
                         details.innerHTML = data.photos.map(p => `
                             <div class="photo-card">
                                 <img class="photo-thumbnail"
-                                     src="/api/photos/thumbnail/${p.uuid}"
-                                     onerror="handlePhotoError(this, '${p.uuid}')"
+                                     src="/api/photos/thumbnail/${encodeURIComponent(p.uuid)}"
+                                     data-uuid="${escapeAttr(p.uuid)}"
+                                     onerror="handlePhotoError(this)"
                                      loading="lazy"
                                      alt="Photo"
-                                     onclick="openPhotoInApp('${p.uuid}')">
+                                     onclick="openPhotoViewer(this.dataset.uuid)">
                                 <div class="photo-info">
                                     <span class="photo-time">${formatTime(p.timestamp)}</span>
-                                    <a href="#" class="photo-open-btn" onclick="event.preventDefault(); openPhotoInApp('${p.uuid}');">Open in Photos</a>
+                                    <button type="button" class="photo-view-btn" data-uuid="${escapeAttr(p.uuid)}"
+                                            onclick="openPhotoViewer(this.dataset.uuid)">View</button>
                                 </div>
                             </div>
                         `).join('') || '<div class="photo-card">No photos found</div>';
@@ -19782,6 +20048,11 @@
             const div = document.createElement('div');
             div.textContent = text;
             return div.innerHTML;
+        }
+
+        // Safe inside a double- or single-quoted HTML attribute value.
+        function escapeAttr(text) {
+            return escapeHtml(text).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
         }
 
         /**

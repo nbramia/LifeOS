@@ -632,13 +632,17 @@ class CRMConfigResponse(BaseModel):
     partner_person_id: str = ""
     partner_name: str = ""
     family_default_selected_ids: list[str] = []
-    # Whether Apple Photos is configured at all (settings.photos_enabled is
-    # just Path.exists() on the library's database file -- cheap, unlike
-    # GET /api/photos/stats, which runs several full-library aggregate
-    # queries when Photos *is* configured). The client uses this to decide
-    # whether to request avatar/profile photos at all, so a Photos-less
-    # install never issues a request that would otherwise 503.
+    # Whether photos can be shown at all: a local Photos library exists
+    # (settings.photos_enabled is just Path.exists() on the library's database
+    # file -- cheap, unlike GET /api/photos/stats, which runs several
+    # full-library aggregate queries when Photos *is* configured) or thumbnails
+    # staged by the Apple Data Agent export are present. The client uses this
+    # to decide whether to request avatar/profile photos at all, so an install
+    # with neither never issues a request that would only 404.
     photos_enabled: bool = False
+    # Whether on-demand originals/previews from the Photos Mac are configured
+    # (LIFEOS_PHOTOS_ORIGIN_SSH_HOST).
+    photos_originals_enabled: bool = False
 
 
 def _load_family_default_selected_ids() -> list[str]:
@@ -682,7 +686,8 @@ def get_crm_config():
         partner_person_id=PARTNER_PERSON_ID,
         partner_name=_get_partner_name(),
         family_default_selected_ids=_load_family_default_selected_ids(),
-        photos_enabled=settings.photos_enabled,
+        photos_enabled=settings.photos_enabled or settings.photos_thumbnails_available,
+        photos_originals_enabled=settings.photos_originals_enabled,
     )
 
 

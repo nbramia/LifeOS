@@ -37,6 +37,9 @@ from datetime import datetime, timezone, timedelta
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+# The Photos library helpers live beside this script; importing them by bare
+# module name avoids depending on a `scripts` package resolving first.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from dotenv import load_dotenv
 load_dotenv(PROJECT_ROOT / ".env")
@@ -47,7 +50,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+import photos_origin_helper
+
 EXPORT_DIR = PROJECT_ROOT / "data" / "apple-imports"
+# Photos thumbnails staged for the Linux server, as
+# photos_thumbnails/<FIRST_CHAR>/<ASSET_UUID>.jpeg under EXPORT_DIR.
+PHOTOS_THUMBNAILS_SUBDIR = "photos_thumbnails"
 
 
 def _parse_abcdp_labeled(field_dict: dict | None) -> list[dict]:
@@ -568,6 +576,67 @@ def export_phone_calls(dry_run: bool = False) -> dict:
     return {"status": "ok", "count": len(export), "path": str(out_path)}
 
 
+def _same_file(src: Path, dest: Path) -> bool:
+    """True when dest already holds a copy of src (same size and mtime)."""
+    try:
+        src_stat, dest_stat = src.stat(), dest.stat()
+    except OSError:
+        return False
+    return (
+        src_stat.st_size == dest_stat.st_size
+        and int(src_stat.st_mtime) == int(dest_stat.st_mtime)
+    )
+
+
+def _stage_photo_thumbnails(library: Path, asset_uuids, dest_root: Path) -> dict:
+    """Copy one small thumbnail per asset into dest_root/<FIRST_CHAR>/<UUID>.jpeg.
+
+    Prefers the library's masters derivative, then the smaller regular
+    derivatives (photos_origin_helper.THUMBNAIL_DERIVATIVES). A file already
+    staged with the same size and mtime is skipped. A copy failure for one
+    asset is counted and does not stop the rest. Staged files are never
+    removed; the server-bound rsync has no --delete and a stale thumbnail is
+    harmless.
+
+    Returns counts: copied, skipped (already current), missing (no derivative
+    in the library), failed (copy error).
+    """
+    copied = skipped = missing = failed = 0
+    for asset_uuid in sorted(asset_uuids):
+        if not photos_origin_helper.UUID_RE.match(asset_uuid):
+            missing += 1
+            continue
+        sources = photos_origin_helper.derivative_paths(
+            library, asset_uuid, photos_origin_helper.THUMBNAIL_DERIVATIVES
+        )
+        if not sources:
+            missing += 1
+            continue
+        dest = dest_root / asset_uuid[0].upper() / f"{asset_uuid}.jpeg"
+        if _same_file(sources[0], dest):
+            skipped += 1
+            continue
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(sources[0], dest)
+            copied += 1
+        except OSError as e:
+            failed += 1
+            if failed <= 5:
+                logger.warning(f"Could not stage a photo thumbnail: {type(e).__name__}")
+    logger.info(
+        f"Photo thumbnails: {copied} copied, {skipped} up to date, "
+        f"{missing} missing, {failed} failed"
+    )
+    return {
+        "status": "ok",
+        "copied": copied,
+        "skipped": skipped,
+        "missing": missing,
+        "failed": failed,
+    }
+
+
 def export_photos_faces(dry_run: bool = False) -> dict:
     """Export Photos face recognition data as JSON.
 
@@ -579,20 +648,11 @@ def export_photos_faces(dry_run: bool = False) -> dict:
     # Seconds from Unix epoch to Apple epoch (2001-01-01)
     APPLE_EPOCH_OFFSET = 978307200
 
-    # Try common Photos library locations
-    photos_db = None
-    candidates = [
-        Path.home() / "Pictures" / "Photos Library.photoslibrary" / "database" / "Photos.sqlite",
-        Path("/Volumes/NVMe External Storage/Photos Library.photoslibrary/database/Photos.sqlite"),
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            photos_db = candidate
-            break
-
-    if not photos_db:
+    library = photos_origin_helper.find_library()
+    if library is None:
         logger.warning("Photos.sqlite not found at any known location")
         return {"status": "skipped", "reason": "Photos.sqlite not found"}
+    photos_db = library / "database" / "Photos.sqlite"
 
     logger.info(f"Reading Photos database: {photos_db}")
 
@@ -671,6 +731,17 @@ def export_photos_faces(dry_run: bool = False) -> dict:
 
     conn.close()
 
+    # Thumbnail staging is best-effort: it never fails the faces export.
+    try:
+        thumbnails = _stage_photo_thumbnails(
+            library,
+            {face["asset_uuid"] for face in faces_export if face["asset_uuid"]},
+            EXPORT_DIR / PHOTOS_THUMBNAILS_SUBDIR,
+        )
+    except Exception as e:
+        logger.warning(f"Photo thumbnail staging failed: {e}")
+        thumbnails = {"status": "error", "error": str(e)}
+
     out_path = EXPORT_DIR / "photos_faces.json"
     with open(out_path, "w") as f:
         json.dump({
@@ -689,6 +760,7 @@ def export_photos_faces(dry_run: bool = False) -> dict:
         "people": len(people_export),
         "faces": len(faces_export),
         "path": str(out_path),
+        "thumbnails": thumbnails,
     }
 
 

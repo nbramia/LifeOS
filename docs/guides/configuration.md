@@ -1,7 +1,7 @@
 # Configuration Guide
 
 **Status:** Complete
-**Last Updated:** 2026-10-31
+**Last Updated:** 2026-11-01
 **Audience:** Operators
 
 **This is the single authoritative reference for every `LIFEOS_*` environment variable and the third-party service variables (`ANTHROPIC_API_KEY`, `OLLAMA_*`, `SLACK_*`, `TELEGRAM_*`, `MONARCH_*`) that LifeOS reads.** Other guides reference this file rather than restating defaults — when documentation conflicts, this file wins (and `config/settings.py` wins over both, since the code is the source of truth).
@@ -412,9 +412,13 @@ All work toggles default to `false` — work data is not indexed unless explicit
 
 ## Photos
 
+Thumbnails need no setting: the Apple Data Agent export stages them under `data/apple-imports/photos_thumbnails/` and the API serves them from there. See [operations.md](operations.md#photo-thumbnails-and-on-demand-originals).
+
 | Variable | Type | Default | Sets |
 |---|---|---|---|
 | `LIFEOS_PHOTOS_PATH` | path | `~/Pictures/Photos Library.photoslibrary` | Apple Photos library path. Read by the Apple Data Agent on macOS (see [ADR-010](../adr/010-apple-data-agent.md)). |
+| `LIFEOS_PHOTOS_ORIGIN_SSH_HOST` | str | *(empty: off)* | SSH target (`host` or `user@host`, a name from `~/.ssh/config` works) of the Mac that holds the Photos library. When set, the CRM photo viewer can show larger previews and download originals on demand by running `scripts/photos_origin_helper.py` there over SSH. The API's user needs non-interactive key access to that host (`BatchMode`). A value starting with `-` or containing whitespace is rejected. |
+| `LIFEOS_PHOTOS_ORIGIN_REPO_PATH` | path | `~/Code/LifeOS` | Path of the LifeOS checkout on that Mac (the helper script is run from there); a leading `~` is expanded by the Mac's shell. |
 | `LIFEOS_APPLE_EXPORT_AGENT_LABEL` | str | `the export agent` | Name for the Apple Data Agent machine used in staleness/failure alerts from `scripts/apple_data_import.py` (e.g. `Mac Mini`, `my MacBook`). Generic default since the export agent's hardware is installer-specific. |
 
 ## Fitness & Health

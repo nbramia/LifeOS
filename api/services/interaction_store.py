@@ -680,6 +680,28 @@ class InteractionStore:
         finally:
             conn.close()
 
+    def has_photo_asset(self, asset_uuid: str) -> bool:
+        """Whether any photos interaction references this Photos asset UUID.
+
+        Photos interactions carry ``source_id`` ``<asset_uuid>:<person_pk>``;
+        a bare ``<asset_uuid>`` also matches. The range scan on
+        ``(source_type, source_id)`` uses the unique index.
+        """
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                """
+                SELECT 1 FROM interactions
+                WHERE source_type = 'photos'
+                  AND (source_id = ? OR (source_id >= ? AND source_id < ?))
+                LIMIT 1
+                """,
+                (asset_uuid, asset_uuid + ":", asset_uuid + ";"),
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+
     def get_for_person(
         self,
         person_id: str,

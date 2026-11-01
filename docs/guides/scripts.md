@@ -330,7 +330,8 @@ The display `sources` column stores each call as `tool(json-args)` cut to 80 cha
 | `run_sync_wrapper.sh` | NVMe wake + pre-flight for nightly sync |
 | `run_sync_with_fda.sh` | FDA wrapper for phone/iMessage sync (macOS) |
 | `run_fda_syncs.py` | Python FDA sync orchestrator (macOS) |
-| `apple_data_export.py` | Export Apple data (iMessage, Contacts, Photos) on macOS |
+| `apple_data_export.py` | Export Apple data (iMessage, Contacts, Photos) on macOS; the photos export also stages one thumbnail per face-linked asset under `data/apple-imports/photos_thumbnails/` |
+| `photos_origin_helper.py` | Read-only Photos library reader run on the Mac over SSH by the API (`info`, `original`, `preview` subcommands); stdlib-only, Python 3.9 compatible. Also supplies the export's library discovery |
 | `apple_data_import.py` | Import Apple data exports on the server |
 | `apple_data_agent.sh` | Apple Data Agent orchestrator (runs on macOS, rsyncs to server) |
 
