@@ -16,6 +16,7 @@ What the tier allows, the token rules and the residual risks are in [MCP OAuth](
 |---|---|---|---|
 | `https://<host>.<tailnet>.ts.net` | tailnet only | `/` | LifeOS itself; never public |
 | `https://<host>.<tailnet>.ts.net:8443` | tailnet only | `/oauth/authorize` | The consent page |
+| `https://<host>.<tailnet>.ts.net:8443` | tailnet only | `/mcp` (optional) | The bearer-authenticated MCP endpoint for the operator's own clients; see [Tailnet route](#tailnet-route-for-your-own-clients) |
 | `https://<mcp-node>.<tailnet>.ts.net` | public (Funnel) | `/mcp`, `/.well-known/oauth-protected-resource`, `/.well-known/oauth-authorization-server`, `/oauth/register`, `/oauth/token`, `/oauth/revoke` | What the app's servers call |
 
 Connector platforms connect out only on port 443, and Funnel exposure is port-wide. LifeOS's own 443 must stay private, so the public paths live on a second node with its own hostname. It runs in a Docker container (`tailscale/tailscale`), so its network namespace holds no host service: a tailnet device connecting to it reaches nothing but what it publishes. Its only way into LifeOS is the transport's public unix-socket listener (`LIFEOS_MCP_HTTP_UDS`), mounted read-only. That listener serves only the paths in the table above, and a request through it never counts as a loopback peer, so it can never reach the consent page or the connected-apps list.
@@ -85,6 +86,35 @@ Revoking deletes the app's registration and tokens at once; to reconnect, the ap
 
 - **Close public access:** set `LIFEOS_MCP_FUNNEL_NODE=false`, then `docker rm -f lifeos-mcp-funnel`. The node goes offline, so nothing is public. Running `docker exec lifeos-mcp-funnel tailscale logout` first also removes it from the tailnet.
 - **Disable OAuth entirely:** empty `LIFEOS_OAUTH_OPERATOR_LOGINS` and restart `lifeos-mcp-http`. Every OAuth endpoint then returns `404`, and issued tokens stop working.
+
+## Tailnet route for your own clients
+
+The OAuth connected-apps endpoint above remains the route for the Claude and ChatGPT apps. For the operator's own tailnet clients (for example Muse), the same MCP transport can also be served to the tailnet only, authenticated by the full-access bearer token (`LIFEOS_MCP_BEARER_TOKEN`). A bearer client lists and calls the whole curated catalog, not the connected-app tier.
+
+1. Add the route to `config/tailscale-routes.local` (private, no `funnel=on`, `/mcp` only):
+
+   ```
+   https=8443 path=/mcp target=http://127.0.0.1:8765/mcp
+   ```
+
+   Do not mount `/` or `/oauth/*` on this port. The public node's path allowlist is unchanged.
+
+2. Apply it: `./scripts/setup-tailscale.sh` (or wait for the infra watchdog, which also keeps the port private as declared).
+
+3. Point the client at `https://<host>.<tailnet>.ts.net:8443/mcp` and configure it to send `Authorization: Bearer <token>`.
+
+Tailscale Serve relays tailnet requests from `127.0.0.1`, so a loopback peer proves nothing: `/mcp` requires a valid bearer (or OAuth) token from every peer, and an unauthenticated or wrong-token request gets `401`.
+
+Hand the token to the client through its secret or credential store (a password manager entry, or the client's own secret field). Never paste it into a chat, and never write it to a file in a repository. To rotate it, generate a new value with `openssl rand -hex 32`, update `.env`, restart `lifeos-mcp-http`, and update each client.
+
+Check from a tailnet machine, reading the token from your secret store into the environment:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' -X POST https://<host>.<tailnet>.ts.net:8443/mcp \
+  -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'   # 401
+curl -s -X POST https://<host>.<tailnet>.ts.net:8443/mcp -H "Authorization: Bearer $LIFEOS_MCP_BEARER_TOKEN" \
+  -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'   # full catalog
+```
 
 ## Troubleshooting
 

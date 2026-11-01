@@ -52,6 +52,7 @@ OAUTH_TOOL_TIER: dict[str, ToolClass] = {
     "lifeos_gmail_search": _read(),
     "lifeos_drive_search": _read(),
     "lifeos_vault_list": _read(),
+    "lifeos_vault_read": _read("reads one vault note by path; confined to the vault root"),
     "lifeos_conversations_list": _read(),
     "lifeos_memories_search": _read(),
     "lifeos_people_search": _read(),

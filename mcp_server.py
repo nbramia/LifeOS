@@ -218,6 +218,11 @@ CURATED_ENDPOINTS = {
         "description": "List vault notes in a folder or glob, newest first, with date, note type, tags and total. Use to browse structure before searching. `path` is vault-relative; page with `limit`/`offset`.",
         "method": "GET"
     },
+    "/api/vault/read": {
+        "name": "lifeos_vault_read",
+        "description": "Read one vault note's full Markdown content by path, with modified date, note type and tags. `path` is vault-relative (e.g. from lifeos_vault_list). Read-only.",
+        "method": "GET"
+    },
     "/api/conversations": {
         "name": "lifeos_conversations_list",
         "description": "List recent LifeOS conversations. Returns conversation IDs and titles for continuing previous chats.",
@@ -586,7 +591,7 @@ CURATED_ENDPOINTS = {
 
 # Contract count for the source catalog. The live fallback catalog is 71
 # curated tools plus 11 lifeos_agent_* tools = 82.
-CURATED_TOOL_COUNT = 72
+CURATED_TOOL_COUNT = 73
 
 # `search` and `fetch` in the shape ChatGPT connectors expect. Offered only to
 # OAuth-authenticated HTTP requests (see `OAuthToolAccess`); the stdio and
@@ -973,6 +978,13 @@ class LifeOSMCPServer:
                     "offset": {"type": "integer", "description": "Entries to skip for the next page (default 0).", "minimum": 0, "default": 0}
                 },
                 "required": []
+            },
+            "lifeos_vault_read": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Vault-relative path of the note, e.g. 'Work/Example.md'."}
+                },
+                "required": ["path"]
             },
             "lifeos_calendar_upcoming": {
                 "type": "object",
