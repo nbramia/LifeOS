@@ -54,6 +54,13 @@ def sync_google_sheets(dry_run: bool = True) -> dict:
             )
             return results
 
+        if results.get("status") == "error":
+            # The config file exists but could not be loaded: a real failure,
+            # distinct from "not configured". main() turns it into a nonzero
+            # exit.
+            logger.error(f"GSheet sync failed: {results.get('reason', 'unknown')}")
+            return {**results, "error": results.get("reason", "unknown")}
+
         new_rows = int(results.get("synced", 0) or 0)
         skipped_rows = int(results.get("skipped", 0) or 0)
         logger.info("\n=== Google Sheets Sync Results ===")
@@ -76,9 +83,23 @@ def sync_google_sheets(dry_run: bool = True) -> dict:
         return {"status": "error", "error": str(e)}
 
 
-if __name__ == '__main__':
+def main(argv=None):
     parser = argparse.ArgumentParser(description='Sync Google Sheets to vault')
     parser.add_argument('--execute', action='store_true', help='Actually sync sheets')
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    sync_google_sheets(dry_run=not args.execute)
+    results = sync_google_sheets(dry_run=not args.execute)
+
+    # A sync that failed outright (an unreadable config, expired OAuth) must
+    # exit nonzero so run_all_syncs records FAILED instead of success. A
+    # "not configured" skip stays a clean exit.
+    if results.get("status") == "error":
+        logger.error(
+            f"Google Sheets sync failed ({results.get('error', 'unknown')}) — "
+            f"exiting nonzero so the orchestrator records a failure"
+        )
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()

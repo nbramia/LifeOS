@@ -119,6 +119,64 @@ class TestGoogleDocsSyncExitCodes:
         main([])  # no SystemExit
 
 
+class TestGoogleSheetsSyncExitCodes:
+    """scripts/sync_google_sheets.py must fail loudly on a real failure and
+    stay a clean skip when no sheets are configured."""
+
+    def test_config_parse_error_exits_nonzero(self, capsys):
+        """A config file that exists but can't be loaded → exit code 1, with no
+        zero-count success stats emitted."""
+        from scripts.sync_google_sheets import main
+
+        parse_error = {
+            "synced": 0, "failed": 0, "skipped": 0, "sheets": [],
+            "status": "error",
+            "reason": "gsheet_config_parse_error: bad indentation",
+        }
+        with patch("api.services.gsheet_sync.sync_gsheets", return_value=parse_error):
+            with pytest.raises(SystemExit) as exc_info:
+                main(["--execute"])
+
+        assert exc_info.value.code == 1
+        assert "SYNC_STATS" not in capsys.readouterr().out
+
+    def test_sync_raising_exits_nonzero(self):
+        from scripts.sync_google_sheets import main
+
+        with patch(
+            "api.services.gsheet_sync.sync_gsheets",
+            side_effect=RuntimeError("invalid_grant: Token has been expired"),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                main(["--execute"])
+
+        assert exc_info.value.code == 1
+
+    def test_not_configured_is_a_clean_skip(self, capsys):
+        from scripts.sync_google_sheets import main
+
+        skipped = {
+            "synced": 0, "failed": 0, "skipped": 0, "sheets": [],
+            "status": "skipped", "reason": "gsheet_sync_not_configured",
+        }
+        with patch("api.services.gsheet_sync.sync_gsheets", return_value=skipped):
+            main(["--execute"])  # no SystemExit
+
+        assert "SYNC_SKIPPED" in capsys.readouterr().out
+
+    def test_healthy_execute_exits_cleanly(self):
+        from scripts.sync_google_sheets import main
+
+        healthy = {"synced": 2, "failed": 0, "skipped": 1, "sheets": []}
+        with patch("api.services.gsheet_sync.sync_gsheets", return_value=healthy):
+            main(["--execute"])  # no SystemExit
+
+    def test_dry_run_exits_cleanly(self):
+        from scripts.sync_google_sheets import main
+
+        main([])  # no SystemExit
+
+
 class TestGmailCalendarSyncExitCodes:
     """scripts/sync_gmail_calendar_interactions.py must fail loudly on
     account-level (fatal) errors while tolerating per-message errors."""
