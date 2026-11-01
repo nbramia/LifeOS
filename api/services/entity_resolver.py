@@ -104,6 +104,8 @@ from config.people_config import (  # noqa: E402
     normalize_domain,
 )
 from config.relationship_weights import (  # noqa: E402
+    CLEARLY_CLOSER_MIN_STRENGTH_LEAD,
+    CLOSE_RELATIONSHIP_MIN_STRENGTH,
     RELATIONSHIP_STRENGTH_BOOST_MAX,
     RELATIONSHIP_STRENGTH_BOOST_WEIGHT,
     FIRST_NAME_ONLY_BOOST_MULTIPLIER,
@@ -572,9 +574,8 @@ class EntityResolver:
                     passing_candidates[0].confidence = min(passing_candidates[0].score / 100.0, 1.0)
                 else:
                     # Check relationship strength as tiebreaker
-                    CLOSE_THRESHOLD = 30
                     close_matches = [c for c in passing_candidates
-                                     if c.entity.relationship_strength >= CLOSE_THRESHOLD]
+                                     if c.entity.relationship_strength >= CLOSE_RELATIONSHIP_MIN_STRENGTH]
 
                     if len(close_matches) == 1:
                         # Only one is "close" - use that one
@@ -586,7 +587,7 @@ class EntityResolver:
                         close_matches.sort(key=lambda c: c.entity.relationship_strength, reverse=True)
                         strength_diff = close_matches[0].entity.relationship_strength - close_matches[1].entity.relationship_strength
 
-                        if strength_diff >= 25:
+                        if strength_diff >= CLEARLY_CLOSER_MIN_STRENGTH_LEAD:
                             # One person is clearly closer
                             close_matches[0].score += 10
                             close_matches[0].match_type = "first_name_relationship_dominant"

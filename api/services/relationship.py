@@ -203,10 +203,9 @@ class Relationship:
         """
         Calculate pair relationship strength (0-100 scale).
 
-        Uses the same formula as person relationship strength:
+        A separate formula from person relationship strength, with its own constants:
             strength = (recency × 0.30) + (frequency × 0.60) + (diversity × 0.10)
 
-        This unifies edge_weight and relationship_strength into a single metric.
         Uses adjusted frequency scaling to work for both high-interaction (owner)
         and low-interaction (non-owner) edges.
 
@@ -218,7 +217,6 @@ class Relationship:
         import math
         from datetime import timezone
 
-        # Constants - match relationship_weights.py but adjusted for pair relationships
         RECENCY_WEIGHT = 0.30
         FREQUENCY_WEIGHT = 0.60
         DIVERSITY_WEIGHT = 0.10
@@ -227,7 +225,7 @@ class Relationship:
         # Frequency target tuned for pair relationships
         # Owner edges avg ~36, non-owner avg ~1.6, max 387
         # Use lower target so non-owner edges with 10-50 interactions get reasonable scores
-        FREQUENCY_TARGET = 100  # Lower than person strength (250) for better non-owner spread
+        FREQUENCY_TARGET = 100
 
         # Interaction type weights (same rationale as relationship_weights.py)
         TYPE_WEIGHTS = {

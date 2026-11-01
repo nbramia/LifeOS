@@ -148,7 +148,7 @@ def _make_interactions_db(tmp_path, existing_ids=None) -> str:
         CREATE TABLE IF NOT EXISTS interactions (
             id TEXT PRIMARY KEY, person_id TEXT, timestamp TEXT,
             source_type TEXT, title TEXT, snippet TEXT,
-            source_link TEXT, source_id TEXT, created_at TEXT
+            source_link TEXT, source_id TEXT, created_at TEXT, attendee_count INTEGER
         )
     """)
     for sid in (existing_ids or []):
@@ -454,6 +454,68 @@ class TestProcessWhatsAppMessagesOutgoingGroup:
             )
 
         assert stats["outgoing_group_created"] == 0
+
+
+class TestProcessWhatsAppMessagesGroupSize:
+    """attendee_count holds the group's size on group rows and NULL on direct ones."""
+
+    GROUP = "120363001@g.us"
+    PARTICIPANTS = [
+        {"group_jid": GROUP, "user_jid": "15559876543@s.whatsapp.net"},
+        {"group_jid": GROUP, "user_jid": "15559876544@s.whatsapp.net"},
+        {"group_jid": GROUP, "user_jid": "15559876545@s.whatsapp.net"},
+    ]
+
+    def _run(self, tmp_path, message):
+        int_db = _make_interactions_db(tmp_path)
+        message = {"msg_id": "m1", "ts": "2026-02-25T10:00:00+00:00", "sender_name": "Pat", **message}
+        with patch("api.services.whatsapp.get_entity_resolver", return_value=_mock_resolver_returning("p1")), \
+             patch("api.services.whatsapp.get_interaction_db_path", return_value=int_db), \
+             patch("api.services.person_stats.refresh_person_stats"):
+            process_whatsapp_messages(
+                messages=[message],
+                group_participants=self.PARTICIPANTS,
+                lid_contacts=[],
+                lid_phones={},
+                dry_run=False,
+                my_person_id="me",
+            )
+        conn = sqlite3.connect(int_db)
+        try:
+            return conn.execute("SELECT source_id, attendee_count FROM interactions ORDER BY source_id").fetchall()
+        finally:
+            conn.close()
+
+    def test_incoming_group(self, tmp_path):
+        rows = self._run(tmp_path, {
+            "chat_jid": self.GROUP, "sender_jid": "15559876543@s.whatsapp.net", "from_me": 0,
+        })
+        assert rows == [("whatsapp_m1", 3)]
+
+    def test_outgoing_group_fanout(self, tmp_path):
+        rows = self._run(tmp_path, {
+            "chat_jid": self.GROUP, "sender_jid": "me@s.whatsapp.net", "from_me": 1,
+        })
+        assert rows == [(f"whatsapp_m1:{p['user_jid']}", 3) for p in self.PARTICIPANTS]
+
+    def test_group_with_unknown_membership_is_marked_with_zero(self, tmp_path):
+        rows = self._run(tmp_path, {
+            "chat_jid": "999999@g.us", "sender_jid": "15559876543@s.whatsapp.net", "from_me": 0,
+        })
+        assert rows == [("whatsapp_m1", 0)]
+
+    def test_incoming_direct_is_null(self, tmp_path):
+        rows = self._run(tmp_path, {
+            "chat_jid": "15559876543@s.whatsapp.net", "sender_jid": "15559876543@s.whatsapp.net", "from_me": 0,
+        })
+        assert rows == [("whatsapp_m1", None)]
+
+    def test_outgoing_direct_is_null(self, tmp_path):
+        rows = self._run(tmp_path, {
+            "chat_jid": "15559876543@s.whatsapp.net", "chat_name": "Pat",
+            "sender_jid": "me@s.whatsapp.net", "from_me": 1,
+        })
+        assert rows == [("whatsapp_m1", None)]
 
 
 class TestProcessWhatsAppMessagesLidPhone:

@@ -577,6 +577,61 @@ class TestParseName:
 
 
 @pytest.mark.unit
+class TestFirstNameStrengthTiebreak:
+    """Two first-name candidates with close scores are separated by relationship strength."""
+
+    CONTEXT = "Work/Acme/notes.md"
+
+    def _resolve(self, temp_store, first_strength, second_strength):
+        for last, strength in (("Alpha", first_strength), ("Beta", second_strength)):
+            person = PersonEntity(canonical_name=f"Robin {last}", vault_contexts=["Work/Acme/"])
+            person.relationship_strength = strength
+            temp_store.add(person)
+        return EntityResolver(temp_store).resolve_by_name("Robin", context_path=self.CONTEXT)
+
+    def test_at_the_close_cutoff_settles_it(self, temp_store):
+        result = self._resolve(temp_store, 14.0, 13.9)
+        assert result.entity.canonical_name == "Robin Alpha"
+        assert result.match_type == "first_name_close_unique"
+
+    def test_below_the_close_cutoff_stays_ambiguous(self, temp_store):
+        assert self._resolve(temp_store, 13.9, 13.8) is None
+
+    def test_a_clear_lead_settles_two_close_people(self, temp_store):
+        result = self._resolve(temp_store, 50.0, 20.0)
+        assert result.entity.canonical_name == "Robin Alpha"
+        assert result.match_type == "first_name_relationship_dominant"
+
+    def test_a_smaller_lead_stays_ambiguous(self, temp_store):
+        assert self._resolve(temp_store, 49.9, 20.0) is None
+
+
+@pytest.mark.unit
+class TestStrengthBoost:
+    """A bare first name needs 40 points: 25 for the name, the rest from strength."""
+
+    def _resolve(self, temp_store, strength):
+        for last, value in (("Alpha", strength), ("Beta", 0.0)):
+            person = PersonEntity(canonical_name=f"Robin {last}")
+            person.relationship_strength = value
+            temp_store.add(person)
+        return EntityResolver(temp_store).resolve_by_name("Robin")
+
+    def test_strength_that_earns_the_missing_points_resolves(self, temp_store):
+        result = self._resolve(temp_store, 25.0)
+        assert result.entity.canonical_name == "Robin Alpha"
+        assert result.match_type == "first_name_context_clear"
+
+    def test_strength_just_short_of_them_does_not(self, temp_store):
+        assert self._resolve(temp_store, 24.9) is None
+
+    def test_the_boost_stops_at_its_cap(self, temp_store):
+        """At the cap a stronger person earns no more: 25 name + 25 * 1.5 boost + 10 clear."""
+        result = self._resolve(temp_store, 100.0)
+        assert result.confidence == pytest.approx(0.725)
+
+
+@pytest.mark.unit
 class TestSingleLetterFirstNameEntity:
     """
     An entity whose first name is a single letter must not swallow every query

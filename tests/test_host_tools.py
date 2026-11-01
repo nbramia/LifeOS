@@ -1168,7 +1168,7 @@ def test_task_file_accepts_plain_edits_and_new_plain_tasks(config, task_vault):
     (lambda s: s.replace("- [ ] TODO Synthetic engine", "- [x] TODO Synthetic engine"), "owned by an engine"),
     (lambda s: s.replace("[parent_id:: aaaa1111]", "[parent_id:: cccc3333]"), "parent_id"),
     (lambda s: s + "- [ ] TODO Synthetic [parent_id:: aaaa1111]\n", "parent_id"),
-    (lambda s: "\n".join(l for l in s.splitlines() if "aaaa1111 -->" not in l) + "\n", "removed"),
+    (lambda s: "\n".join(line for line in s.splitlines() if "aaaa1111 -->" not in line) + "\n", "removed"),
 ])
 def test_task_file_refuses_routing_assignment_and_structure_changes(config, task_vault, change, reason):
     with pytest.raises(HostToolError, match=reason):

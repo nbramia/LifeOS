@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** CRM
-> **Last Updated:** 2026-02-20
+> **Last Updated:** 2026-11-01
 
 How LifeOS links source entities from different data sources to canonical person records.
 
@@ -87,8 +87,8 @@ When the query is a single word (e.g., "Sarah" with no last name), special disam
 | Single candidate | +15 bonus points, match type `first_name_unique` |
 | One candidate passes min threshold (40) | +10 bonus points, match type `first_name_context_clear` |
 | Multiple passing, score gap >= 20 | Top candidate gets +10 bonus |
-| Multiple passing, close scores, one has relationship_strength >= 30 | That candidate gets +15 bonus |
-| Multiple passing, close scores, one has strength lead >= 25 | That candidate gets +10 bonus |
+| Multiple passing, close scores, one has relationship_strength >= 14 | That candidate gets +15 bonus |
+| Multiple passing, close scores, several at >= 14, one has a strength lead >= 30 | That candidate gets +10 bonus |
 | Multiple passing, truly ambiguous | Returns empty (no match) |
 
 ---
@@ -123,8 +123,10 @@ All scoring constants are defined in `config/relationship_weights.py`:
 | `MIN_MATCH_SCORE` | 40 | Minimum score for a valid match |
 | `DISAMBIGUATION_THRESHOLD` | 15 | Score gap below which match is ambiguous |
 | `RELATIONSHIP_STRENGTH_BOOST_MAX` | 25 | Max relationship boost points |
-| `RELATIONSHIP_STRENGTH_BOOST_WEIGHT` | 0.25 | Multiplier: strength * weight = points |
+| `RELATIONSHIP_STRENGTH_BOOST_WEIGHT` | 0.40 | Multiplier: strength * weight = points |
 | `FIRST_NAME_ONLY_BOOST_MULTIPLIER` | 1.5 | Extra relationship boost for first-name queries |
+| `CLOSE_RELATIONSHIP_MIN_STRENGTH` | 14 | Strength that makes a first-name candidate "close" |
+| `CLEARLY_CLOSER_MIN_STRENGTH_LEAD` | 30 | Strength lead that settles a tie between close candidates |
 
 ## Related Documents
 

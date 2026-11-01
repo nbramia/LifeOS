@@ -9,30 +9,45 @@ Central configuration for all weights used in:
 Edit this file to tune relationship scoring behavior.
 """
 
+import json
+import logging
+from pathlib import Path
+
 # =============================================================================
 # RELATIONSHIP STRENGTH WEIGHTS
 # =============================================================================
-# Formula: strength = (recency × RECENCY_WEIGHT) + (frequency × FREQUENCY_WEIGHT) + (diversity × DIVERSITY_WEIGHT)
+# Formula:
+#   strength = 100 * (recency * RECENCY_WEIGHT
+#                     + recent_frequency * RECENT_FREQUENCY_WEIGHT
+#                     + lifetime_frequency * LIFETIME_FREQUENCY_WEIGHT
+#                     + diversity * DIVERSITY_WEIGHT)
+# The family and LinkedIn multipliers apply to the result, capped at 100.
+#
+# Pair strength (Relationship.pair_strength in api/services/relationship.py) is
+# a separate formula with its own constants; nothing here affects it.
 
-RECENCY_WEIGHT = 0.30     # How much recent contact matters
-FREQUENCY_WEIGHT = 0.60   # How much total interaction volume matters
-DIVERSITY_WEIGHT = 0.10   # How much multi-channel communication matters
+RECENCY_WEIGHT = 0.25             # How recently the last real interaction happened
+RECENT_FREQUENCY_WEIGHT = 0.55    # Decayed volume of interaction: the current relationship
+LIFETIME_FREQUENCY_WEIGHT = 0.15  # Undecayed volume: a long history doesn't vanish entirely
+DIVERSITY_WEIGHT = 0.05           # How many channels are in use
 
-# Parameters for component scores
-RECENCY_WINDOW_DAYS = 200     # Days after which recency score drops to 0
-FREQUENCY_TARGET = 250        # Weighted interactions for max frequency score (higher = better spread)
-FREQUENCY_WINDOW_DAYS = 365   # Window for counting recent interactions
+# recency = 0.5 ** (days_since_last_real_interaction / RECENCY_HALF_LIFE_DAYS)
+RECENCY_HALF_LIFE_DAYS = 45
 
-# Logarithmic frequency scaling - spreads out scores between casual and close contacts
-# With log scaling: log(1+count)/log(1+target) instead of count/target
-USE_LOG_FREQUENCY_SCALING = True
+# recent_frequency = min(1, log(1 + S) / log(1 + RECENT_FREQUENCY_TARGET))
+# where S = sum of weight * 0.5 ** (age_days / RECENT_FREQUENCY_HALF_LIFE_DAYS)
+RECENT_FREQUENCY_HALF_LIFE_DAYS = 90
+RECENT_FREQUENCY_TARGET = 600
 
-# Lifetime frequency component - ensures historical relationships don't completely vanish
-# Combines: (recent_freq * RECENT_WEIGHT) + (lifetime_freq * LIFETIME_WEIGHT)
-LIFETIME_FREQUENCY_ENABLED = True
-LIFETIME_FREQUENCY_WEIGHT = 0.35   # % of frequency score from lifetime interactions
-RECENT_FREQUENCY_WEIGHT = 0.65    # % of frequency score from recent (365-day) interactions
-LIFETIME_FREQUENCY_TARGET = 1250  # Higher target for all-time (harder to max out)
+# lifetime_frequency = min(1, log(1 + W) / log(1 + LIFETIME_FREQUENCY_TARGET))
+# where W = sum of weight over LIFETIME_WINDOW_DAYS
+LIFETIME_FREQUENCY_TARGET = 2500
+LIFETIME_WINDOW_DAYS = 3650
+
+# Subtypes that say nothing about this person's own activity. A group message you
+# sent is one row per participant, whether or not they ever reply, so it earns
+# frequency at its reduced weight but no recency credit.
+SUBTYPES_WITHOUT_RECENCY_CREDIT = frozenset({"whatsapp_group_sent"})
 
 # Recency discount for zero-interaction contacts
 # People with no tracked interactions get NO recency credit
@@ -47,6 +62,28 @@ PERIPHERAL_THRESHOLD = 5.0
 
 
 # =============================================================================
+# RELATIONSHIP STRENGTH CUTOFFS
+# =============================================================================
+# What a relationship_strength (0-100) means to the code reading it. Scores are
+# weighted toward current contact, so most people sit well below the midpoint and
+# these bands sit lower than the raw scale suggests.
+
+CLOSE_RELATIONSHIP_MIN_STRENGTH = 14    # Close enough to settle a first-name tie, or to offer in disambiguation
+CLEARLY_CLOSER_MIN_STRENGTH_LEAD = 30   # Lead that settles a first-name tie between two close people
+DEEP_CONTEXT_MIN_STRENGTH = 53          # Queries about this person fetch deep context by default
+NORMAL_CONTEXT_MIN_STRENGTH = 18        # Below this they fetch shallow context
+MIN_STRENGTH_FOR_INDEX = 9              # Eligible for the people index, with or without recent activity
+
+# Wording of a person's indexed profile, highest band first. Lower reads "Distant".
+STRENGTH_DESCRIPTION_BANDS: tuple[tuple[int, str], ...] = (
+    (65, "Very strong"),
+    (40, "Strong"),
+    (18, "Moderate"),
+    (11, "Light"),
+)
+
+
+# =============================================================================
 # MANUAL STRENGTH OVERRIDES (loaded from config/relationship_overrides.json)
 # =============================================================================
 # Force specific people to have a fixed relationship strength regardless of
@@ -54,10 +91,6 @@ PERIPHERAL_THRESHOLD = 5.0
 # Keys are person IDs (UUIDs), values are strength (0-100).
 #
 # To configure, create config/relationship_overrides.json (see .example.json)
-
-import json
-from pathlib import Path
-import logging
 
 _logger = logging.getLogger(__name__)
 
@@ -87,7 +120,7 @@ STRENGTH_OVERRIDES_BY_ID, CIRCLE_OVERRIDES_BY_ID = _load_relationship_overrides(
 # =============================================================================
 # INTERACTION TYPE WEIGHTS
 # =============================================================================
-# Weight applied to each interaction when calculating frequency score.
+# Weight applied to each interaction when calculating frequency scores.
 # Higher weight = interaction counts more toward relationship strength.
 #
 # Rationale:
@@ -141,6 +174,12 @@ DEFAULT_INTERACTION_WEIGHT = 1.0
 # More granular weights for interaction subtypes (parsed from title/metadata).
 # These override the base INTERACTION_TYPE_WEIGHTS when available.
 
+# Share of the whatsapp weight a group message carries. A group message you sent
+# is one row per participant, so it says little about any one of them; a group
+# message you received at least came from that person.
+WHATSAPP_GROUP_SENT_MULTIPLIER = 0.15
+WHATSAPP_GROUP_RECEIVED_MULTIPLIER = 0.35
+
 INTERACTION_SUBTYPE_WEIGHTS: dict[str, float] = {
     # Gmail subtypes (parsed from title prefix: →/←/↔)
     "gmail_received": 1.0,      # ← prefix - received email
@@ -151,6 +190,10 @@ INTERACTION_SUBTYPE_WEIGHTS: dict[str, float] = {
     "calendar_1on1": 6.0,         # 1 other attendee - high intimacy
     "calendar_small_group": 4.0,  # 2-5 other attendees
     "calendar_large_meeting": 2.0,  # 6+ other attendees - diluted attention
+
+    # WhatsApp group subtypes (derived from attendee_count and source_id)
+    "whatsapp_group_sent": INTERACTION_TYPE_WEIGHTS["whatsapp"] * WHATSAPP_GROUP_SENT_MULTIPLIER,
+    "whatsapp_group_received": INTERACTION_TYPE_WEIGHTS["whatsapp"] * WHATSAPP_GROUP_RECEIVED_MULTIPLIER,
 }
 
 
@@ -185,8 +228,8 @@ MIN_MATCH_SCORE = 40.0           # Minimum score to consider a valid match
 
 # Relationship strength boost for name-only resolution
 # When resolving by name only (no email/phone), prefer people with existing relationship
-RELATIONSHIP_STRENGTH_BOOST_MAX = 25    # Max points for relationship strength boost (0-100 strength -> 0-25 points)
-RELATIONSHIP_STRENGTH_BOOST_WEIGHT = 0.25  # Multiplier: strength * weight = boost points
+RELATIONSHIP_STRENGTH_BOOST_MAX = 25    # Max points for relationship strength boost (reached at strength 62.5)
+RELATIONSHIP_STRENGTH_BOOST_WEIGHT = 0.40  # Multiplier: strength * weight = boost points
 
 # First-name-only boost multiplier
 # When matching just "Ben" instead of "Ben Calvin", apply stronger relationship boost
@@ -234,53 +277,6 @@ def get_interaction_weight(
         return base_weight * multiplier
 
     return base_weight
-
-
-def compute_weighted_interaction_count(interactions_by_type: dict[str, int]) -> float:
-    """
-    Compute weighted interaction count from a breakdown by type.
-
-    Args:
-        interactions_by_type: Dict mapping source_type to count
-
-    Returns:
-        Weighted sum of interactions
-    """
-    total = 0.0
-    for source_type, count in interactions_by_type.items():
-        weight = get_interaction_weight(source_type)
-        total += count * weight
-    return total
-
-
-def compute_weighted_interaction_count_detailed(
-    interactions: list[dict],
-) -> float:
-    """
-    Compute weighted interaction count using detailed subtype and account info.
-
-    This is the preferred method when subtype and account data is available,
-    as it provides more accurate weighting.
-
-    Args:
-        interactions: List of dicts with keys:
-            - source_type: str (required)
-            - subtype: str | None (optional)
-            - source_account: str | None (optional, "personal" or "work")
-            - count: int (required)
-
-    Returns:
-        Weighted sum of interactions
-    """
-    total = 0.0
-    for item in interactions:
-        weight = get_interaction_weight(
-            item["source_type"],
-            item.get("subtype"),
-            item.get("source_account"),
-        )
-        total += item["count"] * weight
-    return total
 
 
 # =============================================================================

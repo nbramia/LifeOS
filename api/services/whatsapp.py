@@ -454,8 +454,8 @@ def process_whatsapp_messages(
                 int_cursor.executemany(
                     """
                     INSERT OR IGNORE INTO interactions
-                        (id, person_id, timestamp, source_type, title, snippet, source_link, source_id, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (id, person_id, timestamp, source_type, title, snippet, source_link, source_id, created_at, attendee_count)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     batch,
                 )
@@ -485,6 +485,9 @@ def process_whatsapp_messages(
 
                 ts = parse_message_timestamp(msg.get("ts"))
                 snippet = text[:500] if text else ""
+                # Marks a group message for weighting: the group's size, which is
+                # 0 when its membership isn't known. NULL for a direct message.
+                attendee_count = group_sizes.get(chat_jid, 0) if is_group else None
 
                 # Outgoing group: fan out to each non-self participant
                 if from_me and is_group:
@@ -542,6 +545,7 @@ def process_whatsapp_messages(
                             None,
                             participant_source_id,
                             datetime.now(timezone.utc).isoformat(),
+                            attendee_count,
                         ))
                         stats["outgoing_group_created"] += 1
                     continue
@@ -606,6 +610,7 @@ def process_whatsapp_messages(
                     None,
                     source_id,
                     datetime.now(timezone.utc).isoformat(),
+                    attendee_count,
                 ))
 
                 if len(batch) >= batch_size:

@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-09-05
+**Last Updated:** 2026-11-01
 
 Every `/api/crm/*` HTTP endpoint. Split out of the main [api-reference.md](api-reference.md) because the CRM endpoint catalog is large enough to deserve its own file. For the consumer view of the CRM features these endpoints back, see the [CRM specs](crm-ui.md).
 
@@ -96,7 +96,7 @@ Related people with overlap scores.
 
 ### GET /api/crm/people/{id}/strength
 
-Detailed relationship strength components.
+Detailed relationship strength components: `overall_strength`, `multiplier`, and one object each for `recency`, `recent_frequency`, `lifetime_frequency`, and `diversity`, holding the component's `score`, `weight`, and `weighted_score` plus the measurements behind it. See [Relationship Strength Scoring](crm-people.md#relationship-strength-scoring).
 
 ### GET /api/crm/people/{id}/source-entities
 
