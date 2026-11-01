@@ -88,6 +88,25 @@ class TestGenerateSummary:
         assert "[... content truncated ...]" in prompt
 
     @patch("api.services.summarizer.httpx.Client")
+    def test_disables_thinking(self, mock_client_class):
+        """Should turn thinking off so reasoning cannot consume the token budget."""
+        from api.services.summarizer import generate_summary
+
+        mock_client = MagicMock()
+        mock_client_class.return_value.__enter__ = MagicMock(return_value=mock_client)
+        mock_client_class.return_value.__exit__ = MagicMock(return_value=False)
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "choices": [{"message": {"content": "A valid summary text here."}}]
+        }
+        mock_client.post.return_value = mock_response
+
+        generate_summary("Some document content. " * 20, "test.md")
+
+        payload = mock_client.post.call_args[1]["json"]
+        assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+
+    @patch("api.services.summarizer.httpx.Client")
     def test_returns_none_on_timeout(self, mock_client_class):
         """Should return (None, False) on LLM timeout for retry tracking."""
         import httpx
