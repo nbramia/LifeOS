@@ -298,7 +298,7 @@ def _grant_scratch_access(config: HostToolsConfig, scratch: Path) -> None:
         entry = f"u:{config.run_as}:rX"
         try:
             result = config.runner(
-                [setfacl, "-R", "-m", entry, "-m", f"d:{entry}", str(scratch)],
+                [setfacl, "-R", "-P", "-m", entry, "-m", f"d:{entry}", str(scratch)],
                 capture_output=True, text=True, timeout=30, check=False,
             )
         except (OSError, subprocess.SubprocessError) as exc:
@@ -458,6 +458,18 @@ def fs_read(config: HostToolsConfig, arguments: dict) -> dict:
     }
 
 
+def _inside_git_work_tree(root: Path) -> bool:
+    """Whether the vault is a git work tree, or a folder inside one."""
+    try:
+        probe = subprocess.run(
+            [*_GIT_PREFIX, "-C", str(root), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe.returncode == 0 and probe.stdout.strip() == "true"
+
+
 def _vault_commit(root: Path, rel: PurePosixPath) -> str | None:
     """Commit one vault path as the LifeOS account.
 
@@ -466,8 +478,6 @@ def _vault_commit(root: Path, rel: PurePosixPath) -> str | None:
     that path is committed, so unrelated uncommitted changes stay out.
     Returns the short commit sha, or None when there was nothing to commit.
     """
-    if not (root / ".git").exists():
-        return None
     git = (*_GIT_PREFIX, "-C", str(root))
     add = subprocess.run([*git, "add", "--", str(rel)], capture_output=True, text=True, timeout=30, check=False)
     if add.returncode != 0:
@@ -522,10 +532,10 @@ def fs_write(config: HostToolsConfig, arguments: dict) -> dict:
         "commit": None,
     }
     if name == "vault" and config.vault_autocommit:
-        if (root / ".git").exists():
+        if _inside_git_work_tree(root):
             result["commit"] = _vault_commit(root, rel)
         else:
-            # A synced vault copy with no git repository: the file is saved,
+            # A synced vault copy outside any git work tree: the file is saved,
             # but say plainly that nothing was committed.
             result["commit_skipped"] = "the vault on this host is not a git repository"
     return result

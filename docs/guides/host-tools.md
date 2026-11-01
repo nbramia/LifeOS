@@ -14,7 +14,7 @@ Host tools give an MCP client scoped access to the LifeOS host: read and list fi
 |---|---|---|
 | `lifeos_fs_list` | Lists one directory | Roots `vault`, `scratch`, `lifeos`, `logs`; 500 entries |
 | `lifeos_fs_read` | Reads one text file | Same roots; 512 KB; binary files refused |
-| `lifeos_fs_write` | Writes one text file (`overwrite`, `create` or `append`) | Roots `vault` and `scratch` only; 1 MB; a vault write is committed when the vault is a git repository |
+| `lifeos_fs_write` | Writes one text file (`overwrite`, `create` or `append`) | Roots `vault` and `scratch` only; 1 MB; a vault write is committed when the vault is inside a git repository |
 | `lifeos_shell` | Runs one allowlisted command, argv only, no shell | Runs as `LIFEOS_HOST_TOOLS_RUN_AS`; 30 s; 64 KB of output per stream |
 | `lifeos_logs` | Returns the last lines of a LifeOS service's log, optionally filtered | Named services only; 1,000 lines |
 
@@ -29,7 +29,7 @@ Paths are a root name plus a relative path. Absolute paths, `~` and `..` are ref
 
 A vault write is committed with the message `Host tools: update <path>`, committing only that path (taken literally, never as a pattern), so other uncommitted vault changes stay out of the commit. The commit runs with git hooks and the filesystem monitor disabled. It is not pushed. Set `LIFEOS_HOST_TOOLS_VAULT_AUTOCOMMIT=false` to leave writes uncommitted.
 
-If the vault on the host is not a git repository (for example, a copy kept in step by a sync tool, with git living on another machine), a write is saved but not committed, and the result says so in `commit_skipped`. Whatever syncs that copy carries the write; commit it where the repository lives.
+If the vault on the host is not inside a git repository (for example, a copy kept in step by a sync tool, with git living on another machine), a write is saved but not committed, and the result says so in `commit_skipped`. Whatever syncs that copy carries the write; commit it where the repository lives.
 
 A new file is written with mode `0644`. An overwritten file keeps its mode. Writes go through a temporary file that is renamed into place, so extended ACL entries set on the old file are not carried over: give the vault a default ACL for the run-as account (step 3) so rewritten notes stay readable to it.
 

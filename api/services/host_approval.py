@@ -394,9 +394,12 @@ class ApprovalGate:
             logger.warning("host approval run notice failed: %s", exc)
 
 
-def already_decided_text(row: ApprovalRow) -> str:
+def already_decided_text(row: ApprovalRow, now: float | None = None) -> str:
     """The listener's answer to a reply to a request that is not pending."""
-    return f"Request {row.short_id} is no longer waiting ({row.state}). Nothing changed."
+    state = row.state
+    if state == "pending" and row.expires_at is not None and row.expires_at <= (time.time() if now is None else now):
+        state = "expired"
+    return f"Request {row.short_id} is no longer waiting ({state}). Nothing changed."
 
 
 def unthreaded_approve_text(rows: list[ApprovalRow]) -> str:
