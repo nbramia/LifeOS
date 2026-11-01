@@ -52,7 +52,10 @@ class TestCRMConfig:
         from unittest.mock import patch, PropertyMock
         from config.settings import Settings
 
-        with patch.object(Settings, "photos_enabled", new_callable=PropertyMock, return_value=False):
+        # No staged thumbnails either (photos_enabled is also true when
+        # thumbnails staged by the Apple Data Agent export exist).
+        with patch.object(Settings, "photos_enabled", new_callable=PropertyMock, return_value=False), \
+             patch.object(Settings, "photos_thumbnails_available", new_callable=PropertyMock, return_value=False):
             response = client.get("/api/crm/config")
 
         assert response.status_code == 200

@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** CRM
-**Last Updated:** 2026-09-04
+**Last Updated:** 2026-11-01
 
 The interaction timeline (chronological view of every observed touchpoint with a person) and the data-source integrations that feed it: Gmail, Calendar, iMessage, Apple Contacts, Slack, WhatsApp, Signal.
 
@@ -80,6 +80,7 @@ Behavior:
 - Source-type filter dropdown narrows the list.
 - Clicking an interaction opens the source link — `mailto:` / Google Calendar URL / `obsidian://` / `imessage://` etc.
 - Infinite scroll loads older interactions.
+- Photos are grouped per day into one collapsed "N photos" row; expanding it lists each photo's thumbnail. Clicking a thumbnail (or "View") opens an in-page viewer that shows the thumbnail at once and swaps in a larger preview from the Photos Mac when `GET /api/crm/config`'s `photos_originals_enabled` is true. The viewer closes with its close button, Esc, or a click on the backdrop. A "Download original" button is enabled when the original is on the Mac; otherwise it is disabled with the note "Original isn't on the Mac". When the Mac is offline the thumbnail stays with the note "The Mac is offline"; when originals are not configured the viewer is thumbnail-only with no button and no error. Videos show their thumbnail and a download button and are never played.
 - On the Me and Family timelines (`/me`, `/family` — see [crm-analytics.md](crm-analytics.md)), an interaction still attributed to a person id that was merged into another person displays under the surviving person's name, following the merge chain the same way a direct person lookup does.
 
 ---

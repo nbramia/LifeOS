@@ -4,14 +4,20 @@ Apple Photos API endpoints for LifeOS.
 Provides endpoints for querying Photos face recognition data
 and syncing to LifeOS CRM.
 """
+import mimetypes
+import re
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 
 from api.routes.crm import _mutation_lock
+from api.services import photos_origin
 from config.settings import settings
 
 router = APIRouter(prefix="/api/photos", tags=["photos"])
@@ -74,6 +80,23 @@ def _check_photos_enabled():
             status_code=503,
             detail="Photos integration not available. Photos library not mounted or accessible."
         )
+
+
+def _require_uuid(uuid: str) -> str:
+    """Return the canonical (uppercase) asset UUID, or raise 400.
+
+    Strict on purpose: the value names files on disk and a remote command
+    argument, so nothing but hex digits and hyphens gets through.
+    """
+    if not photos_origin.UUID_RE.match(uuid):
+        raise HTTPException(status_code=400, detail="Invalid photo UUID")
+    return uuid.upper()
+
+
+def _asset_uuid(source_id: Optional[str]) -> str:
+    """The Photos asset UUID of a photos interaction's ``source_id``
+    (``<asset_uuid>:<person_pk>``)."""
+    return (source_id or "").split(":", 1)[0]
 
 
 @router.get("/stats", response_model=PhotosStatsResponse)
@@ -175,9 +198,8 @@ def get_photos_for_person(
     person's face was recognized.
 
     Optionally filter by date (YYYY-MM-DD) to get photos from a specific day.
+    Reads only the interactions table, so it works without a Photos library.
     """
-    _check_photos_enabled()
-
     from api.services.interaction_store import get_interaction_store
 
     interaction_store = get_interaction_store()
@@ -200,7 +222,7 @@ def get_photos_for_person(
     photos = []
     for interaction in interactions[:limit]:
         photos.append(PhotoResponse(
-            uuid=interaction.source_id or "",
+            uuid=_asset_uuid(interaction.source_id),
             timestamp=interaction.timestamp.isoformat() if interaction.timestamp else None,
             latitude=None,  # Not stored in interaction
             longitude=None,
@@ -319,7 +341,7 @@ def _get_thumbnail_path(uuid: str) -> Path | None:
     Returns:
         Path to thumbnail file if found, None otherwise
     """
-    if not uuid:
+    if not uuid or not photos_origin.UUID_RE.match(uuid):
         return None
 
     library_path = Path(settings.photos_library_path)
@@ -354,35 +376,56 @@ def _get_thumbnail_path(uuid: str) -> Path | None:
     return None
 
 
+def _get_staged_thumbnail_path(uuid: str) -> Path | None:
+    """The thumbnail staged by the Apple Data Agent export, if present.
+
+    Staged files live at <photos_thumbnails_dir>/<FIRST_CHAR>/<UUID>.jpeg and
+    need no Photos library on this host.
+    """
+    if not uuid or not photos_origin.UUID_RE.match(uuid):
+        return None
+    uuid = uuid.upper()
+    path = settings.photos_thumbnails_dir / uuid[0] / f"{uuid}.jpeg"
+    return path if path.is_file() else None
+
+
+def _find_thumbnail_path(uuid: str) -> Path | None:
+    """A thumbnail for an asset UUID: staged first, then the local library."""
+    return _get_staged_thumbnail_path(uuid) or _get_thumbnail_path(uuid)
+
+
 @router.get("/thumbnail/{uuid}")
 def get_photo_thumbnail(uuid: str):
     """
     Get a thumbnail for a photo by UUID.
 
-    Returns the thumbnail image from the Photos library's derivatives folder.
-    Returns 404 if no thumbnail is available.
-    Returns 410 (Gone) if photo is in iCloud only (use X-iCloud-Only header to detect).
+    Serves the thumbnail staged by the Apple Data Agent export, falling back
+    to the local Photos library's derivatives folder when one is mounted.
+    Works without a library. Returns 400 for a malformed UUID and 404 if no
+    thumbnail is available. With a local library, returns 410 (Gone) if the
+    photo is in iCloud only (use X-iCloud-Only header to detect).
     """
-    _check_photos_enabled()
+    uuid = _require_uuid(uuid)
 
-    thumb_path = _get_thumbnail_path(uuid)
+    thumb_path = _find_thumbnail_path(uuid)
     if thumb_path is None:
-        # Check if photo is in iCloud only
-        from api.services.apple_photos import get_apple_photos_reader
-        try:
-            reader = get_apple_photos_reader()
-            is_local = reader.get_photo_icloud_status(uuid)
-            if not is_local:
-                # Photo exists but is in iCloud only - return 410 with indicator
-                raise HTTPException(
-                    status_code=410,
-                    detail="icloud-only",
-                    headers={"X-iCloud-Only": "true"}
-                )
-        except HTTPException:
-            raise  # Re-raise HTTP exceptions
-        except Exception:
-            pass  # If we can't check, just return 404
+        if settings.photos_enabled:
+            # Check if photo is in iCloud only
+            from api.services.apple_photos import get_apple_photos_reader
+            try:
+                reader = get_apple_photos_reader()
+                is_local = reader.get_photo_icloud_status(uuid)
+                if not is_local:
+                    # Photo exists but is in iCloud only - return 410 with indicator
+                    raise HTTPException(
+                        status_code=410,
+                        detail="icloud-only",
+                        headers={"X-iCloud-Only": "true"}
+                    )
+            except HTTPException:
+                raise  # Re-raise HTTP exceptions
+            except Exception:
+                pass  # If we can't check, just return 404
 
         raise HTTPException(
             status_code=404,
@@ -422,9 +465,9 @@ def get_profile_photo(person_id: str):
     operation ID" warning that a single `@router.api_route(methods=["GET",
     "HEAD"])` registration would trigger, since GET and HEAD are separate
     routes.
-    """
-    _check_photos_enabled()
 
+    Works without a Photos library: staged thumbnails are served first.
+    """
     from api.services.interaction_store import get_interaction_store
 
     interaction_store = get_interaction_store()
@@ -438,7 +481,7 @@ def get_profile_photo(person_id: str):
     # Find the first one with an available thumbnail
     for interaction in interactions[:50]:  # Check up to 50 most recent
         if interaction.source_id:
-            thumb_path = _get_thumbnail_path(interaction.source_id)
+            thumb_path = _find_thumbnail_path(_asset_uuid(interaction.source_id))
             if thumb_path and thumb_path.exists():
                 suffix = thumb_path.suffix.lower()
                 media_type = "image/jpeg"
@@ -560,3 +603,130 @@ def open_photo_in_app(uuid: str):
             status_code=500,
             detail=f"Failed to open Photos: {e}"
         )
+
+
+# ---------------------------------------------------------------------------
+# On-demand originals and previews from the Photos Mac
+# ---------------------------------------------------------------------------
+
+_CONTENT_TYPE_OVERRIDES = {
+    ".heic": "image/heic",
+    ".heif": "image/heif",
+    ".mov": "video/quicktime",
+    ".dng": "image/x-adobe-dng",
+}
+
+
+def _origin_http_error(exc: photos_origin.OriginError) -> HTTPException:
+    """Map an origin failure to a status the UI can tell apart.
+
+    503 carries an ``X-Photos-Origin`` header naming the cause
+    (unconfigured, unreachable, busy); 404 means the Mac has no such file.
+    """
+    if exc.kind == "not_found":
+        return HTTPException(status_code=404, detail=exc.message)
+    if exc.kind in ("unconfigured", "unreachable", "busy"):
+        return HTTPException(
+            status_code=503,
+            detail=exc.message,
+            headers={"X-Photos-Origin": exc.kind},
+        )
+    return HTTPException(status_code=502, detail=exc.message)
+
+
+async def _require_known_photo(uuid: str) -> None:
+    """404 unless LifeOS has a photos interaction for this asset, so these
+    routes only serve photos the CRM already knows about."""
+    from api.services.interaction_store import get_interaction_store
+
+    store = get_interaction_store()
+    if not await run_in_threadpool(store.has_photo_asset, uuid):
+        raise HTTPException(status_code=404, detail="Unknown photo")
+
+
+async def _checked_origin_request(uuid: str) -> str:
+    """Validate the UUID, then the origin configuration, then that the photo
+    is known; all before any SSH session is started."""
+    uuid = _require_uuid(uuid)
+    if not settings.photos_originals_enabled:
+        raise _origin_http_error(
+            photos_origin.OriginError("unconfigured", "Photos origin is not configured")
+        )
+    await _require_known_photo(uuid)
+    return uuid
+
+
+def _attachment_headers(filename: Optional[str], uuid: str, size: Optional[int]) -> tuple:
+    """Content-Type and headers (sanitized Content-Disposition) for a download."""
+    name = Path(str(filename or "").replace("\\", "/")).name
+    name = re.sub(r"[\x00-\x1f\x7f\"]", "", name).strip(" .")
+    if not name:
+        name = uuid
+    ascii_name = re.sub(r"[^A-Za-z0-9._ -]", "_", name)
+    disposition = f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(name)}"
+    suffix = Path(name).suffix.lower()
+    content_type = (
+        _CONTENT_TYPE_OVERRIDES.get(suffix)
+        or mimetypes.guess_type(name)[0]
+        or "application/octet-stream"
+    )
+    headers = {"Content-Disposition": disposition, "Cache-Control": "private, no-store"}
+    if isinstance(size, int) and size >= 0:
+        headers["Content-Length"] = str(size)
+    return content_type, headers
+
+
+@router.get("/original/{uuid}/info")
+async def get_photo_original_info(uuid: str):
+    """
+    Describe a photo's original on the Photos Mac.
+
+    Returns ``{available, filename, size_bytes, kind, previewable}``;
+    ``available`` is true when the original file is on the Mac's disk (with
+    iCloud "Optimize Mac Storage" many are not). 503 distinguishes an
+    unconfigured origin from an unreachable Mac via ``X-Photos-Origin``.
+    """
+    uuid = await _checked_origin_request(uuid)
+    try:
+        return await photos_origin.fetch_info(uuid)
+    except photos_origin.OriginError as exc:
+        raise _origin_http_error(exc)
+
+
+@router.get("/original/{uuid}")
+async def get_photo_original(uuid: str):
+    """Download a photo's original file from the Photos Mac as an attachment."""
+    uuid = await _checked_origin_request(uuid)
+    try:
+        info = await photos_origin.fetch_info(uuid)
+        if not info.get("available"):
+            raise photos_origin.OriginError("not_found", "Original is not on the Mac")
+        session, first = await photos_origin.open_stream("original", uuid)
+    except photos_origin.OriginError as exc:
+        raise _origin_http_error(exc)
+
+    content_type, headers = _attachment_headers(info.get("filename"), uuid, info.get("size_bytes"))
+    return StreamingResponse(
+        session.stream(first),
+        media_type=content_type,
+        headers=headers,
+        background=BackgroundTask(session.close),
+    )
+
+
+@router.get("/preview/{uuid}")
+async def get_photo_preview(uuid: str):
+    """A browser-renderable JPEG of a photo from the Photos Mac: the original
+    downscaled when it is on disk, otherwise the best derivative."""
+    uuid = await _checked_origin_request(uuid)
+    try:
+        session, first = await photos_origin.open_stream("preview", uuid)
+    except photos_origin.OriginError as exc:
+        raise _origin_http_error(exc)
+
+    return StreamingResponse(
+        session.stream(first),
+        media_type="image/jpeg",
+        headers={"Cache-Control": "private, max-age=3600"},
+        background=BackgroundTask(session.close),
+    )

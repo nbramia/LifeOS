@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-09-22
+**Last Updated:** 2026-11-01
 
 Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Four adjacent catalogs split out for size:
 
@@ -313,7 +313,7 @@ List people recognized in Photos with match status to PersonEntity.
 
 ### GET /api/photos/person/{person_id}
 
-Get photos containing a specific person.
+Get photos containing a specific person. Each photo's `uuid` is the Apple Photos asset UUID. Reads only the interactions table, so it works without a Photos library.
 
 ### GET /api/photos/shared/{person_a_id}/{person_b_id}
 
@@ -325,15 +325,35 @@ Trigger Photos sync (matches faces to PersonEntity, creates interactions). **Err
 
 ### GET /api/photos/thumbnail/{uuid}
 
-Get a thumbnail image for a photo by UUID. Returns the image file from the Photos library derivatives folder. Returns 410 (Gone) with `X-iCloud-Only` header if the photo is in iCloud only.
+Get a thumbnail image for a photo by UUID (`^[0-9A-Fa-f-]{36}$`; anything else is `400`). Serves the thumbnail staged by the Apple Data Agent export (`data/apple-imports/photos_thumbnails/`) and falls back to the local Photos library's derivatives folder, so it works on a host with no library. `404` when no thumbnail exists. With a local library, `410` (Gone) with `X-iCloud-Only` header if the photo is in iCloud only.
 
 ### GET /api/photos/profile/{person_id}
 
-Get a profile photo thumbnail for a person. Returns the most recent available photo thumbnail for use as an avatar. Also accepts `HEAD` (same status as `GET`, no body), so a client can check availability without downloading the image. Both the `200` and `404` responses carry `Cache-Control: public, max-age=3600`, so a client that already knows a person has no reachable photo doesn't need to ask again within the hour.
+Get a profile photo thumbnail for a person. Returns the most recent available photo thumbnail (staged or from a local library; no library required) for use as an avatar. Also accepts `HEAD` (same status as `GET`, no body), so a client can check availability without downloading the image. Both the `200` and `404` responses carry `Cache-Control: public, max-age=3600`, so a client that already knows a person has no reachable photo doesn't need to ask again within the hour.
 
 ### GET /api/photos/open/{uuid}
 
 Open a photo in Preview or Photos app. Tries the original file first, falls back to thumbnail, then the Photos app.
+
+### GET /api/photos/original/{uuid}/info
+
+Describe a photo's original on the Photos Mac (the host named by `LIFEOS_PHOTOS_ORIGIN_SSH_HOST`; see [Configuration](../../guides/configuration.md#photos)). Returns `{available, filename, size_bytes, kind, previewable}`: `available` is true when the original file is on the Mac's disk, `kind` is `photo`, `video`, or `unknown`, and `size_bytes` is the file's size on disk (`null` when absent).
+
+**Errors:** `400` malformed UUID; `404` when LifeOS has no photos interaction for the UUID or the Mac's library has no such asset; `503` when the origin is not configured, the Mac is unreachable, or too many transfers are running (the `X-Photos-Origin` response header is `unconfigured`, `unreachable`, or `busy`); `502` when the Mac's helper fails.
+
+### GET /api/photos/original/{uuid}
+
+Download the original file from the Photos Mac as an attachment: `Content-Disposition: attachment` with a sanitized filename, a `Content-Type` derived from the file extension, and `Content-Length` taken from the info record. Same errors as `/info`; `404` also when the original is not on the Mac (with iCloud "Optimize Mac Storage", most are not).
+
+### GET /api/photos/preview/{uuid}
+
+A browser-renderable `image/jpeg` of the photo from the Photos Mac: the original downscaled to at most 2048 px when it is on disk, otherwise the best existing derivative. `404` when the Mac has nothing servable (including a video with no derivative). Same other errors as `/info`.
+
+The three origin routes only serve photos LifeOS already knows (a photos interaction for the UUID must exist), and none opens a session before the UUID, the configuration, and that check pass.
+
+### GET /api/crm/config (photo fields)
+
+`photos_enabled` (boolean) is true when a local Photos library exists or staged thumbnails are present; the CRM requests avatars and thumbnails only when it is true. `photos_originals_enabled` (boolean) is true when `LIFEOS_PHOTOS_ORIGIN_SSH_HOST` is set; the photo viewer queries the origin routes only when it is true.
 
 ---
 

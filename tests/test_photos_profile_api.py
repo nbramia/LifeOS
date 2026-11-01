@@ -47,15 +47,21 @@ def _fake_photo_interaction(source_id="FAKE-UUID-0001"):
     )
 
 
-class TestProfilePhotoDisabled:
-    """Photos not configured at all: the route's short-circuit runs before
-    HEAD/GET are distinguished, so both must carry the same status."""
+class TestProfilePhotoWithoutLibrary:
+    """No Photos library and no staged thumbnails: the route answers 404 for
+    both GET and HEAD (never 503), since staged thumbnails need no library."""
 
-    def test_head_matches_get_status_and_has_no_body(self, client):
-        get_resp = client.get("/api/photos/profile/some-person")
-        head_resp = client.request("HEAD", "/api/photos/profile/some-person")
+    def test_head_matches_get_status_and_has_no_body(self, client, tmp_path):
+        from config.settings import Settings
+        with patch("api.services.interaction_store.get_interaction_store") as mock_store, \
+             patch.object(Settings, "photos_enabled", new_callable=PropertyMock, return_value=False), \
+             patch.object(Settings, "photos_thumbnails_dir", new_callable=PropertyMock,
+                          return_value=tmp_path / "none"):
+            mock_store.return_value.get_for_person.return_value = []
+            get_resp = client.get("/api/photos/profile/some-person")
+            head_resp = client.request("HEAD", "/api/photos/profile/some-person")
 
-        assert head_resp.status_code == get_resp.status_code == 503
+        assert head_resp.status_code == get_resp.status_code == 404
         assert head_resp.content == b""
 
 

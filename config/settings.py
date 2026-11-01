@@ -1519,6 +1519,22 @@ class Settings(BaseSettings):
         alias="LIFEOS_PHOTOS_PATH",
         description="Path to Photos Library"
     )
+    photos_origin_ssh_host: str = Field(
+        default="",
+        alias="LIFEOS_PHOTOS_ORIGIN_SSH_HOST",
+        description=(
+            "SSH target (host or user@host) of the Mac holding the Photos "
+            "library. Empty disables on-demand originals and previews."
+        ),
+    )
+    photos_origin_repo_path: str = Field(
+        default="~/Code/LifeOS",
+        alias="LIFEOS_PHOTOS_ORIGIN_REPO_PATH",
+        description=(
+            "Path of the LifeOS checkout on the Photos Mac; a leading ~ is "
+            "expanded by the remote shell."
+        ),
+    )
 
     @property
     def work_email_domains(self) -> list[str]:
@@ -2060,6 +2076,24 @@ class Settings(BaseSettings):
         from pathlib import Path
         library = str(Path(self.photos_library_path).expanduser())
         return f"{library}/database/Photos.sqlite"
+
+    @property
+    def photos_thumbnails_dir(self) -> Path:
+        """Directory of Photos thumbnails staged by the Apple Data Agent export
+        (<FIRST_CHAR>/<ASSET_UUID>.jpeg), synced to the server with the
+        rest of data/apple-imports/."""
+        return _REPO_ROOT / "data" / "apple-imports" / "photos_thumbnails"
+
+    @property
+    def photos_thumbnails_available(self) -> bool:
+        """Whether any staged Photos thumbnail exists."""
+        directory = self.photos_thumbnails_dir
+        return directory.is_dir() and next(directory.glob("*/*.jpeg"), None) is not None
+
+    @property
+    def photos_originals_enabled(self) -> bool:
+        """Whether on-demand originals/previews from the Photos Mac are configured."""
+        return bool(self.photos_origin_ssh_host.strip())
 
     @property
     def photos_enabled(self) -> bool:

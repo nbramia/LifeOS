@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Operations
-> **Last Updated:** 2026-09-10
+> **Last Updated:** 2026-11-01
 > **Audience:** Operators
 
 Operational procedures that don't belong in the day-to-day coding reference: the Apple Data Agent, Monarch Money auth, and quick observability commands. Moved here from `AGENTS.md` to keep the agent-facing file lean.
@@ -30,6 +30,12 @@ Messages has its own history-retention setting (Messages → Settings → Genera
 The Apple Data Agent Mac runs `apple_data_agent.sh` from its own separate checkout, which nothing else ever pulls — a fix to the export pipeline on `main` would otherwise silently never reach it. Step 0 of the agent script self-updates that checkout before exporting, using the same guards as `auto-deploy.sh`: only on the `main` branch, only with a clean working tree, and only via `git pull --ff-only` (never force, never reset). If any guard trips or the pull fails, the agent logs a warning (and, on an actual pull failure, sends a Telegram alert) and **continues with the existing checkout** — a slightly stale export is better than a skipped one, as long as the staleness is visible.
 
 The before/after SHA is logged in the agent's own log, and the export's `manifest.json` records the SHA it ran from as `agent_sha`. On the Linux side, `apple_data_import.py`'s `check_manifest()` compares `agent_sha` against the host's own `main` SHA and logs a warning on mismatch — so a stuck self-update is diagnosable from the import log without SSHing to the Apple Data Agent Mac. A manifest that predates `agent_sha` simply lacks the field, which is treated as "nothing to compare" rather than a warning.
+
+### Photo thumbnails and on-demand originals
+
+**Thumbnails.** The photos export step (`scripts/apple_data_export.py`, which runs under Full Disk Access through `LifeOS.app`) copies one small thumbnail per exported face-linked asset into `data/apple-imports/photos_thumbnails/<FIRST_CHAR>/<ASSET_UUID>.jpeg`, preferring the library's `masters/` derivative (`_4_5005_c.jpeg`) and falling back to `_1_105_c.jpeg` then `_1_102_o.jpeg`. The files ride the existing `rsync` of `data/apple-imports/` (no `--delete`, so staged files are never removed), and the API serves them with no Photos library on the Linux host. Staging is incremental (a file with the same size and mtime is skipped) and best-effort: one unreadable file is counted, not fatal, and a staging failure never aborts the faces export. The photos entry in `manifest.json` reports `thumbnails: {copied, skipped, missing, failed}`. `apple_data_import.py` reads only named files and ignores the subdirectory.
+
+**Originals on demand.** With `LIFEOS_PHOTOS_ORIGIN_SSH_HOST` set (see [configuration.md](configuration.md#photos)), the API runs `/usr/bin/python3 <repo>/scripts/photos_origin_helper.py` on the Mac over SSH for each preview or download. The helper is stdlib-only (the system Python on macOS is 3.9), opens `Photos.sqlite` read-only, and reads the library from an SSH session. Requirements: the API's user has non-interactive SSH key access to the Mac, the Mac's LifeOS checkout is current (the nightly agent self-update keeps it at `main`), and the Mac is awake. What can be served depends on what is on that Mac's disk: with iCloud "Optimize Mac Storage" most originals are not local, so those show a preview and a disabled download button; enabling Photos → Settings → iCloud → "Download Originals to this Mac" makes every original available. Nothing pulls a missing original from iCloud. At most four SSH sessions run at once; each is killed when the transfer ends or the browser disconnects.
 
 ## Monarch Money (Financial Data)
 

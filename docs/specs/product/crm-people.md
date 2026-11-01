@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** CRM
-**Last Updated:** 2026-09-05
+**Last Updated:** 2026-11-01
 
 People management: the list and detail views at `/crm`, the contact-source model behind entity splitting/merging, the relationship-strength score that drives ranking and Dunbar circles, and the multi-stage fact-extraction pipeline that surfaces memorable personal details.
 
@@ -184,7 +184,7 @@ Behavior:
 - Real-time search (< 300 ms), debounced; a superseded query's response is discarded so the list always reflects what's currently typed, even if an earlier search's response arrives later.
 - Category tabs (Work / Personal / Family).
 - Cards show avatar, name, company/category, interaction count, strength bar.
-- A card's avatar shows the person's profile photo only when the list response flags them as having one (`has_profile_photo`) AND the install has Apple Photos configured (`GET /api/crm/config`'s `photos_enabled`); nothing else is ever probed. The image loads lazily and falls back to initials with no error if the photo turns out to be unavailable.
+- A card's avatar shows the person's profile photo only when the list response flags them as having one (`has_profile_photo`) AND the install can show photos (`GET /api/crm/config`'s `photos_enabled`: a local Apple Photos library or thumbnails staged by the Apple Data Agent export); nothing else is ever probed. The image loads lazily and falls back to initials with no error if the photo turns out to be unavailable.
 - Cards sorted by relationship strength by default.
 - Infinite scroll loads more people.
 - Mobile-responsive layout.
