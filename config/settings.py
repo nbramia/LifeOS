@@ -831,6 +831,14 @@ class Settings(BaseSettings):
                     "OAuth client may call lifeos_task_update as that agent, which can claim, "
                     "update and release only unassigned tasks or its own."
     )
+    mcp_oauth_tool_grants: str = Field(
+        default="",
+        alias="LIFEOS_MCP_OAUTH_TOOL_GRANTS",
+        description="Comma-separated client_id:tool_name pairs, one tool per pair. The named "
+                    "OAuth client's tool view gains that curated catalog tool in addition to the "
+                    "connected-app tier. Host tools, lifeos_agent_* tools, lifeos_task_update and "
+                    "unknown names grant nothing, nor does a malformed pair."
+    )
     mcp_agent_tokens: str = Field(
         default="",
         alias="LIFEOS_MCP_AGENT_TOKENS",
