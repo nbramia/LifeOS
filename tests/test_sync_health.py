@@ -820,6 +820,66 @@ class TestRepeatedYieldStreak:
             assert get_repeated_yield_streak("apple_import", 1294) == 2
 
 
+class TestRepeatedYieldStreakCreatedOnly:
+    """The stored streak compares newly-created counts only. A source that
+    re-checks the same population every night (constant updated/processed)
+    is healthy; only an identical created count signals a stale re-import."""
+
+    def _insert_run(self, source, started_at, **columns):
+        conn = get_sync_health_db()
+        names = ["source", "status", "started_at", "completed_at", *columns]
+        values = [source, "success", started_at.isoformat(), started_at.isoformat(), *columns.values()]
+        conn.execute(
+            f"INSERT INTO sync_runs ({', '.join(names)}) VALUES ({', '.join('?' * len(names))})",
+            values,
+        )
+        conn.commit()
+        conn.close()
+
+    def _streak(self, temp_db, value, **columns):
+        from api.services.sync_health import get_repeated_yield_streak
+
+        base = datetime.now(timezone.utc)
+        for i in range(4):
+            self._insert_run("src", base - timedelta(days=i), **columns)
+        return get_repeated_yield_streak("src", value)
+
+    def test_updated_only_history_has_no_streak(self, temp_db):
+        with patch('api.services.sync_health.SYNC_HEALTH_DB_PATH', temp_db):
+            assert self._streak(temp_db, 1998, records_updated=1998, people_updated=1998) == 0
+
+    def test_processed_only_history_has_no_streak(self, temp_db):
+        with patch('api.services.sync_health.SYNC_HEALTH_DB_PATH', temp_db):
+            assert self._streak(temp_db, 48, records_processed=48) == 0
+
+    @pytest.mark.parametrize("column", [
+        "records_created", "people_created", "interactions_created", "source_entities_created",
+    ])
+    def test_each_created_column_counts(self, temp_db, column):
+        with patch('api.services.sync_health.SYNC_HEALTH_DB_PATH', temp_db):
+            assert self._streak(temp_db, 7, **{column: 7}) == 4
+
+    def test_created_streak_ignores_unrelated_updated_noise(self, temp_db):
+        """Created stays identical while updated varies: still a streak."""
+        from api.services.sync_health import get_repeated_yield_streak
+
+        with patch('api.services.sync_health.SYNC_HEALTH_DB_PATH', temp_db):
+            base = datetime.now(timezone.utc)
+            for i in range(3):
+                self._insert_run("src", base - timedelta(days=i), records_created=1294, records_updated=i)
+            assert get_repeated_yield_streak("src", 1294) == 3
+
+    def test_zero_created_run_breaks_streak(self, temp_db):
+        from api.services.sync_health import get_repeated_yield_streak
+
+        with patch('api.services.sync_health.SYNC_HEALTH_DB_PATH', temp_db):
+            base = datetime.now(timezone.utc)
+            self._insert_run("src", base, records_created=1294)
+            self._insert_run("src", base - timedelta(days=1), records_created=0, records_updated=1294)
+            self._insert_run("src", base - timedelta(days=2), records_created=1294)
+            assert get_repeated_yield_streak("src", 1294) == 1
+
+
 class TestTypicalYieldWarmup:
     """A single productive run must not become the yield baseline.
 

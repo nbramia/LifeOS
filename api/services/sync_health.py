@@ -214,6 +214,9 @@ SYNC_SOURCES = {
         "script": "scripts/sync_repoint_stale_ids.py",
         "frequency": "daily",
         "phase": 2,
+        # Reports stats, but a night with no stale merged IDs is the normal
+        # outcome, so a long run of zero yield is not a dead-source signal.
+        "idle_is_normal": True,
         "depends_on": ["link_imessage", "link_source_entities"],
     },
 
@@ -689,6 +692,19 @@ def _row_yield(row) -> int:
     )
 
 
+def _row_created(row) -> int:
+    """Records a run reported as newly created: the largest of the created
+    counters. Updates and merely-processed records are excluded — re-checking
+    or re-indexing existing data is not evidence of new upstream data. Mirrors
+    ``run_all_syncs._run_created``."""
+    return max(
+        row["records_created"] or 0,
+        row["people_created"] or 0,
+        row["interactions_created"] or 0,
+        row["source_entities_created"] or 0,
+    )
+
+
 # Minimum number of *productive* runs before a source's yield history is
 # considered a trustworthy baseline. One productive run is the initial backfill;
 # its yield is a corpus size, not a nightly rate. See get_typical_yield.
@@ -784,24 +800,28 @@ def get_consecutive_zero_yield_runs(source: str, limit: int = 50) -> int:
 
 
 def get_repeated_yield_streak(source: str, value: float, limit: int = 50) -> int:
-    """How many of the most recent successful runs, in a row, produced
-    exactly ``value`` records.
+    """How many of the most recent successful runs, in a row, created
+    exactly ``value`` new records.
 
     Complements :func:`get_consecutive_zero_yield_runs`, which only catches
     a source going silent (yield drops to zero). A source re-importing the
     same byte-identical stale upstream file every night can instead report
-    the *same non-zero* count forever — e.g. a dead export agent
-    that leaves ten nights reporting an identical "1294 created" while
-    nothing had actually changed. A long streak of an identical
-    non-zero count is the signature of that: real nightly variation almost
+    the *same non-zero* count of new records forever — e.g. a dead export
+    agent that leaves ten nights reporting an identical "1294 created" while
+    nothing had actually changed. A long streak of an identical non-zero
+    created count is the signature of that: real nightly variation almost
     never lands on the exact same number twice in a row.
+
+    Only newly-created records are compared (see :func:`_row_created`).
+    Updated and processed counts are legitimately constant for a source that
+    re-checks the same population every night.
     """
     conn = get_sync_health_db()
     try:
         rows = conn.execute(
             """
-            SELECT records_created, records_updated, interactions_created,
-                   records_processed
+            SELECT records_created, people_created, interactions_created,
+                   source_entities_created
             FROM sync_runs
             WHERE source = ? AND status = ?
             ORDER BY started_at DESC
@@ -814,7 +834,7 @@ def get_repeated_yield_streak(source: str, value: float, limit: int = 50) -> int
 
     streak = 0
     for row in rows:
-        if _row_yield(row) != value:
+        if _row_created(row) != value:
             break
         streak += 1
     return streak

@@ -143,7 +143,12 @@ def main(argv=None) -> int:
 
     from api.services.sync_health import emit_sync_stats
     # Only int values are read by the orchestrator; vocab_version is informational.
-    emit_sync_stats({**{k: result[k] for k in STAT_KEYS}, "vocab_version": result["vocab_version"]})
+    # ``updated`` is the orchestrator's yield signal: a tagged note is work done.
+    emit_sync_stats({
+        **{k: result[k] for k in STAT_KEYS},
+        "updated": result["tagged"],
+        "vocab_version": result["vocab_version"],
+    })
     return 0
 
 

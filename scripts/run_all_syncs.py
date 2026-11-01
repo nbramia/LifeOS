@@ -570,6 +570,13 @@ def log_sync_summary_to_markdown(result: dict, trigger: str = "unknown"):
             else:
                 lines.append(f"- {src}")
 
+    stale_source_files = result.get("stale_source_files", [])
+    if stale_source_files:
+        lines.append("")
+        lines.append(f"**Stale source file ({len(stale_source_files)}):**")
+        for stale in stale_source_files:
+            lines.append(f"- {stale['file']}: {stale['age_days']} days old — {stale['action']}")
+
     # Apple Data Agent SHA drift — a silently-broken self-update on
     # the (installer-configurable) export agent, surfaced here instead of a
     # log line no batched report reads.
@@ -755,6 +762,7 @@ def send_sync_summary_telegram(result: dict, trigger: str = "unknown"):
         and not collapsed_sources
         and not result.get("investments_stale")
         and not result.get("repeated_yield_sources")
+        and not result.get("stale_source_files")
         and not result.get("apple_agent_sha_drift")
         else "⚠️"
     )
@@ -860,6 +868,13 @@ def send_sync_summary_telegram(result: dict, trigger: str = "unknown"):
                 lines.append(f"  • {src}: {value:.0f} records, {runs} runs in a row")
             else:
                 lines.append(f"  • {src}")
+
+    stale_source_files = result.get("stale_source_files", [])
+    if stale_source_files:
+        lines.append("")
+        lines.append(f"*Stale source file ({len(stale_source_files)}):*")
+        for stale in stale_source_files:
+            lines.append(f"  • {stale['file']}: {stale['age_days']} days old — {stale['action']}")
 
     try:
         success = send_message("\n".join(lines))
@@ -1203,6 +1218,19 @@ def _run_yield(stats: dict) -> int:
     )
 
 
+def _run_created(stats: dict) -> int:
+    """Records this run reported as newly created. Updated and merely-processed
+    records are excluded: re-checking or re-indexing existing data is steady
+    work, not new upstream data. Mirrors sync_health._row_created (max, not
+    sum — ``created`` already absorbs the categorized created counters)."""
+    return max(
+        stats.get("created", 0) or 0,
+        stats.get("people_created", 0) or 0,
+        stats.get("interactions_created", 0) or 0,
+        stats.get("source_entities_created", 0) or 0,
+    )
+
+
 def _detect_yield_collapse(source: str, stats: dict) -> dict | None:
     """Return info if a source that normally produces records produced none.
 
@@ -1231,10 +1259,13 @@ def _detect_never_yielded(source: str, stats: dict) -> dict | None:
 
     This is the blind spot duration-collapse cannot cover: every run looks
     identical, so nothing stands out per-run. Long-running phases are exempt —
-    their runtime shows they are working even when they report no stats.
+    their runtime shows they are working even when they report no stats — and
+    so is any source whose SYNC_SOURCES entry sets ``idle_is_normal``.
     """
     if _run_yield(stats) > 0:
         return None
+    if SYNC_SOURCES.get(source, {}).get("idle_is_normal"):
+        return None  # declared in SYNC_SOURCES: zero yield is its normal state
     try:
         history = get_yield_history(source)
     except Exception as e:
@@ -1263,13 +1294,16 @@ REPEATED_YIELD_MIN_CONSECUTIVE = 3
 
 
 def _detect_repeated_yield(source: str, stats: dict) -> dict | None:
-    """Return info if this run produced the exact same non-zero yield as
-    each of the last few runs — evidence of re-importing an unchanged
-    upstream file and reporting it as new, rather than genuine repetition.
+    """Return info if this run created the exact same non-zero number of new
+    records as each of the last few runs — evidence of re-importing an
+    unchanged upstream file and reporting it as new, rather than genuine
+    repetition. Only created counts are compared; a source that re-checks the
+    same population every night reports a constant updated/processed count
+    legitimately.
 
     Never raises — a sync_health DB hiccup must not fail the sync itself.
     """
-    this_yield = _run_yield(stats)
+    this_yield = _run_created(stats)
     if this_yield <= 0:
         return None
     try:
@@ -1293,9 +1327,9 @@ def _detect_repeated_yield(source: str, stats: dict) -> dict | None:
 NEVER_YIELDED_REWARN_DAYS = 7
 
 
-def _recently_warned_never_yielded(source: str, within_days: int = NEVER_YIELDED_REWARN_DAYS) -> bool:
-    """True if a ``never_yielded`` warning was already recorded for ``source``
-    within the last ``within_days`` days.
+def _recently_warned(source: str, error_type: str, within_days: int) -> bool:
+    """True if a ``sync_errors`` row of ``error_type`` was already recorded for
+    ``source`` within the last ``within_days`` days.
 
     Never raises — a sync_health DB hiccup must not fail the sync. On error we
     fall through to "not recently warned", since a duplicate warning is
@@ -1304,7 +1338,7 @@ def _recently_warned_never_yielded(source: str, within_days: int = NEVER_YIELDED
     try:
         cutoff = datetime.now(timezone.utc) - timedelta(days=within_days)
         for err in get_recent_errors(source=source, limit=20):
-            if err.get("error_type") != "never_yielded":
+            if err.get("error_type") != error_type:
                 continue
             ts = err.get("timestamp")
             if not ts:
@@ -1315,9 +1349,86 @@ def _recently_warned_never_yielded(source: str, within_days: int = NEVER_YIELDED
             if err_dt >= cutoff:
                 return True
     except Exception as e:
-        logger.warning(f"Never-yielded rewarn check failed for {source}: {e}")
+        logger.warning(f"Re-warn check ({error_type}) failed for {source}: {e}")
         return False
     return False
+
+
+def _recently_warned_never_yielded(source: str, within_days: int = NEVER_YIELDED_REWARN_DAYS) -> bool:
+    """True if a ``never_yielded`` warning was already recorded for ``source``
+    within the last ``within_days`` days."""
+    return _recently_warned(source, "never_yielded", within_days)
+
+
+# Source-file staleness: some sources read a file the operator downloads by
+# hand. When the file stops being refreshed the sync keeps "succeeding" on the
+# same bytes, so nothing in the per-run yield stats says the data has gone
+# stale. This check looks at the file's age directly.
+STALE_SOURCE_FILE_MAX_AGE_DAYS = 90
+STALE_SOURCE_FILE_REWARN_DAYS = 7
+STALE_SOURCE_FILE_ERROR_TYPE = "stale_source_file"
+# Where scripts/sync_linkedin.py reads its export (its DEFAULT_CSV_PATH).
+LINKEDIN_EXPORT_PATH = Path(__file__).parent.parent / "data" / "LinkedInConnections.csv"
+
+
+def _detect_stale_linkedin_export(
+    path: Path | None = None, now: datetime | None = None
+) -> dict | None:
+    """Return info if the LinkedIn connections export is older than
+    ``STALE_SOURCE_FILE_MAX_AGE_DAYS``, else None.
+
+    Silent when the file is absent (a fresh install, or one that never uses
+    LinkedIn — the sync itself reports that case as skipped). Never raises.
+    """
+    path = path or LINKEDIN_EXPORT_PATH
+    try:
+        if not path.exists():
+            return None
+        now = now or datetime.now(timezone.utc)
+        modified = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+        age_days = (now - modified).total_seconds() / 86400
+    except Exception as e:
+        logger.warning(f"LinkedIn export age check failed: {e}")
+        return None
+
+    if age_days <= STALE_SOURCE_FILE_MAX_AGE_DAYS:
+        return None
+    return {
+        "source": "linkedin",
+        "file": path.name,
+        "age_days": int(age_days),
+        "action": (
+            "download a fresh LinkedIn export (\"Get a copy of your data\" > "
+            f"Connections) and replace data/{path.name}"
+        ),
+    }
+
+
+def _check_stale_source_files(
+    path: Path | None = None, now: datetime | None = None, record: bool = True
+) -> list[dict]:
+    """Stale-file warnings to report this run: each stale file is logged and
+    (when ``record``) written to ``sync_errors`` at most once per
+    ``STALE_SOURCE_FILE_REWARN_DAYS``, so a chronic condition is reported
+    weekly rather than nightly. Never raises.
+    """
+    stale = []
+    info = _detect_stale_linkedin_export(path=path, now=now)
+    if info and not _recently_warned(
+        info["source"], STALE_SOURCE_FILE_ERROR_TYPE, STALE_SOURCE_FILE_REWARN_DAYS
+    ):
+        msg = (
+            f"{info['file']} is {info['age_days']} days old "
+            f"(limit {STALE_SOURCE_FILE_MAX_AGE_DAYS}) — {info['action']}"
+        )
+        logger.warning(msg)
+        if record:
+            try:
+                record_sync_error(info["source"], msg, error_type=STALE_SOURCE_FILE_ERROR_TYPE)
+            except Exception as e:
+                logger.warning(f"Could not record stale-file warning for {info['source']}: {e}")
+        stale.append(info)
+    return stale
 
 
 # =============================================================================
@@ -1730,8 +1841,8 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
                     if repeated_yield:
                         stats["repeated_yield"] = repeated_yield
                         msg = (
-                            f"{source} produced the same "
-                            f"{repeated_yield['repeated_value']:.0f} records for "
+                            f"{source} created the same "
+                            f"{repeated_yield['repeated_value']:.0f} new records for "
                             f"{repeated_yield['consecutive_runs']} runs in a row — "
                             f"possible re-import of unchanged upstream data reported as new"
                         )
@@ -2114,7 +2225,8 @@ def run_all_syncs(
     duration_collapsed = []  # Sources that "succeeded" suspiciously fast
     yield_collapsed = []  # Normally produce records, produced none this run
     never_yielded_sources = []  # Never produced anything across many runs
-    repeated_yield_sources = []  # Same non-zero count for several runs in a row
+    repeated_yield_sources = []  # Same non-zero created count for several runs in a row
+    stale_source_files = []  # Hand-downloaded input files that stopped being refreshed
     skipped_sources = []  # Exited early because they aren't configured
     start_time = datetime.now()
 
@@ -2315,6 +2427,9 @@ def run_all_syncs(
             _start_llm()
             _llm_stopped_for_sync = False
 
+    if "linkedin" in sources:
+        stale_source_files = _check_stale_source_files(record=not dry_run)
+
     # Log summary
     logger.info("=" * 60)
     logger.info("SYNC RUN COMPLETE")
@@ -2337,6 +2452,10 @@ def run_all_syncs(
         logger.error(
             f"Repeated identical yield (possible stale re-import reported as new): "
             f"{', '.join(repeated_yield_sources)}"
+        )
+    for stale in stale_source_files:
+        logger.warning(
+            f"Stale source file: {stale['file']} is {stale['age_days']} days old — {stale['action']}"
         )
     logger.info("=" * 60)
 
@@ -2458,6 +2577,7 @@ def run_all_syncs(
         "dep_skipped_sources": sorted(dep_skipped),
         "duration_collapsed_sources": duration_collapsed,
         "repeated_yield_sources": repeated_yield_sources,
+        "stale_source_files": stale_source_files,
         "investments_stale": investments_stale,
         "apple_agent_sha_drift": apple_agent_sha_drift,
     }

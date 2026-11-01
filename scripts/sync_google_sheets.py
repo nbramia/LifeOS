@@ -54,9 +54,22 @@ def sync_google_sheets(dry_run: bool = True) -> dict:
             )
             return results
 
+        new_rows = int(results.get("synced", 0) or 0)
+        skipped_rows = int(results.get("skipped", 0) or 0)
         logger.info("\n=== Google Sheets Sync Results ===")
-        logger.info(f"  Sheets synced: {results.get('synced', 0)}")
-        logger.info(f"  Rows processed: {results.get('rows', 0)}")
+        logger.info(f"  New rows written: {new_rows}")
+        logger.info(f"  Rows already synced: {skipped_rows}")
+        logger.info(f"  Sheets failed: {results.get('failed', 0)}")
+
+        # Canonical line consumed by run_all_syncs._parse_sync_output. Rows
+        # examined count as processed so a sheet with no new responses tonight
+        # is still visibly working; only new rows count as created.
+        from api.services.sync_health import emit_sync_stats
+        emit_sync_stats({
+            "processed": new_rows + skipped_rows,
+            "created": new_rows,
+            "errors": int(results.get("failed", 0) or 0),
+        })
         return results
     except Exception as e:
         logger.error(f"Google Sheets sync failed: {e}")

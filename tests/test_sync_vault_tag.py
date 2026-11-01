@@ -16,7 +16,7 @@ pytestmark = pytest.mark.unit
 TX = load_taxonomy()
 TOPIC = list(TX.topics)[0]
 STAT_KEYS = {"tagged", "skipped_unchanged", "skipped_not_allowlisted", "code_only",
-             "restricted", "low_confidence", "errors", "vocab_version"}
+             "restricted", "low_confidence", "errors", "vocab_version", "updated"}
 
 
 def _answers(topic_conf=0.9):
@@ -210,3 +210,26 @@ def test_retag_of_a_previously_sent_row_does_not_send_a_restricted_inline_tag(en
     assert stats["restricted"] == 1 and ask.call_count == 0
     rec = store.get("Notes/a.md")
     assert rec.backend == "code" and rec.sensitivity == "restricted"
+
+
+def test_tagged_notes_count_as_orchestrator_yield(env, capsys):
+    """The orchestrator's yield reads processed/created/updated; tagged notes
+    must land in one of them or a night of real tagging looks like a no-op."""
+    from scripts.run_all_syncs import _parse_sync_output, _run_yield
+
+    with patch.object(JevClient, "ask", return_value=_answers()):
+        assert sync_vault_tag.main(["--execute"]) == 0
+    parsed = _parse_sync_output(capsys.readouterr().out)
+    assert parsed["tagged"] == 3
+    assert parsed["updated"] == 3
+    assert _run_yield(parsed) == 3
+
+
+def test_quiet_night_has_zero_yield(env, capsys):
+    from scripts.run_all_syncs import _parse_sync_output, _run_yield
+
+    with patch.object(JevClient, "ask", return_value=_answers()):
+        sync_vault_tag.main(["--execute"])
+        capsys.readouterr()
+        sync_vault_tag.main(["--execute"])
+    assert _run_yield(_parse_sync_output(capsys.readouterr().out)) == 0

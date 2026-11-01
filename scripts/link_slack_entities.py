@@ -132,7 +132,7 @@ def link_slack_entities(dry_run: bool = True) -> dict:
 
     conn.close()
 
-    logger.info(f"\n=== Slack Entity Linking Summary ===")
+    logger.info("\n=== Slack Entity Linking Summary ===")
     logger.info(f"Slack entities checked: {stats['slack_entities_checked']}")
     logger.info(f"Already linked: {stats['already_linked']}")
     logger.info(f"Newly linked: {stats['newly_linked']}")
@@ -140,7 +140,7 @@ def link_slack_entities(dry_run: bool = True) -> dict:
     logger.info(f"No matching person: {stats['no_match']}")
 
     if unmatched and len(unmatched) <= 20:
-        logger.info(f"\nUnmatched Slack users (need manual linking):")
+        logger.info("\nUnmatched Slack users (need manual linking):")
         for name, email in unmatched:
             logger.info(f"  - {name}: {email}")
 
@@ -150,11 +150,24 @@ def link_slack_entities(dry_run: bool = True) -> dict:
     return stats
 
 
-if __name__ == '__main__':
+def main(argv=None) -> None:
     import argparse
 
     parser = argparse.ArgumentParser(description='Link Slack users to CRM entities')
     parser.add_argument('--execute', action='store_true', help='Actually apply changes')
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    link_slack_entities(dry_run=not args.execute)
+    result = link_slack_entities(dry_run=not args.execute)
+
+    # Canonical line consumed by run_all_syncs._parse_sync_output. Entities
+    # examined count as processed (zero means Slack data went missing); newly
+    # linked entities count as updated.
+    from api.services.sync_health import emit_sync_stats
+    emit_sync_stats({
+        "processed": result["slack_entities_checked"],
+        "updated": result["newly_linked"],
+    })
+
+
+if __name__ == '__main__':
+    main()
