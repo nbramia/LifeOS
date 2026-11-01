@@ -791,7 +791,7 @@ class TestAmbiguousNamesNeverCreate:
 
 @pytest.mark.unit
 class TestPlaceholderNames:
-    """A person named after their identifier takes the first real name that arrives."""
+    """A write-capable call gives a person named after their identifier a real name."""
 
     PHONE = "+12125550173"
     EMAIL = "robin@example.com"
@@ -811,7 +811,7 @@ class TestPlaceholderNames:
     def test_number_placeholder_takes_a_real_name(self, temp_store):
         resolver, placeholder = self._by_number(temp_store)
 
-        result = resolver.resolve(name="Robin Gamma", phone="(212) 555-0173")
+        result = resolver.resolve(name="Robin Gamma", phone="(212) 555-0173", create_if_missing=True)
 
         assert result.entity.id == placeholder.id
         assert result.entity.canonical_name == "Robin Gamma"
@@ -822,7 +822,7 @@ class TestPlaceholderNames:
 
     def test_a_later_mention_of_the_real_name_links_to_them(self, temp_store):
         resolver, placeholder = self._by_number(temp_store)
-        resolver.resolve(name="Robin Gamma", phone=self.PHONE)
+        resolver.resolve(name="Robin Gamma", phone=self.PHONE, create_if_missing=True)
 
         result = resolver.resolve(name="Robin Gamma", create_if_missing=True)
 
@@ -833,7 +833,7 @@ class TestPlaceholderNames:
     def test_address_placeholder_takes_a_real_name(self, temp_store):
         resolver, placeholder = self._by_address(temp_store)
 
-        result = resolver.resolve(name="Robin Gamma", email="ROBIN@example.com")
+        result = resolver.resolve(name="Robin Gamma", email="ROBIN@example.com", create_if_missing=True)
 
         assert result.entity.id == placeholder.id
         assert temp_store.get_by_id(placeholder.id).canonical_name == "Robin Gamma"
@@ -845,7 +845,7 @@ class TestPlaceholderNames:
     def test_only_a_real_multi_word_name_replaces_a_placeholder(self, temp_store, name):
         resolver, placeholder = self._by_number(temp_store)
 
-        resolver.resolve(name=name, phone=self.PHONE)
+        resolver.resolve(name=name, phone=self.PHONE, create_if_missing=True)
 
         assert temp_store.get_by_id(placeholder.id).canonical_name == self.PHONE
         assert temp_store.get_by_name("Robin") is None
@@ -853,17 +853,37 @@ class TestPlaceholderNames:
     def test_a_bare_name_does_not_replace_an_address_placeholder(self, temp_store):
         resolver, placeholder = self._by_address(temp_store)
 
-        resolver.resolve(name="Robin", email=self.EMAIL)
+        resolver.resolve(name="Robin", email=self.EMAIL, create_if_missing=True)
 
         assert temp_store.get_by_id(placeholder.id).canonical_name == self.EMAIL
         assert temp_store.get_by_name("Robin") is None
+
+    def test_a_read_only_lookup_by_number_does_not_rename(self, temp_store):
+        resolver, placeholder = self._by_number(temp_store)
+
+        result = resolver.resolve(name="Robin Gamma", phone=self.PHONE)
+
+        assert result.entity.id == placeholder.id
+        assert result.entity.canonical_name == self.PHONE
+        assert temp_store.get_by_id(placeholder.id).canonical_name == self.PHONE
+        assert temp_store.get_by_name("Robin Gamma") is None
+
+    def test_a_read_only_lookup_by_address_does_not_rename(self, temp_store):
+        resolver, placeholder = self._by_address(temp_store)
+
+        result = resolver.resolve(name="Robin Gamma", email=self.EMAIL)
+
+        assert result.entity.id == placeholder.id
+        assert result.entity.canonical_name == self.EMAIL
+        assert temp_store.get_by_id(placeholder.id).canonical_name == self.EMAIL
+        assert temp_store.get_by_name("Robin Gamma") is None
 
     def test_a_real_name_is_never_overwritten(self, temp_store):
         known = _person(temp_store, "Robin Alpha", 30.0, phone_numbers=[self.PHONE], emails=[self.EMAIL])
         resolver = EntityResolver(temp_store)
 
-        resolver.resolve(name="Robin Gamma", phone=self.PHONE)
-        resolver.resolve(name="Robin Gamma", email=self.EMAIL)
+        resolver.resolve(name="Robin Gamma", phone=self.PHONE, create_if_missing=True)
+        resolver.resolve(name="Robin Gamma", email=self.EMAIL, create_if_missing=True)
 
         assert temp_store.get_by_id(known.id).canonical_name == "Robin Alpha"
         assert temp_store.get_by_name("Robin Gamma") is None
@@ -873,7 +893,7 @@ class TestPlaceholderNames:
             canonical_name=self.PHONE, phone_numbers=[self.PHONE], emails=[self.EMAIL],
         ))
 
-        EntityResolver(temp_store).resolve(name="Robin Gamma", email=self.EMAIL)
+        EntityResolver(temp_store).resolve(name="Robin Gamma", email=self.EMAIL, create_if_missing=True)
 
         assert temp_store.get_by_id(person.id).canonical_name == self.PHONE
 
@@ -881,7 +901,7 @@ class TestPlaceholderNames:
         resolver, placeholder = self._by_number(temp_store)
         holder = _person(temp_store, "Robin Gamma", 30.0)
 
-        resolver.resolve(name="Robin Gamma", phone=self.PHONE)
+        resolver.resolve(name="Robin Gamma", phone=self.PHONE, create_if_missing=True)
 
         assert temp_store.get_by_id(placeholder.id).canonical_name == self.PHONE
         assert temp_store.get_by_name("Robin Gamma").id == holder.id
@@ -891,7 +911,7 @@ class TestPlaceholderNames:
             canonical_name=self.PHONE, display_name="Robin (gym)", phone_numbers=[self.PHONE],
         ))
 
-        EntityResolver(temp_store).resolve(name="Robin Gamma", phone=self.PHONE)
+        EntityResolver(temp_store).resolve(name="Robin Gamma", phone=self.PHONE, create_if_missing=True)
 
         stored = temp_store.get_by_id(person.id)
         assert stored.canonical_name == "Robin Gamma"
@@ -908,7 +928,7 @@ class TestPlaceholderNames:
         conn.close()
         temp_store.save()
 
-        resolver.resolve(name="Robin Gamma", phone=self.PHONE)
+        resolver.resolve(name="Robin Gamma", phone=self.PHONE, create_if_missing=True)
 
         stored = temp_store.get_by_id(placeholder.id)
         assert stored.canonical_name == "Robin Gamma"

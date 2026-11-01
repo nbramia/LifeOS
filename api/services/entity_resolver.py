@@ -758,8 +758,9 @@ class EntityResolver:
         the name. An unknown email or phone next to it still anchors a new
         person of their own, named from the address or number so the tied name
         is not added as another exact match. A tied name with no identifier
-        returns None. A person named only after their identifier takes the real
-        multi-word name of the first call that matches them by it.
+        returns None. With create_if_missing, a person named only after their
+        identifier takes the real multi-word name of a call that matches them by
+        it. Without it, nothing is written.
 
         Phone-only never creates a PersonEntity. A raw phone
         observation with no name or email tells you very little about who the
@@ -787,7 +788,8 @@ class EntityResolver:
         if email:
             entity = self.resolve_by_email(email)
             if entity:
-                self._replace_placeholder_name(entity, email, name)
+                if create_if_missing:
+                    self._replace_placeholder_name(entity, email, name)
                 return ResolutionResult(
                     entity=entity,
                     is_new=False,
@@ -799,8 +801,9 @@ class EntityResolver:
         if phone:
             entity = self.resolve_by_phone(phone)
             if entity:
-                from api.services.phone_utils import normalize_phone
-                self._replace_placeholder_name(entity, normalize_phone(phone), name)
+                if create_if_missing:
+                    from api.services.phone_utils import normalize_phone
+                    self._replace_placeholder_name(entity, normalize_phone(phone), name)
                 return ResolutionResult(
                     entity=entity,
                     is_new=False,
