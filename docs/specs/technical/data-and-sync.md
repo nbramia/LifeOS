@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Data Pipeline
-> **Last Updated:** 2026-09-04
+> **Last Updated:** 2026-11-01
 
 How LifeOS ingests and stores data from multiple sources.
 
@@ -475,6 +475,41 @@ Two Phase 2 sources touch iMessage data, and their order matters:
 `link_imessage` runs after `imessage` (`depends_on: ["imessage"]` in
 `SYNC_SOURCES`) so its backfill operates on the night's freshly-created
 interactions rather than lagging a day behind.
+
+#### iMessage interaction identity
+
+An iMessage interaction is identified by its message key, `(UTC timestamp
+floored to the whole second, direction)`, never by the chat.db ROWID, which
+differs between Macs and changes when chat.db is rebuilt. Direction comes from
+`is_from_me` on a message and from the title prefix (`→` sent, `←` received) on
+an interaction. Sub-second timestamps can differ between exports, so keys never
+include microseconds.
+
+Several real messages can share a key (attachment bursts, group sends, messages
+from different people), so keys are counted as a multiset and matched in two
+stages: each linked, non-hidden message first claims an unused existing
+`imessage` interaction of the same person at its key (merged ids compared as
+their surviving person on both sides); messages still unmatched then claim any
+leftover interaction at that key regardless of person, so a relinked message
+does not duplicate. What remains is new and is inserted under its own person.
+Matching depends only on each row's timestamp, title prefix and person, not on
+its `source_id`. New rows get a rowid-free
+`source_id` (`imessage_k_<hash of second, direction, ordinal>`) using the lowest
+ordinal not already taken, so the UNIQUE `(source_type, source_id)` index never
+drops one. Older `imessage_<rowid>` ids remain valid and coexist with these.
+`api/services/imessage_identity.py` holds the key rules;
+`scripts/repair_imessage_duplicates.py` applies the same rules to remove
+leftover duplicates.
+
+#### Hidden people
+
+Consistency verification deletes interactions that belong to hidden people, so
+the iMessage, Gmail, Calendar, phone, and WhatsApp syncs insert none for them
+(their source entities are still linked). A person id merged into another is
+resolved to the surviving person, whose `hidden` flag decides and whose id the
+iMessage rows carry; the other sources receive survivors from the entity
+resolver. Sync counters (`interactions_created`, `source_entities_created`)
+count rows and entities actually created.
 
 ### Slack Sync
 

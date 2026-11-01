@@ -407,6 +407,7 @@ def process_whatsapp_messages(
         "skipped_large_group": 0,
         "outgoing_group_created": 0,
         "persons_not_found": 0,
+        "hidden_person": 0,
         "errors": 0,
     }
 
@@ -446,7 +447,10 @@ def process_whatsapp_messages(
 
         def flush_batch():
             nonlocal batch
-            if batch and not dry_run:
+            if batch and dry_run:
+                stats["interactions_created"] += len(batch)
+            elif batch:
+                before = int_conn.total_changes
                 int_cursor.executemany(
                     """
                     INSERT OR IGNORE INTO interactions
@@ -455,6 +459,7 @@ def process_whatsapp_messages(
                     """,
                     batch,
                 )
+                stats["interactions_created"] += int_conn.total_changes - before
                 int_conn.commit()
             batch = []
 
@@ -518,6 +523,11 @@ def process_whatsapp_messages(
                         person_id = result.entity.id
                         if person_id == my_person_id:
                             continue
+                        # Hidden people get no interactions (consistency
+                        # verification removes them).
+                        if result.entity.hidden:
+                            stats["hidden_person"] += 1
+                            continue
                         affected_person_ids.add(person_id)
                         p_display = p_name or p_phone
                         title = f"WhatsApp → {chat_name} ({p_display})"
@@ -533,7 +543,6 @@ def process_whatsapp_messages(
                             participant_source_id,
                             datetime.now(timezone.utc).isoformat(),
                         ))
-                        stats["interactions_created"] += 1
                         stats["outgoing_group_created"] += 1
                     continue
 
@@ -575,6 +584,12 @@ def process_whatsapp_messages(
                     stats["persons_not_found"] += 1
                     continue
 
+                # Hidden people get no interactions (consistency verification
+                # removes them).
+                if result.entity.hidden:
+                    stats["hidden_person"] += 1
+                    continue
+
                 person_id = result.entity.id
                 affected_person_ids.add(person_id)
 
@@ -592,7 +607,6 @@ def process_whatsapp_messages(
                     source_id,
                     datetime.now(timezone.utc).isoformat(),
                 ))
-                stats["interactions_created"] += 1
 
                 if len(batch) >= batch_size:
                     flush_batch()

@@ -166,6 +166,7 @@ def _mock_resolver_returning(person_id: str) -> MagicMock:
     """Build a resolver that always resolves to a person with the given id."""
     entity = MagicMock()
     entity.id = person_id
+    entity.hidden = False
     result = MagicMock()
     result.entity = entity
     resolver = MagicMock()
@@ -277,8 +278,8 @@ class TestProcessWhatsAppMessagesOutgoingGroup:
         int_db = _make_interactions_db(tmp_path)
 
         # Two participants: one phone-based, one LID with push_name
-        entity_a = MagicMock(id="person-phone")
-        entity_b = MagicMock(id="person-alice")
+        entity_a = MagicMock(id="person-phone", hidden=False)
+        entity_b = MagicMock(id="person-alice", hidden=False)
         result_a = MagicMock(entity=entity_a)
         result_b = MagicMock(entity=entity_b)
         resolver = MagicMock()
