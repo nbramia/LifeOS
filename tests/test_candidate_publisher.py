@@ -1027,6 +1027,23 @@ def test_publish_builds_the_candidate_only_after_the_shadow_wait(tmp_path, monke
     assert events == ["wait", "build"]
 
 
+def test_publish_refuses_a_head_that_moved_during_the_shadow_wait(tmp_path, monkeypatch):
+    heads = iter([_shadow_pr("h" * 40), _shadow_pr("m" * 40)])
+    monkeypatch.setattr(publisher, "fetch_pull_request", lambda *a, **k: next(heads))
+    monkeypatch.setattr(publisher, "_assert_head_exclusive", lambda *a, **k: None)
+    monkeypatch.setattr(publisher, "await_inflight_shadow", lambda *a, **k: None)
+
+    def not_built(*a, **k):
+        raise AssertionError("built a candidate for a stale head")
+
+    monkeypatch.setattr(publisher, "build_candidate", not_built)
+    with pytest.raises(PublisherError, match="moved"):
+        publish_pull_request(
+            "nbramia/LifeOS", 31, repo=tmp_path, trusted_app_id=999, workflow_file="w.yml", check_name="c",
+            shadow_wait_seconds=60.0,
+        )
+
+
 def test_publish_skips_the_shadow_wait_when_it_is_zero(tmp_path, monkeypatch):
     pr = _shadow_pr()
     monkeypatch.setattr(publisher, "fetch_pull_request", lambda *a, **k: pr)

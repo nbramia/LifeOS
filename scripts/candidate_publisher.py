@@ -266,8 +266,8 @@ def await_inflight_shadow(
 
     The required run reuses a passing shadow of an identical tree, and its
     dispatch shares the shadow's concurrency group, so dispatching early cancels
-    the shadow and then runs the same lanes from the start. Waiting costs at most
-    the shadow's remaining time, which is never more than a fresh run.
+    the shadow and then runs the same lanes from the start. While the base holds
+    still, waiting costs the shadow's remaining time in place of a fresh run.
 
     This decides nothing about verification: the required check still verifies
     the exact candidate. The wait simply ends on the deadline, on any API failure,
@@ -831,6 +831,12 @@ def publish_pull_request(
             repository, workflow_file, repo, remote, pr,
             timeout_seconds=shadow_wait_seconds, run=run, sleep=sleep, now=now,
         )
+        current_head = fetch_pull_request(repository, pr_number, run=run).head_sha
+        if current_head != pr.head_sha:
+            raise PublisherError(
+                f"PR #{pr_number} head moved to {current_head} during the shadow wait; "
+                f"refusing to publish {pr.head_sha}"
+            )
 
     _git(run, repo, ["fetch", remote, pr.base_ref])
     expected_main_sha = _git(run, repo, ["rev-parse", f"{remote}/{pr.base_ref}"]).strip()

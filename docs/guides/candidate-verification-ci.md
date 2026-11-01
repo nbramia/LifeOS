@@ -80,8 +80,9 @@ every part's receipts and pass each directory:
 
 ```bash
 gh run download <run-id> --pattern 'lane-receipts-*' --dir /tmp/lane-receipts
-~/.venvs/lifeos/bin/python scripts/verify_candidate.py record-scope-durations \
-  $(printf -- '--lane-log-dir %s ' /tmp/lane-receipts/lane-receipts-*)
+args=()
+for part in /tmp/lane-receipts/lane-receipts-*; do args+=(--lane-log-dir "$part"); done
+~/.venvs/lifeos/bin/python scripts/verify_candidate.py record-scope-durations "${args[@]}"
 ```
 
 Each part also uploads `impact-selection-<candidate sha>-part<n>`, holding
@@ -302,7 +303,8 @@ check.
 `scripts/candidate_publisher.py` orchestrates the actual publish. If a shadow
 run of this exact head is still running and the head contains the current base,
 it first lets that shadow finish (bounded by `--shadow-wait-seconds`), because
-the dispatch would otherwise cancel a verdict it could reuse. It then builds
+the dispatch would otherwise cancel a verdict it could reuse, and refuses if the
+head moved meanwhile. It then builds
 the candidate, pushes it to a disposable staging ref, dispatches
 `workflow_dispatch` against it, polls for the resulting check via the
 GitHub API filtered to the dedicated App's `app_id` (never accepting a
