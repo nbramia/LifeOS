@@ -792,6 +792,50 @@ class Settings(BaseSettings):
                     "different origin from the issuer. Empty means <issuer>/oauth/authorize."
     )
 
+    # Host tools — scoped file, command and log access over MCP.
+    # See docs/guides/host-tools.md. Which directories are readable or
+    # writable, the denylist, and the command allowlist live in
+    # api/services/host_tools.py.
+    host_tools_enabled: bool = Field(
+        default=False,
+        alias="LIFEOS_HOST_TOOLS_ENABLED",
+        description="Register the lifeos_fs_*, lifeos_shell and lifeos_logs MCP tools."
+    )
+    host_tools_run_as: str = Field(
+        default="",
+        alias="LIFEOS_HOST_TOOLS_RUN_AS",
+        description="Low-privilege account lifeos_shell runs commands as, via `sudo -n -u`. "
+                    "Empty disables lifeos_shell; it never runs commands as the LifeOS user."
+    )
+    host_tools_scratch_dir: Path = Field(
+        default=_REPO_ROOT / "scratch",
+        alias="LIFEOS_HOST_TOOLS_SCRATCH_DIR",
+        description="Writable scratch directory for lifeos_fs_write."
+    )
+    host_tools_oauth_clients: str = Field(
+        default="",
+        alias="LIFEOS_HOST_TOOLS_OAUTH_CLIENTS",
+        description="Comma-separated OAuth client ids that may call the host tools. "
+                    "Empty means no OAuth-connected app gets them."
+    )
+    host_tools_vault_autocommit: bool = Field(
+        default=True,
+        alias="LIFEOS_HOST_TOOLS_VAULT_AUTOCOMMIT",
+        description="Commit each lifeos_fs_write to the vault, when the vault is a git repo."
+    )
+    host_tools_shell_approval: bool = Field(
+        default=False,
+        alias="LIFEOS_HOST_TOOLS_SHELL_APPROVAL",
+        description="Send commands outside the allowlist to Telegram for approval instead "
+                    "of refusing them. Off: they are refused."
+    )
+    host_tools_approval_timeout_seconds: int = Field(
+        default=86400,
+        alias="LIFEOS_HOST_TOOLS_APPROVAL_TIMEOUT_SECONDS",
+        description="How long an approval request, and an approval not yet used, stays open "
+                    "before it expires unused. 0 turns expiry off."
+    )
+
     # Agent Worker — external worker that picks up #agent-tagged tasks.
     # See docs/guides/agent-worker-setup.md and epic #98 for the full design.
     agent_worker_poll_seconds: float = Field(

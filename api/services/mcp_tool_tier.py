@@ -41,6 +41,11 @@ def _deny(reason: str) -> ToolClass:
     return ToolClass(allowed=False, reason=reason)
 
 
+def _operator_grant(reason: str, *, read_only: bool = False) -> ToolClass:
+    """Denied in the tier; callable only by OAuth clients the operator lists."""
+    return ToolClass(allowed=False, reason=f"operator grant only: {reason}", read_only=read_only)
+
+
 _AGENT_DENY = "inter-agent family: agent spawning, messaging and session control"
 
 OAUTH_TOOL_TIER: dict[str, ToolClass] = {
@@ -138,11 +143,23 @@ OAUTH_TOOL_TIER: dict[str, ToolClass] = {
     "lifeos_agent_sessions_list": _deny(_AGENT_DENY),
     "lifeos_agent_user_ask": _deny(_AGENT_DENY),
     "lifeos_agent_execution_override": _deny(_AGENT_DENY),
+    # Host tools: outside the tier for every app. The operator grants them to
+    # named OAuth clients with LIFEOS_HOST_TOOLS_OAUTH_CLIENTS (see
+    # mcp_server.OAuthToolAccess); a grant does not widen anything else.
+    "lifeos_fs_list": _operator_grant("host file listing inside named roots", read_only=True),
+    "lifeos_fs_read": _operator_grant("host file read inside named roots", read_only=True),
+    "lifeos_fs_write": _operator_grant("host file write to the vault or scratch directory"),
+    "lifeos_shell": _operator_grant("allowlisted host commands as a low-privilege account"),
+    "lifeos_logs": _operator_grant("LifeOS service logs", read_only=True),
 }
 
 OAUTH_ALLOWED_TOOLS: frozenset[str] = frozenset(
     name for name, cls in OAUTH_TOOL_TIER.items() if cls.allowed
 )
+
+
+# Overwrites files or runs commands on the host.
+_DESTRUCTIVE_TOOLS = frozenset({"lifeos_fs_write", "lifeos_shell"})
 
 
 def tool_annotations(name: str) -> dict:
@@ -152,7 +169,7 @@ def tool_annotations(name: str) -> dict:
         return {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False}
     return {
         "readOnlyHint": False,
-        "destructiveHint": False,
+        "destructiveHint": name in _DESTRUCTIVE_TOOLS,
         "idempotentHint": False,
         "openWorldHint": False,
     }

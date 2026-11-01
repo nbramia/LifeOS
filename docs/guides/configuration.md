@@ -1,7 +1,7 @@
 # Configuration Guide
 
 **Status:** Complete
-**Last Updated:** 2026-09-16
+**Last Updated:** 2026-10-31
 **Audience:** Operators
 
 **This is the single authoritative reference for every `LIFEOS_*` environment variable and the third-party service variables (`ANTHROPIC_API_KEY`, `OLLAMA_*`, `SLACK_*`, `TELEGRAM_*`, `MONARCH_*`) that LifeOS reads.** Other guides reference this file rather than restating defaults — when documentation conflicts, this file wins (and `config/settings.py` wins over both, since the code is the source of truth).
@@ -169,18 +169,33 @@ The HTTP MCP transport exposes LifeOS tools to remote agents (primarily Anthropi
 |---|---|---|---|
 | `LIFEOS_MCP_HTTP_HOST` | str | `127.0.0.1` | Bind address. Keep `127.0.0.1` and front with Cloudflare Tunnel / Tailscale Funnel. |
 | `LIFEOS_MCP_HTTP_PORT` | int | `8765` | Port. |
-| `LIFEOS_MCP_BEARER_TOKEN` | str | — | Required for any non-loopback request. Generate with `openssl rand -hex 32`. Treat as a secret. |
+| `LIFEOS_MCP_BEARER_TOKEN` | str | — | Full-access token. Required at startup; accepted from the host and the tailnet (and on public edges only with `LIFEOS_MCP_ALLOW_PUBLIC_BEARER`). OAuth requests on public edges authenticate with their own tokens instead. Generate with `openssl rand -hex 32`. Treat as a secret. |
 | `LIFEOS_MCP_HTTP_URL` | str | — | Public URL Managed Agents uses to reach the MCP server. |
 | `LIFEOS_OAUTH_OPERATOR_LOGINS` | str (comma-separated) | — | Tailscale logins (e.g. `operator@example.com`) allowed to approve an app on the MCP OAuth consent page. Empty disables every OAuth endpoint, so a fresh install stays bearer-only. See [mcp-oauth.md](../specs/technical/mcp-oauth.md). |
 | `LIFEOS_OAUTH_ISSUER_URL` | str | — | Public `https://` base URL of the MCP HTTP transport. Advertised as the OAuth issuer; the protected resource is `<issuer>/mcp`. OAuth stays disabled unless this is an `https` URL. |
 | `LIFEOS_OAUTH_ALLOWED_REDIRECT_HOSTS` | str (comma-separated) | `claude.ai,claude.com,chatgpt.com` | Hosts an `https` redirect URI may name at OAuth dynamic client registration (exact host match). Loopback redirects (`localhost`, `127.0.0.1`, `[::1]`, any port) are always allowed, and are the only `http` redirects accepted. Add a host to connect another OAuth app. |
 | `LIFEOS_OAUTH_AUTHORIZE_URL` | str | `<issuer>/oauth/authorize` | Consent-page URL advertised as the authorization endpoint. Set it when the consent page is served on a tailnet-only origin different from the public issuer. |
+| `LIFEOS_MCP_ALLOW_PUBLIC_BEARER` | bool | `false` | Accept `LIFEOS_MCP_BEARER_TOKEN` on requests that came through a public edge (the public unix-socket listener, Tailscale Funnel, or Cloudflare Tunnel). Off, those requests need an OAuth token, so the full-access token works only from the host and the tailnet. Turn on only for a Managed Agents deployment reached through Cloudflare Tunnel. The consent page and connected-apps endpoints refuse public edges regardless. |
 | `LIFEOS_MCP_HTTP_UDS` | str | — | Path of the public unix-socket listener. When set, the transport also listens there, serving only the MCP and OAuth paths an app needs; a socket request never counts as a loopback peer. The public MCP node publishes this socket. |
 | `LIFEOS_MCP_FUNNEL_NODE` | bool | `false` | Keep the public MCP node running: a Tailscale node in its own Docker container whose port 443 is published with Funnel to `LIFEOS_MCP_HTTP_UDS`. The infra watchdog brings it up and keeps it publishing exactly that socket. See [Connected Apps](mcp-connected-apps.md). |
 | `LIFEOS_MCP_FUNNEL_HOSTNAME` | str | `lifeos-mcp` | Tailnet hostname the public MCP node logs in with. |
 | `LIFEOS_MCP_FUNNEL_CONTAINER` | str | `lifeos-mcp-funnel` | Docker container name of the public MCP node. |
 | `LIFEOS_MCP_FUNNEL_IMAGE` | str | `tailscale/tailscale:v1.102.4` | Image the public MCP node runs. |
 | `LIFEOS_MCP_FUNNEL_STATE_DIR` | str | `~/.local/share/lifeos-mcp-ts` | Host directory holding the public MCP node's Tailscale state (its login). |
+
+## Host Tools
+
+Scoped file, command and log access over MCP (`lifeos_fs_list`, `lifeos_fs_read`, `lifeos_fs_write`, `lifeos_shell`, `lifeos_logs`). The roots, denylist and command allowlist are defined in `api/services/host_tools.py`. Setup, including the low-privilege account: [host-tools.md](host-tools.md).
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_HOST_TOOLS_ENABLED` | bool | `false` | Register the host tools on the MCP server. |
+| `LIFEOS_HOST_TOOLS_RUN_AS` | str | — | Low-privilege account `lifeos_shell` runs commands as (`sudo -n -u`). Empty disables `lifeos_shell`; root and the LifeOS account itself are refused. |
+| `LIFEOS_HOST_TOOLS_SCRATCH_DIR` | path | `scratch/` in the checkout | Writable scratch root, created on first use. |
+| `LIFEOS_HOST_TOOLS_OAUTH_CLIENTS` | str (comma-separated) | — | OAuth client ids that get the host tools in addition to the connected-app tier. Empty: no connected app gets them. |
+| `LIFEOS_HOST_TOOLS_VAULT_AUTOCOMMIT` | bool | `true` | Commit each host-tools vault write (that path only) when the vault is a git repo. |
+| `LIFEOS_HOST_TOOLS_SHELL_APPROVAL` | bool | `false` | Send commands outside the allowlist to `TELEGRAM_CHAT_ID` through the primary bot; a reply of `APPROVE` lets the caller run that exact command once. Off: they are refused. See [Host Tools](host-tools.md#approval-for-other-commands). |
+| `LIFEOS_HOST_TOOLS_APPROVAL_TIMEOUT_SECONDS` | int | `86400` | How long a request, and an approval not yet used, stays open before it expires unused (minimum 60). `0` turns expiry off. |
 
 ## Agent Worker — Defaults and Budgets
 

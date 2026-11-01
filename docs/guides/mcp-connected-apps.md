@@ -1,7 +1,7 @@
 # Connected Apps (Claude, ChatGPT)
 
 **Status:** Complete
-**Last Updated:** 2026-10-04
+**Last Updated:** 2026-10-31
 **Audience:** Operator
 
 The Claude and ChatGPT apps can use LifeOS as a custom connector. Their servers reach the MCP HTTP transport through a small, separate Tailscale node, running in its own container, whose port 443 is public (Funnel). Each app is approved once, on a consent page that only the operator's own tailnet devices can open. A connected app gets the restricted "read + safe writes" tool tier, never the full catalog.
@@ -89,7 +89,9 @@ Revoking deletes the app's registration and tokens at once; to reconnect, the ap
 
 ## Tailnet route for your own clients
 
-The OAuth connected-apps endpoint above remains the route for the Claude and ChatGPT apps. For the operator's own tailnet clients (for example Muse), the same MCP transport can also be served to the tailnet only, authenticated by the full-access bearer token (`LIFEOS_MCP_BEARER_TOKEN`). A bearer client lists and calls the whole curated catalog, not the connected-app tier.
+The OAuth connected-apps endpoint above remains the route for the Claude and ChatGPT apps. For the operator's own tailnet clients (for example Muse), the same MCP transport can also be served to the tailnet only, authenticated by the full-access bearer token (`LIFEOS_MCP_BEARER_TOKEN`). A bearer client lists and calls the whole curated catalog, not the connected-app tier, including the tools that start agent-worker execution. The token is therefore accepted only from the host and the tailnet: a request that arrives through the public listener, Tailscale Funnel or Cloudflare Tunnel needs an OAuth token and gets `401` with the bearer token, and the consent page and connected-apps endpoints are likewise unavailable through those edges (`LIFEOS_MCP_ALLOW_PUBLIC_BEARER` relaxes the `/mcp` rule; see [Configuration](configuration.md#mcp-http-transport)).
+
+Every `tools/call` on the HTTP transport is logged as an `mcp audit:` line with the caller (`full-access-token` or `oauth:<client_id>`), the edge it came through, the tool, its argument names and a hash of the arguments, never their values. Calls to tools that can start agent-worker execution, and host-tool writes and commands, log at `WARNING`.
 
 1. Add the route to `config/tailscale-routes.local` (private, no `funnel=on`, `/mcp` only):
 
@@ -116,6 +118,10 @@ curl -s -X POST https://<host>.<tailnet>.ts.net:8443/mcp -H "Authorization: Bear
   -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'   # full catalog
 ```
 
+## Host tools for a connected app
+
+An app can also be given scoped file, command and log access to the host (the host tools), by listing its client id in `LIFEOS_HOST_TOOLS_OAUTH_CLIENTS`. That grant adds those five tools and nothing else. See [Host Tools](host-tools.md).
+
 ## Troubleshooting
 
 | Symptom | Cause |
@@ -132,3 +138,4 @@ curl -s -X POST https://<host>.<tailnet>.ts.net:8443/mcp -H "Authorization: Bear
 - [Operations — Host routes and dependencies](operations.md#host-routes-and-dependencies) — Declared routes, the infra watchdog
 - [Configuration](configuration.md#mcp-http-transport) — `LIFEOS_OAUTH_*` and `LIFEOS_MCP_*` settings
 - [Agent Worker Setup](agent-worker-setup.md) — The bearer-token path for Managed Agents
+- [Host Tools](host-tools.md) — Scoped file, command and log access an app can be granted

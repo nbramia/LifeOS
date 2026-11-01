@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Platform
-> **Last Updated:** 2026-10-03
+> **Last Updated:** 2026-10-31
 
 The MCP HTTP transport (`mcp_server.py --transport http`) accepts two credentials on its MCP endpoint (`POST /mcp`, `POST /`):
 
@@ -23,9 +23,9 @@ OAuth is off unless `LIFEOS_OAUTH_OPERATOR_LOGINS` is non-empty and `LIFEOS_OAUT
 | `GET`/`POST /oauth/authorize` | the operator, from the tailnet | Consent page and the approve/deny decision |
 | `POST /oauth/token` | registered clients | `authorization_code` and `refresh_token` grants (form-encoded) |
 | `POST /oauth/revoke` | registered clients | RFC 7009 revocation |
-| `GET /oauth/clients`, `DELETE /oauth/clients/{client_id}` | loopback, non-Funnel, bearer token | Connected apps and per-app revoke |
+| `GET /oauth/clients`, `DELETE /oauth/clients/{client_id}` | loopback, not via a public edge, bearer token | Connected apps and per-app revoke |
 
-The bearer-authenticated `/mcp` may also be served to the tailnet only (see [Connected Apps](../../guides/mcp-connected-apps.md#tailnet-route-for-your-own-clients)). `/mcp` has no loopback exemption: a peer on `127.0.0.1`, which is what Tailscale Serve presents, needs a valid token like any other.
+The bearer-authenticated `/mcp` may also be served to the tailnet only (see [Connected Apps](../../guides/mcp-connected-apps.md#tailnet-route-for-your-own-clients)). `/mcp` has no loopback exemption: a peer on `127.0.0.1`, which is what Tailscale Serve presents, needs a valid token like any other. The full-access bearer token is accepted only from the host and the tailnet; a request that came through a public edge needs an OAuth token: the public unix-socket listener (marked on the ASGI scope, which a client cannot set), or a request carrying `Tailscale-Funnel-Request` or `Cf-Connecting-Ip`, headers those edges add and a client cannot strip. The consent page and the connected-apps endpoints apply the same public-edge test. Off the tailnet only OAuth tokens, and so only the tier below, reach LifeOS unless `LIFEOS_MCP_ALLOW_PUBLIC_BEARER` is set.
 
 An MCP request with no token, or an unknown, expired or revoked one, gets `401` with `WWW-Authenticate: Bearer resource_metadata="<issuer>/.well-known/oauth-protected-resource/mcp"` (plus `error="invalid_token"` when a token was presented).
 
@@ -43,7 +43,7 @@ An MCP request with no token, or an unknown, expired or revoked one, gets `401` 
 `/oauth/authorize` answers only when all of these hold, else `403`:
 
 1. The direct peer is loopback — the request arrived through Tailscale Serve's local proxy, since the transport binds `127.0.0.1`.
-2. There is no `Tailscale-Funnel-Request` header.
+2. The request carries no public-edge header (`Tailscale-Funnel-Request` or `Cf-Connecting-Ip`).
 3. `Tailscale-User-Login` names one of `LIFEOS_OAUTH_OPERATOR_LOGINS` (case-insensitive). Serve strips client-supplied identity headers, and adds none to Funnel or tagged-device traffic.
 
 The page names the app (`client_name`, escaped), the redirect host and the tier, and warns when the redirect is a loopback address. It loads no external assets and refuses framing. Approve and Deny post back with a CSRF token bound to a server-side pending request (10 minutes, single use, same operator login). Consuming the pending request, checking the client and issuing the code happen in one `BEGIN IMMEDIATE` transaction, so a concurrent prune cannot remove the client mid-approval. A post marked `Sec-Fetch-Site: cross-site`, or whose `Origin` matches neither `Host` nor `X-Forwarded-Host`, is refused.
@@ -64,7 +64,7 @@ A **chain** is everything issued from one code exchange. Revoking a token (RFC 7
 
 ## Tool tier: read + safe writes
 
-`OAUTH_TOOL_TIER` in `api/services/mcp_tool_tier.py` classifies every tool the server can build as allowed or denied, with a reason; a tool absent from it is denied, and `tests/test_mcp_oauth.py` fails until a new tool is classified. For an OAuth request, `tools/list` returns only allowed tools, each with `annotations` (`readOnlyHint`, `destructiveHint: false`), and `tools/call` on any other name returns the same `Unknown tool` error (`-32602`) as a nonexistent tool.
+`OAUTH_TOOL_TIER` in `api/services/mcp_tool_tier.py` classifies every tool the server can build as allowed or denied, with a reason; a tool absent from it is denied, and `tests/test_mcp_oauth.py` fails until a new tool is classified. For an OAuth request, `tools/list` returns only allowed tools, each with `annotations` (`readOnlyHint`, `destructiveHint`), and `tools/call` on any other name returns the same `Unknown tool` error (`-32602`) as a nonexistent tool.
 
 - **Allowed reads:** every read-only curated tool (including `lifeos_vault_read`, which returns one note by vault-relative path and is confined to the vault root), plus `search` and `fetch`.
 - **Allowed writes:** `lifeos_task_create`, `lifeos_reminder_create`, `lifeos_memories_create`, `lifeos_gmail_draft`, with argument guards. A task:
@@ -76,6 +76,7 @@ A **chain** is everything issued from one code exchange. Revoking a token (RFC 7
 
   A reminder must be `message_type: "static"` with no `endpoint_config`. Independently of OAuth, the task store accepts only a plain context name (the whole string matches `[A-Za-z0-9][A-Za-z0-9 _&'-]{0,63}`) whose file resolves directly inside the tasks directory.
 - **Denied:** sending (email, Telegram), deletes, person and fact edits, vault writes, task edits and lifecycle actions, projects, schedules, sync, calendar writes (they email attendees), home-network control, Human-queue writes, workout logging, and the `lifeos_agent_*` family.
+- **Operator grant only:** the host tools (`lifeos_fs_list`, `lifeos_fs_read`, `lifeos_fs_write`, `lifeos_shell`, `lifeos_logs`) are denied in the tier. An OAuth client whose id is listed in `LIFEOS_HOST_TOOLS_OAUTH_CLIENTS`, while `LIFEOS_HOST_TOOLS_ENABLED` is on, also gets those five, and nothing else beyond the tier. `lifeos_fs_write` and `lifeos_shell` carry `destructiveHint: true`. Their own path and command limits are in [Host Tools](../../guides/host-tools.md).
 
 `search` and `fetch` exist only for OAuth requests. `search` (`{query}`) runs vault search and returns `{results: [{id, title, url, text}]}`, one per vault document, where `id` is the vault-relative path and `url` an `obsidian://` link. `fetch` (`{id}`) returns `{id, title, text, url, metadata}` for a document an earlier search by the same OAuth client returned in the same process, re-checked to resolve inside the vault. Both results carry the JSON as text content and as `structuredContent`.
 
@@ -92,3 +93,4 @@ A **chain** is everything issued from one code exchange. Revoking a token (RFC 7
 - [Configuration](../../guides/configuration.md#mcp-http-transport) -- `LIFEOS_OAUTH_*` and `LIFEOS_MCP_*` settings
 - [Security & Privacy](security-privacy.md) -- Broader security posture this tier fits into
 - [Agent Worker Setup](../../guides/agent-worker-setup.md#step-3--enable-the-mcp-http-systemd-unit) -- Bearer-token transport setup for Managed Agents
+- [Host Tools](../../guides/host-tools.md) -- The operator-granted host tools and their limits
