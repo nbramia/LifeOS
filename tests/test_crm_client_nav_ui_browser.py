@@ -601,6 +601,40 @@ class TestActiveLinkAndTabRegressions:
             "selecting a person must clear the Family link, not leave it highlighted"
         )
 
+    def test_person_with_no_interaction_shows_an_empty_state(self, page: Page, crm_base_url):
+        _, _, console_errors = _prepare(page)
+        page.goto(f"{crm_base_url}/family")
+        expect(page.locator("#familyDashboard")).to_be_visible()
+
+        body = {**SYNTHETIC_OTHER_PERSON, "last_seen": None, "first_seen": None}
+        person_url = f"**/api/crm/people/{SYNTHETIC_OTHER_PERSON['id']}"
+        for url in (person_url, f"{person_url}?include_related=true"):
+            page.route(url, lambda route: route.fulfill(
+                status=200, content_type="application/json", body=json.dumps(body),
+            ))
+        page.evaluate(f"selectPerson('{SYNTHETIC_OTHER_PERSON['id']}')")
+        expect(page.locator("#personContentGrid")).to_be_visible()
+
+        expect(page.locator("#heroStatLastSeen")).to_have_text("—")
+        expect(page.locator(".contact-meta-item", has_text="Last seen")).to_contain_text("No interactions")
+        assert not [e for e in console_errors if "last_seen" in e or "Invalid" in e]
+
+    def test_family_member_with_no_interaction_has_no_invented_gap(self, page: Page, crm_base_url):
+        _prepare(page)
+        page.goto(f"{crm_base_url}/family")
+        expect(page.locator("#familyDashboard")).to_be_visible()
+
+        badge = page.evaluate(
+            """() => {
+                familyMembers = [{id: 'synthetic-relative', name: 'Synthetic Relative',
+                                  dunbar_circle: 1, last_seen: null, by_source: {}}];
+                selectedFamilyIds = ['synthetic-relative'];
+                renderDaysSinceContact();
+                return document.querySelector('#daysSinceGrid .days-since-badge').textContent;
+            }"""
+        )
+        assert badge == "None"
+
     def test_me_from_a_no_tab_url_shows_overview_not_a_stale_tab(self, page: Page, crm_base_url):
         """Landing on /me (no tab segment) after /me/timeline was showing
         must reset to the Overview tab, not leave Timeline displayed."""

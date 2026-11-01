@@ -17,6 +17,9 @@ Checks performed:
      overrides, source_entities with invalid person_ids
   6. Missing vault files — interactions pointing at notes that moved or were
      deleted; re-points moves, drops duplicates, flags ambiguous cases
+  7. last_seen — stored value vs the most recent real interaction (always
+     auto-fixes, not gated by threshold — the value is derived, so writing it
+     loses nothing)
 
 Usage:
     python scripts/sync_consistency_verify.py --dry-run          # report only
@@ -55,6 +58,18 @@ def _check_person_stats(dry_run: bool) -> dict:
         "count": len(discrepancies),
         "fixed": len(discrepancies) if not dry_run and discrepancies else 0,
         "details": f"{len(discrepancies)} mismatched" if discrepancies else "all consistent",
+    }
+
+
+def _check_last_seen(dry_run: bool) -> dict:
+    """Check 7: Verify stored last_seen matches the most recent real interaction."""
+    from api.services.person_stats import sync_last_seen
+    result = sync_last_seen(dry_run=dry_run)
+    count = result["mismatched"]
+    return {
+        "count": count,
+        "fixed": count if not dry_run else 0,
+        "details": f"{count} mismatched, {result['cleared']} of them with no real interaction",
     }
 
 
@@ -563,6 +578,7 @@ def verify_consistency(dry_run: bool = True, fix_threshold: int = AUTO_FIX_THRES
         logger.error("valid_ids is empty — aborting consistency checks to prevent data loss")
         return {
             "person_stats_mismatches": {"count": 0, "fixed": 0, "details": "aborted: no valid person IDs"},
+            "last_seen_mismatches": {"count": 0, "fixed": 0},
             "orphaned_interactions": {"count": 0, "fixed": 0},
             "hidden_interactions": {"count": 0, "fixed": 0},
             "stale_merged_ids": {"count": 0, "fixed": 0},
@@ -588,9 +604,10 @@ def verify_consistency(dry_run: bool = True, fix_threshold: int = AUTO_FIX_THRES
     missing_vault_files = _check_missing_vault_files(dry_run, fix_threshold)
     # Person stats AFTER interaction-modifying checks so counts reflect final state
     person_stats = _check_person_stats(dry_run)
+    last_seen = _check_last_seen(dry_run)
 
     checks = [
-        person_stats, orphaned_interactions, hidden_interactions,
+        person_stats, last_seen, orphaned_interactions, hidden_interactions,
         stale_merged_ids, stale_merged_rels, rel_hygiene, orphaned_crm_records,
         missing_vault_files,
     ]
@@ -604,6 +621,7 @@ def verify_consistency(dry_run: bool = True, fix_threshold: int = AUTO_FIX_THRES
 
     return {
         "person_stats_mismatches": person_stats,
+        "last_seen_mismatches": last_seen,
         "orphaned_interactions": orphaned_interactions,
         "hidden_interactions": hidden_interactions,
         "stale_merged_ids": stale_merged_ids,
@@ -636,6 +654,7 @@ def main():
     # Print summary for _parse_sync_output() and human readability
     print("\n=== Consistency Verification ===")
     print(f"Person stats mismatches: {result['person_stats_mismatches']['count']}")
+    print(f"last_seen mismatches: {result['last_seen_mismatches']['count']}")
     print(f"Orphaned interactions: {result['orphaned_interactions']['count']}")
     print(f"Hidden-person interactions: {result['hidden_interactions']['count']}")
     print(f"Stale merged IDs (interactions): {result['stale_merged_ids']['count']}")

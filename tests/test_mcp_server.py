@@ -784,6 +784,27 @@ def test_people_search_formatter_falls_back_to_page_size_without_total():
     assert "Found 1 people:" in out
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("days", "expected"),
+    [(None, "Last contact: no contact on record"), (0, "Last contact: 0 days ago"), (999, "Last contact: 999 days ago")],
+)
+def test_people_search_formatter_reports_contact_honestly(days, expected):
+    """A null days_since_contact is no contact at all, and any number is a real gap."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    server = module.LifeOSMCPServer()
+
+    people = _synthetic_people(1)
+    people[0]["days_since_contact"] = days
+    out = server._format_response(
+        "lifeos_people_search", {"people": people, "count": 1, "query": "solo"}
+    )
+    assert expected in out
+
+
 # ---------------------------------------------------------------------------
 # Investments snapshot tool
 # ---------------------------------------------------------------------------

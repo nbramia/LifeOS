@@ -105,10 +105,7 @@ def migrate(json_path: Path, db_path: Path, dry_run: bool = False) -> None:
                 entity = PersonEntity.from_dict(raw_data)
                 values = store._entity_to_values(entity)
 
-                conn.execute(
-                    f"INSERT OR REPLACE INTO person_entities "
-                    f"({store._COLUMNS_STR}) VALUES ({store._PLACEHOLDERS})",
-                    values)
+                conn.execute(store._UPSERT_SQL, values)
 
                 # Update lookup tables
                 store._update_lookup_tables(conn, entity)
@@ -211,7 +208,7 @@ def verify(json_path: Path, db_path: Path, raw_entities: list[dict]) -> None:
         print("\n  WARNING: Migration has issues. JSON file preserved as backup.")
         sys.exit(1)
     else:
-        print(f"\n  Migration verified successfully.")
+        print("\n  Migration verified successfully.")
         print(f"  JSON file preserved at: {json_path}")
 
 

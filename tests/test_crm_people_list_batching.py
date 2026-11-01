@@ -11,6 +11,7 @@ of caching get_all() -- a strength-sorted CRM page is dominated by the
 highest-interaction people, many of whom have very large source-entity
 histories.
 """
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -49,6 +50,29 @@ class _SpySourceEntityStore:
     def get_for_person(self, canonical_person_id, source_type=None, limit=None):
         self.get_for_person_calls.append(canonical_person_id)
         return []
+
+
+class TestListPeopleSortsByLastSeen:
+    def test_people_with_no_interaction_sort_last_and_stay_null(self):
+        now = datetime.now(timezone.utc)
+        people = _make_people(3)
+        people[0].last_seen = None
+        people[1].last_seen = now - timedelta(days=30)
+        people[2].last_seen = now - timedelta(days=1)
+        person_store = MagicMock()
+        expected = [people[2].id, people[1].id, people[0].id]
+        person_store.get_all.return_value = people
+
+        with patch("api.routes.crm.get_person_entity_store", return_value=person_store), \
+                patch("api.routes.crm.get_source_entity_store", return_value=_SpySourceEntityStore()):
+            result = list_people(
+                q=None, category=None, source=None, dunbar_circles=None, tags=None,
+                has_interactions=None, min_interactions=0, sort="last_seen",
+                offset=0, limit=50,
+            )
+
+        assert [p.id for p in result.people] == expected
+        assert result.people[-1].last_seen is None
 
 
 class TestListPeopleBatchesSourceEntityFetch:

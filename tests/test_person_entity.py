@@ -154,8 +154,8 @@ class TestPersonEntity:
         # Should take earliest first_seen
         assert merged.first_seen == datetime(2023, 6, 1)
 
-        # Should take latest last_seen
-        assert merged.last_seen == datetime(2024, 12, 1)
+        # last_seen is derived from interactions, never from the objects merged
+        assert merged.last_seen is None
 
         # Should sum counts
         assert merged.meeting_count == 8
@@ -917,4 +917,3 @@ class TestTimezoneHandling:
         # Should NOT raise TypeError
         merged = entity1.merge(entity2)
         assert merged.first_seen.year == 2023  # Earlier
-        assert merged.last_seen.month == 12  # Later

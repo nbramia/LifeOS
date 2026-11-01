@@ -1,4 +1,4 @@
-"""Tests for person stats refresh - counts and timestamp updates."""
+"""Tests for person stats refresh - counts and first_seen. See test_last_seen.py for last_seen."""
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -15,6 +15,13 @@ from api.services.person_stats import (
 pytestmark = pytest.mark.unit
 
 
+def _mock_store() -> MagicMock:
+    """A person store with no merges and no rows of its own to compare last_seen against."""
+    store = MagicMock()
+    store.get_canonical_id.side_effect = lambda person_id: person_id
+    return store
+
+
 def _create_interaction_db(db_path: str, interactions: list[tuple]) -> None:
     """Create a test interactions database with given rows."""
     conn = sqlite3.connect(db_path)
@@ -28,7 +35,8 @@ def _create_interaction_db(db_path: str, interactions: list[tuple]) -> None:
             snippet TEXT,
             source_link TEXT,
             source_id TEXT,
-            created_at TEXT
+            created_at TEXT,
+            attendee_count INTEGER
         )
     """)
     conn.executemany("""
@@ -58,47 +66,8 @@ def _create_crm_db(db_path: str, source_entities: list[tuple]) -> None:
     conn.close()
 
 
-class TestRefreshUpdatesLastSeen:
-    """Test that refresh_person_stats updates last_seen from interactions."""
-
-    def test_refresh_updates_last_seen_from_interactions(self, tmp_path):
-        """last_seen should match MAX(timestamp) from interactions."""
-        person_id = "test-person-001"
-        now = datetime.now(timezone.utc)
-        yesterday = now - timedelta(days=1)
-        last_week = now - timedelta(days=7)
-
-        # Create interaction DB with timestamps
-        int_db = str(tmp_path / "interactions.db")
-        _create_interaction_db(int_db, [
-            ("i1", person_id, last_week.isoformat(), "imessage", "msg1", "", None, "src1", now.isoformat()),
-            ("i2", person_id, yesterday.isoformat(), "whatsapp", "msg2", "", None, "src2", now.isoformat()),
-        ])
-
-        # Create entity with stale last_seen
-        entity = PersonEntity(
-            id=person_id,
-            canonical_name="Alex Test",
-            last_seen=last_week - timedelta(days=30),
-        )
-
-        mock_store = MagicMock()
-        mock_store.get_by_id.return_value = entity
-        mock_store.get_legacy_ids.return_value = set()
-        mock_store.get_all.return_value = [entity]
-
-        with patch("api.services.person_entity.get_person_entity_store", return_value=mock_store), \
-             patch("api.services.interaction_store.get_interaction_db_path", return_value=int_db), \
-             patch("api.services.person_stats.Path") as mock_path:
-            # No crm.db - only interactions
-            mock_path.return_value.exists.return_value = False
-
-            result = refresh_person_stats([person_id], save=False)
-
-        assert result['updated'] == 1
-        # last_seen should be approximately yesterday (the MAX timestamp)
-        assert entity.last_seen is not None
-        assert abs((entity.last_seen - yesterday).total_seconds()) < 2
+class TestRefreshUpdatesFirstSeenAndCounts:
+    """Test that refresh_person_stats updates first_seen and counts."""
 
     def test_refresh_uses_earliest_first_seen(self, tmp_path):
         """first_seen should be the earliest across interactions and source_entities."""
@@ -120,7 +89,7 @@ class TestRefreshUpdatesLastSeen:
         ])
 
         entity = PersonEntity(id=person_id, canonical_name="Alex Test")
-        mock_store = MagicMock()
+        mock_store = _mock_store()
         mock_store.get_by_id.return_value = entity
         mock_store.get_legacy_ids.return_value = set()
 
@@ -132,34 +101,6 @@ class TestRefreshUpdatesLastSeen:
         # first_seen should be the source_entity date (older)
         assert entity.first_seen is not None
         assert abs((entity.first_seen - source_entity_first).total_seconds()) < 2
-
-    def test_future_calendar_capped_at_now(self, tmp_path):
-        """Future calendar events should not set last_seen in the future."""
-        person_id = "test-person-003"
-        now = datetime.now(timezone.utc)
-        future = now + timedelta(days=30)
-        past = now - timedelta(days=5)
-
-        int_db = str(tmp_path / "interactions.db")
-        _create_interaction_db(int_db, [
-            ("i1", person_id, past.isoformat(), "imessage", "msg", "", None, "src1", now.isoformat()),
-            ("i2", person_id, future.isoformat(), "calendar", "future mtg", "", None, "src2", now.isoformat()),
-        ])
-
-        entity = PersonEntity(id=person_id, canonical_name="Alex Test")
-        mock_store = MagicMock()
-        mock_store.get_by_id.return_value = entity
-        mock_store.get_legacy_ids.return_value = set()
-
-        with patch("api.services.person_entity.get_person_entity_store", return_value=mock_store), \
-             patch("api.services.interaction_store.get_interaction_db_path", return_value=int_db), \
-             patch("api.services.person_stats.Path") as mock_path:
-            mock_path.return_value.exists.return_value = False
-            refresh_person_stats([person_id], save=False)
-
-        # last_seen should be capped at approximately now, not in the future
-        assert entity.last_seen is not None
-        assert entity.last_seen <= now + timedelta(seconds=5)
 
     def test_phone_source_type_counted(self, tmp_path):
         """'phone' source_type should contribute to message_count (not 'sms')."""
@@ -174,7 +115,7 @@ class TestRefreshUpdatesLastSeen:
         ])
 
         entity = PersonEntity(id=person_id, canonical_name="Alex Test")
-        mock_store = MagicMock()
+        mock_store = _mock_store()
         mock_store.get_by_id.return_value = entity
         mock_store.get_legacy_ids.return_value = set()
 
@@ -193,8 +134,8 @@ class TestMergedLegacyIds:
     (pre-merge) person_ids still attached to interaction rows: processing
     the canonical first (correct counts), then the legacy ID (which
     resolves via get_by_id() to the *same canonical*), must not overwrite
-    with the legacy ID's under-counts and older last_seen. Aggregate by
-    canonical before applying."""
+    with the legacy ID's under-counts. Aggregate by canonical before
+    applying."""
 
     def test_full_refresh_aggregates_legacy_into_canonical(self, tmp_path):
         canonical_id = "canonical-001"
@@ -217,7 +158,7 @@ class TestMergedLegacyIds:
         # canonical_id and legacy_id return the SAME entity.
         entity = PersonEntity(id=canonical_id, canonical_name="Merged Person")
 
-        mock_store = MagicMock()
+        mock_store = _mock_store()
         mock_store.get_by_id.return_value = entity
         mock_store.get_legacy_ids.return_value = set()
         mock_store.get_all.return_value = [entity]
@@ -230,9 +171,6 @@ class TestMergedLegacyIds:
 
         # Counts must be SUM (7), not REPLACED with the legacy under-count (2).
         assert entity.email_count == 7
-        # last_seen must be the recent canonical timestamp, not the 400-day-old
-        # legacy timestamp.
-        assert abs((entity.last_seen - canonical_time).total_seconds()) < 2
 
     def test_targeted_refresh_handles_legacy_id(self, tmp_path):
         """Targeted refresh called with a legacy ID should update the canonical
@@ -249,7 +187,7 @@ class TestMergedLegacyIds:
         ])
 
         entity = PersonEntity(id=canonical_id, canonical_name="Merged Person")
-        mock_store = MagicMock()
+        mock_store = _mock_store()
         mock_store.get_by_id.return_value = entity
         mock_store.get_legacy_ids.return_value = {legacy_id}
 

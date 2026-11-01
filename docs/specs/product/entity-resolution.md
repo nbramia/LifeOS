@@ -118,8 +118,8 @@ All scoring constants are defined in `config/relationship_weights.py`:
 | Constant | Value | Purpose |
 |----------|-------|---------|
 | `CONTEXT_BOOST_POINTS` | 30 | Points for vault path match |
-| `RECENCY_BOOST_POINTS` | 10 | Points for recently seen entities |
-| `RECENCY_BOOST_THRESHOLD_DAYS` | 30 | Days to qualify as "recent" |
+| `RECENCY_BOOST_POINTS` | 10 | Points for entities with a recent real interaction (`last_seen`) |
+| `RECENCY_BOOST_THRESHOLD_DAYS` | 365 | Days since that interaction to qualify as "recent" |
 | `MIN_MATCH_SCORE` | 40 | Minimum score for a valid match |
 | `DISAMBIGUATION_THRESHOLD` | 15 | Score gap below which match is ambiguous |
 | `RELATIONSHIP_STRENGTH_BOOST_MAX` | 25 | Max relationship boost points |

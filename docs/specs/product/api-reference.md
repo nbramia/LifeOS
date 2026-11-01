@@ -288,7 +288,9 @@ canonical-name matches first, then most recently seen.
 - `limit` (integer, optional, default 20, max 200): Max results to return
 
 **Response:** adds a `total` field (count of all matching people, not just
-the returned page) alongside the existing `people`/`count`/`query` fields.
+the returned page) alongside the existing `people`/`count`/`query` fields. Each
+person's `last_seen` and `days_since_contact` are `null` when there is no real
+interaction on record (see [Data Model](data-model.md#last-seen)).
 
 ### GET /api/people/list
 

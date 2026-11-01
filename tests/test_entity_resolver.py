@@ -5,6 +5,7 @@ import pytest
 from datetime import datetime, timedelta
 
 from api.services.person_entity import PersonEntity, PersonEntityStore
+from config.people_config import EntityResolutionConfig
 from api.services.entity_resolver import (
     EntityResolver,
     ResolutionResult,
@@ -16,12 +17,29 @@ from api.services.entity_resolver import (
 # every other test in this file is fully isolated (temp_store/tmp_path).
 
 
+class _StoreHoldingLastSeen(PersonEntityStore):
+    """Puts a fixture's last_seen in the column, as sync_last_seen() would."""
+
+    def add(self, entity):
+        stored = super().add(entity)
+        if entity.last_seen:
+            conn = self._get_connection()
+            conn.execute(
+                "UPDATE person_entities SET last_seen = ? WHERE id = ?",
+                (entity.last_seen.isoformat(), entity.id),
+            )
+            conn.commit()
+            conn.close()
+            self.save()
+        return stored
+
+
 # Module-level fixtures available to all test classes
 @pytest.fixture
 def temp_store(tmp_path):
     """Create a temporary entity store for testing."""
     db_path = str(tmp_path / "test_entity_resolver.db")
-    store = PersonEntityStore(db_path)
+    store = _StoreHoldingLastSeen(db_path)
     yield store
 
 
@@ -78,6 +96,45 @@ def populated_resolver(temp_store):
         temp_store.add(entity)
 
     return EntityResolver(temp_store)
+
+
+@pytest.mark.unit
+class TestRecencyBoost:
+    """A real interaction within the window adds points. No interaction adds none."""
+
+    @staticmethod
+    def _score(store, days_ago):
+        store.add(PersonEntity(
+            canonical_name="Quinn Example",
+            last_seen=None if days_ago is None else datetime.now() - timedelta(days=days_ago),
+        ))
+        candidates = EntityResolver(store)._score_candidates("Quinn Example", None)
+        assert len(candidates) == 1
+        return candidates[0].score
+
+    def test_inside_the_window_earns_the_boost(self, tmp_path):
+        recent = self._score(
+            _StoreHoldingLastSeen(str(tmp_path / "a.db")),
+            EntityResolutionConfig.RECENCY_THRESHOLD_DAYS - 1,
+        )
+        never = self._score(_StoreHoldingLastSeen(str(tmp_path / "b.db")), None)
+        assert recent - never == EntityResolutionConfig.RECENCY_BOOST_POINTS
+
+    def test_a_year_is_the_window(self, tmp_path):
+        never = self._score(_StoreHoldingLastSeen(str(tmp_path / "never.db")), None)
+        inside = self._score(_StoreHoldingLastSeen(str(tmp_path / "inside.db")), 200)
+        outside = self._score(_StoreHoldingLastSeen(str(tmp_path / "outside.db")), 370)
+
+        assert inside - never == EntityResolutionConfig.RECENCY_BOOST_POINTS
+        assert outside == never
+
+    def test_outside_the_window_earns_nothing(self, tmp_path):
+        old = self._score(
+            _StoreHoldingLastSeen(str(tmp_path / "a.db")),
+            EntityResolutionConfig.RECENCY_THRESHOLD_DAYS + 1,
+        )
+        never = self._score(_StoreHoldingLastSeen(str(tmp_path / "b.db")), None)
+        assert old == never
 
 
 @pytest.mark.unit

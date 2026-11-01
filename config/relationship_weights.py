@@ -219,8 +219,8 @@ NAME_SIMILARITY_WEIGHT = 0.4      # Weight for fuzzy name match score (0-1 scale
 
 # Context boosting
 CONTEXT_BOOST_POINTS = 30         # Points added when email domain matches vault context
-RECENCY_BOOST_POINTS = 10         # Points added for recently seen people
-RECENCY_BOOST_THRESHOLD_DAYS = 30 # Days to consider someone "recently seen"
+RECENCY_BOOST_POINTS = 10         # Points added for people with a recent real interaction
+RECENCY_BOOST_THRESHOLD_DAYS = 365 # A year separates people you still deal with from the long tail
 
 # Disambiguation
 DISAMBIGUATION_THRESHOLD = 15     # If top two candidates within this score, it's ambiguous

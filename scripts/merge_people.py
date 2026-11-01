@@ -465,10 +465,7 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
 
     # === EXECUTE PATH (crash-safe with intent log) ===
 
-    # Update last_seen/first_seen on in-memory primary before persisting
-    if secondary.last_seen:
-        if primary.last_seen is None or secondary.last_seen > primary.last_seen:
-            primary.last_seen = secondary.last_seen
+    # Update first_seen on in-memory primary before persisting
     if secondary.first_seen:
         if primary.first_seen is None or secondary.first_seen < primary.first_seen:
             primary.first_seen = secondary.first_seen
@@ -689,14 +686,10 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
                 stats['relationships_updated'] += 1
                 logger.info(f"   > Transferred relationship with {other_id}")
 
-        # 4d. INSERT OR REPLACE primary person entity
+        # 4d. Upsert primary person entity
         primary_values = store._entity_to_values(primary)
         from api.services.person_entity import PersonEntityStore
-        crm_conn.execute(
-            f"INSERT OR REPLACE INTO person_entities ({PersonEntityStore._COLUMNS_STR}) "
-            f"VALUES ({PersonEntityStore._PLACEHOLDERS})",
-            primary_values
-        )
+        crm_conn.execute(PersonEntityStore._UPSERT_SQL, primary_values)
 
         # 4e. Update lookup tables for primary
         crm_conn.execute("DELETE FROM person_emails WHERE person_id = ?", (canonical_primary_id,))

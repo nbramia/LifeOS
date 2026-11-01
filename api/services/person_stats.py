@@ -10,12 +10,16 @@ Usage:
     # At end of sync script:
     affected_person_ids = {'uuid1', 'uuid2', ...}
     refresh_person_stats(list(affected_person_ids))
+
+last_seen has one definition and one writer: sync_last_seen() below stores the
+most recent real interaction with each person, and nothing else writes the
+column. Refreshing stats runs it, and consistency verification checks it nightly.
 """
 import sqlite3
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 from api.services.person_entity import PersonEntityStore
 
@@ -24,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 def refresh_person_stats(person_ids: Optional[list[str]] = None, save: bool = True) -> dict:
     """
-    Recompute PersonEntity counts from InteractionStore.
+    Recompute PersonEntity counts and last_seen from InteractionStore.
 
     This is the ONLY correct way to update PersonEntity counts. It queries
     the source of truth (InteractionStore) and updates the cached counts.
@@ -34,7 +38,8 @@ def refresh_person_stats(person_ids: Optional[list[str]] = None, save: bool = Tr
         save: Whether to persist changes to disk. Set False for batch operations.
 
     Returns:
-        Dict with stats: {updated: int, total_interactions: int}
+        Dict with stats: {updated: int, total_interactions: int,
+        last_seen_changed: int}
     """
     from api.services.person_entity import get_person_entity_store
     from api.services.interaction_store import get_interaction_db_path
@@ -47,12 +52,10 @@ def refresh_person_stats(person_ids: Optional[list[str]] = None, save: bool = Tr
     if person_ids is None:
         # Full refresh — read all per-(person_id, source) counts, then collapse
         # legacy (pre-merge) person_ids onto their canonical entity.id BEFORE
-        # applying. Without this, the loop processes the same canonical entity
-        # multiple times: get_by_id() follows the merge map and returns the
-        # canonical, then _apply_counts_to_entity / _update_timestamps overwrite
-        # with the *legacy* ID's (much smaller, much older) data — silently
-        # corrupting both stats and last_seen on every canonical with merged
-        # IDs that still carry stale interactions in the table.
+        # applying, so each canonical entity is written exactly once with the
+        # totals across every id that resolves to it. get_by_id() follows the
+        # merge map, so applying per raw id would overwrite a canonical's totals
+        # with whichever legacy id came last.
         cursor = conn.execute("""
             SELECT person_id, source_type, COUNT(*) as cnt
             FROM interactions
@@ -61,7 +64,7 @@ def refresh_person_stats(person_ids: Optional[list[str]] = None, save: bool = Tr
 
         canonical_counts: dict[str, dict[str, int]] = {}
         # Map canonical_id -> set of raw person_ids that resolve to it
-        # (used by _update_timestamps to query MAX across all variants).
+        # (used by _update_first_seen to query MIN across all variants).
         canonical_ids: dict[str, set[str]] = {}
 
         for row in cursor:
@@ -80,12 +83,13 @@ def refresh_person_stats(person_ids: Optional[list[str]] = None, save: bool = Tr
             entity = store.get_by_id(canon)
             if entity:
                 _apply_counts_to_entity(entity, counts)
-                _update_timestamps(entity, list(canonical_ids[canon]), conn)
+                _update_first_seen(entity, list(canonical_ids[canon]), conn)
                 store.update(entity)
                 stats['updated'] += 1
 
         # Zero out people with no interactions (they may have had interactions
-        # deleted). They may still have source_entity timestamps worth updating.
+        # deleted). They may still have source_entity timestamps worth updating
+        # for first_seen.
         for cached_entity in store.get_all():
             if cached_entity.id not in canonical_counts:
                 entity = store.get_by_id(cached_entity.id)
@@ -99,7 +103,7 @@ def refresh_person_stats(person_ids: Optional[list[str]] = None, save: bool = Tr
                     entity.mention_count = 0
                     entity.photo_count = 0
                     modified = True
-                if _update_timestamps(entity, [entity.id], conn):
+                if _update_first_seen(entity, [entity.id], conn):
                     modified = True
                 if modified:
                     store.update(entity)
@@ -133,11 +137,13 @@ def refresh_person_stats(person_ids: Optional[list[str]] = None, save: bool = Tr
             entity = store.get_by_id(canon)
             if entity:
                 _apply_counts_to_entity(entity, counts)
-                _update_timestamps(entity, list(variants), conn)
+                _update_first_seen(entity, list(variants), conn)
                 store.update(entity)
                 stats['updated'] += 1
 
     conn.close()
+
+    stats['last_seen_changed'] = sync_last_seen(person_ids)['mismatched']
 
     if save:
         store.save()  # Uses file locking
@@ -148,9 +154,81 @@ def refresh_person_stats(person_ids: Optional[list[str]] = None, save: bool = Tr
     return stats
 
 
-def _update_timestamps(entity, person_ids, int_conn) -> bool:
+def sync_last_seen(person_ids: Optional[Iterable[str]] = None, *, dry_run: bool = False) -> dict:
     """
-    Update first_seen/last_seen from interactions and source_entities.
+    Make person_entities.last_seen agree with the interactions table.
+
+    This is the only code that writes last_seen. The value is the most recent
+    real interaction with the person, as get_last_real_interactions() defines it.
+    Source entities and contact imports play no part, and someone with no real
+    interaction is NULL. A merged id's rows count for the surviving person, so a
+    merged-away row is NULL too.
+
+    Only rows that disagree are written, so a run that finds nothing to do leaves
+    the database untouched.
+
+    Args:
+        person_ids: People to check, by any id that resolves to them. None checks
+            everyone with one aggregate query.
+        dry_run: Report disagreements without writing them.
+
+    Returns:
+        Dict with stats: {checked: int, mismatched: int, cleared: int}, where
+        cleared is how many of the mismatched rows have no value to hold.
+    """
+    from api.services.person_entity import get_person_entity_store
+    from api.services.interaction_store import get_interaction_db_path, get_last_real_interactions
+
+    store = get_person_entity_store()
+
+    targets: Optional[set[str]] = None
+    if person_ids is not None:
+        targets = set()
+        for pid in person_ids:
+            canonical = store.get_canonical_id(pid)
+            targets |= {canonical, pid} | store.get_legacy_ids(canonical)
+
+    int_conn = sqlite3.connect(get_interaction_db_path(), timeout=60.0)
+    try:
+        latest_by_raw_id = get_last_real_interactions(int_conn, targets)
+    finally:
+        int_conn.close()
+
+    latest: dict[str, datetime] = {}
+    for pid, last in latest_by_raw_id.items():
+        canonical = store.get_canonical_id(pid)
+        if canonical not in latest or last > latest[canonical]:
+            latest[canonical] = last
+
+    conn = store._get_connection()
+    try:
+        rows = [
+            (row['id'], row['last_seen'])
+            for row in conn.execute("SELECT id, last_seen FROM person_entities")
+            if targets is None or row['id'] in targets
+        ]
+        changes = []
+        cleared = 0
+        for pid, stored in rows:
+            last = latest.get(pid)
+            value = last.isoformat() if last else None
+            if stored != value:
+                changes.append((value, pid))
+                cleared += value is None
+
+        if changes and not dry_run:
+            conn.executemany("UPDATE person_entities SET last_seen = ? WHERE id = ?", changes)
+            conn.commit()
+            store.save()
+    finally:
+        conn.close()
+
+    return {'checked': len(rows), 'mismatched': len(changes), 'cleared': cleared}
+
+
+def _update_first_seen(entity, person_ids, int_conn) -> bool:
+    """
+    Update first_seen from interactions and source_entities.
 
     Args:
         entity: PersonEntity to update.
@@ -169,32 +247,28 @@ def _update_timestamps(entity, person_ids, int_conn) -> bool:
         return False
     placeholders = ','.join(['?'] * len(person_ids))
 
-    # Get timestamp range from interactions across ALL person_id variants
+    # Earliest interaction across ALL person_id variants
     cursor = int_conn.execute(f"""
-        SELECT MIN(timestamp), MAX(timestamp)
+        SELECT MIN(timestamp)
         FROM interactions
         WHERE person_id IN ({placeholders})
     """, tuple(person_ids))
     row = cursor.fetchone()
     interaction_first = None
-    interaction_last = None
     if row and row[0]:
         interaction_first = datetime.fromisoformat(row[0]).replace(tzinfo=timezone.utc)
-    if row and row[1]:
-        interaction_last = datetime.fromisoformat(row[1]).replace(tzinfo=timezone.utc)
 
-    # Get timestamp range from source_entities across the same variants
+    # Earliest source_entity observation across the same variants
     # (source_entities.canonical_person_id may also still carry legacy IDs
     # if a merge happened without backfilling that column).
     # Same physical database as PersonEntityStore's default — reuse its anchored
     # constant rather than a second cwd-relative literal for the same file.
     crm_db = Path(PersonEntityStore.CRM_DB_PATH)
     source_first = None
-    source_last = None
     if crm_db.exists():
         crm_conn = sqlite3.connect(str(crm_db))
         crm_cursor = crm_conn.execute(f"""
-            SELECT MIN(observed_at), MAX(observed_at)
+            SELECT MIN(observed_at)
             FROM source_entities
             WHERE canonical_person_id IN ({placeholders})
         """, tuple(person_ids))
@@ -202,8 +276,6 @@ def _update_timestamps(entity, person_ids, int_conn) -> bool:
         crm_conn.close()
         if se_row and se_row[0]:
             source_first = datetime.fromisoformat(se_row[0]).replace(tzinfo=timezone.utc)
-        if se_row and se_row[1]:
-            source_last = datetime.fromisoformat(se_row[1]).replace(tzinfo=timezone.utc)
 
     # Compute first_seen = earliest across both sources
     if interaction_first and source_first:
@@ -211,26 +283,10 @@ def _update_timestamps(entity, person_ids, int_conn) -> bool:
     else:
         new_first = interaction_first or source_first
 
-    # Compute last_seen = latest across both sources, capped at now
-    now = datetime.now(timezone.utc)
-    if interaction_last and source_last:
-        new_last = min(max(interaction_last, source_last), now)
-    elif interaction_last:
-        new_last = min(interaction_last, now)
-    elif source_last:
-        new_last = min(source_last, now)
-    else:
-        new_last = None
-
-    modified = False
     if new_first and entity.first_seen != new_first:
         entity.first_seen = new_first
-        modified = True
-    if new_last and entity.last_seen != new_last:
-        entity.last_seen = new_last
-        modified = True
-
-    return modified
+        return True
+    return False
 
 
 def _apply_counts_to_entity(entity, counts: dict[str, int]) -> None:

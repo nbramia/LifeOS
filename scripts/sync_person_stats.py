@@ -59,6 +59,7 @@ def main():
         logger.info("\n=== Full Refresh Complete ===")
         logger.info(f"People updated: {stats['updated']}")
         logger.info(f"Total interactions: {stats['total_interactions']}")
+        logger.info(f"last_seen values changed: {stats['last_seen_changed']}")
 
         # Canonical line consumed by run_all_syncs._parse_sync_output.
         # The prose above reads "People updated", which the regex fallback

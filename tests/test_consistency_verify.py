@@ -384,6 +384,8 @@ class TestVerifyConsistencyIntegration:
 
         with patch("scripts.sync_consistency_verify._get_valid_person_ids", return_value=(valid_ids, set(), mock_store)), \
              patch("api.services.person_stats.verify_person_stats", return_value={}), \
+             patch("api.services.person_stats.sync_last_seen",
+                   return_value={"checked": 2, "mismatched": 0, "cleared": 0}), \
              patch("api.services.interaction_store.get_interaction_db_path", return_value=interaction_db), \
              patch("config.settings.settings") as mock_settings:
             mock_settings.chroma_path = str(tmp_path / "chroma")
@@ -394,6 +396,90 @@ class TestVerifyConsistencyIntegration:
 
         assert result["total_issues"] == 0
         assert result["total_fixed"] == 0
+        assert result["auto_fix_skipped"] is False
+
+
+class TestCheckLastSeen:
+    """A stored last_seen that disagrees with interactions is found, fixed, and counted."""
+
+    @pytest.fixture
+    def env(self, tmp_path):
+        from api.services.interaction_store import InteractionStore
+        from api.services.person_entity import PersonEntityStore
+
+        interaction_db = str(tmp_path / "interactions.db")
+        InteractionStore(interaction_db)
+        conn = sqlite3.connect(interaction_db)
+        conn.execute(
+            "INSERT INTO interactions (id, person_id, timestamp, source_type, title) "
+            "VALUES ('i1', 'has-interaction', '2024-03-01T12:00:00+00:00', 'gmail', 'synthetic')"
+        )
+        conn.commit()
+        conn.close()
+
+        crm_db = str(tmp_path / "crm.db")
+        store = PersonEntityStore(db_path=crm_db)
+        for pid in ("has-interaction", "no-interaction", "agrees"):
+            store.add(_make_person(pid, pid))
+        conn = sqlite3.connect(crm_db)
+        conn.execute("UPDATE person_entities SET last_seen = '2026-01-01T00:00:00+00:00'")
+        conn.execute("UPDATE person_entities SET last_seen = NULL WHERE id = 'agrees'")
+        conn.commit()
+        conn.close()
+
+        with patch("api.services.person_entity.get_person_entity_store", return_value=store), \
+             patch("api.services.interaction_store.get_interaction_db_path", return_value=interaction_db):
+            yield crm_db
+
+    @staticmethod
+    def _stored(crm_db):
+        conn = sqlite3.connect(crm_db)
+        values = dict(conn.execute("SELECT id, last_seen FROM person_entities"))
+        conn.close()
+        return values
+
+    def test_dry_run_counts_without_fixing(self, env):
+        from scripts.sync_consistency_verify import _check_last_seen
+
+        before = self._stored(env)
+        result = _check_last_seen(dry_run=True)
+
+        assert result["count"] == 2
+        assert result["fixed"] == 0
+        assert self._stored(env) == before
+
+    def test_execute_fixes_and_counts(self, env):
+        from scripts.sync_consistency_verify import _check_last_seen
+
+        result = _check_last_seen(dry_run=False)
+
+        assert result["count"] == 2
+        assert result["fixed"] == 2
+        assert self._stored(env) == {
+            "has-interaction": "2024-03-01T12:00:00+00:00",
+            "no-interaction": None,
+            "agrees": None,
+        }
+        assert _check_last_seen(dry_run=False)["count"] == 0
+
+    def test_a_mismatch_reaches_the_totals_regardless_of_threshold(self, env):
+        from scripts import sync_consistency_verify as module
+
+        quiet = {"count": 0, "fixed": 0}
+        with patch.object(module, "_get_valid_person_ids", return_value=({"x"}, set(), MagicMock())), \
+             patch.object(module, "_check_person_stats", return_value=quiet), \
+             patch.object(module, "_check_orphaned_interactions", return_value=quiet), \
+             patch.object(module, "_check_hidden_interactions", return_value=quiet), \
+             patch.object(module, "_check_stale_merged_ids", return_value=quiet), \
+             patch.object(module, "_check_stale_merged_relationships", return_value=quiet), \
+             patch.object(module, "_check_relationship_hygiene", return_value=quiet), \
+             patch.object(module, "_check_orphaned_crm_records", return_value=quiet), \
+             patch.object(module, "_check_missing_vault_files", return_value=quiet):
+            result = module.verify_consistency(dry_run=False, fix_threshold=1)
+
+        assert result["last_seen_mismatches"]["fixed"] == 2
+        assert result["total_issues"] == 2
+        assert result["total_fixed"] == 2
         assert result["auto_fix_skipped"] is False
 
 

@@ -130,7 +130,9 @@ where:
 
 Weights depend on the channel, so a personal 1:1 meeting counts far more than a CC'd email, and a WhatsApp group message counts less than a direct one. Recency is discounted for anyone with fewer than 15 interactions. A LinkedIn connection adds 3% and family adds 5%, capped at 100.
 
-Only real interactions count: future calendar events are ignored, and contact syncs that refresh `last_seen` don't affect the score. Posting to a WhatsApp group adds a little frequency for each member but no recency, while a message a member posts counts for both.
+Only real interactions count: future calendar events are ignored, and contact syncs don't affect the score. Posting to a WhatsApp group adds a little frequency for each member but no recency, while a message a member posts counts for both.
+
+`last_seen` is the date of that same last real interaction, and `null` for someone with no real interaction. The CRM shows "No interactions" in that case. See [Data Model](data-model.md#last-seen).
 
 Examples:
 

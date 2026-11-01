@@ -324,6 +324,18 @@ Taking Alice to the park. Jane is making dinner.
 # exercises the real dataset when present.
 # ---------------------------------------------------------------------------
 
+def _store_last_seen(store, *people):
+    """Put each person's last_seen in the column, as sync_last_seen() would."""
+    conn = store._get_connection()
+    conn.executemany(
+        "UPDATE person_entities SET last_seen = ? WHERE id = ?",
+        [(person.last_seen.isoformat(), person.id) for person in people],
+    )
+    conn.commit()
+    conn.close()
+    store.save()
+
+
 def _make_person(**kwargs):
     from api.services.person_entity import PersonEntity
     defaults = dict(canonical_name="", emails=[], last_seen=None)
@@ -377,6 +389,13 @@ class TestSearchPeopleEndpoint:
         )
         for entity in (exact_old, partial_recent, email_match, non_match):
             person_store.add(entity)
+        _store_last_seen(person_store, exact_old, partial_recent, email_match, non_match)
+        contacted = _make_person(id="contacted", canonical_name="Yara Bcontacted",
+                                 last_seen=now - timedelta(days=900))
+        never_contacted = _make_person(id="never-contacted", canonical_name="Yara Anever")
+        person_store.add(contacted)
+        person_store.add(never_contacted)
+        _store_last_seen(person_store, contacted)
 
         # One of the four has a real interaction; the other three have none
         # at all -- exercising both branches of the batched recency lookup:
@@ -433,6 +452,23 @@ class TestSearchPeopleEndpoint:
         # the default of 20, so this just confirms the default didn't clamp
         # unexpectedly low (e.g. to something like 1 or 5).
         assert resp.json()["count"] == 3
+
+    def test_no_interaction_on_record_is_null_not_a_number(self, client):
+        resp = client.get("/api/people/search", params={"q": "yara anever"})
+        assert resp.status_code == 200
+        person = resp.json()["people"][0]
+        assert person["last_seen"] is None
+        assert person["days_since_contact"] is None
+
+    def test_days_since_contact_comes_from_the_stored_date(self, client):
+        resp = client.get("/api/people/search", params={"q": "ada testerson"})
+        person = resp.json()["people"][0]
+        assert person["days_since_contact"] == 1
+
+    def test_people_with_no_interaction_sort_after_everyone_else(self, client):
+        resp = client.get("/api/people/search", params={"q": "yara"})
+        names = [p["canonical_name"] for p in resp.json()["people"]]
+        assert names == ["Yara Bcontacted", "Yara Anever"]
 
     def test_exact_match_sorts_first_even_when_older(self, client):
         resp = client.get("/api/people/search", params={"q": "Ada Test", "limit": 20})
@@ -525,20 +561,26 @@ class TestExactMatchOutsideCandidateWindow:
         # 205 filler people, all matching the substring "widget" and all
         # more recently seen than the exact match below -- comfortably more
         # than the 200-row candidate window a default query uses.
-        for i in range(205):
-            person_store.add(_make_person(
+        filler = [
+            _make_person(
                 id=f"filler-{i}",
                 canonical_name=f"Widget Owner {i}",
                 last_seen=now - timedelta(seconds=i),
-            ))
+            )
+            for i in range(205)
+        ]
+        for person in filler:
+            person_store.add(person)
         # The exact canonical-name match for query "widget" -- the oldest
         # last_seen of anyone matching, so a plain recency-ordered candidate
         # fetch excludes it from the top 200 entirely.
-        person_store.add(_make_person(
+        exact = _make_person(
             id="exact-widget",
             canonical_name="Widget",
             last_seen=now - timedelta(days=3650),
-        ))
+        )
+        person_store.add(exact)
+        _store_last_seen(person_store, exact, *filler)
 
         monkeypatch.setattr(people_routes, "get_person_entity_store", lambda: person_store)
         monkeypatch.setattr(people_routes, "get_interaction_store", lambda: interaction_store)
@@ -638,6 +680,7 @@ class TestListPeopleEndpoint:
         )
         for entity in (oldest, middle, newest):
             person_store.add(entity)
+        _store_last_seen(person_store, oldest, middle, newest)
 
         monkeypatch.setattr(people_routes, "get_person_entity_store", lambda: person_store)
         monkeypatch.setattr(people_routes, "get_interaction_store", lambda: interaction_store)
@@ -789,14 +832,29 @@ class TestPersonEntityStoreSearchHelpers:
         # include_merged=True restores the pre-merge count, same as search().
         assert store.count_search("ada merged", include_merged=True) == 2
 
+    def test_search_and_list_recent_put_people_with_no_interaction_last(self, store):
+        now = datetime.now(timezone.utc)
+        contacted = _make_person(id="z", canonical_name="Ada Zed", last_seen=now - timedelta(days=900))
+        store.add(_make_person(id="a", canonical_name="Ada Able"))
+        store.add(contacted)
+        _store_last_seen(store, contacted)
+
+        assert [p.id for p in store.search("ada")] == ["z", "a"]
+        assert [p.id for p in store.list_recent()] == ["z", "a"]
+
     def test_list_recent_orders_and_filters_by_category(self, store):
         now = datetime.now(timezone.utc)
-        store.add(_make_person(id="a", canonical_name="A", category="work",
-                                last_seen=now - timedelta(days=1)))
-        store.add(_make_person(id="b", canonical_name="B", category="family",
-                                last_seen=now))
-        store.add(_make_person(id="c", canonical_name="C", category="work",
-                                last_seen=now - timedelta(days=2)))
+        people = [
+            _make_person(id="a", canonical_name="A", category="work",
+                         last_seen=now - timedelta(days=1)),
+            _make_person(id="b", canonical_name="B", category="family",
+                         last_seen=now),
+            _make_person(id="c", canonical_name="C", category="work",
+                         last_seen=now - timedelta(days=2)),
+        ]
+        for person in people:
+            store.add(person)
+        _store_last_seen(store, *people)
 
         all_recent = store.list_recent(limit=10)
         assert [e.canonical_name for e in all_recent] == ["B", "A", "C"]

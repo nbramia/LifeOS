@@ -78,6 +78,8 @@ class PersonEntity:
 
     # Timestamps
     first_seen: Optional[datetime] = None
+    # Most recent real interaction, or None when there isn't one. Read-only here:
+    # the store never persists this attribute, person_stats.sync_last_seen() does.
     last_seen: Optional[datetime] = None
 
     # Aggregated stats
@@ -251,12 +253,6 @@ class PersonEntity:
             if first_seen is None or _make_aware(other.first_seen) < _make_aware(first_seen):
                 first_seen = other.first_seen
 
-        # Take latest last_seen (use _make_aware for safe comparison)
-        last_seen = self.last_seen
-        if other.last_seen:
-            if last_seen is None or _make_aware(other.last_seen) > _make_aware(last_seen):
-                last_seen = other.last_seen
-
         # Sum counts
         meeting_count = self.meeting_count + other.meeting_count
         email_count = self.email_count + other.email_count
@@ -323,7 +319,6 @@ class PersonEntity:
             vault_contexts=vault_contexts,
             sources=sources,
             first_seen=first_seen,
-            last_seen=last_seen,
             meeting_count=meeting_count,
             email_count=email_count,
             mention_count=mention_count,
@@ -426,7 +421,6 @@ class PersonEntity:
             vault_contexts=[],  # Will be populated during re-indexing
             sources=record.sources,
             first_seen=record.first_seen,
-            last_seen=record.last_seen,
             meeting_count=record.meeting_count,
             email_count=record.email_count,
             mention_count=record.mention_count,
@@ -495,10 +489,12 @@ class PersonEntityStore:
     # Path to CRM database (shared with link_override, blocklist, etc.)
     CRM_DB_PATH = Path(__file__).parent.parent.parent / "data" / "crm.db"
 
-    # Column names for INSERT/UPDATE statements
+    # Column names for INSERT/UPDATE statements. last_seen is deliberately absent:
+    # writing the rest of a person never touches it, however stale the object in
+    # hand. person_stats.sync_last_seen() is its only writer.
     _COLUMNS = (
         "id", "canonical_name", "display_name", "emails", "company", "position",
-        "linkedin_url", "category", "vault_contexts", "sources", "first_seen", "last_seen",
+        "linkedin_url", "category", "vault_contexts", "sources", "first_seen",
         "meeting_count", "email_count", "mention_count", "message_count", "slack_message_count", "photo_count",
         "related_notes", "aliases", "phone_numbers", "phone_primary", "confidence_score",
         "tags", "notes", "source_entity_count", "birthday", "hidden", "hidden_at",
@@ -506,6 +502,13 @@ class PersonEntityStore:
     )
     _PLACEHOLDERS = ", ".join(["?"] * len(_COLUMNS))
     _COLUMNS_STR = ", ".join(_COLUMNS)
+    # An upsert rather than INSERT OR REPLACE, which would delete the row and take
+    # the columns outside _COLUMNS with it.
+    _UPSERT_SQL = (
+        f"INSERT INTO person_entities ({_COLUMNS_STR}) VALUES ({_PLACEHOLDERS}) "
+        "ON CONFLICT(id) DO UPDATE SET "
+        + ", ".join(f"{column} = excluded.{column}" for column in _COLUMNS if column != "id")
+    )
 
     def __init__(self, db_path: str = None):
         """
@@ -666,7 +669,6 @@ class PersonEntityStore:
             json.dumps(entity.vault_contexts),
             json.dumps(entity.sources),
             entity.first_seen.isoformat() if entity.first_seen else None,
-            entity.last_seen.isoformat() if entity.last_seen else None,
             entity.meeting_count,
             entity.email_count,
             entity.mention_count,
@@ -944,9 +946,7 @@ class PersonEntityStore:
         values = self._entity_to_values(entity)
         conn = self._get_connection()
         try:
-            conn.execute(
-                f"INSERT OR REPLACE INTO person_entities ({self._COLUMNS_STR}) "
-                f"VALUES ({self._PLACEHOLDERS})", values)
+            conn.execute(self._UPSERT_SQL, values)
             self._update_lookup_tables(conn, entity)
             conn.commit()
         finally:
@@ -970,9 +970,7 @@ class PersonEntityStore:
         values = self._entity_to_values(entity)
         conn = self._get_connection()
         try:
-            conn.execute(
-                f"INSERT OR REPLACE INTO person_entities ({self._COLUMNS_STR}) "
-                f"VALUES ({self._PLACEHOLDERS})", values)
+            conn.execute(self._UPSERT_SQL, values)
             self._update_lookup_tables(conn, entity)
             conn.commit()
         finally:

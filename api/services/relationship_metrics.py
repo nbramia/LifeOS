@@ -20,8 +20,8 @@ Where:
 Family and LinkedIn multipliers apply to the result, capped at 100.
 
 Every interaction-derived input comes from the interactions table and ignores
-future-dated rows. PersonEntity.last_seen is not an input: it also tracks source
-entity observations, which syncs refresh without any interaction taking place.
+future-dated rows. The last real interaction is get_last_real_interactions(), the
+same definition PersonEntity.last_seen stores.
 
 Interaction weights depend on source type, subtype, and account.
 See config/relationship_weights.py for all weights.
