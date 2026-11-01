@@ -758,7 +758,8 @@ class EntityResolver:
         the name. An unknown email or phone next to it still anchors a new
         person of their own, named from the address or number so the tied name
         is not added as another exact match. A tied name with no identifier
-        returns None.
+        returns None. A person named only after their identifier takes the real
+        multi-word name of the first call that matches them by it.
 
         Phone-only never creates a PersonEntity. A raw phone
         observation with no name or email tells you very little about who the
@@ -786,6 +787,7 @@ class EntityResolver:
         if email:
             entity = self.resolve_by_email(email)
             if entity:
+                self._replace_placeholder_name(entity, email, name)
                 return ResolutionResult(
                     entity=entity,
                     is_new=False,
@@ -797,6 +799,8 @@ class EntityResolver:
         if phone:
             entity = self.resolve_by_phone(phone)
             if entity:
+                from api.services.phone_utils import normalize_phone
+                self._replace_placeholder_name(entity, normalize_phone(phone), name)
                 return ResolutionResult(
                     entity=entity,
                     is_new=False,
@@ -838,6 +842,15 @@ class EntityResolver:
                 )
 
             name_from_email = self._extract_name_from_email(email)
+            # A name reaching this point is tied. A person named after it, or
+            # after any bare first name, would take its exact matches from here
+            # on, so they go by the address instead.
+            if name and name.strip() and (
+                not parse_name(name_from_email).last
+                or name_from_email.lower() == name.strip().lower()
+            ):
+                name_from_email = email.lower()
+
             domain = normalize_domain(email)
             vault_contexts = get_vault_contexts_for_domain(domain) if domain else []
             category = "work" if vault_contexts else "unknown"
@@ -857,6 +870,8 @@ class EntityResolver:
             )
 
             stored = self._store.add(entity)
+            if not stored:
+                return None
 
             return ResolutionResult(
                 entity=stored,
@@ -886,6 +901,37 @@ class EntityResolver:
                     )
 
         return None
+
+    def _replace_placeholder_name(
+        self, entity: PersonEntity, identifier: str, name: Optional[str]
+    ) -> None:
+        """
+        Give a person named only after an identifier the real name a call supplies.
+
+        Applies when the name is multi-word and no other person holds it. A bare
+        first name would take that name's exact matches, and a name someone else
+        holds would take theirs, so neither replaces the placeholder.
+
+        Args:
+            entity: Person matched exactly by the identifier
+            identifier: The email or normalized phone that matched
+            name: Name the call supplied, if any
+        """
+        if not name or entity.canonical_name.lower() != identifier.lower():
+            return
+
+        real_name = resolve_person_name(name).strip()
+        if not parse_name(real_name).last or any(c.isdigit() or c == "@" for c in real_name):
+            return
+
+        holder = self._store.get_by_name(real_name)
+        if holder and holder.id != entity.id:
+            return
+
+        if entity.display_name == entity.canonical_name:
+            entity.display_name = real_name
+        entity.canonical_name = real_name
+        self._store.update(entity)
 
     def _extract_name_from_email(self, email: str) -> str:
         """
