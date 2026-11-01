@@ -20,6 +20,7 @@ from fastapi.testclient import TestClient
 
 import mcp_server
 from api.services import mcp_oauth
+from api.services.host_tools import HOST_TOOL_NAMES
 from api.services.mcp_oauth import OAuthConfig, OAuthStore, pkce_s256
 from api.services.mcp_tool_tier import OAUTH_ALLOWED_TOOLS, OAUTH_TOOL_TIER
 
@@ -1209,6 +1210,7 @@ def _every_buildable_tool() -> set[str]:
     names = {c["name"] for c in mcp_server.CURATED_ENDPOINTS.values()}
     names |= {s["name"] for s in INTER_AGENT_TOOL_SCHEMAS}
     names |= set(mcp_server.CHATGPT_TOOL_NAMES)
+    names |= set(HOST_TOOL_NAMES)
     return names
 
 

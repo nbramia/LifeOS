@@ -662,6 +662,8 @@ class LifeOSMCPServer:
         self._load_openapi_spec()
         self._cap_people_search_limit()
         self._register_inter_agent_tools()
+        self._host_tools_config = None
+        self._register_host_tools()
 
     def _cap_people_search_limit(self) -> None:
         """Advertise a smaller `limit` default/max for lifeos_people_search
@@ -724,6 +726,36 @@ class LifeOSMCPServer:
             # what _build_tools_from_spec produces.
             tool["inputSchema"] = tool.pop("input_schema")
             self.tools.append(tool)
+
+    def _register_host_tools(self) -> None:
+        """Expose the scoped host tools (`lifeos_fs_*`, `lifeos_shell`,
+        `lifeos_logs`) when `LIFEOS_HOST_TOOLS_ENABLED` is set. Their policy
+        lives in `api/services/host_tools.py`."""
+        try:
+            from api.services.host_tools import HOST_TOOL_SCHEMAS
+            from config.settings import settings
+        except Exception as e:  # pragma: no cover — keep server bootable
+            logger.warning(f"host tools not registered: {e}")
+            return
+        if not settings.host_tools_enabled:
+            return
+        self.tools.extend(dict(schema) for schema in HOST_TOOL_SCHEMAS)
+
+    def call_host_tool(self, name: str, arguments: object, *, caller: str) -> dict:
+        """Run one host tool and return its MCP tool result."""
+        from api.services import host_tools
+
+        if self._host_tools_config is None:
+            config = host_tools.HostToolsConfig.from_settings()
+            if config.approval_enabled:
+                from api.services.host_approval import request_approval
+
+                timeout = config.approval_timeout_seconds
+                config.approver = lambda summary, _caller: request_approval(
+                    summary, timeout_seconds=timeout,
+                )
+            self._host_tools_config = config
+        return host_tools.call(self._host_tools_config, name, arguments, caller=caller)
 
     def _load_openapi_spec(self):
         """Load OpenAPI spec from LifeOS API."""
@@ -2753,6 +2785,12 @@ class OAuthToolAccess:
         # The OAuth client id; `fetch` serves only ids this principal searched.
         self.principal = principal
         self.allowed = OAUTH_ALLOWED_TOOLS
+        from api.services.host_tools import HOST_TOOL_NAMES, oauth_clients_granted
+
+        if principal in oauth_clients_granted():
+            # Operator grant (LIFEOS_HOST_TOOLS_OAUTH_CLIENTS): this client also
+            # gets the host tools, and nothing else beyond the tier.
+            self.allowed = OAUTH_ALLOWED_TOOLS | HOST_TOOL_NAMES
         self._annotations = tool_annotations
 
     def tools(self) -> list[dict]:
@@ -2768,10 +2806,13 @@ class OAuthToolAccess:
         return name in CHATGPT_TOOL_NAMES or any(t["name"] == name for t in self.server.tools)
 
     def call(self, name: str, arguments: object) -> dict:
+        from api.services.host_tools import HOST_TOOL_NAMES
         from api.services.mcp_tool_tier import check_oauth_arguments
 
         if not isinstance(arguments, dict):
             return _tool_error("arguments must be an object")
+        if name in HOST_TOOL_NAMES:
+            return self.server.call_host_tool(name, arguments, caller=f"oauth:{self.principal}")
         refusal = check_oauth_arguments(
             name, arguments, existing_contexts=self.server.task_contexts,
         )
@@ -2805,6 +2846,7 @@ def respond(
     request: dict,
     *,
     access: OAuthToolAccess | None = None,
+    caller: str = "local-stdio",
 ) -> dict | None:
     """Build the JSON-RPC response for one request, whether or not it has an id.
 
@@ -2812,7 +2854,8 @@ def respond(
     audit a notification's execution even though the transport sends no reply.
     Returns None only for `notifications/initialized`. `access` is set only for
     an OAuth-authenticated HTTP request; it narrows `tools/list` and
-    `tools/call` to the OAuth tool tier.
+    `tools/call` to the OAuth tool tier. `caller` names the full-access caller
+    in the host tools' audit record.
     """
     method = request.get("method")
     request_id = request.get("id")
@@ -2848,6 +2891,9 @@ def respond(
             params = request.get("params", {})
             tool_name = params.get("name")
             arguments = params.get("arguments", {})
+            if tool_name in _host_tool_names() and any(t["name"] == tool_name for t in server.tools):
+                result = server.call_host_tool(tool_name, arguments, caller=caller)
+                return _ok(request_id, result)
             data = server._call_api(tool_name, arguments)
             formatted = server._format_response(tool_name, data, arguments)
             result = {"content": [{"type": "text", "text": formatted}]}
@@ -2873,14 +2919,21 @@ def dispatch(
     request: dict,
     *,
     access: OAuthToolAccess | None = None,
+    caller: str = "local-stdio",
 ) -> dict | None:
     """Handle a single JSON-RPC request.
 
     Returns the response dict, or None for notifications (requests with no id).
     Used by both the stdio and HTTP transports so behavior stays identical.
     """
-    response = respond(server, request, access=access)
+    response = respond(server, request, access=access, caller=caller)
     return None if request.get("id") is None else response
+
+
+def _host_tool_names() -> frozenset[str]:
+    from api.services.host_tools import HOST_TOOL_NAMES
+
+    return HOST_TOOL_NAMES
 
 
 def run_stdio(server: "LifeOSMCPServer") -> None:
@@ -2918,6 +2971,11 @@ WORKER_REACHING_TOOLS = frozenset({
     "lifeos_schedule_update",
     "lifeos_schedule_trigger",
 })
+
+
+# Host tools that write files or run commands; their HTTP calls are also
+# audit-logged at WARNING (api/services/host_tools.HOST_WRITE_TOOLS).
+_HOST_WRITE_TOOLS = frozenset({"lifeos_fs_write", "lifeos_shell"})
 
 
 def reaches_worker(tool_name: object) -> bool:
@@ -2969,11 +3027,20 @@ def _audit_tool_call(request_obj: object, response: dict | None, *, caller: str,
         or (isinstance(response.get("result"), dict) and response["result"].get("isError"))
     )
     worker = reaches_worker(tool)
+    host_write = tool in _HOST_WRITE_TOOLS
     logger.log(
-        logging.WARNING if worker else logging.INFO,
-        "mcp audit: caller=%s edge=%s tool=%s reaches_worker=%s arg_keys=%s args_sha256=%s failed=%s",
-        caller, edge or "local", _audit_token(tool), worker, ",".join(keys), digest, failed,
+        logging.WARNING if worker or host_write else logging.INFO,
+        "mcp audit: caller=%s edge=%s tool=%s reaches_worker=%s host_write=%s "
+        "arg_keys=%s args_sha256=%s failed=%s",
+        caller, edge or "local", _audit_token(tool), worker, host_write, ",".join(keys), digest, failed,
     )
+
+
+def _is_shell_call(request_obj: object) -> bool:
+    if not isinstance(request_obj, dict) or request_obj.get("method") != "tools/call":
+        return False
+    params = request_obj.get("params")
+    return isinstance(params, dict) and params.get("name") == "lifeos_shell"
 
 
 def build_http_app(
@@ -3012,6 +3079,7 @@ def build_http_app(
 
     from fastapi import FastAPI, HTTPException, Request, Response
     from fastapi.responses import JSONResponse
+    from starlette.concurrency import run_in_threadpool
 
     app = FastAPI(title="LifeOS MCP", docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -3068,17 +3136,27 @@ def build_http_app(
             return _parse_error_response()
 
         def _dispatch_audited(req: object) -> dict | None:
-            outcome = respond(server, req, access=access) if isinstance(req, dict) else dispatch(server, req, access=access)
+            if isinstance(req, dict):
+                outcome = respond(server, req, access=access, caller=caller)
+            else:
+                outcome = dispatch(server, req, access=access, caller=caller)
             _audit_tool_call(req, outcome, caller=caller, edge=edge)
             return None if isinstance(req, dict) and req.get("id") is None else outcome
 
+        async def _run(req: object) -> dict | None:
+            # A shell call can wait on an approval for minutes, so it runs
+            # off the event loop.
+            if _is_shell_call(req):
+                return await run_in_threadpool(_dispatch_audited, req)
+            return _dispatch_audited(req)
+
         if isinstance(body, list):
-            responses = [r for r in (_dispatch_audited(req) for req in body) if r is not None]
+            responses = [r for r in [await _run(req) for req in body] if r is not None]
             if not responses:
                 return Response(status_code=202)
             return JSONResponse(responses)
 
-        response = _dispatch_audited(body)
+        response = await _run(body)
         if response is None:
             return Response(status_code=202)
         return JSONResponse(response)

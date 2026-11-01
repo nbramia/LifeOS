@@ -2,7 +2,7 @@
 
 > **Audience:** All AI coding agents (Claude Code, Cursor, Copilot, etc.)
 > **Status:** Complete
-> **Last Updated:** 2026-09-22
+> **Last Updated:** 2026-10-31
 
 LifeOS is a self-hosted personal AI assistant with two halves:
 
@@ -71,6 +71,7 @@ Runs on Linux or macOS. Optionally, a Mac can act as an Apple Data Agent for iMe
 | How does the doctor self-repair bot work? | [guides/doctor-bot.md](docs/guides/doctor-bot.md) |
 | How do Claude/ChatGPT apps authenticate to MCP, and which tools can they use? | [specs/technical/mcp-oauth.md](docs/specs/technical/mcp-oauth.md) |
 | How do I connect the Claude or ChatGPT app to LifeOS? | [guides/mcp-connected-apps.md](docs/guides/mcp-connected-apps.md) |
+| What file, command and log access can an MCP client get on the host? | [guides/host-tools.md](docs/guides/host-tools.md) |
 | How do agents hand work to the human? | [guides/human-queue.md](docs/guides/human-queue.md) |
 | How do I pause/resume household internet access via eero? | [guides/home-eero.md](docs/guides/home-eero.md) |
 | How do schedules (triggers + actions) work? | [guides/scheduler.md](docs/guides/scheduler.md) |
@@ -235,7 +236,7 @@ Quick-reference guardrails for all contributors. These complement the Developmen
 | `api/services/perf_trace.py` | Request-level performance tracing (spans, SQLite) |
 | `api/routes/perf.py` | Performance trace query API |
 | `api/services/agent_worker/` | Autonomous worker for engine-assigned tasks (local Gemma or cloud Claude via Managed Agents) |
-| `mcp_server.py` | MCP server — stdio for Claude Code + HTTP transport for Managed Agents (84 tools: 73 from `CURATED_ENDPOINTS` plus 11 `lifeos_agent_*` tools registered separately by `_register_inter_agent_tools()` from `INTER_AGENT_TOOL_SCHEMAS`) |
+| `mcp_server.py` | MCP server — stdio for Claude Code + HTTP transport for Managed Agents (84 tools: 73 from `CURATED_ENDPOINTS` plus 11 `lifeos_agent_*` tools registered separately by `_register_inter_agent_tools()` from `INTER_AGENT_TOOL_SCHEMAS`; plus the 5 host tools from `api/services/host_tools.py` when `LIFEOS_HOST_TOOLS_ENABLED` is set) |
 | `tests/test_perf_benchmark.py` | Benchmark suite for query performance and quality |
 
 | Script | Purpose |

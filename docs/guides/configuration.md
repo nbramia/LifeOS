@@ -1,7 +1,7 @@
 # Configuration Guide
 
 **Status:** Complete
-**Last Updated:** 2026-09-16
+**Last Updated:** 2026-10-31
 **Audience:** Operators
 
 **This is the single authoritative reference for every `LIFEOS_*` environment variable and the third-party service variables (`ANTHROPIC_API_KEY`, `OLLAMA_*`, `SLACK_*`, `TELEGRAM_*`, `MONARCH_*`) that LifeOS reads.** Other guides reference this file rather than restating defaults — when documentation conflicts, this file wins (and `config/settings.py` wins over both, since the code is the source of truth).
@@ -182,6 +182,20 @@ The HTTP MCP transport exposes LifeOS tools to remote agents (primarily Anthropi
 | `LIFEOS_MCP_FUNNEL_CONTAINER` | str | `lifeos-mcp-funnel` | Docker container name of the public MCP node. |
 | `LIFEOS_MCP_FUNNEL_IMAGE` | str | `tailscale/tailscale:v1.102.4` | Image the public MCP node runs. |
 | `LIFEOS_MCP_FUNNEL_STATE_DIR` | str | `~/.local/share/lifeos-mcp-ts` | Host directory holding the public MCP node's Tailscale state (its login). |
+
+## Host Tools
+
+Scoped file, command and log access over MCP (`lifeos_fs_list`, `lifeos_fs_read`, `lifeos_fs_write`, `lifeos_shell`, `lifeos_logs`). The roots, denylist and command allowlist are defined in `api/services/host_tools.py`. Setup, including the low-privilege account: [host-tools.md](host-tools.md).
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_HOST_TOOLS_ENABLED` | bool | `false` | Register the host tools on the MCP server. |
+| `LIFEOS_HOST_TOOLS_RUN_AS` | str | — | Low-privilege account `lifeos_shell` runs commands as (`sudo -n -u`). Empty disables `lifeos_shell`; root and the LifeOS account itself are refused. |
+| `LIFEOS_HOST_TOOLS_SCRATCH_DIR` | path | `scratch/` in the checkout | Writable scratch root, created on first use. |
+| `LIFEOS_HOST_TOOLS_OAUTH_CLIENTS` | str (comma-separated) | — | OAuth client ids that get the host tools in addition to the connected-app tier. Empty: no connected app gets them. |
+| `LIFEOS_HOST_TOOLS_VAULT_AUTOCOMMIT` | bool | `true` | Commit each host-tools vault write (that path only) when the vault is a git repo. |
+| `LIFEOS_HOST_TOOLS_SHELL_APPROVAL` | bool | `false` | Send commands outside the allowlist to the primary Telegram bot for an `APPROVE` reply. Off: they are refused. |
+| `LIFEOS_HOST_TOOLS_APPROVAL_TIMEOUT_SECONDS` | int | `120` | How long an approval request waits before it is denied (minimum 10). |
 
 ## Agent Worker — Defaults and Budgets
 

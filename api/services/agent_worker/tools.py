@@ -336,15 +336,20 @@ class ToolRegistry:
             from mcp_server import LifeOSMCPServer
             lifeos_mcp_server = LifeOSMCPServer()
         self._mcp = lifeos_mcp_server
-        self._mcp_tool_names: set[str] = {t["name"] for t in self._mcp.tools}
+        # The host tools (lifeos_fs_*, lifeos_shell, lifeos_logs) are for
+        # MCP clients; the worker already has its own file and Bash tools.
+        from api.services.host_tools import HOST_TOOL_NAMES
+
+        self._mcp_tools = [t for t in self._mcp.tools if t["name"] not in HOST_TOOL_NAMES]
+        self._mcp_tool_names: set[str] = {t["name"] for t in self._mcp_tools}
         self._inter_ctx = inter_agent_context
 
     def definitions(self) -> list[dict[str, Any]]:
         """Anthropic-format tool definitions for the agent's system message."""
         if self._inter_ctx is not None:
             from api.services.agent_worker.inter_agent import INTER_AGENT_TOOL_SCHEMAS
-            return STANDARD_TOOLS + list(INTER_AGENT_TOOL_SCHEMAS) + list(self._mcp.tools)
-        return STANDARD_TOOLS + list(self._mcp.tools)
+            return STANDARD_TOOLS + list(INTER_AGENT_TOOL_SCHEMAS) + list(self._mcp_tools)
+        return STANDARD_TOOLS + list(self._mcp_tools)
 
     def bind_caller_turn(self, attempt_id: str, turn_id: str) -> None:
         """Bind in-process inter-agent calls to the executor turn just begun."""

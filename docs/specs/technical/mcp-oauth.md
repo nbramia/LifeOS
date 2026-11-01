@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Platform
-> **Last Updated:** 2026-10-03
+> **Last Updated:** 2026-10-31
 
 The MCP HTTP transport (`mcp_server.py --transport http`) accepts two credentials on its MCP endpoint (`POST /mcp`, `POST /`):
 
@@ -64,7 +64,7 @@ A **chain** is everything issued from one code exchange. Revoking a token (RFC 7
 
 ## Tool tier: read + safe writes
 
-`OAUTH_TOOL_TIER` in `api/services/mcp_tool_tier.py` classifies every tool the server can build as allowed or denied, with a reason; a tool absent from it is denied, and `tests/test_mcp_oauth.py` fails until a new tool is classified. For an OAuth request, `tools/list` returns only allowed tools, each with `annotations` (`readOnlyHint`, `destructiveHint: false`), and `tools/call` on any other name returns the same `Unknown tool` error (`-32602`) as a nonexistent tool.
+`OAUTH_TOOL_TIER` in `api/services/mcp_tool_tier.py` classifies every tool the server can build as allowed or denied, with a reason; a tool absent from it is denied, and `tests/test_mcp_oauth.py` fails until a new tool is classified. For an OAuth request, `tools/list` returns only allowed tools, each with `annotations` (`readOnlyHint`, `destructiveHint`), and `tools/call` on any other name returns the same `Unknown tool` error (`-32602`) as a nonexistent tool.
 
 - **Allowed reads:** every read-only curated tool (including `lifeos_vault_read`, which returns one note by vault-relative path and is confined to the vault root), plus `search` and `fetch`.
 - **Allowed writes:** `lifeos_task_create`, `lifeos_reminder_create`, `lifeos_memories_create`, `lifeos_gmail_draft`, with argument guards. A task:
@@ -76,6 +76,7 @@ A **chain** is everything issued from one code exchange. Revoking a token (RFC 7
 
   A reminder must be `message_type: "static"` with no `endpoint_config`. Independently of OAuth, the task store accepts only a plain context name (the whole string matches `[A-Za-z0-9][A-Za-z0-9 _&'-]{0,63}`) whose file resolves directly inside the tasks directory.
 - **Denied:** sending (email, Telegram), deletes, person and fact edits, vault writes, task edits and lifecycle actions, projects, schedules, sync, calendar writes (they email attendees), home-network control, Human-queue writes, workout logging, and the `lifeos_agent_*` family.
+- **Operator grant only:** the host tools (`lifeos_fs_list`, `lifeos_fs_read`, `lifeos_fs_write`, `lifeos_shell`, `lifeos_logs`) are denied in the tier. An OAuth client whose id is listed in `LIFEOS_HOST_TOOLS_OAUTH_CLIENTS`, while `LIFEOS_HOST_TOOLS_ENABLED` is on, also gets those five, and nothing else beyond the tier. `lifeos_fs_write` and `lifeos_shell` carry `destructiveHint: true`. Their own path and command limits are in [Host Tools](../../guides/host-tools.md).
 
 `search` and `fetch` exist only for OAuth requests. `search` (`{query}`) runs vault search and returns `{results: [{id, title, url, text}]}`, one per vault document, where `id` is the vault-relative path and `url` an `obsidian://` link. `fetch` (`{id}`) returns `{id, title, text, url, metadata}` for a document an earlier search by the same OAuth client returned in the same process, re-checked to resolve inside the vault. Both results carry the JSON as text content and as `structuredContent`.
 
@@ -92,3 +93,4 @@ A **chain** is everything issued from one code exchange. Revoking a token (RFC 7
 - [Configuration](../../guides/configuration.md#mcp-http-transport) -- `LIFEOS_OAUTH_*` and `LIFEOS_MCP_*` settings
 - [Security & Privacy](security-privacy.md) -- Broader security posture this tier fits into
 - [Agent Worker Setup](../../guides/agent-worker-setup.md#step-3--enable-the-mcp-http-systemd-unit) -- Bearer-token transport setup for Managed Agents
+- [Host Tools](../../guides/host-tools.md) -- The operator-granted host tools and their limits

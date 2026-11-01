@@ -39,6 +39,9 @@ data/
 logs/
 *.log
 
+# Host tools scratch directory (LIFEOS_HOST_TOOLS_SCRATCH_DIR default)
+scratch/
+
 # =============================================================================
 # CREDENTIALS & SECRETS
 # =============================================================================

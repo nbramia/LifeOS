@@ -781,6 +781,24 @@ class TelegramBotListener:
             logger.warning(f"agent-worker deposit_answer failed: {exc}")
             return False
 
+    def _maybe_decide_host_approval(self, reply_to_message_id: int, text: str) -> bool:
+        """Record APPROVE (or a refusal) for an open host-tools approval request."""
+        try:
+            from api.services.host_approval import DEFAULT_DB_PATH, ApprovalStore
+        except Exception as exc:  # pragma: no cover — keep the listener running
+            logger.warning(f"host approval hook unavailable: {exc}")
+            return False
+        if not DEFAULT_DB_PATH.exists():
+            return False
+        try:
+            decided = ApprovalStore().decide_by_reply(reply_to_message_id, text)
+        except Exception as exc:
+            logger.warning(f"host approval decision failed: {exc}")
+            return False
+        if decided:
+            send_message("Recorded.", chat_id=self._chat_id, reply_to_message_id=reply_to_message_id)
+        return decided
+
     async def _handle_agent_spawn(self, rest: str, chat_id: str):
         """Spawn an operator agent on demand: `/agent [local|claude] <task>`.
 
@@ -1017,6 +1035,13 @@ class TelegramBotListener:
         # so without scoping a specialized bot could collide with the primary's
         # ids in the shared follow-up table. Pure-chat specialized bots skip it.
         reply_to = message.get("reply_to_message")
+        # A reply to a host-tools approval request (sent by the MCP server
+        # process through the primary bot) decides that request and nothing else.
+        if (
+            self._is_primary and reply_to and reply_to.get("message_id")
+            and self._maybe_decide_host_approval(int(reply_to["message_id"]), text)
+        ):
+            return
         if self._owns_agent_sessions and reply_to and reply_to.get("message_id"):
             reply_to_id = int(reply_to["message_id"])
             # A reply to a /claude completion resumes that Claude Code session —
