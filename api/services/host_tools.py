@@ -92,6 +92,8 @@ RESTARTABLE_UNITS = ("lifeos-api", "lifeos-mcp-http", "lifeos-agent-worker")
 
 READ_MAX_BYTES = 512 * 1024
 WRITE_MAX_BYTES = 1024 * 1024
+# Mode for a file the host tools create (an overwritten file keeps its own).
+NEW_FILE_MODE = 0o644
 LIST_MAX_ENTRIES = 500
 LOG_MAX_LINES = 1000
 LOG_SCAN_BYTES = 4 * 1024 * 1024
@@ -209,6 +211,9 @@ class HostToolsConfig:
     runner: Callable[..., subprocess.CompletedProcess] = field(default=subprocess.run)
     # The Telegram approval gate (host_approval.ApprovalGate), set when approval is on.
     approvals: Any = None
+    # Give the run-as account an ACL entry on the scratch directory (see
+    # _grant_scratch_access). On for the real service, off in tests.
+    grant_scratch_access: bool = False
 
     @classmethod
     def from_settings(cls) -> HostToolsConfig:
@@ -225,6 +230,7 @@ class HostToolsConfig:
             vault_autocommit=settings.host_tools_vault_autocommit,
             approval_enabled=settings.host_tools_shell_approval,
             approval_timeout_seconds=approval_timeout(settings.host_tools_approval_timeout_seconds),
+            grant_scratch_access=True,
         )
 
 
@@ -263,6 +269,45 @@ def _denied_reason(root_name: str, root: Path, rel_parts: tuple[str, ...]) -> st
     return None
 
 
+_scratch_access_granted: set[tuple[str, str]] = set()
+_scratch_access_lock = threading.Lock()
+
+
+def _grant_scratch_access(config: HostToolsConfig, scratch: Path) -> None:
+    """Let the run-as account read the scratch directory.
+
+    The scratch directory is created private to the LifeOS account, so
+    without an ACL entry the low-privilege account cannot open it and every
+    command run from it fails with "Permission denied". This adds a read entry
+    for that one account (and a default entry, so new files and folders
+    inherit it), once per process. It never widens access for anyone else.
+    """
+    if not config.grant_scratch_access or not config.run_as or not scratch.is_dir():
+        return
+    key = (str(scratch), config.run_as)
+    with _scratch_access_lock:
+        if key in _scratch_access_granted:
+            return
+        setfacl = shutil.which("setfacl")
+        # One attempt per process, whatever the outcome, so a failure is
+        # logged once rather than on every call. A restart tries again.
+        _scratch_access_granted.add(key)
+        if setfacl is None:
+            logger.warning("host tools: setfacl not found; %s cannot read the scratch directory", config.run_as)
+            return
+        entry = f"u:{config.run_as}:rX"
+        try:
+            result = config.runner(
+                [setfacl, "-R", "-m", entry, "-m", f"d:{entry}", str(scratch)],
+                capture_output=True, text=True, timeout=30, check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.warning("host tools: could not grant scratch access: %s", exc)
+            return
+        if result.returncode != 0:
+            logger.warning("host tools: could not grant scratch access: %s", (result.stderr or "").strip()[:300])
+
+
 def _root(config: HostToolsConfig, root_name: object, *, for_write: bool) -> tuple[str, Path]:
     allowed = WRITABLE_ROOTS if for_write else READABLE_ROOTS
     if not isinstance(root_name, str) or root_name not in allowed:
@@ -275,6 +320,7 @@ def _root(config: HostToolsConfig, root_name: object, *, for_write: bool) -> tup
             Path(raw).mkdir(mode=0o700, parents=True, exist_ok=True)
         except OSError:
             pass
+        _grant_scratch_access(config, Path(raw))
     try:
         return root_name, Path(raw).resolve(strict=True)
     except (OSError, RuntimeError):
@@ -458,21 +504,31 @@ def fs_write(config: HostToolsConfig, arguments: dict) -> dict:
         raise HostToolError("path exists and is not a file")
     if mode == "create" and target.exists():
         raise HostToolError("file already exists")
+    old_mode = target.stat().st_mode & 0o7777 if target.exists() else None
     if mode == "append" and target.exists():
         with open(target, "a", encoding="utf-8") as f:
             f.write(content)
     else:
         atomic_write_text(target, content)
-    commit = None
-    if name == "vault" and config.vault_autocommit:
-        commit = _vault_commit(root, rel)
-    return {
+        # The atomic write goes through a private temp file (mode 0600). Keep
+        # an overwritten file's mode, and give a new file ordinary 0644, so
+        # the run-as account can still read it.
+        os.chmod(target, old_mode if old_mode is not None else NEW_FILE_MODE)
+    result = {
         "root": name,
         "path": str(rel),
         "bytes": len(encoded),
         "sha256": hashlib.sha256(encoded).hexdigest(),
-        "commit": commit,
+        "commit": None,
     }
+    if name == "vault" and config.vault_autocommit:
+        if (root / ".git").exists():
+            result["commit"] = _vault_commit(root, rel)
+        else:
+            # A synced vault copy with no git repository: the file is saved,
+            # but say plainly that nothing was committed.
+            result["commit_skipped"] = "the vault on this host is not a git repository"
+    return result
 
 
 # ── Logs ──────────────────────────────────────────────────────────────────
@@ -852,7 +908,8 @@ HOST_TOOL_SCHEMAS: list[dict] = [
     {
         "name": "lifeos_fs_write",
         "description": "Write one text file in the vault or the scratch directory. A vault "
-                       "write is committed to the vault's git repo. The LifeOS code is "
+                       "write is committed when the vault on the host is a git repo; "
+                       "otherwise the result says it was not. The LifeOS code is "
                        "read-only; change it through a pull request.",
         "inputSchema": {
             "type": "object",
@@ -921,6 +978,7 @@ def call(config: HostToolsConfig, name: str, arguments: object, *, caller: str) 
                 "root": payload.get("root"), "path": payload.get("path"),
                 "service": payload.get("service"), "bytes": payload.get("bytes"),
                 "sha256": payload.get("sha256"), "commit": payload.get("commit"),
+                "commit_skipped": payload.get("commit_skipped"),
             }, path=config.audit_path)
     except HostToolError as exc:
         if name != "lifeos_shell":

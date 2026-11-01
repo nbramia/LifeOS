@@ -930,3 +930,82 @@ def test_listener_decides_only_for_the_configured_chat(approval_listener):
     assert approval_listener.listener(CHAT)._maybe_decide_host_approval(8, "APPROVE") is True
     assert store.get(mine).state == "approved"
     assert approval_listener.replies and "Approved request" in approval_listener.replies[0]
+
+
+def test_listener_answers_a_reply_to_a_request_that_is_no_longer_waiting(approval_listener):
+    store = approval_listener.store
+    rid = _open_request(store, CHAT, message_id=11)
+    assert approval_listener.listener(CHAT)._maybe_decide_host_approval(11, "APPROVE") is True
+    assert store.get(rid).state == "approved"
+
+    # A second reply to the same request is answered, not sent to chat.
+    assert approval_listener.listener(CHAT)._maybe_decide_host_approval(11, "APPROVE") is True
+    assert store.get(rid).state == "approved"
+    assert "no longer waiting" in approval_listener.replies[-1]
+
+    # A reply to a message that is not a request is left for the chat pipeline.
+    assert approval_listener.listener(CHAT)._maybe_decide_host_approval(999, "APPROVE") is False
+
+
+def test_a_bare_approve_approves_nothing_and_stays_out_of_chat(approval_listener):
+    store = approval_listener.store
+    listener = approval_listener.listener(CHAT)
+    # Nothing waiting: a bare "approve" is ordinary chat.
+    assert listener._maybe_catch_unthreaded_approve("approve") is False
+
+    rid = _open_request(store, CHAT, message_id=12)
+    assert listener._maybe_catch_unthreaded_approve("hello") is False
+    assert listener._maybe_catch_unthreaded_approve(" Approve ") is True
+    assert store.get(rid).state == "pending"
+    assert "Nothing was approved" in approval_listener.replies[-1]
+    assert store.get(rid).short_id in approval_listener.replies[-1]
+
+    # Only the configured chat is answered.
+    assert approval_listener.listener("chat-other")._maybe_catch_unthreaded_approve("approve") is False
+
+
+def test_scratch_access_is_granted_to_the_run_as_account_once(config, roots, runner, monkeypatch):
+    monkeypatch.setattr(host_tools, "_scratch_access_granted", set())
+    monkeypatch.setattr(host_tools.shutil, "which", lambda name: f"/usr/bin/{name}")
+    config.grant_scratch_access = True
+
+    host_tools.fs_list(config, {"root": "scratch"})
+    host_tools.fs_list(config, {"root": "scratch"})
+
+    acl_calls = [c["argv"] for c in runner.calls if c["argv"][0].endswith("setfacl")]
+    assert acl_calls == [[
+        "/usr/bin/setfacl", "-R", "-m", "u:lifeos-tools:rX", "-m", "d:u:lifeos-tools:rX",
+        str(roots["scratch"]),
+    ]]
+
+
+def test_scratch_access_is_not_granted_without_a_run_as_account(config, runner, monkeypatch):
+    monkeypatch.setattr(host_tools, "_scratch_access_granted", set())
+    config.grant_scratch_access = True
+    config.run_as = ""
+    host_tools.fs_list(config, {"root": "scratch"})
+    assert runner.calls == []
+
+
+def test_written_files_are_readable_and_keep_their_mode(config, roots):
+    host_tools.fs_write(config, {"root": "scratch", "path": "new.txt", "content": "one\n"})
+    assert (roots["scratch"] / "new.txt").stat().st_mode & 0o777 == 0o644
+
+    plan = roots["vault"] / "Work" / "Plan.md"
+    plan.chmod(0o664)
+    host_tools.fs_write(config, {"root": "vault", "path": "Work/Plan.md", "content": "# Plan\nrewritten\n"})
+    assert plan.stat().st_mode & 0o777 == 0o664
+
+
+def test_vault_write_says_when_the_vault_is_not_a_git_repo(config, roots):
+    config.vault_autocommit = True
+    result = host_tools.call(
+        config, "lifeos_fs_write", {"root": "vault", "path": "Inbox/Note.md", "content": "hi\n"},
+        caller="oauth:client-a",
+    )
+    payload = json.loads(result["content"][0]["text"])
+    assert not result.get("isError")
+    assert payload["commit"] is None
+    assert payload["commit_skipped"] == "the vault on this host is not a git repository"
+    assert (roots["vault"] / "Inbox" / "Note.md").read_text() == "hi\n"
+    assert _audit(config)[-1]["commit_skipped"] == payload["commit_skipped"]

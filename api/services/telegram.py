@@ -805,12 +805,24 @@ class TelegramBotListener:
         if not DEFAULT_DB_PATH.exists() or not self._chat_id or self._chat_id != settings.telegram_chat_id:
             return False
         try:
-            row = ApprovalStore().decide_by_reply(reply_to_message_id, text, chat_id=self._chat_id)
+            store = ApprovalStore()
+            row = store.decide_by_reply(reply_to_message_id, text, chat_id=self._chat_id)
+            stale = None if row is not None else store.find_by_message(reply_to_message_id, chat_id=self._chat_id)
         except Exception as exc:
             logger.warning(f"host approval decision failed: {exc}")
             return False
         if row is None:
-            return False
+            if stale is None:
+                return False
+            # A reply to a request that was already decided, ran or expired is
+            # still about that request: answer it here, never in chat.
+            from api.services.host_approval import already_decided_text
+
+            send_message_capture_ids(
+                already_decided_text(stale), chat_id=self._chat_id,
+                reply_to_message_id=reply_to_message_id, parse_mode=None,
+            )
+            return True
         try:
             from api.services.host_tools import audit as host_tools_audit
 
@@ -824,6 +836,38 @@ class TelegramBotListener:
             approval_reply_text(row), chat_id=self._chat_id,
             reply_to_message_id=reply_to_message_id, parse_mode=None,
         )
+        return True
+
+    def _maybe_catch_unthreaded_approve(self, text: str) -> bool:
+        """Keep a bare APPROVE that is not a reply out of the chat pipeline.
+
+        Approval is bound to a reply to the request's own message, so a bare
+        APPROVE approves nothing. While a request is waiting in this chat,
+        answer it with how to approve instead of sending it to chat as a
+        question. With nothing waiting, the message is ordinary chat.
+        """
+        try:
+            from api.services.host_approval import (
+                APPROVE_WORD,
+                DEFAULT_DB_PATH,
+                ApprovalStore,
+                unthreaded_approve_text,
+            )
+        except Exception as exc:  # pragma: no cover — keep the listener running
+            logger.warning(f"host approval hook unavailable: {exc}")
+            return False
+        if text.strip().lower() != APPROVE_WORD:
+            return False
+        if not DEFAULT_DB_PATH.exists() or not self._chat_id or self._chat_id != settings.telegram_chat_id:
+            return False
+        try:
+            waiting = ApprovalStore().pending_in_chat(self._chat_id)
+        except Exception as exc:
+            logger.warning(f"host approval lookup failed: {exc}")
+            return False
+        if not waiting:
+            return False
+        send_message_capture_ids(unthreaded_approve_text(waiting), chat_id=self._chat_id, parse_mode=None)
         return True
 
     async def _handle_agent_spawn(self, rest: str, chat_id: str):
@@ -1080,6 +1124,8 @@ class TelegramBotListener:
                 return
             if self._maybe_deposit_agent_answer(reply_to_id, text):
                 return
+        if self._is_primary and not reply_to and self._maybe_catch_unthreaded_approve(text):
+            return
 
         logger.info(f"Telegram message: {text[:100]}")
 

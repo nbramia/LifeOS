@@ -1,7 +1,7 @@
 # Host Tools
 
 **Status:** Complete
-**Last Updated:** 2026-10-31
+**Last Updated:** 2026-11-01
 **Audience:** Operator
 
 Host tools give an MCP client scoped access to the LifeOS host: read and list files under named roots, write to the vault or a scratch directory, run a short allowlist of commands as a separate low-privilege account, and read LifeOS service logs. They are off by default. They exist so a connected app can check on and maintain LifeOS without holding a full shell.
@@ -14,20 +14,24 @@ Host tools give an MCP client scoped access to the LifeOS host: read and list fi
 |---|---|---|
 | `lifeos_fs_list` | Lists one directory | Roots `vault`, `scratch`, `lifeos`, `logs`; 500 entries |
 | `lifeos_fs_read` | Reads one text file | Same roots; 512 KB; binary files refused |
-| `lifeos_fs_write` | Writes one text file (`overwrite`, `create` or `append`) | Roots `vault` and `scratch` only; 1 MB; a vault write is committed |
+| `lifeos_fs_write` | Writes one text file (`overwrite`, `create` or `append`) | Roots `vault` and `scratch` only; 1 MB; a vault write is committed when the vault is a git repository |
 | `lifeos_shell` | Runs one allowlisted command, argv only, no shell | Runs as `LIFEOS_HOST_TOOLS_RUN_AS`; 30 s; 64 KB of output per stream |
 | `lifeos_logs` | Returns the last lines of a LifeOS service's log, optionally filtered | Named services only; 1,000 lines |
 
 The roots are:
 
 - `vault`: `LIFEOS_VAULT_PATH`. Readable and writable.
-- `scratch`: `LIFEOS_HOST_TOOLS_SCRATCH_DIR` (default `scratch/` in the LifeOS checkout, created on first use). Readable and writable.
+- `scratch`: `LIFEOS_HOST_TOOLS_SCRATCH_DIR` (default `scratch/` in the LifeOS checkout, created on first use). Readable and writable. The directory is private to the LifeOS account; on first use in each process the service adds a read ACL entry (and a default entry, so new files inherit it) for the `LIFEOS_HOST_TOOLS_RUN_AS` account only, so commands can run from it. This needs `setfacl`; without it, commands run from scratch fail with "Permission denied" and a warning is logged.
 - `lifeos`: the LifeOS checkout. Read-only; code changes go through pull requests.
 - `logs`: the checkout's `logs/` directory. Read-only.
 
 Paths are a root name plus a relative path. Absolute paths, `~` and `..` are refused, and the resolved path must stay inside its root, so a symlink pointing out of a root is refused. A write refuses any symlink on its path. Everywhere under a root, the denylist refuses `.git`, `.ssh`, `.gnupg` and similar directories, `.env*` and `*.env` files, keys and certificates (`.pem`, `.key`, `.crt`, `.cer`, `.p12`, `.pfx`), pickles, SQLite databases and credential or token JSON files; the checkout's `data/` directory is refused outright. Listings hide denied entries.
 
 A vault write is committed with the message `Host tools: update <path>`, committing only that path (taken literally, never as a pattern), so other uncommitted vault changes stay out of the commit. The commit runs with git hooks and the filesystem monitor disabled. It is not pushed. Set `LIFEOS_HOST_TOOLS_VAULT_AUTOCOMMIT=false` to leave writes uncommitted.
+
+If the vault on the host is not a git repository (for example, a copy kept in step by a sync tool, with git living on another machine), a write is saved but not committed, and the result says so in `commit_skipped`. Whatever syncs that copy carries the change; commit it where the repository lives.
+
+A new file is written with mode `0644`. An overwritten file keeps its mode. Writes go through a temporary file that is renamed into place, so extended ACL entries set on the old file are not carried over: give the vault a default ACL for the run-as account (step 3) so rewritten notes stay readable to it.
 
 ### The command allowlist
 
@@ -49,7 +53,7 @@ Off by default: a command outside the allowlist is refused. Turn on approval wit
 
 1. The caller gets a `pending-approval` result straight away, with a short request id. Nothing runs.
 2. The primary bot sends a plain-text message to `TELEGRAM_CHAT_ID` with the request id, when it was asked, when it expires, the caller, the account it runs as, the directory, the exact argv (shown as shell words, never shortened) and the first 16 characters of the command hash. A command too long to show in one message is refused instead.
-3. Reply `APPROVE` to that message to allow it, or anything else to refuse it. Only a reply in the configured chat, to a request sent to that chat, counts. The bot answers with the request's age.
+3. Reply `APPROVE` to that message to allow it, or anything else to refuse it. Only a reply in the configured chat, to a request sent to that chat, counts. The bot answers with the request's age. A bare `APPROVE` that is not a reply approves nothing: while a request is waiting, the bot answers with the waiting request ids instead of treating it as a chat message. A reply to a request that was already decided, ran or expired gets a short answer and changes nothing.
 4. The command runs the next time the same caller asks for the same argv in the same directory as the same account. The approval is spent the moment it runs, so it runs once; a second identical call starts a new request. The bot tells you when it ran, with its exit code and how long ago it was asked and approved.
 
 An approval is bound to a SHA-256 hash of the caller, the run-as account, the directory and the argv, so it cannot be used for any other command or by any other caller. Approving does not run anything by itself: if the caller never asks again (its conversation ended, say), the approval expires unused, and that is logged too. Requests and unused approvals expire after `LIFEOS_HOST_TOOLS_APPROVAL_TIMEOUT_SECONDS` (default 86400, one day); set it to `0` to turn expiry off. A caller can have at most three requests waiting at once.
@@ -114,7 +118,11 @@ VAULT_DIR="/path/to/your vault"              # same as LIFEOS_VAULT_PATH; keep t
    sudo setfacl -m u:"$TOOLS_USER":--- "$LIFEOS_DIR/data" "$LIFEOS_DIR/.env"
    ```
 
-   These entries grant read access to everything else in both trees and withhold only `data/` and `.env`. Add the same `u:"$TOOLS_USER":---` entry for any other secret file in the checkout or vault (for example OAuth token files under `config/`). The tool-level denylist matches names; these file permissions are what the account itself can read. New files inherit nothing from these entries; rerun the first `setfacl` after large changes, or add a default ACL (`setfacl -d -m ...`) on the vault.
+   These entries grant read access to everything else in both trees and withhold only `data/` and `.env`. Add the same `u:"$TOOLS_USER":---` entry for any other secret file in the checkout or vault (for example OAuth token files under `config/`). The tool-level denylist matches names; these file permissions are what the account itself can read. New files inherit nothing from these entries; rerun the first `setfacl` after large changes, or add a default ACL on the vault so new and rewritten files inherit read access:
+
+   ```bash
+   sudo setfacl -R -d -m u:"$TOOLS_USER":rX "$VAULT_DIR"
+   ```
 
 4. Let it run git in those repositories (git otherwise refuses a repository owned by another account):
 
