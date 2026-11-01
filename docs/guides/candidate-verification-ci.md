@@ -1,7 +1,7 @@
 # Candidate Verification CI
 
 **Status:** Partial
-**Last Updated:** 2026-09-21
+**Last Updated:** 2026-11-01
 **Audience:** Operators
 
 Candidate verification runs on GitHub-hosted ephemeral runners. The publisher
@@ -296,6 +296,7 @@ a later advance of `main` therefore fails closed rather than silently
 substituting a different runner implementation for the one claimed by that
 check.
 
+`./scripts/merge-pr.sh <pr>` is the operator entry point for a merge.
 `scripts/candidate_publisher.py` orchestrates the actual publish: it builds
 the candidate, pushes it to a disposable staging ref, dispatches
 `workflow_dispatch` against it, polls for the resulting check via the
