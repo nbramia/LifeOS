@@ -2,8 +2,9 @@
 #
 # LifeOS Pre-push Hook
 #
-# Runs unit tests before allowing pushes. Output is redirected to a log
-# file to avoid flooding the terminal — only a pass/fail summary is shown.
+# Runs cheap local checks before allowing pushes. Output is redirected to a log
+# file to avoid flooding the terminal: a pass shows one summary line, and a
+# failure shows the end of the log.
 #
 # Installation: none. This repo sets `core.hooksPath = scripts`, so git runs
 # THIS tracked file directly. Do not copy it into .git/hooks — a copy there is
@@ -61,10 +62,35 @@ HAVE_CONTENT=0
 PUSH_CANDIDATES=""
 # First local_ref seen on stdin — used below to derive a per-branch log path.
 PUSH_LOCAL_REF=""
-while read local_ref local_sha remote_ref remote_sha; do
+PUSH_LINES=$(cat)
+
+# scripts/candidate_publisher.py pushes each candidate twice: to a staging ref
+# under this prefix for hosted verification, and then, once the App-issued
+# check has passed, to main and the source branch in one atomic transaction.
+# The hosted gate verifies that exact commit and main refuses anything without
+# its check, so these two pushes skip the local pre-flight. That pre-flight
+# reads the pushing checkout rather than the pushed commit, and landing has to
+# work from any checkout. A push to any other ref is only exempt when it shares
+# the commit of a main update that is staged on the remote right now; an
+# ordinary push never reaches that lookup.
+CANDIDATE_REF_PREFIX="refs/heads/lifeos-candidate/"
+STAGED_MAIN_SHA=""
+while read -r local_ref local_sha remote_ref remote_sha; do
+    if [ "$remote_ref" = "refs/heads/main" ] && [ -n "$local_sha" ] && [ "$local_sha" != "$ZERO_SHA" ] \
+        && git ls-remote "${1:-origin}" "${CANDIDATE_REF_PREFIX}*" 2>/dev/null | grep -q "^${local_sha}[[:space:]]"; then
+        STAGED_MAIN_SHA="$local_sha"
+    fi
+done <<< "$PUSH_LINES"
+
+PUBLISHER_PUSH=0
+while read -r local_ref local_sha remote_ref remote_sha; do
     [ -z "$local_sha" ] && continue
     # Deletion push (local_sha is zeros) — nothing to diff.
     [ "$local_sha" = "$ZERO_SHA" ] && continue
+    if [[ "$remote_ref" == "$CANDIDATE_REF_PREFIX"* ]] || [ "$local_sha" = "$STAGED_MAIN_SHA" ]; then
+        PUBLISHER_PUSH=1
+        continue
+    fi
     HAVE_CONTENT=1
     [ -z "$PUSH_LOCAL_REF" ] && PUSH_LOCAL_REF="$local_ref"
     if [ "$remote_sha" = "$ZERO_SHA" ]; then
@@ -86,7 +112,7 @@ while read local_ref local_sha remote_ref remote_sha; do
         PUSH_CANDIDATES="$PUSH_CANDIDATES$local_sha $remote_sha"$'\n'
     fi
     CHANGED_FILES="$CHANGED_FILES"$'\n'"$DIFF"
-done
+done <<< "$PUSH_LINES"
 CHANGED_FILES=$(echo "$CHANGED_FILES" | sort -u | grep -v '^$' || true)
 
 # --- Per-run log paths (#908) --------------------------------------------
@@ -277,6 +303,13 @@ docs_only() {
     [ "$plan" = "skip" ]
 }
 
+# Only publisher pushes carry commits: the hosted gate owns these.
+if [ "$HAVE_CONTENT" = "0" ] && [ "$PUBLISHER_PUSH" = "1" ]; then
+    plan_only_exit "skip-candidate"
+    echo "Pre-push: candidate publication, verified by the hosted gate"
+    exit 0
+fi
+
 # Deletion-only push: no commits are being sent, so there is nothing to gate.
 if [ "$HAVE_CONTENT" = "0" ]; then
     plan_only_exit "skip-deletion"
@@ -316,7 +349,10 @@ fail() {
     else
         echo "FAILED (no log was written to $LOG)"
     fi
-    [ -e "$LOG" ] && echo "  Full output: $LOG"
+    if [ -e "$LOG" ]; then
+        echo "  Full output: $LOG"
+        tail -n 20 "$LOG" | sed 's/^/  | /'
+    fi
     exit 1
 }
 

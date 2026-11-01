@@ -367,6 +367,159 @@ def test_deletion_only_push_skips(tmp_path):
     assert _decision(tmp_path, "", have_content="0") == "skip-deletion"
 
 
+_ZERO_SHA = "0" * 40
+
+
+def _commit_on_fixture(name: str) -> str:
+    """A real commit in the fixture repository, changing one Python file."""
+    (REPO / "api" / f"{name}.py").write_text("value = 2\n")
+    subprocess.run(["git", "-C", str(REPO), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(REPO), "commit", "-q", "-m", name], check=True)
+    return subprocess.run(
+        ["git", "-C", str(REPO), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def _with_remote(tmp_path, staged: dict[str, str] | None = None) -> None:
+    """Point the fixture's origin at a real bare repository holding `staged` refs."""
+    bare = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    subprocess.run(["git", "-C", str(REPO), "remote", "add", "origin", str(bare)], check=True)
+    for ref, sha in (staged or {}).items():
+        subprocess.run(["git", "-C", str(REPO), "push", "-q", "origin", f"{sha}:{ref}"], check=True)
+
+
+def _plan_for_refs(tmp_path, lines: list[str], remote: str = "origin") -> str:
+    """Plan-only run on real ref lines, with no changed-file override."""
+    env = {**os.environ, "LIFEOS_PREPUSH_PLAN_ONLY": "1", "TMPDIR": str(tmp_path)}
+    env.pop("LIFEOS_PREPUSH_CHANGED_FILES", None)
+    result = subprocess.run(
+        ["bash", str(HOOK), remote, "https://example.invalid/synthetic.git"],
+        capture_output=True, text=True, env=env, cwd=str(REPO), input="".join(f"{line}\n" for line in lines),
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return next(
+        line.split("prepush-plan:", 1)[1].strip()
+        for line in result.stdout.splitlines() if line.startswith("prepush-plan:")
+    )
+
+
+@pytest.mark.unit
+def test_candidate_staging_push_skips_local_checks(tmp_path):
+    sha = _commit_on_fixture("candidate")
+    _with_remote(tmp_path)
+    line = f"{sha} {sha} refs/heads/lifeos-candidate/pr-1-abc {_ZERO_SHA}"
+    assert _plan_for_refs(tmp_path, [line]) == "skip-candidate"
+
+
+@pytest.mark.unit
+def test_atomic_publish_of_a_staged_candidate_skips_local_checks(tmp_path):
+    """Main and the source branch advance together to the staged commit."""
+    base = subprocess.run(
+        ["git", "-C", str(REPO), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    sha = _commit_on_fixture("candidate")
+    _with_remote(tmp_path, {"refs/heads/lifeos-candidate/pr-1-abc": sha})
+    lines = [
+        f"{sha} {sha} refs/heads/main {base}",
+        f"{sha} {sha} refs/heads/feat/source {base}",
+    ]
+    assert _plan_for_refs(tmp_path, lines) == "skip-candidate"
+
+
+@pytest.mark.unit
+def test_main_update_that_is_not_staged_still_runs_local_checks(tmp_path):
+    base = subprocess.run(
+        ["git", "-C", str(REPO), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    staged = _commit_on_fixture("staged")
+    sha = _commit_on_fixture("not_staged")
+    _with_remote(tmp_path, {"refs/heads/lifeos-candidate/pr-1-abc": staged})
+    assert _plan_for_refs(tmp_path, [f"{sha} {sha} refs/heads/main {base}"]) == "run-local"
+
+
+@pytest.mark.unit
+def test_branch_push_of_a_staged_commit_still_runs_local_checks(tmp_path):
+    """Only a main update can match the staged list; a branch alone never does."""
+    base = subprocess.run(
+        ["git", "-C", str(REPO), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    sha = _commit_on_fixture("candidate")
+    _with_remote(tmp_path, {"refs/heads/lifeos-candidate/pr-1-abc": sha})
+    assert _plan_for_refs(tmp_path, [f"{sha} {sha} refs/heads/feat/ordinary {base}"]) == "run-local"
+
+
+@pytest.mark.unit
+def test_ordinary_ref_in_a_mixed_push_still_runs_local_checks(tmp_path):
+    base = subprocess.run(
+        ["git", "-C", str(REPO), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    candidate = _commit_on_fixture("candidate")
+    ordinary = _commit_on_fixture("ordinary")
+    _with_remote(tmp_path)
+    lines = [
+        f"{candidate} {candidate} refs/heads/lifeos-candidate/pr-1-abc {_ZERO_SHA}",
+        f"{ordinary} {ordinary} refs/heads/feat/ordinary {base}",
+    ]
+    assert _plan_for_refs(tmp_path, lines) == "run-local"
+
+
+@pytest.mark.unit
+def test_unreadable_staging_list_runs_local_checks_for_a_main_update(tmp_path):
+    base = subprocess.run(
+        ["git", "-C", str(REPO), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    sha = _commit_on_fixture("candidate")
+    line = f"{sha} {sha} refs/heads/main {base}"
+    assert _plan_for_refs(tmp_path, [line], remote=str(tmp_path / "missing.git")) == "run-local"
+
+
+@pytest.mark.unit
+def test_publisher_pushes_succeed_where_the_checkout_fails_the_local_checks(stub_python, tmp_path):
+    """Both real pushes the publisher makes, through real git and the real hook,
+    from a checkout where every local check fails."""
+    (REPO / "scripts" / "pre-push").chmod(0o755)
+    subprocess.run(["git", "-C", str(REPO), "config", "core.hooksPath", "scripts"], check=True)
+    sha = _commit_on_fixture("candidate")
+    _with_remote(tmp_path)
+    captured = tmp_path / "ruff-arguments"
+    env = {
+        **os.environ,
+        "PATH": f"{stub_python['bin_dir']}:{os.environ['PATH']}",
+        "HOME": str(stub_python["home_dir"]),
+        "TMPDIR": str(tmp_path),
+        "STUB_RUFF_EXIT": "1",
+        "STUB_CAPTURE_RUFF": str(captured),
+    }
+
+    def push(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", "-C", str(REPO), "push", "origin", *args], capture_output=True, text=True, env=env,
+        )
+
+    staged = push(f"{sha}:refs/heads/lifeos-candidate/pr-1-abc")
+    assert staged.returncode == 0, staged.stdout + staged.stderr
+    published = push("--atomic", f"{sha}:refs/heads/main", f"{sha}:refs/heads/feat/source")
+    assert published.returncode == 0, published.stdout + published.stderr
+    assert not captured.exists(), "the publisher's pushes must not reach the local lint"
+
+    # The same checkout's ordinary push still hits the failing lint.
+    follow_up = _commit_on_fixture("ordinary")
+    ordinary = push(f"{follow_up}:refs/heads/feat/ordinary")
+    assert ordinary.returncode != 0
+    assert captured.exists()
+
+
+@pytest.mark.unit
+def test_failed_local_check_shows_the_end_of_its_log(stub_python, tmp_path):
+    result = _run_real_hook(
+        stub_python, tmp_path, local_ref="refs/heads/feat/ruff-failure",
+        extra_env={"STUB_RUFF_EXIT": "1"},
+    )
+    assert result.returncode == 1
+    assert "  | ruff: FAILED" in result.stdout
+
+
 @pytest.mark.unit
 def test_unknown_changes_still_run_local_checks(tmp_path):
     """An empty file list on a push that carries commits must not skip."""

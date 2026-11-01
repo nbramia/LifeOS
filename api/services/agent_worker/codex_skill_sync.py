@@ -16,11 +16,8 @@ Only engine-agnostic skills are ported. `mine-for-ideas` drives Claude's
 `Task`/`Skill` subagent loop and is deliberately left Claude-only; `tune` edits
 the LifeOS Claude-orchestrator internals and is also excluded.
 
-The implementation lifecycle (planning, issue drafting, PR checks, review,
-merge) is not synced from here at all: it comes from the
-`benjamcalvin/bootstraps` marketplace, which ships a Codex-compatible plugin
-(`implement-lifecycle`, `issue-management`) installed through Codex's own
-plugin browser.
+The implementation lifecycle (`/implement`, `/draft-issue`) is not synced from
+here at all: those are user-scope skills outside this repo.
 """
 from __future__ import annotations
 

@@ -320,6 +320,52 @@ def test_publish_atomic_refuses_a_non_fast_forward_source_update_before_push(tmp
 
 
 # ---------------------------------------------------------------------------
+# A failed push reports what the pre-push hook printed
+# ---------------------------------------------------------------------------
+
+def _clone_with_failing_hook(tmp_path: Path) -> Path:
+    """A clone whose pre-push hook explains itself on stdout, as scripts/pre-push does."""
+    _, clone = _init_bare_and_clone(tmp_path)
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    hook = hooks / "pre-push"
+    hook.write_text("#!/bin/sh\necho 'synthetic hook reason on stdout'\nexit 1\n")
+    hook.chmod(0o755)
+    subprocess.run(["git", "-C", str(clone), "config", "core.hooksPath", str(hooks)], check=True)
+    return clone
+
+
+def test_failed_staging_push_reports_the_hook_output(tmp_path):
+    clone = _clone_with_failing_hook(tmp_path)
+    sha = _commit(clone, "base.txt", "base")
+    with pytest.raises(PublisherError, match="synthetic hook reason on stdout"):
+        publisher.push_candidate_for_verification(clone, "origin", sha, "refs/heads/lifeos-candidate/pr-1-abc")
+
+
+def test_rejected_publish_reports_the_hook_output(tmp_path, monkeypatch, capsys):
+    clone = _clone_with_failing_hook(tmp_path)
+    sha = _commit(clone, "base.txt", "base")
+    outcome = publish_atomic(clone, "origin", sha, main_ref="refs/heads/main", expected_main_sha=sha)
+    assert not outcome.accepted
+    assert "synthetic hook reason on stdout" in outcome.stderr
+
+    candidate = CandidateCommit(
+        sha=sha, tree="tree", base_sha=sha, head_sha=sha,
+        author_name="A", author_email="a@example.com", normalized_date="2026-01-01T12:00:00Z",
+    )
+    monkeypatch.setattr(
+        publisher, "publish_pull_request",
+        lambda *args, **kwargs: publisher.PublishResult(candidate=candidate, publish=outcome, cleanup=None),
+    )
+    code = publisher.main([
+        "--repository", "nbramia/LifeOS", "--pr", "1", "--workflow-file", "w.yml",
+        "--check-name", "c", "--trusted-app-id", "999",
+    ])
+    assert code == 1
+    assert "synthetic hook reason on stdout" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
 # fetch_pull_request: fork refusal (no network — injected runner)
 # ---------------------------------------------------------------------------
 

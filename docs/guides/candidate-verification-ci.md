@@ -456,6 +456,12 @@ The audit reports either a pass or its named no-real-`.env` not-applicable
 result; any other result blocks the push. Its per-push log remains the local
 evidence record, while the App-bound candidate receipt remains the merge
 evidence; ordinary pushes do not rerun the broad fast-unit/browser lanes.
+The publisher's own two pushes, to the staging ref and then to `main` and the
+source branch, skip these checks: they read the pushing checkout rather than the
+pushed commit, and the hosted gate verifies that exact commit. The hook exempts a
+main update only when its commit is staged under `refs/heads/lifeos-candidate/`
+on the remote at that moment, so ordinary pushes are unaffected. When a publisher
+push does fail, the publisher reports everything the push printed.
 
 Before disabling the hosted requirement, first restore the existing blocking
 local verifier in every checkout that may push:

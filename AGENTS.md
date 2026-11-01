@@ -89,90 +89,34 @@ Runs on Linux or macOS. Optionally, a Mac can act as an Apple Data Agent for iMe
 | What scripts are available? | [guides/scripts.md](docs/guides/scripts.md) |
 | Why does LifeOS exist? What guides decisions? | [vision/philosophy.md](docs/vision/philosophy.md) |
 | Why was X chosen over Y? | `docs/adr/` (specific ADR) |
-| How do we review PRs? | `/implement <pr> just review`, `/pr-check`, `/merge-pr` — from the user-scope `implement-lifecycle` plugin |
+| How do I land a PR? | [§ Development Workflow](#development-workflow) |
 | What lifecycle applies to a change? | [Development lifecycle standard](docs/specs/standards/development-lifecycle.md) |
 
 ---
 
 ## Development Principles
 
-These apply to all agents. Bias toward caution over speed. For trivial tasks, use judgment.
+Bias toward caution over speed. For trivial tasks, use judgment.
 
 ### 1. Think Before Acting
 
-**Don't assume. Don't hide confusion. Surface tradeoffs.**
-
-- State assumptions explicitly. If uncertain, ask.
-- If multiple interpretations exist, present them — don't pick silently.
-- If a simpler approach exists, say so. Push back when warranted.
-- If something is unclear, stop. Name what's confusing. Ask.
+State assumptions. If a request is unclear or has several readings, say so and ask rather than pick silently. Push back when a simpler approach exists.
 
 ### 2. Simplicity First
 
-**Minimum code that solves the problem. Nothing speculative.**
-
-- No features beyond what was asked.
-- No abstractions for single-use code.
-- No "flexibility" or "configurability" that wasn't requested.
-- No error handling for impossible scenarios.
-- If you write 200 lines and it could be 50, rewrite it.
-- Ask yourself: "Would a senior engineer say this is overcomplicated?" If yes, simplify.
+Write the minimum code that solves the problem: no speculative features, single-use abstractions, unrequested configurability, or handling for impossible cases.
 
 ### 3. Surgical Changes
 
-**Touch only what you must. Clean up only your own mess.**
-
-- Don't "improve" adjacent code, comments, or formatting.
-- Don't refactor things that aren't broken.
-- Match existing style, even if you'd do it differently.
-- If you notice unrelated dead code, mention it — don't delete it.
-- Remove imports/variables/functions that YOUR changes made unused.
-- Don't remove pre-existing dead code unless asked.
+Touch only what the task needs and match the existing style. Mention unrelated dead code rather than deleting it, and remove only what your own change made unused.
 
 ### 4. Goal-Driven Execution
 
-**Define success criteria. Loop until verified.**
-
-Transform tasks into verifiable goals:
-- "Add validation" → "Write tests for invalid inputs, then make them pass"
-- "Fix the bug" → "Write a test that reproduces it, then make it pass"
-- "Refactor X" → "Ensure tests pass before and after"
-
-For non-trivial features, follow this cycle:
-
-1. Define requirements (what does "done" look like?)
-2. Write tests that pass if and only if requirements are met
-3. Plan the implementation approach
-4. Implement — deliver production code and tests together
-5. Adversarial review — compare implementation against requirements; identify gaps, missed edge cases, deviations from spec
-6. Close gaps and re-verify
-
-Steps 5–6 repeat until no meaningful gaps remain.
-
-For smaller tasks, a brief inline plan suffices:
-1. [Step] → verify: [check]
-2. [Step] → verify: [check]
+Turn the task into a checkable goal, write tests that pass only when it is met, and loop until verified.
 
 ### 5. Tests Are Sacred
 
-- Never skip or weaken tests to make code pass.
-- All fixes must consider effects on the full system, not just one test.
-- Pre-existing test failures are documented — don't "fix" them without understanding context.
-
-**When an existing test fails after your changes:**
-
-The default assumption is that your code is wrong, not the test. Before modifying any test, answer:
-1. What was this test originally meant to verify?
-2. Why is it failing — what specific change caused it?
-3. Is the correct fix to (a) fix your code, (b) update the test for intentionally changed behavior, or (c) remove the test because the behavior isn't there anymore?
-
-Option (a) is the default. Options (b) and (c) require explicit justification.
-
-**Never:**
-- Delete a failing test to make the suite pass.
-- Mark a test as skipped/xfail to unblock a commit.
-- Rewrite a test you don't fully understand.
-- Assume a flaky test is "just flaky" without investigating.
+Never skip, weaken, or delete a test to make code pass, and never assume a flaky test is "just flaky" without investigating. When an existing test fails after your change, assume your code is wrong. Change the test only for intentionally changed behavior, and say why. Consider the effects of a fix on the full system, not just one test.
 
 ### 6. Privacy Is Non-Negotiable
 
@@ -187,13 +131,10 @@ Option (a) is the default. Options (b) and (c) require explicit justification.
 
 ## Boundaries
 
-Quick-reference guardrails for all contributors. These complement the Development Principles above with a scannable list.
-
 | Tier | Action |
 |------|--------|
-| **Always** | Obtain current evidence for every lane selected by the lifecycle contract before commit; run broad gates when the current repository gate requires them |
-| **Always** | Restart server after **deploying** Python changes (test-only runs in isolated copies don't need it) |
-| **Always** | Use `./scripts/server.sh` for server management |
+| **Always** | Run focused tests for what you changed; the hosted gate runs the full lanes |
+| **Always** | Restart the server after **deploying** Python changes, with `./scripts/server.sh` (isolated test runs never restart production) |
 | **Always** | Use obviously synthetic data in tests and docs |
 | **Ask first** | Database schema changes (new or altered tables) |
 | **Ask first** | Adding new third-party dependencies |
@@ -202,7 +143,7 @@ Quick-reference guardrails for all contributors. These complement the Developmen
 | **Ask first** | Changes to MCP tool definitions |
 | **Ask first** | Breaking changes to HTTP client contract — see [client-surfaces.md](docs/specs/technical/client-surfaces.md) |
 | **Never** | Commit secrets, credentials, or API keys |
-| **Never** | Force push to main (sole exception: `merge-pr`'s post-merge timestamp normalization) |
+| **Never** | Force push to main |
 | **Never** | Skip pre-commit hooks (`--no-verify`) |
 | **Never** | Log, print, or expose real personal data |
 | **Never** | Run uvicorn directly (use `./scripts/server.sh`) |
@@ -213,16 +154,13 @@ Quick-reference guardrails for all contributors. These complement the Developmen
 
 **Branch naming:** `<type>/<short-description>` where type is one of: `feat`, `fix`, `refactor`, `docs`, `test`, `chore`. Lowercase, hyphen-separated.
 
-1. **Edit code**
-2. **Test**: obtain current evidence for the selected lane(s) with `./scripts/test.sh` or the applicable isolated runner
-3. **Deploy**: `./scripts/deploy.sh "Your commit message"`; deployment owns any production restart
-
-`deploy.sh` is the direct-to-main hotfix path. PR-based work (e.g. `/implement`) uses feature branches + `merge-pr` and never calls `deploy.sh`.
-
-**Merging a PR:** run `./scripts/merge-pr.sh <pr>`, from the MacBook or the Linux server. `main` requires a check that is only published on a candidate merge commit, so `gh pr merge` is blocked, and admin enforcement means `--admin` is too. In this repository, two steps of the user-scope `merge-pr` skill work differently, and these rules take precedence over the skill's text:
-
-- **Merge step:** replace `gh pr merge --squash` with `./scripts/merge-pr.sh <pr>`, which creates a two-parent merge commit.
-- **Exact-head verification evidence step:** this applies only to work that hits one of the six risk triggers in the [Development lifecycle](docs/specs/standards/development-lifecycle.md#risk-and-review). Other work needs no local suite run or evidence comment, because the hosted `candidate-verification` check verifies the commit that gets published.
+1. **Build** on a branch off `origin/main` in its own worktree, with `/implement` for coding work and `/draft-issue` to file work. Both are user-scope skills. `wt-sweep --apply` removes merged worktrees.
+2. **Test** with focused runs (`pytest <files>`, `./scripts/test.sh`). The [Development lifecycle](docs/specs/standards/development-lifecycle.md) sets what review and evidence a change's risk requires.
+3. **Open a PR.** It gets a full advisory run, `candidate-verification-shadow`.
+4. **Land** with `./scripts/merge-pr.sh <pr>`, from any checkout, on the MacBook or the Linux server. `main` requires a check that is only published on a candidate merge commit, so `gh pr merge` and `ship` cannot land here, and admin enforcement rules out `--admin`.
+   - `REJECTED` with a lease reason means `main` or the branch moved during verification. Run it again.
+   - Never cancel a candidate verification run. Its publisher records a failed check on that exact candidate.
+5. **Deploy:** the host's autodeploy timer pulls `main` and restarts within about 10 minutes. See [guides/operations.md](docs/guides/operations.md).
 
 ---
 
@@ -244,55 +182,35 @@ Quick-reference guardrails for all contributors. These complement the Developmen
 | `mcp_server.py` | MCP server — stdio for Claude Code + HTTP transport for Managed Agents (84 tools: 73 from `CURATED_ENDPOINTS` plus 11 `lifeos_agent_*` tools registered separately by `_register_inter_agent_tools()` from `INTER_AGENT_TOOL_SCHEMAS`; plus the 5 host tools from `api/services/host_tools.py` when `LIFEOS_HOST_TOOLS_ENABLED` is set) |
 | `tests/test_perf_benchmark.py` | Benchmark suite for query performance and quality |
 
-| Script | Purpose |
-|--------|---------|
-| `./scripts/server.sh` | Start/stop/restart/foreground server |
-| `./scripts/deploy.sh` | Test → restart → commit → push |
-| `./scripts/merge-pr.sh` | Merge a PR through the hosted candidate gate (no venv needed) |
-| `./scripts/test.sh` | Run test suites |
-| `./scripts/service.sh` | systemd (Linux) / launchd (macOS) service management |
-| `./scripts/setup-systemd.sh` | Install systemd units and enable services (Linux, run with sudo) |
-| `./scripts/run_sync_wrapper.sh` | Pre-flight checks for nightly sync |
-| `./scripts/apple_data_export.py` | Export Apple data (contacts, iMessage, phone) — macOS only |
-| `./scripts/apple_data_import.py` | Import Apple data on Linux server |
-| `./scripts/apple_data_agent.sh` | macOS cron wrapper: FDA sync → export → rsync to server |
+Scripts are in [guides/scripts.md](docs/guides/scripts.md). The ones you need most: `./scripts/merge-pr.sh`, `./scripts/server.sh`, `./scripts/test.sh`, `./scripts/remote-test.sh`.
 
 ---
 
 ## Dependency Management
 
-**Single source of truth**: `requirements.txt`
-**Virtual environment**: `~/.venvs/lifeos` (external — see [ADR-005](docs/adr/005-external-venv-macos-tcc.md))
-
-### Adding a new dependency
-
-1. Add to `requirements.txt`
-2. Install: `~/.venvs/lifeos/bin/pip install -r requirements.txt`
-3. Restart the deployed server: `./scripts/server.sh restart` (an isolated test run never restarts production)
+`requirements.txt` is the single source of truth. The virtual environment is `~/.venvs/lifeos`, outside the repo (see [ADR-005](docs/adr/005-external-venv-macos-tcc.md)). To add a dependency, add it to `requirements.txt`, then run `~/.venvs/lifeos/bin/pip install -r requirements.txt`.
 
 ### Testing
 
 ```bash
 ./scripts/test.sh              # Unit tests (fast-unit lane, serial by default)
-./scripts/test.sh smoke        # Unit + critical browser (used by deploy)
+./scripts/test.sh smoke        # Unit + critical browser
 ./scripts/test.sh all          # Full test suite
 ```
 
-- **No local venv (the MacBook)** — `./scripts/test.sh` only runs where a venv exists (the server). From the Mac, run **`./scripts/remote-test.sh`**: it rsyncs your uncommitted working tree to an isolated branch-keyed dir on the test-runner host and runs the same `test.sh auto` scope there. Set `LIFEOS_REMOTE_HOST` to that host's ssh target first (there is no default) — put it in your shell profile so it persists. Get a green run **before** committing — no push required, and committing/pushing "so tests can run" is neither necessary nor allowed.
-- **Parallelism:** `./scripts/test.sh` (the `fast-unit` lane) runs serially by default — `verify_candidate.py`'s `--workers` defaults to `1`, and pytest-xdist's `-n <workers> --dist loadscope` is only added once `LIFEOS_TEST_PARALLEL_WORKERS` (or an explicit `--workers`/`--capacity-max-run-workers` invocation of `verify_candidate.py`) sets it above `1`. Reproduce a `--dist loadscope` co-scheduling flake by setting `LIFEOS_TEST_PARALLEL_WORKERS=<n>` before running — the default run is not already parallel.
-- **Co-scheduling a `browser`-marked file with an unrelated `async def` test in one invocation can fail nondeterministically.** Under `--dist loadscope`, scope groups (a test class, or a module's top-level functions) are handed to workers largest-first — pytest-xdist's `--loadscope-reorder` is on by default — with command-line order only breaking ties, so which groups share a worker process, and in what sequence, shifts with the selection; a bug that manifests only once a browser test's fixtures have *already run* in the same worker process can appear or vanish with an unrelated change to the file set. Do not bisect such a flake by shuffling file order under xdist. Run the browser file and the suspect test together in ONE process, no `-n`, browser file first — sequential order is then exactly command-line order, so the run is deterministic:
-  `pytest tests/some_x_ui_browser.py tests/the_suspect_test.py -q`. The concrete hazard: pytest-playwright's sync-API driver connection parks an event loop for the fixture's whole lifetime, which can make an unrelated `async def` test that runs after it in the same process fail. `tests/conftest.py`'s comment above the module-scoped UI-driver fixture overrides carries the mechanism and both the minimal and the real-suite reproducer.
-- **Browser tests:** the web SPA is served at `/chat` (not `/`). `scripts/test_lane_registry.py` is the single source of truth for lane membership: a test belongs to `browser-free` when it carries the `browser` marker without `requires_server`, and to `browser-server` when it carries both — not a hardcoded file list. `test.sh browser` runs both lanes; run a new browser test file directly with pytest to confirm which lane it lands in.
-- **What the pre-push hook runs by default:** an ordinary push runs two cheap local checks — Ruff on changed Python files, and the direct, read-only fixture privacy audit (`tests/test_fixtures_no_personal_data.py::test_no_fixture_contains_a_real_sensitive_value`), which must report either a pass or its exact no-real-`.env` not-applicable result; any other outcome (a different skip, an error, or a failure) blocks the push. A docs-only push and a deletion-only push skip even those two checks. The docs-only judgement is `test.sh`'s `decide_plan`, called by the hook rather than reimplemented — so dependency manifests (`requirements*.txt`, `constraints*.txt`) still run the checks despite the `.txt` extension. Each run writes to a per-branch, per-process log under `${TMPDIR:-/tmp}/lifeos-prepush/` (path printed before the checks run), so concurrent pushes from different worktrees don't overwrite each other's output; logs past 4 days old are pruned on each run (`find -mtime +3` starts deleting at the 4-day mark, not 3). If that directory turns out to be unwritable, the hook falls back to a fixed path, then a throwaway `lifeos-prepush.XXXXXX` directory next to it, then (only if that templated `mktemp` call itself fails) a bare `mktemp -d`, which lands in a `tmp.XXXXXXXXXX`-style directory — and says so rather than blocking the push. A log found under any of those, or (as a last resort) directly under `/tmp`, means the configured directory was unusable that run. Any directory the hook doesn't own this way — the bare `/tmp` last resort, or a symlinked directory at any rung — gets a `lifeos-prepush-` filename prefix on its logs so they stay attributable, and is never tightened or swept; only a directory it owns is.
-- **The real merge gate is hosted, not local:** the App-bound required check `candidate-verification` (GitHub App `4891159`, environment locked to `main`) runs the retained lanes a candidate's changed set can affect — `fast-unit` always, `browser-free` when a `web/` file changed, and nothing at all for a docs-only candidate (`scripts/candidate_lanes.py`, mirroring `test.sh`'s docs-only rule) or for a candidate whose tree the head's passing shadow check already verified (`scripts/candidate_reuse.py`) — and is what actually blocks a bad merge to `main` — including the `web/` JS regression coverage described above. It runs them across a 4-part matrix (`strategy.matrix.part: [0, 1, 2, 3]`, `fail-fast: false`): `verify_candidate.py`'s `--part-index`/`--part-count` splits each lane into parts of whole module scopes balanced by recorded duration (`scripts/lane_scope_durations.json`). Partitioning is safe because every module establishes its own prerequisites — `tests/test_briefings_service.py`, for example, pulls in `require_db`'s module-scoped `interaction_schema` fixture, which creates the runtime `interactions` table itself rather than depending on another module to have created it, so a part owning that module reports the same skip count as the whole lane does. See [candidate-verification-ci.md § The partitioning safety invariant](docs/guides/candidate-verification-ci.md). `browser-server` stays part of the full local lane registry (`test.sh browser`/`test.sh all`) but is not run by this hosted check. The local pre-push checks above are a fast, non-authoritative pre-flight; they never run those two lanes by default. See [candidate-verification-ci.md § Local cutover and rollback](docs/guides/candidate-verification-ci.md) for the activation prerequisites and for `./scripts/setup-hooks.sh --restore-blocking-local-verification`, which restores the blocking local verifier (running that same `fast-unit,browser-free` pair locally, never narrowing which tests run via `--lf` — a prior failure changes only test *order*, `--ff`) for a checkout that needs it before hosted enforcement is trusted.
-- **A checkout with no venv (the MacBook) stays without the tracked hooks:** the pre-push checks need pytest, so running `./scripts/setup-hooks.sh` there makes code pushes fail, including the push `./scripts/merge-pr.sh` makes. The hosted gate still verifies what reaches `main`.
-- **Push over HTTPS, not SSH:** `./scripts/setup-hooks.sh` points `origin`'s push URL at HTTPS (fetch stays SSH) because GitHub closes an idle SSH session after ~6 minutes. The default local checks finish in seconds, but the restored blocking local verifier (`--restore-blocking-local-verification`) can run for several minutes and hit that idle limit, failing the push even after every test passed. If you push over SSH anyway, `scripts/pre-push` prints a one-line warning naming the HTTPS URL and keeps going.
+- **No local venv (the MacBook):** run `./scripts/remote-test.sh`, which rsyncs your uncommitted tree to an isolated directory on the host named by `LIFEOS_REMOTE_HOST` and runs the same `test.sh auto` scope there. There is no need to commit or push so tests can run. Don't run `./scripts/setup-hooks.sh` on a checkout with no venv: ordinary code pushes would then need pytest.
+- **Parallelism:** `LIFEOS_TEST_PARALLEL_WORKERS=<n>` adds `-n <n> --dist loadscope`. The default is serial.
+- **A `browser`-marked file co-scheduled with an unrelated `async def` test can fail nondeterministically.** pytest-playwright's sync-API driver parks an event loop that can break a later async test in the same process, and under `--dist loadscope` which scopes share a worker shifts with the selection. Don't bisect by shuffling files under xdist. Run them in one process, browser file first: `pytest tests/some_x_ui_browser.py tests/the_suspect_test.py -q`. `tests/conftest.py` has the mechanism and reproducers.
+- **Browser tests:** the web SPA is served at `/chat`, not `/`. `scripts/test_lane_registry.py` defines lane membership from markers: `browser` alone is `browser-free`, `browser` with `requires_server` is `browser-server`.
+- **Pre-push hook:** an ordinary push runs Ruff on changed Python files, a pytest collection check, and the fixture privacy audit. Docs-only pushes, deletions, and the candidate publisher's own pushes skip them. A failure shows the end of the log it writes under `${TMPDIR:-/tmp}/lifeos-prepush/`.
+- **The merge gate is hosted:** the App-bound required check `candidate-verification` is what blocks a bad merge. It runs `fast-unit`, plus `browser-free` when a `web/` file changed, and nothing for a docs-only candidate, across a matrix of parts. See [candidate-verification-ci.md](docs/guides/candidate-verification-ci.md), including its rollback to blocking local verification.
+- **Push over HTTPS:** `./scripts/setup-hooks.sh` points `origin`'s push URL at HTTPS, because GitHub closes an idle SSH session after about 6 minutes.
 
 ---
 
 ## Server Management — CRITICAL
 
-**NEVER run uvicorn or start the server directly.** Always use the provided scripts:
+**NEVER run uvicorn or start the server directly.** A direct uvicorn often binds only to localhost while the script binds `0.0.0.0:8000`, which leaves two servers answering on different interfaces.
 
 ```bash
 ./scripts/server.sh start    # Start server (background)
@@ -311,150 +229,39 @@ sudo systemctl status lifeos-llm         # Check local LLM (llama-server)
 systemctl list-timers lifeos-*           # Check sync/watchdog timers
 ```
 
-Restart the server after deploying Python changes because it does not auto-reload.
-Isolated test runs never restart or stop a production server.
-
-### Why This Matters
-
-Running `uvicorn api.main:app` directly causes **ghost server processes**:
-
-1. The script binds to `0.0.0.0:8000` (all interfaces including Tailscale)
-2. Direct uvicorn often binds only to `127.0.0.1:8000` (localhost)
-3. This creates TWO servers on different interfaces
-4. User sees different behavior via localhost vs Tailscale/network
-5. Code changes appear to "not work" because the wrong server handles requests
-
 ---
 
 ## Common Tasks
 
-### Check Service Health
-
 ```bash
-curl http://localhost:8000/health/full | jq          # All endpoints
-curl http://localhost:8000/health/services | jq      # External services
+curl http://localhost:8000/health/full | jq                        # Health of all endpoints
+curl http://localhost:8000/health/services | jq                    # External services
+curl -X POST http://localhost:8000/api/admin/reindex               # Vault reindex
+~/.venvs/lifeos/bin/python scripts/run_all_syncs.py --dry-run      # Preview a manual sync
+~/.venvs/lifeos/bin/python scripts/run_all_syncs.py --status       # Sync status
+tail -50 logs/server.log                                           # Linux systemd (macOS launchd: logs/lifeos-api-error.log)
 ```
 
-### Search for a Person
+`gws` is the Google Workspace CLI, for raw Drive, Gmail, Sheets, and Calendar calls the `lifeos_*` tools don't wrap (`gws schema drive.files.list` shows the parameters of any call). Prefer `lifeos_*` tools for search and synthesis.
 
-```bash
-curl "http://localhost:8000/api/crm/people?q=Name" | jq '.people[0]'
-```
-
-### Run a Search Query
-
-```bash
-curl -X POST http://localhost:8000/api/search \
-  -H "Content-Type: application/json" \
-  -d '{"query": "search terms", "top_k": 10}' | jq
-```
-
-### Trigger Vault Reindex
-
-```bash
-curl -X POST http://localhost:8000/api/admin/reindex
-```
-
-### Run Manual Sync
-
-```bash
-~/.venvs/lifeos/bin/python scripts/run_all_syncs.py --dry-run     # Preview
-~/.venvs/lifeos/bin/python scripts/run_all_syncs.py --execute --force  # Execute
-```
-
-### Debug Sync Issues
-
-```bash
-~/.venvs/lifeos/bin/python scripts/run_all_syncs.py --status
-tail -50 logs/server.log    # Linux systemd (macOS launchd: logs/lifeos-api-error.log)
-```
-
-### Manage Tasks
-
-```bash
-# Create a task
-curl -X POST http://localhost:8000/api/tasks \
-  -H "Content-Type: application/json" \
-  -d '{"description": "Review Q4 report", "context": "Work", "tags": ["review"]}' | jq
-
-# List open tasks
-curl "http://localhost:8000/api/tasks?status=todo" | jq
-
-# Complete a task
-curl -X PUT http://localhost:8000/api/tasks/{id}/complete | jq
-```
-
-### Google Workspace CLI (`gws`)
-
-`gws` is the Google Workspace CLI — direct, typed access to Drive, Gmail, Sheets, and Calendar via the user's authenticated account. Useful for raw API calls the `lifeos_*` tools don't wrap (creating a Sheet, downloading a Drive file by id). Available to any agent with shell access (Claude Code, Codex).
-
-```bash
-gws drive files list --params '{"pageSize": 10}'
-gws gmail users messages list --params '{"userId": "me"}'
-gws sheets spreadsheets get --params '{"spreadsheetId": "..."}'
-gws schema drive.files.list          # discover params for any call
-```
-
-Prefer `lifeos_*` tools for search/synthesis; reach for `gws` for direct Google API calls.
-
----
-
-## Operations Pointers
-
-Operational procedures live in [guides/operations.md](docs/guides/operations.md): the Apple Data Agent (macOS export + FDA wrapper), Monarch Money re-auth, perf-tracing quick commands, and alerting severities. Perf/monitoring design: [specs/technical/observability.md](docs/specs/technical/observability.md).
-
----
-
-## Common Mistakes to Avoid
-
-1. **Running uvicorn directly** → Use `./scripts/server.sh start`
-2. **Forgetting to restart the deployed server after deploying code changes** → Use `./scripts/server.sh restart`; isolated test runs must not restart or stop a production server
-3. **Committing without testing** → Use `./scripts/deploy.sh`
-4. **Starting server on localhost only** → Must use 0.0.0.0 for Tailscale
-5. **Overfitting to specific test cases** → Consider effects on the full system
-6. **Breaking external chat clients** → See [client-surfaces.md](docs/specs/technical/client-surfaces.md) before editing chat/conversation routes or web SSE handling
+Operational procedures live in [guides/operations.md](docs/guides/operations.md): the Apple Data Agent, Monarch Money re-auth, perf tracing, and alerting severities. Perf and monitoring design: [specs/technical/observability.md](docs/specs/technical/observability.md).
 
 ---
 
 ## Documentation Rules (Quick Reference)
 
-Full standards in [docs/AGENTS.md](docs/AGENTS.md). Key rules:
+Full standards in [docs/AGENTS.md](docs/AGENTS.md). After changing docs, check them against it. Key rules:
 
 - **Product specs** describe WHAT (consumer view). Implementation details go in `specs/technical/`.
 - **ADRs are immutable.** To change a decision, create a new ADR that supersedes.
-- **Every doc** must have a Related Documents section (linking back and adding a tagline to each link is guidance, not enforced).
-- **No task lists in specs.** Specs describe target state. Tasks go in `docs/plans/` or GitHub issues.
+- **Every doc** must have a Related Documents section.
+- **No task lists in specs, and no `backlog.md`.** Specs describe target state; tasks go in GitHub issues. Plan files in `docs/plans/` are for one in-flight effort, and move to `docs/plans/archive/` when done.
+- **Split docs by concern.** Target line counts are in `docs/AGENTS.md`. Write what helps the next reader, not a note on every routine change.
 - **Synthetic data only** in all examples and test fixtures.
-- **Completed plans** must be moved to `docs/plans/archive/`.
 - **Current behavior only, everywhere.** Docs, code comments, docstrings, and test docstrings describe the system as it is — no temporal before/after comparisons, no review-round or reviewer-finding narration, and no issue/PR numbers cited as history. Git history holds that narrative.
 - **PR descriptions are short summaries.** No verification matrix, evidence section, or risk table required for work outside the named risk triggers — see [Development Lifecycle](docs/specs/standards/development-lifecycle.md#risk-and-review).
 
-## Workflow
-
-- Use plan mode for non-trivial tasks (3+ files, architectural decisions, unclear requirements).
-- After modifying docs, verify compliance with [docs/AGENTS.md](docs/AGENTS.md) standards.
-- Production restarts belong to deployment; isolated test runs must not restart or stop a production server.
-- When creating new directories or modules, check if an AGENTS.md is appropriate.
-
-## Skills
-
-Repo skills live in `.claude/skills/` and are surfaced automatically as slash commands (their descriptions come from each skill's own definition). These are LifeOS-specific — health checks, housekeeping, and reporting.
-
-The development lifecycle comes from elsewhere: the user-scope `implement-lifecycle` and `issue-management` plugins, which read this repo's AGENTS.md and `docs/` at runtime rather than carrying LifeOS knowledge of their own. `/implement <task>` is the primary entry point — full lifecycle: plan → implement → PR → adversarial review → merge. `/pr-check` and `/merge-pr` run standalone; review and follow-up are scoped invocations of `/implement` (`/implement <pr> just review`, `/implement <pr> address the review feedback`).
-
-## Read First
-
-- [docs/AGENTS.md](docs/AGENTS.md) — Documentation standards
-- [Development lifecycle](docs/specs/standards/development-lifecycle.md) — Shared risk, review, and verification contract
-
-## Documentation Hygiene Mistakes
-
-The operational and documentation mistake lists live in § Common Mistakes to Avoid, § Documentation Rules and § Tests Are Sacred above. The docs-hygiene items below aren't restated there:
-
-1. **Creating monolithic docs** → Split by concern. Target line counts are in `docs/AGENTS.md`.
-2. **Creating a `backlog.md` (or `todo.md`, `ideas.md`)** → Backlog lives in GitHub issues. Plan files are only for time-bounded execution notes for a specific in-flight effort.
-3. **Over-documenting routine changes** → Not every change needs a docs update. Write what helps the next reader understand current state.
-4. **Narrating changes in comments or docs** → describe current behavior; history lives in git.
+Repo skills in `.claude/skills/` are LifeOS-specific health checks, housekeeping, and reporting. When creating a new directory or module, check if an AGENTS.md is appropriate.
 
 ---
 
@@ -462,3 +269,4 @@ The operational and documentation mistake lists live in § Common Mistakes to Av
 
 - [README.md](README.md) — Architecture overview with diagrams
 - [docs/AGENTS.md](docs/AGENTS.md) — Documentation strategy and standards
+- [Development lifecycle](docs/specs/standards/development-lifecycle.md) — Shared risk, review, and verification contract
