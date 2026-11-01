@@ -963,3 +963,165 @@ def test_same_named_fork_branch_does_not_conflict_with_exact_source_identity():
         "nbramia/LifeOS", pr,
         run=lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=json.dumps(rows), stderr=""),
     ) == ()
+
+
+# ---------------------------------------------------------------------------
+# Waiting out a running shadow of the same head
+# ---------------------------------------------------------------------------
+
+def _shadow_pr(head_sha: str = "h" * 40) -> publisher.PullRequestRef:
+    return publisher.PullRequestRef(
+        number=31, base_ref="main", base_repository="nbramia/LifeOS", head_sha=head_sha, head_ref="feature",
+        head_repository="nbramia/LifeOS", is_cross_repository=False, title="t", body="",
+    )
+
+
+class _ShadowWorld:
+    """A fake runner: `statuses` is what each poll of the runs API reports."""
+
+    def __init__(self, statuses, contains_base=True, runs_returncode=0, runs_stdout=None):
+        self.statuses = list(statuses)
+        self.contains_base = contains_base
+        self.runs_returncode = runs_returncode
+        self.runs_stdout = runs_stdout
+        self.polls: list[str] = []
+        self.sleeps = 0
+
+    def run(self, args, **kwargs):
+        if args[:2] == ["gh", "api"]:
+            self.polls.append(args[2])
+            if self.runs_stdout is not None:
+                return SimpleNamespace(returncode=self.runs_returncode, stdout=self.runs_stdout, stderr="")
+            status = self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
+            body = {"workflow_runs": [{"status": status}] if status else []}
+            return SimpleNamespace(returncode=self.runs_returncode, stdout=json.dumps(body), stderr="")
+        if "merge-base" in args:
+            return SimpleNamespace(returncode=0 if self.contains_base else 1, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def sleep(self, _seconds):
+        self.sleeps += 1
+
+
+def _await(world: _ShadowWorld, tmp_path: Path, *, timeout: float = 600.0, now=lambda: 0.0) -> None:
+    publisher.await_inflight_shadow(
+        "nbramia/LifeOS", "candidate-verification.yml", tmp_path, "origin", _shadow_pr(),
+        timeout_seconds=timeout, run=world.run, sleep=world.sleep, now=now,
+    )
+
+
+def test_shadow_wait_polls_until_the_running_shadow_of_this_head_finishes(tmp_path):
+    world = _ShadowWorld(["queued", "in_progress", "completed"])
+    _await(world, tmp_path)
+    assert world.sleeps == 2
+    assert len(world.polls) == 3
+    assert "head_sha=" + "h" * 40 in world.polls[0]
+    assert "event=pull_request_target" in world.polls[0]
+
+
+@pytest.mark.parametrize("status", ["completed", None], ids=["finished", "no_shadow"])
+def test_shadow_wait_does_not_wait_without_a_running_shadow(tmp_path, status):
+    world = _ShadowWorld([status])
+    _await(world, tmp_path)
+    assert world.sleeps == 0
+
+
+def test_shadow_wait_ends_when_the_head_does_not_contain_the_base(tmp_path):
+    """The candidate's tree then differs from the head's, so no verdict could apply."""
+    world = _ShadowWorld(["in_progress"], contains_base=False)
+    _await(world, tmp_path)
+    assert world.sleeps == 0
+
+
+def test_shadow_wait_ends_at_its_deadline(tmp_path):
+    world = _ShadowWorld(["in_progress"])
+    clock = iter([0.0, 10.0, 20.0, 700.0, 700.0])
+    _await(world, tmp_path, timeout=600.0, now=lambda: next(clock))
+    assert world.sleeps == 2
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"runs_returncode": 1, "runs_stdout": json.dumps({"workflow_runs": [{"status": "in_progress"}]})},
+    {"runs_stdout": "not json"},
+    {"runs_stdout": "[]"},
+], ids=["api_failure", "malformed", "unexpected_shape"])
+def test_shadow_wait_never_blocks_on_doubt(tmp_path, kwargs):
+    world = _ShadowWorld(["in_progress"], **kwargs)
+    _await(world, tmp_path)
+    assert world.sleeps == 0
+
+
+def test_publish_builds_the_candidate_only_after_the_shadow_wait(tmp_path, monkeypatch):
+    """Main may advance during the wait, so the base is read after it."""
+    events: list[str] = []
+    pr = _shadow_pr()
+
+    def stop_after_build(*args, **kwargs):
+        events.append("build")
+        raise PublisherError("stop here")
+
+    monkeypatch.setattr(publisher, "fetch_pull_request", lambda *a, **k: pr)
+    monkeypatch.setattr(publisher, "_assert_head_exclusive", lambda *a, **k: None)
+    monkeypatch.setattr(publisher, "_git", lambda *a, **k: "base")
+    monkeypatch.setattr(publisher, "build_candidate", stop_after_build)
+    monkeypatch.setattr(publisher, "await_inflight_shadow", lambda *a, **k: events.append("wait"))
+    with pytest.raises(PublisherError, match="stop here"):
+        publish_pull_request(
+            "nbramia/LifeOS", 31, repo=tmp_path, trusted_app_id=999, workflow_file="w.yml", check_name="c",
+            shadow_wait_seconds=60.0,
+        )
+    assert events == ["wait", "build"]
+
+
+def test_publish_refuses_a_head_that_moved_during_the_shadow_wait(tmp_path, monkeypatch):
+    heads = iter([_shadow_pr("h" * 40), _shadow_pr("m" * 40)])
+    monkeypatch.setattr(publisher, "fetch_pull_request", lambda *a, **k: next(heads))
+    monkeypatch.setattr(publisher, "_assert_head_exclusive", lambda *a, **k: None)
+    monkeypatch.setattr(publisher, "await_inflight_shadow", lambda *a, **k: None)
+
+    def not_built(*a, **k):
+        raise AssertionError("built a candidate for a stale head")
+
+    monkeypatch.setattr(publisher, "build_candidate", not_built)
+    with pytest.raises(PublisherError, match="moved"):
+        publish_pull_request(
+            "nbramia/LifeOS", 31, repo=tmp_path, trusted_app_id=999, workflow_file="w.yml", check_name="c",
+            shadow_wait_seconds=60.0,
+        )
+
+
+def test_publish_skips_the_shadow_wait_when_it_is_zero(tmp_path, monkeypatch):
+    pr = _shadow_pr()
+    monkeypatch.setattr(publisher, "fetch_pull_request", lambda *a, **k: pr)
+    monkeypatch.setattr(publisher, "_assert_head_exclusive", lambda *a, **k: None)
+    monkeypatch.setattr(publisher, "_git", lambda *a, **k: "base")
+
+    def boom(*a, **k):
+        raise AssertionError("waited")
+
+    monkeypatch.setattr(publisher, "await_inflight_shadow", boom)
+
+    def stop(*a, **k):
+        raise PublisherError("stop here")
+
+    monkeypatch.setattr(publisher, "build_candidate", stop)
+    with pytest.raises(PublisherError, match="stop here"):
+        publish_pull_request(
+            "nbramia/LifeOS", 31, repo=tmp_path, trusted_app_id=999, workflow_file="w.yml", check_name="c",
+        )
+
+
+def test_cli_waits_for_a_running_shadow_by_default(monkeypatch):
+    captured = {}
+
+    def fake_publish(*args, **kwargs):
+        captured.update(kwargs)
+        raise PublisherError("stop here")
+
+    monkeypatch.setattr(publisher, "publish_pull_request", fake_publish)
+    with pytest.raises(PublisherError, match="stop here"):
+        publisher.main([
+            "--repository", "nbramia/LifeOS", "--pr", "1", "--workflow-file", "w.yml",
+            "--check-name", "c", "--trusted-app-id", "999",
+        ])
+    assert captured["shadow_wait_seconds"] == 1200.0

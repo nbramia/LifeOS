@@ -12,7 +12,8 @@ of imbalance:
 * **unpublished** -- a completed run whose commit carries no check of the
   expected name published by the dedicated App (``candidate-verification``
   for a dispatched candidate, ``candidate-verification-shadow`` for a pull
-  request head).
+  request head). A shadow run of a commit that already carries the required
+  check publishes nothing, because that commit is already on main.
 
 Cancelled runs are expected (a newer push or candidate supersedes the one
 in flight) and are not counted. The check changes nothing: it prints a
@@ -148,7 +149,10 @@ def collect(
             if age > ceiling_minutes:
                 imbalances.append(Imbalance("stalled", run_id, event, head_sha, started, f"{status} for {age:.0f} min, ceiling {ceiling_minutes:.0f}", url))
             continue
-        if status == "completed" and head_sha and not _published(run, repository, head_sha, check_name, app_id):
+        if status == "completed" and head_sha and not (
+            _published(run, repository, head_sha, check_name, app_id)
+            or (event == "pull_request_target" and _published(run, repository, head_sha, CHECK_NAME_BY_EVENT["workflow_dispatch"], app_id))
+        ):
             imbalances.append(Imbalance("unpublished", run_id, event, head_sha, started, f"completed ({conclusion}) but no App-published {check_name} check on its commit", url))
     return FlowReport(hours, ceiling_minutes, counted, cancelled, tuple(imbalances))
 

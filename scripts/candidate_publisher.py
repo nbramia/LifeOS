@@ -255,6 +255,57 @@ def _assert_head_exclusive(repository: str, pr: PullRequestRef, *, run: Runner =
 # Step 2: construct the final candidate BEFORE any verification runs.
 # ---------------------------------------------------------------------------
 
+def await_inflight_shadow(
+    repository: str,
+    workflow_file: str,
+    repo: Path,
+    remote: str,
+    pr: PullRequestRef,
+    *,
+    timeout_seconds: float,
+    poll_interval_seconds: float = 15.0,
+    run: Runner = subprocess.run,
+    sleep: Callable[[float], None] = time.sleep,
+    now: Callable[[], float] = time.monotonic,
+) -> None:
+    """Let a running shadow of this exact head finish, when it could be reused.
+
+    The required run reuses a passing shadow of an identical tree, and its
+    dispatch shares the shadow's concurrency group, so dispatching early cancels
+    the shadow and then runs the same lanes from the start. While the base holds
+    still, waiting costs the shadow's remaining time in place of a fresh run.
+
+    This decides nothing about verification: the required check still verifies
+    the exact candidate. The wait simply ends on the deadline, on any API failure,
+    or when the head does not contain the base, since the candidate's tree then
+    differs from the head's and the shadow's verdict cannot apply.
+    """
+    query = urlencode({"event": "pull_request_target", "head_sha": pr.head_sha, "per_page": "20"})
+    deadline = now() + timeout_seconds
+    announced = False
+    _run(run, ["git", "-C", str(repo), "fetch", remote, f"pull/{pr.number}/head"])
+    while True:
+        result = _run(run, ["gh", "api", f"repos/{repository}/actions/workflows/{workflow_file}/runs?{query}"])
+        if result.returncode != 0:
+            return
+        try:
+            runs = json.loads(result.stdout).get("workflow_runs") or []
+        except (ValueError, AttributeError):
+            return
+        if not any(isinstance(item, dict) and item.get("status") != "completed" for item in runs):
+            return
+        _run(run, ["git", "-C", str(repo), "fetch", remote, pr.base_ref])
+        contains_base = _run(run, [
+            "git", "-C", str(repo), "merge-base", "--is-ancestor", f"{remote}/{pr.base_ref}", pr.head_sha,
+        ])
+        if contains_base.returncode != 0 or now() >= deadline:
+            return
+        if not announced:
+            announced = True
+            print(f"waiting for the running shadow of {pr.head_sha[:9]} so the required run can reuse it", flush=True)
+        sleep(poll_interval_seconds)
+
+
 @dataclass(frozen=True)
 class CandidateCommit:
     sha: str
@@ -722,6 +773,7 @@ def publish_pull_request(
     expected_head_sha: Optional[str] = None,
     check_timeout_seconds: float = 1800.0,
     check_poll_interval_seconds: float = 5.0,
+    shadow_wait_seconds: float = 0.0,
     run: Runner = subprocess.run,
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], float] = time.monotonic,
@@ -779,6 +831,18 @@ def publish_pull_request(
             f"refusing to publish a commit that was not the one validated"
         )
     _assert_head_exclusive(repository, pr, run=run)
+
+    if shadow_wait_seconds > 0:
+        await_inflight_shadow(
+            repository, workflow_file, repo, remote, pr,
+            timeout_seconds=shadow_wait_seconds, run=run, sleep=sleep, now=now,
+        )
+        current_head = fetch_pull_request(repository, pr_number, run=run).head_sha
+        if current_head != pr.head_sha:
+            raise PublisherError(
+                f"PR #{pr_number} head moved to {current_head} during the shadow wait; "
+                f"refusing to publish {pr.head_sha}"
+            )
 
     _git(run, repo, ["fetch", remote, pr.base_ref])
     expected_main_sha = _git(run, repo, ["rev-parse", f"{remote}/{pr.base_ref}"]).strip()
@@ -853,6 +917,10 @@ def _build_arg_parser():
     parser.add_argument("--no-delete-source", action="store_false", dest="delete_source")
     parser.add_argument("--expected-head-sha", default=None, help="refuse unless the PR head still equals this SHA")
     parser.add_argument("--check-timeout-seconds", type=float, default=1800.0)
+    parser.add_argument(
+        "--shadow-wait-seconds", type=float, default=1200.0,
+        help="how long to let a running shadow of this head finish before dispatching; 0 skips the wait",
+    )
     return parser
 
 
@@ -865,6 +933,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         trusted_app_id=args.trusted_app_id, delete_source=args.delete_source,
         expected_head_sha=args.expected_head_sha,
         check_timeout_seconds=args.check_timeout_seconds,
+        shadow_wait_seconds=args.shadow_wait_seconds,
     )
     print(f"candidate: {result.candidate.sha}")
     print(f"publish: {'accepted' if result.publish.accepted else 'REJECTED'} — {result.publish.reason}")

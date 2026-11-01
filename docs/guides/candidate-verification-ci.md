@@ -80,11 +80,9 @@ every part's receipts and pass each directory:
 
 ```bash
 gh run download <run-id> --pattern 'lane-receipts-*' --dir /tmp/lane-receipts
-~/.venvs/lifeos/bin/python scripts/verify_candidate.py record-scope-durations \
-  --lane-log-dir /tmp/lane-receipts/lane-receipts-<sha>-part0 \
-  --lane-log-dir /tmp/lane-receipts/lane-receipts-<sha>-part1 \
-  --lane-log-dir /tmp/lane-receipts/lane-receipts-<sha>-part2 \
-  --lane-log-dir /tmp/lane-receipts/lane-receipts-<sha>-part3
+args=()
+for part in /tmp/lane-receipts/lane-receipts-*; do args+=(--lane-log-dir "$part"); done
+~/.venvs/lifeos/bin/python scripts/verify_candidate.py record-scope-durations "${args[@]}"
 ```
 
 Each part also uploads `impact-selection-<candidate sha>-part<n>`, holding
@@ -105,9 +103,9 @@ under `lane-logs-<candidate sha>-part<n>`.
 
 ### The partitioning safety invariant
 
-The hosted gate runs each retained lane across a 4-part matrix
-(`.github/workflows/candidate-verification.yml`'s `strategy.matrix.part: [0,
-1, 2, 3]`, `fail-fast: false`), each part invoking the verifier with its own
+The hosted gate runs each retained lane across an 8-part matrix
+(`.github/workflows/candidate-verification.yml`'s `strategy.matrix.part`,
+`fail-fast: false`), each part invoking the verifier with its own
 `--part-index`/`--part-count`. Partitioning a lane is safe only where every
 module in it establishes its own prerequisites. A cross-module prerequisite —
 a module whose tests pass only because some other module created runtime
@@ -124,8 +122,12 @@ the same candidate, and require the total skip count to be identical.
 Note also that a workflow change cannot verify itself: `pull_request_target`
 and `workflow_dispatch` both resolve the workflow definition from the base
 branch, so a PR that edits the topology is gated by whatever topology `main`
-carries, and an edited topology's first real exercise is the first candidate
-built after that edit merges.
+carries. To exercise an edited topology before it merges, dispatch the workflow
+from the branch (`gh workflow run candidate-verification.yml --ref <branch>`)
+against a two-parent commit whose first parent is the branch tip, with that tip
+as `trusted_runner_sha`. The execution job runs for real, and the environment's
+branch policy keeps the publishing job from ever holding the App credential, so
+the rehearsal cannot publish the required check.
 
 ## The cached test environment
 
@@ -167,7 +169,8 @@ queued or in progress past the 25-minute ceiling (**stalled**), or a
 completed run whose commit carries no check of the expected name published
 by the dedicated App (**unpublished** — `candidate-verification` for a
 dispatched candidate, `candidate-verification-shadow` for a pull request
-head). Cancelled runs are superseded ones and are not counted. A capacity
+head, unless that commit already carries the required check). Cancelled runs
+are superseded ones and are not counted. A capacity
 deadlock or a publisher that never reports looks like slowness from the
 outside; this is the cheap signal that distinguishes the two.
 
@@ -297,7 +300,11 @@ substituting a different runner implementation for the one claimed by that
 check.
 
 `./scripts/merge-pr.sh <pr>` is the operator entry point for a merge.
-`scripts/candidate_publisher.py` orchestrates the actual publish: it builds
+`scripts/candidate_publisher.py` orchestrates the actual publish. If a shadow
+run of this exact head is still running and the head contains the current base,
+it first lets that shadow finish (bounded by `--shadow-wait-seconds`), because
+the dispatch would otherwise cancel a verdict it could reuse, and refuses if the
+head moved meanwhile. It then builds
 the candidate, pushes it to a disposable staging ref, dispatches
 `workflow_dispatch` against it, polls for the resulting check via the
 GitHub API filtered to the dedicated App's `app_id` (never accepting a
