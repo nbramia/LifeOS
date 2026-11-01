@@ -9,6 +9,7 @@ v3 additions:
 - Populates relationship_context from CRM for person queries
 - Determines fetch_depth based on query patterns and relationship strength
 """
+import asyncio
 import json
 import re
 import time
@@ -174,19 +175,40 @@ class QueryRouter:
         - primary_channel: Most used channel
 
         If resolution fails, may return dict with resolution_failed=True
-        containing disambiguation candidates or fuzzy suggestions.
+        containing disambiguation candidates or fuzzy suggestions. A name is
+        only ambiguous when the resolver finds a tie and at least two of the
+        tied people are close; a name it settled on one person never is.
 
-        Returns None only on errors.
+        Returns None when the name matches no one or on errors.
         """
         try:
             from api.services.entity_resolver import get_entity_resolver
             from api.services.relationship_summary import get_relationship_summary
-            from api.services.person_entity_store import get_person_entity_store
 
-            resolver = get_entity_resolver()
-            result = resolver.resolve(name=person_name)
+            match = get_entity_resolver().match_name(person_name)
 
-            if not result or not result.entity:
+            close_ties = sorted(
+                (p for p in match.tied if p.relationship_strength >= CLOSE_RELATIONSHIP_MIN_STRENGTH),
+                key=lambda p: p.relationship_strength,
+                reverse=True,
+            )
+            if len(close_ties) > 1:
+                return {
+                    "resolution_failed": True,
+                    "failure_type": "ambiguous",
+                    "query_name": person_name,
+                    "candidates": [
+                        {
+                            "id": p.id,
+                            "name": p.canonical_name,
+                            "strength": p.relationship_strength,
+                            "context": self._get_disambiguation_context(p),
+                        }
+                        for p in close_ties[:5]  # Max 5 options
+                    ],
+                }
+
+            if not match.result:
                 # No match - try to get suggestions
                 suggestions = self._get_fuzzy_suggestions(person_name)
                 if suggestions:
@@ -196,38 +218,9 @@ class QueryRouter:
                         "query_name": person_name,
                         "suggestions": suggestions,
                     }
-                logger.debug(f"Could not resolve person: {person_name}")
                 return None
 
-            entity = result.entity
-
-            # Check for ambiguous matches (multiple strong candidates with similar names)
-            if result.confidence and result.confidence < 0.9:
-                # Look for other potential matches
-                store = get_person_entity_store()
-                candidates = store.search(name=person_name, limit=10)
-                strong_matches = [
-                    p for p in candidates
-                    if p.relationship_strength >= CLOSE_RELATIONSHIP_MIN_STRENGTH
-                    and self._names_match(person_name, p.canonical_name)
-                ]
-
-                if len(strong_matches) > 1:
-                    # Multiple strong matches - return disambiguation options
-                    return {
-                        "resolution_failed": True,
-                        "failure_type": "ambiguous",
-                        "query_name": person_name,
-                        "candidates": [
-                            {
-                                "id": p.id,
-                                "name": p.canonical_name,
-                                "strength": p.relationship_strength,
-                                "context": self._get_disambiguation_context(p),
-                            }
-                            for p in strong_matches[:5]  # Max 5 options
-                        ],
-                    }
+            entity = match.result.entity
 
             summary = get_relationship_summary(entity.id)
             if not summary:
@@ -255,21 +248,8 @@ class QueryRouter:
                 "has_facts": summary.has_facts,
             }
         except Exception as e:
-            logger.warning(f"Failed to fetch CRM context for {person_name}: {e}")
+            logger.warning(f"Failed to fetch CRM context: {type(e).__name__}")
             return None
-
-    def _names_match(self, query: str, candidate: str) -> bool:
-        """Check if names are similar enough to be the same person."""
-        from rapidfuzz import fuzz
-        q_lower = query.lower()
-        c_lower = candidate.lower()
-        # Exact match, starts with query, or high fuzzy match
-        return (
-            c_lower == q_lower
-            or c_lower.startswith(q_lower)
-            or q_lower in c_lower.split()
-            or fuzz.ratio(q_lower, c_lower) >= 85
-        )
 
     def _get_disambiguation_context(self, person) -> str:
         """Get contextual info to help distinguish this person."""
@@ -289,15 +269,11 @@ class QueryRouter:
     def _get_fuzzy_suggestions(self, name: str, threshold: int = 70) -> list[str]:
         """Get fuzzy name suggestions from CRM."""
         try:
-            from api.services.person_entity_store import get_person_entity_store
+            from api.services.person_entity import get_person_entity_store
             from rapidfuzz import fuzz
 
-            store = get_person_entity_store()
-            # Get top people by interaction count for suggestions
-            people = store.list_all(limit=200)
-
             matches = []
-            for person in people:
+            for person in get_person_entity_store().get_all():
                 score = fuzz.ratio(name.lower(), person.canonical_name.lower())
                 if score >= threshold:
                     matches.append((person.canonical_name, score))
@@ -305,7 +281,7 @@ class QueryRouter:
             matches.sort(key=lambda x: x[1], reverse=True)
             return [m[0] for m in matches[:3]]
         except Exception as e:
-            logger.warning(f"Failed to get fuzzy suggestions: {e}")
+            logger.warning(f"Failed to get fuzzy suggestions: {type(e).__name__}")
             return []
 
     def _determine_fetch_depth(
@@ -345,8 +321,8 @@ class QueryRouter:
         if any(p in query_lower for p in shallow_patterns):
             return "shallow"
 
-        # Relationship-based depth
-        if relationship_context:
+        # Relationship-based depth. An unresolved name has no strength to go on.
+        if relationship_context and not relationship_context.get("resolution_failed"):
             strength = relationship_context.get("relationship_strength", 0)
             # High-strength relationships get more context by default
             if strength >= DEEP_CONTEXT_MIN_STRENGTH:
@@ -384,7 +360,6 @@ class QueryRouter:
                 # missing llama-server doesn't break the chat surface.
                 logger.warning(f"Local LLM routing failed, using fallback: {e}")
                 result = self._keyword_fallback(query)
-        result.latency_ms = int((time.time() - start_time) * 1000)
 
         # v3: Enrich with CRM context for people queries
         if "people" in result.sources:
@@ -392,21 +367,19 @@ class QueryRouter:
             person_name = result.extracted_person_name or self._extract_person_name(query)
             if person_name:
                 result.extracted_person_name = person_name
-                crm_context = self._fetch_crm_context(person_name)
+                # Scoring a name reads every person, which would stall the event loop.
+                crm_context = await asyncio.to_thread(self._fetch_crm_context, person_name)
                 if crm_context:
                     result.relationship_context = crm_context
                     result.fetch_depth = self._determine_fetch_depth(query, crm_context)
-                    logger.info(
-                        f"CRM context for {person_name}: "
-                        f"strength={crm_context.get('relationship_strength', 0):.0f}, "
-                        f"fetch_depth={result.fetch_depth}"
-                    )
+                    logger.info(f"CRM context found: fetch_depth={result.fetch_depth}")
                 else:
                     # No CRM context, use query-based depth
                     result.fetch_depth = self._determine_fetch_depth(query, None)
             else:
                 result.fetch_depth = self._determine_fetch_depth(query, None)
 
+        result.latency_ms = int((time.time() - start_time) * 1000)
         return result
 
     async def _llm_route(self, query: str) -> RoutingResult:
@@ -460,7 +433,7 @@ class QueryRouter:
                 # Use the first person mentioned
                 extracted_name = people_mentioned[0] if isinstance(people_mentioned[0], str) else None
                 if extracted_name:
-                    logger.info(f"LLM extracted person name: {extracted_name}")
+                    logger.info("LLM extracted a person name")
 
             # Extract action_after for compound queries
             action_after = data.get("action_after")

@@ -228,6 +228,97 @@ class TestProcessWhatsAppMessagesLidResolution:
             name="Hannah", phone=None, create_if_missing=True,
         )
 
+    def test_sender_resolving_to_no_one_is_counted_and_records_nothing(self, tmp_path):
+        int_db = _make_interactions_db(tmp_path)
+        resolver = MagicMock()
+        resolver.resolve.return_value = None
+
+        messages = [{
+            "msg_id": "msg-no-link",
+            "chat_jid": "120363001@g.us",
+            "chat_name": "Test Group",
+            "sender_jid": "246698660126807@lid",
+            "sender_name": "",
+            "ts": "2026-02-25T10:00:00+00:00",
+            "from_me": 0,
+        }]
+
+        with patch("api.services.whatsapp.get_entity_resolver", return_value=resolver), \
+             patch("api.services.whatsapp.get_interaction_db_path", return_value=int_db), \
+             patch("api.services.person_stats.refresh_person_stats"):
+            stats = process_whatsapp_messages(
+                messages=messages,
+                group_participants=[{"group_jid": "120363001@g.us", "user_jid": "246698660126807@lid"}],
+                lid_contacts=[{"jid": "246698660126807@lid", "push_name": "Robin"}],
+                lid_phones={},
+                dry_run=False,
+                my_person_id="me",
+            )
+
+        assert stats["persons_not_found"] == 1
+        assert stats["interactions_created"] == 0
+
+    def _process_from_tied_name(self, tmp_path, monkeypatch, sender_jid, lid_contacts=()):
+        from api.services import entity_resolver
+        from api.services.entity_resolver import EntityResolver
+        from api.services.link_override import LinkOverrideStore
+        from api.services.person_entity import PersonEntity, PersonEntityStore
+
+        store = PersonEntityStore(str(tmp_path / "crm.db"))
+        overrides = LinkOverrideStore(tmp_path / "crm.db")
+        monkeypatch.setattr(entity_resolver, "get_link_override_store", lambda: overrides)
+        for name in ("Robin Alpha", "Robin Beta"):
+            person = PersonEntity(canonical_name=name)
+            person.relationship_strength = 30.0
+            store.add(person)
+        int_db = _make_interactions_db(tmp_path)
+        messages = [{
+            "msg_id": "msg-tied-name",
+            "chat_jid": sender_jid,
+            "chat_name": "Robin",
+            "sender_jid": sender_jid,
+            "sender_name": "Robin",
+            "ts": "2026-02-25T10:00:00+00:00",
+            "from_me": 0,
+        }]
+
+        with patch("api.services.whatsapp.get_entity_resolver", return_value=EntityResolver(store)), \
+             patch("api.services.whatsapp.get_interaction_db_path", return_value=int_db), \
+             patch("api.services.person_stats.refresh_person_stats"):
+            stats = process_whatsapp_messages(
+                messages=messages,
+                group_participants=[],
+                lid_contacts=list(lid_contacts),
+                lid_phones={},
+                dry_run=False,
+                my_person_id="me",
+            )
+        conn = sqlite3.connect(int_db)
+        owners = [row[0] for row in conn.execute("SELECT person_id FROM interactions")]
+        conn.close()
+        return stats, store, owners
+
+    def test_contact_with_a_tied_name_and_a_phone_is_recorded(self, tmp_path, monkeypatch):
+        stats, store, owners = self._process_from_tied_name(tmp_path, monkeypatch, "12125550173@s.whatsapp.net")
+
+        assert stats["persons_not_found"] == 0
+        assert stats["interactions_created"] == 1
+        created = store.get_by_phone("+12125550173")
+        assert created.canonical_name == "+12125550173"
+        assert owners == [created.id]
+        assert store.get_by_name("Robin") is None
+
+    def test_contact_with_a_tied_name_and_no_phone_is_still_not_found(self, tmp_path, monkeypatch):
+        stats, store, owners = self._process_from_tied_name(
+            tmp_path, monkeypatch, "246698660126807@lid",
+            lid_contacts=[{"jid": "246698660126807@lid", "push_name": "Robin"}],
+        )
+
+        assert stats["persons_not_found"] == 1
+        assert stats["interactions_created"] == 0
+        assert owners == []
+        assert store.count() == 2
+
     def test_lid_without_push_name_skipped(self, tmp_path):
         int_db = _make_interactions_db(tmp_path)
         resolver = MagicMock()

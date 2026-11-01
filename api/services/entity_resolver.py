@@ -4,11 +4,11 @@ Entity Resolver for LifeOS People System v2.
 Implements three-pass entity resolution:
 1. Email anchoring - exact email match across sources
 2. Fuzzy name matching with context boost - for names without email
-3. Disambiguation - create separate entities when ambiguous
+3. Disambiguation - a name that fits several people about equally links to no one
 """
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -96,7 +96,6 @@ def parse_name(name: str) -> ParsedName:
 from api.services.people import resolve_person_name  # noqa: E402
 from api.services.link_override import get_link_override_store  # noqa: E402
 from config.people_config import (  # noqa: E402
-    COMPANY_NORMALIZATION,
     EntityResolutionConfig,
     get_vault_contexts_for_domain,
     get_domains_for_company,
@@ -135,6 +134,27 @@ class ResolutionResult:
     confidence: float
     match_type: str
     disambiguation_applied: bool = False
+
+
+@dataclass
+class ScoredCandidates:
+    """Every person a name could mean, with whether that choice is a tie."""
+
+    candidates: list[ResolutionCandidate]
+    ambiguous: bool = False  # Several people fit the name and none stands out
+
+
+@dataclass
+class NameMatch:
+    """How a name relates to the people already in the store.
+
+    ``tied`` lists the people the name fits about equally. ``result`` is empty
+    when the name matched no one or a first-name tie had no best guess; a tie
+    between scored candidates carries the top one with reduced confidence.
+    """
+
+    result: Optional[ResolutionResult] = None
+    tied: list[PersonEntity] = field(default_factory=list)
 
 
 class EntityResolver:
@@ -204,10 +224,14 @@ class EntityResolver:
         """
         Pass 2 & 3: Fuzzy name matching with context boost and disambiguation.
 
+        A name that fits several existing people about equally never creates a
+        person: there is no one to link it to and a new row would only add one
+        more candidate.
+
         Args:
             name: Name to resolve (will be canonicalized)
             context_path: Vault path for context boost (e.g., "Work/ML/meeting.md")
-            create_if_missing: Create new entity if no match found
+            create_if_missing: Create new entity if the name matches no one
 
         Returns:
             ResolutionResult with matched/created entity, or None
@@ -215,18 +239,39 @@ class EntityResolver:
         if not name or not name.strip():
             return None
 
+        match = self.match_name(name, context_path)
+
+        if match.tied:
+            return None if create_if_missing else match.result
+        if match.result:
+            return match.result
+        if create_if_missing:
+            return self._create_new_entity(resolve_person_name(name), context_path)
+        return None
+
+    def match_name(self, name: str, context_path: Optional[str] = None) -> NameMatch:
+        """
+        Match a name against existing people without creating anything.
+
+        Args:
+            name: Name to match (will be canonicalized)
+            context_path: Vault path for context boost (e.g., "Work/ML/meeting.md")
+
+        Returns:
+            NameMatch separating a unique match, a tie, and no match at all
+        """
         # First, try to canonicalize using existing PEOPLE_DICTIONARY
         canonical = resolve_person_name(name)
 
         # Check for exact name/alias match in store
         exact_match = self._store.get_by_name(canonical)
         if exact_match:
-            return ResolutionResult(
+            return NameMatch(ResolutionResult(
                 entity=exact_match,
                 is_new=False,
                 confidence=1.0,
                 match_type="name_exact",
-            )
+            ))
 
         # Check for link override (disambiguation rules from previous splits)
         override_store = get_link_override_store()
@@ -238,63 +283,51 @@ class EntityResolver:
         if override:
             preferred = self._store.get_by_id(override.preferred_person_id)
             if preferred:
-                logger.debug(f"Link override matched: '{canonical}' -> {preferred.canonical_name}")
-                return ResolutionResult(
+                return NameMatch(ResolutionResult(
                     entity=preferred,
                     is_new=False,
                     confidence=1.0,
                     match_type="link_override",
-                )
+                ))
 
         # Score all candidates using fuzzy matching
-        candidates = self._score_candidates(canonical, context_path)
+        scored = self._score_candidates(canonical, context_path)
+        candidates = sorted(scored.candidates, key=lambda c: c.score, reverse=True)
 
-        if not candidates:
-            if create_if_missing:
-                return self._create_new_entity(canonical, context_path)
-            return None
+        if scored.ambiguous:
+            return NameMatch(tied=[c.entity for c in candidates])
 
-        # Sort by score descending
-        candidates.sort(key=lambda c: c.score, reverse=True)
+        # A candidate has to meet the minimum score to count as a match
+        if not candidates or candidates[0].score < EntityResolutionConfig.MIN_MATCH_SCORE:
+            return NameMatch()
 
         top = candidates[0]
-
-        # Check if score meets minimum threshold
-        if top.score < EntityResolutionConfig.MIN_MATCH_SCORE:
-            if create_if_missing:
-                return self._create_new_entity(canonical, context_path)
-            return None
+        cutoff = top.score - EntityResolutionConfig.DISAMBIGUATION_THRESHOLD
+        tied = [c.entity for c in candidates if c.score > cutoff]
 
         # Check for disambiguation (Pass 3)
-        if len(candidates) >= 2:
-            second = candidates[1]
-            score_diff = top.score - second.score
-
-            if score_diff < EntityResolutionConfig.DISAMBIGUATION_THRESHOLD:
-                # Ambiguous - check if we should create a new entity
-                if create_if_missing:
-                    return self._create_disambiguated_entity(
-                        canonical, context_path, top.entity
-                    )
-                # Otherwise return top match with lower confidence
-                return ResolutionResult(
+        if len(tied) >= 2:
+            return NameMatch(
+                ResolutionResult(
                     entity=top.entity,
                     is_new=False,
                     confidence=top.confidence * 0.7,  # Reduce confidence for ambiguous
                     match_type="fuzzy_ambiguous",
                     disambiguation_applied=True,
-                )
+                ),
+                tied=tied,
+            )
 
-        return ResolutionResult(
+        return NameMatch(ResolutionResult(
             entity=top.entity,
             is_new=False,
             confidence=top.confidence,
             match_type=top.match_type,
-        )
+        ))
 
     def _score_candidates(
         self, name: str, context_path: Optional[str]
-    ) -> list[ResolutionCandidate]:
+    ) -> ScoredCandidates:
         """
         Score all entities against a name using structured matching.
 
@@ -317,7 +350,8 @@ class EntityResolver:
             context_path: Path for context boost
 
         Returns:
-            List of candidates with scores
+            Candidates with scores, marked ambiguous when a bare first name
+            fits several of them and none stands out
         """
         candidates = []
 
@@ -546,6 +580,7 @@ class EntityResolver:
         # 2. Multiple candidates, but only one passes MIN_MATCH_SCORE → unambiguous
         # 3. Multiple close relationship matches without clear winner → ambiguous
         # 4. One candidate has significantly higher score → unambiguous
+        # 5. Multiple candidates, none strong enough to pass → ambiguous
         if is_first_name_only and candidates:
             MIN_SCORE = EntityResolutionConfig.MIN_MATCH_SCORE
 
@@ -594,15 +629,15 @@ class EntityResolver:
                             close_matches[0].confidence = min(close_matches[0].score / 100.0, 1.0)
                         else:
                             # Truly ambiguous - multiple close people with similar strength
-                            logger.debug(f"First-name-only '{name}' ambiguous: {len(close_matches)} close matches")
-                            return []
+                            return ScoredCandidates(passing_candidates, ambiguous=True)
                     else:
                         # Multiple passing but none close - ambiguous
-                        logger.debug(f"First-name-only '{name}' ambiguous: {len(passing_candidates)} passing, none close")
-                        return []
-            # else: no candidates pass threshold - will naturally return no match
+                        return ScoredCandidates(passing_candidates, ambiguous=True)
+            else:
+                # Several people carry this first name and none is strong enough
+                return ScoredCandidates(candidates, ambiguous=True)
 
-        return candidates
+        return ScoredCandidates(candidates)
 
     def _path_matches_context(
         self, file_path: str, vault_contexts: list[str]
@@ -665,51 +700,6 @@ class EntityResolver:
             match_type="new_entity",
         )
 
-    def _create_disambiguated_entity(
-        self, name: str, context_path: Optional[str], similar_entity: PersonEntity
-    ) -> ResolutionResult:
-        """
-        Create a disambiguated entity when name is ambiguous.
-
-        Args:
-            name: Canonical name
-            context_path: Path for inferring context
-            similar_entity: The entity this would be confused with
-
-        Returns:
-            ResolutionResult with disambiguated entity
-        """
-        vault_contexts = []
-        category = "unknown"
-        suffix = ""
-
-        if context_path:
-            vault_contexts = self._infer_vault_contexts(context_path)
-            category = self._infer_category(context_path)
-            suffix = self._infer_context_suffix(context_path)
-
-        # Create display name with disambiguation
-        display_name = f"{name} ({suffix})" if suffix else name
-
-        entity = PersonEntity(
-            canonical_name=name,
-            display_name=display_name,
-            vault_contexts=vault_contexts,
-            category=category,
-            first_seen=None,  # Will be set from actual interactions
-            confidence_score=0.7,  # Slightly lower for disambiguated
-        )
-
-        stored = self._store.add(entity)
-
-        return ResolutionResult(
-            entity=stored,
-            is_new=True,
-            confidence=0.7,
-            match_type="disambiguated",
-            disambiguation_applied=True,
-        )
-
     def _infer_vault_contexts(self, file_path: str) -> list[str]:
         """Infer vault context from file path."""
         path_str = str(file_path).replace("\\", "/")
@@ -746,33 +736,6 @@ class EntityResolver:
 
         return "unknown"
 
-    def _infer_context_suffix(self, file_path: str) -> str:
-        """Infer disambiguation suffix from file path."""
-        path_str = str(file_path).replace("\\", "/")
-
-        # Check current work path
-        if settings.current_work_path and settings.current_work_path in path_str:
-            # Try to find company name from normalization map
-            for company, info in COMPANY_NORMALIZATION.items():
-                if any(settings.current_work_path in ctx for ctx in info.get("vault_contexts", [])):
-                    return company.split()[0]  # First word of company name
-            return "Work"
-
-        # Check archive paths for company context
-        if settings.personal_archive_path and settings.personal_archive_path in path_str:
-            for company, info in COMPANY_NORMALIZATION.items():
-                for ctx in info.get("vault_contexts", []):
-                    if ctx in path_str:
-                        return company.split()[0]
-            return "Archive"
-
-        if "Work/" in path_str:
-            return "Work"
-        elif "Personal/" in path_str:
-            return "Personal"
-
-        return ""
-
     def resolve(
         self,
         name: Optional[str] = None,
@@ -790,6 +753,14 @@ class EntityResolver:
         3. Name exact match
         4. Fuzzy name match with context boost
         5. Create new entity from email or name (if create_if_missing)
+
+        A name that fits several existing people never creates a person from
+        the name. An unknown email or phone next to it still anchors a new
+        person of their own, named from the address or number so the tied name
+        is not added as another exact match. A tied name with no identifier
+        returns None. With create_if_missing, a person named only after their
+        identifier takes the real multi-word name of a call that matches them by
+        it. Without it, nothing is written.
 
         Phone-only never creates a PersonEntity. A raw phone
         observation with no name or email tells you very little about who the
@@ -817,6 +788,8 @@ class EntityResolver:
         if email:
             entity = self.resolve_by_email(email)
             if entity:
+                if create_if_missing:
+                    self._replace_placeholder_name(entity, email, name)
                 return ResolutionResult(
                     entity=entity,
                     is_new=False,
@@ -828,6 +801,9 @@ class EntityResolver:
         if phone:
             entity = self.resolve_by_phone(phone)
             if entity:
+                if create_if_missing:
+                    from api.services.phone_utils import normalize_phone
+                    self._replace_placeholder_name(entity, normalize_phone(phone), name)
                 return ResolutionResult(
                     entity=entity,
                     is_new=False,
@@ -869,6 +845,15 @@ class EntityResolver:
                 )
 
             name_from_email = self._extract_name_from_email(email)
+            # A name reaching this point is tied. A person named after it, or
+            # after any bare first name, would take its exact matches from here
+            # on, so they go by the address instead.
+            if name and name.strip() and (
+                not parse_name(name_from_email).last
+                or name_from_email.lower() == name.strip().lower()
+            ):
+                name_from_email = email.lower()
+
             domain = normalize_domain(email)
             vault_contexts = get_vault_contexts_for_domain(domain) if domain else []
             category = "work" if vault_contexts else "unknown"
@@ -888,6 +873,8 @@ class EntityResolver:
             )
 
             stored = self._store.add(entity)
+            if not stored:
+                return None
 
             return ResolutionResult(
                 entity=stored,
@@ -896,7 +883,58 @@ class EntityResolver:
                 match_type="email_new",
             )
 
+        # A name reaching this point is tied: an unknown one was created above.
+        # The phone anchors a person of their own, named from the number.
+        if name and name.strip() and phone and create_if_missing:
+            from api.services.phone_utils import normalize_phone
+            norm_phone = normalize_phone(phone)
+            if norm_phone:
+                stored = self._store.add(PersonEntity(
+                    canonical_name=norm_phone,
+                    display_name=norm_phone,
+                    phone_numbers=[norm_phone],
+                    phone_primary=norm_phone,
+                ))
+                if stored:
+                    return ResolutionResult(
+                        entity=stored,
+                        is_new=True,
+                        confidence=0.6,
+                        match_type="phone_new",
+                    )
+
         return None
+
+    def _replace_placeholder_name(
+        self, entity: PersonEntity, identifier: str, name: Optional[str]
+    ) -> None:
+        """
+        Give a person named only after an identifier the real name a call supplies.
+
+        Applies when the name is multi-word and no other person holds it. A bare
+        first name would take that name's exact matches, and a name someone else
+        holds would take theirs, so neither replaces the placeholder.
+
+        Args:
+            entity: Person matched exactly by the identifier
+            identifier: The email or normalized phone that matched
+            name: Name the call supplied, if any
+        """
+        if not name or entity.canonical_name.lower() != identifier.lower():
+            return
+
+        real_name = resolve_person_name(name).strip()
+        if not parse_name(real_name).last or any(c.isdigit() or c == "@" for c in real_name):
+            return
+
+        holder = self._store.get_by_name(real_name)
+        if holder and holder.id != entity.id:
+            return
+
+        if entity.display_name == entity.canonical_name:
+            entity.display_name = real_name
+        entity.canonical_name = real_name
+        self._store.update(entity)
 
     def _extract_name_from_email(self, email: str) -> str:
         """
