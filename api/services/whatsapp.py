@@ -76,6 +76,19 @@ def is_group_jid(jid: str) -> bool:
     return "@g.us" in jid
 
 
+# JID domains of chats that are not a person: Meta AI bot chats and status /
+# broadcast lists. A message in one is not correspondence with the number in
+# its JID, so it never becomes a person interaction.
+NON_PERSON_JID_DOMAINS = frozenset({"bot", "broadcast"})
+
+
+def is_non_person_chat_jid(jid: str) -> bool:
+    """Return True if the JID is a bot or broadcast chat rather than a person."""
+    if not jid or "@" not in jid:
+        return False
+    return jid.rpartition("@")[2] in NON_PERSON_JID_DOMAINS
+
+
 def extract_phone_from_jid(jid: str) -> str:
     """Extract a normalized E.164 phone from a WhatsApp JID.
 
@@ -405,6 +418,7 @@ def process_whatsapp_messages(
         "resolved_lid": 0,
         "resolved_lid_phone": 0,
         "skipped_large_group": 0,
+        "skipped_non_person_chat": 0,
         "outgoing_group_created": 0,
         "persons_not_found": 0,
         "hidden_person": 0,
@@ -478,6 +492,10 @@ def process_whatsapp_messages(
                 from_me = bool(msg.get("from_me"))
                 text = msg.get("display_text") or msg.get("text") or ""
                 is_group = is_group_jid(chat_jid)
+
+                if is_non_person_chat_jid(chat_jid):
+                    stats["skipped_non_person_chat"] += 1
+                    continue
 
                 if is_group and group_sizes.get(chat_jid, 0) > LARGE_GROUP_THRESHOLD:
                     stats["skipped_large_group"] += 1

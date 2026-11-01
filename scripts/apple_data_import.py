@@ -829,6 +829,7 @@ def import_whatsapp(dry_run: bool = False, manifest: dict | None = None) -> dict
         f"WhatsApp messages: {message_stats['interactions_created']} created, "
         f"{message_stats['interactions_skipped']} skipped, "
         f"{message_stats['skipped_large_group']} large-group skips, "
+        f"{message_stats['skipped_non_person_chat']} bot/broadcast skips, "
         f"{message_stats['outgoing_group_created']} outgoing-group fan-outs"
     )
 
