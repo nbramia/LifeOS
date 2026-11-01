@@ -493,3 +493,51 @@ class TestActionAfterRouting:
             result = await router.route("What's the weather for my NYC trip tomorrow?")
         # Should have web for weather and calendar for trip
         assert "web" in result.sources or "calendar" in result.sources
+
+
+class TestStrengthCutoffs:
+    """Relationship strength sets how much context a query fetches, and who to disambiguate."""
+
+    @pytest.mark.parametrize(
+        ("strength", "depth"),
+        [(100, "deep"), (53, "deep"), (52.9, "normal"), (18, "normal"), (17.9, "shallow"), (0, "shallow")],
+    )
+    def test_fetch_depth(self, strength, depth):
+        from api.services.query_router import QueryRouter
+
+        context = {"relationship_strength": strength}
+        assert QueryRouter()._determine_fetch_depth("how is Robin doing", context) == depth
+
+    @staticmethod
+    def _crm_context(strengths):
+        from types import ModuleType, SimpleNamespace
+        from unittest.mock import MagicMock
+        from api.services.query_router import QueryRouter
+
+        candidates = [
+            SimpleNamespace(
+                id=f"p{n}", canonical_name=f"Robin {n}", relationship_strength=s, email_count=0, message_count=0,
+            )
+            for n, s in enumerate(strengths)
+        ]
+        store_module = ModuleType("api.services.person_entity_store")
+        store_module.get_person_entity_store = lambda: SimpleNamespace(search=lambda **kwargs: candidates)
+        resolver = MagicMock()
+        resolver.resolve.return_value = SimpleNamespace(entity=candidates[0], confidence=0.5)
+
+        router = QueryRouter()
+        with patch.dict("sys.modules", {"api.services.person_entity_store": store_module}), \
+             patch("api.services.entity_resolver.get_entity_resolver", return_value=resolver), \
+             patch("api.services.relationship_summary.get_relationship_summary", return_value=None), \
+             patch.object(router, "_names_match", return_value=True), \
+             patch.object(router, "_get_disambiguation_context", return_value=""):
+            return router._fetch_crm_context("Robin")
+
+    def test_two_people_at_the_close_cutoff_need_disambiguation(self):
+        context = self._crm_context([14, 14])
+        assert context["failure_type"] == "ambiguous"
+        assert len(context["candidates"]) == 2
+
+    def test_one_person_below_the_close_cutoff_does_not(self):
+        context = self._crm_context([14, 13.9])
+        assert context["entity_id"] == "p0"

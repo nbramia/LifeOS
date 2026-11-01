@@ -577,6 +577,36 @@ class TestParseName:
 
 
 @pytest.mark.unit
+class TestFirstNameStrengthTiebreak:
+    """Two first-name candidates with close scores are separated by relationship strength."""
+
+    CONTEXT = "Work/Acme/notes.md"
+
+    def _resolve(self, temp_store, first_strength, second_strength):
+        for last, strength in (("Alpha", first_strength), ("Beta", second_strength)):
+            person = PersonEntity(canonical_name=f"Robin {last}", vault_contexts=["Work/Acme/"])
+            person.relationship_strength = strength
+            temp_store.add(person)
+        return EntityResolver(temp_store).resolve_by_name("Robin", context_path=self.CONTEXT)
+
+    def test_at_the_close_cutoff_settles_it(self, temp_store):
+        result = self._resolve(temp_store, 14.0, 13.9)
+        assert result.entity.canonical_name == "Robin Alpha"
+        assert result.match_type == "first_name_close_unique"
+
+    def test_below_the_close_cutoff_stays_ambiguous(self, temp_store):
+        assert self._resolve(temp_store, 13.9, 13.8) is None
+
+    def test_a_clear_lead_settles_two_close_people(self, temp_store):
+        result = self._resolve(temp_store, 50.0, 20.0)
+        assert result.entity.canonical_name == "Robin Alpha"
+        assert result.match_type == "first_name_relationship_dominant"
+
+    def test_a_smaller_lead_stays_ambiguous(self, temp_store):
+        assert self._resolve(temp_store, 49.9, 20.0) is None
+
+
+@pytest.mark.unit
 class TestSingleLetterFirstNameEntity:
     """
     An entity whose first name is a single letter must not swallow every query

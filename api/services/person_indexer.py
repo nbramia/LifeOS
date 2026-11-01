@@ -4,8 +4,9 @@ Person Profile Indexer - Index CRM person data to vector store.
 Generates searchable documents for people with relationship context,
 enabling semantic searches like "my important contacts" or "people I work with".
 
-Key design principle: Only index significant contacts (relationship_strength >= 15
-or non-hidden) with at least 3 interactions in last 90 days.
+Key design principle: Only index significant contacts: not hidden, and either
+relationship_strength >= MIN_STRENGTH_FOR_INDEX or at least
+MIN_INTERACTIONS_FOR_INDEX interactions in the last 90 days.
 """
 import json
 import logging
@@ -15,14 +16,14 @@ from api.services.vectorstore import VectorStore
 from api.services.person_entity import PersonEntity, get_person_entity_store
 from api.services.relationship_summary import get_relationship_summary, RelationshipSummary
 from api.services.person_facts import get_person_fact_store
+from config.relationship_weights import MIN_STRENGTH_FOR_INDEX, STRENGTH_DESCRIPTION_BANDS
 
 logger = logging.getLogger(__name__)
 
 # Collection name for person profiles (separate from vault documents)
 PERSON_COLLECTION = "lifeos_people"
 
-# Thresholds for indexing
-MIN_STRENGTH_FOR_INDEX = 15  # Minimum relationship strength (0-100)
+# Threshold for indexing, alongside MIN_STRENGTH_FOR_INDEX
 MIN_INTERACTIONS_FOR_INDEX = 3  # Minimum interactions in 90 days
 
 
@@ -46,16 +47,11 @@ def generate_person_document(person: PersonEntity, summary: RelationshipSummary)
 
     # Relationship strength description
     strength = summary.relationship_strength
-    if strength >= 80:
-        parts.append(f"Very strong relationship (strength: {strength}/100)")
-    elif strength >= 60:
-        parts.append(f"Strong relationship (strength: {strength}/100)")
-    elif strength >= 40:
-        parts.append(f"Moderate relationship (strength: {strength}/100)")
-    elif strength >= 20:
-        parts.append(f"Light relationship (strength: {strength}/100)")
-    else:
-        parts.append(f"Distant relationship (strength: {strength}/100)")
+    description = next(
+        (label for cutoff, label in STRENGTH_DESCRIPTION_BANDS if strength >= cutoff),
+        "Distant",
+    )
+    parts.append(f"{description} relationship (strength: {strength}/100)")
 
     # Category
     category_desc = {

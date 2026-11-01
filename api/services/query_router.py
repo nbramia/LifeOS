@@ -17,6 +17,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from config.relationship_weights import (
+    CLOSE_RELATIONSHIP_MIN_STRENGTH,
+    DEEP_CONTEXT_MIN_STRENGTH,
+    NORMAL_CONTEXT_MIN_STRENGTH,
+)
 from config.settings import settings
 from api.services.llm_client import (
     generate_text,
@@ -27,9 +32,6 @@ logger = logging.getLogger(__name__)
 
 # Valid data sources
 VALID_SOURCES = {"vault", "calendar", "gmail", "drive", "people", "actions", "slack", "photos", "web"}
-
-# Minimum relationship strength to be considered "strong" for disambiguation
-DISAMBIGUATION_STRENGTH_THRESHOLD = 0.3
 
 # Fetch depth limits for context retrieval
 # Maps fetch_depth -> (email_char_limit, vault_chunks, message_limit)
@@ -206,7 +208,7 @@ class QueryRouter:
                 candidates = store.search(name=person_name, limit=10)
                 strong_matches = [
                     p for p in candidates
-                    if p.relationship_strength >= DISAMBIGUATION_STRENGTH_THRESHOLD * 100
+                    if p.relationship_strength >= CLOSE_RELATIONSHIP_MIN_STRENGTH
                     and self._names_match(person_name, p.canonical_name)
                 ]
 
@@ -347,9 +349,9 @@ class QueryRouter:
         if relationship_context:
             strength = relationship_context.get("relationship_strength", 0)
             # High-strength relationships get more context by default
-            if strength >= 70:
+            if strength >= DEEP_CONTEXT_MIN_STRENGTH:
                 return "deep"
-            elif strength >= 40:
+            elif strength >= NORMAL_CONTEXT_MIN_STRENGTH:
                 return "normal"
             else:
                 return "shallow"
