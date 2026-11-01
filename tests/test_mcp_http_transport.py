@@ -489,6 +489,132 @@ def test_read_call_is_audit_logged_at_info(client: TestClient, bearer_token: str
     assert "reaches_worker=False" in audit[0].getMessage()
 
 
+@pytest.mark.unit
+def test_audit_keeps_arguments_a_handler_consumes(client: TestClient, bearer_token: str, caplog, monkeypatch):
+    """Handlers pop path parameters out of the arguments they are given; the
+    audit line must still name and hash them, or a delete or resolve can't be
+    traced to the item it touched."""
+    import hashlib
+    import logging
+
+    def consuming_call(self, tool_name, arguments):
+        arguments.pop("schedule_id", None)
+        return {"ok": True}
+
+    monkeypatch.setattr(mcp_server.LifeOSMCPServer, "_call_api", consuming_call)
+    caplog.set_level(logging.INFO, logger=mcp_server.logger.name)
+    client.post("/mcp", headers={"Authorization": f"Bearer {bearer_token}"}, json={
+        "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+        "params": {"name": "lifeos_schedule_delete", "arguments": {"schedule_id": "abc12345"}},
+    })
+    (message,) = _audit_messages(caplog)
+    assert "arg_keys=schedule_id" in message
+    empty = hashlib.sha256(b"{}").hexdigest()[:16]
+    assert f"args_sha256={empty}" not in message
+
+
+@pytest.mark.unit
+def test_call_api_leaves_the_callers_arguments_intact(monkeypatch):
+    """Path parameters go into the URL without being removed from the dict the
+    caller passed."""
+    from unittest.mock import MagicMock
+
+    srv = mcp_server.LifeOSMCPServer()
+    response = MagicMock()
+    response.json.return_value = {"id": "abc12345"}
+    srv.client = MagicMock()
+    srv.client.delete.return_value = response
+    arguments = {"schedule_id": "abc12345"}
+    srv._call_api("lifeos_schedule_delete", arguments)
+    assert arguments == {"schedule_id": "abc12345"}
+    assert srv.client.delete.call_args.args[0].endswith("/abc12345")
+
+
+@pytest.mark.unit
+def test_reminder_reply_shows_no_next_trigger_while_disabled():
+    srv = mcp_server.LifeOSMCPServer()
+    for tool in ("lifeos_reminder_create", "lifeos_reminder_update"):
+        disabled = srv._format_response(tool, {
+            "id": "abc12345", "name": "Synthetic", "enabled": False,
+            "next_trigger_at": "2030-01-01T14:00:00+00:00",
+        })
+        assert "Next trigger: none (disabled)" in disabled
+        enabled = srv._format_response(tool, {
+            "id": "abc12345", "name": "Synthetic", "enabled": True,
+            "next_trigger_at": "2030-01-01T14:00:00+00:00",
+        })
+        assert "Next trigger: 2030-01-01T14:00:00+00:00" in enabled
+        unscheduled = srv._format_response(tool, {
+            "id": "abc12345", "name": "Synthetic", "enabled": True, "next_trigger_at": None,
+        })
+        assert "Next trigger: not scheduled" in unscheduled
+
+
+# --- OpenAPI spec load at startup ----------------------------------------------
+
+
+class _FlakySpecClient:
+    """Refuses the first `failures` connections, then serves a spec."""
+
+    def __init__(self, failures: int):
+        self.failures = failures
+        self.calls = 0
+
+    def get(self, url):
+        from unittest.mock import MagicMock
+
+        import httpx
+
+        self.calls += 1
+        if self.calls <= self.failures:
+            raise httpx.ConnectError("Connection refused")
+        resp = MagicMock()
+        resp.json.return_value = {"paths": {}, "components": {"schemas": {}}}
+        return resp
+
+
+def _server_with_spec_client(monkeypatch, fake, wait_seconds):
+    monkeypatch.setattr(mcp_server.time, "sleep", lambda s: None)
+    monkeypatch.setattr(mcp_server.httpx, "Client", lambda **kw: fake)
+    return mcp_server.LifeOSMCPServer(spec_wait_seconds=wait_seconds)
+
+
+@pytest.mark.unit
+def test_spec_load_waits_for_the_api_when_asked(monkeypatch):
+    fake = _FlakySpecClient(failures=3)
+    srv = _server_with_spec_client(monkeypatch, fake, wait_seconds=60)
+    assert fake.calls == 4
+    assert srv.openapi_spec == {"paths": {}, "components": {"schemas": {}}}
+
+
+@pytest.mark.unit
+def test_spec_load_without_a_wait_tries_once_and_falls_back(monkeypatch):
+    fake = _FlakySpecClient(failures=3)
+    srv = _server_with_spec_client(monkeypatch, fake, wait_seconds=0)
+    assert fake.calls == 1
+    assert srv.openapi_spec is None
+    assert any(t["name"] == "lifeos_health" for t in srv.tools)
+
+
+@pytest.mark.unit
+def test_spec_load_gives_up_after_the_wait(monkeypatch):
+    clock = iter(range(0, 10_000, 7))
+    monkeypatch.setattr(mcp_server.time, "monotonic", lambda: next(clock))
+    fake = _FlakySpecClient(failures=10_000)
+    srv = _server_with_spec_client(monkeypatch, fake, wait_seconds=30)
+    assert 1 < fake.calls < 10
+    assert srv.openapi_spec is None
+    names = [t["name"] for t in srv.tools]
+    assert len(names) == len(set(names))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("raw, expected", [("", 90.0), ("15", 15.0), ("-3", 0.0), ("soon", 90.0)])
+def test_spec_wait_seconds_setting(monkeypatch, raw, expected):
+    monkeypatch.setenv("LIFEOS_MCP_SPEC_WAIT_SECONDS", raw)
+    assert mcp_server._spec_wait_seconds() == expected
+
+
 def _audit_messages(caplog) -> list[str]:
     return [r.getMessage() for r in caplog.records if r.getMessage().startswith("mcp audit:")]
 

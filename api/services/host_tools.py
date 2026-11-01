@@ -1035,6 +1035,13 @@ HOST_TOOL_SCHEMAS: list[dict] = [
 HOST_TOOL_NAMES = frozenset(t["name"] for t in HOST_TOOL_SCHEMAS)
 HOST_WRITE_TOOLS = frozenset({"lifeos_fs_write", "lifeos_shell"})
 
+# Allowlist rules (the "rule" a shell result reports) that only read. A call
+# that ran under one of these is not counted as a host write in the MCP audit
+# line; "approved", "systemctl restart", refusals and pending approvals are.
+READ_ONLY_SHELL_RULES = frozenset({
+    "ls", "tail", "git status", "git log", "git diff", "git show", "systemctl status",
+})
+
 
 def call(config: HostToolsConfig, name: str, arguments: object, *, caller: str) -> dict:
     """Run one host tool. Returns an MCP tool result (content + isError)."""

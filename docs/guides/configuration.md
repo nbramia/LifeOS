@@ -169,6 +169,7 @@ The HTTP MCP transport exposes LifeOS tools to remote agents (primarily Anthropi
 |---|---|---|---|
 | `LIFEOS_MCP_HTTP_HOST` | str | `127.0.0.1` | Bind address. Keep `127.0.0.1` and front with Cloudflare Tunnel / Tailscale Funnel. |
 | `LIFEOS_MCP_HTTP_PORT` | int | `8765` | Port. |
+| `LIFEOS_MCP_SPEC_WAIT_SECONDS` | float | `90` | How long the HTTP transport keeps retrying the API's OpenAPI spec at startup while the API refuses connections, before falling back to the curated tool schemas. `0` tries once. Stdio always tries once. |
 | `LIFEOS_MCP_BEARER_TOKEN` | str | — | Full-access token. Required at startup; accepted from the host and the tailnet (and on public edges only with `LIFEOS_MCP_ALLOW_PUBLIC_BEARER`). OAuth requests on public edges authenticate with their own tokens instead. Generate with `openssl rand -hex 32`. Treat as a secret. |
 | `LIFEOS_MCP_HTTP_URL` | str | — | Public URL Managed Agents uses to reach the MCP server. |
 | `LIFEOS_OAUTH_OPERATOR_LOGINS` | str (comma-separated) | — | Tailscale logins (e.g. `operator@example.com`) allowed to approve an app on the MCP OAuth consent page. Empty disables every OAuth endpoint, so a fresh install stays bearer-only. See [mcp-oauth.md](../specs/technical/mcp-oauth.md). |

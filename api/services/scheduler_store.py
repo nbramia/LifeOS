@@ -676,7 +676,9 @@ class SchedulerStore:
                 action=action,
                 **kwargs,
             )
-            entry.next_trigger_at = compute_next_trigger(entry)
+            # Same rule as update() and rebuild_index(): a disabled entry has
+            # no next fire, so the create reply never shows one.
+            entry.next_trigger_at = compute_next_trigger(entry) if entry.enabled else None
             self._insert_block_at_top(_format_entry_block(entry))
             self._entries = {**self._entries, entry.id: entry}
             self._save()
