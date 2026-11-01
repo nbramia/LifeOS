@@ -188,12 +188,6 @@ def get_entity_resolution_config() -> dict:
     return settings.get("entity_resolution", {})
 
 
-def get_relationship_strength_config() -> dict:
-    """Get relationship strength configuration."""
-    settings = get_settings()
-    return settings.get("relationship_strength", {})
-
-
 def get_discovery_config() -> dict:
     """Get relationship discovery configuration."""
     settings = get_settings()
