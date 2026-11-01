@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** CRM
-> **Last Updated:** 2026-08-12
+> **Last Updated:** 2026-11-01
 
 LifeOS uses a two-tier data model to separate raw observations from canonical records.
 
