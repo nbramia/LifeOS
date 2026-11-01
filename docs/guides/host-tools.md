@@ -25,29 +25,44 @@ The roots are:
 - `lifeos`: the LifeOS checkout. Read-only; code changes go through pull requests.
 - `logs`: the checkout's `logs/` directory. Read-only.
 
-Paths are a root name plus a relative path. Absolute paths, `~` and `..` are refused, and the resolved path must stay inside its root, so a symlink pointing out of a root is refused. A write refuses any symlink on its path. Everywhere under a root, the denylist refuses `.git`, `.ssh`, `.gnupg` and similar directories, `.env` files, keys and certificates, pickles, SQLite databases and credential or token JSON files; the checkout's `data/` directory is refused outright. Listings hide denied entries.
+Paths are a root name plus a relative path. Absolute paths, `~` and `..` are refused, and the resolved path must stay inside its root, so a symlink pointing out of a root is refused. A write refuses any symlink on its path. Everywhere under a root, the denylist refuses `.git`, `.ssh`, `.gnupg` and similar directories, `.env*` and `*.env` files, keys and certificates (`.pem`, `.key`, `.crt`, `.cer`, `.p12`, `.pfx`), pickles, SQLite databases and credential or token JSON files; the checkout's `data/` directory is refused outright. Listings hide denied entries.
 
-A vault write is committed with the message `Host tools: update <path>`, committing only that path, so other uncommitted vault changes stay out of the commit. It is not pushed. Set `LIFEOS_HOST_TOOLS_VAULT_AUTOCOMMIT=false` to leave writes uncommitted.
+A vault write is committed with the message `Host tools: update <path>`, committing only that path (taken literally, never as a pattern), so other uncommitted vault changes stay out of the commit. The commit runs with git hooks and the filesystem monitor disabled. It is not pushed. Set `LIFEOS_HOST_TOOLS_VAULT_AUTOCOMMIT=false` to leave writes uncommitted.
 
 ### The command allowlist
 
 | Command | Allowed arguments |
 |---|---|
 | `git status` | `--short`, `--branch`, `--porcelain`, `-uno`, paths |
-| `git log`, `git show` | `--oneline`, `--stat`, `--name-only`, `--name-status`, `-p`, `--graph`, `-n N`, `--since=`, `--until=` and similar read-only flags, refs, paths |
-| `git diff` | `--stat`, `--name-only`, `--name-status`, `--cached`, `--staged`, `-U N`, refs, paths |
+| `git log`, `git show` | `--oneline`, `--stat`, `--name-only`, `--name-status`, `-p`, `--graph`, `-nN`, `--since=`, `--until=` and similar read-only flags, refs, paths |
+| `git diff` | `--stat`, `--name-only`, `--name-status`, `--cached`, `--staged`, `-UN`, refs, paths |
 | `systemctl status <unit>` | `lifeos-api`, `lifeos-mcp-http`, `lifeos-agent-worker`, `lifeos-chromadb`, `lifeos-llm`, `lifeos-sync` |
 | `systemctl restart <unit>` | `lifeos-api`, `lifeos-mcp-http`, `lifeos-agent-worker` (one at a time) |
 | `ls` | Common listing flags (not `-R`); relative paths inside a root |
-| `tail -n N <file>` | Relative paths inside a root; never `-f` |
+| `tail -nN <file>` (or `-n N`) | Relative paths inside a root; never `-f` |
 
-Git always runs with no pager, no filesystem monitor and no hooks, and `git diff`, `log` and `show` skip external diff drivers and textconv filters. Every other command, and every other flag, is refused. The allowlist, the roots, the denylist and the caps are defined together at the top of `api/services/host_tools.py`.
+Every non-flag git argument (including those after `--`) is treated as a path and must be relative, inside a readable root and off the denylist; for `<rev>:<path>` the path part is checked. Pathspec magic and `--no-index` are not accepted. Git always runs with literal pathspecs, no pager, no filesystem monitor and no hooks, and `git diff`, `log` and `show` skip external diff drivers and textconv filters. Every other command, and every other flag, is refused. The allowlist, the roots, the denylist and the caps are defined together at the top of `api/services/host_tools.py`.
 
 ### Approval for other commands
 
-`LIFEOS_HOST_TOOLS_SHELL_APPROVAL` is off, so a command outside the allowlist is refused. Turned on, the command is sent to the primary Telegram bot instead, and runs (still as the low-privilege account) only if you reply `APPROVE` to that message before `LIFEOS_HOST_TOOLS_APPROVAL_TIMEOUT_SECONDS` (default 120) runs out. Any other reply denies it, and so does no reply.
+Off by default: a command outside the allowlist is refused. Turn on approval with one setting, `LIFEOS_HOST_TOOLS_SHELL_APPROVAL=true` (step 8 below), and a command outside the allowlist is sent to you on Telegram instead:
 
-The gate is off by default because a phone prompt is a weak check on an arbitrary command: the argv can be long, can look routine while doing something else, and arrives while you are busy. Widen the allowlist in code for anything you want to run regularly.
+1. The caller gets a `pending-approval` result straight away, with a short request id. Nothing runs.
+2. The primary bot sends a plain-text message to `TELEGRAM_CHAT_ID` with the request id, when it was asked, when it expires, the caller, the account it runs as, the directory, the exact argv (shown as shell words, never shortened) and the first 16 characters of the command hash. A command too long to show in one message is refused instead.
+3. Reply `APPROVE` to that message to allow it, or anything else to refuse it. Only a reply in the configured chat, to a request sent to that chat, counts. The bot answers with the request's age.
+4. The command runs the next time the same caller asks for the same argv in the same directory as the same account. The approval is spent the moment it runs, so it runs once; a second identical call starts a new request. The bot tells you when it ran, with its exit code and how long ago it was asked and approved.
+
+An approval is bound to a SHA-256 hash of the caller, the run-as account, the directory and the argv, so it cannot be used for any other command or by any other caller. Approving does not run anything by itself: if the caller never asks again (its conversation ended, say), the approval expires unused, and that is logged too. Requests and unused approvals expire after `LIFEOS_HOST_TOOLS_APPROVAL_TIMEOUT_SECONDS` (default 86400, one day); set it to `0` to turn expiry off. A caller can have at most three requests waiting at once.
+
+An approved command still:
+
+- runs as `LIFEOS_HOST_TOOLS_RUN_AS`, with the same 30-second and output limits;
+- passes the path checks: every argument that looks like a path (and the value after any `=`) must be relative, stay inside a readable root and miss the denylist;
+- never names a shell, an interpreter, a command that runs other commands, a privilege tool, or a network tool (`bash`, `python`, `env`, `xargs`, `find`, `sed`, `awk`, `make`, `tar`, `systemd-run`, `sudo`, `curl`, `ssh`, `rsync` and others), a git option before the subcommand (`-c`, `-C`, `--git-dir`), or a git subcommand that reaches another host (`push`, `pull`, `fetch`, `clone`, `remote` and others). The full list is `NEVER_APPROVED_COMMANDS` in `api/services/host_tools.py`. These are refused without asking you, because they would let a command step around the path checks or send data off the host.
+
+The path checks look at arguments, not at what a program does with them, so the low-privilege account and its file permissions remain the real boundary.
+
+Approval is only as strong as the Telegram account behind `TELEGRAM_CHAT_ID`. Use a private chat with the bot, not a group (anyone in a group could reply `APPROVE`), and keep two-step verification on. Read the argv before approving: a request made by a session that read untrusted mail or web pages can look routine and do something else. Widen the allowlist in code for anything you want to run regularly.
 
 ## Who can call them
 
@@ -57,11 +72,15 @@ The gate is off by default because a phone prompt is a weak check on an arbitrar
 
 ## Audit
 
-Every host tool call is appended to `data/host_tools_audit.jsonl`: the time, the caller (`local-stdio`, `full-access-token` or `oauth:<client_id>`), the tool and the decision. Shell records carry the full argv, the working directory, the rule that allowed it (or why it was refused), the exit code and the duration. Write records carry the path, size, SHA-256 and commit; file content is never recorded. On the HTTP transport, writes and shell calls are also logged at `WARNING` in the `mcp audit:` line.
+Every host tool call is appended to `data/host_tools_audit.jsonl`: the time, the caller (`local-stdio`, `full-access-token` or `oauth:<client_id>`), the tool and the decision. Shell records carry the full argv, the working directory, the rule that allowed it (or why it was refused), the exit code and the duration. Approval adds records for each request (`approval-pending`, `approval-denied`, `approval-refused`), each reply (`operator-approved`, `operator-denied`), each run (`approved`, with the request id, the approver and the request's age) and each expiry (`approval-expired-pending`, or `approval-expired-approved` for an approval never used). Write records carry the path, size, SHA-256 and commit; file content is never recorded. On the HTTP transport, writes and shell calls are also logged at `WARNING` in the `mcp audit:` line.
 
-Command output and log lines have Telegram bot tokens redacted before they are returned.
+A shell command is recorded with the decision `started` before it runs and again, with its exit code, when it finishes, so a command that restarts the MCP service itself still leaves a record. If the `started` record cannot be written, the command does not run.
+
+Telegram bot tokens are redacted before anything is returned from a file read (in any root), shell output, or a log line. Audit records redact the same tokens in argv, reason and detail before they are written.
 
 ## Set up
+
+This setup is for a Linux host: it uses `useradd`, `setfacl`, `sudo` and systemd.
 
 The steps below create the low-privilege account and give it only what the allowlist needs. Run them on the LifeOS host as an admin. They use shell variables so nothing host-specific is written into a file you might share; set them first.
 
@@ -87,7 +106,7 @@ VAULT_DIR="/path/to/your vault"              # same as LIFEOS_VAULT_PATH; keep t
 
    This grants the LifeOS account the low-privilege account's rights, which are what the next steps give it. It does not grant root.
 
-3. Give it read access to the checkout and the vault, minus the checkout's `data/` and `.env`:
+3. Give it read access to the checkout and the vault, with no access to the checkout's `data/` and `.env`:
 
    ```bash
    sudo setfacl -R -m u:"$TOOLS_USER":rX "$LIFEOS_DIR" "$VAULT_DIR"
@@ -95,7 +114,7 @@ VAULT_DIR="/path/to/your vault"              # same as LIFEOS_VAULT_PATH; keep t
    sudo setfacl -m u:"$TOOLS_USER":--- "$LIFEOS_DIR/data" "$LIFEOS_DIR/.env"
    ```
 
-   New files inherit nothing from these entries; rerun the first `setfacl` after large changes, or add a default ACL (`setfacl -d -m ...`) on the vault.
+   These entries grant read access to everything else in both trees and withhold only `data/` and `.env`. Add the same `u:"$TOOLS_USER":---` entry for any other secret file in the checkout or vault (for example OAuth token files under `config/`). The tool-level denylist matches names; these file permissions are what the account itself can read. New files inherit nothing from these entries; rerun the first `setfacl` after large changes, or add a default ACL (`setfacl -d -m ...`) on the vault.
 
 4. Let it run git in those repositories (git otherwise refuses a repository owned by another account):
 
@@ -130,11 +149,24 @@ VAULT_DIR="/path/to/your vault"              # same as LIFEOS_VAULT_PATH; keep t
    # LIFEOS_HOST_TOOLS_OAUTH_CLIENTS=<client_id>
    ```
 
+8. Optional: turn on Telegram approval for commands outside the allowlist. Telegram must already work (`TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`, see [Telegram Setup](telegram-setup.md)), and `TELEGRAM_CHAT_ID` should be your private chat with the bot. Add to `.env`, then restart both the MCP transport and the API (the API's Telegram listener records your replies):
+
+   ```bash
+   LIFEOS_HOST_TOOLS_SHELL_APPROVAL=true
+   # Optional: how long a request or unused approval stays open, in seconds (0: never expires)
+   # LIFEOS_HOST_TOOLS_APPROVAL_TIMEOUT_SECONDS=86400
+   ```
+
+   ```bash
+   sudo systemctl restart lifeos-mcp-http lifeos-api
+   ```
+
 `lifeos_shell` refuses to run when `LIFEOS_HOST_TOOLS_RUN_AS` is empty, names an account that does not exist, names root, or names the account LifeOS itself runs as. The file and log tools work without it.
 
 ## Turn it off
 
 - **One app:** remove its client id from `LIFEOS_HOST_TOOLS_OAUTH_CLIENTS` and restart `lifeos-mcp-http`.
+- **Approval only:** set `LIFEOS_HOST_TOOLS_SHELL_APPROVAL=false` and restart `lifeos-mcp-http`. Open requests and unused approvals stop counting at once, because nothing outside the allowlist reaches the gate.
 - **Commands only:** empty `LIFEOS_HOST_TOOLS_RUN_AS`, or remove `/etc/sudoers.d/lifeos-host-tools`.
 - **Everything:** set `LIFEOS_HOST_TOOLS_ENABLED=false` and restart `lifeos-mcp-http`.
 
@@ -143,7 +175,7 @@ VAULT_DIR="/path/to/your vault"              # same as LIFEOS_VAULT_PATH; keep t
 - **Path races.** Paths are checked, then opened. A local process that swaps a directory for a symlink between the two can redirect one read or write. An MCP caller cannot cause that on its own, because writes refuse symlinks and `.git` paths.
 - **Vault content.** The vault is readable in full, minus the denylist, and the denylist matches names, not content. A secret pasted into a note is readable.
 - **Git configuration.** Git reads repository configuration as the low-privilege account. Hooks, the pager, the filesystem monitor, external diff and textconv are disabled per call, but a clean or smudge filter configured in a repository still runs during `git status`. Host tools cannot write `.git`, so only someone who can already write the repository can set one.
-- **Approval prompts** (when turned on) run whatever was approved, with the low-privilege account's rights.
+- **Approval** (when turned on) runs whatever was approved, with the low-privilege account's rights. With expiry turned off, an approval nobody used stays usable by that caller for that exact command until it is used or approval is turned off.
 
 ## Related Documents
 

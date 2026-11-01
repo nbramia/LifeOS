@@ -748,11 +748,12 @@ class LifeOSMCPServer:
         if self._host_tools_config is None:
             config = host_tools.HostToolsConfig.from_settings()
             if config.approval_enabled:
-                from api.services.host_approval import request_approval
+                from api.services.host_approval import ApprovalGate
+                from config.settings import settings
 
-                timeout = config.approval_timeout_seconds
-                config.approver = lambda summary, _caller: request_approval(
-                    summary, timeout_seconds=timeout,
+                config.approvals = ApprovalGate(
+                    timeout_seconds=config.approval_timeout_seconds,
+                    chat_id=settings.telegram_chat_id,
                 )
             self._host_tools_config = config
         return host_tools.call(self._host_tools_config, name, arguments, caller=caller)
@@ -3144,8 +3145,8 @@ def build_http_app(
             return None if isinstance(req, dict) and req.get("id") is None else outcome
 
         async def _run(req: object) -> dict | None:
-            # A shell call can wait on an approval for minutes, so it runs
-            # off the event loop.
+            # A shell call can run for up to 30 seconds, so it runs off the
+            # event loop.
             if _is_shell_call(req):
                 return await run_in_threadpool(_dispatch_audited, req)
             return _dispatch_audited(req)

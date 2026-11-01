@@ -312,84 +312,244 @@ def test_shell_output_is_capped_and_redacted(config, runner, run_as_ok):
 
 # ── shell: approval gate ─────────────────────────────────────────────────
 
+CHAT = "chat-synthetic-1"
 
-def test_gate_off_by_default_refuses_without_asking(config, runner, run_as_ok):
-    asked = []
-    config.approver = lambda summary, caller: asked.append(summary) or "approved"
+
+class Clock:
+    def __init__(self, now: float):
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class Sender:
+    def __init__(self):
+        self.sent: list[str] = []
+        self.next_id = 100
+
+    def __call__(self, text: str) -> list[int]:
+        self.sent.append(text)
+        self.next_id += 1
+        return [self.next_id]
+
+
+@pytest.fixture
+def clock() -> Clock:
+    return Clock(time.time())
+
+
+@pytest.fixture
+def sender() -> Sender:
+    return Sender()
+
+
+@pytest.fixture
+def store(tmp_path) -> host_approval.ApprovalStore:
+    return host_approval.ApprovalStore(tmp_path / "approvals.db")
+
+
+@pytest.fixture
+def gated(config, store, sender, clock) -> HostToolsConfig:
+    config.approval_enabled = True
+    config.approvals = host_approval.ApprovalGate(
+        timeout_seconds=86400, chat_id=CHAT, store=store, send=sender, clock=clock,
+    )
+    return config
+
+
+def _approve(store, sender, clock, *, text="APPROVE", chat=CHAT):
+    with store._connect() as conn:  # the newest request's message
+        message_id = int(conn.execute(
+            "SELECT message_ids FROM host_approval_requests ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()[0].strip("[]"))
+    return store.decide_by_reply(message_id, text, chat_id=chat, now=clock.now)
+
+
+def test_gate_off_by_default_refuses_without_asking(config, runner, run_as_ok, sender):
     assert config.approval_enabled is False
     with pytest.raises(HostToolError, match="refused"):
         host_tools.shell(config, {"argv": ["uptime"]}, caller="c")
-    assert asked == [] and runner.calls == []
+    assert sender.sent == [] and runner.calls == []
 
 
-def test_approved_command_runs_as_the_low_privilege_account(config, runner, run_as_ok):
-    asked = []
-    config.approval_enabled = True
-    config.approver = lambda summary, caller: asked.append((summary, caller)) or "approved"
-    result = host_tools.shell(config, {"argv": ["uptime"]}, caller="oauth:client-a")
-    assert result["rule"] == "approved"
-    assert runner.calls[0]["argv"] == ["sudo", "-n", "-u", "lifeos-tools", "--", "uptime"]
-    assert "uptime" in asked[0][0] and asked[0][1] == "oauth:client-a"
-
-
-@pytest.mark.parametrize("verdict", ["denied", "timeout"])
-def test_unapproved_command_is_refused(config, runner, run_as_ok, verdict):
-    config.approval_enabled = True
-    config.approver = lambda summary, caller: verdict
-    with pytest.raises(HostToolError, match=verdict):
-        host_tools.shell(config, {"argv": ["uptime"]}, caller="c")
+def test_request_shows_the_exact_command_and_waits(gated, runner, run_as_ok, sender):
+    argv = ["grep", "-c", "a_b*c [x]", "Work/Plan.md"]
+    result = host_tools.shell(gated, {"argv": argv, "cwd_root": "vault"}, caller="oauth:client-a")
+    assert result["rule"] == "pending-approval" and result["exit_code"] is None
     assert runner.calls == []
-    assert _audit(config)[-1]["decision"] == f"approval-{verdict}"
+    message = sender.sent[0]
+    assert "grep -c 'a_b*c [x]' Work/Plan.md" in message  # unshortened, markup untouched
+    assert "Caller: oauth:client-a" in message
+    assert "Runs as: lifeos-tools" in message
+    assert "Directory: vault/." in message
+    assert "Asked: " in message and "Expires: " in message and "Command hash: " in message
+    assert _audit(gated)[-1]["decision"] == "approval-pending"
 
 
-def test_approval_store_decides_only_on_reply_to_its_message(tmp_path):
-    store = host_approval.ApprovalStore(tmp_path / "approvals.db")
-    rid = store.create(expires_at=9e12)
-    store.attach_messages(rid, [101, 102])
-    assert store.decide_by_reply(999, "approve") is False
-    assert store.decide_by_reply(102, " APPROVE ") is True
-    assert store.decision(rid) == "approved"
-    other = store.create(expires_at=9e12)
-    store.attach_messages(other, [200])
-    assert store.decide_by_reply(200, "yes") is True
-    assert store.decision(other) == "denied"
-    expired = store.create(expires_at=1.0)
-    store.attach_messages(expired, [300])
-    assert store.decide_by_reply(300, "approve") is False
+def test_approved_command_runs_once_as_the_low_privilege_account(gated, runner, run_as_ok, sender, store, clock):
+    call = {"argv": ["uptime"]}
+    host_tools.shell(gated, call, caller="oauth:client-a")
+    clock.now += 5 * 3600  # approved hours later
+    row = _approve(store, sender, clock)
+    assert row.state == "approved" and row.approver == f"telegram:{CHAT}"
+    clock.now += 60
+    result = host_tools.shell(gated, call, caller="oauth:client-a")
+    assert result["rule"] == "approved" and result["exit_code"] == 0
+    assert runner.calls[0]["argv"] == ["sudo", "-n", "-u", "lifeos-tools", "--", "uptime"]
+    record = _audit(gated)[-1]
+    assert record["decision"] == "approved" and record["request_id"] == row.id
+    assert record["approver"] == f"telegram:{CHAT}" and record["request_age_s"] > 0
+    assert "ran (exit 0)" in sender.sent[-1] and "Asked 5h 1m ago" in sender.sent[-1]
+    # Spent: the same call asks again rather than running a second time.
+    again = host_tools.shell(gated, call, caller="oauth:client-a")
+    assert again["rule"] == "pending-approval" and len(runner.calls) == 1
 
 
-def test_request_approval_times_out_to_a_denial(tmp_path):
-    store = host_approval.ApprovalStore(tmp_path / "approvals.db")
-    now = [1000.0]
-    sent = []
-    verdict = host_approval.request_approval(
-        "run uptime", timeout_seconds=30, store=store,
-        send=lambda text: sent.append(text) or [7],
-        clock=lambda: now[0], sleep=lambda s: now.__setitem__(0, now[0] + 10),
+def test_waiting_request_is_not_sent_twice(gated, runner, run_as_ok, sender):
+    for _ in range(3):
+        result = host_tools.shell(gated, {"argv": ["uptime"]}, caller="c")
+        assert result["rule"] == "pending-approval"
+    assert len(sender.sent) == 1 and runner.calls == []
+
+
+def test_approval_is_bound_to_caller_argv_and_directory(gated, runner, run_as_ok, sender, store, clock):
+    host_tools.shell(gated, {"argv": ["uptime"]}, caller="oauth:client-a")
+    _approve(store, sender, clock)
+    for call, caller in [
+        ({"argv": ["uptime", "-p"]}, "oauth:client-a"),
+        ({"argv": ["uptime"], "cwd_root": "vault"}, "oauth:client-a"),
+        ({"argv": ["uptime"]}, "oauth:client-b"),
+    ]:
+        assert host_tools.shell(gated, call, caller=caller)["rule"] == "pending-approval"
+    assert runner.calls == []
+    assert host_tools.shell(gated, {"argv": ["uptime"]}, caller="oauth:client-a")["rule"] == "approved"
+
+
+def test_only_the_configured_chat_can_decide(gated, run_as_ok, sender, store, clock):
+    host_tools.shell(gated, {"argv": ["uptime"]}, caller="c")
+    assert _approve(store, sender, clock, chat="chat-someone-else") is None
+    assert _approve(store, sender, clock).state == "approved"
+    # A second reply to the same message is not a new decision.
+    assert _approve(store, sender, clock) is None
+
+
+def test_denied_request_is_reported_once_then_can_be_asked_again(gated, runner, run_as_ok, sender, store, clock):
+    host_tools.shell(gated, {"argv": ["uptime"]}, caller="c")
+    assert _approve(store, sender, clock, text="no").state == "denied"
+    with pytest.raises(HostToolError, match="refused request"):
+        host_tools.shell(gated, {"argv": ["uptime"]}, caller="c")
+    assert _audit(gated)[-1]["decision"] == "approval-denied"
+    assert host_tools.shell(gated, {"argv": ["uptime"]}, caller="c")["rule"] == "pending-approval"
+    assert len(sender.sent) == 2 and runner.calls == []
+
+
+def test_requests_and_unused_approvals_expire_and_are_logged(gated, runner, run_as_ok, sender, store, clock):
+    host_tools.shell(gated, {"argv": ["uptime"]}, caller="c")
+    host_tools.shell(gated, {"argv": ["hostname"]}, caller="c")
+    _approve(store, sender, clock)  # approves the newest (hostname); its caller never comes back
+    clock.now += 86400 + 1
+    assert _approve(store, sender, clock) is None
+    host_tools.shell(gated, {"argv": ["date"]}, caller="c")  # any later call sweeps
+    decisions = [r["decision"] for r in _audit(gated)]
+    assert "approval-expired-pending" in decisions and "approval-expired-approved" in decisions
+    assert runner.calls == []
+
+
+def test_expiry_can_be_turned_off(gated, runner, run_as_ok, sender, store, clock):
+    gated.approvals.timeout_seconds = None
+    host_tools.shell(gated, {"argv": ["uptime"]}, caller="c")
+    assert "Expires: never" in sender.sent[0]
+    clock.now += 400 * 86400
+    assert _approve(store, sender, clock).state == "approved"
+    assert host_tools.shell(gated, {"argv": ["uptime"]}, caller="c")["rule"] == "approved"
+
+
+def test_approval_timeout_setting():
+    assert host_tools.approval_timeout(0) is None
+    assert host_tools.approval_timeout(-1) is None
+    assert host_tools.approval_timeout(5) == 60
+    assert host_tools.approval_timeout(86400) == 86400
+
+
+def test_two_racing_calls_spend_one_approval(store, clock):
+    rid = store.create(caller="c", command_hash="h", chat_id=CHAT, expires_at=None, now=clock.now)
+    store.attach_messages(rid, [9])
+    store.decide_by_reply(9, "approve", chat_id=CHAT, now=clock.now)
+    assert store.consume(rid, "other-hash", now=clock.now) is False
+    assert store.consume(rid, "h", now=clock.now) is True
+    assert store.consume(rid, "h", now=clock.now) is False
+
+
+@pytest.mark.parametrize("argv, why", [
+    (["bash", "-c", "uptime"], "never run through approval"),
+    (["python3.12", "-V"], "never run through approval"),
+    (["curl", "https://example.invalid"], "never run through approval"),
+    (["git", "push", "origin"], "never run through approval"),
+    (["cat", "/etc/hostname"], "absolute"),
+    (["cat", "~/notes"], "absolute"),
+    (["cat", "--file=/etc/hostname"], "absolute"),
+    (["cat", "../outside/secret.txt"], "'..'"),
+    (["cat", ".env"], "denied path"),
+    (["cat", "data/session.pickle"], "denied path"),
+    (["wc", "-l", "data/notes.txt"], "'data/'"),
+])
+def test_dangerous_commands_are_refused_without_asking(gated, runner, run_as_ok, sender, argv, why):
+    with pytest.raises(HostToolError, match=why):
+        host_tools.shell(gated, {"argv": argv}, caller="c")
+    assert sender.sent == [] and runner.calls == []
+    assert _audit(gated)[-1]["decision"] == "refused"
+
+
+def test_symlinked_argument_out_of_a_root_is_refused(gated, roots, runner, run_as_ok, sender):
+    (roots["lifeos"] / "escape").symlink_to(roots["outside"], target_is_directory=True)
+    with pytest.raises(HostToolError, match="outside the readable roots"):
+        host_tools.shell(gated, {"argv": ["cat", "escape/secret.txt"]}, caller="c")
+    assert sender.sent == []
+
+
+def test_too_long_or_unsendable_requests_are_refused(gated, run_as_ok, sender, monkeypatch):
+    with pytest.raises(HostToolError, match="too long"):
+        host_tools.shell(gated, {"argv": ["echo", "x" * 4000]}, caller="c")
+    gated.approvals.send = lambda text: []
+    with pytest.raises(HostToolError, match="could not be sent"):
+        host_tools.shell(gated, {"argv": ["uptime"]}, caller="c")
+
+
+def test_pending_requests_per_caller_are_capped(gated, run_as_ok, sender):
+    for i in range(host_approval.MAX_PENDING_PER_CALLER):
+        host_tools.shell(gated, {"argv": ["echo", str(i)]}, caller="c")
+    with pytest.raises(HostToolError, match="already waiting"):
+        host_tools.shell(gated, {"argv": ["echo", "more"]}, caller="c")
+    assert host_tools.shell(gated, {"argv": ["echo", "more"]}, caller="other")["rule"] == "pending-approval"
+
+
+def test_gate_refuses_without_a_configured_chat(config, store, run_as_ok):
+    config.approval_enabled = True
+    config.approvals = host_approval.ApprovalGate(timeout_seconds=60, chat_id="", store=store)
+    with pytest.raises(HostToolError, match="TELEGRAM_CHAT_ID"):
+        host_tools.shell(config, {"argv": ["uptime"]}, caller="c")
+
+
+def test_default_sender_sends_plain_text(monkeypatch):
+    from api.services import telegram
+
+    calls = []
+    monkeypatch.setattr(
+        telegram, "send_message_capture_ids",
+        lambda text, **kw: calls.append((text, kw)) or [1],
     )
-    assert verdict == "timeout"
-    assert "APPROVE" in sent[0] and "run uptime" in sent[0]
+    send = host_approval._default_sender(CHAT)
+    assert send("a_b *c*") == [1]
+    assert calls == [("a_b *c*", {"chat_id": CHAT, "parse_mode": None})]
 
 
-def test_request_approval_returns_the_recorded_reply(tmp_path):
-    store = host_approval.ApprovalStore(tmp_path / "approvals.db")
-    now = [time.time()]  # the store checks expiry against the wall clock
-
-    def sleep(_):
-        store.decide_by_reply(7, "approve")
-        now[0] += 1
-
-    verdict = host_approval.request_approval(
-        "run uptime", timeout_seconds=30, store=store, send=lambda text: [7],
-        clock=lambda: now[0], sleep=sleep,
-    )
-    assert verdict == "approved"
-
-
-def test_request_approval_denies_when_the_message_cannot_be_sent(tmp_path):
-    store = host_approval.ApprovalStore(tmp_path / "approvals.db")
-    verdict = host_approval.request_approval("x", timeout_seconds=30, store=store, send=lambda text: [])
-    assert verdict == "denied"
+def test_operator_reply_text_names_the_request_and_its_age(store, clock):
+    rid = store.create(caller="oauth:client-a", command_hash="h", chat_id=CHAT, expires_at=None, now=clock.now - 7200)
+    store.attach_messages(rid, [5])
+    row = store.decide_by_reply(5, "approve", chat_id=CHAT, now=clock.now)
+    text = host_approval.approval_reply_text(row, now=clock.now)
+    assert rid[:8] in text and "2h 0m ago" in text and "oauth:client-a" in text
 
 
 # ── logs ─────────────────────────────────────────────────────────────────
@@ -448,6 +608,36 @@ def test_full_access_dispatch_runs_host_tools_with_its_caller(monkeypatch, confi
     assert _audit(config)[-1]["caller"] == "full-access-token"
 
 
+def test_host_write_sent_as_a_notification_runs_once_and_is_audited(monkeypatch, config, roots, caplog):
+    import logging
+
+    from fastapi.testclient import TestClient
+
+    srv = _server(monkeypatch, True)
+    srv._host_tools_config = config
+    client = TestClient(mcp_server.build_http_app(srv, bearer_token="synthetic-token"))
+    caplog.set_level(logging.INFO, logger=mcp_server.logger.name)
+    notification = {"jsonrpc": "2.0", "method": "tools/call", "params": {
+        "name": "lifeos_fs_write",
+        "arguments": {"root": "scratch", "path": "n/a.md", "content": "once\n", "mode": "append"},
+    }}
+    resp = client.post("/mcp", headers={"Authorization": "Bearer synthetic-token"}, json=notification)
+    assert resp.status_code == 202
+    assert resp.content == b""
+    assert (roots["scratch"] / "n" / "a.md").read_text() == "once\n"
+    writes = [r for r in _audit(config) if r.get("tool") == "lifeos_fs_write"]
+    assert len(writes) == 1
+    assert writes[0]["caller"] == "full-access-token"
+    lines = [r for r in caplog.records if r.getMessage().startswith("mcp audit:")]
+    assert len(lines) == 1
+    message = lines[0].getMessage()
+    assert lines[0].levelno == logging.WARNING
+    assert "caller=full-access-token" in message
+    assert "tool=lifeos_fs_write" in message
+    assert "host_write=True" in message
+    assert "failed=False" in message
+
+
 def test_oauth_clients_get_host_tools_only_when_the_operator_lists_them(monkeypatch, config):
     from config.settings import settings
 
@@ -483,3 +673,260 @@ def test_agent_worker_registry_leaves_host_tools_out(monkeypatch):
     registry = ToolRegistry(lifeos_mcp_server=_server(monkeypatch, True))
     names = {t["name"] for t in registry.definitions()}
     assert not names & host_tools.HOST_TOOL_NAMES
+
+
+# ── git path arguments, vault commit literalness, audit ordering ─────────
+
+
+@pytest.mark.parametrize("argv", [
+    ["git", "diff", ".env", "api/main.py"],
+    ["git", "diff", "api/main.py", "data/notes.txt"],
+    ["git", "show", "HEAD:.env"],
+    ["git", "show", "HEAD:data/notes.txt"],
+    ["git", "show", "HEAD:./data/notes.txt"],
+    ["git", "log", "--", "data/notes.txt"],
+    ["git", "log", "--", ".env"],
+    ["git", "log", "--", "../outside/secret.txt"],
+    ["git", "diff", "--no-index", "api/main.py", "api/main.py"],
+    ["git", "log", ":(top)data"],
+])
+def test_git_path_arguments_stay_inside_the_readable_roots(config, runner, run_as_ok, argv):
+    with pytest.raises(HostToolError, match="refused"):
+        host_tools.shell(config, {"argv": argv}, caller="c")
+    assert runner.calls == []
+
+
+def test_git_path_arguments_are_confined_from_a_cwd_that_is_not_a_repo(config, runner, run_as_ok):
+    with pytest.raises(HostToolError, match="refused"):
+        host_tools.shell(config, {"argv": ["git", "diff", "server.log", "../.env"], "cwd_root": "logs"}, caller="c")
+    host_tools.shell(config, {"argv": ["git", "diff", "a.log", "b.log"], "cwd_root": "logs"}, caller="c")
+    assert runner.calls[0]["cwd"].endswith("logs")
+
+
+def test_git_revisions_and_in_root_paths_are_allowed(config, runner, run_as_ok):
+    host_tools.shell(config, {"argv": ["git", "show", "HEAD:api/main.py"]}, caller="c")
+    host_tools.shell(config, {"argv": ["git", "log", "-n5", "main..HEAD", "--", "api"]}, caller="c")
+    assert "--literal-pathspecs" in runner.calls[0]["argv"]
+    assert len(runner.calls) == 2
+
+
+def test_vault_commit_takes_the_path_literally(config, roots):
+    vault = roots["vault"]
+    _git("init", "-q", cwd=vault)
+    _git("config", "user.email", "test@example.com", cwd=vault)
+    _git("config", "user.name", "Synthetic Tester", cwd=vault)
+    (vault / "Work" / "Other.md").write_text("one\n")
+    _git("add", "-A", cwd=vault)
+    _git("commit", "-q", "-m", "init", cwd=vault)
+    (vault / "Work" / "Other.md").write_text("dirty\n")
+    config.vault_autocommit = True
+
+    host_tools.fs_write(config, {"root": "vault", "path": "Work/*.md", "content": "star\n"})
+
+    assert _git("show", "--name-only", "--format=", "HEAD", cwd=vault).strip() == "Work/*.md"
+    assert "Work/Other.md" in _git("status", "--porcelain", cwd=vault)
+
+
+def test_shell_records_the_command_before_it_runs(config, run_as_ok):
+    seen = []
+
+    def runner(argv, **kwargs):
+        seen.append(_audit(config))
+        raise RuntimeError("process went away")
+
+    config.runner = runner
+    with pytest.raises(RuntimeError):
+        host_tools.shell(config, {"argv": ["systemctl", "restart", "lifeos-mcp-http"]}, caller="c")
+    started = seen[0][-1]
+    assert started["decision"] == "started" and started["rule"] == "systemctl restart"
+    assert started["argv"] == ["systemctl", "restart", "lifeos-mcp-http"] and started["caller"] == "c"
+
+
+@pytest.mark.parametrize("argv", [
+    ["git", "-c", "core.pager=sh", "log"],
+    ["git", "-C", "api", "log"],
+    ["git", "--git-dir=x", "log"],
+])
+def test_git_options_before_the_subcommand_are_not_sent_for_approval(gated, runner, run_as_ok, sender, argv):
+    with pytest.raises(HostToolError, match="before the subcommand"):
+        host_tools.shell(gated, {"argv": argv}, caller="c")
+    assert sender.sent == [] and runner.calls == []
+
+
+@pytest.mark.parametrize("command", [
+    "find", "systemd-run", "sed", "make", "tar", "awk", "perl", "xargs", "watch",
+    "nohup", "setsid", "chroot", "flock",
+])
+def test_command_runners_are_not_sent_for_approval(gated, runner, run_as_ok, sender, command):
+    with pytest.raises(HostToolError, match="never run through approval"):
+        host_tools.shell(gated, {"argv": [command, "x"]}, caller="c")
+    assert sender.sent == [] and runner.calls == []
+
+
+def test_reading_a_log_file_redacts_tokens(config, roots):
+    (roots["logs"] / "server.log").write_text("ok\nerror bot42:SYNTHETICtoken_abc here\n")
+    content = host_tools.fs_read(config, {"root": "logs", "path": "server.log"})["content"]
+    assert "SYNTHETIC" not in content and "ok" in content
+
+
+# ── revision paths, audit redaction, denylist coverage ───────────────────
+
+
+@pytest.mark.parametrize("argv", [
+    ["git", "show", "HEAD:.env"],
+    ["git", "show", "HEAD:data/notes.txt"],
+    ["git", "show", "HEAD:../outside.txt"],
+    ["git", "show", "HEAD:./data/notes.txt"],
+])
+def test_git_revision_paths_refused_by_the_allowlist_are_not_sent_for_approval(
+    gated, runner, run_as_ok, sender, argv,
+):
+    with pytest.raises(HostToolError, match="Not sent for approval"):
+        host_tools.shell(gated, {"argv": argv}, caller="c")
+    assert sender.sent == [] and runner.calls == []
+
+
+TOKEN = "bot42:SYNTHETICtoken_abc"
+
+
+def test_audit_records_redact_tokens_in_argv_and_reasons(gated, run_as_ok):
+    host_tools.shell(gated, {"argv": ["git", "log", f"--since={TOKEN}"]}, caller="c")
+    with pytest.raises(HostToolError):
+        host_tools.shell(gated, {"argv": ["ls", f"../{TOKEN}"]}, caller="c")
+    with pytest.raises(HostToolError):
+        host_tools.shell(gated, {"argv": ["cat", f"../{TOKEN}"]}, caller="c")
+    assert "SYNTHETIC" not in gated.audit_path.read_text()
+    records = _audit(gated)
+    assert [r["decision"] for r in records] == ["started", "git log", "refused", "refused"]
+    assert "bot<REDACTED>" in records[0]["argv"][2]
+
+
+def test_command_does_not_run_when_the_started_record_cannot_be_written(config, runner, run_as_ok, tmp_path):
+    config.audit_path = tmp_path  # a directory: the append fails
+    with pytest.raises(HostToolError, match="audit log"):
+        host_tools.shell(config, {"argv": ["ls"]}, caller="c")
+    assert runner.calls == []
+
+
+def test_fs_read_redacts_tokens_whichever_root_alias_is_used(config, roots):
+    (roots["logs"] / "server.log").write_text(f"error {TOKEN} here\n")
+    for root, path in [("logs", "server.log"), ("lifeos", "logs/server.log")]:
+        content = host_tools.fs_read(config, {"root": root, "path": path})["content"]
+        assert "SYNTHETIC" not in content and "here" in content
+
+
+ENV_AND_CERT_NAMES = [".envrc", ".env.local", ".env.production", "prod.env", "server.crt", "ca.cer", "tls.pem"]
+
+
+@pytest.mark.parametrize("name", ENV_AND_CERT_NAMES)
+def test_env_and_certificate_names_are_denied_for_every_tool(config, roots, runner, run_as_ok, name):
+    (roots["vault"] / name).write_text("synthetic\n")
+    with pytest.raises(HostToolError, match="not available"):
+        host_tools.fs_read(config, {"root": "vault", "path": name})
+    with pytest.raises(HostToolError, match="not available"):
+        host_tools.fs_write(config, {"root": "vault", "path": name, "content": "x"})
+    assert name not in {e["name"] for e in host_tools.fs_list(config, {"root": "vault"})["entries"]}
+    for argv in (["ls", name], ["tail", name]):
+        with pytest.raises(HostToolError, match="refused"):
+            host_tools.shell(config, {"argv": argv, "cwd_root": "vault"}, caller="c")
+    assert runner.calls == []
+
+
+# ── approval concurrency, account binding, vault literal paths, listener chat ──
+
+
+def test_concurrent_calls_spend_one_approval(tmp_path, clock):
+    import threading
+
+    store = host_approval.ApprovalStore(tmp_path / "race.db")
+    for round_no in range(25):
+        digest = f"h{round_no}"
+        rid = store.create(caller="c", command_hash=digest, chat_id=CHAT, expires_at=None, now=clock.now)
+        store.attach_messages(rid, [round_no + 1])
+        store.decide_by_reply(round_no + 1, "approve", chat_id=CHAT, now=clock.now)
+        gate = host_approval.ApprovalGate(
+            timeout_seconds=None, chat_id=CHAT, store=store, send=lambda text: [1], clock=clock,
+        )
+        barrier = threading.Barrier(8)
+        outcomes: list[str] = []
+
+        def attempt():
+            barrier.wait()
+            outcomes.append(gate.check(caller="c", command_hash=digest, details="d").outcome)
+
+        threads = [threading.Thread(target=attempt) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert outcomes.count("run") == 1, outcomes
+
+
+def test_approval_is_bound_to_the_run_as_account(gated, runner, run_as_ok, sender, store, clock):
+    host_tools.shell(gated, {"argv": ["uptime"]}, caller="c")
+    _approve(store, sender, clock)
+    gated.run_as = "other-tools"
+    assert host_tools.shell(gated, {"argv": ["uptime"]}, caller="c")["rule"] == "pending-approval"
+    assert len(sender.sent) == 2 and runner.calls == []
+    gated.run_as = "lifeos-tools"
+    assert host_tools.shell(gated, {"argv": ["uptime"]}, caller="c")["rule"] == "approved"
+
+
+def test_vault_commit_treats_pathspec_magic_in_a_file_name_literally(config, roots):
+    vault = roots["vault"]
+    _git("init", "-q", cwd=vault)
+    _git("config", "user.email", "test@example.com", cwd=vault)
+    _git("config", "user.name", "Synthetic Tester", cwd=vault)
+    (vault / "other.md").write_text("one\n")
+    _git("add", "-A", cwd=vault)
+    _git("commit", "-q", "-m", "init", cwd=vault)
+    (vault / "other.md").write_text("dirty\n")
+    config.vault_autocommit = True
+
+    host_tools.fs_write(config, {"root": "vault", "path": ":(glob)*.md", "content": "magic\n"})
+
+    assert _git("show", "--name-only", "--format=", "HEAD", cwd=vault).strip() == ":(glob)*.md"
+    assert "other.md" in _git("status", "--porcelain", cwd=vault)
+
+
+class _ListenerSettings:
+    telegram_chat_id = CHAT
+
+
+@pytest.fixture
+def approval_listener(tmp_path, monkeypatch):
+    from api.services import telegram
+
+    db = tmp_path / "listener-approvals.db"
+    store = host_approval.ApprovalStore(db)
+    monkeypatch.setattr(host_approval, "DEFAULT_DB_PATH", db)
+    monkeypatch.setattr(host_approval, "ApprovalStore", lambda: store)
+    monkeypatch.setattr(host_tools, "_audit_path", lambda: tmp_path / "listener-audit.jsonl")
+    monkeypatch.setattr(telegram, "settings", _ListenerSettings)
+    replies: list[str] = []
+    monkeypatch.setattr(telegram, "send_message_capture_ids", lambda text, **kw: replies.append(text) or [1])
+
+    def listener(chat_id: str):
+        obj = object.__new__(telegram.TelegramBotListener)
+        obj._chat_id = chat_id
+        return obj
+
+    return SimpleNamespace(store=store, listener=listener, replies=replies)
+
+
+def _open_request(store, chat: str, message_id: int = 7) -> str:
+    rid = store.create(caller="c", command_hash="h", chat_id=chat, expires_at=None)
+    store.attach_messages(rid, [message_id])
+    return rid
+
+
+def test_listener_decides_only_for_the_configured_chat(approval_listener):
+    store = approval_listener.store
+    other = _open_request(store, "chat-other")
+    assert approval_listener.listener("chat-other")._maybe_decide_host_approval(7, "APPROVE") is False
+    assert store.get(other).state == "pending"
+
+    mine = _open_request(store, CHAT, message_id=8)
+    assert approval_listener.listener(CHAT)._maybe_decide_host_approval(8, "APPROVE") is True
+    assert store.get(mine).state == "approved"
+    assert approval_listener.replies and "Approved request" in approval_listener.replies[0]

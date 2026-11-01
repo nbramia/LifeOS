@@ -17,6 +17,11 @@ the path. The file tools run in the MCP server process; `lifeos_shell` runs
 every command as a separate low-privilege account through `sudo -n -u`, and
 refuses to run at all when that account is not configured.
 
+Commands outside the allowlist are refused unless the operator turns on
+Telegram approval (`LIFEOS_HOST_TOOLS_SHELL_APPROVAL`); see host_approval.py.
+An approved command still runs as the low-privilege account, still passes the
+path checks, and never names a shell, interpreter or network tool.
+
 Every call is appended to an audit file (`data/host_tools_audit.jsonl`) with
 the caller, the decision and, for commands, the full argv.
 """
@@ -37,6 +42,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 from api.services.atomic_write import atomic_write_text
 from api.services.log_redaction import REDACTED_TOKEN, TELEGRAM_TOKEN_PATTERN
@@ -59,7 +65,7 @@ DENIED_COMPONENTS = frozenset({
 
 # File names (glob, case-insensitive) that are refused anywhere under a root.
 DENIED_NAME_GLOBS = (
-    ".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "*.kdbx",
+    ".env*", "*.env", "*.pem", "*.key", "*.crt", "*.cer", "*.p12", "*.pfx", "*.kdbx",
     "id_rsa*", "id_ed25519*", "id_ecdsa*", "id_dsa*",
     "*.pickle", "*.pkl", "*.db", "*.sqlite", "*.sqlite3", "*.db-wal", "*.db-shm",
     "credentials*.json", "token*.json", "client_secret*.json", "*cookies*",
@@ -98,7 +104,10 @@ SHELL_PATH = "/usr/local/bin:/usr/bin:/bin"
 # Git runs with no pager, no filesystem monitor and no hooks, and diff-like
 # commands skip external diff drivers and textconv filters, so repository
 # config cannot turn a read into a command.
-_GIT_PREFIX = ("git", "--no-pager", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null")
+_GIT_PREFIX = (
+    "git", "--no-pager", "--literal-pathspecs",
+    "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+)
 _GIT_DIFF_SAFETY = ("--no-ext-diff", "--no-textconv")
 
 _GIT_STATUS_FLAGS = frozenset({"-s", "--short", "-b", "--branch", "--porcelain", "-uno", "--untracked-files=no"})
@@ -114,6 +123,25 @@ _LS_FLAGS = frozenset({"-l", "-a", "-A", "-h", "-1", "-t", "-S", "-r", "-la", "-
 _GIT_VALUE_FLAG_RE = re.compile(r"^(-n\d{1,4}|-\d{1,4}|--max-count=\d{1,4}|--since=[^\s]{1,40}|--until=[^\s]{1,40}|-U\d{1,3})$")
 _COUNT_RE = re.compile(r"^\d{1,4}$")
 
+# Commands that are never sent for approval, because they run other commands
+# (so the path checks below would not see what they do), change privilege, or
+# move data off the host. The low-privilege account stays the real boundary;
+# this list removes the obvious ways around the path checks.
+NEVER_APPROVED_COMMANDS = frozenset({
+    "sh", "bash", "zsh", "dash", "ksh", "mksh", "fish", "csh", "tcsh", "busybox",
+    "env", "xargs", "parallel", "nohup", "setsid", "timeout", "nice", "ionice", "stdbuf",
+    "watch", "script", "expect", "chroot", "unshare", "nsenter", "flock",
+    "find", "systemd-run", "sed", "make", "tar",
+    "sudo", "su", "doas", "pkexec", "runuser",
+    "python", "python2", "python3", "perl", "ruby", "node", "nodejs", "deno", "bun",
+    "php", "lua", "tclsh", "awk", "gawk", "mawk", "nawk",
+    "curl", "wget", "ssh", "scp", "sftp", "rsync", "nc", "ncat", "netcat", "socat",
+    "telnet", "ftp", "tftp", "mail", "sendmail",
+})
+_NEVER_APPROVED_RE = re.compile(r"^(python|pypy|perl|ruby|node|php|lua)[\d.]*$")
+# Git subcommands that are never sent for approval: they reach other hosts.
+NEVER_APPROVED_GIT = frozenset({"push", "pull", "fetch", "clone", "ls-remote", "remote", "send-email", "submodule"})
+
 # ── Errors and audit ──────────────────────────────────────────────────────
 
 
@@ -128,15 +156,33 @@ def _audit_path() -> Path:
     return _REPO_ROOT / "data" / "host_tools_audit.jsonl"
 
 
-def audit(event: dict, *, path: Path | None = None) -> None:
-    """Append one audit record. Never raises: a failed audit write is logged."""
+def _redacted_event(event: dict) -> dict:
+    """The event with secrets masked in its argv and free-text fields."""
+    out = dict(event)
+    if isinstance(out.get("argv"), list):
+        out["argv"] = [redact(a) if isinstance(a, str) else a for a in out["argv"]]
+    for key in ("reason", "detail"):
+        if isinstance(out.get(key), str):
+            out[key] = redact(out[key])
+    return out
+
+
+def audit(event: dict, *, path: Path | None = None) -> bool:
+    """Append one audit record; return whether it was written.
+
+    Never raises: a failed audit write is logged. Argv and reason text are
+    redacted before they are written.
+    """
+    event = _redacted_event(event)
     record = {"ts": time.time(), **event}
+    written = False
     target = path or _audit_path()
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(record, sort_keys=True, default=str)
         with _audit_lock, open(target, "a", encoding="utf-8") as f:
             f.write(line + "\n")
+        written = True
     except OSError as exc:
         logger.error("host tools audit write failed: %s", exc)
     logger.log(
@@ -144,6 +190,7 @@ def audit(event: dict, *, path: Path | None = None) -> None:
         "host tools audit: caller=%s tool=%s decision=%s",
         event.get("caller"), event.get("tool"), event.get("decision"),
     )
+    return written
 
 
 # ── Configuration ─────────────────────────────────────────────────────────
@@ -155,12 +202,13 @@ class HostToolsConfig:
     run_as: str = ""
     vault_autocommit: bool = True
     approval_enabled: bool = False
-    approval_timeout_seconds: int = 120
+    # Seconds a request (and an unused approval) stays open; None never expires.
+    approval_timeout_seconds: int | None = 86400
     audit_path: Path | None = None
     # Injected for tests: run a command list, return CompletedProcess.
     runner: Callable[..., subprocess.CompletedProcess] = field(default=subprocess.run)
-    # Injected for tests: approve(summary) -> "approved" | "denied" | "timeout".
-    approver: Callable[[str, str], str] | None = None
+    # The Telegram approval gate (host_approval.ApprovalGate), set when approval is on.
+    approvals: Any = None
 
     @classmethod
     def from_settings(cls) -> HostToolsConfig:
@@ -176,8 +224,15 @@ class HostToolsConfig:
             run_as=(settings.host_tools_run_as or "").strip(),
             vault_autocommit=settings.host_tools_vault_autocommit,
             approval_enabled=settings.host_tools_shell_approval,
-            approval_timeout_seconds=max(10, int(settings.host_tools_approval_timeout_seconds)),
+            approval_timeout_seconds=approval_timeout(settings.host_tools_approval_timeout_seconds),
         )
+
+
+def approval_timeout(seconds: float | None) -> int | None:
+    """Settings value to a timeout: 0 or less turns expiry off; otherwise at least a minute."""
+    if seconds is None or int(seconds) <= 0:
+        return None
+    return max(60, int(seconds))
 
 
 def oauth_clients_granted() -> frozenset[str]:
@@ -347,24 +402,27 @@ def fs_read(config: HostToolsConfig, arguments: dict) -> dict:
         data = f.read(limit)
     if b"\x00" in data[:8192]:
         raise HostToolError("binary files are not returned")
+    content = redact(data.decode("utf-8", errors="replace"))
     return {
         "root": name,
         "path": str(rel),
         "size": size,
         "truncated": size > len(data),
-        "content": data.decode("utf-8", errors="replace"),
+        "content": content,
     }
 
 
 def _vault_commit(root: Path, rel: PurePosixPath) -> str | None:
-    """Commit one vault path as the LifeOS account, with the vault's own hooks.
+    """Commit one vault path as the LifeOS account.
 
-    Only that path is committed, so unrelated uncommitted changes stay out.
+    The path is taken literally (no pattern matching), and git runs with the
+    same no-hooks, no-fsmonitor settings as the shell's git commands. Only
+    that path is committed, so unrelated uncommitted changes stay out.
     Returns the short commit sha, or None when there was nothing to commit.
     """
     if not (root / ".git").exists():
         return None
-    git = ("git", "--no-pager", "-C", str(root))
+    git = (*_GIT_PREFIX, "-C", str(root))
     add = subprocess.run([*git, "add", "--", str(rel)], capture_output=True, text=True, timeout=30, check=False)
     if add.returncode != 0:
         raise HostToolError(f"written, but git add failed: {add.stderr.strip()[:300]}")
@@ -452,18 +510,43 @@ def logs(config: HostToolsConfig, arguments: dict) -> dict:
 # ── Commands ──────────────────────────────────────────────────────────────
 
 
-def _git_args(rest: list[str], flags: frozenset[str]) -> str | None:
+def _check_git_path_arg(config: HostToolsConfig, cwd: Path, arg: str) -> str | None:
+    """Refusal for a non-flag git argument, or None.
+
+    Every such argument is treated as a possible path and confined like an
+    `ls` or `tail` argument. A `<rev>:<path>` argument has its path part
+    checked against the denylist and the readable roots.
+    """
+    if arg.startswith((":(", ":/", ":!", ":^")):
+        return f"git pathspec magic is not on the allowlist: {arg!r}"
+    if ":" in arg:
+        path = arg.split(":", 1)[1]
+        if not path:
+            return None
+        parts = PurePosixPath(path.lstrip("./") or ".").parts
+        reason = _denied_reason("lifeos", Path("."), parts)
+        if reason:
+            return f"{reason}: {arg!r}"
+        return _check_shell_path_arg(config, cwd, path)
+    return _check_shell_path_arg(config, cwd, arg)
+
+
+def _git_args(
+    rest: list[str], flags: frozenset[str], config: HostToolsConfig, cwd: Path,
+) -> str | None:
     after_separator = False
     for arg in rest:
-        if after_separator:
-            continue
-        if arg == "--":
-            after_separator = True
-            continue
-        if arg.startswith("-"):
-            if arg in flags or _GIT_VALUE_FLAG_RE.match(arg):
+        if not after_separator:
+            if arg == "--":
+                after_separator = True
                 continue
-            return f"git option {arg!r} is not on the allowlist"
+            if arg.startswith("-"):
+                if arg in flags or _GIT_VALUE_FLAG_RE.match(arg):
+                    continue
+                return f"git option {arg!r} is not on the allowlist"
+        why = _check_git_path_arg(config, cwd, arg)
+        if why:
+            return why
     return None
 
 
@@ -487,11 +570,11 @@ def match_allowlist(config: HostToolsConfig, argv: list[str], cwd: Path) -> tupl
     if head == "git" and rest:
         sub, args = rest[0], rest[1:]
         if sub == "status":
-            why = _git_args(args, _GIT_STATUS_FLAGS)
+            why = _git_args(args, _GIT_STATUS_FLAGS, config, cwd)
             return (None, why) if why else ([*_GIT_PREFIX, "status", *args], "git status")
         if sub in ("log", "diff", "show"):
             flags = _GIT_LOG_FLAGS if sub in ("log", "show") else _GIT_DIFF_FLAGS
-            why = _git_args(args, flags)
+            why = _git_args(args, flags, config, cwd)
             return (None, why) if why else ([*_GIT_PREFIX, sub, *_GIT_DIFF_SAFETY, *args], f"git {sub}")
         return None, f"git {sub!r} is not on the allowlist"
     if head == "systemctl" and rest:
@@ -578,6 +661,96 @@ def _cap(text: str) -> tuple[str, bool]:
     return raw[-SHELL_OUTPUT_MAX_BYTES:].decode("utf-8", errors="replace"), True
 
 
+def check_approval_argv(config: HostToolsConfig, argv: list[str], cwd: Path) -> str | None:
+    """Refusal for a command that may not be sent for approval, or None.
+
+    Every argument (and the value after any '=') that looks like a path must
+    stay inside a readable root and off the denylist, as for ls and tail.
+    """
+    head = argv[0].lower()
+    if head in NEVER_APPROVED_COMMANDS or _NEVER_APPROVED_RE.match(head):
+        return f"{argv[0]!r} is never run through approval"
+    if head == "git":
+        if len(argv) > 1 and argv[1].startswith("-"):
+            return f"git options before the subcommand are never run through approval: {argv[1]!r}"
+        sub = argv[1] if len(argv) > 1 else ""
+        if sub in NEVER_APPROVED_GIT:
+            return f"git {sub!r} is never run through approval"
+    if head == "git":
+        for arg in argv[2:]:
+            if not arg.startswith("-") and ":" in arg:
+                why = _check_git_path_arg(config, cwd, arg)
+                if why:
+                    return why
+    for arg in argv[1:]:
+        candidates = [arg] + ([arg.split("=", 1)[1]] if "=" in arg else [])
+        for value in candidates:
+            if not value:
+                continue
+            if value.startswith(("/", "~")):
+                return f"absolute and home paths are refused: {arg!r}"
+            parts = PurePosixPath(value).parts
+            if ".." in parts:
+                return f"'..' is refused: {arg!r}"
+            if any(p in DENIED_COMPONENTS or _is_denied_name(p) for p in parts):
+                return f"denied path: {arg!r}"
+            try:
+                looks_like_path = "/" in value or (cwd / value).exists()
+            except (OSError, ValueError):
+                looks_like_path = True
+            if looks_like_path:
+                why = _check_shell_path_arg(config, cwd, value)
+                if why:
+                    return why
+    return None
+
+
+def _approval_details(*, caller: str, user: str, cwd_label: str, argv: list[str], digest: str) -> str:
+    return (
+        f"Caller: {caller}\n"
+        f"Runs as: {user}\n"
+        f"Directory: {cwd_label}\n"
+        f"Command ({len(argv)} arguments, shown as shell words):\n"
+        f"{shlex.join(argv)}\n"
+        f"Command hash: {digest[:16]}"
+    )
+
+
+def _shell_via_approval(
+    config: HostToolsConfig, argv: list[str], cwd: Path, cwd_label: str,
+    user: str, caller: str, event: dict, reason: str,
+):
+    """Return (approval row, None) to run now, or (None, result) to return instead."""
+    from api.services.host_approval import command_hash
+
+    gate = config.approvals
+    for row in gate.sweep():
+        audit({
+            "tool": "lifeos_shell", "caller": row.caller, "decision": f"approval-expired-{row.state}",
+            "request_id": row.id, "command_hash": row.command_hash,
+        }, path=config.audit_path)
+    why = check_approval_argv(config, argv, cwd)
+    if why:
+        audit({**event, "decision": "refused", "reason": why}, path=config.audit_path)
+        raise HostToolError(f"refused: {why}. Not sent for approval.")
+    digest = command_hash(caller=caller, run_as=user, cwd=cwd_label, argv=argv)
+    details = _approval_details(caller=caller, user=user, cwd_label=cwd_label, argv=argv, digest=digest)
+    result = gate.check(caller=caller, command_hash=digest, details=details)
+    row = result.request
+    record = {**event, "command_hash": digest, "request_id": row.id if row else None, "reason": reason}
+    if result.outcome == "run":
+        return row, None
+    audit({**record, "decision": f"approval-{result.outcome}", "detail": result.message}, path=config.audit_path)
+    if result.outcome == "pending":
+        return None, {
+            "exit_code": None,
+            "rule": "pending-approval",
+            "request_id": row.short_id if row else None,
+            "message": result.message,
+        }
+    raise HostToolError(f"refused: {result.message}")
+
+
 def shell(config: HostToolsConfig, arguments: dict, *, caller: str) -> dict:
     argv = _validate_argv(arguments.get("argv"))
     cwd_root = arguments.get("cwd_root") or "lifeos"
@@ -591,18 +764,25 @@ def shell(config: HostToolsConfig, arguments: dict, *, caller: str) -> dict:
         audit({**event, "decision": "refused", "reason": str(exc)}, path=config.audit_path)
         raise
     execute, rule = match_allowlist(config, argv, cwd)
+    approval = None
     if execute is None:
         reason = rule
-        if not config.approval_enabled or config.approver is None:
+        if not config.approval_enabled or config.approvals is None:
             audit({**event, "decision": "refused", "reason": reason}, path=config.audit_path)
             raise HostToolError(f"refused: {reason}. Commands outside the allowlist are not run.")
-        summary = f"{caller} wants to run in {cwd_root}/{cwd_rel}:\n{shlex.join(argv)}"
-        verdict = config.approver(summary, caller)
-        if verdict != "approved":
-            audit({**event, "decision": f"approval-{verdict}", "reason": reason}, path=config.audit_path)
-            raise HostToolError(f"refused: not approved ({verdict})")
+        approval, pending = _shell_via_approval(
+            config, argv, cwd, event["cwd"], user, caller, event, reason,
+        )
+        if approval is None:
+            return pending
         execute, rule = argv, "approved"
+        event = {
+            **event, "request_id": approval.id, "approver": approval.approver,
+            "request_age_s": round(config.approvals.clock() - approval.created_at, 1),
+        }
     command = ["sudo", "-n", "-u", user, "--", *execute]
+    if not audit({**event, "decision": "started", "rule": rule}, path=config.audit_path):
+        raise HostToolError("the audit log is not writable, so the command was not run")
     started = time.monotonic()
     try:
         result = config.runner(
@@ -616,6 +796,8 @@ def shell(config: HostToolsConfig, arguments: dict, *, caller: str) -> dict:
         )
     except subprocess.TimeoutExpired:
         audit({**event, "decision": rule, "exit": None, "timeout": True}, path=config.audit_path)
+        if approval is not None:
+            config.approvals.notify_ran(approval, None)
         raise HostToolError(f"timed out after {SHELL_TIMEOUT_SECONDS}s")
     stdout, out_cut = _cap(redact(result.stdout or ""))
     stderr, err_cut = _cap(redact(result.stderr or ""))
@@ -624,6 +806,8 @@ def shell(config: HostToolsConfig, arguments: dict, *, caller: str) -> dict:
         "duration_s": round(time.monotonic() - started, 3),
         "stdout_bytes": len(result.stdout or ""), "stderr_bytes": len(result.stderr or ""),
     }, path=config.audit_path)
+    if approval is not None:
+        config.approvals.notify_ran(approval, result.returncode)
     return {
         "exit_code": result.returncode,
         "rule": rule,
@@ -686,7 +870,9 @@ HOST_TOOL_SCHEMAS: list[dict] = [
         "description": "Run one allowlisted command on the LifeOS host as a low-privilege "
                        "account: git status/log/diff/show, systemctl status or restart of a "
                        "LifeOS unit, ls, tail. Pass argv as a list; there is no shell. "
-                       "Anything else is refused.",
+                       "Anything else is refused, unless the operator has turned on approval: "
+                       "then it returns a pending request, and repeating the identical call "
+                       "after the operator approves runs it once.",
         "inputSchema": {
             "type": "object",
             "properties": {

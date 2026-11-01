@@ -830,9 +830,10 @@ class Settings(BaseSettings):
                     "of refusing them. Off: they are refused."
     )
     host_tools_approval_timeout_seconds: int = Field(
-        default=120,
+        default=86400,
         alias="LIFEOS_HOST_TOOLS_APPROVAL_TIMEOUT_SECONDS",
-        description="How long an approval request waits for a reply before it is denied."
+        description="How long an approval request, and an approval not yet used, stays open "
+                    "before it expires unused. 0 turns expiry off."
     )
 
     # Agent Worker — external worker that picks up #agent-tagged tasks.

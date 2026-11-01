@@ -93,10 +93,6 @@ The OAuth connected-apps endpoint above remains the route for the Claude and Cha
 
 Every `tools/call` on the HTTP transport is logged as an `mcp audit:` line with the caller (`full-access-token` or `oauth:<client_id>`), the edge it came through, the tool, its argument names and a hash of the arguments, never their values. Calls to tools that can start agent-worker execution, and host-tool writes and commands, log at `WARNING`.
 
-## Host tools for a connected app
-
-An app can also be given scoped file, command and log access to the host (the host tools), by listing its client id in `LIFEOS_HOST_TOOLS_OAUTH_CLIENTS`. That grant adds those five tools and nothing else. See [Host Tools](host-tools.md).
-
 1. Add the route to `config/tailscale-routes.local` (private, no `funnel=on`, `/mcp` only):
 
    ```
@@ -121,6 +117,10 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST https://<host>.<tailnet>.ts.net
 curl -s -X POST https://<host>.<tailnet>.ts.net:8443/mcp -H "Authorization: Bearer $LIFEOS_MCP_BEARER_TOKEN" \
   -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'   # full catalog
 ```
+
+## Host tools for a connected app
+
+An app can also be given scoped file, command and log access to the host (the host tools), by listing its client id in `LIFEOS_HOST_TOOLS_OAUTH_CLIENTS`. That grant adds those five tools and nothing else. See [Host Tools](host-tools.md).
 
 ## Troubleshooting
 

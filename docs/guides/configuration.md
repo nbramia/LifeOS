@@ -194,8 +194,8 @@ Scoped file, command and log access over MCP (`lifeos_fs_list`, `lifeos_fs_read`
 | `LIFEOS_HOST_TOOLS_SCRATCH_DIR` | path | `scratch/` in the checkout | Writable scratch root, created on first use. |
 | `LIFEOS_HOST_TOOLS_OAUTH_CLIENTS` | str (comma-separated) | — | OAuth client ids that get the host tools in addition to the connected-app tier. Empty: no connected app gets them. |
 | `LIFEOS_HOST_TOOLS_VAULT_AUTOCOMMIT` | bool | `true` | Commit each host-tools vault write (that path only) when the vault is a git repo. |
-| `LIFEOS_HOST_TOOLS_SHELL_APPROVAL` | bool | `false` | Send commands outside the allowlist to the primary Telegram bot for an `APPROVE` reply. Off: they are refused. |
-| `LIFEOS_HOST_TOOLS_APPROVAL_TIMEOUT_SECONDS` | int | `120` | How long an approval request waits before it is denied (minimum 10). |
+| `LIFEOS_HOST_TOOLS_SHELL_APPROVAL` | bool | `false` | Send commands outside the allowlist to `TELEGRAM_CHAT_ID` through the primary bot; a reply of `APPROVE` lets the caller run that exact command once. Off: they are refused. See [Host Tools](host-tools.md#approval-for-other-commands). |
+| `LIFEOS_HOST_TOOLS_APPROVAL_TIMEOUT_SECONDS` | int | `86400` | How long a request, and an approval not yet used, stays open before it expires unused (minimum 60). `0` turns expiry off. |
 
 ## Agent Worker — Defaults and Budgets
 

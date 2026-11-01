@@ -201,6 +201,7 @@ def send_message_capture_ids(
     chat_id: str = None,
     bot: str = None,
     reply_to_message_id: int | None = None,
+    parse_mode: str | None = "Markdown",
 ) -> list[int]:
     """Send a message and return the Telegram `message_id` of every chunk sent.
 
@@ -214,15 +215,20 @@ def send_message_capture_ids(
     Args:
         bot: Optional bot name to send from. Resolved via the registry;
             falls back to the primary token if unset or unknown.
+        parse_mode: Telegram parse mode. None sends the text exactly as given,
+            with no Markdown cleanup, for text that must not be reformatted.
     """
     if not settings.telegram_enabled:
         return []
     token, bot_chat_id = _resolve_bot(bot)
     chat_id = chat_id or bot_chat_id or settings.telegram_chat_id
-    text = _clean_markdown_for_telegram(text)
+    if parse_mode is not None:
+        text = _clean_markdown_for_telegram(text)
     ids: list[int] = []
     for part in _split_message(text):
-        payload = {"chat_id": chat_id, "text": part, "parse_mode": "Markdown"}
+        payload = {"chat_id": chat_id, "text": part}
+        if parse_mode is not None:
+            payload["parse_mode"] = parse_mode
         if reply_to_message_id is not None:
             payload["reply_to_message_id"] = int(reply_to_message_id)
             payload["allow_sending_without_reply"] = True
@@ -782,22 +788,43 @@ class TelegramBotListener:
             return False
 
     def _maybe_decide_host_approval(self, reply_to_message_id: int, text: str) -> bool:
-        """Record APPROVE (or a refusal) for an open host-tools approval request."""
+        """Record APPROVE (or a refusal) for an open host-tools approval request.
+
+        Only a reply in the configured chat, to a request sent to that chat,
+        can decide it.
+        """
         try:
-            from api.services.host_approval import DEFAULT_DB_PATH, ApprovalStore
+            from api.services.host_approval import (
+                DEFAULT_DB_PATH,
+                ApprovalStore,
+                approval_reply_text,
+            )
         except Exception as exc:  # pragma: no cover — keep the listener running
             logger.warning(f"host approval hook unavailable: {exc}")
             return False
-        if not DEFAULT_DB_PATH.exists():
+        if not DEFAULT_DB_PATH.exists() or not self._chat_id or self._chat_id != settings.telegram_chat_id:
             return False
         try:
-            decided = ApprovalStore().decide_by_reply(reply_to_message_id, text)
+            row = ApprovalStore().decide_by_reply(reply_to_message_id, text, chat_id=self._chat_id)
         except Exception as exc:
             logger.warning(f"host approval decision failed: {exc}")
             return False
-        if decided:
-            send_message("Recorded.", chat_id=self._chat_id, reply_to_message_id=reply_to_message_id)
-        return decided
+        if row is None:
+            return False
+        try:
+            from api.services.host_tools import audit as host_tools_audit
+
+            host_tools_audit({
+                "tool": "lifeos_shell", "caller": row.caller, "decision": f"operator-{row.state}",
+                "request_id": row.id, "command_hash": row.command_hash, "approver": row.approver,
+            })
+        except Exception as exc:
+            logger.warning(f"host approval audit failed: {exc}")
+        send_message_capture_ids(
+            approval_reply_text(row), chat_id=self._chat_id,
+            reply_to_message_id=reply_to_message_id, parse_mode=None,
+        )
+        return True
 
     async def _handle_agent_spawn(self, rest: str, chat_id: str):
         """Spawn an operator agent on demand: `/agent [local|claude] <task>`.
