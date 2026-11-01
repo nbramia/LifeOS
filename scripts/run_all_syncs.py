@@ -570,6 +570,16 @@ def log_sync_summary_to_markdown(result: dict, trigger: str = "unknown"):
             else:
                 lines.append(f"- {src}")
 
+    # Sources that produced nothing — one line each, only when non-empty.
+    yield_collapsed_sources = result.get("yield_collapsed_sources", [])
+    if yield_collapsed_sources:
+        lines.append("")
+        lines.append(f"**Produced no records (normally do):** {', '.join(yield_collapsed_sources)}")
+    never_yielded_sources = result.get("never_yielded_sources", [])
+    if never_yielded_sources:
+        lines.append("")
+        lines.append(f"**Never produced records:** {', '.join(never_yielded_sources)}")
+
     # Apple Data Agent SHA drift — a silently-broken self-update on
     # the (installer-configurable) export agent, surfaced here instead of a
     # log line no batched report reads.
@@ -860,6 +870,16 @@ def send_sync_summary_telegram(result: dict, trigger: str = "unknown"):
                 lines.append(f"  • {src}: {value:.0f} records, {runs} runs in a row")
             else:
                 lines.append(f"  • {src}")
+
+    # Sources that produced nothing — one line each, only when non-empty.
+    yield_collapsed_sources = result.get("yield_collapsed_sources", [])
+    if yield_collapsed_sources:
+        lines.append("")
+        lines.append(f"*Produced no records (normally do):* {', '.join(yield_collapsed_sources)}")
+    never_yielded_sources = result.get("never_yielded_sources", [])
+    if never_yielded_sources:
+        lines.append("")
+        lines.append(f"*Never produced records:* {', '.join(never_yielded_sources)}")
 
     try:
         success = send_message("\n".join(lines))
@@ -2480,6 +2500,8 @@ def run_all_syncs(
         "dep_skipped_sources": sorted(dep_skipped),
         "duration_collapsed_sources": duration_collapsed,
         "repeated_yield_sources": repeated_yield_sources,
+        "yield_collapsed_sources": yield_collapsed,
+        "never_yielded_sources": never_yielded_sources,
         "investments_stale": investments_stale,
         "apple_agent_sha_drift": apple_agent_sha_drift,
     }

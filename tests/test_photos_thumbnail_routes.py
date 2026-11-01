@@ -11,7 +11,7 @@ from unittest.mock import PropertyMock, patch
 
 import pytest
 
-from tests._photos_fakes import FAKE_JPEG, UUID_A, UUID_B
+from tests._photos_fakes import FAKE_JPEG, UUID_A, UUID_B, UUID_C
 
 pytestmark = pytest.mark.unit
 
@@ -208,8 +208,43 @@ class TestPersonRoute:
 
     def test_library_dependent_routes_still_require_the_library(self, client, staged_dir):
         assert client.get("/api/photos/people").status_code == 503
-        assert client.get("/api/photos/shared/a/b").status_code == 503
         assert client.post("/api/photos/sync").status_code == 503
+
+
+class TestSharedRoute:
+    """Photo interactions carry ``<asset_uuid>:<person_pk>``, so two people in
+    the same photo have different source_ids; the route matches on the asset
+    UUID and reads only the interactions table."""
+
+    def test_matches_across_people_on_the_asset_uuid(self, client, staged_dir, store):
+        add_photo(store, UUID_A, person_id="person-1", pk=11)
+        add_photo(store, UUID_A, person_id="person-2", pk=22)
+        add_photo(store, UUID_B, person_id="person-1", pk=11)
+        add_photo(store, UUID_C, person_id="person-2", pk=22)
+        response = client.get("/api/photos/shared/person-1/person-2")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["shared_photo_count"] == 1
+        assert [p["uuid"] for p in body["photos"]] == [UUID_A]
+
+    def test_works_without_a_library(self, client, staged_dir, store):
+        response = client.get("/api/photos/shared/person-1/person-2")
+        assert response.status_code == 200
+        assert response.json()["shared_photo_count"] == 0
+
+    def test_limit_caps_photos_but_not_the_count(self, client, staged_dir, store):
+        for asset in (UUID_A, UUID_B, UUID_C):
+            add_photo(store, asset, person_id="person-1", pk=1)
+            add_photo(store, asset, person_id="person-2", pk=2)
+        body = client.get("/api/photos/shared/person-1/person-2?limit=2").json()
+        assert body["shared_photo_count"] == 3
+        assert len(body["photos"]) == 2
+
+    def test_a_photo_with_no_shared_person_is_excluded(self, client, staged_dir, store):
+        add_photo(store, UUID_A, person_id="person-1", pk=1)
+        add_photo(store, UUID_B, person_id="person-2", pk=2)
+        body = client.get("/api/photos/shared/person-1/person-2").json()
+        assert body["photos"] == [] and body["shared_photo_count"] == 0
 
 
 class TestCrmConfigFlags:
@@ -277,3 +312,29 @@ class TestCrmConfigFlags:
             instance = Settings(LIFEOS_PHOTOS_PATH=str(tmp_path / "no-library"))
             assert instance.photos_enabled is False
             assert instance.photos_thumbnails_available is True
+
+
+class TestLibraryPathExpansion:
+    """A tilde-prefixed LIFEOS_PHOTOS_PATH resolves for the library file
+    lookups the same way settings.photos_db_path resolves it."""
+
+    @pytest.fixture
+    def tilde_library(self, tmp_path, monkeypatch):
+        from config.settings import settings
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr(settings, "photos_library_path", "~/Synthetic.photoslibrary")
+        return tmp_path / "Synthetic.photoslibrary"
+
+    def test_thumbnail_lookup_expands_the_tilde(self, tilde_library):
+        from api.routes.photos import _get_thumbnail_path
+        thumb = tilde_library / "resources" / "derivatives" / UUID_A[0] / f"{UUID_A}_1_105_c.jpeg"
+        thumb.parent.mkdir(parents=True)
+        thumb.write_bytes(FAKE_JPEG)
+        assert _get_thumbnail_path(UUID_A) == thumb
+
+    def test_original_lookup_expands_the_tilde(self, tilde_library):
+        from api.routes.photos import _get_photo_file_path
+        original = tilde_library / "originals" / UUID_A[0] / f"{UUID_A}.jpeg"
+        original.parent.mkdir(parents=True)
+        original.write_bytes(FAKE_JPEG)
+        assert _get_photo_file_path(UUID_A) == original

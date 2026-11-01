@@ -317,7 +317,7 @@ Get photos containing a specific person. Each photo's `uuid` is the Apple Photos
 
 ### GET /api/photos/shared/{person_a_id}/{person_b_id}
 
-Get photos where two people appear together.
+Get photos where two people appear together, matched on the Apple Photos asset UUID. Each photo's `uuid` is that asset UUID. Reads only the interactions table, so it works without a Photos library.
 
 ### POST /api/photos/sync
 

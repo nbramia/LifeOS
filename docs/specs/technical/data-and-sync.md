@@ -449,6 +449,13 @@ photos.
 - Groups larger than `LARGE_GROUP_THRESHOLD` (currently 20) are skipped
   entirely as broadcast noise.
 
+**Bot and broadcast chats:**
+- Chats whose JID domain is `@bot` or `@broadcast` are not correspondence with a
+  person: their messages create no interactions and are counted in
+  `skipped_non_person_chat`.
+- `scripts/purge_whatsapp_non_person_chats.py` removes such rows already stored
+  (dry run by default; `--execute` takes a SQLite backup first).
+
 **Group Size:**
 - A group row stores the group's participant count in `attendee_count` (0 when
   the export doesn't list the group's membership). A direct message stores NULL.

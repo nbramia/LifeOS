@@ -15,6 +15,7 @@ from api.services.whatsapp import (
     SOURCE_WHATSAPP,
     extract_phone_from_jid,
     is_group_jid,
+    is_non_person_chat_jid,
     normalize_phone,
     parse_message_timestamp,
     process_whatsapp_contacts,
@@ -139,6 +140,23 @@ class TestParseMessageTimestamp:
 # ---------------------------------------------------------------------------
 # Message processing — operates on dicts, only the interaction store is mocked
 # ---------------------------------------------------------------------------
+
+class TestIsNonPersonChatJid:
+    """Bot and broadcast chats are not correspondence with a person."""
+
+    def test_bot_and_broadcast(self):
+        assert is_non_person_chat_jid("15550000001@bot") is True
+        assert is_non_person_chat_jid("status@broadcast") is True
+
+    def test_people_and_groups_are_not_flagged(self):
+        assert is_non_person_chat_jid("15551234567@s.whatsapp.net") is False
+        assert is_non_person_chat_jid("123456789012345@g.us") is False
+        assert is_non_person_chat_jid("15551234567@lid") is False
+
+    def test_empty(self):
+        assert is_non_person_chat_jid("") is False
+        assert is_non_person_chat_jid(None) is False
+
 
 def _make_interactions_db(tmp_path, existing_ids=None) -> str:
     """Create a minimal interactions.db with optional pre-existing rows."""
@@ -516,6 +534,53 @@ class TestProcessWhatsAppMessagesGroupSize:
             "sender_jid": "me@s.whatsapp.net", "from_me": 1,
         })
         assert rows == [("whatsapp_m1", None)]
+
+
+class TestProcessWhatsAppMessagesNonPersonChats:
+    """Bot and broadcast chats create no person interactions."""
+
+    PEER = "15559876543@s.whatsapp.net"
+
+    def _run(self, tmp_path, messages):
+        int_db = _make_interactions_db(tmp_path)
+        resolver = _mock_resolver_returning("p1")
+        base = {"ts": "2026-02-25T10:00:00+00:00", "sender_name": "Pat"}
+        with patch("api.services.whatsapp.get_entity_resolver", return_value=resolver), \
+             patch("api.services.whatsapp.get_interaction_db_path", return_value=int_db), \
+             patch("api.services.person_stats.refresh_person_stats"):
+            stats = process_whatsapp_messages(
+                messages=[{**base, **m} for m in messages],
+                group_participants=[],
+                lid_contacts=[],
+                lid_phones={},
+                dry_run=False,
+                my_person_id="me",
+            )
+        conn = sqlite3.connect(int_db)
+        try:
+            rows = conn.execute("SELECT source_id FROM interactions ORDER BY source_id").fetchall()
+        finally:
+            conn.close()
+        return stats, rows, resolver
+
+    def test_bot_and_broadcast_chats_are_skipped_and_counted(self, tmp_path):
+        stats, rows, resolver = self._run(tmp_path, [
+            {"msg_id": "bot-out", "chat_jid": "15550000001@bot", "sender_jid": "me@s.whatsapp.net", "from_me": 1},
+            {"msg_id": "bot-in", "chat_jid": "15550000001@bot", "sender_jid": "15550000001@bot", "from_me": 0},
+            {"msg_id": "bcast", "chat_jid": "status@broadcast", "sender_jid": self.PEER, "from_me": 0},
+        ])
+        assert rows == []
+        assert stats["skipped_non_person_chat"] == 3
+        assert stats["interactions_created"] == 0
+        resolver.resolve.assert_not_called()
+
+    def test_a_direct_message_alongside_them_is_still_stored(self, tmp_path):
+        stats, rows, _ = self._run(tmp_path, [
+            {"msg_id": "bcast", "chat_jid": "status@broadcast", "sender_jid": self.PEER, "from_me": 0},
+            {"msg_id": "dm", "chat_jid": self.PEER, "sender_jid": self.PEER, "from_me": 0},
+        ])
+        assert rows == [("whatsapp_dm",)]
+        assert stats["skipped_non_person_chat"] == 1
 
 
 class TestProcessWhatsAppMessagesLidPhone:

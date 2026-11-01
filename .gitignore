@@ -39,6 +39,9 @@ data/
 logs/
 *.log
 
+# Per-worktree metadata written by scripts/create-worktree.sh
+.worktree-info
+
 # Host tools scratch directory (LIFEOS_HOST_TOOLS_SCRATCH_DIR default)
 scratch/
 
