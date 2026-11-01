@@ -1478,8 +1478,8 @@ def test_agent_task_update_refuses_arguments_outside_its_own_lane(client, calls,
 
 
 def test_agent_grant_ignores_unknown_agents_and_shared_client_ids(monkeypatch):
-    from config.settings import settings
     from api.services.mcp_tool_tier import task_agent_clients
+    from config.settings import settings
 
     monkeypatch.setattr(settings, "task_agent_oauth_clients", "duet=a, claude=b, muse=c, duet=c, =d, muse")
     assert task_agent_clients() == {"a": "duet"}

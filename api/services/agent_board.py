@@ -783,8 +783,8 @@ def agent_task_edit_error(
     current = derive_assignee(tset)
     owned_by = sorted(tset & EXTERNAL_AGENT_HANDS_OFF_TAGS)
     if owned_by:
-        return (409, f"task is owned by an engine, the worker or the operator queue (#{owned_by[0]}); "
-                     "only the operator can change it")
+        return (409, (f"task is owned by an engine, the worker or the operator queue (#{owned_by[0]}); "
+                      "only the operator can change it"))
     if current is not None and current not in ("me", agent):
         return (409, f"task is assigned to {current}; only the operator can reassign it")
     if assignee is None:

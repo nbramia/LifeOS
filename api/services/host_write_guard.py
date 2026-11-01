@@ -82,7 +82,7 @@ def _check_task_file(old: str, new: str) -> str | None:
         old_owned = agent_board.normalize_tags(task.tags) & agent_board.EXTERNAL_AGENT_HANDS_OFF_TAGS
         if old_owned and new_block != block:
             return (f"task {task_id} is owned by an engine, the worker or the operator queue "
-                    f"(#{sorted(old_owned)[0]}); leave its lines unchanged")
+                    f"(#{min(old_owned)}); leave its lines unchanged")
         old_tags = {t.lower() for t in task.tags if _forbidden(t)}
         new_tags = {t.lower() for t in new_task.tags if _forbidden(t)}
         if old_tags != new_tags:
