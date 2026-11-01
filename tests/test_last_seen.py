@@ -342,6 +342,66 @@ class TestStoreNeverWritesIt:
         assert person.message_count == 1
         assert env.stored("p") == _days_ago(3)
 
+    def test_update_round_trips_every_column_and_never_last_seen(self, env):
+        env.person("p", stored=_days_ago(3))
+        conn = sqlite3.connect(env.crm_db)
+        conn.row_factory = sqlite3.Row
+        before = dict(conn.execute("SELECT * FROM person_entities WHERE id = 'p'").fetchone())
+        conn.close()
+
+        moment = datetime(2020, 2, 3, 4, 5, 6, tzinfo=timezone.utc)
+        updated = PersonEntity(
+            id="p",
+            canonical_name="Updated Name",
+            display_name="Updated Display",
+            emails=["updated@example.test"],
+            company="Updated Co",
+            position="Updated Role",
+            linkedin_url="https://example.test/updated",
+            category="work",
+            vault_contexts=["Work/"],
+            sources=["gmail"],
+            first_seen=moment,
+            last_seen=NOW,
+            meeting_count=1,
+            email_count=2,
+            mention_count=3,
+            message_count=4,
+            slack_message_count=5,
+            photo_count=6,
+            related_notes=["note.md"],
+            aliases=["Updated"],
+            phone_numbers=["+12125550100"],
+            phone_primary="+12125550100",
+            confidence_score=0.5,
+            tags=["tag"],
+            notes="note",
+            source_entity_count=7,
+            birthday="01-02",
+            hidden=True,
+            hidden_at=moment,
+            hidden_reason="reason",
+            is_peripheral_contact=True,
+            dunbar_circle=2,
+        )
+        updated.relationship_strength = 42.0
+
+        env.store.update(updated)
+
+        conn = sqlite3.connect(env.crm_db)
+        conn.row_factory = sqlite3.Row
+        after = dict(conn.execute("SELECT * FROM person_entities WHERE id = 'p'").fetchone())
+        conn.close()
+        written = dict(zip(PersonEntityStore._COLUMNS, env.store._entity_to_values(updated)))
+        for column in PersonEntityStore._COLUMNS:
+            assert after[column] == written[column], column
+            if column != "id":
+                assert after[column] != before[column], f"fixture leaves {column} unchanged"
+        assert after["last_seen"] == _days_ago(3)
+        assert env.store._entity_to_values(env.store.get_by_id("p")) == tuple(
+            written[column] for column in PersonEntityStore._COLUMNS
+        )
+
     def test_upsert_sql_covers_every_column_but_last_seen(self, env):
         conn = sqlite3.connect(env.crm_db)
         table = {row[1] for row in conn.execute("PRAGMA table_info(person_entities)")}

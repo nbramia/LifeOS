@@ -120,6 +120,14 @@ class TestRecencyBoost:
         never = self._score(_StoreHoldingLastSeen(str(tmp_path / "b.db")), None)
         assert recent - never == EntityResolutionConfig.RECENCY_BOOST_POINTS
 
+    def test_a_year_is_the_window(self, tmp_path):
+        never = self._score(_StoreHoldingLastSeen(str(tmp_path / "never.db")), None)
+        inside = self._score(_StoreHoldingLastSeen(str(tmp_path / "inside.db")), 200)
+        outside = self._score(_StoreHoldingLastSeen(str(tmp_path / "outside.db")), 370)
+
+        assert inside - never == EntityResolutionConfig.RECENCY_BOOST_POINTS
+        assert outside == never
+
     def test_outside_the_window_earns_nothing(self, tmp_path):
         old = self._score(
             _StoreHoldingLastSeen(str(tmp_path / "a.db")),

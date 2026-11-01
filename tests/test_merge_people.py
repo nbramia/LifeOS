@@ -369,6 +369,60 @@ class TestMergeOperationDetails:
         assert "slack" in combined_sources
 
 
+class TestMergeSetsSurvivorLastSeen:
+    """A real merge, with the real stats refresh, against real temporary SQLite files."""
+
+    def test_survivor_takes_the_absorbed_persons_later_interaction(self, tmp_path, monkeypatch):
+        from datetime import datetime, timezone
+
+        from api.services.interaction_store import Interaction, InteractionStore
+        from api.services.person_entity import PersonEntity, PersonEntityStore
+        from api.services.person_facts import PersonFactStore
+        from api.services.person_stats import sync_last_seen
+        from api.services.relationship import RelationshipStore
+        from api.services.source_entity import SourceEntityStore
+        from scripts.merge_people import merge_people
+
+        crm_db_path = str(tmp_path / "crm.db")
+        interactions_db_path = str(tmp_path / "interactions.db")
+        person_store = PersonEntityStore(crm_db_path)
+        rel_store = RelationshipStore(crm_db_path)
+        SourceEntityStore(crm_db_path)
+        PersonFactStore(crm_db_path)
+        interaction_store = InteractionStore(interactions_db_path, strict=False)
+
+        for person_id, name in (("primary-person", "Primary Person"), ("secondary-person", "Secondary Person")):
+            person_store.add(PersonEntity(id=person_id, canonical_name=name))
+        earlier = datetime(2025, 1, 1, 12, 0, tzinfo=timezone.utc)
+        later = datetime(2025, 6, 1, 12, 0, tzinfo=timezone.utc)
+        for row_id, person_id, timestamp in (
+            ("synthetic-1", "primary-person", earlier),
+            ("synthetic-2", "secondary-person", later),
+        ):
+            interaction_store.add(Interaction(
+                id=row_id, person_id=person_id, timestamp=timestamp,
+                source_type="imessage", title="synthetic message",
+            ))
+
+        monkeypatch.setattr("scripts.merge_people.get_person_entity_store", lambda: person_store)
+        monkeypatch.setattr("scripts.merge_people.get_crm_db_path", lambda: crm_db_path)
+        monkeypatch.setattr("scripts.merge_people.get_interaction_db_path", lambda: interactions_db_path)
+        monkeypatch.setattr("scripts.merge_people.MERGED_IDS_FILE", tmp_path / "merged_ids.json")
+        monkeypatch.setattr("scripts.merge_people.MERGE_LOG_FILE", tmp_path / "merge_log.json")
+        monkeypatch.setattr("api.services.relationship.get_relationship_store", lambda *a, **k: rel_store)
+        monkeypatch.setattr("api.services.relationship_metrics.update_strength_for_person", lambda *a, **k: None)
+        monkeypatch.setattr("api.services.person_entity.get_person_entity_store", lambda: person_store)
+        monkeypatch.setattr("api.services.interaction_store.get_interaction_db_path", lambda: interactions_db_path)
+        monkeypatch.setattr(PersonEntityStore, "CRM_DB_PATH", Path(crm_db_path))
+
+        sync_last_seen()
+        assert person_store.get_by_id("primary-person").last_seen == earlier
+
+        merge_people("primary-person", "secondary-person", dry_run=False)
+
+        assert person_store.get_by_id("primary-person").last_seen == later
+
+
 class TestMergePeopleToneAnalysisResults:
     """Merging a person must remove tone_analysis_results rows for the
     absorbed (secondary) person, and must leave the primary's own rows
