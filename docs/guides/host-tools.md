@@ -20,7 +20,7 @@ Host tools give an MCP client scoped access to the LifeOS host: read and list fi
 
 The roots are:
 
-- `vault`: `LIFEOS_VAULT_PATH`. Readable and writable.
+- `vault`: `LIFEOS_VAULT_PATH`. Readable in full. Writable in full, or only inside the folders listed in `LIFEOS_HOST_TOOLS_VAULT_WRITE_DIRS` (comma-separated, relative to the vault root, for example `Assistant`). The limit applies to every host-tool caller; a refused write names the allowed folders.
 - `scratch`: `LIFEOS_HOST_TOOLS_SCRATCH_DIR` (default `scratch/` in the LifeOS checkout, created on first use). Readable and writable. The directory is private to the LifeOS account; on first use in each process the service adds a read ACL entry (and a default entry, so new files inherit it) for the `LIFEOS_HOST_TOOLS_RUN_AS` account only, so commands can run from it. This needs `setfacl`; without it, commands run from scratch fail with "Permission denied" and a warning is logged.
 - `lifeos`: the LifeOS checkout. Read-only; code changes go through pull requests.
 - `logs`: the checkout's `logs/` directory. Read-only.
@@ -155,6 +155,8 @@ VAULT_DIR="/path/to/your vault"              # same as LIFEOS_VAULT_PATH; keep t
    LIFEOS_HOST_TOOLS_RUN_AS=lifeos-tools
    # Optional: grant a connected app (client id from scripts/mcp_oauth.py list)
    # LIFEOS_HOST_TOOLS_OAUTH_CLIENTS=<client_id>
+   # Optional: limit vault writes to these folders (empty: the whole vault)
+   # LIFEOS_HOST_TOOLS_VAULT_WRITE_DIRS=Assistant
    ```
 
 8. Optional: turn on Telegram approval for commands outside the allowlist. Telegram must already work (`TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`, see [Telegram Setup](telegram-setup.md)), and `TELEGRAM_CHAT_ID` should be your private chat with the bot. Add to `.env`, then restart both the MCP transport and the API (the API's Telegram listener records your replies):

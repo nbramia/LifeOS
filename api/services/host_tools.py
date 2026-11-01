@@ -214,6 +214,8 @@ class HostToolsConfig:
     # Give the run-as account an ACL entry on the scratch directory (see
     # _grant_scratch_access). On for the real service, off in tests.
     grant_scratch_access: bool = False
+    # Vault folders (as path parts) that writes may touch; empty: the whole vault.
+    vault_write_dirs: tuple[tuple[str, ...], ...] = ()
 
     @classmethod
     def from_settings(cls) -> HostToolsConfig:
@@ -231,7 +233,27 @@ class HostToolsConfig:
             approval_enabled=settings.host_tools_shell_approval,
             approval_timeout_seconds=approval_timeout(settings.host_tools_approval_timeout_seconds),
             grant_scratch_access=True,
+            vault_write_dirs=parse_vault_write_dirs(settings.host_tools_vault_write_dirs),
         )
+
+
+def parse_vault_write_dirs(raw: str | None) -> tuple[tuple[str, ...], ...]:
+    """Vault folders from a comma-separated list, each as its path parts.
+
+    Entries are relative to the vault root (a leading `/` is ignored). An
+    entry with `..` or `~` is kept as a part no folder can match, so a
+    malformed list allows less, never more.
+    """
+    dirs = []
+    for entry in (raw or "").split(","):
+        entry = entry.strip().strip("/")
+        if not entry:
+            continue
+        parts = tuple(p for p in PurePosixPath(entry).parts if p not in ("", "."))
+        if ".." in parts or entry.startswith("~"):
+            parts = ("\0",)
+        dirs.append(parts)
+    return tuple(dirs)
 
 
 def approval_timeout(seconds: float | None) -> int | None:
@@ -510,6 +532,11 @@ def fs_write(config: HostToolsConfig, arguments: dict) -> dict:
     )
     if rel == PurePosixPath("."):
         raise HostToolError("path must name a file")
+    if name == "vault" and config.vault_write_dirs:
+        parts = rel.parts
+        if not any(len(parts) > len(d) and parts[:len(d)] == d for d in config.vault_write_dirs):
+            allowed = ", ".join("/".join(d) for d in config.vault_write_dirs)
+            raise HostToolError(f"vault writes are limited to: {allowed}")
     if target.exists() and not target.is_file():
         raise HostToolError("path exists and is not a file")
     if mode == "create" and target.exists():
@@ -919,7 +946,8 @@ HOST_TOOL_SCHEMAS: list[dict] = [
         "name": "lifeos_fs_write",
         "description": "Write one text file in the vault or the scratch directory. A vault "
                        "write is committed when the vault on the host is a git repo; "
-                       "otherwise the result says it was not. The LifeOS code is "
+                       "otherwise the result says it was not. The operator may limit vault "
+                       "writes to some folders; a refusal names them. The LifeOS code is "
                        "read-only; change it through a pull request.",
         "inputSchema": {
             "type": "object",

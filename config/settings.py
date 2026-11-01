@@ -818,6 +818,12 @@ class Settings(BaseSettings):
         description="Comma-separated OAuth client ids that may call the host tools. "
                     "Empty means no OAuth-connected app gets them."
     )
+    host_tools_vault_write_dirs: str = Field(
+        default="",
+        alias="LIFEOS_HOST_TOOLS_VAULT_WRITE_DIRS",
+        description="Comma-separated vault folders that lifeos_fs_write may write inside. "
+                    "Empty means the whole vault."
+    )
     host_tools_vault_autocommit: bool = Field(
         default=True,
         alias="LIFEOS_HOST_TOOLS_VAULT_AUTOCOMMIT",

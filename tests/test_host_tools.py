@@ -1072,3 +1072,40 @@ def test_vault_write_says_when_the_vault_is_not_a_git_repo(config, roots):
     assert payload["commit_skipped"] == "the vault on this host is not a git repository"
     assert (roots["vault"] / "Inbox" / "Note.md").read_text() == "hi\n"
     assert _audit(config)[-1]["commit_skipped"] == payload["commit_skipped"]
+
+
+# ── vault write folders ──────────────────────────────────────────────────
+
+
+def test_vault_write_dirs_parse_relative_folders_and_never_widen():
+    assert host_tools.parse_vault_write_dirs("") == ()
+    assert host_tools.parse_vault_write_dirs(" Assistant , /Shared/Drafts/ ") == (
+        ("Assistant",), ("Shared", "Drafts"),
+    )
+    for bad in ("../Assistant", "Assistant/../Work", "~/Assistant"):
+        (parts,) = host_tools.parse_vault_write_dirs(bad)
+        assert parts == ("\0",)
+
+
+def test_vault_writes_stay_inside_the_listed_folders(config, roots):
+    config.vault_write_dirs = host_tools.parse_vault_write_dirs("Assistant")
+    host_tools.fs_write(config, {"root": "vault", "path": "Assistant/Notes/Today.md", "content": "hi\n"})
+    assert (roots["vault"] / "Assistant" / "Notes" / "Today.md").read_text() == "hi\n"
+
+    for path in ("Work/Plan.md", "Assistant", "AssistantNotes/x.md", ".obsidian/app.json"):
+        with pytest.raises(host_tools.HostToolError, match="limited to: Assistant"):
+            host_tools.fs_write(config, {"root": "vault", "path": path, "content": "x\n"})
+    assert (roots["vault"] / "Work" / "Plan.md").read_text().startswith("# Plan")
+
+
+def test_vault_write_folders_leave_scratch_and_reads_alone(config, roots):
+    config.vault_write_dirs = host_tools.parse_vault_write_dirs("Assistant")
+    host_tools.fs_write(config, {"root": "scratch", "path": "out.txt", "content": "ok\n"})
+    assert host_tools.fs_read(config, {"root": "vault", "path": "Work/Plan.md"})["content"].startswith("# Plan")
+
+
+def test_vault_write_folders_come_from_settings(monkeypatch):
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "host_tools_vault_write_dirs", "Assistant")
+    assert host_tools.HostToolsConfig.from_settings().vault_write_dirs == (("Assistant",),)
