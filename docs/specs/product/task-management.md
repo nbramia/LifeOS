@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Task Management
-> **Last Updated:** 2026-09-22
+> **Last Updated:** 2026-11-01
 
 LifeOS stores tasks as markdown checkboxes in your vault, in a format the Obsidian Tasks plugin can query and display, and manages them via chat, API, or Obsidian. Any checkbox line in `LifeOS/Tasks/*.md` counts as a task — you don't need to type LifeOS's own conventions by hand, and a plain hand-written checklist item is picked up on the next reindex. LifeOS's non-standard statuses (In Progress, Deferred, Blocked, Urgent — see below) render as generic checkboxes in Obsidian until you add them under the Tasks plugin's own "Custom statuses" settings; the plugin doesn't know about them out of the box.
 
@@ -140,6 +140,46 @@ curl -X PUT http://localhost:8000/api/tasks/{id} \
 `notes` replaces the notes body outright. `fields` is a merge, not a
 replacement: a string value sets that field, a `null` value removes it, and
 any field you don't mention is left alone.
+
+`assignee` swaps the task's assignee tag for another one and leaves every
+other tag alone: one of `me`, `claude`, `codex`, `hermes`, `local`, `cloud`,
+`duet`, `muse`, or `none` to clear it. It can't be combined with `tags`. A
+claimed card refuses an assignee change with **409**, as a `tags` change
+does.
+
+### External agents
+
+`duet` and `muse` are assignees for agents that work outside LifeOS (a chief
+of staff app, a personal assistant). They show on the `/agents` board like
+any assignee and can be picked from its assignee menus. The agent worker
+never picks them up: a task assigned to one sits in Assigned until that agent
+works it or you move it.
+
+An external agent edits tasks through `PUT /api/tasks/{id}` with
+`acting_agent` set to its own name (a connected app, or an agent with its own token from
+`LIFEOS_MCP_AGENT_TOKENS`, does this through `lifeos_task_update`, which sets
+`acting_agent` for it, so the agent can't claim to be someone else). Such a request may
+change only `description`, `status`, `priority`, `due_date`, `notes` and
+`assignee`; any other field (`tags`, `fields`, `context`, `actor`, ...) is refused
+with **422**, as is a `priority` other than `high`, `medium`, `low` or empty and a
+`due_date` that is not `YYYY-MM-DD` or empty. The rules, so two agents never fight over a task:
+
+| The task is | The agent may | The agent may not |
+|---|---|---|
+| Unassigned | Edit it, claim it (`assignee` set to itself) | Assign it to anyone else |
+| Its own | Edit it, complete it, release it (`assignee: "none"`) | Hand it to anyone else |
+| Assigned to `me` | Edit it, complete it | Claim it or unassign it |
+| Assigned to the other external agent | Nothing (**409**) | |
+| Assigned to an engine, claimed, or waiting on you (`agent`, `#human`, any lifecycle or consent tag) | Nothing (**409**) | |
+
+Assigning anyone other than itself is **403**. The rules are checked again
+against the file as it is being written, under the task store's lock, so an
+agent that read the task before another agent claimed it gets **409** and
+writes nothing. Concurrent edits from Obsidian are merged as for any update.
+
+Only you reassign across agents: a request without `acting_agent` (the
+board, the API, your own MCP session) can assign any assignee to any
+unclaimed task.
 
 ### Delete Tasks
 
@@ -310,7 +350,7 @@ it by hand.
 | GET | `/api/tasks/conflicts` | - | List Syncthing conflict/temp files sitting in the tasks folder |
 | GET | `/api/tasks/{id}` | - | Get specific task |
 | GET | `/api/tasks/{id}/children` | limit, offset | List every child by stable parent ID |
-| PUT | `/api/tasks/{id}` | description, status, context, priority, due_date, tags, notes, fields | Update a task |
+| PUT | `/api/tasks/{id}` | description, status, context, priority, due_date, tags, assignee, notes, fields, acting_agent | Update a task |
 | PUT | `/api/tasks/{id}/complete` | - | Mark as done |
 | DELETE | `/api/tasks/{id}` | - | Delete a task |
 | POST | `/api/tasks/{id}/project/start` | - | Start a project without worker lifecycle tags |

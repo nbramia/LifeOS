@@ -39,16 +39,20 @@ ACCEPTED_TAG = "accepted"
 # member of this set from the latest CAS snapshot.
 PROTECTED_TAGS: frozenset[str] = frozenset({
     "me", "claude", "codex", "hermes", "local", "cloud",
-    "cloud-haiku", "cloud-sonnet",
+    "cloud-haiku", "cloud-sonnet", "duet", "muse",
     RUNNING_TAG, BLOCKED_TAG, COMPLETED_TAG, "agent-failed",
     "agent-budget-exceeded", REASSIGNED_TAG, ACCEPTED_TAG,
 })
 
-# Assignee is exactly one tag from this set. "me" is the operator; the rest
-# are agent engines. An engine assignee on a todo/urgent task is what makes
-# it claimable by the worker — see agent-worker claim pickup.
-ASSIGNEE_TAGS: tuple[str, ...] = ("me", "claude", "codex", "hermes", "local", "cloud")
+# Assignee is exactly one tag from this set. "me" is the operator; the
+# engines in AGENT_ASSIGNEES are run by the worker, and an engine assignee on
+# a todo/urgent task is what makes it claimable by the worker — see
+# agent-worker claim pickup. EXTERNAL_AGENT_ASSIGNEES are agents outside
+# LifeOS (connected apps) that claim and update their own tasks through MCP;
+# the worker never picks them up. See `agent_task_edit_error`.
 AGENT_ASSIGNEES: tuple[str, ...] = ("claude", "codex", "hermes", "local", "cloud")
+EXTERNAL_AGENT_ASSIGNEES: tuple[str, ...] = ("duet", "muse")
+ASSIGNEE_TAGS: tuple[str, ...] = ("me", *AGENT_ASSIGNEES, *EXTERNAL_AGENT_ASSIGNEES)
 # Execution-capable sub-tags are not board lanes, but they are valid explicit
 # task/schedule handoffs. Keep this shared with the worker, task API, and
 # bounded capture consumers so a renamed route cannot leave a stale local
@@ -628,7 +632,10 @@ def plan_review_action(
     # vocabularies so a stale #cloud-haiku cannot outrank the requested target.
     cleaned = [t for t in cleaned if t.lstrip("#").lower() not in AGENT_EXECUTOR_TAGS]
     cleaned.append(normalized)
-    cleaned.append(REASSIGNED_TAG)
+    # The tag marks a card for the agent worker to clear on its next claim;
+    # external agents' cards are never claimed, so it would only lock them out.
+    if normalized not in EXTERNAL_AGENT_ASSIGNEES:
+        cleaned.append(REASSIGNED_TAG)
     return ReviewActionPlan(status="todo", tags=cleaned)
 
 
@@ -744,3 +751,67 @@ def is_schedule_active(enabled: bool, next_trigger_at: Optional[str], schedule_t
     if schedule_type == "manual":
         return bool(enabled)
     return bool(enabled) and next_trigger_at is not None
+
+
+# ── External agents (connected apps acting as a named assignee) ───────────
+
+# Tags that mean an engine or the worker owns or runs the card, or that it is
+# filed for the operator. An external agent edits none of these cards.
+EXTERNAL_AGENT_HANDS_OFF_TAGS: frozenset[str] = frozenset({
+    "agent", *AGENT_EXECUTOR_TAGS, RUNNING_TAG, BLOCKED_TAG, COMPLETED_TAG,
+    REASSIGNED_TAG, *MACHINE_WAIT_TAGS, HUMAN_TAG,
+})
+UNASSIGN = "none"
+
+
+def agent_task_edit_error(
+    status: str,
+    tags: Iterable[str],
+    agent: str,
+    assignee: Optional[str] = None,
+) -> Optional[tuple[int, str]]:
+    """Refusal for an external agent's edit of a task, or None if allowed.
+
+    Agents must not fight over tasks. `agent` (one of
+    EXTERNAL_AGENT_ASSIGNEES) may edit a task that is unassigned, assigned to
+    itself, or assigned to the operator (`me`); it never touches a task
+    assigned to another agent, one an engine or the worker owns or runs, or a
+    `#human` card. `assignee`, when given, is the assignee the edit sets: the
+    agent may claim an unassigned task or release its own (`none`), and may
+    never assign a task to anyone but itself or take one from the operator.
+    Only the operator reassigns across agents, from the board or the vault.
+    Pure: callers run it against the snapshot being written.
+    """
+    tset = _norm_tags(tags)
+    current = derive_assignee(tset)
+    owned_by = sorted(tset & EXTERNAL_AGENT_HANDS_OFF_TAGS)
+    if owned_by:
+        return (409, (f"task is owned by an engine, the worker or the operator queue (#{owned_by[0]}); "
+                      "only the operator can change it"))
+    if current is not None and current not in ("me", agent):
+        return (409, f"task is assigned to {current}; only the operator can reassign it")
+    if assignee is None:
+        return None
+    wanted = assignee.lstrip("#").lower()
+    if wanted not in (agent, UNASSIGN):
+        return (403, f"{agent} can assign a task only to itself; only the operator assigns other assignees")
+    if wanted == agent and current == "me":
+        return (409, "task is assigned to the operator; only the operator can reassign it")
+    if wanted == UNASSIGN and current not in (None, agent):
+        return (409, f"task is assigned to {current}; only the operator can unassign it")
+    return None
+
+
+def swap_assignee(tags: Iterable[str], assignee: str) -> list[str]:
+    """`tags` with its assignee replaced by `assignee` (`none` clears it).
+
+    Removes every assignee tag and Managed Agents consent tag, the same
+    vocabulary a board reassignment clears, and keeps every other tag in
+    order.
+    """
+    wanted = assignee.lstrip("#").lower()
+    drop = {*ASSIGNEE_TAGS, *MANAGED_AGENT_ASSIGNEES}
+    kept = [t for t in tags if str(t).lstrip("#").lower() not in drop]
+    if wanted != UNASSIGN:
+        kept.append(wanted)
+    return kept

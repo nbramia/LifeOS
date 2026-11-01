@@ -19,7 +19,13 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Callable
 
-from api.services.agent_board import AGENT_PICKUP_TAGS, HUMAN_TAG, PROTECTED_TAGS
+from api.services.agent_board import (
+    AGENT_PICKUP_TAGS,
+    EXTERNAL_AGENT_ASSIGNEES,
+    HUMAN_TAG,
+    PROTECTED_TAGS,
+    UNASSIGN,
+)
 
 
 @dataclass(frozen=True)
@@ -115,7 +121,10 @@ OAUTH_TOOL_TIER: dict[str, ToolClass] = {
     "lifeos_schedule_trigger": _deny("schedule trigger"),
     "lifeos_sync_trigger": _deny("sync trigger"),
     "lifeos_workout_manage": _deny("mixes logging writes and profile edits behind one action argument"),
-    "lifeos_task_update": _deny("task edit can assign an agent engine"),
+    "lifeos_task_update": _operator_grant(
+        "task edits as a named external agent (LIFEOS_TASK_AGENT_OAUTH_CLIENTS); "
+        "tags, fields and other assignees are refused"
+    ),
     "lifeos_task_complete": _deny("task lifecycle change"),
     "lifeos_project_start": _deny("project lifecycle and agent execution"),
     "lifeos_project_complete": _deny("project lifecycle"),
@@ -254,6 +263,106 @@ def _check_task_create(arguments: dict, existing_contexts: Callable[[], set[str]
     return None
 
 
+# What a connected app acting as an external agent may send to
+# lifeos_task_update. The assignee goes through `assignee`, never tags.
+_TASK_UPDATE_KEYS = frozenset(
+    {"task_id", "description", "status", "priority", "due_date", "notes", "assignee"}
+)
+
+
+def _check_task_update(arguments: dict, task_agent: str | None) -> str | None:
+    if task_agent is None:
+        return "task updates are granted only to a connected app named as an agent assignee"
+    extra = sorted(set(arguments) - _TASK_UPDATE_KEYS)
+    if extra:
+        return f"arguments not available to connected apps: {', '.join(extra)}"
+    task_id = arguments.get("task_id")
+    if not isinstance(task_id, str) or not task_id.strip():
+        return "task_id must be a non-empty string"
+    for key in ("description", "status", "priority", "due_date", "notes", "assignee"):
+        value = arguments.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            return f"{key} must be a string"
+        if key != "notes" and any(not ch.isprintable() for ch in value):
+            return f"{key} must be a single line without control characters"
+    assignee = arguments.get("assignee")
+    if assignee is not None and assignee.strip().lstrip("#").lower() not in (task_agent, UNASSIGN):
+        return f"you can assign a task only to yourself ({task_agent}) or release it ({UNASSIGN})"
+    text = {k: arguments.get(k) for k in ("description", "notes", "priority", "due_date", "status")}
+    if any(_forbidden_tag(t) for t in _rendered_tags(text)):
+        return _TAG_REFUSAL
+    return None
+
+
+def task_agent_clients() -> dict[str, str]:
+    """OAuth client id -> external agent assignee, from settings.
+
+    `LIFEOS_TASK_AGENT_OAUTH_CLIENTS` is a comma-separated list of
+    `agent=client_id` pairs. An agent name outside EXTERNAL_AGENT_ASSIGNEES,
+    or a client id named twice, grants nothing.
+    """
+    from config.settings import settings
+
+    pairs: dict[str, str] = {}
+    seen: set[str] = set()
+    for entry in (settings.task_agent_oauth_clients or "").split(","):
+        agent, sep, client_id = entry.partition("=")
+        agent, client_id = agent.strip().lower(), client_id.strip()
+        if not sep or not client_id or agent not in EXTERNAL_AGENT_ASSIGNEES:
+            continue
+        if client_id in seen:
+            pairs.pop(client_id, None)
+            continue
+        seen.add(client_id)
+        pairs[client_id] = agent
+    return pairs
+
+
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+
+def agent_token_hashes() -> dict[str, str]:
+    """SHA-256 hex digest -> external agent assignee, from settings.
+
+    `LIFEOS_MCP_AGENT_TOKENS` is a comma-separated list of `agent=sha256`
+    pairs. An agent may appear more than once (for rotation). An agent name
+    outside EXTERNAL_AGENT_ASSIGNEES, a malformed digest, or a digest named
+    for two agents grants nothing.
+    """
+    from config.settings import settings
+
+    pairs: dict[str, str] = {}
+    shared: set[str] = set()
+    for entry in (settings.mcp_agent_tokens or "").split(","):
+        agent, sep, digest = entry.partition("=")
+        agent, digest = agent.strip().lower(), digest.strip().lower()
+        if not sep or agent not in EXTERNAL_AGENT_ASSIGNEES or not _SHA256_HEX.fullmatch(digest):
+            continue
+        if pairs.get(digest, agent) != agent:
+            shared.add(digest)
+        pairs[digest] = agent
+    for digest in shared:
+        pairs.pop(digest, None)
+    return pairs
+
+
+def agent_for_token(token: str) -> str | None:
+    """The external agent a bearer token belongs to, or None."""
+    import hashlib
+    import hmac
+
+    if not token:
+        return None
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    found = None
+    for known, agent in agent_token_hashes().items():
+        if hmac.compare_digest(digest, known):
+            found = agent
+    return found
+
+
 def _check_reminder_create(arguments: dict) -> str | None:
     if arguments.get("message_type") != "static":
         return "connected apps can create only static reminders (message_type='static')"
@@ -267,15 +376,19 @@ def check_oauth_arguments(
     arguments: dict,
     *,
     existing_contexts: Callable[[], set[str]] = lambda: set(),
+    task_agent: str | None = None,
 ) -> str | None:
     """Return a refusal message when an allowed tool's arguments leave the tier.
 
     `existing_contexts` returns the task contexts that already have a file;
     a connected app may file a task only into one of those (an omitted
-    context means `Inbox`), so it never creates a file.
+    context means `Inbox`), so it never creates a file. `task_agent` is the
+    external agent the calling app acts as, if the operator named one.
     """
     if name == "lifeos_task_create":
         return _check_task_create(arguments, existing_contexts)
+    if name == "lifeos_task_update":
+        return _check_task_update(arguments, task_agent)
     if name == "lifeos_reminder_create":
         return _check_reminder_create(arguments)
     return None

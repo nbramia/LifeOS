@@ -456,8 +456,19 @@ Get a specific task.
 ### PUT /api/tasks/{id}
 
 Update a task (description, status, context, priority, due_date, tags,
-notes, fields). `fields` merges into the task's operator/unknown fields — a
+assignee, notes, fields, acting_agent). `fields` merges into the task's operator/unknown fields — a
 string value sets a field, a `null` value removes it.
+
+`assignee` (one of `me`/`claude`/`codex`/`hermes`/`local`/`cloud`/`duet`/`muse`,
+or `none`) replaces the task's assignee tag and keeps its other tags; it is
+checked like a `tags` change and can't be sent with `tags` (**422**).
+`acting_agent` (`duet` or `muse`) marks the request as that external agent's:
+only `description`, `status`, `priority`, `due_date`, `notes` and `assignee`
+are accepted, and the agent may claim only an unassigned task or its own,
+release only its own, and assign no one but itself (**403**); a task assigned
+to another agent, run by an engine or waiting on the operator returns
+**409**. The rule is re-checked under the store lock against the task being
+written. See [Task Management](task-management.md#external-agents).
 
 A patch that includes a `tags` key is checked regardless of whether
 `fields.assigned_by` is `"board"`: adding any of the worker's lifecycle
@@ -664,7 +675,7 @@ Move a task card to a lane, writing the corresponding status/tag at once —
 or writing nothing and returning an error. Body: `{lane, assignee?}`.
 `lane: "done"` marks the task done; `lane: "unassigned"` clears the
 assignee tag; `lane: "assigned"` requires `assignee` (one of
-`me`/`claude`/`codex`/`hermes`/`local`) and replaces any existing assignee
+`me`/`claude`/`codex`/`hermes`/`local`/`cloud`/`duet`/`muse`) and replaces any existing assignee
 tag. `review`, `scheduled`, and `snoozed` can't be set directly (derived
 from a tag, the scheduler store, and the `snoozed_until` field,
 respectively — see below) and return **400**. Every successful move also

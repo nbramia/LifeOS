@@ -30,7 +30,12 @@ from zoneinfo import ZoneInfo
 from croniter import croniter
 
 from api.services.human_queue import add_card
-from api.services.agent_board import AGENT_EXECUTOR_TAGS, AGENT_PICKUP_TAGS, ASSIGNEE_TAGS
+from api.services.agent_board import (
+    AGENT_EXECUTOR_TAGS,
+    AGENT_PICKUP_TAGS,
+    ASSIGNEE_TAGS,
+    EXTERNAL_AGENT_ASSIGNEES,
+)
 from api.services.jev_client import JevClient, JevError, jev_configured
 from api.services.jev_task_routing import judge_task
 from api.services.journal_filing_policy import PEBBLE_DISPOSITION_CRITERIA, classifier_prompt
@@ -44,7 +49,11 @@ from config.settings import settings
 logger = logging.getLogger(__name__)
 
 _VALID_EXECUTORS = frozenset(AGENT_EXECUTOR_TAGS)
-_VALID_TASK_ASSIGNEES = frozenset((*ASSIGNEE_TAGS, *AGENT_EXECUTOR_TAGS))
+# External agents (duet, muse) claim their own work through MCP; a ring
+# capture does not hand work to them.
+_VALID_TASK_ASSIGNEES = frozenset(
+    t for t in (*ASSIGNEE_TAGS, *AGENT_EXECUTOR_TAGS) if t not in EXTERNAL_AGENT_ASSIGNEES
+)
 _ROUTING_TAGS = frozenset((*_VALID_TASK_ASSIGNEES, *AGENT_PICKUP_TAGS))
 _VALID_KINDS = {"task", "schedule", "human"}
 _EFFECT_LEASE_SECONDS = 60

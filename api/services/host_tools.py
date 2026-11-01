@@ -474,13 +474,18 @@ def fs_read(config: HostToolsConfig, arguments: dict) -> dict:
     if b"\x00" in data[:8192]:
         raise HostToolError("binary files are not returned")
     content = redact(data.decode("utf-8", errors="replace"))
-    return {
+    result = {
         "root": name,
         "path": str(rel),
         "size": size,
         "truncated": size > len(data),
         "content": content,
     }
+    if not result["truncated"]:
+        # Pass back as expected_sha256 to lifeos_fs_write to refuse a write
+        # over a file that changed since this read.
+        result["sha256"] = hashlib.sha256(data).hexdigest()
+    return result
 
 
 def _inside_git_work_tree(root: Path) -> bool:
@@ -537,13 +542,35 @@ def fs_write(config: HostToolsConfig, arguments: dict) -> dict:
         raise HostToolError("path must name a file")
     if name == "vault" and config.vault_write_dirs:
         parts = rel.parts
-        if not any(len(parts) > len(d) and parts[:len(d)] == d for d in config.vault_write_dirs):
+        # An entry names a folder (anything inside it) or one file.
+        def allows(d: tuple[str, ...]) -> bool:
+            if parts == d:
+                return not target.is_dir()
+            return parts[:len(d)] == d and not root.joinpath(*d).is_file()
+
+        if not any(allows(d) for d in config.vault_write_dirs):
             allowed = ", ".join("/".join(d) for d in config.vault_write_dirs)
             raise HostToolError(f"vault writes are limited to: {allowed}")
     if target.exists() and not target.is_file():
         raise HostToolError("path exists and is not a file")
     if mode == "create" and target.exists():
         raise HostToolError("file already exists")
+    expected = arguments.get("expected_sha256")
+    if expected is not None and not isinstance(expected, str):
+        raise HostToolError("expected_sha256 must be a string")
+    from api.services import host_write_guard
+
+    guarded = name == "vault" and host_write_guard.guarded_path(rel)
+    if expected is not None or guarded:
+        old_bytes = target.read_bytes() if target.exists() else b""
+        if expected is not None and hashlib.sha256(old_bytes).hexdigest() != expected.strip().lower():
+            raise HostToolError("the file changed since it was read; read it again and redo the edit")
+        if guarded:
+            old_text = old_bytes.decode("utf-8", errors="replace")
+            new_text = old_text + content if mode == "append" else content
+            refusal = host_write_guard.check_vault_write(rel, old_text, new_text)
+            if refusal:
+                raise HostToolError(refusal)
     old_mode = target.stat().st_mode & 0o7777 if target.exists() else None
     if mode == "append" and target.exists():
         with open(target, "a", encoding="utf-8") as f:
@@ -950,8 +977,11 @@ HOST_TOOL_SCHEMAS: list[dict] = [
         "description": "Write one text file in the vault or the scratch directory. A vault "
                        "write is committed when the vault on the host is a git repo; "
                        "otherwise the result says it was not. The operator may limit vault "
-                       "writes to some folders; a refusal names them. The LifeOS code is "
-                       "read-only; change it through a pull request.",
+                       "writes to some folders or files; a refusal names them. Writes to "
+                       "task files and the schedule inbox cannot add routing, assignee or "
+                       "#human tags, remove tasks or schedules, or change agent-owned ones; "
+                       "use the task tools for those. The LifeOS code is read-only; change "
+                       "it through a pull request.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -959,6 +989,11 @@ HOST_TOOL_SCHEMAS: list[dict] = [
                 "path": {"type": "string", "description": "File path relative to the root."},
                 "content": {"type": "string"},
                 "mode": {"type": "string", "enum": ["overwrite", "create", "append"], "default": "overwrite"},
+                "expected_sha256": {
+                    "type": "string",
+                    "description": "The sha256 lifeos_fs_read returned. The write is refused "
+                                   "if the file changed since, so a concurrent edit is never lost.",
+                },
             },
             "required": ["root", "path", "content"],
         },

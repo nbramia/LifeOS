@@ -40,11 +40,13 @@ import {
   onTabActivate, activateTab, getSelectedGraphCardId,
 } from './linking.js';
 
-const ASSIGNEES = ['me', 'claude', 'codex', 'hermes', 'local', 'cloud'];
+// agent_board.ASSIGNEE_TAGS: the operator, the worker's engines, then the
+// external agents (duet, muse) that claim their own tasks over MCP.
+const ASSIGNEES = ['me', 'claude', 'codex', 'hermes', 'local', 'cloud', 'duet', 'muse'];
 // plan_lane_move (api/services/agent_board.py) 409s a lane=in_progress move
-// whose assignee is one of these — "only the worker claims agent-assigned
-// tasks" — so the composer must not let one through.
-const AGENT_ASSIGNEES = ASSIGNEES.filter(a => a !== 'me');
+// whose assignee is one of these engines — "only the worker claims
+// agent-assigned tasks" — so the composer must not let one through.
+const AGENT_ASSIGNEES = ['claude', 'codex', 'hermes', 'local', 'cloud'];
 
 const SORT_STORAGE_KEY = 'lifeos.agents.board.sort';
 const DEFAULT_SORT = 'modified_desc';

@@ -1117,3 +1117,136 @@ def test_vault_write_folders_come_from_settings(monkeypatch):
 
     monkeypatch.setattr(settings, "host_tools_vault_write_dirs", "Assistant")
     assert host_tools.HostToolsConfig.from_settings().vault_write_dirs == (("Assistant",),)
+
+
+# ── task files and the schedule inbox ────────────────────────────────────
+
+_TASKS = "LifeOS/Tasks/Inbox.md"
+_SCHEDULES = "LifeOS/Scheduler/Inbox.md"
+_TASK_FILE = (
+    "# Inbox\n"
+    "- [ ] TODO Synthetic errand [created:: 2026-01-01] #errand <!-- id:aaaa1111 -->\n"
+    "- [ ] TODO Synthetic engine job [created:: 2026-01-01] #claude <!-- id:bbbb2222 -->\n"
+    "    > the prompt the engine runs\n"
+    "- [ ] TODO Synthetic agent task [created:: 2026-01-01] #muse <!-- id:cccc3333 -->\n"
+    "- [ ] TODO Synthetic child [created:: 2026-01-01] [parent_id:: aaaa1111] <!-- id:dddd4444 -->\n"
+)
+
+
+@pytest.fixture
+def task_vault(roots):
+    path = roots["vault"] / _TASKS
+    path.parent.mkdir(parents=True)
+    path.write_text(_TASK_FILE)
+    return path
+
+
+def _write(config, path, content, **extra):
+    return host_tools.fs_write(config, {"root": "vault", "path": path, "content": content, **extra})
+
+
+def test_task_file_accepts_plain_edits_and_new_plain_tasks(config, task_vault):
+    edited = _TASK_FILE.replace("Synthetic errand", "Synthetic errand, called back").replace(
+        "#muse <!-- id:cccc3333 -->", "#muse <!-- id:cccc3333 -->\n    > note from the operator")
+    edited += "- [ ] TODO Synthetic new errand #home\n"
+    _write(config, _TASKS, edited)
+    assert task_vault.read_text() == edited
+    _write(config, _TASKS, "- [ ] TODO Synthetic appended errand\n", mode="append")
+
+
+@pytest.mark.parametrize("change,reason", [
+    (lambda s: s + "- [ ] TODO Synthetic #codex\n", "cannot gain #codex"),
+    (lambda s: s + "- [ ] TODO Synthetic #duet\n", "cannot gain #duet"),
+    (lambda s: s + "- [ ] TODO Synthetic\n    > run with #cloud-sonnet\n", "cannot gain #cloud-sonnet"),
+    (lambda s: s + "- [ ] TODO Synthetic ＃hermes\n", "cannot gain #hermes"),
+    (lambda s: s + "- [ ] TODO Synthetic #human\n", "cannot gain #human"),
+    (lambda s: s.replace("#errand <!-- id:aaaa1111", "#errand #agent-running <!-- id:aaaa1111"), "agent-running"),
+    (lambda s: s.replace("#muse <!-- id:cccc3333", "<!-- id:cccc3333").replace(
+        "#errand <!-- id:aaaa1111", "#errand #muse <!-- id:aaaa1111"), "assignee or routing"),
+    (lambda s: s.replace("#muse <!-- id:cccc3333", "<!-- id:cccc3333"), "assignee or routing"),
+    (lambda s: s.replace("the prompt the engine runs", "a different prompt"), "owned by an engine"),
+    (lambda s: s.replace("- [ ] TODO Synthetic engine", "- [x] TODO Synthetic engine"), "owned by an engine"),
+    (lambda s: s.replace("[parent_id:: aaaa1111]", "[parent_id:: cccc3333]"), "parent_id"),
+    (lambda s: s + "- [ ] TODO Synthetic [parent_id:: aaaa1111]\n", "parent_id"),
+    (lambda s: "\n".join(l for l in s.splitlines() if "aaaa1111 -->" not in l) + "\n", "removed"),
+])
+def test_task_file_refuses_routing_assignment_and_structure_changes(config, task_vault, change, reason):
+    with pytest.raises(HostToolError, match=reason):
+        _write(config, _TASKS, change(_TASK_FILE))
+    assert task_vault.read_text() == _TASK_FILE
+
+
+def test_append_to_a_task_file_is_checked_too(config, task_vault):
+    with pytest.raises(HostToolError, match="cannot gain #local"):
+        _write(config, _TASKS, "- [ ] TODO Synthetic #local\n", mode="append")
+    assert task_vault.read_text() == _TASK_FILE
+
+
+def test_files_below_the_tasks_folder_are_not_task_files(config, roots, task_vault):
+    _write(config, "LifeOS/Tasks/Agent Output/Note.md", "Ran by #claude\n")
+
+
+_SCHEDULE_FILE = (
+    "# Schedules\n"
+    "- [ ] Synthetic morning note [cron:: 0 9 * * *] [action:: notify] [mtype:: static] <!-- id:s1 -->\n"
+    "    > Stretch\n"
+    "- [ ] Synthetic agent run [cron:: 0 8 * * 1] [action:: agent] #local <!-- id:s2 -->\n"
+    "    > do the weekly review\n"
+)
+
+
+@pytest.fixture
+def schedule_vault(roots):
+    path = roots["vault"] / _SCHEDULES
+    path.parent.mkdir(parents=True)
+    path.write_text(_SCHEDULE_FILE)
+    return path
+
+
+def test_schedule_inbox_accepts_static_notifications(config, schedule_vault):
+    edited = _SCHEDULE_FILE.replace("Stretch", "Stretch and drink water") + (
+        "- [ ] Synthetic reminder [at:: 2026-12-01T09:00:00] [action:: notify]\n    > Call back\n"
+    )
+    _write(config, _SCHEDULES, edited)
+    assert schedule_vault.read_text() == edited
+
+
+@pytest.mark.parametrize("change,reason", [
+    (lambda s: s + "- [ ] Synthetic [cron:: * * * * *] [action:: prompt]\n    > summarize mail\n",
+     "only static notification"),
+    (lambda s: s + "- [ ] Synthetic [cron:: * * * * *] [action:: notify] [mtype:: prompt]\n", "only static"),
+    (lambda s: s + "- [ ] Synthetic [cron:: * * * * *] [action:: endpoint] [endpoint:: POST /api/x]\n",
+     "only static"),
+    (lambda s: s + "- [ ] Synthetic [cron:: * * * * *] [action:: agent] #cloud\n", "only static"),
+    (lambda s: s.replace("do the weekly review", "send my mail"), "leave its lines unchanged"),
+    (lambda s: s.replace("[action:: notify] [mtype:: static] <!-- id:s1",
+                         "[action:: agent] <!-- id:s1"), "only static"),
+    (lambda s: s.split("- [ ] Synthetic agent run")[0], "removed"),
+])
+def test_schedule_inbox_refuses_execution_schedules(config, schedule_vault, change, reason):
+    with pytest.raises(HostToolError, match=reason):
+        _write(config, _SCHEDULES, change(_SCHEDULE_FILE))
+    assert schedule_vault.read_text() == _SCHEDULE_FILE
+
+
+def test_write_refuses_a_file_that_changed_since_it_was_read(config, roots):
+    read = host_tools.fs_read(config, {"root": "vault", "path": "Work/Plan.md"})
+    assert read["sha256"]
+    (roots["vault"] / "Work" / "Plan.md").write_text("# Plan\nedited elsewhere\n")
+    with pytest.raises(HostToolError, match="changed since it was read"):
+        _write(config, "Work/Plan.md", "# Plan\nmine\n", expected_sha256=read["sha256"])
+    assert "edited elsewhere" in (roots["vault"] / "Work" / "Plan.md").read_text()
+    fresh = host_tools.fs_read(config, {"root": "vault", "path": "Work/Plan.md"})
+    _write(config, "Work/Plan.md", "# Plan\nmine\n", expected_sha256=fresh["sha256"])
+
+
+def test_a_truncated_read_has_no_hash(config):
+    assert "sha256" not in host_tools.fs_read(config, {"root": "vault", "path": "Work/Plan.md", "max_bytes": 3})
+
+
+def test_vault_write_list_can_name_single_files(config, roots, task_vault):
+    config.vault_write_dirs = host_tools.parse_vault_write_dirs("Assistant, LifeOS/Tasks/Inbox.md")
+    _write(config, _TASKS, _TASK_FILE + "- [ ] TODO Synthetic plain\n")
+    for path in ("LifeOS/Tasks/Work.md", "LifeOS/Tasks/Inbox.md.bak", "LifeOS/Tasks/Inbox.md/x"):
+        with pytest.raises(HostToolError, match="limited to"):
+            _write(config, path, "x\n")

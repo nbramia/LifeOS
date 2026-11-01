@@ -1940,7 +1940,10 @@ async def review_board_card_action(card_id: str, body: ReviewActionRequest) -> d
                 t for t in cleaned
                 if t.lstrip("#").lower() not in agent_board.AGENT_EXECUTOR_TAGS
             ]
-            cleaned.extend([(body.assignee or "").lstrip("#").lower(), agent_board.REASSIGNED_TAG])
+            target = (body.assignee or "").lstrip("#").lower()
+            cleaned.append(target)
+            if target not in agent_board.EXTERNAL_AGENT_ASSIGNEES:
+                cleaned.append(agent_board.REASSIGNED_TAG)
             return cleaned
 
         def merge_note(current_notes: str) -> str:

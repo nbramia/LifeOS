@@ -5,6 +5,7 @@ CRUD endpoints for tasks stored in Obsidian-compatible markdown.
 """
 import logging
 import re
+from datetime import date
 from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException, Query
@@ -292,6 +293,36 @@ class PreflightPreviewResponse(BaseModel):
     ambiguity: Optional[dict] = None
 
 
+# The only fields an acting external agent may change on a task.
+_ACTING_AGENT_UPDATE_FIELDS = frozenset({"description", "status", "priority", "due_date", "notes"})
+_ACTING_AGENT_PRIORITIES = ("high", "medium", "low")
+_ISO_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _validate_acting_agent_values(updates: dict) -> None:
+    """Refuse priority and due_date values outside their documented formats.
+
+    These values are rendered into the task line, so a free-form value could
+    carry extra markup (such as a tag) into the stored task.
+    """
+    priority = updates.get("priority")
+    if priority is not None and priority not in ("", *_ACTING_AGENT_PRIORITIES):
+        raise HTTPException(
+            status_code=422,
+            detail="priority must be one of: " + ", ".join(_ACTING_AGENT_PRIORITIES) + ", or empty",
+        )
+    due_date = updates.get("due_date")
+    if due_date is not None and due_date != "":
+        valid = _ISO_DATE_RE.fullmatch(due_date) is not None
+        if valid:
+            try:
+                date.fromisoformat(due_date)
+            except ValueError:
+                valid = False
+        if not valid:
+            raise HTTPException(status_code=422, detail="due_date must be YYYY-MM-DD, or empty to clear it")
+
+
 class UpdateTaskRequest(BaseModel):
     description: Optional[str] = None
     status: Optional[str] = None
@@ -319,6 +350,22 @@ class UpdateTaskRequest(BaseModel):
                     "Set parent_id to an existing stable task ID to attach or "
                     "reparent this child; set parent_id to null to detach it. "
                     "Fields not mentioned are left alone.",
+    )
+    assignee: Optional[str] = Field(
+        default=None,
+        description="Sets the task's one assignee tag (me, an engine, or an "
+                    "external agent such as duet or muse), replacing any other; "
+                    "'none' clears it. Other tags are kept. Cannot be combined "
+                    "with tags.",
+    )
+    acting_agent: Optional[str] = Field(
+        default=None,
+        description="The external agent (duet, muse) making this edit. When set, "
+                    "agents cannot fight over tasks: the edit must leave alone tasks "
+                    "assigned to another agent or run by an engine, may claim only "
+                    "an unassigned task, and may assign only to the acting agent. "
+                    "Rechecked against the snapshot being written. Cannot be "
+                    "combined with tags or fields. Not persisted.",
     )
     actor: Optional[str] = Field(
         default=None,
@@ -1062,7 +1109,38 @@ async def update_task(
     manager = get_task_manager()
     updates = {k: v for k, v in request.model_dump().items() if v is not None}
     actor = updates.pop("actor", None)
+    assignee = updates.pop("assignee", None)
+    acting_agent = updates.pop("acting_agent", None)
     agent_session_id = _clean_agent_session_header(x_lifeos_agent_session)
+
+    from api.services import agent_board as _board
+
+    if assignee is not None:
+        assignee = assignee.strip().lstrip("#").lower()
+        if assignee not in (*_board.ASSIGNEE_TAGS, _board.UNASSIGN):
+            raise HTTPException(
+                status_code=422,
+                detail="assignee must be one of: " + ", ".join((*_board.ASSIGNEE_TAGS, _board.UNASSIGN)),
+            )
+        if "tags" in updates:
+            raise HTTPException(status_code=422, detail="assignee cannot be combined with tags")
+    if acting_agent is not None:
+        acting_agent = acting_agent.strip().lstrip("#").lower()
+        if acting_agent not in _board.EXTERNAL_AGENT_ASSIGNEES:
+            raise HTTPException(
+                status_code=422,
+                detail="acting_agent must be one of: " + ", ".join(_board.EXTERNAL_AGENT_ASSIGNEES),
+            )
+        refused = sorted(set(updates) - _ACTING_AGENT_UPDATE_FIELDS)
+        if actor is not None:
+            refused.append("actor")
+        if refused:
+            raise HTTPException(
+                status_code=422,
+                detail=f"an acting agent may set only {', '.join(sorted(_ACTING_AGENT_UPDATE_FIELDS))} "
+                       f"and assignee; not {', '.join(refused)}",
+            )
+        _validate_acting_agent_values(updates)
 
     # The board's assignment pickers stamp `fields.assigned_by: "board"` on
     # every write (see web/agents/assignment.js) — that marker routes a
@@ -1084,15 +1162,29 @@ async def update_task(
         bool({"model", "effort", "host"} & set((fields_patch or {}).keys()))
         or "status" in updates
     )
-    needs_current = "tags" in updates or board_marked_field_change
+    needs_current = (
+        "tags" in updates or assignee is not None or acting_agent is not None
+        or board_marked_field_change
+    )
     current = manager.get(task_id) if needs_current else None
     if needs_current and current is None:
         raise HTTPException(status_code=404, detail="Task not found")
 
+    # The tag list this write would leave, for the guards below: a tags patch
+    # names it, an assignee patch swaps one tag on the current list.
+    requested_tags = updates.get("tags")
+    if assignee is not None and current is not None:
+        requested_tags = _board.swap_assignee(current.tags, assignee)
+
+    if current is not None and acting_agent is not None:
+        error = _board.agent_task_edit_error(current.status, current.tags, acting_agent, assignee)
+        if error is not None:
+            raise HTTPException(status_code=error[0], detail=error[1])
+
     if current is not None:
         from api.services import agent_board
 
-        if agent_session_id and "tags" in updates:
+        if agent_session_id and requested_tags is not None:
             effective_parent_id = (
                 clean_parent_id(fields_patch.get("parent_id"))
                 if fields_patch and "parent_id" in fields_patch
@@ -1103,7 +1195,7 @@ async def update_task(
             # already assigned (e.g. #hermes) must not itself get refused;
             # only introducing a new one does.
             newly_added_tags = agent_board.normalize_tags(
-                updates["tags"]
+                requested_tags
             ) - agent_board.normalize_tags(current.tags)
             if effective_parent_id and newly_added_tags:
                 _enforce_agent_child_tag_guard(
@@ -1120,7 +1212,7 @@ async def update_task(
             if error is not None:
                 raise HTTPException(status_code=error[0], detail=error[1])
 
-        if "tags" in updates:
+        if requested_tags is not None:
             # Compare the normalized assignee-tag *and* claim-tag SETS,
             # not just `derive_assignee`'s single first-match-wins value —
             # that value is blind to two holes a free-text tags patch can
@@ -1146,7 +1238,7 @@ async def update_task(
             # `actor` field precisely because it exists to tell the
             # worker's own write apart from everyone else's.
             old_tags = agent_board.normalize_tags(current.tags)
-            new_tags = agent_board.normalize_tags(updates["tags"])
+            new_tags = agent_board.normalize_tags(requested_tags)
             # Managed Agents consent tags are executor assignments too. They
             # are not board assignee lanes, but removing one through a raw
             # tags PUT would silently change the worker's requested target.
@@ -1241,6 +1333,23 @@ async def update_task(
             )
             if fresh_error is not None:
                 raise agent_board.CardDecisionChanged(fresh_error)
+
+    if acting_agent is not None:
+        board_precondition = precondition
+
+        def precondition(current) -> None:  # noqa: F811 — composes the board check
+            if board_precondition is not None:
+                board_precondition(current)
+            fresh_error = _board.agent_task_edit_error(
+                current.status, current.tags, acting_agent, assignee,
+            )
+            if fresh_error is not None:
+                raise _board.CardDecisionChanged(fresh_error)
+
+    if assignee is not None:
+        # Swapped on the snapshot being written, so a concurrent tag edit
+        # (Obsidian, the board) is kept rather than overwritten.
+        updates["_tags_merge"] = lambda tags: _board.swap_assignee(tags, assignee)
 
     try:
         task = manager.update(task_id, _precondition=precondition, **updates)

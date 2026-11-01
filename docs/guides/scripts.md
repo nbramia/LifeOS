@@ -440,6 +440,16 @@ python scripts/eero_login.py --code 123456
 
 Stores the session in `data/home/eero_session.json` (mode 0600); never prints the token.
 
+### mcp_agent_token.py
+
+Mints a bearer token for an external agent (`duet` or `muse`) on the MCP HTTP transport (see [Connected Apps](mcp-connected-apps.md#a-scoped-token-for-an-agent)).
+
+```bash
+~/.venvs/lifeos/bin/python scripts/mcp_agent_token.py new muse
+```
+
+Prints the token once and the `agent=sha256` entry for `LIFEOS_MCP_AGENT_TOKENS`. Writes nothing; only the hash goes in `.env`.
+
 ---
 
 ## Maintenance
