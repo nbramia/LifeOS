@@ -1,7 +1,7 @@
 # Scripts Reference
 
 > **Status:** Complete
-> **Last Updated:** 2026-09-18
+> **Last Updated:** 2026-11-01
 > **Audience:** Operators
 
 Reference for the operator-facing scripts under `scripts/`, with usage examples. One-off CRM entity-repair scripts (`merge_people.py`, `split_person.py`, `fix_*`, etc.), git hooks, and Claude Code worktree/session-diagnostic helpers aren't covered here — they're self-documenting via `--help` or their own docstring.
@@ -99,6 +99,16 @@ LIFEOS_REMOTE_HOST=<ssh-target> ./scripts/remote-test.sh
 ```
 
 Set `LIFEOS_REMOTE_HOST` once in your shell profile — there is no default.
+
+### merge-pr.sh
+
+Merges a pull request through the hosted candidate gate. It works from any machine with `git`, `gh`, and `python3`, with no venv:
+
+```bash
+./scripts/merge-pr.sh <pr-number>
+```
+
+It runs `origin/main`'s copy of `scripts/candidate_publisher.py`, pinned to the head commit it reads at startup, and refuses to publish any other head. See [Candidate Verification CI](candidate-verification-ci.md#the-actual-gate-a-dedicated-app-issued-required-check) for what the publisher does.
 
 ### Candidate CI policy audit
 

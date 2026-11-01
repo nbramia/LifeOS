@@ -1,7 +1,7 @@
 # Development Lifecycle
 
 **Status:** Partial
-**Last Updated:** 2026-09-10
+**Last Updated:** 2026-11-01
 **Owner:** Development workflow
 
 This contract defines the shared implementation, review, verification, and
@@ -100,7 +100,7 @@ and records it at most once for the exact candidate. Implementers, reviewers,
 documentation checks, PR standards checks, and merge preparation may run
 focused commands but do not consume or rerun that authoritative plan. Broad
 gates remain required until an approved enforcement change records a safe
-reuse policy. Missing or mismatched evidence is a readiness failure, not a
+reuse policy. Missing or mismatched required evidence is a readiness failure, not a
 reason to guess or silently rerun a broad suite. Verification preserves this
 evidence for the exact candidate; it does not run a separate multi-round
 findings loop of its own — anything it surfaces is a finding under [Risk and
@@ -124,7 +124,11 @@ together. PR size is advisory unless a concrete cohesion or reviewability
 problem is demonstrated.
 
 Merge readiness requires the current candidate, repository-required checks,
-accepted review state, and matching verification evidence. Publication and
+and accepted review state. Work that hits one of the six triggers in [Risk and
+review](#risk-and-review) also requires matching verification evidence for the
+exact PR head. For other work, the `candidate-verification` check on the
+published candidate is the verification evidence, and no separate local suite
+run or evidence record is required. Publication and
 post-publication history are immutable under normal operation; no `--no-verify`
 or main-history rewrite is a lifecycle escape hatch. Production restart is a
 deployment concern only; isolated testing never restarts production.
