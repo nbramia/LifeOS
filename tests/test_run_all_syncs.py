@@ -356,6 +356,76 @@ class TestRepeatedYieldExcludedFromNewRecords:
         assert result["interactions_created"] == 35
 
 
+def test_run_all_syncs_reports_dead_source_flags_on_the_result():
+    """Yield-collapsed and never-yielded sources are on the result dict, not
+    only in the log, so the summaries can show them."""
+    from scripts.run_all_syncs import run_all_syncs
+
+    def side_effect(source, dry_run=False):
+        if source == "source_a":
+            return True, {"yield_collapse": {"typical_yield": 40.0}}
+        if source == "source_b":
+            return True, {"never_yielded": {"runs": 9}, "never_yielded_warned": True}
+        return True, {"interactions_created": 5}
+
+    with (
+        patch("scripts.run_all_syncs.SYNC_SOURCES", TEST_SYNC_SOURCES),
+        patch("scripts.run_all_syncs.SYNC_ORDER", TEST_SYNC_ORDER),
+        patch("scripts.run_all_syncs.run_sync", MagicMock(side_effect=side_effect)),
+        patch("scripts.run_all_syncs.check_sync_health", return_value=(True, "healthy")),
+        patch("scripts.run_all_syncs.get_disabled_work_sources", return_value=set()),
+        patch("scripts.run_all_syncs.log_sync_summary_to_markdown"),
+    ):
+        result = run_all_syncs(dry_run=True)
+
+    assert result["yield_collapsed_sources"] == ["source_a"]
+    assert result["never_yielded_sources"] == ["source_b"]
+
+
+def test_sync_summaries_show_dead_sources_without_changing_the_status():
+    """Both summaries name yield-collapsed and never-yielded sources on one
+    line each; the status emoji stays as the other signals set it."""
+    from scripts.run_all_syncs import log_sync_summary_to_markdown, send_sync_summary_telegram
+    result = {
+        "succeeded": 3, "sources_run": 3, "failed": 0, "failed_sources": [],
+        "duration_seconds": 12,
+        "yield_collapsed_sources": ["source_a"],
+        "never_yielded_sources": ["source_b", "source_c"],
+        "results": {},
+    }
+    with patch("api.services.telegram.send_message", return_value=True) as send_mock:
+        send_sync_summary_telegram(result, trigger="test")
+    message = send_mock.call_args[0][0]
+    assert "source_a" in message
+    assert "source_b, source_c" in message
+    assert message.startswith("✅")
+
+    with patch("scripts.run_all_syncs._write_to_markdown_log") as write_mock:
+        log_sync_summary_to_markdown(result, trigger="test")
+    entry = write_mock.call_args[0][0]
+    assert "source_a" in entry
+    assert "source_b, source_c" in entry
+
+
+def test_sync_summaries_omit_dead_source_lines_when_empty():
+    from scripts.run_all_syncs import log_sync_summary_to_markdown, send_sync_summary_telegram
+    result = {
+        "succeeded": 3, "sources_run": 3, "failed": 0, "failed_sources": [],
+        "duration_seconds": 12,
+        "yield_collapsed_sources": [], "never_yielded_sources": [],
+        "results": {},
+    }
+    with patch("api.services.telegram.send_message", return_value=True) as send_mock:
+        send_sync_summary_telegram(result, trigger="test")
+    assert "Never produced" not in send_mock.call_args[0][0]
+    assert "Produced no records" not in send_mock.call_args[0][0]
+
+    with patch("scripts.run_all_syncs._write_to_markdown_log") as write_mock:
+        log_sync_summary_to_markdown(result, trigger="test")
+    assert "Never produced" not in write_mock.call_args[0][0]
+    assert "Produced no records" not in write_mock.call_args[0][0]
+
+
 def test_run_all_syncs_surfaces_apple_agent_sha_drift():
     """run_all_syncs() reads the SHA-drift signal directly from the Apple
     import manifest (independent of the apple_import subprocess) and puts
