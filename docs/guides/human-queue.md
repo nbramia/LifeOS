@@ -22,7 +22,7 @@ not a separate list.
 
 ## The instruction paragraph
 
-Paste this into an operator-level instruction file (`CLAUDE.md`/`AGENTS.md`
+Paste this into an operator-level instruction file (`AGENTS.md`
 on a machine you run agents from) so every agent on that machine knows the
 convention:
 

@@ -1,6 +1,6 @@
 This directory contains time-bounded execution notes — working files for a specific in-flight effort.
 
-> **Gitignored content:** the actual plan files in this directory are personal and gitignored. Only this `AGENTS.md` and `CLAUDE.md` are tracked, so any agent or contributor landing here knows the conventions even when the personal content isn't visible.
+> **Gitignored content:** the actual plan files in this directory are personal and gitignored. Only this `AGENTS.md` is tracked, so any agent or contributor landing here knows the conventions even when the personal content isn't visible.
 
 > **Backlog lives in GitHub issues — never in `docs/plans/`.** Do not create `backlog.md`, `todo.md`, `ideas.md`, or any running list of deferred work. File a GitHub issue instead. Plan files exist only for the slice of work that's actively being executed and needs scratch space outside the issue tracker.
 

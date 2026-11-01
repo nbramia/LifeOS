@@ -519,7 +519,7 @@ LifeOS is running. Core functionality available:
 
 **Remember:** Come back to Phase 7 after the first full sync to set your person ID.
 
-For ongoing maintenance, see the project `CLAUDE.md` and `README.md`.
+For ongoing maintenance, see the project `AGENTS.md` and `README.md`.
 
 ## Related Documents
 

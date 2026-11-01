@@ -172,4 +172,3 @@ GPU guards, and deployment controls remain owned by their current components.
 ### Code References
 
 - [Project Instructions](../../../AGENTS.md) — Repository-wide workflow and privacy invariants
-- [Claude Instructions](../../../CLAUDE.md) — Claude harness entry points
