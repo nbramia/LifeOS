@@ -57,7 +57,7 @@ def agents_base_url():
         server.server_close()
 
 
-_ASSIGNEE_TAGS = {"me", "claude", "codex", "hermes", "local", "cloud"}
+_ASSIGNEE_TAGS = {"me", "claude", "codex", "hermes", "local", "cloud", "duet", "muse"}
 _PROTECTED_TAGS = _ASSIGNEE_TAGS | {
     "cloud-haiku", "cloud-sonnet", "agent-running", "agent-blocked",
     "agent-completed", "agent-failed", "agent-budget-exceeded",

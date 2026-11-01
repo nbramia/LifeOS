@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from api.services.agent_board import AGENT_EXECUTOR_TAGS, ASSIGNEE_TAGS
+from api.services.agent_board import AGENT_EXECUTOR_TAGS, ASSIGNEE_TAGS, EXTERNAL_AGENT_ASSIGNEES
 from api.services.jev_client import JevError
 from api.services.jev_task_routing import JevAnswer, TaskJudgment
 from api.services.pebble_capture import (
@@ -2963,7 +2963,9 @@ async def test_jev_classifier_asks_assignee_and_title_questions_in_one_call():
     transcript = "Make a task assigned to me to buy some synthetic widgets"
     client = _QuestionAwareJev(_answers(assignee="me"))
     await JevPebbleClassifier(client=client).classify(transcript, _RECORDED)
-    assert set(client.questions["assignee"]["criteria"]) == {"none", *ASSIGNEE_TAGS, *AGENT_EXECUTOR_TAGS}
+    assert set(client.questions["assignee"]["criteria"]) == (
+        {"none", *ASSIGNEE_TAGS, *AGENT_EXECUTOR_TAGS} - set(EXTERNAL_AGENT_ASSIGNEES)
+    )
     options = client.questions["title_s0"]["criteria"]
     assert "buy some synthetic widgets" in options.values()
     assert len(options) <= 255

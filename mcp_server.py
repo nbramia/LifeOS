@@ -67,6 +67,42 @@ _TASK_UPDATE_FIELDS_DESCRIPTION = (
     "carries it."
 )
 
+_TASK_UPDATE_ASSIGNEE_DESCRIPTION = (
+    "Set the one assignee: me, an engine (claude, codex, hermes, local, cloud) "
+    "or an external agent (duet, muse); 'none' clears it. Other tags are kept. "
+    "Assign only the assignee the operator named. Cannot be combined with tags."
+)
+_TASK_UPDATE_ACTING_AGENT_DESCRIPTION = (
+    "If you are an external agent (duet, muse), your own name. LifeOS then "
+    "refuses to let you touch a task assigned to another agent or run by an "
+    "engine, to claim anything but an unassigned task, or to assign anyone but "
+    "yourself."
+)
+# The schema a connected app acting as an external agent sees for
+# lifeos_task_update: only the arguments `mcp_tool_tier._check_task_update`
+# accepts.
+_TASK_UPDATE_AGENT_DESCRIPTION = (
+    "Update a task as yourself, the agent assignee this app is connected as: "
+    "status (claim with in_progress, finish with done), notes, priority, due "
+    "date, description, or assignee (yourself to claim, 'none' to release). "
+    "You may edit unassigned tasks, your own, and the operator's; you cannot "
+    "claim the operator's task, touch one assigned to another agent or run by "
+    "an engine, or assign anyone but yourself. Use lifeos_task_list for the ID."
+)
+_TASK_UPDATE_AGENT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "task_id": {"type": "string", "description": "Task ID from lifeos_task_list"},
+        "status": {"type": "string", "description": "todo, in_progress, done, cancelled, deferred, blocked or urgent"},
+        "assignee": {"type": "string", "description": "Your own agent name to claim the task, or 'none' to release your claim"},
+        "notes": {"type": "string", "description": "Replaces the notes body; send the old notes plus your addition to append."},
+        "priority": {"type": "string", "description": "high, medium or low"},
+        "due_date": {"type": "string", "description": "YYYY-MM-DD"},
+        "description": {"type": "string", "description": "New task description"},
+    },
+    "required": ["task_id"],
+}
+
 
 def _task_status_symbol(status: str) -> str:
     return {
@@ -467,7 +503,7 @@ CURATED_ENDPOINTS = {
     },
     "/api/tasks/{task_id}:PUT": {
         "name": "lifeos_task_update",
-        "description": "Update a task's description, status, context, priority, due_date, tags, notes, or fields. Use lifeos_task_list first to find the task ID.",
+        "description": "Update a task's description, status, context, priority, due_date, tags, assignee, notes, or fields. Use lifeos_task_list first to find the task ID.",
         "method": "PUT",
         "path": "/api/tasks/{task_id}"
     },
@@ -1407,7 +1443,9 @@ class LifeOSMCPServer:
                     "due_date": {"type": "string", "description": "New due date (YYYY-MM-DD)"},
                     "tags": {"type": "array", "items": {"type": "string"}, "description": "New tags (replaces existing). Add exactly the tags the operator named — a routing tag (local/claude/codex/hermes/cloud/cloud-haiku/cloud-sonnet) only if the operator explicitly named that engine; these tags are operator-authority and outrank every routing safeguard."},
                     "notes": {"type": "string", "description": "Replaces the notes body."},
-                    "fields": {"type": "object", "additionalProperties": {"type": ["string", "null"]}, "description": _TASK_UPDATE_FIELDS_DESCRIPTION}
+                    "fields": {"type": "object", "additionalProperties": {"type": ["string", "null"]}, "description": _TASK_UPDATE_FIELDS_DESCRIPTION},
+                    "assignee": {"type": "string", "description": _TASK_UPDATE_ASSIGNEE_DESCRIPTION},
+                    "acting_agent": {"type": "string", "description": _TASK_UPDATE_ACTING_AGENT_DESCRIPTION}
                 },
                 "required": ["task_id"]
             },
@@ -2792,12 +2830,25 @@ class OAuthToolAccess:
             # Operator grant (LIFEOS_HOST_TOOLS_OAUTH_CLIENTS): this client also
             # gets the host tools, and nothing else beyond the tier.
             self.allowed = OAUTH_ALLOWED_TOOLS | HOST_TOOL_NAMES
+        from api.services.mcp_tool_tier import task_agent_clients
+
+        # Operator grant (LIFEOS_TASK_AGENT_OAUTH_CLIENTS): this client acts as
+        # a named external agent and may update tasks as that agent.
+        self.task_agent = task_agent_clients().get(principal)
+        if self.task_agent:
+            self.allowed = self.allowed | {"lifeos_task_update"}
         self._annotations = tool_annotations
 
     def tools(self) -> list[dict]:
         listed = []
         for tool in [*self.server.tools, *CHATGPT_TOOLS]:
             if tool["name"] in self.allowed:
+                if tool["name"] == "lifeos_task_update":
+                    tool = {
+                        **tool,
+                        "description": _TASK_UPDATE_AGENT_DESCRIPTION,
+                        "inputSchema": _TASK_UPDATE_AGENT_SCHEMA,
+                    }
                 listed.append({**tool, "annotations": self._annotations(tool["name"])})
         return listed
 
@@ -2816,9 +2867,13 @@ class OAuthToolAccess:
             return self.server.call_host_tool(name, arguments, caller=f"oauth:{self.principal}")
         refusal = check_oauth_arguments(
             name, arguments, existing_contexts=self.server.task_contexts,
+            task_agent=self.task_agent,
         )
         if refusal:
             return _tool_error(refusal)
+        if name == "lifeos_task_update":
+            # The API enforces the agent rules against the snapshot it writes.
+            arguments = {**arguments, "acting_agent": self.task_agent}
         if name in CHATGPT_TOOL_NAMES:
             if name == "search":
                 payload = self.server.chatgpt_search(arguments, principal=self.principal)

@@ -105,7 +105,7 @@ export function openReviewActionModal(card, action, onChanged, {
 } = {}) {
   const isReject = action === 'reject';
   const title = isReject ? 'Reject review' : 'Reassign review';
-  const assignees = ['me', 'claude', 'codex', 'hermes', 'local', 'cloud'];
+  const assignees = ['me', 'claude', 'codex', 'hermes', 'local', 'cloud', 'duet', 'muse'];
   const assigneeHtml = isReject ? '' : `
     <label for="review-assignee">Assignee</label>
     <select id="review-assignee">

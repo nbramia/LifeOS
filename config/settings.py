@@ -821,8 +821,15 @@ class Settings(BaseSettings):
     host_tools_vault_write_dirs: str = Field(
         default="",
         alias="LIFEOS_HOST_TOOLS_VAULT_WRITE_DIRS",
-        description="Comma-separated vault folders that lifeos_fs_write may write inside. "
-                    "Empty means the whole vault."
+        description="Comma-separated vault folders, or single files, that lifeos_fs_write "
+                    "may write. Empty means the whole vault."
+    )
+    task_agent_oauth_clients: str = Field(
+        default="",
+        alias="LIFEOS_TASK_AGENT_OAUTH_CLIENTS",
+        description="Comma-separated agent=client_id pairs (agent: duet or muse). The named "
+                    "OAuth client may call lifeos_task_update as that agent, which can claim, "
+                    "update and release only unassigned tasks or its own."
     )
     host_tools_vault_autocommit: bool = Field(
         default=True,

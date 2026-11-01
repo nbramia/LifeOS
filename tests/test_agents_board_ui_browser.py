@@ -60,7 +60,7 @@ _HOST_CATALOG = {
 # Assignee-name tags board.js's own drawer strips/re-adds on an assignee
 # change (web/agents/board.js ASSIGNEES) — used by the lane stub below to
 # mirror plan_lane_move's tag bookkeeping on a drawer-driven assign.
-_ASSIGNEE_TAGS = {"me", "claude", "codex", "hermes", "local", "cloud"}
+_ASSIGNEE_TAGS = {"me", "claude", "codex", "hermes", "local", "cloud", "duet", "muse"}
 
 
 class _AgentsHandler(http.server.SimpleHTTPRequestHandler):
@@ -6598,7 +6598,7 @@ class TestMobileAssignmentTray:
         if assignees is not None:
             source = (WEB_DIR / "agents" / "board.js").read_text()
             source = source.replace(
-                "const ASSIGNEES = ['me', 'claude', 'codex', 'hermes', 'local', 'cloud'];",
+                "const ASSIGNEES = ['me', 'claude', 'codex', 'hermes', 'local', 'cloud', 'duet', 'muse'];",
                 f"const ASSIGNEES = {json.dumps(assignees)};",
             )
             page.route(

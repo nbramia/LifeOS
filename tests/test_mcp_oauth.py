@@ -1417,3 +1417,85 @@ def test_public_listener_accepts_oauth_tokens_and_refuses_the_full_access_token(
     audit = [r.getMessage() for r in caplog.records if r.getMessage().startswith("mcp audit:")]
     assert audit and f"caller=oauth:{client_id}" in audit[-1] and "edge=public-listener" in audit[-1]
     assert _rpc(public, BEARER, "tools/list").status_code == 401
+
+
+# ── task updates for a connected app acting as an external agent ─────────
+
+
+def _as_agent(monkeypatch, client_id: str, agent: str = "duet") -> None:
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "task_agent_oauth_clients", f"{agent}={client_id}")
+
+
+def _update_task(client: TestClient, token: str, arguments: dict) -> dict:
+    return _rpc(client, token, "tools/call",
+                {"name": "lifeos_task_update", "arguments": arguments}).json()
+
+
+def test_task_update_is_not_listed_or_callable_without_an_agent_grant(client, calls):
+    _, tokens, _ = _connect(client)
+    names = {t["name"] for t in _rpc(client, tokens["access_token"], "tools/list").json()["result"]["tools"]}
+    assert "lifeos_task_update" not in names
+    body = _update_task(client, tokens["access_token"], {"task_id": "t1", "status": "done"})
+    assert body["error"]["message"] == "Unknown tool: lifeos_task_update"
+    assert calls == []
+
+
+def test_agent_grant_lists_a_trimmed_task_update_and_names_the_agent(client, calls, monkeypatch):
+    client_id, tokens, _ = _connect(client)
+    _as_agent(monkeypatch, client_id)
+    listed = {t["name"]: t for t in _rpc(client, tokens["access_token"], "tools/list").json()["result"]["tools"]}
+    schema = listed["lifeos_task_update"]["inputSchema"]["properties"]
+    assert set(schema) == {"task_id", "status", "assignee", "notes", "priority", "due_date", "description"}
+    assert listed["lifeos_task_update"]["annotations"]["readOnlyHint"] is False
+    assert not set(listed) & HOST_TOOL_NAMES  # the grant adds nothing else
+
+    body = _update_task(client, tokens["access_token"], {"task_id": "t1", "assignee": "duet", "status": "in_progress"})
+    assert "isError" not in body["result"], body
+    assert calls == [("lifeos_task_update",
+                      {"task_id": "t1", "assignee": "duet", "status": "in_progress", "acting_agent": "duet"})]
+
+
+@pytest.mark.parametrize("arguments", [
+    {"task_id": "t1", "assignee": "muse"},
+    {"task_id": "t1", "assignee": "claude"},
+    {"task_id": "t1", "assignee": "me"},
+    {"task_id": "t1", "tags": ["duet"]},
+    {"task_id": "t1", "fields": {"parent_id": "p1"}},
+    {"task_id": "t1", "context": "Personal"},
+    {"task_id": "t1", "acting_agent": "muse"},
+    {"task_id": "t1", "notes": "hand to #claude"},
+    {"task_id": "t1", "description": "Errand #muse"},
+    {"task_id": "t1", "status": "done\n#codex"},
+    {"status": "done"},
+])
+def test_agent_task_update_refuses_arguments_outside_its_own_lane(client, calls, monkeypatch, arguments):
+    client_id, tokens, _ = _connect(client)
+    _as_agent(monkeypatch, client_id)
+    assert _update_task(client, tokens["access_token"], arguments)["result"]["isError"] is True
+    assert calls == []
+
+
+def test_agent_grant_ignores_unknown_agents_and_shared_client_ids(monkeypatch):
+    from config.settings import settings
+    from api.services.mcp_tool_tier import task_agent_clients
+
+    monkeypatch.setattr(settings, "task_agent_oauth_clients", "duet=a, claude=b, muse=c, duet=c, =d, muse")
+    assert task_agent_clients() == {"a": "duet"}
+
+
+def test_agent_task_update_end_to_end_cannot_take_another_agents_task(client, real_tasks, monkeypatch):
+    client_id, tokens, _ = _connect(client)
+    _as_agent(monkeypatch, client_id)
+    mine = real_tasks.create(description="Synthetic open errand", tags=["errand"]).id
+    theirs = real_tasks.create(description="Synthetic claimed errand", tags=["muse"]).id
+    token = tokens["access_token"]
+
+    assert "isError" not in _update_task(client, token, {"task_id": mine, "assignee": "duet"})["result"]
+    assert _update_task(client, token, {"task_id": theirs, "assignee": "duet"})["result"]["isError"] is True
+    assert _update_task(client, token, {"task_id": theirs, "status": "done"})["result"]["isError"] is True
+    real_tasks.rebuild_index()
+    assert set(real_tasks.get(mine).tags) == {"errand", "duet"}
+    assert set(real_tasks.get(theirs).tags) == {"muse"}
+    assert real_tasks.get(theirs).status == "todo"

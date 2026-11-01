@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Platform
-> **Last Updated:** 2026-10-31
+> **Last Updated:** 2026-11-01
 
 The MCP HTTP transport (`mcp_server.py --transport http`) accepts two credentials on its MCP endpoint (`POST /mcp`, `POST /`):
 
@@ -75,8 +75,9 @@ A **chain** is everything issued from one code exchange. Revoking a token (RFC 7
   - may not set the `fields` map or `dry_run`.
 
   A reminder must be `message_type: "static"` with no `endpoint_config`. Independently of OAuth, the task store accepts only a plain context name (the whole string matches `[A-Za-z0-9][A-Za-z0-9 _&'-]{0,63}`) whose file resolves directly inside the tasks directory.
-- **Denied:** sending (email, Telegram), deletes, person and fact edits, vault writes, task edits and lifecycle actions, projects, schedules, sync, calendar writes (they email attendees), home-network control, Human-queue writes, workout logging, and the `lifeos_agent_*` family.
+- **Denied:** sending (email, Telegram), deletes, person and fact edits, vault writes, task lifecycle actions, projects, schedules, sync, calendar writes (they email attendees), home-network control, Human-queue writes, workout logging, and the `lifeos_agent_*` family.
 - **Operator grant only:** the host tools (`lifeos_fs_list`, `lifeos_fs_read`, `lifeos_fs_write`, `lifeos_shell`, `lifeos_logs`) are denied in the tier. An OAuth client whose id is listed in `LIFEOS_HOST_TOOLS_OAUTH_CLIENTS`, while `LIFEOS_HOST_TOOLS_ENABLED` is on, also gets those five, and nothing else beyond the tier. `lifeos_fs_write` and `lifeos_shell` carry `destructiveHint: true`. Their own path and command limits are in [Host Tools](../../guides/host-tools.md).
+- **Operator grant, per agent:** `lifeos_task_update` is denied in the tier. An OAuth client mapped to an external agent in `LIFEOS_TASK_AGENT_OAUTH_CLIENTS` (`duet=<client_id>`) also gets it, with a trimmed schema: `task_id`, `status`, `assignee`, `notes`, `priority`, `due_date`, `description`. The argument guard refuses any other key, non-string values, non-printable characters outside `notes`, a rendered forbidden tag in `description` or `notes`, and any `assignee` other than the agent itself or `none`. The server then adds `acting_agent` for the mapped agent, so the API applies the agent assignee rules under the task store's lock ([Task Management](../product/task-management.md#external-agents)). Tags and fields cannot be set this way.
 
 `search` and `fetch` exist only for OAuth requests. `search` (`{query}`) runs vault search and returns `{results: [{id, title, url, text}]}`, one per vault document, where `id` is the vault-relative path and `url` an `obsidian://` link. `fetch` (`{id}`) returns `{id, title, text, url, metadata}` for a document an earlier search by the same OAuth client returned in the same process, re-checked to resolve inside the vault. Both results carry the JSON as text content and as `structuredContent`.
 

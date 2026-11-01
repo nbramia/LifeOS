@@ -1,7 +1,7 @@
 # Connected Apps (Claude, ChatGPT)
 
 **Status:** Complete
-**Last Updated:** 2026-10-31
+**Last Updated:** 2026-11-01
 **Audience:** Operator
 
 The Claude and ChatGPT apps can use LifeOS as a custom connector. Their servers reach the MCP HTTP transport through a small, separate Tailscale node, running in its own container, whose port 443 is public (Funnel). Each app is approved once, on a consent page that only the operator's own tailnet devices can open. A connected app gets the restricted "read + safe writes" tool tier, never the full catalog.
@@ -121,6 +121,16 @@ curl -s -X POST https://<host>.<tailnet>.ts.net:8443/mcp -H "Authorization: Bear
 ## Host tools for a connected app
 
 An app can also be given scoped file, command and log access to the host (the host tools), by listing its client id in `LIFEOS_HOST_TOOLS_OAUTH_CLIENTS`. That grant adds those five tools and nothing else. See [Host Tools](host-tools.md).
+
+## Task edits for an agent app
+
+A connected app that works tasks for you, such as a chief of staff app, can be given `lifeos_task_update` as a named external agent. Map its client id to the agent's name in `.env` and restart the MCP transport:
+
+```bash
+LIFEOS_TASK_AGENT_OAUTH_CLIENTS=duet=<client_id>
+```
+
+The app can then claim an unassigned task, update and complete its own or yours, and release its own. It can't take a task assigned to another agent or run by an engine, assign anyone but itself, or set tags or fields. The rules are in [Task Management](../specs/product/task-management.md#external-agents). Apps cache their tool list when they connect, so the tool appears in a new conversation.
 
 ## Troubleshooting
 
