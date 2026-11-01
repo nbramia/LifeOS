@@ -108,7 +108,7 @@ class TestRecencyBoost:
             canonical_name="Quinn Example",
             last_seen=None if days_ago is None else datetime.now() - timedelta(days=days_ago),
         ))
-        candidates = EntityResolver(store)._score_candidates("Quinn Example", None)
+        candidates = EntityResolver(store)._score_candidates("Quinn Example", None).candidates
         assert len(candidates) == 1
         return candidates[0].score
 

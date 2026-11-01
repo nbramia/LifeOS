@@ -540,9 +540,19 @@ def _add_person(store, name, strength):
 
     from api.services.person_entity import PersonEntity
 
-    person = PersonEntity(canonical_name=name, last_seen=datetime.now(timezone.utc) - timedelta(days=2))
+    person = PersonEntity(canonical_name=name)
     person.relationship_strength = strength
-    return store.add(person)
+    stored = store.add(person)
+    # A recent real interaction, in the column sync_last_seen() keeps.
+    conn = store._get_connection()
+    conn.execute(
+        "UPDATE person_entities SET last_seen = ? WHERE id = ?",
+        ((datetime.now(timezone.utc) - timedelta(days=2)).isoformat(), stored.id),
+    )
+    conn.commit()
+    conn.close()
+    store.save()
+    return stored
 
 
 class TestCrmContext:
