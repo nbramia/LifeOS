@@ -215,7 +215,8 @@ SYNC_SOURCES = {
         "frequency": "daily",
         "phase": 2,
         # Reports stats, but a night with no stale merged IDs is the normal
-        # outcome, so a long run of zero yield is not a dead-source signal.
+        # outcome, so a run of zero yield is neither a dead-source nor a
+        # yield-collapse signal.
         "idle_is_normal": True,
         "depends_on": ["link_imessage", "link_source_entities"],
     },

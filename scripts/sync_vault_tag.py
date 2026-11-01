@@ -143,9 +143,12 @@ def main(argv=None) -> int:
 
     from api.services.sync_health import emit_sync_stats
     # Only int values are read by the orchestrator; vocab_version is informational.
-    # ``updated`` is the orchestrator's yield signal: a tagged note is work done.
+    # The orchestrator's yield signal: ``updated`` is notes tagged, ``processed``
+    # is notes examined (tagged or found unchanged), so a quiet night is not a
+    # zero-yield night while an empty or unreadable vault still is.
     emit_sync_stats({
         **{k: result[k] for k in STAT_KEYS},
+        "processed": result["tagged"] + result["skipped_unchanged"],
         "updated": result["tagged"],
         "vocab_version": result["vocab_version"],
     })

@@ -218,6 +218,81 @@ class TestNeverYieldedIdleDeclaration:
 
 
 # =============================================================================
+# Yield collapse honours idle_is_normal
+# =============================================================================
+
+
+class TestYieldCollapseIdleDeclaration:
+    SOURCES = {
+        "declared_idle": {"description": "d", "phase": 1, "frequency": "daily", "idle_is_normal": True},
+        "undeclared": {"description": "u", "phase": 1, "frequency": "daily"},
+    }
+
+    def _detect(self, source, stats=None):
+        from scripts.run_all_syncs import _detect_yield_collapse
+
+        with (
+            patch("scripts.run_all_syncs.SYNC_SOURCES", self.SOURCES),
+            patch("scripts.run_all_syncs.get_typical_yield", return_value=20.0),
+            patch("scripts.run_all_syncs.get_consecutive_zero_yield_runs", return_value=5),
+        ):
+            return _detect_yield_collapse(source, stats or {"created": 0})
+
+    def test_undeclared_source_with_productive_history_then_zeros_collapses(self):
+        info = self._detect("undeclared")
+
+        assert info == {"typical_yield": 20.0, "consecutive_zero_runs": 6}
+
+    def test_declared_idle_source_with_same_history_does_not_collapse(self):
+        assert self._detect("declared_idle") is None
+
+    def test_declared_idle_source_is_checked_before_history_is_read(self):
+        from scripts.run_all_syncs import _detect_yield_collapse
+
+        with (
+            patch("scripts.run_all_syncs.SYNC_SOURCES", self.SOURCES),
+            patch("scripts.run_all_syncs.get_typical_yield") as typical,
+        ):
+            assert _detect_yield_collapse("declared_idle", {"created": 0}) is None
+
+        typical.assert_not_called()
+
+    def test_source_missing_from_metadata_still_collapses(self):
+        assert self._detect("not_listed") is not None
+
+    def test_productive_run_never_collapses(self):
+        assert self._detect("undeclared", {"updated": 3}) is None
+
+
+class TestVaultTagQuietNightsDoNotCollapse:
+    """Real stored history: vault_tag tags notes on some nights and examines
+    unchanged notes on the rest, so a quiet night is not a collapse."""
+
+    def _history(self):
+        for day in (4, 5, 6, 7):
+            _insert_run("vault_tag", day, records_updated=19, records_processed=240)
+        for day in (1, 2, 3):
+            _insert_run("vault_tag", day, records_updated=0, records_processed=240)
+
+    def test_quiet_night_with_notes_examined_is_not_a_collapse(self, temp_db):
+        from scripts.run_all_syncs import _detect_yield_collapse
+
+        self._history()
+
+        assert _detect_yield_collapse("vault_tag", {"updated": 0, "processed": 240}) is None
+
+    def test_night_with_nothing_examined_still_collapses(self, temp_db):
+        from scripts.run_all_syncs import _detect_yield_collapse
+
+        for day in (1, 2, 3, 4):
+            _insert_run("vault_tag", day, records_updated=0, records_processed=0)
+        for day in (5, 6, 7):
+            _insert_run("vault_tag", day, records_updated=19, records_processed=240)
+
+        assert _detect_yield_collapse("vault_tag", {"updated": 0, "processed": 0}) is not None
+
+
+# =============================================================================
 # Stale LinkedIn export
 # =============================================================================
 

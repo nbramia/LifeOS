@@ -16,7 +16,7 @@ pytestmark = pytest.mark.unit
 TX = load_taxonomy()
 TOPIC = list(TX.topics)[0]
 STAT_KEYS = {"tagged", "skipped_unchanged", "skipped_not_allowlisted", "code_only",
-             "restricted", "low_confidence", "errors", "vocab_version", "updated"}
+             "restricted", "low_confidence", "errors", "vocab_version", "updated", "processed"}
 
 
 def _answers(topic_conf=0.9):
@@ -225,11 +225,58 @@ def test_tagged_notes_count_as_orchestrator_yield(env, capsys):
     assert _run_yield(parsed) == 3
 
 
-def test_quiet_night_has_zero_yield(env, capsys):
+def test_quiet_night_still_counts_notes_examined(env, capsys):
+    """Nothing changed tonight: the examined notes keep the run from reading
+    as a zero-yield night."""
     from scripts.run_all_syncs import _parse_sync_output, _run_yield
 
     with patch.object(JevClient, "ask", return_value=_answers()):
         sync_vault_tag.main(["--execute"])
         capsys.readouterr()
         sync_vault_tag.main(["--execute"])
+    parsed = _parse_sync_output(capsys.readouterr().out)
+    assert parsed["tagged"] == 0 and parsed["updated"] == 0
+    assert parsed["processed"] == 3
+    assert _run_yield(parsed) == 3
+
+
+def test_processed_is_tagged_plus_unchanged(env, capsys):
+    vault, _ = env
+    with patch.object(JevClient, "ask", return_value=_answers()):
+        sync_vault_tag.main(["--execute"])
+        capsys.readouterr()
+        (vault / "Notes" / "a.md").write_text("# A\nchanged\n")
+        sync_vault_tag.main(["--execute"])
+    stats = json.loads(_stats_lines(capsys.readouterr().out)[0])
+    assert stats["tagged"] == 1 and stats["skipped_unchanged"] == 2
+    assert stats["processed"] == 3 and stats["updated"] == 1
+
+
+def test_failed_notes_are_not_counted_as_examined(env, capsys):
+    with patch.object(JevClient, "ask", side_effect=JevError("boom")):
+        sync_vault_tag.main(["--execute"])
+    stats = json.loads(_stats_lines(capsys.readouterr().out)[0])
+    assert stats["errors"] == 2
+    assert stats["processed"] == stats["tagged"] + stats["skipped_unchanged"] == 1
+
+
+def test_empty_vault_has_zero_yield(env, capsys):
+    from scripts.run_all_syncs import _parse_sync_output, _run_yield
+
+    vault, _ = env
+    for note in vault.rglob("*.md"):
+        note.unlink()
+    with patch.object(JevClient, "ask", return_value=_answers()):
+        assert sync_vault_tag.main(["--execute"]) == 0
     assert _run_yield(_parse_sync_output(capsys.readouterr().out)) == 0
+
+
+def test_unreadable_vault_has_zero_yield(env, capsys, monkeypatch, tmp_path):
+    from scripts.run_all_syncs import _parse_sync_output, _run_yield
+
+    monkeypatch.setattr(settings, "vault_path", str(tmp_path / "missing"))
+    with patch.object(JevClient, "ask", return_value=_answers()):
+        sync_vault_tag.main(["--execute"])
+    parsed = _parse_sync_output(capsys.readouterr().out)
+    assert parsed["errors"] == 1
+    assert _run_yield(parsed) == 0

@@ -1233,11 +1233,14 @@ def _run_created(stats: dict) -> int:
 
 def _detect_yield_collapse(source: str, stats: dict) -> dict | None:
     """Return info if a source that normally produces records produced none.
+    A source whose SYNC_SOURCES entry sets ``idle_is_normal`` is exempt.
 
     Never raises — a sync_health DB hiccup must not fail the sync itself.
     """
     if _run_yield(stats) > 0:
         return None
+    if SYNC_SOURCES.get(source, {}).get("idle_is_normal"):
+        return None  # declared in SYNC_SOURCES: zero yield is its normal state
     try:
         typical = get_typical_yield(source)
         # +1 for the run in flight: it isn't recorded yet, so the stored
