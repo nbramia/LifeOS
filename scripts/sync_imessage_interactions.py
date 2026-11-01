@@ -16,6 +16,17 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
+from api.services.imessage_identity import (
+    INCOMING_MARK,
+    OUTGOING_MARK,
+    claim_source_id,
+    consume,
+    direction_for_is_from_me,
+    load_existing,
+    make_key,
+    parse_timestamp,
+    resolve_people,
+)
 from api.services.interaction_store import get_interaction_db_path
 from api.services.person_entity import get_person_entity_store
 from api.services.source_entity import (
@@ -103,6 +114,7 @@ def sync_imessage_interactions(dry_run: bool = True, limit: int = None) -> dict:
         'messages_checked': 0,
         'already_exists': 0,
         'person_not_found': 0,
+        'hidden_person': 0,
         'inserted': 0,
         'source_entities_created': 0,
         'errors': 0,
@@ -115,15 +127,11 @@ def sync_imessage_interactions(dry_run: bool = True, limit: int = None) -> dict:
     imessage_conn = sqlite3.connect(imessage_db)
     interactions_conn = sqlite3.connect(interactions_db)
 
-    # Get existing iMessage interactions to avoid duplicates
-    existing = set()
-    cursor = interactions_conn.execute(
-        "SELECT source_id FROM interactions WHERE source_type = 'imessage'"
-    )
-    for row in cursor.fetchall():
-        existing.add(row[0])
+    # Existing iMessage interactions, counted per message key (UTC second,
+    # direction). Messages are matched to them by key, never by source_id.
+    key_counts, taken_source_ids = load_existing(interactions_conn)
 
-    logger.info(f"Found {len(existing)} existing iMessage interactions")
+    logger.info(f"Found {sum(key_counts.values())} existing iMessage interactions")
 
     # Get linked messages from iMessage database
     query = """
@@ -136,36 +144,63 @@ def sync_imessage_interactions(dry_run: bool = True, limit: int = None) -> dict:
     if limit:
         query += f" LIMIT {limit}"
 
-    cursor = imessage_conn.execute(query)
+    rows = imessage_conn.execute(query).fetchall()
+
+    # One batched lookup for every linked person: the survivor of any merge
+    # chain, with its hidden flag.
+    people = resolve_people(person_store, (row[7] for row in rows))
 
     batch = []
     batch_size = 500
 
-    for row in cursor.fetchall():
-        rowid, text, timestamp, is_from_me, handle, handle_normalized, service, person_id = row
+    def flush():
+        nonlocal batch
+        if not batch:
+            return
+        if dry_run:
+            stats['inserted'] += len(batch)
+        else:
+            inserted = _insert_batch(interactions_conn, batch)
+            if inserted != len(batch):
+                logger.warning(
+                    f"{len(batch) - inserted} of {len(batch)} interactions were not inserted"
+                )
+            stats['inserted'] += inserted
+        logger.info(f"Processed {stats['messages_checked']} messages, inserted {stats['inserted']}")
+        batch = []
+
+    for row in rows:
+        _rowid, text, timestamp, is_from_me, handle, handle_normalized, service, person_id = row
         stats['messages_checked'] += 1
 
-        # Create unique source_id from rowid
-        source_id = f"imessage_{rowid}"
-
-        # Skip if already exists
-        if source_id in existing:
-            stats['already_exists'] += 1
-            continue
-
-        # Verify person still exists
-        person = person_store.get_by_id(person_id)
+        # Verify person still exists; merged ids resolve to the survivor
+        person = people.get(person_id)
         if not person:
             stats['person_not_found'] += 1
             continue
+        person_id = person.id
 
         # Parse timestamp
-        try:
-            ts = datetime.fromisoformat(timestamp)
-            if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-        except (ValueError, TypeError):
+        ts = parse_timestamp(timestamp)
+        if ts is None:
             stats['errors'] += 1
+            continue
+
+        key = make_key(ts, direction_for_is_from_me(is_from_me))
+
+        # Hidden people get no interactions (consistency verification removes
+        # them); their handle is still linked to them.
+        if person.hidden:
+            stats['hidden_person'] += 1
+            if not dry_run and handle:
+                stats['source_entities_created'] += _link_source_entity(
+                    source_entity_store, person, handle, handle_normalized, service, ts,
+                )
+            continue
+
+        # An unused existing interaction at this key means it is already synced
+        if consume(key_counts, key):
+            stats['already_exists'] += 1
             continue
 
         # Create title from message text
@@ -176,8 +211,8 @@ def sync_imessage_interactions(dry_run: bool = True, limit: int = None) -> dict:
             text_preview = "[No text content]"
 
         # Direction indicator
-        direction = "→" if is_from_me else "←"
-        title = f"{direction} {text_preview}"
+        mark = OUTGOING_MARK if is_from_me else INCOMING_MARK
+        title = f"{mark} {text_preview}"
 
         # Create interaction record
         interaction_id = str(uuid.uuid4())
@@ -189,7 +224,7 @@ def sync_imessage_interactions(dry_run: bool = True, limit: int = None) -> dict:
             title,
             text[:200] if text else None,  # snippet
             '',  # source_link (no web link for iMessage)
-            source_id,
+            claim_source_id(key, taken_source_ids),
             datetime.now(timezone.utc).isoformat(),
         ))
 
@@ -198,32 +233,16 @@ def sync_imessage_interactions(dry_run: bool = True, limit: int = None) -> dict:
 
         # Create source entity for this handle (deduped by add_or_update)
         if not dry_run and handle:
-            source_entity = create_imessage_source_entity(
-                handle=handle_normalized or handle,
-                display_name=person.canonical_name,
-                observed_at=ts,
-                metadata={"service": service},
+            stats['source_entities_created'] += _link_source_entity(
+                source_entity_store, person, handle, handle_normalized, service, ts,
             )
-            source_entity.canonical_person_id = person_id
-            source_entity.link_confidence = 1.0
-            source_entity.link_method = "imessage_handle"
-            source_entity.linked_at = datetime.now(timezone.utc)
-            source_entity_store.add_or_update(source_entity)
-            stats['source_entities_created'] += 1
 
         # Insert in batches
         if len(batch) >= batch_size:
-            if not dry_run:
-                _insert_batch(interactions_conn, batch)
-            stats['inserted'] += len(batch)
-            logger.info(f"Processed {stats['messages_checked']} messages, inserted {stats['inserted']}")
-            batch = []
+            flush()
 
     # Insert remaining
-    if batch:
-        if not dry_run:
-            _insert_batch(interactions_conn, batch)
-        stats['inserted'] += len(batch)
+    flush()
 
     if not dry_run:
         interactions_conn.commit()
@@ -235,6 +254,7 @@ def sync_imessage_interactions(dry_run: bool = True, limit: int = None) -> dict:
     logger.info(f"Messages checked: {stats['messages_checked']}")
     logger.info(f"Already exists: {stats['already_exists']}")
     logger.info(f"Person not found: {stats['person_not_found']}")
+    logger.info(f"Hidden person (skipped): {stats['hidden_person']}")
     logger.info(f"Inserted: {stats['inserted']}")
     logger.info(f"Source entities created: {stats['source_entities_created']}")
     logger.info(f"Errors: {stats['errors']}")
@@ -260,12 +280,30 @@ def sync_imessage_interactions(dry_run: bool = True, limit: int = None) -> dict:
     return stats
 
 
-def _insert_batch(conn: sqlite3.Connection, batch: list):
-    """Insert a batch of interactions."""
+def _link_source_entity(source_entity_store, person, handle, handle_normalized, service, observed_at) -> int:
+    """Link this handle's source entity to ``person``; 1 if newly created, else 0."""
+    source_entity = create_imessage_source_entity(
+        handle=handle_normalized or handle,
+        display_name=person.canonical_name,
+        observed_at=observed_at,
+        metadata={"service": service},
+    )
+    source_entity.canonical_person_id = person.id
+    source_entity.link_confidence = 1.0
+    source_entity.link_method = "imessage_handle"
+    source_entity.linked_at = datetime.now(timezone.utc)
+    _, created = source_entity_store.add_or_update(source_entity)
+    return 1 if created else 0
+
+
+def _insert_batch(conn: sqlite3.Connection, batch: list) -> int:
+    """Insert a batch of interactions; returns the number of rows actually inserted."""
+    before = conn.total_changes
     conn.executemany("""
         INSERT OR IGNORE INTO interactions (id, person_id, timestamp, source_type, title, snippet, source_link, source_id, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, batch)
+    return conn.total_changes - before
 
 
 if __name__ == '__main__':

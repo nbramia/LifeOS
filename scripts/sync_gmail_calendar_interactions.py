@@ -293,6 +293,7 @@ def sync_gmail_interactions(
                     create_if_missing=True,
                 )
                 sender_person_id = sender_result.entity.id if sender_result and sender_result.entity else None
+                sender_hidden = bool(sender_result and sender_result.entity and sender_result.entity.hidden)
 
                 timestamp = email.date.isoformat()
                 source_link = f"https://mail.google.com/mail/u/0/#inbox/{message_id}"
@@ -306,21 +307,25 @@ def sync_gmail_interactions(
 
                     # 1. Create interaction with the sender (use base message_id)
                     if message_id not in existing:
-                        batch.append((
-                            str(uuid.uuid4()),
-                            sender_person_id,
-                            timestamp,
-                            'gmail',
-                            f"← {subject}",
-                            snippet,
-                            source_link,
-                            message_id,
-                            datetime.now(timezone.utc).isoformat(),
-                            account_type.value,  # source_account: "personal" or "work"
-                            None,  # attendee_count: N/A for gmail
-                        ))
-                        affected_person_ids.add(sender_person_id)
-                        existing.add(message_id)
+                        # Hidden people get no interactions (consistency
+                        # verification removes them); their source entity is
+                        # still linked below.
+                        if not sender_hidden:
+                            batch.append((
+                                str(uuid.uuid4()),
+                                sender_person_id,
+                                timestamp,
+                                'gmail',
+                                f"← {subject}",
+                                snippet,
+                                source_link,
+                                message_id,
+                                datetime.now(timezone.utc).isoformat(),
+                                account_type.value,  # source_account: "personal" or "work"
+                                None,  # attendee_count: N/A for gmail
+                            ))
+                            affected_person_ids.add(sender_person_id)
+                            existing.add(message_id)
 
                         # Create source entity for the sender
                         if not dry_run:
@@ -335,8 +340,9 @@ def sync_gmail_interactions(
                             source_entity.link_confidence = sender_result.confidence if sender_result else 1.0
                             source_entity.link_method = sender_result.match_type if sender_result else None
                             source_entity.linked_at = datetime.now(timezone.utc)
-                            source_entity_store.add_or_update(source_entity)
-                            stats['source_entities_created'] += 1
+                            _, created = source_entity_store.add_or_update(source_entity)
+                            if created:
+                                stats['source_entities_created'] += 1
 
                     # 2. Create interactions with To/CC recipients (excluding myself)
                     # These are people I was on an email thread with
@@ -368,22 +374,26 @@ def sync_gmail_interactions(
                         if participant_result.entity.id == sender_person_id:
                             continue  # Already created interaction with sender
 
-                        # Use ↔ arrow to indicate shared thread (not direct send/receive)
-                        batch.append((
-                            str(uuid.uuid4()),
-                            participant_result.entity.id,
-                            timestamp,
-                            'gmail',
-                            f"↔ {subject}",
-                            snippet,
-                            source_link,
-                            participant_source_id,
-                            datetime.now(timezone.utc).isoformat(),
-                            account_type.value,  # source_account: "personal" or "work"
-                            None,  # attendee_count: N/A for gmail
-                        ))
-                        affected_person_ids.add(participant_result.entity.id)
-                        existing.add(participant_source_id)
+                        # Hidden people get no interactions (consistency
+                        # verification removes them); their source entity is
+                        # still linked below.
+                        if not participant_result.entity.hidden:
+                            # Use ↔ arrow to indicate shared thread (not direct send/receive)
+                            batch.append((
+                                str(uuid.uuid4()),
+                                participant_result.entity.id,
+                                timestamp,
+                                'gmail',
+                                f"↔ {subject}",
+                                snippet,
+                                source_link,
+                                participant_source_id,
+                                datetime.now(timezone.utc).isoformat(),
+                                account_type.value,  # source_account: "personal" or "work"
+                                None,  # attendee_count: N/A for gmail
+                            ))
+                            affected_person_ids.add(participant_result.entity.id)
+                            existing.add(participant_source_id)
 
                         # Create source entity for the participant
                         if not dry_run:
@@ -398,8 +408,9 @@ def sync_gmail_interactions(
                             source_entity.link_confidence = participant_result.confidence if participant_result else 1.0
                             source_entity.link_method = participant_result.match_type if participant_result else None
                             source_entity.linked_at = datetime.now(timezone.utc)
-                            source_entity_store.add_or_update(source_entity)
-                            stats['source_entities_created'] += 1
+                            _, created = source_entity_store.add_or_update(source_entity)
+                            if created:
+                                stats['source_entities_created'] += 1
                 else:
                     # SENT EMAIL: Create interactions for ALL recipients (To + CC)
                     recipients = []
@@ -439,23 +450,27 @@ def sync_gmail_interactions(
                         if recipient_result.entity.id == my_person_id:
                             continue  # Skip myself
 
-                        # Use → arrow to indicate sent (like iMessage)
-                        batch.append((
-                            str(uuid.uuid4()),
-                            recipient_result.entity.id,
-                            timestamp,
-                            'gmail',
-                            f"→ {subject}",
-                            snippet,
-                            source_link,
-                            source_id,  # Use email-specific source_id for deduplication
-                            datetime.now(timezone.utc).isoformat(),
-                            account_type.value,  # source_account: "personal" or "work"
-                            None,  # attendee_count: N/A for gmail
-                        ))
-                        created_for_this_email += 1
-                        # Track for stats refresh
-                        affected_person_ids.add(recipient_result.entity.id)
+                        # Hidden people get no interactions (consistency
+                        # verification removes them); their source entity is
+                        # still linked below.
+                        if not recipient_result.entity.hidden:
+                            # Use → arrow to indicate sent (like iMessage)
+                            batch.append((
+                                str(uuid.uuid4()),
+                                recipient_result.entity.id,
+                                timestamp,
+                                'gmail',
+                                f"→ {subject}",
+                                snippet,
+                                source_link,
+                                source_id,  # Use email-specific source_id for deduplication
+                                datetime.now(timezone.utc).isoformat(),
+                                account_type.value,  # source_account: "personal" or "work"
+                                None,  # attendee_count: N/A for gmail
+                            ))
+                            created_for_this_email += 1
+                            # Track for stats refresh
+                            affected_person_ids.add(recipient_result.entity.id)
 
                         # Create source entity for the recipient
                         if not dry_run:
@@ -470,18 +485,20 @@ def sync_gmail_interactions(
                             source_entity.link_confidence = recipient_result.confidence
                             source_entity.link_method = recipient_result.match_type
                             source_entity.linked_at = datetime.now(timezone.utc)
-                            source_entity_store.add_or_update(source_entity)
-                            stats['source_entities_created'] += 1
+                            _, created = source_entity_store.add_or_update(source_entity)
+                            if created:
+                                stats['source_entities_created'] += 1
 
                     if created_for_this_email == 0:
                         stats['no_person'] += 1
                         continue
 
                 if len(batch) >= batch_size:
-                    if not dry_run:
-                        _insert_batch(conn, batch)
+                    if dry_run:
+                        stats['inserted'] += len(batch)
+                    else:
+                        stats['inserted'] += _insert_batch(conn, batch)
                         conn.commit()  # Commit after each batch to avoid losing progress
-                    stats['inserted'] += len(batch)
                     batch = []
 
                 processed += 1
@@ -494,9 +511,10 @@ def sync_gmail_interactions(
 
         # Insert remaining
         if batch:
-            if not dry_run:
-                _insert_batch(conn, batch)
-            stats['inserted'] += len(batch)
+            if dry_run:
+                stats['inserted'] += len(batch)
+            else:
+                stats['inserted'] += _insert_batch(conn, batch)
 
         if not dry_run:
             conn.commit()
@@ -661,28 +679,30 @@ def sync_calendar_interactions(
                 if person_id == my_person_id:
                     continue
 
-                # Track for stats refresh
-                affected_person_ids.add(person_id)
+                # Hidden people get no interactions (consistency verification
+                # removes them); their source entity is still linked below.
+                if not result.entity.hidden:
+                    # Track for stats refresh
+                    affected_person_ids.add(person_id)
 
-                # Create interaction
-                interaction_id = str(uuid.uuid4())
-                timestamp = event.start_time.isoformat()
-                source_link = event.html_link or ""
+                    # Create interaction
+                    interaction_id = str(uuid.uuid4())
+                    timestamp = event.start_time.isoformat()
+                    source_link = event.html_link or ""
 
-                batch.append((
-                    interaction_id,
-                    person_id,
-                    timestamp,
-                    'calendar',
-                    event.title,
-                    event.description[:200] if event.description else None,
-                    source_link,
-                    source_id,
-                    datetime.now(timezone.utc).isoformat(),
-                    account_type.value,  # source_account: "personal" or "work"
-                    other_attendee_count,  # attendee_count: for calendar size classification
-                ))
-                stats['interactions_inserted'] += 1
+                    batch.append((
+                        interaction_id,
+                        person_id,
+                        timestamp,
+                        'calendar',
+                        event.title,
+                        event.description[:200] if event.description else None,
+                        source_link,
+                        source_id,
+                        datetime.now(timezone.utc).isoformat(),
+                        account_type.value,  # source_account: "personal" or "work"
+                        other_attendee_count,  # attendee_count: for calendar size classification
+                    ))
 
                 # Create source entity for the attendee
                 if not dry_run and attendee_email:
@@ -697,8 +717,9 @@ def sync_calendar_interactions(
                     source_entity.link_confidence = result.confidence if result else 1.0
                     source_entity.link_method = result.match_type if result else None
                     source_entity.linked_at = datetime.now(timezone.utc)
-                    source_entity_store.add_or_update(source_entity)
-                    stats['source_entities_created'] += 1
+                    _, created = source_entity_store.add_or_update(source_entity)
+                    if created:
+                        stats['source_entities_created'] += 1
 
             # Progress logging every 100 events
             events_processed += 1
@@ -711,9 +732,12 @@ def sync_calendar_interactions(
         logger.info(f"Processed all {len(events)} events in {process_elapsed:.1f}s")
 
         # Insert batch
-        if batch and not dry_run:
-            _insert_batch(conn, batch)
-            conn.commit()
+        if batch:
+            if dry_run:
+                stats['interactions_inserted'] += len(batch)
+            else:
+                stats['interactions_inserted'] += _insert_batch(conn, batch)
+                conn.commit()
 
     except Exception as e:
         logger.error(f"Failed to sync Calendar: {e}")
@@ -833,19 +857,21 @@ def _parse_attendees_from_title(title: str) -> list[str]:
     return list(set(names))
 
 
-def _insert_batch(conn: sqlite3.Connection, batch: list):
-    """Insert a batch of interactions.
+def _insert_batch(conn: sqlite3.Connection, batch: list) -> int:
+    """Insert a batch of interactions; returns the number of rows actually inserted.
 
     Batch tuples should have 11 elements:
     (id, person_id, timestamp, source_type, title, snippet, source_link, source_id,
      created_at, source_account, attendee_count)
     """
+    before = conn.total_changes
     conn.executemany("""
         INSERT OR IGNORE INTO interactions
         (id, person_id, timestamp, source_type, title, snippet, source_link, source_id,
          created_at, source_account, attendee_count)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, batch)
+    return conn.total_changes - before
 
 
 def main(argv=None):
