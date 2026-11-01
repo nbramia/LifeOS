@@ -2,7 +2,7 @@
 Tests for EntityResolver.
 """
 import pytest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from api.services.person_entity import PersonEntity, PersonEntityStore
 from config.people_config import EntityResolutionConfig
@@ -499,23 +499,19 @@ class TestEdgeCases:
         assert result is not None
         assert result.is_new is False
 
-    def test_disambiguation_creates_separate_entities(self, populated_resolver):
-        """Test that ambiguous names can create separate entities."""
-        # First, resolve Sarah in one context
-        result1 = populated_resolver.resolve_by_name(
-            "Sarah",
-            context_path="/vault/Work/ExampleCorp/meeting.md",
-        )
-        assert result1 is not None
+    def test_shared_first_name_does_not_create_a_separate_entity(self, populated_resolver):
+        """A bare first name shared by existing people links to no one and adds no one."""
+        store = populated_resolver.store
+        before = store.count()
 
-        # Then create a new Sarah in a completely different context
-        # This should potentially create a disambiguated entity
-        result2 = populated_resolver.resolve_by_name(
+        result = populated_resolver.resolve_by_name(
             "Sarah",
             context_path="/vault/Personal/notes.md",
             create_if_missing=True,
         )
-        assert result2 is not None
+
+        assert result is None
+        assert store.count() == before
 
     def test_extract_name_from_email(self, resolver):
         """Test name extraction from email."""
@@ -531,6 +527,255 @@ class TestEdgeCases:
             create_if_missing=True,
         )
         assert result.entity.canonical_name == "Jdoe"
+
+
+def _person(store, name, strength=0.0, **kwargs):
+    person = PersonEntity(canonical_name=name, last_seen=datetime.now() - timedelta(days=2), **kwargs)
+    person.relationship_strength = strength
+    return store.add(person)
+
+
+@pytest.mark.unit
+class TestAmbiguousNamesNeverCreate:
+    """A name that fits existing people is not the same as a name that fits no one."""
+
+    def test_tie_between_close_people(self, temp_store):
+        _person(temp_store, "Robin Alpha", 30.0)
+        _person(temp_store, "Robin Beta", 30.0)
+
+        assert EntityResolver(temp_store).resolve_by_name("Robin", create_if_missing=True) is None
+        assert temp_store.count() == 2
+
+    def test_tie_between_people_who_are_not_close(self, temp_store):
+        _person(temp_store, "Robin Alpha", 10.0)
+        _person(temp_store, "Robin Beta", 10.0)
+
+        assert EntityResolver(temp_store).resolve_by_name("Robin", create_if_missing=True) is None
+        assert temp_store.count() == 2
+
+    def test_several_weak_candidates_are_a_tie(self, temp_store):
+        temp_store.add(PersonEntity(canonical_name="Robin Alpha"))
+        temp_store.add(PersonEntity(canonical_name="Robin Beta"))
+
+        assert EntityResolver(temp_store).resolve_by_name("Robin", create_if_missing=True) is None
+        assert temp_store.count() == 2
+
+    def test_tie_between_scored_candidates(self, temp_store):
+        _person(temp_store, "Robin Alpha")
+        _person(temp_store, "Riley Alpha")
+
+        assert EntityResolver(temp_store).resolve_by_name("R Alpha", create_if_missing=True) is None
+        assert temp_store.count() == 2
+
+    def test_tie_between_scored_candidates_still_reports_a_best_guess_when_not_creating(self, temp_store):
+        _person(temp_store, "Robin Alpha")
+        _person(temp_store, "Riley Alpha")
+
+        result = EntityResolver(temp_store).resolve_by_name("R Alpha")
+
+        assert result.match_type == "fuzzy_ambiguous"
+        assert result.disambiguation_applied is True
+        assert temp_store.count() == 2
+
+    def test_unknown_name_is_still_created(self, temp_store):
+        _person(temp_store, "Robin Alpha")
+
+        result = EntityResolver(temp_store).resolve_by_name("Quillon Example", create_if_missing=True)
+
+        assert result.is_new is True
+        assert result.match_type == "new_entity"
+        assert temp_store.count() == 2
+
+    def test_unknown_bare_name_is_still_created(self, temp_store):
+        _person(temp_store, "Robin Alpha")
+
+        result = EntityResolver(temp_store).resolve_by_name("Quillon", create_if_missing=True)
+
+        assert result.is_new is True
+        assert temp_store.count() == 2
+
+    def test_a_single_weak_candidate_is_not_a_tie(self, temp_store):
+        temp_store.add(PersonEntity(canonical_name="Michael Alpha"))
+
+        result = EntityResolver(temp_store).resolve_by_name("Mike", create_if_missing=True)
+
+        assert result.is_new is True
+        assert temp_store.count() == 2
+
+    def test_a_settled_first_name_links_to_the_settled_person(self, temp_store):
+        close = _person(temp_store, "Robin Alpha", 60.0)
+        _person(temp_store, "Robin Beta", 0.0)
+
+        result = EntityResolver(temp_store).resolve_by_name("Robin", create_if_missing=True)
+
+        assert result.entity.id == close.id
+        assert result.is_new is False
+        assert temp_store.count() == 2
+
+    def test_an_existing_bare_row_keeps_taking_exact_matches(self, temp_store):
+        bare = temp_store.add(PersonEntity(canonical_name="Robin"))
+        _person(temp_store, "Robin Alpha", 30.0)
+        _person(temp_store, "Robin Beta", 30.0)
+
+        result = EntityResolver(temp_store).resolve_by_name("Robin", create_if_missing=True)
+
+        assert result.entity.id == bare.id
+        assert result.match_type == "name_exact"
+
+    def test_unknown_email_still_gets_its_own_person_named_from_the_address(self, temp_store):
+        _person(temp_store, "Robin Alpha", 30.0)
+        _person(temp_store, "Robin Beta", 30.0)
+
+        result = EntityResolver(temp_store).resolve(
+            name="Robin", email="robin.gamma@example.com", create_if_missing=True
+        )
+
+        assert result.is_new is True
+        assert result.match_type == "email_new"
+        assert result.entity.canonical_name == "Robin Gamma"
+        assert temp_store.get_by_name("Robin") is None
+
+    def test_known_email_wins_over_the_tie(self, temp_store):
+        known = _person(temp_store, "Robin Alpha", 30.0, emails=["robin.alpha@example.com"])
+        _person(temp_store, "Robin Beta", 30.0)
+
+        result = EntityResolver(temp_store).resolve(
+            name="Robin", email="robin.alpha@example.com", create_if_missing=True
+        )
+
+        assert result.entity.id == known.id
+
+    def test_unknown_phone_with_a_tied_name_links_to_no_one(self, temp_store):
+        _person(temp_store, "Robin Alpha", 30.0)
+        _person(temp_store, "Robin Beta", 30.0)
+
+        result = EntityResolver(temp_store).resolve(
+            name="Robin", phone="+12125550173", create_if_missing=True
+        )
+
+        assert result is None
+        assert temp_store.count() == 2
+
+
+@pytest.mark.unit
+class TestMatchName:
+    """match_name separates a unique match, a tie, and no match, and never writes."""
+
+    def test_no_match(self, temp_store):
+        match = EntityResolver(temp_store).match_name("Quillon Example")
+        assert match.result is None
+        assert match.tied == []
+
+    def test_unique_match(self, temp_store):
+        person = _person(temp_store, "Robin Alpha", 60.0)
+        match = EntityResolver(temp_store).match_name("Robin")
+        assert match.result.entity.id == person.id
+        assert match.tied == []
+
+    def test_first_name_tie_has_no_best_guess(self, temp_store):
+        first = _person(temp_store, "Robin Alpha", 30.0)
+        second = _person(temp_store, "Robin Beta", 30.0)
+        match = EntityResolver(temp_store).match_name("Robin")
+        assert match.result is None
+        assert {p.id for p in match.tied} == {first.id, second.id}
+
+    def test_scored_tie_keeps_the_top_candidate_and_lists_the_tie(self, temp_store):
+        first = _person(temp_store, "Robin Alpha")
+        second = _person(temp_store, "Riley Alpha")
+        match = EntityResolver(temp_store).match_name("R Alpha")
+        assert match.result.match_type == "fuzzy_ambiguous"
+        assert {p.id for p in match.tied} == {first.id, second.id}
+
+    def test_a_candidate_outside_the_score_gap_is_not_in_the_tie(self, temp_store):
+        close = _person(temp_store, "Robin Alpha", 60.0)
+        _person(temp_store, "Riley Alpha", 0.0)
+        match = EntityResolver(temp_store).match_name("R Alpha")
+        assert match.result.entity.id == close.id
+        assert match.tied == []
+
+    def test_a_candidate_exactly_at_the_score_gap_is_not_in_the_tie(self, temp_store):
+        # 10 for recency plus 12.5 * 0.4 strength: a lead of exactly 15.
+        close = _person(temp_store, "Robin Alpha", 12.5)
+        temp_store.add(PersonEntity(canonical_name="Riley Alpha"))
+        match = EntityResolver(temp_store).match_name("R Alpha")
+        assert match.result.entity.id == close.id
+        assert match.tied == []
+
+
+@pytest.mark.unit
+class TestVaultMentionOfAmbiguousName:
+    """The vault indexer skips a mention that links to no one and keeps the others."""
+
+    def test_tied_name_records_no_interaction_and_creates_no_person(self, temp_store, tmp_path):
+        from unittest.mock import MagicMock
+
+        from api.services.indexer import IndexerService
+
+        known = _person(temp_store, "Quillon Example", 30.0)
+        _person(temp_store, "Robin Alpha", 30.0)
+        _person(temp_store, "Robin Beta", 30.0)
+        indexer = IndexerService.__new__(IndexerService)
+        indexer._entity_resolver = EntityResolver(temp_store)
+        indexer._interaction_store = MagicMock()
+        indexer._interaction_store.add_if_not_exists.return_value = (None, True)
+        indexer._source_entity_store = MagicMock()
+
+        affected = indexer._sync_people_to_v2(
+            tmp_path / "note.md", ["Robin", "Quillon Example"], datetime(2026, 1, 2)
+        )
+
+        assert affected == {known.id}
+        assert indexer._interaction_store.add_if_not_exists.call_count == 1
+        assert temp_store.count() == 3
+
+
+@pytest.mark.unit
+class TestSyncLoopsSkipNoLink:
+    """Sync loops skip a person the resolver returns no link for."""
+
+    def test_gmail_recipient_is_skipped(self):
+        from unittest.mock import MagicMock
+
+        from api.services.people_aggregator import sync_gmail_to_v2
+
+        message = MagicMock(
+            to="Robin <robin@example.com>, Quillon <quillon@example.com>", message_id="m1", subject="s",
+            date=datetime(2026, 1, 2, tzinfo=timezone.utc), snippet="",
+        )
+        gmail = MagicMock()
+        gmail.search.return_value = [message]
+        resolver = MagicMock()
+        resolver.resolve.side_effect = [None, MagicMock(entity=PersonEntity(id="p1", canonical_name="Quillon"), is_new=False)]
+        store = MagicMock()
+        store.add_if_not_exists.return_value = (None, True)
+
+        stats = sync_gmail_to_v2(gmail_service=gmail, entity_resolver=resolver, interaction_store=store)
+
+        assert resolver.resolve.call_count == 2
+        assert stats["interactions_created"] == 1
+        assert store.add_if_not_exists.call_args.args[0].person_id == "p1"
+
+    def test_calendar_attendee_is_skipped(self):
+        from unittest.mock import MagicMock
+
+        from api.services.people_aggregator import sync_calendar_to_v2
+
+        event = MagicMock(
+            is_all_day=False, attendees=["Robin", "Quillon"], event_id="e1", title="t",
+            start_time=datetime(2026, 1, 2, tzinfo=timezone.utc), description="",
+        )
+        calendar = MagicMock()
+        calendar.get_events_in_range.return_value = [event]
+        resolver = MagicMock()
+        resolver.resolve.side_effect = [None, MagicMock(entity=PersonEntity(id="p1", canonical_name="Quillon"), is_new=False)]
+        store = MagicMock()
+        store.add_if_not_exists.return_value = (None, True)
+
+        stats = sync_calendar_to_v2(calendar_services=[calendar], entity_resolver=resolver, interaction_store=store)
+
+        assert resolver.resolve.call_count == 2
+        assert stats["interactions_created"] == 1
+        assert store.add_if_not_exists.call_args.args[0].person_id == "p1"
 
 
 @pytest.mark.unit

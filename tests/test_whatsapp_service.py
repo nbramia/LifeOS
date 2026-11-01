@@ -228,6 +228,36 @@ class TestProcessWhatsAppMessagesLidResolution:
             name="Hannah", phone=None, create_if_missing=True,
         )
 
+    def test_sender_resolving_to_no_one_is_counted_and_records_nothing(self, tmp_path):
+        int_db = _make_interactions_db(tmp_path)
+        resolver = MagicMock()
+        resolver.resolve.return_value = None
+
+        messages = [{
+            "msg_id": "msg-no-link",
+            "chat_jid": "120363001@g.us",
+            "chat_name": "Test Group",
+            "sender_jid": "246698660126807@lid",
+            "sender_name": "",
+            "ts": "2026-02-25T10:00:00+00:00",
+            "from_me": 0,
+        }]
+
+        with patch("api.services.whatsapp.get_entity_resolver", return_value=resolver), \
+             patch("api.services.whatsapp.get_interaction_db_path", return_value=int_db), \
+             patch("api.services.person_stats.refresh_person_stats"):
+            stats = process_whatsapp_messages(
+                messages=messages,
+                group_participants=[{"group_jid": "120363001@g.us", "user_jid": "246698660126807@lid"}],
+                lid_contacts=[{"jid": "246698660126807@lid", "push_name": "Robin"}],
+                lid_phones={},
+                dry_run=False,
+                my_person_id="me",
+            )
+
+        assert stats["persons_not_found"] == 1
+        assert stats["interactions_created"] == 0
+
     def test_lid_without_push_name_skipped(self, tmp_path):
         int_db = _make_interactions_db(tmp_path)
         resolver = MagicMock()

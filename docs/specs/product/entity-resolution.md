@@ -38,7 +38,8 @@ The `EntityResolver` uses a multi-pass algorithm. Each pass is tried in order; t
 
 **Pass 5: Disambiguation**
 - If the top two candidates score within 15 points of each other, the match is ambiguous
-- Ambiguous matches either create a new disambiguated entity (with context suffix) or return the top match with reduced confidence (0.7x)
+- A lookup that may create a person (`create_if_missing`) returns no link for an ambiguous name and never creates one; a read-only lookup returns the top match with reduced confidence (0.7x), match type `fuzzy_ambiguous`
+- An unknown email alongside an ambiguous name still anchors a new person, named from the address. An unknown phone does not, so the observation stays unlinked
 
 ---
 
@@ -89,7 +90,10 @@ When the query is a single word (e.g., "Sarah" with no last name), special disam
 | Multiple passing, score gap >= 20 | Top candidate gets +10 bonus |
 | Multiple passing, close scores, one has relationship_strength >= 14 | That candidate gets +15 bonus |
 | Multiple passing, close scores, several at >= 14, one has a strength lead >= 30 | That candidate gets +10 bonus |
-| Multiple passing, truly ambiguous | Returns empty (no match) |
+| Multiple passing, truly ambiguous | Ambiguous: returns no link and creates no one |
+| Multiple candidates, none passing | Ambiguous: returns no link and creates no one |
+
+A bare name that matches no one, or a single candidate below the threshold, is an unknown name: `create_if_missing` creates a person for it.
 
 ---
 
