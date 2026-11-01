@@ -133,7 +133,7 @@ Never skip, weaken, or delete a test to make code pass, and never assume a flaky
 
 | Tier | Action |
 |------|--------|
-| **Always** | Run focused tests for what you changed; the hosted gate runs the full lanes |
+| **Always** | Run focused tests for what you changed; the hosted gate runs the retained lanes |
 | **Always** | Restart the server after **deploying** Python changes, with `./scripts/server.sh` (isolated test runs never restart production) |
 | **Always** | Use obviously synthetic data in tests and docs |
 | **Ask first** | Database schema changes (new or altered tables) |
@@ -154,13 +154,13 @@ Never skip, weaken, or delete a test to make code pass, and never assume a flaky
 
 **Branch naming:** `<type>/<short-description>` where type is one of: `feat`, `fix`, `refactor`, `docs`, `test`, `chore`. Lowercase, hyphen-separated.
 
-1. **Build** on a branch off `origin/main` in its own worktree, with `/implement` for coding work and `/draft-issue` to file work. Both are user-scope skills. `wt-sweep --apply` removes merged worktrees.
+1. **Build** on a branch off `origin/main` in its own worktree, with `/implement` for coding work and `/draft-issue` to file work. Both are user-scope skills, and so is the `wt-sweep --apply` command that removes merged worktrees.
 2. **Test** with focused runs (`pytest <files>`, `./scripts/test.sh`). The [Development lifecycle](docs/specs/standards/development-lifecycle.md) sets what review and evidence a change's risk requires.
 3. **Open a PR.** It gets a full advisory run, `candidate-verification-shadow`.
 4. **Land** with `./scripts/merge-pr.sh <pr>`, from any checkout, on the MacBook or the Linux server. `main` requires a check that is only published on a candidate merge commit, so `gh pr merge` and `ship` cannot land here, and admin enforcement rules out `--admin`.
    - `REJECTED` with a lease reason means `main` or the branch moved during verification. Run it again.
    - Never cancel a candidate verification run. Its publisher records a failed check on that exact candidate.
-5. **Deploy:** the host's autodeploy timer pulls `main` and restarts within about 10 minutes. See [guides/operations.md](docs/guides/operations.md).
+5. **Deploy:** a host with autodeploy enabled pulls `main` and restarts within about 10 minutes. See [guides/operations.md](docs/guides/operations.md).
 
 ---
 
@@ -203,7 +203,7 @@ Scripts are in [guides/scripts.md](docs/guides/scripts.md). The ones you need mo
 - **A `browser`-marked file co-scheduled with an unrelated `async def` test can fail nondeterministically.** pytest-playwright's sync-API driver parks an event loop that can break a later async test in the same process, and under `--dist loadscope` which scopes share a worker shifts with the selection. Don't bisect by shuffling files under xdist. Run them in one process, browser file first: `pytest tests/some_x_ui_browser.py tests/the_suspect_test.py -q`. `tests/conftest.py` has the mechanism and reproducers.
 - **Browser tests:** the web SPA is served at `/chat`, not `/`. `scripts/test_lane_registry.py` defines lane membership from markers: `browser` alone is `browser-free`, `browser` with `requires_server` is `browser-server`.
 - **Pre-push hook:** an ordinary push runs Ruff on changed Python files, a pytest collection check, and the fixture privacy audit. Docs-only pushes, deletions, and the candidate publisher's own pushes skip them. A failure shows the end of the log it writes under `${TMPDIR:-/tmp}/lifeos-prepush/`.
-- **The merge gate is hosted:** the App-bound required check `candidate-verification` is what blocks a bad merge. It runs `fast-unit`, plus `browser-free` when a `web/` file changed, and nothing for a docs-only candidate, across a matrix of parts. See [candidate-verification-ci.md](docs/guides/candidate-verification-ci.md), including its rollback to blocking local verification.
+- **The merge gate is hosted:** the App-bound required check `candidate-verification` is what blocks a bad merge. It runs `fast-unit`, plus `browser-free` when a `web/` file changed, and nothing for a docs-only candidate, across a matrix of parts. It never runs `browser-server`, so run `./scripts/test.sh browser` when you change server-backed UI. See [candidate-verification-ci.md](docs/guides/candidate-verification-ci.md), including its rollback to blocking local verification.
 - **Push over HTTPS:** `./scripts/setup-hooks.sh` points `origin`'s push URL at HTTPS, because GitHub closes an idle SSH session after about 6 minutes.
 
 ---
