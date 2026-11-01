@@ -218,8 +218,6 @@ def sync_gmail_to_v2(
 
                     # Update entity stats
                     entity.email_count = (entity.email_count or 0) + 1
-                    if _is_newer(msg.date, entity.last_seen):
-                        entity.last_seen = _make_aware(msg.date)
                     if "gmail" not in entity.sources:
                         entity.sources.append("gmail")
 
@@ -354,11 +352,6 @@ def sync_calendar_to_v2(
 
                         # Update entity stats
                         entity.meeting_count = (entity.meeting_count or 0) + 1
-                        # Only update last_seen if event is not in the future
-                        now = datetime.now(timezone.utc)
-                        event_ts = _make_aware(event.start_time)
-                        if event_ts <= now and _is_newer(event_ts, entity.last_seen):
-                            entity.last_seen = event_ts
                         if "calendar" not in entity.sources:
                             entity.sources.append("calendar")
 

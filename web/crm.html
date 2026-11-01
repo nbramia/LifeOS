@@ -10893,9 +10893,7 @@
             if (person.first_seen) {
                 contactHtml += `<div class="info-item"><div class="info-label">First Seen</div><div class="info-value">${formatDate(person.first_seen)}</div></div>`;
             }
-            if (person.last_seen) {
-                contactHtml += `<div class="info-item"><div class="info-label">Last Seen</div><div class="info-value">${formatDate(person.last_seen)}</div></div>`;
-            }
+            contactHtml += `<div class="info-item"><div class="info-label">Last Seen</div><div class="info-value">${person.last_seen ? formatDate(person.last_seen) : 'No interactions'}</div></div>`;
 
             contactEl.innerHTML = contactHtml || '<div class="info-item"><div class="info-value">No contact info</div></div>';
 
@@ -11038,21 +11036,15 @@
                 }
             }
 
-            // Last seen date (capped at today for future calendar events)
+            // Last seen date
             if (person.last_seen) {
-                let lastSeenDate = new Date(person.last_seen);
-                const now = new Date();
-                // Cap future dates at today
-                if (lastSeenDate > now) {
-                    document.getElementById('heroStatLastSeen').textContent = 'Today';
-                } else {
-                    const options = { month: 'short', day: 'numeric' };
-                    // Add year if not current year
-                    if (lastSeenDate.getFullYear() !== now.getFullYear()) {
-                        options.year = 'numeric';
-                    }
-                    document.getElementById('heroStatLastSeen').textContent = lastSeenDate.toLocaleDateString('en-US', options);
+                const lastSeenDate = new Date(person.last_seen);
+                const options = { month: 'short', day: 'numeric' };
+                // Add year if not current year
+                if (lastSeenDate.getFullYear() !== new Date().getFullYear()) {
+                    options.year = 'numeric';
                 }
+                document.getElementById('heroStatLastSeen').textContent = lastSeenDate.toLocaleDateString('en-US', options);
             } else {
                 document.getElementById('heroStatLastSeen').textContent = '—';
             }
@@ -11441,14 +11433,12 @@
                     </div>
                 `);
             }
-            if (person.last_seen) {
-                metaItems.push(`
-                    <div class="contact-meta-item">
-                        <span class="contact-meta-label">Last seen</span>
-                        <span class="contact-meta-value">${formatDate(person.last_seen)}</span>
-                    </div>
-                `);
-            }
+            metaItems.push(`
+                <div class="contact-meta-item">
+                    <span class="contact-meta-label">Last seen</span>
+                    <span class="contact-meta-value">${person.last_seen ? formatDate(person.last_seen) : 'No interactions'}</span>
+                </div>
+            `);
             if (person.category) {
                 metaItems.push(`
                     <div class="contact-meta-item">
@@ -11604,14 +11594,10 @@
             `).join('');
         }
 
-        // Calculate recency score (future dates capped at today)
+        // Calculate recency score
         function calculateRecencyScore(lastSeen) {
             if (!lastSeen) return '0.00';
-            const now = new Date();
-            let last = new Date(lastSeen);
-            // Cap future dates at today
-            if (last > now) last = now;
-            const daysDiff = (now - last) / (1000 * 60 * 60 * 24);
+            const daysDiff = (new Date() - new Date(lastSeen)) / (1000 * 60 * 60 * 24);
 
             if (daysDiff < 7) return '1.00';
             if (daysDiff < 30) return '0.75';
@@ -14284,7 +14270,7 @@
             membersWithDays.sort((a, b) => a.name.localeCompare(b.name));
 
             container.innerHTML = membersWithDays.map(member => {
-                const daysText = member.daysSince === null ? '?' :
+                const daysText = member.daysSince === null ? 'None' :
                     member.daysSince === 0 ? 'Today' :
                     member.daysSince === 1 ? '1 day' :
                     `${member.daysSince}d`;

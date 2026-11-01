@@ -1507,7 +1507,6 @@ def split_person(request: PersonSplitRequest):
                 canonical_name=request.new_person_name,
                 sources=[],
                 first_seen=datetime.now(timezone.utc),
-                last_seen=datetime.now(timezone.utc),
             )
             person_store.add(to_person)
             person_store.save()
@@ -5023,7 +5022,6 @@ def reject_review_item(entity_id: str, request: LinkConfirmRequest):
                 phone_numbers=[entity.observed_phone] if entity.observed_phone else [],
                 sources=[entity.source_type],
                 first_seen=entity.observed_at,
-                last_seen=entity.observed_at,
                 source_entity_count=1,
             )
             person_store.add(new_person)

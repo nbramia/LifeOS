@@ -69,9 +69,17 @@ Where:
 - diversity = unique_sources / total_sources
 ```
 
-The result takes a 3% LinkedIn and a 5% family multiplier, capped at 100. Every input comes from the `interactions` table and ignores future-dated rows; `last_seen` is not an input, because it also tracks source-entity observations that syncs refresh without any interaction taking place.
+The result takes a 3% LinkedIn and a 5% family multiplier, capped at 100. Every input comes from the `interactions` table and ignores future-dated rows.
 
 WhatsApp group messages weigh less than direct ones: a group message you sent carries 15% of the WhatsApp weight (it is one row per participant), and one you received carries 35%. A group message you sent earns no recency credit, because it says nothing about the other person's activity: it doesn't set the last interaction or count toward the 15. A WhatsApp row marks a group message by holding the group's size in `attendee_count`, which is NULL for a direct message.
+
+### Last Seen
+
+`last_seen` on a person is the most recent real interaction with them, by the same rule the recency score uses: rows in the future never count, and neither does a WhatsApp group message you sent. An interaction recorded under a merged id counts for the surviving person. Source entities, contact imports, and sync timestamps have no effect on it. Someone with no real interaction has `last_seen` of `null`.
+
+The value is derived, so it can always be recomputed. Syncs recalculate it for the people they touch, the nightly pipeline recalculates it for everyone, and consistency verification corrects and counts any disagreement.
+
+`first_seen` is the earliest thing known about a person, across both interactions and source-entity observations.
 
 ### Pair Strength Formula (for non-owner edges)
 

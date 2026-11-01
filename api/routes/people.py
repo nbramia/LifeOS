@@ -39,7 +39,7 @@ class PersonResponse(BaseModel):
     # Relationship context fields (for smart routing)
     relationship_strength: float = 0.0  # 0-100 scale
     active_channels: list[str] = []  # Channels with activity in last 7 days
-    days_since_contact: int = 999  # 999 = never contacted
+    days_since_contact: Optional[int] = None  # None = no interaction on record
 
 
 class SearchResponse(BaseModel):
@@ -139,8 +139,6 @@ def _entity_to_response(
         if last.tzinfo is None:
             last = last.replace(tzinfo=timezone.utc)
         response.days_since_contact = (now - last).days
-    else:
-        response.days_since_contact = 999
 
     # Fetch active channels if requested (uses new get_last_interaction_by_source)
     if include_channels and entity.id:

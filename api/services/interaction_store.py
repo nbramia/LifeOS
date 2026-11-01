@@ -101,6 +101,64 @@ def get_interaction_db_path() -> str:
     return str(db_dir / "interactions.db")
 
 
+def get_last_real_interactions(
+    conn: sqlite3.Connection,
+    person_ids: Optional[Iterable[str]] = None,
+    now: Optional[datetime] = None,
+) -> dict[str, datetime]:
+    """
+    The latest real interaction per interactions.person_id.
+
+    A real interaction is a non-future row of any age, other than a group message
+    you sent, which says nothing about this person's own activity. This is the
+    one definition behind both the recency half of relationship strength and
+    PersonEntity.last_seen.
+
+    Rows are keyed by the person_id they carry. Callers that need a merged id's
+    rows counted for the survivor collapse the result through the merge map.
+
+    Args:
+        conn: Open connection to the interactions database.
+        person_ids: Limit to these ids. None covers everyone in one table scan.
+        now: The instant separating past from future (default: current time).
+
+    Returns:
+        Dict mapping person_id to a UTC datetime, to the second. People with no
+        real interaction are absent.
+    """
+    now_iso = (now or datetime.now(timezone.utc)).isoformat()
+    if person_ids is None:
+        scopes: list[tuple[str, tuple[str, ...]]] = [("person_id IS NOT NULL", ())]
+    else:
+        wanted = list(dict.fromkeys(person_ids))
+        scopes = [
+            (
+                f"person_id IN ({','.join('?' * len(chunk))})",
+                tuple(chunk),
+            )
+            for chunk in (
+                wanted[i:i + SQL_IN_CLAUSE_CHUNK_SIZE]
+                for i in range(0, len(wanted), SQL_IN_CLAUSE_CHUNK_SIZE)
+            )
+        ]
+
+    latest: dict[str, datetime] = {}
+    for person_sql, params in scopes:
+        for pid, last in conn.execute(
+            f"""
+            SELECT person_id, datetime(MAX(julianday(timestamp)))
+            FROM interactions
+            WHERE {person_sql}
+              AND julianday(timestamp) <= julianday(?)
+              AND NOT ({_WHATSAPP_GROUP_SENT_SQL})
+            GROUP BY person_id
+        """,
+            (*params, now_iso),
+        ):
+            latest[pid] = datetime.fromisoformat(last).replace(tzinfo=timezone.utc)
+    return latest
+
+
 @dataclass(frozen=True)
 class StrengthBucket:
     """Interactions sharing a weight and a UTC day."""
@@ -1082,10 +1140,9 @@ class InteractionStore:
         SQL, so scoring every person is one scan of the table rather than one
         query per person.
 
-        Future-dated rows never appear. The last interaction is the latest
-        non-future row of any age, other than a group message you sent, which
-        says nothing about this person's own activity. The day buckets are
-        limited to the last `days_back` days and leave out mass meetings.
+        Future-dated rows never appear. The last interaction follows
+        get_last_real_interactions(). The day buckets are limited to the last
+        `days_back` days and leave out mass meetings.
 
         Args:
             person_id: Limit to one person. None aggregates everyone.
@@ -1103,21 +1160,12 @@ class InteractionStore:
 
         conn = self._get_connection()
         try:
-            inputs: dict[str, StrengthInputs] = {}
-            for pid, last in conn.execute(
-                f"""
-                SELECT person_id, datetime(MAX(julianday(timestamp)))
-                FROM interactions
-                WHERE {person_sql}
-                  AND julianday(timestamp) <= julianday(?)
-                  AND NOT ({_WHATSAPP_GROUP_SENT_SQL})
-                GROUP BY person_id
-            """,
-                (*person_params, now_iso),
-            ):
-                inputs[pid] = StrengthInputs(
-                    last_interaction=datetime.fromisoformat(last).replace(tzinfo=timezone.utc)
-                )
+            inputs: dict[str, StrengthInputs] = {
+                pid: StrengthInputs(last_interaction=last)
+                for pid, last in get_last_real_interactions(
+                    conn, [person_id] if person_id else None, now
+                ).items()
+            }
 
             for pid, source_type, account, subtype, day, count in conn.execute(
                 f"""

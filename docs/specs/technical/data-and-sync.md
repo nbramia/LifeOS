@@ -334,7 +334,7 @@ Runs in this order (see [iMessage Sync Ordering](#imessage-sync-ordering) below)
 
 | Script | Purpose | Data Source |
 |--------|---------|-------------|
-| `sync_consistency_verify.py` | Cross-store consistency check (orphans, stale merged IDs, cached counts, vault files that moved or vanished) and auto-fix | `data/crm.db`, `data/interactions.db` |
+| `sync_consistency_verify.py` | Cross-store consistency check (orphans, stale merged IDs, cached counts, `last_seen`, vault files that moved or vanished) and auto-fix | `data/crm.db`, `data/interactions.db` |
 
 ### Unified Sync Runner
 
@@ -597,7 +597,7 @@ The unified sync runner (`run_all_syncs.py`) executes `SYNC_ORDER` in this order
 24. `entity_cleanup` - Auto-hide obvious non-human entities
 
 **Phase 7: Consistency Verification**
-25. `consistency_verify` - Cross-store consistency check (orphans, stale merged IDs, cached counts, vault files that moved or vanished) and auto-fix
+25. `consistency_verify` - Cross-store consistency check (orphans, stale merged IDs, cached counts, `last_seen`, vault files that moved or vanished) and auto-fix
 
 **Automated via systemd (Linux) / launchd (macOS):**
 - Service: `lifeos-sync` (systemd) or `com.lifeos.crm-sync` (launchd)

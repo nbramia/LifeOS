@@ -742,10 +742,6 @@ class IndexerService:
                     if file_path_str not in entity.related_notes:
                         entity.related_notes.append(file_path_str)
 
-                    # Update last_seen
-                    if entity.last_seen is None or note_date > entity.last_seen:
-                        entity.last_seen = note_date
-
                     # Add vault/granola to sources if not present
                     source_type = "granola" if is_granola else "vault"
                     if source_type not in entity.sources:

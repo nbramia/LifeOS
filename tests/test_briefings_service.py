@@ -252,6 +252,37 @@ class TestBriefingsServiceGenerateBriefing:
     """
 
     @pytest.mark.asyncio
+    async def test_no_interaction_on_record_reads_as_unknown(
+        self,
+        populated_entity_store,
+        populated_interaction_store,
+    ):
+        """A NULL last_seen reaches the prompt as Unknown, not a date or a number."""
+        resolver = EntityResolver(populated_entity_store)
+        assert populated_entity_store.get_by_id("test-entity-123").last_seen is None
+
+        mock_hybrid_search = MagicMock()
+        mock_hybrid_search.search.return_value = []
+        mock_task_manager = MagicMock()
+        mock_task_manager.list_tasks.return_value = []
+
+        service = BriefingsService(
+            hybrid_search=mock_hybrid_search,
+            task_manager=mock_task_manager,
+            entity_resolver=resolver,
+            interaction_store=populated_interaction_store,
+        )
+
+        with patch('api.services.briefings.get_synthesizer') as mock_synth:
+            mock_synth.return_value.get_response = AsyncMock(return_value="# Test Briefing")
+            result = await service.generate_briefing("Alex Johnson")
+            prompt = mock_synth.return_value.get_response.call_args.args[0]
+
+        assert result["status"] == "success"
+        assert result["metadata"]["last_interaction"] is None
+        assert "- Last interaction: Unknown" in prompt
+
+    @pytest.mark.asyncio
     async def test_generate_briefing_includes_v2_fields(
         self,
         populated_entity_store,
