@@ -649,6 +649,71 @@ def _run_lane_selection(tmp_path, head_files: dict) -> dict:
     return dict(line.split("=", 1) for line in output.read_text().splitlines() if "=" in line)
 
 
+def _run_lane_selection_on_event(tmp_path, event: str, gh_script: str) -> tuple[dict, Path]:
+    """The real selection step under `event`, with a stub `gh` and a call log."""
+    work, base_sha, head_sha = _two_shallow_checkouts(tmp_path, {"api/x.py": "X = 2\n"})
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh_log = tmp_path / "gh.log"
+    gh = bin_dir / "gh"
+    gh.write_text(f'#!/bin/bash\necho "$@" >> "{gh_log}"\n{gh_script}\n')
+    gh.chmod(0o755)
+    runner_temp = tmp_path / "runner-temp"
+    runner_temp.mkdir()
+    output = tmp_path / "github-output"
+    output.touch()
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}{os.pathsep}{Path(sys.executable).parent}{os.pathsep}{os.environ.get('PATH', '')}",
+        "TRUSTED_RUNNER_SHA": base_sha, "CANDIDATE_SHA": head_sha,
+        "RUNNER_TEMP": str(runner_temp), "GITHUB_OUTPUT": str(output), "GITHUB_ENV": str(tmp_path / "github-env"),
+        "GITHUB_REPOSITORY": "synthetic/repo", "EVENT_NAME": event,
+    }
+    result = subprocess.run(["bash", "-eo", "pipefail", "-c", _lane_selection_step_run()], cwd=work, env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    return dict(line.split("=", 1) for line in output.read_text().splitlines() if "=" in line), gh_log
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("status", ["behind", "identical"])
+def test_shadow_of_a_head_already_on_main_executes_nothing(tmp_path, status):
+    outputs, _ = _run_lane_selection_on_event(tmp_path, "pull_request_target", f"echo {status}")
+    assert outputs == {"mode": "already-published"}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("gh_script", ["echo ahead", "echo diverged", "exit 1", "true"],
+                         ids=["ahead", "diverged", "api_failure", "empty"])
+def test_shadow_of_any_other_head_still_selects_lanes(tmp_path, gh_script):
+    outputs, _ = _run_lane_selection_on_event(tmp_path, "pull_request_target", gh_script)
+    assert (outputs["mode"], outputs["lanes"]) == ("executed", "fast-unit")
+
+
+@pytest.mark.unit
+def test_required_run_never_takes_the_already_published_path(tmp_path):
+    """Even a compare that says the head is on main cannot skip a dispatched run."""
+    outputs, gh_log = _run_lane_selection_on_event(tmp_path, "workflow_dispatch", "echo behind")
+    assert (outputs["mode"], outputs["lanes"]) == ("executed", "fast-unit")
+    assert not gh_log.exists()
+
+
+@pytest.mark.unit
+def test_only_a_shadow_of_an_already_published_head_may_skip_publishing():
+    """Every other run, and every required run whatever its outputs, publishes."""
+    import yaml
+
+    workflow = yaml.safe_load((ROOT / ".github/workflows/candidate-verification.yml").read_text())
+    step = next(
+        s for s in workflow["jobs"]["publish-aggregate"]["steps"] if "github-script" in (s.get("uses") or "")
+    )
+    assert step["if"] == (
+        "${{ github.event_name == 'workflow_dispatch' || "
+        "needs.execute-candidate.outputs.verification_mode != 'already-published' }}"
+    )
+    # An unknown mode must still publish failure rather than count as verified.
+    assert "already-published" not in step["with"]["script"]
+
+
 @pytest.mark.unit
 def test_lane_selection_step_sees_the_real_diff_across_two_shallow_checkouts(tmp_path):
     """The step diffs two commits that live in different depth-1 clones, so it

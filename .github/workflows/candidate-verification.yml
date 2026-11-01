@@ -42,7 +42,9 @@ concurrency:
   # Keyed on stable PR identity, not the ephemeral candidate SHA: a second
   # candidate built for the same PR (e.g. after a rebuild) must cancel the
   # still-running verification of the one it supersedes, which a SHA-keyed
-  # group could never do since each candidate has a distinct SHA.
+  # group could never do since each candidate has a distinct SHA. A dispatch
+  # shares this group with its PR's shadow run, so the publisher waits out a
+  # shadow of the same head rather than cancelling a verdict it could reuse.
   group: candidate-verification-${{ github.event.pull_request.number || github.event.inputs.pr_number }}
   cancel-in-progress: true
 
@@ -155,8 +157,9 @@ jobs:
         # duration. `strategy.job-total` below derives the part count from
         # this list rather than restating it, so the two cannot disagree
         # and leave a part's tests unrun while every other part reports
-        # success.
-        part: [0, 1, 2, 3]
+        # success. Two whole runs fit under the account's concurrent-job cap,
+        # so the width costs queue time only when three overlap.
+        part: [0, 1, 2, 3, 4, 5, 6, 7]
     # Each part runs its own share of the retained lanes at the runner's
     # full width, with the capacity headroom the step below establishes.
     # The ceiling exists to fail a genuinely stuck part, so it sits above
@@ -210,7 +213,24 @@ jobs:
           fi
       - name: Select the lanes this candidate's changes can affect
         id: select
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
         run: |
+          # The publisher advances a PR's source branch to the commit it just
+          # published, which fires `synchronize` for a head already on main.
+          # The required check verified that commit, so a shadow run has nothing
+          # to add. This only ever skips advisory work: a dispatched run never
+          # takes this path, and any doubt falls through to the selection below.
+          if [ "$EVENT_NAME" = pull_request_target ]; then
+            case "$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$CANDIDATE_SHA" --jq .status 2>/dev/null || true)" in
+              behind|identical)
+                echo "head is already on main: nothing to verify"
+                echo "mode=already-published" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+            esac
+          fi
           # Fails closed: any doubt about the changed set runs every retained
           # lane. The changed set is the diff from the merge base when the
           # checkout can compute one, so a branch behind the base is judged
@@ -460,7 +480,10 @@ jobs:
         with:
           app-id: ${{ vars.LIFEOS_CANDIDATE_APP_ID }}
           private-key: ${{ secrets.LIFEOS_CANDIDATE_APP_PRIVATE_KEY }}
+      # A required run always publishes. Only a shadow of a head already on
+      # main publishes nothing.
       - uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        if: ${{ github.event_name == 'workflow_dispatch' || needs.execute-candidate.outputs.verification_mode != 'already-published' }}
         env:
           RESULT: ${{ needs.execute-candidate.result }}
           VERIFICATION_MODE: ${{ needs.execute-candidate.outputs.verification_mode }}
