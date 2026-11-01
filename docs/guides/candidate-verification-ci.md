@@ -168,7 +168,8 @@ queued or in progress past the 25-minute ceiling (**stalled**), or a
 completed run whose commit carries no check of the expected name published
 by the dedicated App (**unpublished** — `candidate-verification` for a
 dispatched candidate, `candidate-verification-shadow` for a pull request
-head). Cancelled runs are superseded ones and are not counted. A capacity
+head, unless that commit already carries the required check). Cancelled runs
+are superseded ones and are not counted. A capacity
 deadlock or a publisher that never reports looks like slowness from the
 outside; this is the cheap signal that distinguishes the two.
 

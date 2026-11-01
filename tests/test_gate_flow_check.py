@@ -85,6 +85,22 @@ def test_a_completed_run_without_its_published_check_is_unpublished(event):
 
 
 @pytest.mark.unit
+def test_a_shadow_run_of_a_commit_already_published_is_balanced():
+    """Its head is on main, carrying the required check, so it publishes nothing."""
+    runs = [_run_item(9, "pull_request_target", "completed", "success", 60, "a" * 40)]
+    checks = {"a" * 40: [_check("candidate-verification")]}
+    assert collect("o/r", app_id=APP, now=NOW, run=_fake_run(runs, checks)).balanced
+
+
+@pytest.mark.unit
+def test_a_required_run_is_not_balanced_by_a_shadow_check():
+    runs = [_run_item(9, "workflow_dispatch", "completed", "success", 60, "a" * 40)]
+    checks = {"a" * 40: [_check("candidate-verification-shadow")]}
+    report = collect("o/r", app_id=APP, now=NOW, run=_fake_run(runs, checks))
+    assert [i.kind for i in report.imbalances] == ["unpublished"]
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("check", [
     _check("candidate-verification", app=APP + 1),
     _check("candidate-verification-shadow"),
