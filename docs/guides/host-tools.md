@@ -29,7 +29,7 @@ Paths are a root name plus a relative path. Absolute paths, `~` and `..` are ref
 
 A vault write is committed with the message `Host tools: update <path>`, committing only that path (taken literally, never as a pattern), so other uncommitted vault changes stay out of the commit. The commit runs with git hooks and the filesystem monitor disabled. It is not pushed. Set `LIFEOS_HOST_TOOLS_VAULT_AUTOCOMMIT=false` to leave writes uncommitted.
 
-If the vault on the host is not a git repository (for example, a copy kept in step by a sync tool, with git living on another machine), a write is saved but not committed, and the result says so in `commit_skipped`. Whatever syncs that copy carries the change; commit it where the repository lives.
+If the vault on the host is not a git repository (for example, a copy kept in step by a sync tool, with git living on another machine), a write is saved but not committed, and the result says so in `commit_skipped`. Whatever syncs that copy carries the write; commit it where the repository lives.
 
 A new file is written with mode `0644`. An overwritten file keeps its mode. Writes go through a temporary file that is renamed into place, so extended ACL entries set on the old file are not carried over: give the vault a default ACL for the run-as account (step 3) so rewritten notes stay readable to it.
 

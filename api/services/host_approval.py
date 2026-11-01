@@ -395,7 +395,7 @@ class ApprovalGate:
 
 
 def already_decided_text(row: ApprovalRow) -> str:
-    """The listener's answer to a reply to a request that is no longer pending."""
+    """The listener's answer to a reply to a request that is not pending."""
     return f"Request {row.short_id} is no longer waiting ({row.state}). Nothing changed."
 
 
