@@ -1203,13 +1203,29 @@ def _run_yield(stats: dict) -> int:
     )
 
 
+def _run_created(stats: dict) -> int:
+    """Records this run reported as newly created. Updated and merely-processed
+    records are excluded: re-checking or re-indexing existing data is steady
+    work, not new upstream data. Mirrors sync_health._row_created (max, not
+    sum — ``created`` already absorbs the categorized created counters)."""
+    return max(
+        stats.get("created", 0) or 0,
+        stats.get("people_created", 0) or 0,
+        stats.get("interactions_created", 0) or 0,
+        stats.get("source_entities_created", 0) or 0,
+    )
+
+
 def _detect_yield_collapse(source: str, stats: dict) -> dict | None:
     """Return info if a source that normally produces records produced none.
+    A source whose SYNC_SOURCES entry sets ``idle_is_normal`` is exempt.
 
     Never raises — a sync_health DB hiccup must not fail the sync itself.
     """
     if _run_yield(stats) > 0:
         return None
+    if SYNC_SOURCES.get(source, {}).get("idle_is_normal"):
+        return None  # declared in SYNC_SOURCES: zero yield is its normal state
     try:
         typical = get_typical_yield(source)
         # +1 for the run in flight: it isn't recorded yet, so the stored
@@ -1231,10 +1247,13 @@ def _detect_never_yielded(source: str, stats: dict) -> dict | None:
 
     This is the blind spot duration-collapse cannot cover: every run looks
     identical, so nothing stands out per-run. Long-running phases are exempt —
-    their runtime shows they are working even when they report no stats.
+    their runtime shows they are working even when they report no stats — and
+    so is any source whose SYNC_SOURCES entry sets ``idle_is_normal``.
     """
     if _run_yield(stats) > 0:
         return None
+    if SYNC_SOURCES.get(source, {}).get("idle_is_normal"):
+        return None  # declared in SYNC_SOURCES: zero yield is its normal state
     try:
         history = get_yield_history(source)
     except Exception as e:
@@ -1263,13 +1282,16 @@ REPEATED_YIELD_MIN_CONSECUTIVE = 3
 
 
 def _detect_repeated_yield(source: str, stats: dict) -> dict | None:
-    """Return info if this run produced the exact same non-zero yield as
-    each of the last few runs — evidence of re-importing an unchanged
-    upstream file and reporting it as new, rather than genuine repetition.
+    """Return info if this run created the exact same non-zero number of new
+    records as each of the last few runs — evidence of re-importing an
+    unchanged upstream file and reporting it as new, rather than genuine
+    repetition. Only created counts are compared; a source that re-checks the
+    same population every night reports a constant updated/processed count
+    legitimately.
 
     Never raises — a sync_health DB hiccup must not fail the sync itself.
     """
-    this_yield = _run_yield(stats)
+    this_yield = _run_created(stats)
     if this_yield <= 0:
         return None
     try:
@@ -1730,8 +1752,8 @@ def run_sync(source: str, dry_run: bool = False) -> tuple[bool, dict]:
                     if repeated_yield:
                         stats["repeated_yield"] = repeated_yield
                         msg = (
-                            f"{source} produced the same "
-                            f"{repeated_yield['repeated_value']:.0f} records for "
+                            f"{source} created the same "
+                            f"{repeated_yield['repeated_value']:.0f} new records for "
                             f"{repeated_yield['consecutive_runs']} runs in a row — "
                             f"possible re-import of unchanged upstream data reported as new"
                         )
@@ -2114,7 +2136,7 @@ def run_all_syncs(
     duration_collapsed = []  # Sources that "succeeded" suspiciously fast
     yield_collapsed = []  # Normally produce records, produced none this run
     never_yielded_sources = []  # Never produced anything across many runs
-    repeated_yield_sources = []  # Same non-zero count for several runs in a row
+    repeated_yield_sources = []  # Same non-zero created count for several runs in a row
     skipped_sources = []  # Exited early because they aren't configured
     start_time = datetime.now()
 
