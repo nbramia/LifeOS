@@ -96,7 +96,7 @@ Related people with overlap scores.
 
 ### GET /api/crm/people/{id}/strength
 
-Detailed relationship strength components.
+Detailed relationship strength components: `overall_strength`, `multiplier`, and one object each for `recency`, `recent_frequency`, `lifetime_frequency`, and `diversity`, holding the component's `score`, `weight`, and `weighted_score` plus the measurements behind it. See [Relationship Strength Scoring](crm-people.md#relationship-strength-scoring).
 
 ### GET /api/crm/people/{id}/source-entities
 

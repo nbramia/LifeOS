@@ -2,10 +2,12 @@
 Tests for InteractionStore.
 """
 import pytest
+import sqlite3
 import tempfile
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from api.services.interaction_store import (
     Interaction,
@@ -1266,7 +1268,7 @@ class TestMassMeetingExclusion:
         store.add(Interaction(
             id=str(uuid.uuid4()),
             person_id=person_id,
-            timestamp=datetime.now(),
+            timestamp=datetime.now(timezone.utc),
             source_type="calendar",
             title=title,
             attendee_count=attendee_count,
@@ -1319,7 +1321,7 @@ class TestMassMeetingExclusion:
         temp_store.add(Interaction(
             id=str(uuid.uuid4()),
             person_id="p1",
-            timestamp=datetime.now(),
+            timestamp=datetime.now(timezone.utc),
             source_type="gmail",
             title="→ Subject",
         ))
@@ -1334,6 +1336,232 @@ class TestMassMeetingExclusion:
         self._calendar(temp_store, "p1", 1, title="Coffee")
 
         assert self._subtypes(temp_store, "p1") == {"calendar_1on1": 1}
+
+
+class TestWhatsAppSubtypesAndAttendeeCount:
+    """On a WhatsApp row attendee_count marks a group; it never means a meeting size."""
+
+    @pytest.fixture
+    def temp_store(self, tmp_path):
+        return InteractionStore(str(tmp_path / "interactions.db"), strict=False)
+
+    @staticmethod
+    def _whatsapp(store, person_id, source_id, attendee_count):
+        store.add(Interaction(
+            id=str(uuid.uuid4()),
+            person_id=person_id,
+            timestamp=datetime.now(timezone.utc) - timedelta(days=1),
+            source_type="whatsapp",
+            title="WhatsApp",
+            source_id=source_id,
+            attendee_count=attendee_count,
+        ))
+
+    @staticmethod
+    def _subtypes(store, person_id):
+        return {
+            r["subtype"]: r["count"]
+            for r in store.get_interaction_counts_with_subtypes(person_id)
+        }
+
+    def test_null_is_a_direct_message(self, temp_store):
+        self._whatsapp(temp_store, "p1", "whatsapp_m1", None)
+        assert self._subtypes(temp_store, "p1") == {None: 1}
+
+    def test_group_received(self, temp_store):
+        self._whatsapp(temp_store, "p1", "whatsapp_m1", 5)
+        assert self._subtypes(temp_store, "p1") == {"whatsapp_group_received": 1}
+
+    def test_fanout_form_is_group_sent(self, temp_store):
+        self._whatsapp(temp_store, "p1", "whatsapp_m1:peer@s.whatsapp.net", 5)
+        assert self._subtypes(temp_store, "p1") == {"whatsapp_group_sent": 1}
+
+    def test_unknown_membership_is_still_a_group(self, temp_store):
+        self._whatsapp(temp_store, "p1", "whatsapp_m1", 0)
+        self._whatsapp(temp_store, "p1", "whatsapp_m2:peer@s.whatsapp.net", 0)
+        assert self._subtypes(temp_store, "p1") == {
+            "whatsapp_group_received": 1,
+            "whatsapp_group_sent": 1,
+        }
+
+    @pytest.mark.parametrize("size", [1, 3, 10])
+    def test_sizes_matching_meeting_buckets_stay_group_messages(self, temp_store, size):
+        self._whatsapp(temp_store, "p1", "whatsapp_m1", size)
+        assert self._subtypes(temp_store, "p1") == {"whatsapp_group_received": 1}
+
+    def test_group_size_above_the_meeting_limit_is_not_a_mass_meeting(self, temp_store):
+        size = InteractionConfig.MASS_MEETING_ATTENDEE_LIMIT + 50
+        self._whatsapp(temp_store, "p1", "whatsapp_m1", size)
+        assert self._subtypes(temp_store, "p1") == {"whatsapp_group_received": 1}
+
+        inputs = temp_store.get_strength_inputs("p1", days_back=3650)["p1"]
+        assert [b.subtype for b in inputs.buckets] == ["whatsapp_group_received"]
+
+    def test_fanout_form_means_nothing_on_a_calendar_row(self, temp_store):
+        temp_store.add(Interaction(
+            id=str(uuid.uuid4()),
+            person_id="p1",
+            timestamp=datetime.now(timezone.utc) - timedelta(days=1),
+            source_type="calendar",
+            title="Meeting",
+            source_id="event1:someone@example.com",
+            attendee_count=1,
+        ))
+        assert self._subtypes(temp_store, "p1") == {"calendar_1on1": 1}
+
+    def test_mass_meeting_purge_leaves_whatsapp_alone(self, temp_store, monkeypatch):
+        import scripts.purge_mass_meeting_interactions as purge
+
+        limit = InteractionConfig.MASS_MEETING_ATTENDEE_LIMIT
+        self._whatsapp(temp_store, "p1", "whatsapp_m1", limit + 50)
+        temp_store.add(Interaction(
+            id=str(uuid.uuid4()),
+            person_id="p1",
+            timestamp=datetime.now(timezone.utc) - timedelta(days=1),
+            source_type="calendar",
+            title="All hands",
+            source_id="event1:someone@example.com",
+            attendee_count=limit + 50,
+        ))
+        monkeypatch.setattr(purge, "get_interaction_db_path", lambda: temp_store.db_path)
+
+        purge.purge(limit, dry_run=False)
+
+        conn = sqlite3.connect(temp_store.db_path)
+        try:
+            remaining = conn.execute("SELECT source_type FROM interactions").fetchall()
+        finally:
+            conn.close()
+        assert remaining == [("whatsapp",)]
+
+    def test_relationship_discovery_never_treats_whatsapp_as_a_meeting(self, temp_store, monkeypatch):
+        from api.services import relationship_discovery as discovery
+        from config.settings import settings
+
+        # Two people sharing a WhatsApp message id, in the source_id shape the
+        # shared-event query splits on. Neither row is a calendar event.
+        for person_id in ("p1", "p2"):
+            self._whatsapp(temp_store, person_id, f"whatsapp_m1:{person_id}@s.whatsapp.net", 3)
+        monkeypatch.setattr(discovery, "get_interaction_db_path", lambda: temp_store.db_path)
+        monkeypatch.setattr(settings, "my_person_id", "owner", raising=False)
+        rel_store = SimpleNamespace(
+            get_between=lambda *a: None,
+            add=lambda rel: rel,
+            update=lambda rel: rel,
+        )
+        monkeypatch.setattr(discovery, "get_relationship_store", lambda: rel_store)
+
+        assert discovery.discover_from_calendar_direct(min_events=1) == []
+
+
+class TestStrengthInputs:
+    """The aggregate relationship strength is computed from."""
+
+    @pytest.fixture
+    def temp_store(self, tmp_path):
+        return InteractionStore(str(tmp_path / "interactions.db"), strict=False)
+
+    NOW = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)
+
+    def _add(self, store, person_id, when, source_type="imessage", **kwargs):
+        store.add(Interaction(
+            id=str(uuid.uuid4()),
+            person_id=person_id,
+            timestamp=when,
+            source_type=source_type,
+            title=kwargs.pop("title", "Hello"),
+            source_id=kwargs.pop("source_id", str(uuid.uuid4())),
+            **kwargs,
+        ))
+
+    def test_groups_by_day_and_weight(self, temp_store):
+        self._add(temp_store, "p1", self.NOW - timedelta(days=1, hours=1))
+        self._add(temp_store, "p1", self.NOW - timedelta(days=1, hours=2))
+        self._add(temp_store, "p1", self.NOW - timedelta(days=2))
+        self._add(temp_store, "p1", self.NOW - timedelta(days=2), source_type="gmail", title="→ Subject",
+                  source_account="personal")
+
+        buckets = temp_store.get_strength_inputs("p1", days_back=3650, now=self.NOW)["p1"].buckets
+
+        assert sorted((b.source_type, b.subtype, b.source_account, b.day, b.count) for b in buckets) == [
+            ("gmail", "gmail_sent", "personal", "2026-06-13", 1),
+            ("imessage", None, None, "2026-06-13", 1),
+            ("imessage", None, None, "2026-06-14", 2),
+        ]
+
+    def test_day_is_utc_regardless_of_the_stored_offset(self, temp_store):
+        offset = timezone(timedelta(hours=-5))
+        self._add(temp_store, "p1", datetime(2026, 6, 13, 22, 0, tzinfo=offset))
+
+        buckets = temp_store.get_strength_inputs("p1", days_back=3650, now=self.NOW)["p1"].buckets
+
+        assert [b.day for b in buckets] == ["2026-06-14"]
+
+    def test_last_interaction_is_the_latest_past_row(self, temp_store):
+        latest = self.NOW - timedelta(days=3)
+        self._add(temp_store, "p1", latest)
+        self._add(temp_store, "p1", self.NOW - timedelta(days=30))
+        self._add(temp_store, "p1", self.NOW + timedelta(days=30), source_type="calendar", attendee_count=1)
+
+        inputs = temp_store.get_strength_inputs("p1", days_back=3650, now=self.NOW)["p1"]
+
+        assert inputs.last_interaction == latest
+
+    def test_future_rows_are_absent_everywhere(self, temp_store):
+        self._add(temp_store, "p1", self.NOW + timedelta(hours=1), source_type="calendar", attendee_count=1)
+
+        assert temp_store.get_strength_inputs("p1", days_back=3650, now=self.NOW) == {}
+
+    def test_offset_timestamp_is_compared_as_an_instant(self, temp_store):
+        """Lexically earlier than now, but later as an instant."""
+        offset = timezone(timedelta(hours=-5))
+        self._add(temp_store, "p1", datetime(2026, 6, 15, 8, 0, tzinfo=offset), source_type="calendar", attendee_count=1)
+
+        assert temp_store.get_strength_inputs("p1", days_back=3650, now=self.NOW) == {}
+
+    def test_counts_with_subtypes_exclude_future_rows(self, temp_store):
+        self._add(temp_store, "p1", datetime.now(timezone.utc) + timedelta(days=30), source_type="calendar", attendee_count=1)
+        self._add(temp_store, "p1", datetime.now(timezone.utc) - timedelta(days=1), source_type="calendar", attendee_count=1)
+
+        assert [r["count"] for r in temp_store.get_interaction_counts_with_subtypes("p1")] == [1]
+
+    def test_generic_counts_still_include_future_rows(self, temp_store):
+        """Interaction counts shown to users aren't a score component."""
+        self._add(temp_store, "p1", datetime.now(timezone.utc) + timedelta(days=30), source_type="calendar", attendee_count=1)
+
+        assert temp_store.get_interaction_counts("p1", days_back=365) == {"calendar": 1}
+
+    def test_window_limits_buckets_but_not_last_interaction(self, temp_store):
+        old = self.NOW - timedelta(days=400)
+        self._add(temp_store, "p1", old)
+
+        inputs = temp_store.get_strength_inputs("p1", days_back=365, now=self.NOW)["p1"]
+
+        assert inputs.buckets == []
+        assert inputs.last_interaction == old
+
+    def test_mass_meetings_leave_buckets_but_not_last_interaction(self, temp_store):
+        when = self.NOW - timedelta(days=1)
+        self._add(temp_store, "p1", when, source_type="calendar",
+                  attendee_count=InteractionConfig.MASS_MEETING_ATTENDEE_LIMIT + 1)
+
+        inputs = temp_store.get_strength_inputs("p1", days_back=3650, now=self.NOW)["p1"]
+
+        assert inputs.buckets == []
+        assert inputs.last_interaction == when
+
+    def test_everyone_matches_each_person(self, temp_store):
+        for person_id, days in (("p1", (1, 2)), ("p2", (5,))):
+            for d in days:
+                self._add(temp_store, person_id, self.NOW - timedelta(days=d))
+
+        everyone = temp_store.get_strength_inputs(days_back=3650, now=self.NOW)
+
+        assert set(everyone) == {"p1", "p2"}
+        for person_id in everyone:
+            one = temp_store.get_strength_inputs(person_id, days_back=3650, now=self.NOW)[person_id]
+            assert sorted(everyone[person_id].buckets, key=lambda b: b.day) == sorted(one.buckets, key=lambda b: b.day)
+            assert everyone[person_id].last_interaction == one.last_interaction
 
 
 class TestMeFamilyAggregates:

@@ -449,6 +449,14 @@ photos.
 - Groups larger than `LARGE_GROUP_THRESHOLD` (currently 20) are skipped
   entirely as broadcast noise.
 
+**Group Size:**
+- A group row stores the group's participant count in `attendee_count` (0 when
+  the export doesn't list the group's membership). A direct message stores NULL.
+- Relationship strength reads this to weight group messages, and takes direction
+  from the source_id: only a group message you sent has the
+  `whatsapp_<msg_id>:<participant_jid>` fan-out form.
+- `scripts/backfill_whatsapp_group_size.py` fills in rows stored without it.
+
 **Entity Resolution:**
 - 1:1 messages use `create_if_missing=True` so unknown contacts still get a
   PersonEntity — we'd rather have the interaction attached to a thin person

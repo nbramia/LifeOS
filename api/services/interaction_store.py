@@ -67,11 +67,53 @@ def format_window_label(days_back: Optional[int]) -> str:
     return f"the last {days_back} days"
 
 
+# Classifies a row into the subtype that sets its weight. A WhatsApp row with a
+# non-NULL attendee_count is a group message (0 means the membership isn't known,
+# so this tests for NULL rather than truthiness). Only a group message you sent
+# fans out to one `whatsapp_<msg_id>:<participant>` row per participant, so the
+# colon gives the direction.
+_WEIGHT_SUBTYPE_SQL = """CASE
+    WHEN source_type = 'gmail' AND title LIKE '→ %' THEN 'gmail_sent'
+    WHEN source_type = 'gmail' AND title LIKE '← %' THEN 'gmail_received'
+    WHEN source_type = 'gmail' AND title LIKE '↔ %' THEN 'gmail_cc'
+    WHEN source_type = 'calendar' AND attendee_count = 1 THEN 'calendar_1on1'
+    WHEN source_type = 'calendar' AND attendee_count BETWEEN 2 AND 5 THEN 'calendar_small_group'
+    WHEN source_type = 'calendar' AND attendee_count >= 6 THEN 'calendar_large_meeting'
+    WHEN source_type = 'whatsapp' AND attendee_count IS NOT NULL AND instr(source_id, ':') > 0
+        THEN 'whatsapp_group_sent'
+    WHEN source_type = 'whatsapp' AND attendee_count IS NOT NULL THEN 'whatsapp_group_received'
+    ELSE NULL
+END"""
+
+# attendee_count means something else on other source types, so the limit is
+# only ever applied to calendar rows. Bound to MASS_MEETING_ATTENDEE_LIMIT.
+_NOT_MASS_MEETING_SQL = "NOT (source_type = 'calendar' AND COALESCE(attendee_count, 0) > ?)"
+
+
 def get_interaction_db_path() -> str:
     """Get the path to the interactions database."""
     db_dir = Path(settings.chroma_path).parent
     db_dir.mkdir(parents=True, exist_ok=True)
     return str(db_dir / "interactions.db")
+
+
+@dataclass(frozen=True)
+class StrengthBucket:
+    """Interactions sharing a weight and a UTC day."""
+
+    source_type: str
+    subtype: Optional[str]
+    source_account: Optional[str]
+    day: str  # YYYY-MM-DD
+    count: int
+
+
+@dataclass
+class StrengthInputs:
+    """One person's interaction data as relationship strength consumes it."""
+
+    last_interaction: Optional[datetime] = None
+    buckets: list[StrengthBucket] = field(default_factory=list)
 
 
 @dataclass
@@ -100,7 +142,9 @@ class Interaction:
 
     # Account and subtype info (for weighted scoring)
     source_account: Optional[str] = None  # "personal" or "work"
-    attendee_count: Optional[int] = None  # For calendar events: number of other attendees
+    # Calendar: number of other attendees. WhatsApp: group size for a group
+    # message (0 when the group's membership isn't known), NULL for a direct one.
+    attendee_count: Optional[int] = None
 
     def to_dict(self) -> dict:
         """Convert to dict for JSON serialization."""
@@ -966,6 +1010,10 @@ class InteractionStore:
 
         For gmail: parses direction from title prefix (→/←/↔)
         For calendar: derives size from attendee_count
+        For whatsapp: a non-NULL attendee_count marks a group message, and the
+        fan-out source_id form marks one you sent
+
+        Future-dated rows are excluded, as are mass meetings.
 
         Args:
             person_id: PersonEntity ID
@@ -977,33 +1025,29 @@ class InteractionStore:
         if days_back is None:
             days_back = InteractionConfig.DEFAULT_WINDOW_DAYS
 
-        cutoff = datetime.now() - timedelta(days=days_back)
+        now = datetime.now(timezone.utc).isoformat()
 
         conn = self._get_connection()
         try:
             cursor = conn.execute(
-                """
+                f"""
                 SELECT
                     source_type,
                     source_account,
-                    CASE
-                        WHEN source_type = 'gmail' AND title LIKE '→ %' THEN 'gmail_sent'
-                        WHEN source_type = 'gmail' AND title LIKE '← %' THEN 'gmail_received'
-                        WHEN source_type = 'gmail' AND title LIKE '↔ %' THEN 'gmail_cc'
-                        WHEN source_type = 'calendar' AND attendee_count = 1 THEN 'calendar_1on1'
-                        WHEN source_type = 'calendar' AND attendee_count BETWEEN 2 AND 5 THEN 'calendar_small_group'
-                        WHEN source_type = 'calendar' AND attendee_count >= 6 THEN 'calendar_large_meeting'
-                        ELSE NULL
-                    END as subtype,
+                    {_WEIGHT_SUBTYPE_SQL} as subtype,
                     COUNT(*) as count
                 FROM interactions
-                WHERE person_id = ? AND timestamp > ?
-                  AND NOT (source_type = 'calendar' AND COALESCE(attendee_count, 0) > ?)
+                WHERE person_id = ?
+                  AND julianday(timestamp) > julianday(?) - ?
+                  AND julianday(timestamp) <= julianday(?)
+                  AND {_NOT_MASS_MEETING_SQL}
                 GROUP BY source_type, subtype, source_account
             """,
                 (
                     person_id,
-                    cutoff.isoformat(),
+                    now,
+                    days_back,
+                    now,
                     InteractionConfig.MASS_MEETING_ATTENDEE_LIMIT,
                 ),
             )
@@ -1017,6 +1061,86 @@ class InteractionStore:
                     "count": row[3],
                 })
             return results
+        finally:
+            conn.close()
+
+    def get_strength_inputs(
+        self,
+        person_id: Optional[str] = None,
+        *,
+        days_back: int,
+        now: Optional[datetime] = None,
+    ) -> dict[str, StrengthInputs]:
+        """
+        Aggregate what relationship strength needs, by person.
+
+        Rows are grouped by (person, source_type, subtype, account, UTC day) in
+        SQL, so scoring every person is one scan of the table rather than one
+        query per person.
+
+        Future-dated rows never appear. The last interaction is the latest
+        non-future row of any kind and any age; the day buckets are limited to
+        the last `days_back` days and leave out mass meetings.
+
+        Args:
+            person_id: Limit to one person. None aggregates everyone.
+            days_back: Size of the bucket window in days.
+            now: The instant separating past from future (default: current time).
+
+        Returns:
+            Dict mapping person_id to StrengthInputs. People with no past
+            interactions are absent.
+        """
+        now = now or datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        person_sql = "person_id = ?" if person_id else "person_id IS NOT NULL"
+        person_params = (person_id,) if person_id else ()
+
+        conn = self._get_connection()
+        try:
+            inputs: dict[str, StrengthInputs] = {}
+            for pid, last in conn.execute(
+                f"""
+                SELECT person_id, datetime(MAX(julianday(timestamp)))
+                FROM interactions
+                WHERE {person_sql}
+                  AND julianday(timestamp) <= julianday(?)
+                GROUP BY person_id
+            """,
+                (*person_params, now_iso),
+            ):
+                inputs[pid] = StrengthInputs(
+                    last_interaction=datetime.fromisoformat(last).replace(tzinfo=timezone.utc)
+                )
+
+            for pid, source_type, account, subtype, day, count in conn.execute(
+                f"""
+                SELECT
+                    person_id,
+                    source_type,
+                    source_account,
+                    {_WEIGHT_SUBTYPE_SQL} as subtype,
+                    date(timestamp) as day,
+                    COUNT(*)
+                FROM interactions
+                WHERE {person_sql}
+                  AND julianday(timestamp) > julianday(?) - ?
+                  AND julianday(timestamp) <= julianday(?)
+                  AND {_NOT_MASS_MEETING_SQL}
+                GROUP BY person_id, source_type, source_account, subtype, day
+            """,
+                (
+                    *person_params,
+                    now_iso,
+                    days_back,
+                    now_iso,
+                    InteractionConfig.MASS_MEETING_ATTENDEE_LIMIT,
+                ),
+            ):
+                inputs.setdefault(pid, StrengthInputs()).buckets.append(
+                    StrengthBucket(source_type, subtype, account, day, count)
+                )
+            return inputs
         finally:
             conn.close()
 

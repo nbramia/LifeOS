@@ -116,26 +116,31 @@ Birthday-toast behavior is covered in [crm-analytics.md § Birthdays Page](crm-a
 
 ## Relationship Strength Scoring
 
-Each person carries a `relationship_strength` score in `[0.0, 1.0]` computed from three signals:
+Each person carries a `relationship_strength` score from 0 to 100 computed from four signals:
 
 ```
-strength = (recency × 0.3) + (frequency × 0.4) + (diversity × 0.3)
+strength = 100 × ((recency × 0.25) + (recent_frequency × 0.55) + (lifetime_frequency × 0.15) + (diversity × 0.05))
 
 where:
-  recency   = max(0, 1 − days_since_last_interaction / 90)
-  frequency = min(1, interactions_in_90_days / 20)
-  diversity = unique_source_types / total_source_types
+  recency            = 0.5 ^ (days_since_last_interaction / 45)
+  recent_frequency   = min(1, log(1 + S) / log(1 + 600)), S = sum of weight × 0.5 ^ (age_days / 90)
+  lifetime_frequency = min(1, log(1 + W) / log(1 + 2500)), W = sum of weight over 10 years
+  diversity          = unique_source_types / total_source_types
 ```
+
+Weights depend on the channel, so a personal 1:1 meeting counts far more than a CC'd email, and a WhatsApp group message counts less than a direct one. Recency is discounted for anyone with fewer than 15 interactions. A LinkedIn connection adds 3% and family adds 5%, capped at 100.
+
+Only real interactions count: future calendar events are ignored, and contact syncs that refresh `last_seen` don't affect the score.
 
 Examples:
 
-| Person | Days Since | Interactions (90d) | Sources | Recency | Frequency | Diversity | Strength |
-|--------|-----------:|-------------------:|--------:|--------:|----------:|----------:|---------:|
-| Alex   | 1 | 50 | 4 (gmail, cal, imsg, vault) | 0.99 | 1.00 | 0.67 | 0.90 |
-| Sam    | 3 | 30 | 3 (gmail, cal, vault) | 0.97 | 1.00 | 0.50 | 0.84 |
-| Older friend | 60 | 2 | 1 (gmail) | 0.33 | 0.10 | 0.17 | 0.19 |
+| Person | Days Since | Decayed Weight (S) | Lifetime Weight (W) | Sources | Recency | Recent | Lifetime | Diversity | Strength |
+|--------|-----------:|-------------------:|--------------------:|--------:|--------:|-------:|---------:|----------:|---------:|
+| Alex | 1 | 300 | 1500 | 6 | 0.98 | 0.89 | 0.93 | 0.43 | 89.8 |
+| Sam | 30 | 40 | 800 | 3 | 0.63 | 0.58 | 0.85 | 0.21 | 61.6 |
+| Older friend | 400 | 0.4 | 300 | 4 | 0.00 | 0.05 | 0.73 | 0.29 | 15.3 |
 
-Strength is persisted on `PersonEntity`, updated when new interactions are recorded, and used as the default sort key in the people list.
+Strength is persisted on `PersonEntity`, recalculated nightly, and used as the default sort key in the people list.
 
 ---
 
@@ -143,7 +148,7 @@ Strength is persisted on `PersonEntity`, updated when new interactions are recor
 
 Contacts are assigned to one of 8 Dunbar circles (`0` = closest, `6` = outermost, `7` = peripheral). Circles drive filtering, color coding, and prioritization across the CRM.
 
-- Circles `0–6` are derived from the strength ranking among non-peripheral contacts.
+- Circles `0–6` are derived from the strength ranking among non-peripheral contacts. Work contacts take the circle their strength qualifies for but don't use up a slot.
 - Circle `7` is anyone below `PERIPHERAL_THRESHOLD`.
 - Computed in `api/services/relationship_metrics.py`.
 - Operator overrides via `CIRCLE_OVERRIDES_BY_ID` in `config/relationship_weights.py` (the file is gitignored — see [configuration.md](../../guides/configuration.md)).

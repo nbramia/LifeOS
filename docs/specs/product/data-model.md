@@ -60,15 +60,22 @@ Graph edges use unified strength scoring:
 ### Relationship Strength Formula
 
 ```
-strength = (recency × 0.30) + (frequency × 0.60) + (diversity × 0.10)
+strength = 100 × ((recency × 0.25) + (recent_frequency × 0.55) + (lifetime_frequency × 0.15) + (diversity × 0.05))
 
 Where:
-- recency = max(0, 1 - days_since_last / 200)
-- frequency = hybrid of recent (70%) and lifetime (30%) weighted interactions
+- recency = 0.5 ^ (days_since_last_interaction / 45), discounted below 15 interactions
+- recent_frequency = min(1, log(1 + S) / log(1 + 600)), S = sum of weight × 0.5 ^ (age_days / 90)
+- lifetime_frequency = min(1, log(1 + W) / log(1 + 2500)), W = sum of weight over 10 years
 - diversity = unique_sources / total_sources
 ```
 
+The result takes a 3% LinkedIn and a 5% family multiplier, capped at 100. Every input comes from the `interactions` table and ignores future-dated rows; `last_seen` is not an input, because it also tracks source-entity observations that syncs refresh without any interaction taking place.
+
+WhatsApp group messages weigh less than direct ones: a group message you sent carries 15% of the WhatsApp weight (it is one row per participant), and one you received carries 35%. A WhatsApp row marks a group message by holding the group's size in `attendee_count`, which is NULL for a direct message.
+
 ### Pair Strength Formula (for non-owner edges)
+
+Pair strength is its own formula, independent of relationship strength.
 
 ```
 pair_strength = (recency × 0.30) + (frequency × 0.60) + (diversity × 0.10)
