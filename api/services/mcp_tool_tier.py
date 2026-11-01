@@ -290,7 +290,7 @@ def _check_task_update(arguments: dict, task_agent: str | None) -> str | None:
     assignee = arguments.get("assignee")
     if assignee is not None and assignee.strip().lstrip("#").lower() not in (task_agent, UNASSIGN):
         return f"you can assign a task only to yourself ({task_agent}) or release it ({UNASSIGN})"
-    text = {k: arguments.get(k) for k in ("description", "notes")}
+    text = {k: arguments.get(k) for k in ("description", "notes", "priority", "due_date", "status")}
     if any(_forbidden_tag(t) for t in _rendered_tags(text)):
         return _TAG_REFUSAL
     return None

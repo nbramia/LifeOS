@@ -1468,6 +1468,8 @@ def test_agent_grant_lists_a_trimmed_task_update_and_names_the_agent(client, cal
     {"task_id": "t1", "notes": "hand to #claude"},
     {"task_id": "t1", "description": "Errand #muse"},
     {"task_id": "t1", "status": "done\n#codex"},
+    {"task_id": "t1", "due_date": "2026-12-01 #claude"},
+    {"task_id": "t1", "priority": "high #claude"},
     {"status": "done"},
 ])
 def test_agent_task_update_refuses_arguments_outside_its_own_lane(client, calls, monkeypatch, arguments):
@@ -1580,6 +1582,21 @@ def test_agent_token_rotation_and_bad_entries(client, monkeypatch):
     # The full-access token is unchanged and separate.
     assert "lifeos_shell" not in {t["name"] for t in _rpc(client, new, "tools/list").json()["result"]["tools"]}
     assert _rpc(client, BEARER, "tools/list").status_code == 200
+
+
+def test_malformed_agent_token_entries_grant_nothing(monkeypatch):
+    from api.services.mcp_tool_tier import agent_for_token, agent_token_hashes
+
+    good = _sha("synthetic-token")
+    for entry in ("muse=", "muse=abc", f"muse={good[:63]}", f"muse={good}0", f"muse={'g' * 64}",
+                  f"muse {good}", good, ""):
+        _agent_tokens(monkeypatch, entry)
+        assert agent_token_hashes() == {}, entry
+    _agent_tokens(monkeypatch, f"muse={good.upper()}")
+    assert agent_token_hashes() == {good: "muse"}
+    _agent_tokens(monkeypatch, "muse=")
+    for token in ("", "garbage", "synthetic-token"):
+        assert agent_for_token(token) is None
 
 
 def test_mint_script_prints_a_token_whose_hash_is_its_entry(capsys):

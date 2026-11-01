@@ -155,6 +155,13 @@ def test_agent_may_finish_the_operators_task_without_taking_it(api, manager):
 @pytest.mark.parametrize("body", [
     {"acting_agent": "duet", "tags": ["duet"]},
     {"acting_agent": "duet", "fields": {"parent_id": "x"}},
+    {"acting_agent": "duet", "context": "Personal"},
+    {"acting_agent": "duet", "priority": "high #claude"},
+    {"acting_agent": "duet", "priority": "urgent"},
+    {"acting_agent": "duet", "due_date": "2026-12-01 #claude"},
+    {"acting_agent": "duet", "due_date": "2026-13-45"},
+    {"acting_agent": "duet", "due_date": "12/01/2026"},
+    {"acting_agent": "duet", "status": "finished"},
     {"acting_agent": "duet", "actor": "worker", "status": "done"},
     {"acting_agent": "claude", "status": "done"},
     {"assignee": "somebody"},
@@ -162,7 +169,54 @@ def test_agent_may_finish_the_operators_task_without_taking_it(api, manager):
 ])
 def test_malformed_agent_requests_are_422(api, manager, body):
     task_id = _task(manager)
+    before = (manager.tasks_dir / "Inbox.md").read_text()
     assert api.put(f"/api/tasks/{task_id}", json=body).status_code == 422
+    assert (manager.tasks_dir / "Inbox.md").read_text() == before
+
+
+def test_agent_may_set_documented_priority_and_due_date_or_clear_them(api, manager):
+    task_id = _task(manager)
+    resp = api.put(f"/api/tasks/{task_id}", json={
+        "acting_agent": "duet", "priority": "high", "due_date": "2026-12-01",
+    })
+    assert resp.status_code == 200, resp.text
+    assert (manager.get(task_id).priority, manager.get(task_id).due_date) == ("high", "2026-12-01")
+    resp = api.put(f"/api/tasks/{task_id}", json={"acting_agent": "duet", "priority": "", "due_date": ""})
+    assert resp.status_code == 200, resp.text
+    assert not manager.get(task_id).priority and not manager.get(task_id).due_date
+
+
+def test_context_refusal_names_the_field(api, manager):
+    task_id = _task(manager)
+    resp = api.put(f"/api/tasks/{task_id}", json={"acting_agent": "duet", "context": "Personal"})
+    assert resp.status_code == 422 and "context" in resp.json()["detail"]
+
+
+def test_assignee_swap_keeps_a_tag_added_after_the_agent_read_the_task(api, manager, monkeypatch):
+    import copy
+
+    task_id = _task(manager, ["errand"])
+    stale = copy.copy(manager.get(task_id))
+    path = manager.tasks_dir / "Inbox.md"
+    path.write_text(path.read_text().replace("Synthetic errand", "Synthetic errand #late-tag"))
+    monkeypatch.setattr(manager, "get", lambda _id: stale)
+    resp = api.put(f"/api/tasks/{task_id}", json={"acting_agent": "duet", "assignee": "duet"})
+    assert resp.status_code == 200, resp.text
+    line = next(ln for ln in path.read_text().splitlines() if task_id in ln)
+    assert {t for t in line.split() if t.startswith("#")} == {"#errand", "#late-tag", "#duet"}
+
+
+def test_review_reassign_to_an_external_agent_leaves_the_card_editable_by_it():
+    for target in ("duet", "muse"):
+        plan = agent_board.plan_review_action("done", ["claude", "agent-completed"], "reassign", target)
+        assert plan.error is None and target in plan.tags
+        assert "agent-reassigned" not in plan.tags
+        assert agent_board.agent_task_edit_error(plan.status, plan.tags, target, None) is None
+
+
+def test_review_reassign_to_an_engine_still_marks_the_card_reassigned():
+    plan = agent_board.plan_review_action("done", ["claude", "agent-completed"], "reassign", "codex")
+    assert "agent-reassigned" in plan.tags
 
 
 def test_rule_is_rechecked_against_the_snapshot_being_written(api, manager, monkeypatch):

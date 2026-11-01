@@ -632,7 +632,10 @@ def plan_review_action(
     # vocabularies so a stale #cloud-haiku cannot outrank the requested target.
     cleaned = [t for t in cleaned if t.lstrip("#").lower() not in AGENT_EXECUTOR_TAGS]
     cleaned.append(normalized)
-    cleaned.append(REASSIGNED_TAG)
+    # The tag marks a card for the agent worker to clear on its next claim;
+    # external agents' cards are never claimed, so it would only lock them out.
+    if normalized not in EXTERNAL_AGENT_ASSIGNEES:
+        cleaned.append(REASSIGNED_TAG)
     return ReviewActionPlan(status="todo", tags=cleaned)
 
 

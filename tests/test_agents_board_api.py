@@ -564,6 +564,17 @@ class TestReviewActions:
         assert session_store.get(task.id).session_id == session.session_id
         assert session_store.get_messages(session.session_id)[0]["content"] == "Prior synthetic result"
 
+    def test_reassign_to_an_external_agent_does_not_mark_the_card_reassigned(self, client, stores):
+        task_manager, _sched, _session_store, _transcript = stores
+        task = task_manager.create("Review synthetic output", tags=["codex", "agent-completed"], status="done")
+
+        response = client.post(
+            f"/api/agents/board/cards/{task.id}/review-action",
+            json={"action": "reassign", "assignee": "duet"},
+        )
+        assert response.status_code == 200, response.text
+        assert task_manager.get(task.id).tags == ["duet"]
+
     def test_reassign_clears_a_stale_snooze(self, client, stores):
         """Assigned IS a snooze-eligible natural lane, so the write-path
         natural-lane guard alone would not clear this — the reassignment

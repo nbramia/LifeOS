@@ -160,8 +160,9 @@ An external agent edits tasks through `PUT /api/tasks/{id}` with
 `LIFEOS_MCP_AGENT_TOKENS`, does this through `lifeos_task_update`, which sets
 `acting_agent` for it, so the agent can't claim to be someone else). Such a request may
 change only `description`, `status`, `priority`, `due_date`, `notes` and
-`assignee`; `tags`, `fields`, `context` and `actor` are refused with
-**422**. The rules, so two agents never fight over a task:
+`assignee`; any other field (`tags`, `fields`, `context`, `actor`, ...) is refused
+with **422**, as is a `priority` other than `high`, `medium`, `low` or empty and a
+`due_date` that is not `YYYY-MM-DD` or empty. The rules, so two agents never fight over a task:
 
 | The task is | The agent may | The agent may not |
 |---|---|---|

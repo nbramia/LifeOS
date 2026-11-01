@@ -5,6 +5,7 @@ CRUD endpoints for tasks stored in Obsidian-compatible markdown.
 """
 import logging
 import re
+from datetime import date
 from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException, Query
@@ -290,6 +291,36 @@ class PreflightPreviewResponse(BaseModel):
     sane: bool
     sane_reason: str
     ambiguity: Optional[dict] = None
+
+
+# The only fields an acting external agent may change on a task.
+_ACTING_AGENT_UPDATE_FIELDS = frozenset({"description", "status", "priority", "due_date", "notes"})
+_ACTING_AGENT_PRIORITIES = ("high", "medium", "low")
+_ISO_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _validate_acting_agent_values(updates: dict) -> None:
+    """Refuse priority and due_date values outside their documented formats.
+
+    These values are rendered into the task line, so a free-form value could
+    carry extra markup (such as a tag) into the stored task.
+    """
+    priority = updates.get("priority")
+    if priority is not None and priority not in ("", *_ACTING_AGENT_PRIORITIES):
+        raise HTTPException(
+            status_code=422,
+            detail="priority must be one of: " + ", ".join(_ACTING_AGENT_PRIORITIES) + ", or empty",
+        )
+    due_date = updates.get("due_date")
+    if due_date is not None and due_date != "":
+        valid = _ISO_DATE_RE.fullmatch(due_date) is not None
+        if valid:
+            try:
+                date.fromisoformat(due_date)
+            except ValueError:
+                valid = False
+        if not valid:
+            raise HTTPException(status_code=422, detail="due_date must be YYYY-MM-DD, or empty to clear it")
 
 
 class UpdateTaskRequest(BaseModel):
@@ -1100,11 +1131,16 @@ async def update_task(
                 status_code=422,
                 detail="acting_agent must be one of: " + ", ".join(_board.EXTERNAL_AGENT_ASSIGNEES),
             )
-        if "tags" in updates or "fields" in updates or actor is not None:
+        refused = sorted(set(updates) - _ACTING_AGENT_UPDATE_FIELDS)
+        if actor is not None:
+            refused.append("actor")
+        if refused:
             raise HTTPException(
                 status_code=422,
-                detail="an acting agent sets its assignee with assignee, not tags, fields or actor",
+                detail=f"an acting agent may set only {', '.join(sorted(_ACTING_AGENT_UPDATE_FIELDS))} "
+                       f"and assignee; not {', '.join(refused)}",
             )
+        _validate_acting_agent_values(updates)
 
     # The board's assignment pickers stamp `fields.assigned_by: "board"` on
     # every write (see web/agents/assignment.js) — that marker routes a
