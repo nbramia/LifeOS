@@ -44,6 +44,11 @@ RECENT_FREQUENCY_TARGET = 600
 LIFETIME_FREQUENCY_TARGET = 2500
 LIFETIME_WINDOW_DAYS = 3650
 
+# Subtypes that say nothing about this person's own activity. A group message you
+# sent is one row per participant, whether or not they ever reply, so it earns
+# frequency at its reduced weight but no recency credit.
+SUBTYPES_WITHOUT_RECENCY_CREDIT = frozenset({"whatsapp_group_sent"})
+
 # Recency discount for zero-interaction contacts
 # People with no tracked interactions get NO recency credit
 # (contacts list and LinkedIn connections shouldn't inflate scores)

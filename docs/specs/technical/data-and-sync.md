@@ -454,7 +454,8 @@ photos.
   the export doesn't list the group's membership). A direct message stores NULL.
 - Relationship strength reads this to weight group messages, and takes direction
   from the source_id: only a group message you sent has the
-  `whatsapp_<msg_id>:<participant_jid>` fan-out form.
+  `whatsapp_<msg_id>:<participant_jid>` fan-out form. A group message you sent
+  earns frequency but no recency credit.
 - `scripts/backfill_whatsapp_group_size.py` fills in rows stored without it.
 
 **Entity Resolution:**

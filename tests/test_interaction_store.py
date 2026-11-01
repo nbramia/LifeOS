@@ -1540,6 +1540,44 @@ class TestStrengthInputs:
         assert inputs.buckets == []
         assert inputs.last_interaction == old
 
+    def test_group_sent_rows_never_set_last_interaction(self, temp_store):
+        own = self.NOW - timedelta(days=30)
+        self._add(temp_store, "p1", own)
+        self._add(temp_store, "p1", self.NOW - timedelta(days=1), source_type="whatsapp",
+                  source_id="whatsapp_m1:peer@s.whatsapp.net", attendee_count=4)
+
+        inputs = temp_store.get_strength_inputs("p1", days_back=3650, now=self.NOW)["p1"]
+
+        assert inputs.last_interaction == own
+        assert {b.subtype for b in inputs.buckets} == {None, "whatsapp_group_sent"}
+
+    def test_sent_only_person_has_buckets_and_no_last_interaction(self, temp_store):
+        self._add(temp_store, "p1", self.NOW - timedelta(days=1), source_type="whatsapp",
+                  source_id="whatsapp_m1:peer@s.whatsapp.net", attendee_count=0)
+
+        inputs = temp_store.get_strength_inputs("p1", days_back=3650, now=self.NOW)["p1"]
+
+        assert inputs.last_interaction is None
+        assert [b.subtype for b in inputs.buckets] == ["whatsapp_group_sent"]
+
+    @pytest.mark.parametrize(
+        ("source_type", "source_id", "attendee_count"),
+        [
+            ("whatsapp", "whatsapp_m1", 4),
+            ("whatsapp", "whatsapp_m1", None),
+            ("whatsapp", None, 4),
+            ("whatsapp", "whatsapp_m1:peer@s.whatsapp.net", None),
+            ("calendar", "event1:someone@example.com", 4),
+        ],
+    )
+    def test_other_rows_still_set_last_interaction(self, temp_store, source_type, source_id, attendee_count):
+        when = self.NOW - timedelta(days=1)
+        self._add(temp_store, "p1", when, source_type=source_type, source_id=source_id, attendee_count=attendee_count)
+
+        inputs = temp_store.get_strength_inputs("p1", days_back=3650, now=self.NOW)["p1"]
+
+        assert inputs.last_interaction == when
+
     def test_mass_meetings_leave_buckets_but_not_last_interaction(self, temp_store):
         when = self.NOW - timedelta(days=1)
         self._add(temp_store, "p1", when, source_type="calendar",

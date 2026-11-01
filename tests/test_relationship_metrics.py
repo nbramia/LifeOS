@@ -29,7 +29,9 @@ from config.relationship_weights import (
     INTERACTION_TYPE_WEIGHTS,
     LIFETIME_FREQUENCY_TARGET,
     LIFETIME_FREQUENCY_WEIGHT,
+    LIFETIME_WINDOW_DAYS,
     MIN_INTERACTIONS_FOR_FULL_RECENCY,
+    PERIPHERAL_THRESHOLD,
     RECENCY_HALF_LIFE_DAYS,
     RECENCY_WEIGHT,
     RECENT_FREQUENCY_HALF_LIFE_DAYS,
@@ -270,6 +272,20 @@ class TestStrengthComponents:
         assert sent.decayed_weight == pytest.approx(22.5)
         assert received.decayed_weight == pytest.approx(52.5)
 
+    def test_group_sent_rows_earn_no_recency_interactions(self):
+        c = self._components(
+            StrengthBucket("imessage", None, None, TODAY, 5),
+            StrengthBucket("whatsapp", "whatsapp_group_sent", None, TODAY, 100),
+        )
+        assert c.recency_interactions == 5
+        assert c.total_interactions == 105
+        assert c.recency == pytest.approx(5 / 15)
+
+    def test_group_received_rows_earn_recency_interactions(self):
+        c = self._components(StrengthBucket("whatsapp", "whatsapp_group_received", None, TODAY, 15))
+        assert c.recency_interactions == 15
+        assert c.recency == pytest.approx(1.0)
+
     def test_low_interaction_discount_applies_to_recency(self):
         few = self._components(StrengthBucket("imessage", None, None, TODAY, 5))
         many = self._components(StrengthBucket("imessage", None, None, TODAY, 15))
@@ -386,6 +402,135 @@ class TestStrengthForPerson:
         assert compute_strength_for_person(person, modest, NOW) == pytest.approx(base * 1.03 * 1.05, abs=0.05)
 
 
+class TestGroupSentEarnsNoRecency:
+    """Posting to a group says nothing about a member who never replies."""
+
+    @staticmethod
+    def _sent(store, person_id, now, count):
+        for n in range(count):
+            _add(store, person_id, now - timedelta(days=n, minutes=1), source_type="whatsapp",
+                 source_id=f"whatsapp_{person_id}-{n}:peer@s.whatsapp.net", attendee_count=4)
+
+    def test_sent_only_member_scores_below_a_few_direct_messages(self, interaction_store, no_relationships):
+        now = datetime.now(timezone.utc)
+        self._sent(interaction_store, "passive", now, 15)
+        for n in range(5):
+            _add(interaction_store, "direct", now - timedelta(days=n, minutes=1))
+
+        passive = compute_strength_for_person(PersonEntity(id="passive", canonical_name="Pat Passive"), now=now)
+        direct = compute_strength_for_person(PersonEntity(id="direct", canonical_name="Dee Direct"), now=now)
+
+        assert passive < direct
+
+    def test_sent_only_member_gets_no_recency_but_keeps_frequency(self, interaction_store, no_relationships):
+        now = datetime.now(timezone.utc)
+        self._sent(interaction_store, "passive", now, 15)
+        person = PersonEntity(id="passive", canonical_name="Pat Passive")
+
+        data = rm.get_strength_breakdown(person)
+
+        assert data["recency"]["score"] == 0.0
+        assert data["recency"]["last_interaction"] is None
+        assert data["recency"]["interactions_counted"] == 0
+        assert data["lifetime_frequency"]["raw_interaction_count"] == 15
+        assert data["recent_frequency"]["score"] > 0.0
+        assert data["lifetime_frequency"]["weighted_interaction_count"] == pytest.approx(15 * 0.225, abs=0.01)
+
+    def test_received_group_rows_keep_recency(self, interaction_store, no_relationships):
+        now = datetime.now(timezone.utc)
+        for n in range(15):
+            _add(interaction_store, "active", now - timedelta(days=n, minutes=1), source_type="whatsapp",
+                 source_id=f"whatsapp_active-{n}", attendee_count=4)
+        person = PersonEntity(id="active", canonical_name="Ari Active")
+
+        data = rm.get_strength_breakdown(person)
+
+        assert data["recency"]["days_since_last"] == 0
+        assert data["recency"]["interactions_counted"] == 15
+        assert data["recency"]["score"] > 0.9
+
+    def test_last_interaction_comes_from_the_persons_own_activity(self, interaction_store, no_relationships):
+        now = datetime.now(timezone.utc)
+        self._sent(interaction_store, "mixed", now, 15)
+        for n in range(15):
+            _add(interaction_store, "mixed", now - timedelta(days=90 + n))
+        person = PersonEntity(id="mixed", canonical_name="Mo Mixed")
+
+        data = rm.get_strength_breakdown(person)
+
+        assert data["recency"]["days_since_last"] == 90
+        assert data["recency"]["interactions_counted"] == 15
+
+    def test_nightly_pass_agrees(self, interaction_store, no_relationships, person_store):
+        now = datetime.now(timezone.utc)
+        self._sent(interaction_store, "passive", now, 15)
+        store = person_store([PersonEntity(id="passive", canonical_name="Pat Passive")])
+
+        rm.update_all_strengths()
+
+        single = compute_strength_for_person(PersonEntity(id="passive", canonical_name="Pat Passive"))
+        assert store.people["passive"].relationship_strength == pytest.approx(single, abs=0.11)
+
+    def test_row_and_aggregate_definitions_agree(self, interaction_store):
+        """The subtype the bucket query assigns is the one scoring withholds credit for."""
+        now = datetime.now(timezone.utc)
+        self._sent(interaction_store, "passive", now, 1)
+        _add(interaction_store, "active", now - timedelta(days=1), source_type="whatsapp",
+             source_id="whatsapp_active-1", attendee_count=4)
+
+        inputs = interaction_store.get_strength_inputs(days_back=LIFETIME_WINDOW_DAYS, now=now)
+
+        assert inputs["passive"].last_interaction is None
+        assert {b.subtype for b in inputs["passive"].buckets} == rm.SUBTYPES_WITHOUT_RECENCY_CREDIT
+        assert inputs["active"].last_interaction is not None
+        assert not {b.subtype for b in inputs["active"].buckets} & rm.SUBTYPES_WITHOUT_RECENCY_CREDIT
+
+
+class TestLifetimeWindow:
+    """Both scoring paths count interactions over the same ten-year window."""
+
+    INSIDE = LIFETIME_WINDOW_DAYS - 1
+    OUTSIDE = LIFETIME_WINDOW_DAYS + 1
+
+    def test_value(self):
+        assert LIFETIME_WINDOW_DAYS == 3650
+
+    def test_single_person_path(self, interaction_store, no_relationships):
+        now = datetime.now(timezone.utc)
+        _add(interaction_store, "inside", now - timedelta(days=self.INSIDE))
+        _add(interaction_store, "outside", now - timedelta(days=self.OUTSIDE))
+
+        inside = compute_strength_for_person(PersonEntity(id="inside", canonical_name="In Side"), now=now)
+        outside = compute_strength_for_person(PersonEntity(id="outside", canonical_name="Out Side"), now=now)
+
+        assert inside > 0.0
+        assert outside == 0.0
+
+    def test_nightly_path(self, interaction_store, no_relationships, person_store):
+        now = datetime.now(timezone.utc)
+        _add(interaction_store, "inside", now - timedelta(days=self.INSIDE))
+        _add(interaction_store, "outside", now - timedelta(days=self.OUTSIDE))
+        store = person_store([
+            PersonEntity(id="inside", canonical_name="In Side"),
+            PersonEntity(id="outside", canonical_name="Out Side"),
+        ])
+
+        rm.update_all_strengths()
+
+        assert store.people["inside"].relationship_strength > 0.0
+        assert store.people["outside"].relationship_strength == 0.0
+
+    def test_breakdown_path(self, interaction_store, no_relationships):
+        now = datetime.now(timezone.utc)
+        _add(interaction_store, "p1", now - timedelta(days=self.INSIDE))
+        _add(interaction_store, "p1", now - timedelta(days=self.OUTSIDE))
+
+        data = rm.get_strength_breakdown(PersonEntity(id="p1", canonical_name="Pat Example"))
+
+        assert data["lifetime_frequency"]["raw_interaction_count"] == 1
+        assert sum(v["count"] for v in data["lifetime_frequency"]["interactions_by_type"].values()) == 1
+
+
 class _MemoryPersonStore:
     """The slice of PersonEntityStore that update_all_strengths touches."""
 
@@ -414,6 +559,42 @@ def person_store(monkeypatch):
         monkeypatch.setattr(rm, "TAG_OVERRIDES_BY_ID", {})
         return store
     return install
+
+
+class TestPeripheralThreshold:
+    """Below the threshold a person is a peripheral contact, at it they are not."""
+
+    def test_value(self):
+        assert PERIPHERAL_THRESHOLD == 5.0
+
+    @pytest.mark.parametrize(("strength", "peripheral"), [(5.0, False), (4.9, True)])
+    def test_single_person_update(self, person_store, monkeypatch, strength, peripheral):
+        store = person_store([PersonEntity(id="p1", canonical_name="Pat Example")])
+        monkeypatch.setattr(rm, "compute_strength_for_person", lambda person: strength)
+
+        assert rm.update_strength_for_person("p1") == strength
+
+        assert store.people["p1"].relationship_strength == strength
+        assert store.people["p1"].is_peripheral_contact is peripheral
+
+    def test_single_person_update_clears_the_flag(self, person_store, monkeypatch):
+        person = PersonEntity(id="p1", canonical_name="Pat Example", is_peripheral_contact=True)
+        store = person_store([person])
+        monkeypatch.setattr(rm, "compute_strength_for_person", lambda person: 6.0)
+
+        rm.update_strength_for_person("p1")
+
+        assert store.people["p1"].is_peripheral_contact is False
+
+    @pytest.mark.parametrize(("strength", "peripheral"), [(5.0, False), (4.9, True)])
+    def test_nightly_pass(self, interaction_store, person_store, monkeypatch, strength, peripheral):
+        store = person_store([PersonEntity(id="p1", canonical_name="Pat Example")])
+        monkeypatch.setattr(rm, "compute_strength_for_person", lambda *args: strength)
+
+        rm.update_all_strengths()
+
+        assert store.people["p1"].is_peripheral_contact is peripheral
+        assert (store.people["p1"].dunbar_circle == 7) is peripheral
 
 
 class TestUpdateAllStrengths:

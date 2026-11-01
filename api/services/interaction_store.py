@@ -72,15 +72,19 @@ def format_window_label(days_back: Optional[int]) -> str:
 # so this tests for NULL rather than truthiness). Only a group message you sent
 # fans out to one `whatsapp_<msg_id>:<participant>` row per participant, so the
 # colon gives the direction.
-_WEIGHT_SUBTYPE_SQL = """CASE
+_WHATSAPP_GROUP_SENT_SQL = (
+    "source_type = 'whatsapp' AND attendee_count IS NOT NULL "
+    "AND instr(COALESCE(source_id, ''), ':') > 0"
+)
+
+_WEIGHT_SUBTYPE_SQL = f"""CASE
     WHEN source_type = 'gmail' AND title LIKE '→ %' THEN 'gmail_sent'
     WHEN source_type = 'gmail' AND title LIKE '← %' THEN 'gmail_received'
     WHEN source_type = 'gmail' AND title LIKE '↔ %' THEN 'gmail_cc'
     WHEN source_type = 'calendar' AND attendee_count = 1 THEN 'calendar_1on1'
     WHEN source_type = 'calendar' AND attendee_count BETWEEN 2 AND 5 THEN 'calendar_small_group'
     WHEN source_type = 'calendar' AND attendee_count >= 6 THEN 'calendar_large_meeting'
-    WHEN source_type = 'whatsapp' AND attendee_count IS NOT NULL AND instr(source_id, ':') > 0
-        THEN 'whatsapp_group_sent'
+    WHEN {_WHATSAPP_GROUP_SENT_SQL} THEN 'whatsapp_group_sent'
     WHEN source_type = 'whatsapp' AND attendee_count IS NOT NULL THEN 'whatsapp_group_received'
     ELSE NULL
 END"""
@@ -1079,8 +1083,9 @@ class InteractionStore:
         query per person.
 
         Future-dated rows never appear. The last interaction is the latest
-        non-future row of any kind and any age; the day buckets are limited to
-        the last `days_back` days and leave out mass meetings.
+        non-future row of any age, other than a group message you sent, which
+        says nothing about this person's own activity. The day buckets are
+        limited to the last `days_back` days and leave out mass meetings.
 
         Args:
             person_id: Limit to one person. None aggregates everyone.
@@ -1105,6 +1110,7 @@ class InteractionStore:
                 FROM interactions
                 WHERE {person_sql}
                   AND julianday(timestamp) <= julianday(?)
+                  AND NOT ({_WHATSAPP_GROUP_SENT_SQL})
                 GROUP BY person_id
             """,
                 (*person_params, now_iso),

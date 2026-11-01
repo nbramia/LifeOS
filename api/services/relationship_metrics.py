@@ -9,7 +9,8 @@ Relationship strength is computed using the formula:
 
 Where:
 - recency: 0.5 ** (days_since_last_real_interaction / RECENCY_HALF_LIFE_DAYS),
-  discounted for people with few interactions
+  discounted for people with few interactions. A group message you sent doesn't
+  count toward either, since it says nothing about this person's own activity.
 - recent_frequency: min(1, log(1 + S) / log(1 + RECENT_FREQUENCY_TARGET)), with
   S = sum of weight * 0.5 ** (age_days / RECENT_FREQUENCY_HALF_LIFE_DAYS)
 - lifetime_frequency: min(1, log(1 + W) / log(1 + LIFETIME_FREQUENCY_TARGET)),
@@ -42,6 +43,7 @@ from config.relationship_weights import (
     LIFETIME_FREQUENCY_WEIGHT,
     DIVERSITY_WEIGHT,
     RECENCY_HALF_LIFE_DAYS,
+    SUBTYPES_WITHOUT_RECENCY_CREDIT,
     RECENT_FREQUENCY_HALF_LIFE_DAYS,
     RECENT_FREQUENCY_TARGET,
     LIFETIME_FREQUENCY_TARGET,
@@ -96,7 +98,8 @@ def compute_recency_multiplier(total_interactions: int) -> float:
     single interaction doesn't earn a whole relationship's worth of recency.
 
     Args:
-        total_interactions: Past interactions within LIFETIME_WINDOW_DAYS
+        total_interactions: Past interactions within LIFETIME_WINDOW_DAYS that
+            earn recency credit
 
     Returns:
         Multiplier between ZERO_INTERACTION_RECENCY_MULTIPLIER and 1.0
@@ -203,6 +206,7 @@ class StrengthComponents:
     decayed_weight: float
     lifetime_weight: float
     total_interactions: int
+    recency_interactions: int
     sources: list[str]
 
 
@@ -226,6 +230,7 @@ def compute_strength_components(
     decayed_weight = 0.0
     lifetime_weight = 0.0
     total_interactions = 0
+    recency_interactions = 0
     sources = set(person.sources)
 
     for bucket in inputs.buckets:
@@ -236,12 +241,14 @@ def compute_strength_components(
         decayed_weight += weight * 0.5 ** (age_days / RECENT_FREQUENCY_HALF_LIFE_DAYS)
         lifetime_weight += weight
         total_interactions += bucket.count
+        if bucket.subtype not in SUBTYPES_WITHOUT_RECENCY_CREDIT:
+            recency_interactions += bucket.count
         sources.add(bucket.source_type)
 
     return StrengthComponents(
         recency=(
             compute_recency_score(inputs.last_interaction, now)
-            * compute_recency_multiplier(total_interactions)
+            * compute_recency_multiplier(recency_interactions)
         ),
         recent_frequency=compute_recent_frequency_score(decayed_weight),
         lifetime_frequency=compute_lifetime_frequency_score(lifetime_weight),
@@ -250,6 +257,7 @@ def compute_strength_components(
         decayed_weight=decayed_weight,
         lifetime_weight=lifetime_weight,
         total_interactions=total_interactions,
+        recency_interactions=recency_interactions,
         sources=sorted(sources),
     )
 
@@ -304,7 +312,8 @@ def compute_strength_for_person(
     multipliers:
     - Gmail: sent (1.2x), received (1.0x), CC (0.3x)
     - Calendar: 1on1 (6.0x), small group (4.0x), large meeting (2.0x)
-    - WhatsApp: direct (1.5x), group received (0.525x), group sent (0.225x)
+    - WhatsApp: direct (1.5x), group received (0.525x), group sent (0.225x, and
+      no recency credit)
     - Personal account: 2x gmail, 3x calendar
 
     Args:
@@ -659,6 +668,7 @@ def get_strength_breakdown(person: PersonEntity) -> dict:
             "weighted_score": round(components.recency * RECENCY_WEIGHT, 4),
             "last_interaction": last_interaction.isoformat() if last_interaction else None,
             "days_since_last": (now - last_interaction).days if last_interaction else None,
+            "interactions_counted": components.recency_interactions,
             "half_life_days": RECENCY_HALF_LIFE_DAYS,
         },
         "recent_frequency": {

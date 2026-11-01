@@ -71,7 +71,7 @@ Where:
 
 The result takes a 3% LinkedIn and a 5% family multiplier, capped at 100. Every input comes from the `interactions` table and ignores future-dated rows; `last_seen` is not an input, because it also tracks source-entity observations that syncs refresh without any interaction taking place.
 
-WhatsApp group messages weigh less than direct ones: a group message you sent carries 15% of the WhatsApp weight (it is one row per participant), and one you received carries 35%. A WhatsApp row marks a group message by holding the group's size in `attendee_count`, which is NULL for a direct message.
+WhatsApp group messages weigh less than direct ones: a group message you sent carries 15% of the WhatsApp weight (it is one row per participant), and one you received carries 35%. A group message you sent earns no recency credit, because it says nothing about the other person's activity: it doesn't set the last interaction or count toward the 15. A WhatsApp row marks a group message by holding the group's size in `attendee_count`, which is NULL for a direct message.
 
 ### Pair Strength Formula (for non-owner edges)
 
