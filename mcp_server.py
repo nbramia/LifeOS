@@ -11,6 +11,8 @@ Usage:
 Register with Claude Code:
     claude mcp add lifeos -s user -- python /path/to/mcp_server.py
 """
+import hashlib
+import re
 import json
 import sys
 import httpx
@@ -2798,22 +2800,22 @@ def _tool_error(message: str) -> dict:
     return {"content": [{"type": "text", "text": f"Error: {message}"}], "isError": True}
 
 
-def dispatch(
+def respond(
     server: "LifeOSMCPServer",
     request: dict,
     *,
     access: OAuthToolAccess | None = None,
 ) -> dict | None:
-    """Handle a single JSON-RPC request.
+    """Build the JSON-RPC response for one request, whether or not it has an id.
 
-    Returns the response dict, or None for notifications (requests with no id).
-    Used by both the stdio and HTTP transports so behavior stays identical.
-    `access` is set only for an OAuth-authenticated HTTP request; it narrows
-    `tools/list` and `tools/call` to the OAuth tool tier.
+    The response carries the real outcome (result or error), so a caller can
+    audit a notification's execution even though the transport sends no reply.
+    Returns None only for `notifications/initialized`. `access` is set only for
+    an OAuth-authenticated HTTP request; it narrows `tools/list` and
+    `tools/call` to the OAuth tool tier.
     """
     method = request.get("method")
     request_id = request.get("id")
-    is_notification = request_id is None
 
     try:
         if method == "initialize":
@@ -2823,24 +2825,24 @@ def dispatch(
                 "serverInfo": {"name": "lifeos", "version": "1.0.0"},
                 "instructions": SERVER_INSTRUCTIONS,
             }
-            return None if is_notification else _ok(request_id, result)
+            return _ok(request_id, result)
 
         if method == "notifications/initialized":
             return None
 
         if method == "tools/list":
             tools = access.tools() if access is not None else server.tools
-            return None if is_notification else _ok(request_id, {"tools": tools})
+            return _ok(request_id, {"tools": tools})
 
         if method == "tools/call" and access is not None:
             params = request.get("params") or {}
             tool_name = params.get("name")
             if not access.callable(tool_name):
-                return None if is_notification else _err(
+                return _err(
                     request_id, f"Unknown tool: {tool_name}", code=-32602,
                 )
             result = access.call(tool_name, params.get("arguments") or {})
-            return None if is_notification else _ok(request_id, result)
+            return _ok(request_id, result)
 
         if method == "tools/call":
             params = request.get("params", {})
@@ -2856,18 +2858,29 @@ def dispatch(
             # tool call from a successful one (MCP tool-result spec).
             if isinstance(data, dict) and "error" in data:
                 result["isError"] = True
-            return None if is_notification else _ok(request_id, result)
+            return _ok(request_id, result)
 
         # Unknown method
-        if is_notification:
-            return None
         return _err(request_id, f"Method not found: {method}", code=-32601)
 
     except Exception as e:
         logger.error(f"Error handling {method}: {e}")
-        if is_notification:
-            return None
         return _err(request_id, str(e))
+
+
+def dispatch(
+    server: "LifeOSMCPServer",
+    request: dict,
+    *,
+    access: OAuthToolAccess | None = None,
+) -> dict | None:
+    """Handle a single JSON-RPC request.
+
+    Returns the response dict, or None for notifications (requests with no id).
+    Used by both the stdio and HTTP transports so behavior stays identical.
+    """
+    response = respond(server, request, access=access)
+    return None if request.get("id") is None else response
 
 
 def run_stdio(server: "LifeOSMCPServer") -> None:
@@ -2886,7 +2899,86 @@ def run_stdio(server: "LifeOSMCPServer") -> None:
             print(json.dumps(response), flush=True)
 
 
-def build_http_app(server: "LifeOSMCPServer", bearer_token: str, oauth=None):
+# Set on the ASGI scope by `public_socket_app`: the request arrived through the
+# public (Funnel node) unix-socket listener. A scope key, never a header, so a
+# client cannot set or clear it.
+PUBLIC_LISTENER_SCOPE_KEY = "lifeos.public_listener"
+
+# Tools whose call can start or steer agent-worker execution (directly, or by
+# setting an engine tag or running a schedule). Every HTTP call to one is
+# audit-logged at WARNING; every other tools/call at INFO.
+WORKER_REACHING_TOOLS = frozenset({
+    "lifeos_task_create",
+    "lifeos_task_update",
+    "lifeos_task_resume_execution",
+    "lifeos_project_start",
+    "lifeos_project_plan",
+    "lifeos_project_resume",
+    "lifeos_schedule_create",
+    "lifeos_schedule_update",
+    "lifeos_schedule_trigger",
+})
+
+
+def reaches_worker(tool_name: object) -> bool:
+    return isinstance(tool_name, str) and (
+        tool_name in WORKER_REACHING_TOOLS or tool_name.startswith("lifeos_agent_")
+    )
+
+
+def public_edge(request) -> str | None:
+    """Name the public edge a request came through, or None for a tailnet/local one."""
+    from api.services.mcp_oauth import PUBLIC_EDGE_HEADERS
+
+    if request.scope.get(PUBLIC_LISTENER_SCOPE_KEY):
+        return "public-listener"
+    for header in PUBLIC_EDGE_HEADERS:
+        if header in request.headers:
+            return header
+    return None
+
+
+_AUDIT_UNSAFE = re.compile(r"[^A-Za-z0-9_.-]")
+
+
+def _audit_token(value: object) -> str:
+    """A caller-supplied name made safe for one log line: restricted charset, bounded length."""
+    text = value if isinstance(value, str) else type(value).__name__
+    return _AUDIT_UNSAFE.sub("_", text)[:64]
+
+
+def _audit_tool_call(request_obj: object, response: dict | None, *, caller: str, edge: str | None) -> None:
+    """Log one HTTP tools/call: who, through which edge, which tool, what argument
+    keys. Argument values stay out of the log (they can hold personal data); a
+    hash lets a call be matched to the worker transcript it produced."""
+    if not isinstance(request_obj, dict) or request_obj.get("method") != "tools/call":
+        return
+    params = request_obj.get("params") or {}
+    tool = params.get("name") if isinstance(params, dict) else None
+    arguments = params.get("arguments") if isinstance(params, dict) else None
+    keys = sorted(_audit_token(k) for k in arguments) if isinstance(arguments, dict) else []
+    try:
+        digest = hashlib.sha256(
+            json.dumps(arguments, sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()[:16]
+    except (TypeError, ValueError):
+        digest = "unhashable"
+    failed = bool(
+        response is None
+        or "error" in response
+        or (isinstance(response.get("result"), dict) and response["result"].get("isError"))
+    )
+    worker = reaches_worker(tool)
+    logger.log(
+        logging.WARNING if worker else logging.INFO,
+        "mcp audit: caller=%s edge=%s tool=%s reaches_worker=%s arg_keys=%s args_sha256=%s failed=%s",
+        caller, edge or "local", _audit_token(tool), worker, ",".join(keys), digest, failed,
+    )
+
+
+def build_http_app(
+    server: "LifeOSMCPServer", bearer_token: str, oauth=None, *, allow_public_bearer: bool = False,
+):
     """Build a FastAPI app exposing the MCP server over HTTP.
 
     A non-empty `bearer_token` is required — the HTTP transport is intended for
@@ -2896,8 +2988,14 @@ def build_http_app(server: "LifeOSMCPServer", bearer_token: str, oauth=None):
 
     `oauth` (an `api.services.mcp_oauth.OAuthConfig`) additionally mounts the
     single-operator OAuth 2.1 endpoints and accepts their access tokens on the
-    MCP endpoint, restricted to the OAuth tool tier. The bearer token keeps
-    full access either way.
+    MCP endpoint, restricted to the OAuth tool tier.
+
+    The bearer token has full access, including the agent worker, so it is
+    accepted only from the host and the tailnet. A request that came through a
+    public edge (the public unix-socket listener, Tailscale Funnel, or a
+    Cloudflare Tunnel) must use an OAuth token, unless `allow_public_bearer`
+    is set (`LIFEOS_MCP_ALLOW_PUBLIC_BEARER=true`, for a Managed Agents
+    deployment that reaches the transport through Cloudflare).
     """
     if not bearer_token:
         raise ValueError(
@@ -2939,7 +3037,11 @@ def build_http_app(server: "LifeOSMCPServer", bearer_token: str, oauth=None):
         token = token.strip()
         if scheme.lower() != "bearer" or not token:
             raise _unauthorized("missing bearer token", invalid_token=False)
-        if hmac.compare_digest(token, bearer_token):
+        if hmac.compare_digest(token.encode("utf-8"), bearer_token.encode("utf-8")):
+            edge = public_edge(request)
+            if edge is not None and not allow_public_bearer:
+                logger.warning("mcp auth: full-access token refused through public edge %s", edge)
+                raise _unauthorized("invalid bearer token", invalid_token=True)
             return None
         if oauth is not None:
             grant = oauth.store.validate_access_token(token, resource=oauth.resource)
@@ -2958,20 +3060,25 @@ def build_http_app(server: "LifeOSMCPServer", bearer_token: str, oauth=None):
 
     async def _handle(request: Request) -> Response:
         access = _check_auth(request)
+        caller = "full-access-token" if access is None else f"oauth:{access.principal}"
+        edge = public_edge(request)
         try:
             body = await request.json()
         except json.JSONDecodeError:
             return _parse_error_response()
 
+        def _dispatch_audited(req: object) -> dict | None:
+            outcome = respond(server, req, access=access) if isinstance(req, dict) else dispatch(server, req, access=access)
+            _audit_tool_call(req, outcome, caller=caller, edge=edge)
+            return None if isinstance(req, dict) and req.get("id") is None else outcome
+
         if isinstance(body, list):
-            responses = [
-                r for r in (dispatch(server, req, access=access) for req in body) if r is not None
-            ]
+            responses = [r for r in (_dispatch_audited(req) for req in body) if r is not None]
             if not responses:
                 return Response(status_code=202)
             return JSONResponse(responses)
 
-        response = dispatch(server, body, access=access)
+        response = _dispatch_audited(body)
         if response is None:
             return Response(status_code=202)
         return JSONResponse(response)
@@ -3012,7 +3119,8 @@ def public_socket_app(app):
 
     A unix-socket request has no client address, so it never counts as a
     loopback peer; the allowlist keeps the consent and connected-apps endpoints
-    off this listener as well.
+    off this listener as well. Every request is marked with
+    `PUBLIC_LISTENER_SCOPE_KEY`, so `/mcp` there accepts only OAuth tokens.
     """
     async def wrapped(scope, receive, send):
         if scope["type"] == "http" and scope.get("path") not in PUBLIC_SOCKET_PATHS:
@@ -3020,20 +3128,24 @@ def public_socket_app(app):
                         "headers": [(b"content-type", b"text/plain")]})
             await send({"type": "http.response.body", "body": b"Not Found"})
             return
+        if scope["type"] in ("http", "websocket"):
+            scope = {**scope, PUBLIC_LISTENER_SCOPE_KEY: True}
         await app(scope, receive, send)
     return wrapped
 
 
 def run_http(
     server: "LifeOSMCPServer", host: str, port: int, bearer_token: str, oauth=None,
-    uds: str | None = None,
+    uds: str | None = None, allow_public_bearer: bool = False,
 ) -> None:
     """Run the HTTP transport via uvicorn, plus the public unix-socket listener when `uds` is set."""
     import asyncio
 
     import uvicorn  # local import — only needed for HTTP mode
 
-    app = build_http_app(server, bearer_token=bearer_token, oauth=oauth)
+    app = build_http_app(
+        server, bearer_token=bearer_token, oauth=oauth, allow_public_bearer=allow_public_bearer,
+    )
     # proxy_headers=False keeps request.client the real TCP peer. The consent
     # and connected-apps endpoints trust identity only from a loopback peer
     # (Tailscale Serve); uvicorn's default would replace that peer with the
@@ -3109,12 +3221,20 @@ def main():
         sys.exit(2)
 
     uds = os.environ.get("LIFEOS_MCP_HTTP_UDS", "").strip() or None
+    allow_public_bearer = (
+        os.environ.get("LIFEOS_MCP_ALLOW_PUBLIC_BEARER", "").strip().lower() in ("1", "true", "yes")
+    )
     logger.info(f"LifeOS MCP HTTP transport listening on {args.host}:{args.port}")
     if uds:
         logger.info(f"LifeOS MCP public listener on unix socket {uds}")
+    if allow_public_bearer:
+        logger.warning(
+            "LIFEOS_MCP_ALLOW_PUBLIC_BEARER is set: the full-access token is accepted "
+            "through public edges (Funnel, Cloudflare Tunnel, the public listener)"
+        )
     run_http(
         server, host=args.host, port=args.port, bearer_token=bearer_token,
-        oauth=_oauth_config_from_settings(), uds=uds,
+        oauth=_oauth_config_from_settings(), uds=uds, allow_public_bearer=allow_public_bearer,
     )
 
 

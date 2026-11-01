@@ -30,6 +30,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from api.services.mcp_oauth import (
+    PUBLIC_EDGE_HEADERS,
     OAUTH_SCOPE,
     OAuthConfig,
     OAuthError,
@@ -40,7 +41,6 @@ from api.services.mcp_oauth import (
 logger = logging.getLogger(__name__)
 
 IDENTITY_HEADER = "Tailscale-User-Login"
-FUNNEL_HEADER = "Tailscale-Funnel-Request"
 _LOOPBACK_PEERS = frozenset({"127.0.0.1", "::1", "::ffff:127.0.0.1"})
 _NO_STORE = {"Cache-Control": "no-store", "Pragma": "no-cache"}
 _PAGE_HEADERS = {
@@ -61,8 +61,9 @@ def is_loopback_peer(request: Request) -> bool:
     return bool(request.client) and request.client.host in _LOOPBACK_PEERS
 
 
-def is_funnel_request(request: Request) -> bool:
-    return FUNNEL_HEADER in request.headers
+def is_public_edge_request(request: Request) -> bool:
+    """True when a public edge (Tailscale Funnel, Cloudflare Tunnel) relayed the request."""
+    return any(header in request.headers for header in PUBLIC_EDGE_HEADERS)
 
 
 def operator_identity(request: Request, config: OAuthConfig) -> str | None:
@@ -76,7 +77,7 @@ def operator_identity(request: Request, config: OAuthConfig) -> str | None:
         return None
     if not is_loopback_peer(request):
         return None
-    if is_funnel_request(request):
+    if is_public_edge_request(request):
         return None
     login = request.headers.get(IDENTITY_HEADER, "").strip().lower()
     if not login or login not in config.operator_logins:
@@ -366,7 +367,7 @@ def install_oauth_routes(app: FastAPI, config: OAuthConfig, *, bearer_token: str
         return Response(status_code=200, headers=_NO_STORE)
 
     def _local_admin(request: Request) -> bool:
-        if not is_loopback_peer(request) or is_funnel_request(request):
+        if not is_loopback_peer(request) or is_public_edge_request(request):
             return False
         scheme, _, token = request.headers.get("authorization", "").partition(" ")
         token = token.strip()

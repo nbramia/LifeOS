@@ -794,6 +794,28 @@ def test_approval_post_is_refused_outside_the_operator_tailnet_path(app, client,
     assert "location" not in resp.headers
 
 
+@pytest.mark.parametrize("edge_header", ["Tailscale-Funnel-Request", "Cf-Connecting-Ip"])
+def test_oauth_routes_refuse_every_public_edge_header(client, edge_header):
+    """The consent page and the connected-apps endpoints apply the same public-edge
+    test as /mcp, for each header an edge adds."""
+    client_id = _register(client)["client_id"]
+    _, challenge = _pkce()
+    params = _authorize_params(client_id, challenge)
+    form = _consent_form(client.get("/oauth/authorize", params=params, headers=OPERATOR_HEADERS))
+    edge = {edge_header: "203.0.113.7"}
+
+    page = client.get("/oauth/authorize", params=params, headers={**OPERATOR_HEADERS, **edge})
+    assert page.status_code == 403 and "csrf_token" not in page.text
+
+    approved = _post_form(client, "/oauth/authorize", {**form, "decision": "approve"}, {**OPERATOR_HEADERS, **edge})
+    assert approved.status_code == 403 and "location" not in approved.headers
+
+    auth = {"Authorization": f"Bearer {BEARER}", **edge}
+    assert client.get("/oauth/clients", headers=auth).status_code == 403
+    assert client.delete(f"/oauth/clients/{client_id}", headers=auth).status_code == 403
+    assert client.get("/oauth/clients", headers={"Authorization": f"Bearer {BEARER}"}).status_code == 200
+
+
 def test_approval_accepts_a_same_origin_post_through_the_proxy(client):
     client_id = _register(client)["client_id"]
     _, challenge = _pkce()
@@ -1338,6 +1360,8 @@ def test_public_socket_listener_serves_only_public_paths_and_never_trusts_identi
         assert _socket_status(uds, "/.well-known/oauth-authorization-server") == 200
         assert _socket_status(uds, "/.well-known/oauth-protected-resource/mcp") == 200
         assert _socket_status(uds, "/mcp", "POST") == 401
+        # The full-access token is refused here: the public listener takes OAuth only.
+        assert _socket_status(uds, "/mcp", "POST", headers={"Authorization": f"Bearer {BEARER}"}) == 401
         for path in ("/oauth/authorize", "/oauth/clients", "/", "/oauth/authorize/", "/%6Fauth/authorize"):
             assert _socket_status(uds, path, headers=OPERATOR_HEADERS) == 404, path
     finally:
@@ -1375,3 +1399,19 @@ def test_a_listener_that_fails_to_start_stops_the_other_and_exits_nonzero(
     assert exited.value.code == 3
     assert all(s.should_exit for s in servers)
     assert uds.parent.is_dir() and (uds.parent.stat().st_mode & 0o777) == 0o700
+
+
+def test_public_listener_accepts_oauth_tokens_and_refuses_the_full_access_token(app, client, caplog):
+    """Through the public listener an OAuth token reaches its tier; the
+    full-access token is refused, so nothing off the tailnet reaches the
+    agent worker. The call is audit-logged with the OAuth client as caller."""
+    import logging
+
+    client_id, tokens, _ = _connect(client)
+    public = TestClient(mcp_server.public_socket_app(app), follow_redirects=False)
+    caplog.set_level(logging.INFO, logger=mcp_server.logger.name)
+    ok = _rpc(public, tokens["access_token"], "tools/call", {"name": "lifeos_health", "arguments": {}})
+    assert ok.status_code == 200 and "result" in ok.json()
+    audit = [r.getMessage() for r in caplog.records if r.getMessage().startswith("mcp audit:")]
+    assert audit and f"caller=oauth:{client_id}" in audit[-1] and "edge=public-listener" in audit[-1]
+    assert _rpc(public, BEARER, "tools/list").status_code == 401

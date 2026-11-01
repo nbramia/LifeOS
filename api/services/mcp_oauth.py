@@ -40,6 +40,12 @@ logger = logging.getLogger(__name__)
 # The one tool tier an OAuth grant carries. `api/services/mcp_tool_tier.py`
 # maps it to the allowlisted tools.
 TIER_READ_SAFE_WRITES = "read_safe_writes"
+
+# Headers a public edge adds to every request it relays and a client cannot
+# strip: Tailscale Funnel's marker and Cloudflare Tunnel's client address.
+# A client can add them, which only makes its own request stricter.
+PUBLIC_EDGE_HEADERS = ("tailscale-funnel-request", "cf-connecting-ip")
+
 # The scope string advertised in metadata and returned with tokens. Requested
 # scopes do not widen a grant: every token carries exactly this tier.
 OAUTH_SCOPE = "lifeos:read-safe-writes"

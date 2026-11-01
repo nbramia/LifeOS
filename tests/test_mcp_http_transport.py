@@ -374,3 +374,239 @@ def test_public_socket_allowlist_serves_only_the_oauth_paths():
         "/oauth/token",
         "/oauth/revoke",
     }
+
+
+# --- The full-access token stays off public edges ------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("edge_header", [
+    {"Tailscale-Funnel-Request": "?1"},
+    {"Cf-Connecting-Ip": "203.0.113.9"},
+])
+def test_full_access_token_is_refused_through_a_public_edge(
+    loopback_client: TestClient, bearer_token: str, edge_header: dict[str, str],
+):
+    resp = loopback_client.post(
+        "/mcp",
+        headers={"Authorization": f"Bearer {bearer_token}", **edge_header},
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+    )
+    assert resp.status_code == 401
+
+
+@pytest.mark.unit
+def test_full_access_token_is_refused_on_the_public_listener(
+    server: mcp_server.LifeOSMCPServer, bearer_token: str,
+):
+    public = TestClient(
+        mcp_server.public_socket_app(mcp_server.build_http_app(server, bearer_token=bearer_token)),
+        client=LOOPBACK_PEER,
+    )
+    assert _tools_list(public, bearer_token).status_code == 401
+
+
+@pytest.mark.unit
+def test_public_bearer_opt_in_accepts_the_token_through_a_public_edge(
+    server: mcp_server.LifeOSMCPServer, bearer_token: str,
+):
+    app = mcp_server.build_http_app(server, bearer_token=bearer_token, allow_public_bearer=True)
+    public = TestClient(mcp_server.public_socket_app(app), client=LOOPBACK_PEER)
+    assert _tools_list(public, bearer_token).status_code == 200
+    via_tunnel = TestClient(app, client=LOOPBACK_PEER).post(
+        "/mcp",
+        headers={"Authorization": f"Bearer {bearer_token}", "Cf-Connecting-Ip": "203.0.113.9"},
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+    )
+    assert via_tunnel.status_code == 200
+
+
+@pytest.mark.unit
+def test_tailnet_request_with_the_full_access_token_is_accepted(
+    loopback_client: TestClient, bearer_token: str,
+):
+    # Tailscale Serve (no Funnel marker) presents a loopback peer.
+    assert _tools_list(loopback_client, bearer_token).status_code == 200
+
+
+@pytest.mark.unit
+def test_non_ascii_token_is_a_401_not_a_server_error(client: TestClient):
+    resp = client.post(
+        "/mcp",
+        headers={"Authorization": "Bearer töken".encode("latin-1")},
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+    )
+    assert resp.status_code == 401
+
+
+# --- Audit log ------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_worker_reaching_call_is_audit_logged_without_argument_values(
+    client: TestClient, bearer_token: str, caplog,
+):
+    import logging
+
+    caplog.set_level(logging.INFO, logger=mcp_server.logger.name)
+    resp = client.post(
+        "/mcp",
+        headers={"Authorization": f"Bearer {bearer_token}"},
+        json={"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {
+            "name": "lifeos_task_update",
+            "arguments": {"task_id": "abc123", "description": "synthetic-secret-value"},
+        }},
+    )
+    assert resp.status_code == 200
+    audit = [r for r in caplog.records if r.getMessage().startswith("mcp audit:")]
+    assert len(audit) == 1
+    record = audit[0]
+    message = record.getMessage()
+    assert record.levelno == logging.WARNING
+    assert "caller=full-access-token" in message
+    assert "edge=local" in message
+    assert "tool=lifeos_task_update" in message
+    assert "reaches_worker=True" in message
+    assert "arg_keys=description,task_id" in message
+    assert "synthetic-secret-value" not in message
+
+
+@pytest.mark.unit
+def test_read_call_is_audit_logged_at_info(client: TestClient, bearer_token: str, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger=mcp_server.logger.name)
+    client.post(
+        "/mcp",
+        headers={"Authorization": f"Bearer {bearer_token}"},
+        json={"jsonrpc": "2.0", "id": 8, "method": "tools/call", "params": {
+            "name": "lifeos_vault_list", "arguments": {},
+        }},
+    )
+    audit = [r for r in caplog.records if r.getMessage().startswith("mcp audit:")]
+    assert len(audit) == 1
+    assert audit[0].levelno == logging.INFO
+    assert "reaches_worker=False" in audit[0].getMessage()
+
+
+def _audit_messages(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith("mcp audit:")]
+
+
+def _call(req_id, name="lifeos_vault_list", arguments=None) -> dict:
+    request = {"jsonrpc": "2.0", "method": "tools/call", "params": {"name": name, "arguments": arguments or {}}}
+    if req_id is not None:
+        request["id"] = req_id
+    return request
+
+
+@pytest.mark.unit
+def test_successful_notification_tool_call_is_audited_as_not_failed(
+    client: TestClient, bearer_token: str, caplog,
+):
+    import logging
+
+    caplog.set_level(logging.INFO, logger=mcp_server.logger.name)
+    resp = client.post("/mcp", headers={"Authorization": f"Bearer {bearer_token}"}, json=_call(None))
+    assert resp.status_code == 202
+    messages = _audit_messages(caplog)
+    assert len(messages) == 1
+    assert "failed=False" in messages[0]
+
+
+@pytest.mark.unit
+def test_batch_tool_calls_are_audited_once_each(client: TestClient, bearer_token: str, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger=mcp_server.logger.name)
+    resp = client.post(
+        "/mcp",
+        headers={"Authorization": f"Bearer {bearer_token}"},
+        json=[_call(1, "lifeos_vault_list"), _call(2, "lifeos_task_list")],
+    )
+    assert resp.status_code == 200
+    messages = _audit_messages(caplog)
+    assert len(messages) == 2
+    assert "tool=lifeos_vault_list" in messages[0]
+    assert "tool=lifeos_task_list" in messages[1]
+
+
+@pytest.mark.unit
+def test_audit_failed_flag_tracks_tool_errors(
+    client: TestClient, bearer_token: str, caplog, monkeypatch,
+):
+    import logging
+
+    caplog.set_level(logging.INFO, logger=mcp_server.logger.name)
+    headers = {"Authorization": f"Bearer {bearer_token}"}
+    client.post("/mcp", headers=headers, json=_call(1))
+    monkeypatch.setattr(
+        mcp_server.LifeOSMCPServer, "_call_api", lambda self, name, args: {"error": "boom"},
+    )
+    client.post("/mcp", headers=headers, json=_call(2))
+
+    def _raise(self, name, args):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(mcp_server.LifeOSMCPServer, "_call_api", _raise)
+    client.post("/mcp", headers=headers, json=_call(3))
+    messages = _audit_messages(caplog)
+    assert [("failed=True" in m) for m in messages] == [False, True, True]
+
+
+@pytest.mark.unit
+def test_audit_argument_hash_is_stable_and_argument_specific(
+    client: TestClient, bearer_token: str, caplog,
+):
+    import logging
+    import re
+
+    caplog.set_level(logging.INFO, logger=mcp_server.logger.name)
+    headers = {"Authorization": f"Bearer {bearer_token}"}
+    for i, args in enumerate([{"query": "a"}, {"query": "a"}, {"query": "b"}], start=1):
+        client.post("/mcp", headers=headers, json=_call(i, "lifeos_search", args))
+    hashes = [re.search(r"args_sha256=(\S+)", m).group(1) for m in _audit_messages(caplog)]
+    assert all(re.fullmatch(r"[0-9a-f]{16}", h) for h in hashes)
+    assert hashes[0] == hashes[1]
+    assert hashes[0] != hashes[2]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("name", [
+    "lifeos_agent_spawn", "lifeos_task_create", "lifeos_project_start", "lifeos_schedule_trigger",
+])
+def test_worker_reaching_tools_include_every_agent_entry_point(name):
+    assert mcp_server.reaches_worker(name)
+
+
+@pytest.mark.unit
+def test_worker_reaching_tools_are_all_denied_to_connected_apps_or_guarded():
+    from api.services.mcp_tool_tier import OAUTH_TOOL_TIER
+
+    for name in mcp_server.WORKER_REACHING_TOOLS:
+        tier = OAUTH_TOOL_TIER[name]
+        # lifeos_task_create is allowed only with its engine-tag guard.
+        assert not tier.allowed or name == "lifeos_task_create", name
+
+
+@pytest.mark.unit
+def test_audit_line_fields_are_restricted_to_one_line(caplog):
+    """A tool name or argument key holding a newline and an audit prefix is
+    reduced to a safe token, so one call writes exactly one single-line record."""
+    import logging
+
+    caplog.set_level(logging.INFO, logger=mcp_server.logger.name)
+    multiline = "lifeos_health\nmcp audit: caller=full-access-token edge=local tool=x"
+    request_obj = {
+        "method": "tools/call",
+        "params": {"name": multiline, "arguments": {multiline: 1, "ok_key": 2}},
+    }
+    mcp_server._audit_tool_call(request_obj, {"result": {}}, caller="full-access-token", edge=None)
+    records = [r.getMessage() for r in caplog.records if r.getMessage().startswith("mcp audit:")]
+    assert len(records) == 1
+    assert "\n" not in records[0] and "\r" not in records[0]
+    assert records[0].count("mcp audit:") == 1
+    assert "ok_key" in records[0]
+    long = mcp_server._audit_token("a" * 500)
+    assert len(long) == 64
+    assert mcp_server._audit_token(["x"]) == "list"

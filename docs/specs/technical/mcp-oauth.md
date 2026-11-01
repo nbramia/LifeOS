@@ -23,9 +23,9 @@ OAuth is off unless `LIFEOS_OAUTH_OPERATOR_LOGINS` is non-empty and `LIFEOS_OAUT
 | `GET`/`POST /oauth/authorize` | the operator, from the tailnet | Consent page and the approve/deny decision |
 | `POST /oauth/token` | registered clients | `authorization_code` and `refresh_token` grants (form-encoded) |
 | `POST /oauth/revoke` | registered clients | RFC 7009 revocation |
-| `GET /oauth/clients`, `DELETE /oauth/clients/{client_id}` | loopback, non-Funnel, bearer token | Connected apps and per-app revoke |
+| `GET /oauth/clients`, `DELETE /oauth/clients/{client_id}` | loopback, not via a public edge, bearer token | Connected apps and per-app revoke |
 
-The bearer-authenticated `/mcp` may also be served to the tailnet only (see [Connected Apps](../../guides/mcp-connected-apps.md#tailnet-route-for-your-own-clients)). `/mcp` has no loopback exemption: a peer on `127.0.0.1`, which is what Tailscale Serve presents, needs a valid token like any other.
+The bearer-authenticated `/mcp` may also be served to the tailnet only (see [Connected Apps](../../guides/mcp-connected-apps.md#tailnet-route-for-your-own-clients)). `/mcp` has no loopback exemption: a peer on `127.0.0.1`, which is what Tailscale Serve presents, needs a valid token like any other. The full-access bearer token is accepted only from the host and the tailnet; a request that came through a public edge needs an OAuth token: the public unix-socket listener (marked on the ASGI scope, which a client cannot set), or a request carrying `Tailscale-Funnel-Request` or `Cf-Connecting-Ip`, headers those edges add and a client cannot strip. The consent page and the connected-apps endpoints apply the same public-edge test. Off the tailnet only OAuth tokens, and so only the tier below, reach LifeOS unless `LIFEOS_MCP_ALLOW_PUBLIC_BEARER` is set.
 
 An MCP request with no token, or an unknown, expired or revoked one, gets `401` with `WWW-Authenticate: Bearer resource_metadata="<issuer>/.well-known/oauth-protected-resource/mcp"` (plus `error="invalid_token"` when a token was presented).
 
@@ -43,7 +43,7 @@ An MCP request with no token, or an unknown, expired or revoked one, gets `401` 
 `/oauth/authorize` answers only when all of these hold, else `403`:
 
 1. The direct peer is loopback — the request arrived through Tailscale Serve's local proxy, since the transport binds `127.0.0.1`.
-2. There is no `Tailscale-Funnel-Request` header.
+2. The request carries no public-edge header (`Tailscale-Funnel-Request` or `Cf-Connecting-Ip`).
 3. `Tailscale-User-Login` names one of `LIFEOS_OAUTH_OPERATOR_LOGINS` (case-insensitive). Serve strips client-supplied identity headers, and adds none to Funnel or tagged-device traffic.
 
 The page names the app (`client_name`, escaped), the redirect host and the tier, and warns when the redirect is a loopback address. It loads no external assets and refuses framing. Approve and Deny post back with a CSRF token bound to a server-side pending request (10 minutes, single use, same operator login). Consuming the pending request, checking the client and issuing the code happen in one `BEGIN IMMEDIATE` transaction, so a concurrent prune cannot remove the client mid-approval. A post marked `Sec-Fetch-Site: cross-site`, or whose `Origin` matches neither `Host` nor `X-Forwarded-Host`, is refused.

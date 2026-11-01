@@ -121,7 +121,9 @@ ingress:
 
 Add a DNS record (CNAME `mcp.example.com` → `<tunnel-uuid>.cfargotunnel.com`) and reload `cloudflared`.
 
-Verify from outside the host:
+The full-access token is accepted only from the host and the tailnet, so the transport requires OAuth on any request Cloudflare relays (it carries `Cf-Connecting-Ip`). To let Managed Agents use the bearer token through the tunnel, set `LIFEOS_MCP_ALLOW_PUBLIC_BEARER=true` in `.env` and restart `lifeos-mcp-http`. Use a dedicated `LIFEOS_MCP_BEARER_TOKEN` for the tunnel, since this setting lets that token work on a public hostname.
+
+Verify from outside the host (with `LIFEOS_MCP_ALLOW_PUBLIC_BEARER=true`; otherwise the same request returns 401 and an OAuth token is required):
 
 ```bash
 curl -sS -X POST https://mcp.example.com/mcp \
@@ -130,7 +132,7 @@ curl -sS -X POST https://mcp.example.com/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | jq '.result.tools | length'
 ```
 
-Hardening upgrade (deferred to a later issue): swap the bearer-token check for a [Cloudflare Access service token](https://developers.cloudflare.com/cloudflare-one/identity/service-tokens/) for revocable, per-token audit logging. Bearer token is fine for v1.
+Optional hardening: put the tunnel hostname behind a [Cloudflare Access service token](https://developers.cloudflare.com/cloudflare-one/identity/service-tokens/) for revocable, per-token audit logging. A request then also needs the `CF-Access-Client-Id` and `CF-Access-Client-Secret` headers, so add them to the verification command.
 
 ---
 
