@@ -516,6 +516,21 @@ granola_id: auto-detected
         # Should still chunk by headers due to granola_id
         assert len(chunks) >= 2
 
+    def test_chunk_auto_detect_wispr(self):
+        """A wispr_id in frontmatter chunks by headers, like granola_id."""
+        content = """---
+wispr_id: auto-detected
+source: wispr
+---
+
+## First
+
+## Second
+"""
+        chunks = chunk_document(content, is_granola=False)
+
+        assert len(chunks) >= 2
+
     def test_chunk_all_have_chunk_index(self):
         """Test that all chunks have chunk_index."""
         content = """## One
@@ -605,6 +620,24 @@ class TestGenerateChunkContext:
         assert "John" in context
         assert "2026-01-30" in context
         assert "Part 1 of 2" in context
+
+    def test_context_wispr_meeting(self):
+        """A wispr_id gets the same meeting-notes prefix as a granola_id."""
+        context = generate_chunk_context(
+            file_path=Path("/vault/Work/ML/Meetings/team-sync.md"),
+            metadata={
+                "wispr_id": "test123",
+                "people": ["John", "Jane", "Bob"],
+                "modified_date": "2026-01-30"
+            },
+            chunk_content="## Summary",
+            chunk_index=0,
+            total_chunks=2
+        )
+
+        assert "meeting notes" in context.lower()
+        assert "John" in context
+        assert "2026-01-30" in context
 
     def test_context_people_profile(self):
         """Test context generation for People profile."""

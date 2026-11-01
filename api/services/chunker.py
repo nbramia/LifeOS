@@ -234,6 +234,11 @@ def _strip_base64_images(text: str) -> str:
     return re.sub(r'data:image/[^;]+;base64,[A-Za-z0-9+/=]+', '[image]', text)
 
 
+def has_meeting_id(metadata: dict) -> bool:
+    """True when frontmatter/metadata carries a meeting-recorder id (Granola or Wispr)."""
+    return bool(metadata.get("granola_id") or metadata.get("wispr_id"))
+
+
 def chunk_document(
     content: str,
     is_granola: bool = False,
@@ -263,8 +268,8 @@ def chunk_document(
     # Extract frontmatter first
     metadata, body = extract_frontmatter(content)
 
-    # Check if Granola note (has granola_id in frontmatter or explicit flag)
-    if is_granola or metadata.get("granola_id"):
+    # Meeting note: granola_id or wispr_id in frontmatter, or explicit flag
+    if is_granola or has_meeting_id(metadata):
         chunks = chunk_by_headers(body)
     else:
         # Check document length
@@ -390,8 +395,8 @@ def generate_chunk_context(
     folder = file_path.parent.name
 
     # Build context based on document type
-    if metadata.get("granola_id"):
-        # Granola meeting note
+    if has_meeting_id(metadata):
+        # Meeting note (Granola or Wispr)
         people = metadata.get("people", [])
         date = metadata.get("modified_date", "")
         if people:
