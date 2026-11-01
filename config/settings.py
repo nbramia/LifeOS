@@ -831,6 +831,15 @@ class Settings(BaseSettings):
                     "OAuth client may call lifeos_task_update as that agent, which can claim, "
                     "update and release only unassigned tasks or its own."
     )
+    mcp_agent_tokens: str = Field(
+        default="",
+        alias="LIFEOS_MCP_AGENT_TOKENS",
+        description="Comma-separated agent=sha256 pairs (agent: duet or muse). A bearer token "
+                    "whose SHA-256 hex digest is listed gets the connected-app tool tier and "
+                    "lifeos_task_update as that agent, never the full catalog. An agent may have "
+                    "more than one entry, so a new token can be added before the old one is "
+                    "removed. Mint one with `python scripts/mcp_agent_token.py new <agent>`."
+    )
     host_tools_vault_autocommit: bool = Field(
         default=True,
         alias="LIFEOS_HOST_TOOLS_VAULT_AUTOCOMMIT",

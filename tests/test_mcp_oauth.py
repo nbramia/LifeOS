@@ -1499,3 +1499,100 @@ def test_agent_task_update_end_to_end_cannot_take_another_agents_task(client, re
     assert set(real_tasks.get(mine).tags) == {"errand", "duet"}
     assert set(real_tasks.get(theirs).tags) == {"muse"}
     assert real_tasks.get(theirs).status == "todo"
+
+
+# ── agent tokens (LIFEOS_MCP_AGENT_TOKENS) ───────────────────────────────
+
+MUSE_TOKEN = "synthetic-muse-token"
+
+
+def _sha(token: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _agent_tokens(monkeypatch, value: str) -> None:
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "mcp_agent_tokens", value)
+
+
+def test_agent_token_gets_the_tier_and_task_updates_as_its_agent(client, calls, monkeypatch):
+    _agent_tokens(monkeypatch, f"muse={_sha(MUSE_TOKEN)}")
+    listed = {t["name"]: t for t in _rpc(client, MUSE_TOKEN, "tools/list").json()["result"]["tools"]}
+    assert set(listed) <= OAUTH_ALLOWED_TOOLS | set(mcp_server.CHATGPT_TOOL_NAMES) | {"lifeos_task_update"}
+    assert "lifeos_task_update" in listed and not set(listed) & HOST_TOOL_NAMES
+    assert set(listed["lifeos_task_update"]["inputSchema"]["properties"]) == {
+        "task_id", "status", "assignee", "notes", "priority", "due_date", "description"}
+
+    body = _update_task(client, MUSE_TOKEN, {"task_id": "t1", "assignee": "muse"})
+    assert "isError" not in body["result"], body
+    assert calls == [("lifeos_task_update", {"task_id": "t1", "assignee": "muse", "acting_agent": "muse"})]
+    calls.clear()
+    assert _update_task(client, MUSE_TOKEN, {"task_id": "t1", "assignee": "duet"})["result"]["isError"] is True
+    out = _rpc(client, MUSE_TOKEN, "tools/call", {"name": "lifeos_shell", "arguments": {"argv": ["ls"]}}).json()
+    assert out["error"]["message"] == "Unknown tool: lifeos_shell"
+    assert calls == []
+
+
+def test_agent_token_never_gets_host_tools_even_when_its_label_is_granted(client, monkeypatch):
+    from config.settings import settings
+
+    _agent_tokens(monkeypatch, f"muse={_sha(MUSE_TOKEN)}")
+    monkeypatch.setattr(settings, "host_tools_enabled", True)
+    monkeypatch.setattr(settings, "host_tools_oauth_clients", "agent-token:muse,")
+    names = {t["name"] for t in _rpc(client, MUSE_TOKEN, "tools/list").json()["result"]["tools"]}
+    assert not names & HOST_TOOL_NAMES
+
+
+def test_agent_token_end_to_end_cannot_take_the_other_agents_task(client, real_tasks, monkeypatch):
+    _agent_tokens(monkeypatch, f"muse={_sha(MUSE_TOKEN)}")
+    open_task = real_tasks.create(description="Synthetic open errand").id
+    duets = real_tasks.create(description="Synthetic errand", tags=["duet"]).id
+
+    assert "isError" not in _update_task(client, MUSE_TOKEN, {"task_id": open_task, "assignee": "muse"})["result"]
+    assert _update_task(client, MUSE_TOKEN, {"task_id": duets, "status": "done"})["result"]["isError"] is True
+    assert _update_task(client, MUSE_TOKEN, {"task_id": duets, "assignee": "muse"})["result"]["isError"] is True
+    real_tasks.rebuild_index()
+    assert set(real_tasks.get(open_task).tags) == {"muse"}
+    assert set(real_tasks.get(duets).tags) == {"duet"}
+
+
+@pytest.mark.parametrize("edge_header", ["Tailscale-Funnel-Request", "Cf-Connecting-Ip"])
+def test_agent_token_is_refused_through_a_public_edge(client, monkeypatch, edge_header):
+    _agent_tokens(monkeypatch, f"muse={_sha(MUSE_TOKEN)}")
+    resp = client.post("/mcp", json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                       headers={"Authorization": f"Bearer {MUSE_TOKEN}", edge_header: "203.0.113.7"})
+    assert resp.status_code == 401
+
+
+def test_agent_token_rotation_and_bad_entries(client, monkeypatch):
+    from api.services.mcp_tool_tier import agent_for_token
+
+    new = "synthetic-muse-token-2"
+    _agent_tokens(monkeypatch, f"muse={_sha(MUSE_TOKEN)}, muse={_sha(new).upper()}, claude={_sha('c')}, "
+                               f"duet=nothex, muse={_sha('shared')}, duet={_sha('shared')}, =x, muse")
+    assert agent_for_token(MUSE_TOKEN) == "muse" and agent_for_token(new) == "muse"
+    for token in ("c", "nothex", "shared", "", "unknown"):
+        assert agent_for_token(token) is None
+    assert _rpc(client, "unknown", "tools/list").status_code == 401
+    # The full-access token is unchanged and separate.
+    assert "lifeos_shell" not in {t["name"] for t in _rpc(client, new, "tools/list").json()["result"]["tools"]}
+    assert _rpc(client, BEARER, "tools/list").status_code == 200
+
+
+def test_mint_script_prints_a_token_whose_hash_is_its_entry(capsys):
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parent.parent / "scripts" / "mcp_agent_token.py"
+    spec = importlib.util.spec_from_file_location("mcp_agent_token", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    token, entry = module.mint("muse")
+    assert entry == f"muse={_sha(token)}" and len(token) >= 40
+    assert module.main(["new", "duet"]) == 0
+    assert "duet=" in capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        module.main(["new", "claude"])

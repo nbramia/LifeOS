@@ -2817,16 +2817,18 @@ class OAuthToolAccess:
     unknown tool.
     """
 
-    def __init__(self, server: "LifeOSMCPServer", principal: str):
+    def __init__(self, server: "LifeOSMCPServer", principal: str, *, agent_token: str | None = None):
         from api.services.mcp_tool_tier import OAUTH_ALLOWED_TOOLS, tool_annotations
 
         self.server = server
-        # The OAuth client id; `fetch` serves only ids this principal searched.
-        self.principal = principal
+        # The OAuth client id (or `agent-token:<agent>` for an agent token);
+        # `fetch` serves only ids this principal searched.
+        self.principal = f"agent-token:{agent_token}" if agent_token else principal
+        self.caller = self.principal if agent_token else f"oauth:{principal}"
         self.allowed = OAUTH_ALLOWED_TOOLS
         from api.services.host_tools import HOST_TOOL_NAMES, oauth_clients_granted
 
-        if principal in oauth_clients_granted():
+        if agent_token is None and principal in oauth_clients_granted():
             # Operator grant (LIFEOS_HOST_TOOLS_OAUTH_CLIENTS): this client also
             # gets the host tools, and nothing else beyond the tier.
             self.allowed = OAUTH_ALLOWED_TOOLS | HOST_TOOL_NAMES
@@ -2834,7 +2836,8 @@ class OAuthToolAccess:
 
         # Operator grant (LIFEOS_TASK_AGENT_OAUTH_CLIENTS): this client acts as
         # a named external agent and may update tasks as that agent.
-        self.task_agent = task_agent_clients().get(principal)
+        # An agent token (LIFEOS_MCP_AGENT_TOKENS) names its agent directly.
+        self.task_agent = agent_token or task_agent_clients().get(principal)
         if self.task_agent:
             self.allowed = self.allowed | {"lifeos_task_update"}
         self._annotations = tool_annotations
@@ -2864,7 +2867,7 @@ class OAuthToolAccess:
         if not isinstance(arguments, dict):
             return _tool_error("arguments must be an object")
         if name in HOST_TOOL_NAMES:
-            return self.server.call_host_tool(name, arguments, caller=f"oauth:{self.principal}")
+            return self.server.call_host_tool(name, arguments, caller=self.caller)
         refusal = check_oauth_arguments(
             name, arguments, existing_contexts=self.server.task_contexts,
             task_agent=self.task_agent,
@@ -3134,6 +3137,8 @@ def build_http_app(
     import hmac
 
     from fastapi import FastAPI, HTTPException, Request, Response
+
+    from api.services.mcp_tool_tier import agent_for_token
     from fastapi.responses import JSONResponse
     from starlette.concurrency import run_in_threadpool
 
@@ -3167,6 +3172,15 @@ def build_http_app(
                 logger.warning("mcp auth: full-access token refused through public edge %s", edge)
                 raise _unauthorized("invalid bearer token", invalid_token=True)
             return None
+        agent = agent_for_token(token)
+        if agent is not None:
+            # An agent token is scoped like a connected app, but it is a static
+            # secret: it follows the full-access token's rule on public edges.
+            edge = public_edge(request)
+            if edge is not None and not allow_public_bearer:
+                logger.warning("mcp auth: agent token refused through public edge %s", edge)
+                raise _unauthorized("invalid bearer token", invalid_token=True)
+            return OAuthToolAccess(server, principal="", agent_token=agent)
         if oauth is not None:
             grant = oauth.store.validate_access_token(token, resource=oauth.resource)
             if grant is not None and grant.tier == TIER_READ_SAFE_WRITES:
@@ -3184,7 +3198,7 @@ def build_http_app(
 
     async def _handle(request: Request) -> Response:
         access = _check_auth(request)
-        caller = "full-access-token" if access is None else f"oauth:{access.principal}"
+        caller = "full-access-token" if access is None else access.caller
         edge = public_edge(request)
         try:
             body = await request.json()

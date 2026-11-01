@@ -320,6 +320,49 @@ def task_agent_clients() -> dict[str, str]:
     return pairs
 
 
+_SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+
+def agent_token_hashes() -> dict[str, str]:
+    """SHA-256 hex digest -> external agent assignee, from settings.
+
+    `LIFEOS_MCP_AGENT_TOKENS` is a comma-separated list of `agent=sha256`
+    pairs. An agent may appear more than once (for rotation). An agent name
+    outside EXTERNAL_AGENT_ASSIGNEES, a malformed digest, or a digest named
+    for two agents grants nothing.
+    """
+    from config.settings import settings
+
+    pairs: dict[str, str] = {}
+    shared: set[str] = set()
+    for entry in (settings.mcp_agent_tokens or "").split(","):
+        agent, sep, digest = entry.partition("=")
+        agent, digest = agent.strip().lower(), digest.strip().lower()
+        if not sep or agent not in EXTERNAL_AGENT_ASSIGNEES or not _SHA256_HEX.fullmatch(digest):
+            continue
+        if pairs.get(digest, agent) != agent:
+            shared.add(digest)
+        pairs[digest] = agent
+    for digest in shared:
+        pairs.pop(digest, None)
+    return pairs
+
+
+def agent_for_token(token: str) -> str | None:
+    """The external agent a bearer token belongs to, or None."""
+    import hashlib
+    import hmac
+
+    if not token:
+        return None
+    digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    found = None
+    for known, agent in agent_token_hashes().items():
+        if hmac.compare_digest(digest, known):
+            found = agent
+    return found
+
+
 def _check_reminder_create(arguments: dict) -> str | None:
     if arguments.get("message_type") != "static":
         return "connected apps can create only static reminders (message_type='static')"

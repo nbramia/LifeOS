@@ -91,7 +91,7 @@ Revoking deletes the app's registration and tokens at once; to reconnect, the ap
 
 The OAuth connected-apps endpoint above remains the route for the Claude and ChatGPT apps. For the operator's own tailnet clients (for example Muse), the same MCP transport can also be served to the tailnet only, authenticated by the full-access bearer token (`LIFEOS_MCP_BEARER_TOKEN`). A bearer client lists and calls the whole curated catalog, not the connected-app tier, including the tools that start agent-worker execution. The token is therefore accepted only from the host and the tailnet: a request that arrives through the public listener, Tailscale Funnel or Cloudflare Tunnel needs an OAuth token and gets `401` with the bearer token, and the consent page and connected-apps endpoints are likewise unavailable through those edges (`LIFEOS_MCP_ALLOW_PUBLIC_BEARER` relaxes the `/mcp` rule; see [Configuration](configuration.md#mcp-http-transport)).
 
-Every `tools/call` on the HTTP transport is logged as an `mcp audit:` line with the caller (`full-access-token` or `oauth:<client_id>`), the edge it came through, the tool, its argument names and a hash of the arguments, never their values. Calls to tools that can start agent-worker execution, and host-tool writes and commands, log at `WARNING`.
+Every `tools/call` on the HTTP transport is logged as an `mcp audit:` line with the caller (`full-access-token`, `agent-token:<agent>` or `oauth:<client_id>`), the edge it came through, the tool, its argument names and a hash of the arguments, never their values. Calls to tools that can start agent-worker execution, and host-tool writes and commands, log at `WARNING`.
 
 1. Add the route to `config/tailscale-routes.local` (private, no `funnel=on`, `/mcp` only):
 
@@ -117,6 +117,32 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST https://<host>.<tailnet>.ts.net
 curl -s -X POST https://<host>.<tailnet>.ts.net:8443/mcp -H "Authorization: Bearer $LIFEOS_MCP_BEARER_TOKEN" \
   -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'   # full catalog
 ```
+
+## A scoped token for an agent
+
+The full-access token suits clients you run yourself that need everything. An agent that works your tasks alongside other agents should have its own token instead, so the task rules bind it rather than depending on it naming itself. An agent token gets the connected-app tier plus `lifeos_task_update` as its agent, with the same trimmed schema and guards as an OAuth client mapped in `LIFEOS_TASK_AGENT_OAUTH_CLIENTS`: it can claim only an unassigned task or its own, can't touch another agent's task, and can't assign anyone but itself ([Task Management](../specs/product/task-management.md#external-agents)). It never gets the host tools or the agent-worker tools. Like the full-access token, it is accepted only from the host and the tailnet.
+
+1. Mint a token on the host:
+
+   ```bash
+   ~/.venvs/lifeos/bin/python scripts/mcp_agent_token.py new muse
+   ```
+
+   It prints the token once and an entry like `muse=<sha256>`.
+
+2. Add the entry to `.env` (comma-separate several) and restart `lifeos-mcp-http`:
+
+   ```bash
+   LIFEOS_MCP_AGENT_TOKENS=muse=<sha256>
+   ```
+
+   Only the hash is stored on the host.
+
+3. Give the token to the agent through its secret store, and have it send `Authorization: Bearer <token>` on the tailnet route above in place of the full-access token. Audit lines name it `agent-token:<agent>`.
+
+To rotate, mint a new token, add its entry next to the old one, restart, switch the agent to the new token, then remove the old entry and restart again. An agent can have several entries at once, so nothing breaks in between. To revoke, remove the entry and restart.
+
+If the agent still needs a tool outside the connected-app tier, that is a reason to widen the tier or the grant in a reviewed change, not to hand it the full-access token.
 
 ## Host tools for a connected app
 
