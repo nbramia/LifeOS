@@ -13,8 +13,16 @@ The rule is conservative; when in doubt a row is kept:
   the message store at the key (linked or not, hidden people included).
 * A row is deletable only if it is "stale": a legacy ``imessage_<rowid>`` id
   whose store row is missing or whose store row has a different key.
-* A stale row is deleted only if another retained row at the same key belongs
-  to the same person_id.
+* A stale row is deleted only if a retained row at the same key with the same
+  person_id has an equal or similar title (same direction; equal normalized
+  text, or difflib ratio >= 0.8). A stale row with no text may be deleted
+  against any same-person retained row; a stale row with text is never
+  deleted against a no-text row.
+* Every deletion is justified by a partner row that stays: a partner is
+  protected from deletion afterwards, so two rows can never justify each
+  other's deletion and leave neither.
+* Candidates with an exactly matching partner go first, then similar ones, so
+  the cap removes true duplicates first.
 * Rows at a key with no store message at all are kept (orphans).
 * At most ``extras`` rows are deleted per key.
 
@@ -36,11 +44,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from api.services.imessage_identity import (
-    consume,
     interaction_key,
     legacy_rowid,
+    match_messages,
     message_key,
     resolve_people,
+    title_match_tier,
 )
 from api.services.interaction_store import get_interaction_db_path
 from scripts.sync_imessage_interactions import get_imessage_db_path
@@ -90,6 +99,8 @@ def _plan(rows, key_by_rowid, unkeyed_rowids, store_counts):
         "kept_person_mismatch": 0,
         "kept_orphan": 0,
         "kept_over_cap": 0,
+        "kept_different_text": 0,
+        "kept_needed_as_partner": 0,
     }
 
     by_key: dict[tuple, list[dict]] = defaultdict(list)
@@ -108,7 +119,8 @@ def _plan(rows, key_by_rowid, unkeyed_rowids, store_counts):
         )
         stats["stale_rows"] += stale
         by_key[key].append(
-            {"id": row_id, "person": person_id, "stale": stale, "order": (rowid or 0, row_id)}
+            {"id": row_id, "person": person_id, "title": title, "stale": stale,
+             "order": (rowid or 0, row_id)}
         )
 
     delete_ids: list[str] = []
@@ -123,38 +135,79 @@ def _plan(rows, key_by_rowid, unkeyed_rowids, store_counts):
             continue
 
         retained = {row["id"]: row for row in group}
-        for candidate in sorted((r for r in group if r["stale"]), key=lambda r: r["order"]):
-            if deleted_per_key[key] >= extras:
-                stats["kept_over_cap"] += 1
-                continue
-            has_same_person = any(
-                other["id"] != candidate["id"] and other["person"] == candidate["person"]
-                for other in retained.values()
-            )
-            if not has_same_person:
-                stats["kept_person_mismatch"] += 1
-                continue
+        protected: set[str] = set()
+        pending = sorted((r for r in group if r["stale"]), key=lambda r: r["order"])
+        while pending and deleted_per_key[key] < extras:
+            best = None  # (tier, order, candidate, partner)
+            for candidate in pending:
+                if candidate["id"] in protected:
+                    continue
+                partner = _best_partner(candidate, retained)
+                if partner is None:
+                    continue
+                tier, partner_row = partner
+                if best is None or (tier, candidate["order"]) < (best[0], best[1]):
+                    best = (tier, candidate["order"], candidate, partner_row)
+            if best is None:
+                break
+            _tier, _order, candidate, partner_row = best
             del retained[candidate["id"]]
+            protected.add(partner_row["id"])
+            pending.remove(candidate)
             delete_ids.append(candidate["id"])
             deleted_per_key[key] += 1
+
+        for candidate in pending:
+            if deleted_per_key[key] >= extras:
+                stats["kept_over_cap"] += 1
+            elif candidate["id"] in protected:
+                stats["kept_needed_as_partner"] += 1
+            elif not any(
+                other["id"] != candidate["id"] and other["person"] == candidate["person"]
+                for other in retained.values()
+            ):
+                stats["kept_person_mismatch"] += 1
+            else:
+                stats["kept_different_text"] += 1
 
     stats["would_delete"] = len(delete_ids)
     return delete_ids, deleted_per_key, stats
 
 
-def _would_insert(linked, store_counts_after, person_store) -> int:
+def _best_partner(candidate, retained):
+    """Best retained same-person row at the candidate's key that justifies
+    deleting it: (tier, row), lowest tier first, non-stale rows preferred."""
+    best = None
+    for other in retained.values():
+        if other["id"] == candidate["id"] or other["person"] != candidate["person"]:
+            continue
+        tier = title_match_tier(candidate["title"], other["title"])
+        if tier is None:
+            continue
+        rank = (tier, other["stale"], other["order"])
+        if best is None or rank < best[0]:
+            best = (rank, other)
+    return None if best is None else (best[0][0], best[1])
+
+
+def _would_insert(linked, retained_rows, person_store) -> int:
     """Messages the sync would insert after the deletes: linked, non-hidden,
-    and with no unused interaction at their key."""
-    people = resolve_people(person_store, (person_id for _, person_id in linked))
-    counts = Counter(store_counts_after)
-    would_insert = 0
+    and unmatched by the sync's two-stage match against the retained rows."""
+    people = resolve_people(
+        person_store,
+        [person_id for _, person_id in linked] + [person_id for _, person_id in retained_rows],
+    )
+    existing: Counter = Counter()
+    for key, person_id in retained_rows:
+        person = people.get(person_id)
+        existing[(key, person.id if person else person_id)] += 1
+    items = []
     for key, person_id in linked:
         person = people.get(person_id)
         if person is None or person.hidden:
             continue
-        if not consume(counts, key):
-            would_insert += 1
-    return would_insert
+        items.append((key, person.id))
+    return len(items) - sum(match_messages(items, existing))
 
 
 def _backup(db_path: str) -> str:
@@ -202,11 +255,11 @@ def repair(
 
     # Interaction counts per key after the deletes, as the sync will see them.
     deleted = set(delete_ids)
-    after: Counter = Counter()
-    for row_id, _person, timestamp, title, _source in rows:
+    after = []
+    for row_id, person_id, timestamp, title, _source in rows:
         key = interaction_key(timestamp, title)
         if key is not None and row_id not in deleted:
-            after[key] += 1
+            after.append((key, person_id))
     stats["would_be_inserted"] = _would_insert(linked, after, person_store)
 
     stats["deleted"] = 0
@@ -231,6 +284,8 @@ def repair(
     label = "Would delete" if dry_run else "Deleted"
     logger.info(f"{label:<23}: {(stats['would_delete'] if dry_run else stats['deleted']):,}")
     logger.info(f"Kept (person mismatch) : {stats['kept_person_mismatch']:,}")
+    logger.info(f"Kept (different text)  : {stats['kept_different_text']:,}")
+    logger.info(f"Kept (needed as partner): {stats['kept_needed_as_partner']:,}")
     logger.info(f"Kept (orphan)          : {stats['kept_orphan']:,}")
     logger.info(f"Kept (over extras cap) : {stats['kept_over_cap']:,}")
     logger.info(f"Kept (no usable key)   : {stats['kept_unkeyed']:,}")

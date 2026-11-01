@@ -5,6 +5,7 @@ message matching across renumbered/reused rowids and sub-second drift, burst
 handling, hidden and merged people, and honest counters.
 """
 import uuid
+from collections import Counter
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -14,6 +15,7 @@ from api.services.imessage_identity import (
     direction_from_title,
     interaction_key,
     make_key,
+    match_messages,
     message_key,
     parse_timestamp,
     source_id_for,
@@ -366,3 +368,95 @@ class TestCounters:
         assert second["inserted"] == 2
         # The known handle is only refreshed; the other handle is new.
         assert second["source_entities_created"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Messages from different people in one second
+# ---------------------------------------------------------------------------
+
+class TestPersonAwareMatching:
+    @pytest.fixture(autouse=True)
+    def _first_person(self, env):
+        env.add_person("p1")
+
+    @pytest.mark.parametrize("p1_rowid, p2_rowid", [(1, 2), (2, 1)])
+    def test_other_persons_message_does_not_consume_this_persons_interaction(
+        self, env, monkeypatch, p1_rowid, p2_rowid
+    ):
+        """Person 1 has an interaction; person 2 has a message in the same
+        second. Person 2's message is inserted and person 1 gains no copy."""
+        env.add_person("p2")
+        env.add_interaction("imessage_700", ts(10), person="p1")
+        env.add_message(p1_rowid, ts(10, ".100000"), person="p1")
+        env.add_message(p2_rowid, ts(10, ".600000"), person="p2")
+
+        stats = run_sync(env, monkeypatch)
+
+        assert stats["inserted"] == 1
+        assert sorted(r[1] for r in env.interactions()) == ["p1", "p2"]
+        assert run_sync(env, monkeypatch)["inserted"] == 0
+
+    def test_relinked_message_takes_the_leftover_row_instead_of_duplicating(
+        self, env, monkeypatch
+    ):
+        env.add_person("p2")
+        env.add_interaction("imessage_700", ts(10), person="p1")
+        env.add_message(1, ts(10), person="p2")
+
+        stats = run_sync(env, monkeypatch)
+
+        assert stats["inserted"] == 0
+        assert stats["already_exists"] == 1
+        assert env.interaction_count() == 1
+
+    def test_same_person_is_matched_before_any_leftover_is_taken(self, env, monkeypatch):
+        """Messages for p2 and p1; only p1's row exists. p1 keeps its row and
+        p2's message is new, whichever message the store lists first."""
+        env.add_person("p2")
+        env.add_interaction("imessage_700", ts(10), person="p1")
+        env.add_message(1, ts(10, ".200000"), person="p2")
+        env.add_message(2, ts(10, ".300000"), person="p1")
+
+        stats = run_sync(env, monkeypatch)
+
+        assert stats["inserted"] == 1
+        assert [r[1] for r in env.interactions() if r[0] != "imessage_700"] == ["p2"]
+
+    @pytest.mark.parametrize("survivor_frac, other_frac", [(".100000", ".200000"), (".200000", ".100000")])
+    def test_row_under_a_merged_id_matches_the_survivors_message(
+        self, env, monkeypatch, survivor_frac, other_frac
+    ):
+        env.add_person("survivor")
+        env.add_person("p2")
+        env.merge("old-id", into_id="survivor")
+        env.add_interaction("imessage_700", ts(10), person="old-id")
+        env.add_message(1, ts(10, other_frac), person="p2")
+        env.add_message(2, ts(10, survivor_frac), person="survivor")
+
+        stats = run_sync(env, monkeypatch)
+
+        assert stats["inserted"] == 1
+        new_rows = [r for r in env.interactions() if r[0] != "imessage_700"]
+        assert [r[1] for r in new_rows] == ["p2"]
+
+    def test_unmatched_messages_are_inserted_under_their_own_person(self, env, monkeypatch):
+        env.add_person("p2")
+        env.add_message(1, ts(10, ".100000"), person="p1")
+        env.add_message(2, ts(10, ".200000"), person="p2")
+        env.add_message(3, ts(10, ".300000"), person="p2")
+
+        stats = run_sync(env, monkeypatch)
+
+        assert stats["inserted"] == 3
+        assert Counter(r[1] for r in env.interactions()) == {"p1": 1, "p2": 2}
+        assert run_sync(env, monkeypatch)["inserted"] == 0
+
+    def test_match_messages_stages(self):
+        key = make_key(parse_timestamp(ts(10)), "in")
+        other = make_key(parse_timestamp(ts(20)), "in")
+
+        existing = Counter({(key, "a"): 1, (key, "b"): 1})
+        items = [(key, "c"), (key, "a"), (other, "a")]
+        assert match_messages(items, existing) == [True, True, False]
+        # "c" took b's leftover row; "a" kept its own.
+        assert existing[(key, "a")] == 0

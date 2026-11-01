@@ -485,11 +485,15 @@ differs between Macs and changes when chat.db is rebuilt. Direction comes from
 an interaction. Sub-second timestamps can differ between exports, so keys never
 include microseconds.
 
-Several real messages can share a key (attachment bursts, group sends), so keys
-are counted as a multiset: the sync counts existing `imessage` interactions per
-key and each linked, non-hidden message consumes one count if available;
-otherwise it is new and is inserted. Counting depends only on each row's
-timestamp and title, not on its `source_id`. New rows get a rowid-free
+Several real messages can share a key (attachment bursts, group sends, messages
+from different people), so keys are counted as a multiset and matched in two
+stages: each linked, non-hidden message first claims an unused existing
+`imessage` interaction of the same person at its key (merged ids compared as
+their surviving person on both sides); messages still unmatched then claim any
+leftover interaction at that key regardless of person, so a relinked message
+does not duplicate. What remains is new and is inserted under its own person.
+Matching depends only on each row's timestamp, title prefix and person, not on
+its `source_id`. New rows get a rowid-free
 `source_id` (`imessage_k_<hash of second, direction, ordinal>`) using the lowest
 ordinal not already taken, so the UNIQUE `(source_type, source_id)` index never
 drops one. Older `imessage_<rowid>` ids remain valid and coexist with these.

@@ -20,10 +20,11 @@ from api.services.imessage_identity import (
     INCOMING_MARK,
     OUTGOING_MARK,
     claim_source_id,
-    consume,
+    NO_TEXT,
     direction_for_is_from_me,
     load_existing,
     make_key,
+    match_messages,
     parse_timestamp,
     resolve_people,
 )
@@ -128,10 +129,11 @@ def sync_imessage_interactions(dry_run: bool = True, limit: int = None) -> dict:
     interactions_conn = sqlite3.connect(interactions_db)
 
     # Existing iMessage interactions, counted per message key (UTC second,
-    # direction). Messages are matched to them by key, never by source_id.
-    key_counts, taken_source_ids = load_existing(interactions_conn)
+    # direction) and surviving person. Messages are matched to them by key and
+    # person, never by source_id.
+    existing_counts, taken_source_ids = load_existing(interactions_conn, person_store)
 
-    logger.info(f"Found {sum(key_counts.values())} existing iMessage interactions")
+    logger.info(f"Found {sum(existing_counts.values())} existing iMessage interactions")
 
     # Get linked messages from iMessage database
     query = """
@@ -169,6 +171,8 @@ def sync_imessage_interactions(dry_run: bool = True, limit: int = None) -> dict:
         logger.info(f"Processed {stats['messages_checked']} messages, inserted {stats['inserted']}")
         batch = []
 
+    # Linked, non-hidden messages with a usable timestamp, in store order.
+    eligible = []  # (row, person, ts, key)
     for row in rows:
         _rowid, text, timestamp, is_from_me, handle, handle_normalized, service, person_id = row
         stats['messages_checked'] += 1
@@ -178,7 +182,6 @@ def sync_imessage_interactions(dry_run: bool = True, limit: int = None) -> dict:
         if not person:
             stats['person_not_found'] += 1
             continue
-        person_id = person.id
 
         # Parse timestamp
         ts = parse_timestamp(timestamp)
@@ -198,17 +201,27 @@ def sync_imessage_interactions(dry_run: bool = True, limit: int = None) -> dict:
                 )
             continue
 
-        # An unused existing interaction at this key means it is already synced
-        if consume(key_counts, key):
-            stats['already_exists'] += 1
+        eligible.append((row, person, ts, key))
+
+    # Messages already synced are matched to existing interactions: same
+    # person first, then leftover interactions at the key from any person.
+    matched = match_messages(
+        [(key, person.id) for _row, person, _ts, key in eligible], existing_counts
+    )
+    stats['already_exists'] = sum(matched)
+
+    for (row, person, ts, key), is_synced in zip(eligible, matched):
+        if is_synced:
             continue
+        _rowid, text, _timestamp, is_from_me, handle, handle_normalized, service, _pid = row
+        person_id = person.id
 
         # Create title from message text
         text_preview = (text or "").strip()
         if len(text_preview) > 100:
             text_preview = text_preview[:97] + "..."
         if not text_preview:
-            text_preview = "[No text content]"
+            text_preview = NO_TEXT
 
         # Direction indicator
         mark = OUTGOING_MARK if is_from_me else INCOMING_MARK

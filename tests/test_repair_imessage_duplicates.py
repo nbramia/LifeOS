@@ -271,3 +271,185 @@ class TestOutput:
         assert "Rows scanned" in output
         for secret in (PERSON_NAME, HANDLE, TEXT, "p1", "imessage_"):
             assert secret not in output
+
+
+def titled(env, source_id, text, person="p1", second=10, **kwargs):
+    env.add_interaction(source_id, ts(second), person=person, title=f"← {text}", **kwargs)
+
+
+def remaining(env):
+    return sorted(r[0] for r in env.interactions())
+
+
+class TestTitleGuard:
+    def test_stale_row_with_different_text_is_kept(self, env):
+        """The store has two messages in the second; one stale row carries text
+        that no retained same-person row has, so it is the only copy."""
+        env.add_message(500, ts(10), text="second")
+        env.add_message(501, ts(10, ".500000"), text="first")
+        titled(env, "imessage_100", "first")
+        titled(env, "imessage_500", "second")
+        key = make_key(parse_timestamp(ts(10)), "in")
+        titled(env, source_id_for(key, 0), "second")
+
+        stats = run(env, dry_run=False)
+
+        assert stats["deleted"] == 0
+        assert stats["kept_different_text"] == 1
+        assert len(env.interactions()) == 3
+
+    def test_true_duplicate_is_deleted_and_the_unique_stale_row_survives(self, env):
+        env.add_message(500, ts(10), text="second")
+        env.add_message(501, ts(10, ".500000"), text="first")
+        titled(env, "imessage_100", "first")
+        titled(env, "imessage_500", "second")
+        titled(env, "imessage_900", "second")
+
+        stats = run(env, dry_run=False)
+
+        assert stats["deleted"] == 1
+        assert remaining(env) == ["imessage_100", "imessage_500"]
+
+    @pytest.mark.parametrize("stale, valid", [
+        ("Hello,  World!", "hello world"),
+        ("ＨＥＬＬＯ world", "hello World"),
+        ("meet me at the cafe at 5", "meet me at the café at 5"),
+    ])
+    def test_equal_or_similar_text_is_deleted(self, env, stale, valid):
+        env.add_message(500, ts(10), text=valid)
+        titled(env, "imessage_500", valid)
+        titled(env, "imessage_100", stale)
+
+        assert run(env, dry_run=False)["deleted"] == 1
+        assert remaining(env) == ["imessage_500"]
+
+    def test_dissimilar_text_is_kept(self, env):
+        env.add_message(500, ts(10), text="see you at noon")
+        titled(env, "imessage_500", "see you at noon")
+        titled(env, "imessage_100", "completely different words here")
+
+        stats = run(env, dry_run=False)
+
+        assert stats["deleted"] == 0
+        assert stats["kept_different_text"] == 1
+
+    def test_stale_row_without_text_is_deleted_against_any_same_person_row(self, env):
+        env.add_message(500, ts(10), text="anything")
+        titled(env, "imessage_500", "anything")
+        titled(env, "imessage_100", "[No text content]")
+
+        assert run(env, dry_run=False)["deleted"] == 1
+        assert remaining(env) == ["imessage_500"]
+
+    @pytest.mark.parametrize("stale_text", ["an actual sentence", "no text content"])
+    def test_stale_row_with_text_is_kept_when_the_only_survivor_has_no_text(
+        self, env, stale_text
+    ):
+        env.add_message(500, ts(10), text="")
+        titled(env, "imessage_500", "[No text content]")
+        titled(env, "imessage_100", stale_text)
+
+        stats = run(env, dry_run=False)
+
+        assert stats["deleted"] == 0
+        assert stats["kept_different_text"] == 1
+
+    def test_different_person_with_equal_text_is_still_a_mismatch(self, env):
+        env.add_person("p2")
+        env.add_message(500, ts(10), text="same words")
+        titled(env, "imessage_500", "same words")
+        titled(env, "imessage_100", "same words", person="p2")
+
+        stats = run(env, dry_run=False)
+
+        assert stats["deleted"] == 0
+        assert stats["kept_person_mismatch"] == 1
+
+
+class TestPartnerProtection:
+    def test_two_similar_stale_rows_never_delete_each_other_to_nothing(self, env):
+        env.add_message(500, ts(10), text="unrelated anchor message")
+        titled(env, "imessage_500", "unrelated anchor message")
+        titled(env, "imessage_100", "alpha beta gamma delta")
+        titled(env, "imessage_200", "alpha beta gamma delta!")
+        # extras = 2, so the cap alone would allow both deletions.
+
+        stats = run(env, dry_run=False)
+
+        assert stats["deleted"] == 1
+        assert stats["kept_needed_as_partner"] == 1
+        assert len({"imessage_100", "imessage_200"} & set(remaining(env))) == 1
+
+    def test_a_partner_is_not_deleted_later_through_a_chain_of_similar_titles(self, env):
+        from api.services.imessage_identity import title_match_tier
+
+        words = "the weather today looks rather lovely outside so lets walk toward".split()
+        a = "← " + " ".join(words[0:8])
+        b = "← " + " ".join(words[1:9])
+        c = "← " + " ".join(words[2:10])
+        assert title_match_tier(a, b) is not None
+        assert title_match_tier(b, c) is not None
+        assert title_match_tier(a, c) is None
+
+        env.add_message(500, ts(10), text="x")
+        env.add_interaction("imessage_100", ts(10), person="p1", title=a)
+        env.add_interaction("imessage_200", ts(10), person="p1", title=b)
+        env.add_interaction("imessage_500", ts(10), person="p1", title=c)
+        # extras = 2: a is deleted on the strength of b, so b must stay.
+
+        stats = run(env, dry_run=False)
+
+        assert stats["deleted"] == 1
+        assert "imessage_200" in remaining(env)
+        assert "imessage_100" not in remaining(env)
+
+
+class TestPriorityOrder:
+    def test_exact_duplicate_goes_before_a_similar_row_with_a_lower_rowid(self, env):
+        env.add_message(500, ts(10), text="hello world")
+        env.add_message(501, ts(10, ".500000"), text="other")
+        titled(env, "imessage_500", "hello world")
+        titled(env, "imessage_100", "hello world pals")  # similar, sorts first
+        titled(env, "imessage_200", "hello world")       # exact duplicate
+        # extras = 1: the cap must spend its one deletion on the exact copy.
+
+        stats = run(env, dry_run=False)
+
+        assert stats["deleted"] == 1
+        assert remaining(env) == ["imessage_100", "imessage_500"]
+        assert stats["kept_over_cap"] == 1
+
+
+class TestTitleMatchTier:
+    def test_tiers(self):
+        from api.services.imessage_identity import title_match_tier
+
+        assert title_match_tier("← hi there", "← Hi, there!") == 0
+        assert title_match_tier("← hello world pals", "← hello world") == 1
+        assert title_match_tier("← hello", "← completely other") is None
+        assert title_match_tier("← [No text content]", "← anything") == 1
+        assert title_match_tier("← [No text content]", "← [No text content]") == 0
+        assert title_match_tier("← some words", "← [No text content]") is None
+
+    def test_direction_must_match(self):
+        from api.services.imessage_identity import title_match_tier
+
+        assert title_match_tier("→ hi there", "← hi there") is None
+        assert title_match_tier("→ [No text content]", "← anything") is None
+
+    def test_punctuation_only_text_is_compared_as_written(self):
+        from api.services.imessage_identity import title_match_tier
+
+        assert title_match_tier("← !!!", "← ???") is None
+        assert title_match_tier("← !!!", "← !!!") == 0
+
+
+class TestWouldBeInsertedPersonAware:
+    def test_matches_the_syncs_two_stage_logic(self, env):
+        env.add_person("p2")
+        env.add_message(1, ts(10), person="p1")
+        env.add_message(2, ts(10, ".500000"), person="p2")
+        env.add_interaction("imessage_1", ts(10), person="p1")
+
+        # The sync would insert the second person's message.
+        assert run(env)["would_be_inserted"] == 1
