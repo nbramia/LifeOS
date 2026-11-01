@@ -1082,9 +1082,17 @@ def test_vault_write_dirs_parse_relative_folders_and_never_widen():
     assert host_tools.parse_vault_write_dirs(" Assistant , /Shared/Drafts/ ") == (
         ("Assistant",), ("Shared", "Drafts"),
     )
-    for bad in ("../Assistant", "Assistant/../Work", "~/Assistant"):
+    for bad in ("../Assistant", "Assistant/../Work", "~/Assistant", ".", "/", ",", " , "):
         (parts,) = host_tools.parse_vault_write_dirs(bad)
         assert parts == ("\0",)
+    assert host_tools.parse_vault_write_dirs("Assistant,.") == (("Assistant",), ("\0",))
+
+
+@pytest.mark.parametrize("setting", [".", "Assistant,.", "/", ","])
+def test_a_malformed_vault_write_setting_never_opens_the_whole_vault(config, setting):
+    config.vault_write_dirs = host_tools.parse_vault_write_dirs(setting)
+    with pytest.raises(host_tools.HostToolError, match="limited to"):
+        host_tools.fs_write(config, {"root": "vault", "path": "Work/Plan.md", "content": "x\n"})
 
 
 def test_vault_writes_stay_inside_the_listed_folders(config, roots):

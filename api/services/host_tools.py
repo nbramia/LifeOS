@@ -241,8 +241,8 @@ def parse_vault_write_dirs(raw: str | None) -> tuple[tuple[str, ...], ...]:
     """Vault folders from a comma-separated list, each as its path parts.
 
     Entries are relative to the vault root (a leading `/` is ignored). An
-    entry with `..` or `~` is kept as a part no folder can match, so a
-    malformed list allows less, never more.
+    entry that names no folder (`.`) or uses `..` or `~` is kept as a part no
+    folder can match, so a malformed list allows less, never more.
     """
     dirs = []
     for entry in (raw or "").split(","):
@@ -250,9 +250,12 @@ def parse_vault_write_dirs(raw: str | None) -> tuple[tuple[str, ...], ...]:
         if not entry:
             continue
         parts = tuple(p for p in PurePosixPath(entry).parts if p not in ("", "."))
-        if ".." in parts or entry.startswith("~"):
+        if not parts or ".." in parts or entry.startswith("~"):
             parts = ("\0",)
         dirs.append(parts)
+    if not dirs and (raw or "").strip():
+        # A non-empty setting that names no folder (`/`, `,`) allows none.
+        dirs.append(("\0",))
     return tuple(dirs)
 
 
