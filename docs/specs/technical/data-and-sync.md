@@ -37,7 +37,7 @@ How LifeOS ingests and stores data from multiple sources.
 | Vault Notes | Obsidian markdown | Name mentions, context paths |
 | LinkedIn | CSV Import | Connections, companies, titles |
 | LinkedIn Profiles | Browser Scraping | Full profile data (experience, education, skills) |
-| Granola | Vault file watcher (notes placed by external classifier) | Meeting transcripts, attendees |
+| Meeting notes (Wispr, Granola) | Nightly vault reindex (notes placed by the external `local-processing` watchers) | Meeting transcripts, attendees |
 
 ### Example Data Volume
 
@@ -137,7 +137,6 @@ All data syncing is consolidated into a single daily sync with proper phase orde
 12:00          Calendar sync
 15:00          Calendar sync
 
-24/7           File watcher (real-time vault changes → ChromaDB + BM25)
 ```
 
 ### Phase Dependencies
@@ -165,7 +164,8 @@ The 7-phase structure ensures correct data flow:
 | systemd/launchd API Service | Continuous (boot) | All data | API logs |
 | Unified Sync | Daily 3:00 AM ET | All sources | All stores |
 | Calendar Indexer | 8 AM, 12 PM, 3 PM ET | Google Calendar | ChromaDB (`lifeos_calendar`) |
-| Vault File Watcher | Continuous | Vault filesystem | ChromaDB, BM25 |
+
+Vault notes reach search through the vault reindex in the unified sync, so a new or edited note is searchable after the next nightly run, or sooner with `POST /api/admin/reindex`. No process watches the vault for search indexing; the task and scheduler file watchers maintain their own indexes only.
 
 ### Failure Notifications
 
@@ -183,9 +183,9 @@ auto-resolved by the next successful run of that source.
 
 | Store | Location | Purpose | Updated By |
 |-------|----------|---------|------------|
-| ChromaDB | `data/chromadb/` | Vector embeddings | Nightly reindex, File watcher |
+| ChromaDB | `data/chromadb/` | Vector embeddings | Nightly reindex |
 | ChromaDB (Slack) | `lifeos_slack` collection | Slack message vectors | Nightly Slack sync |
-| BM25 Index | `data/chromadb/bm25_index.db` | Keyword search | Nightly reindex, File watcher |
+| BM25 Index | `data/chromadb/bm25_index.db` | Keyword search | Nightly reindex |
 | Vault | Configured via `LIFEOS_VAULT_PATH` | Primary knowledge base | User, external classifier, GDoc Sync |
 | PersonEntity | `data/crm.db` (person_entities table) | Resolved identities | People v2 sync, iMessage sync |
 | SourceEntity | `data/crm.db` | Raw observations | All sync scripts |
