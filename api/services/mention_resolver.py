@@ -45,6 +45,7 @@ from config.relationship_weights import (
     MENTION_MIN_LEAD,
     MENTION_MIN_SCORE,
     MENTION_PENALTY_DOMAIN_MISMATCH,
+    MENTION_PENALTY_NICKNAME,
     MENTION_PENALTY_OTHER_EMPLOYER,
     MENTION_WEIGHT_ALIAS,
     MENTION_WEIGHT_COMENTION_STRONG,
@@ -60,7 +61,6 @@ from config.relationship_weights import (
     MENTION_WEIGHT_FULL_NAME_IN_NOTE,
     MENTION_WEIGHT_INITIAL,
     MENTION_WEIGHT_MEETING_SAME_DAY,
-    MENTION_WEIGHT_NICKNAME,
     MENTION_WEIGHT_ONLY_CANDIDATE,
     MENTION_WEIGHT_PERSON_PATH,
 )
@@ -337,11 +337,12 @@ class MentionResolver:
                 note(person, "name_first", MENTION_WEIGHT_FIRST_NAME)
             for person in self._by_alias.get(mention.strip().casefold(), []):
                 note(person, "name_alias", MENTION_WEIGHT_ALIAS)
-            # A variant is a candidate only when nobody goes by the name as given.
+            # A variant is a candidate only when nobody goes by the name as given,
+            # and it starts behind: the variant lists run broad.
             if not found:
                 for variant in sorted(get_name_variants(first)):
                     for person in self._by_first.get(variant, []):
-                        note(person, "name_nickname", MENTION_WEIGHT_NICKNAME)
+                        note(person, "name_nickname", MENTION_PENALTY_NICKNAME)
             if len(last) == 1:
                 for person_id, candidate in list(found.items()):
                     person_last = parse_name(candidate.entity.canonical_name).last

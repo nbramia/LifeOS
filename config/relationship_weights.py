@@ -130,7 +130,7 @@ MENTION_MIN_LEAD = 25
 
 # The name itself
 MENTION_WEIGHT_FIRST_NAME = 10          # Mention equals the candidate's first name
-MENTION_WEIGHT_NICKNAME = 5             # Mention is a known variant of it, and nobody goes by it as given
+MENTION_PENALTY_NICKNAME = -20          # Mention is only a known variant of it, and nobody goes by it as given
 MENTION_WEIGHT_ALIAS = 10               # Mention equals an alias on the person
 MENTION_WEIGHT_INITIAL = 15             # "Robin G" or "R Gamma" agrees with the other part of the name
 MENTION_WEIGHT_ONLY_CANDIDATE = 15      # Nobody else real carries this name

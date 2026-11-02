@@ -155,7 +155,7 @@ class TestCandidates:
     def test_nickname_counts_only_when_nobody_goes_by_the_name_given(self, world):
         michael = world.person("Michael Gamma")
         decision = world.resolver().resolve("Mike", context())
-        assert signals_for(decision, michael)["name_nickname"] == w.MENTION_WEIGHT_NICKNAME
+        assert signals_for(decision, michael)["name_nickname"] == w.MENTION_PENALTY_NICKNAME
 
         world.person("Mike Delta")
         decision = world.resolver().resolve("Mike", context())

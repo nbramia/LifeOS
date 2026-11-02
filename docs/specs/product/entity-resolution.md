@@ -118,7 +118,7 @@ Each candidate collects points from whichever of these signals apply. Weights ar
 |--------|--------------|--------|
 | `name_first` | Mention equals their first name | 10 |
 | `name_alias` | Mention equals an alias on them | 10 |
-| `name_nickname` | Mention is a known variant of their first name, and nobody goes by it as given | 5 |
+| `name_nickname` | Mention is only a known variant of their first name, and nobody goes by it as given | -20 |
 | `name_initial` | The other half of "Robin G" or "R Gamma" agrees | 15 |
 | `only_candidate` | Nobody else real could be meant | 15 |
 | `dictionary_category` | The people dictionary lists the name in their category | 15 |
