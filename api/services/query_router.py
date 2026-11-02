@@ -5,11 +5,9 @@ Routes user queries to appropriate data sources using the local LLM
 (llama-server). Falls back to keyword matching when the local LLM is
 unavailable.
 
-v3 additions:
-- Populates relationship_context from CRM for person queries
-- Determines fetch_depth based on query patterns and relationship strength
+Also holds the phrasing-based search-depth signal and the name-extraction and
+disambiguation helpers that the person context block reads.
 """
-import asyncio
 import json
 import re
 import time
@@ -18,11 +16,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from config.relationship_weights import (
-    CLOSE_RELATIONSHIP_MIN_STRENGTH,
-    DEEP_CONTEXT_MIN_STRENGTH,
-    NORMAL_CONTEXT_MIN_STRENGTH,
-)
 from config.settings import settings
 from api.services.llm_client import (
     generate_text,
@@ -33,26 +26,6 @@ logger = logging.getLogger(__name__)
 
 # Valid data sources
 VALID_SOURCES = {"vault", "calendar", "gmail", "drive", "people", "actions", "slack", "photos", "web"}
-
-# Fetch depth limits for context retrieval
-# Maps fetch_depth -> (email_char_limit, vault_chunks, message_limit)
-FETCH_DEPTH_LIMITS = {
-    "shallow": {
-        "email_char_limit": 1500,
-        "vault_chunks": 5,
-        "message_limit": 50,
-    },
-    "normal": {
-        "email_char_limit": 3000,
-        "vault_chunks": 10,
-        "message_limit": 100,
-    },
-    "deep": {
-        "email_char_limit": 5000,
-        "vault_chunks": 20,
-        "message_limit": 200,
-    },
-}
 
 # Load router prompt from file
 PROMPT_FILE = Path(__file__).parent.parent.parent / "config" / "prompts" / "query_router.txt"
@@ -82,11 +55,7 @@ class RoutingResult:
     confidence: float
     latency_ms: int
     extracted_person_name: Optional[str] = None
-    # v3: Orchestration intelligence
-    fetch_depth: str = "normal"  # "shallow", "normal", "deep"
-    min_results_threshold: int = 3  # Minimum chunks needed
-    relationship_context: Optional[dict] = None  # CRM signals
-    # v4: Compound query support
+    # Compound query support
     action_after: Optional[str] = None  # "task_create", "reminder_create", "compose"
 
 
@@ -162,95 +131,6 @@ class QueryRouter:
                     return ' '.join(words)
         return None
 
-    def _fetch_crm_context(self, person_name: str) -> Optional[dict]:
-        """
-        Fetch CRM context for a person to inform routing decisions.
-
-        Returns dict with:
-        - entity_id: Person's entity ID
-        - relationship_strength: 0-100 score
-        - active_channels: List of recently active channels
-        - email_count: Total emails
-        - message_count: Total messages
-        - primary_channel: Most used channel
-
-        If resolution fails, may return dict with resolution_failed=True
-        containing disambiguation candidates or fuzzy suggestions. A name is
-        only ambiguous when the resolver finds a tie and at least two of the
-        tied people are close; a name it settled on one person never is.
-
-        Returns None when the name matches no one or on errors.
-        """
-        try:
-            from api.services.entity_resolver import get_entity_resolver
-            from api.services.relationship_summary import get_relationship_summary
-
-            match = get_entity_resolver().match_name(person_name)
-
-            close_ties = sorted(
-                (p for p in match.tied if p.relationship_strength >= CLOSE_RELATIONSHIP_MIN_STRENGTH),
-                key=lambda p: p.relationship_strength,
-                reverse=True,
-            )
-            if len(close_ties) > 1:
-                return {
-                    "resolution_failed": True,
-                    "failure_type": "ambiguous",
-                    "query_name": person_name,
-                    "candidates": [
-                        {
-                            "id": p.id,
-                            "name": p.canonical_name,
-                            "strength": p.relationship_strength,
-                            "context": self._get_disambiguation_context(p),
-                        }
-                        for p in close_ties[:5]  # Max 5 options
-                    ],
-                }
-
-            if not match.result:
-                # No match - try to get suggestions
-                suggestions = self._get_fuzzy_suggestions(person_name)
-                if suggestions:
-                    return {
-                        "resolution_failed": True,
-                        "failure_type": "no_match",
-                        "query_name": person_name,
-                        "suggestions": suggestions,
-                    }
-                return None
-
-            entity = match.result.entity
-
-            summary = get_relationship_summary(entity.id)
-            if not summary:
-                # Return basic context even without relationship summary
-                return {
-                    "entity_id": entity.id,
-                    "person_name": entity.canonical_name,
-                    "relationship_strength": entity.relationship_strength,
-                    "active_channels": [],
-                    "email_count": entity.email_count,
-                    "message_count": entity.message_count,
-                    "primary_channel": None,
-                }
-
-            return {
-                "entity_id": entity.id,
-                "person_name": entity.canonical_name,
-                "relationship_strength": summary.relationship_strength,
-                "active_channels": summary.active_channels,
-                "email_count": entity.email_count,
-                "message_count": entity.message_count,
-                "primary_channel": summary.primary_channel,
-                "total_interactions_90d": summary.total_interactions_90d,
-                "days_since_contact": summary.days_since_contact,
-                "has_facts": summary.has_facts,
-            }
-        except Exception as e:
-            logger.warning(f"Failed to fetch CRM context: {type(e).__name__}")
-            return None
-
     def _get_disambiguation_context(self, person) -> str:
         """Get contextual info to help distinguish this person."""
         parts = []
@@ -266,31 +146,9 @@ class QueryRouter:
                 parts.append(domain)
         return " · ".join(parts) if parts else "No additional context"
 
-    def _get_fuzzy_suggestions(self, name: str, threshold: int = 70) -> list[str]:
-        """Get fuzzy name suggestions from CRM."""
-        try:
-            from api.services.person_entity import get_person_entity_store
-            from rapidfuzz import fuzz
-
-            matches = []
-            for person in get_person_entity_store().get_all():
-                score = fuzz.ratio(name.lower(), person.canonical_name.lower())
-                if score >= threshold:
-                    matches.append((person.canonical_name, score))
-
-            matches.sort(key=lambda x: x[1], reverse=True)
-            return [m[0] for m in matches[:3]]
-        except Exception as e:
-            logger.warning(f"Failed to get fuzzy suggestions: {type(e).__name__}")
-            return []
-
-    def _determine_fetch_depth(
-        self,
-        query: str,
-        relationship_context: Optional[dict] = None
-    ) -> str:
+    def _determine_fetch_depth(self, query: str) -> str:
         """
-        Determine fetch depth based on query patterns and relationship context.
+        Determine fetch depth from how the question is phrased.
 
         Returns: "shallow", "normal", or "deep"
         """
@@ -321,17 +179,6 @@ class QueryRouter:
         if any(p in query_lower for p in shallow_patterns):
             return "shallow"
 
-        # Relationship-based depth. An unresolved name has no strength to go on.
-        if relationship_context and not relationship_context.get("resolution_failed"):
-            strength = relationship_context.get("relationship_strength", 0)
-            # High-strength relationships get more context by default
-            if strength >= DEEP_CONTEXT_MIN_STRENGTH:
-                return "deep"
-            elif strength >= NORMAL_CONTEXT_MIN_STRENGTH:
-                return "normal"
-            else:
-                return "shallow"
-
         return "normal"
 
     async def route(self, query: str) -> RoutingResult:
@@ -360,24 +207,6 @@ class QueryRouter:
                 # missing llama-server doesn't break the chat surface.
                 logger.warning(f"Local LLM routing failed, using fallback: {e}")
                 result = self._keyword_fallback(query)
-
-        # v3: Enrich with CRM context for people queries
-        if "people" in result.sources:
-            # Prefer LLM-extracted name (set by _llm_route), fall back to regex
-            person_name = result.extracted_person_name or self._extract_person_name(query)
-            if person_name:
-                result.extracted_person_name = person_name
-                # Scoring a name reads every person, which would stall the event loop.
-                crm_context = await asyncio.to_thread(self._fetch_crm_context, person_name)
-                if crm_context:
-                    result.relationship_context = crm_context
-                    result.fetch_depth = self._determine_fetch_depth(query, crm_context)
-                    logger.info(f"CRM context found: fetch_depth={result.fetch_depth}")
-                else:
-                    # No CRM context, use query-based depth
-                    result.fetch_depth = self._determine_fetch_depth(query, None)
-            else:
-                result.fetch_depth = self._determine_fetch_depth(query, None)
 
         result.latency_ms = int((time.time() - start_time) * 1000)
         return result

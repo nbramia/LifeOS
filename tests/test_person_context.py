@@ -245,7 +245,7 @@ class TestFirstNames:
         assert resolution.person.id == close.id
         assert other.id in [p.id for p in resolution.candidates]
 
-    @pytest.mark.parametrize(("top", "second", "tier"), [(50.0, 20.0, LIKELY), (50.0, 20.1, UNCERTAIN)])
+    @pytest.mark.parametrize(("top", "second", "tier"), [(50.0, 20.0, LIKELY), (50.0, 20.1, UNCERTAIN), (14.0, 14.0, UNCERTAIN)])
     def test_the_closeness_lead_decides_between_likely_and_uncertain(self, crm, top, second, tier):
         add_person(crm, "Robin Alpha", top)
         add_person(crm, "Robin Beta", second)
@@ -527,7 +527,6 @@ class TestFetchDepth:
 
         context = build_person_context("catch me up on Robin Alpha")
 
-        assert context.fetch_depth == "deep"
         assert "search every channel" in context.block
 
     def test_a_quick_lookup_is_answered_from_the_profile_first(self, crm):
@@ -535,7 +534,6 @@ class TestFetchDepth:
 
         context = build_person_context("what is the phone number for Robin Alpha")
 
-        assert context.fetch_depth == "shallow"
         assert "quick lookup" in context.block
 
     def test_closeness_alone_does_not_widen_the_search(self, crm):
@@ -543,7 +541,6 @@ class TestFetchDepth:
 
         context = build_person_context("who is Robin Alpha")
 
-        assert context.fetch_depth == "normal"
         assert "search every channel" not in context.block
         assert "quick lookup" not in context.block
 
@@ -681,6 +678,15 @@ class TestFollowUps:
         history = [message("assistant", "ok", routing={"person": "Robin Alpha", "person_id": "id-1"})]
 
         assert extract_context_from_history(history).last_person_name == "Robin Alpha"
+
+    def test_a_depth_key_in_stored_routing_is_ignored(self):
+        history = [message("assistant", "ok", routing={"person": "Robin Alpha", "fetch_depth": "deep"})]
+
+        context = extract_context_from_history(history)
+
+        assert context.last_person_name == "Robin Alpha"
+        assert not hasattr(context, "last_fetch_depth")
+        assert "last_fetch_depth" not in context.to_dict()
 
     def test_a_pronoun_is_replaced_as_a_whole_word_only(self):
         context = ConversationContext(

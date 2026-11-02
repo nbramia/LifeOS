@@ -114,13 +114,12 @@ class PersonContext:
 
     block: str
     tier: str
-    fetch_depth: str
     person_name: Optional[str] = None
     person_id: Optional[str] = None
 
     def routing_fields(self) -> dict:
         """Fields for the stored assistant message. An unconfirmed person is never carried forward."""
-        fields = {"person_tier": self.tier, "fetch_depth": self.fetch_depth}
+        fields = {"person_tier": self.tier}
         if self.person_id:
             fields["person"] = self.person_name
             fields["person_id"] = self.person_id
@@ -600,7 +599,6 @@ def build_person_context(question: str, history: Optional[list] = None) -> Optio
         return PersonContext(
             block=_render_block(resolution, depth),
             tier=resolution.tier,
-            fetch_depth=depth,
             person_name=resolution.person.canonical_name if identified else None,
             person_id=resolution.person.id if identified else None,
         )
