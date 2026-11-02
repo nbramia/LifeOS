@@ -29,7 +29,6 @@ import logging
 from datetime import datetime, timezone
 
 from api.services.person_entity import get_person_entity_store, PersonEntity
-from api.services.source_entity import get_source_entity_store
 from api.services.interaction_store import get_interaction_db_path
 from api.services.link_override import get_link_override_store, LinkOverride
 from api.services.meeting_source import expand_source_types, normalize_source_type
@@ -349,7 +348,6 @@ def split_person(from_name: str, to_name: str, source_types: list[str],
         # Recalculate relationship strength for both affected people
         # (also updates is_peripheral_contact; dunbar_circle requires full recalc)
         from api.services.relationship_metrics import update_strength_for_person
-        from api.services.person_entity import get_person_entity_store
         person_store = get_person_entity_store()
 
         # Reload from_person to get fresh stats for logging

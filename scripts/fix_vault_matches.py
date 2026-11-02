@@ -170,7 +170,7 @@ def main():
                 continue
 
             if target_id == source_id:
-                print(f"  SKIP: Already correct (same person)")
+                print("  SKIP: Already correct (same person)")
                 stats['skipped'] += 1
                 continue
 
@@ -247,7 +247,7 @@ def main():
         refresh_person_stats(list(affected_person_ids))
 
     print(f"\n{'='*60}")
-    print(f"Summary:")
+    print("Summary:")
     print(f"  Fixed (reassigned): {stats['fixed']}")
     print(f"  Unlinked: {stats['unlinked']}")
     print(f"  Skipped: {stats['skipped']}")
