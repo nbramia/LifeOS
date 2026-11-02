@@ -7,6 +7,7 @@ Model files are cached at settings.embedding_cache_dir to save internal disk spa
 NOTE: sentence_transformers is imported lazily to avoid slow startup.
 This allows tests to import this module without loading the ML library.
 """
+import copy
 import errno
 import fcntl
 import logging
@@ -61,6 +62,12 @@ if TYPE_CHECKING:
     from sentence_transformers import SentenceTransformer
 
 
+# Most tokens one character can become (a four-byte character as byte tokens);
+# with the slack for special tokens it bounds which texts can reach the ceiling.
+_MAX_TOKENS_PER_CHAR = 4
+_SPECIAL_TOKEN_SLACK = 8
+
+
 # Model dimension lookup (for known models)
 MODEL_DIMENSIONS = {
     "all-MiniLM-L6-v2": 384,
@@ -87,6 +94,7 @@ class EmbeddingService:
         self._model: Any = None
         self._force_cpu: bool = False
         self._ceiling: int | None = None
+        self._length_tokenizer: Any = None
         # Serialize lazy loads. Searches run through execute_tool_parallel →
         # asyncio.to_thread, so concurrent first-use from multiple tool threads
         # would otherwise race the (meta-device) model init and leave params on
@@ -168,27 +176,52 @@ class EmbeddingService:
         """
         ceiling = settings.embedding_max_seq_length
         native = getattr(model, "max_seq_length", None)
+        self._length_tokenizer = None
         if isinstance(native, int) and native > ceiling:
             model.max_seq_length = ceiling
             self._ceiling = ceiling
+            self._length_tokenizer = self._private_tokenizer(model)
         else:
             self._ceiling = None
+
+    @staticmethod
+    def _private_tokenizer(model):
+        """A copy of the model's tokenizer for measuring input length, or None.
+
+        The model's own tokenizer is shared by every thread that encodes, and
+        each encode sets its truncation and padding on it, which a concurrent
+        call with different settings contends with ("Already borrowed"). The
+        copy is fixed to no truncation and no padding, so measuring never
+        writes to it and never touches the shared one.
+        """
+        try:
+            private = copy.deepcopy(model.tokenizer)
+            private.backend_tokenizer.no_truncation()
+            private.backend_tokenizer.no_padding()
+            return private
+        except Exception:
+            logger.debug("No private tokenizer for input length checks", exc_info=True)
+            return None
 
     def _warn_if_truncated(self, data) -> None:
         """Log (counts only, never text) when ``data`` exceeds the ceiling."""
         _ = self.model  # a first call loads the model, which sets the ceiling
-        if self._ceiling is None:
+        if self._ceiling is None or self._length_tokenizer is None:
             return
         try:
             texts = [data] if isinstance(data, str) else list(data)
-            ids = self.model.tokenizer(texts, truncation=False, verbose=False)["input_ids"]
-            longest = max((len(i) for i in ids), default=0)
+            # A text this short cannot reach the ceiling, so queries cost nothing.
+            texts = [t for t in texts if len(t) * _MAX_TOKENS_PER_CHAR + _SPECIAL_TOKEN_SLACK > self._ceiling]
+            if not texts:
+                return
+            ids = self._length_tokenizer(texts, verbose=False)["input_ids"]
+            longest = max(len(i) for i in ids)
             over = sum(len(i) > self._ceiling for i in ids)
             if over:
                 logger.warning(
-                    "Embedding input over the %d-token ceiling: %d of %d texts, longest %d "
-                    "tokens; the excess is left out of the vector (keyword search still "
-                    "sees all of it)", self._ceiling, over, len(texts), longest,
+                    "Embedding input over the %d-token ceiling: %d of %d long texts, longest %d "
+                    "tokens; the excess is left out of the vector (the stored text is unchanged)",
+                    self._ceiling, over, len(texts), longest,
                 )
         except Exception:
             logger.debug("Could not check embedding input length", exc_info=True)

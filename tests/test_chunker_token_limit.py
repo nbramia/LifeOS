@@ -14,6 +14,7 @@ import pytest
 from api.services import chunker
 from api.services.chunker import chunk_by_tokens, chunk_document, enforce_token_limit
 from config.settings import settings
+from tests.tiny_tokenizer import build_tokenizer, text_with_tokens
 
 pytestmark = pytest.mark.unit
 
@@ -21,24 +22,9 @@ CEILING = 384
 LIMIT = CEILING - chunker.CONTEXT_PREFIX_RESERVE_TOKENS  # 128 tokens
 
 
-def _build_tokenizer():
-    from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
-    from transformers import PreTrainedTokenizerFast
-
-    rng = random.Random(1)
-    words = ["".join(rng.choices(string.ascii_lowercase, k=rng.randint(2, 9))) for _ in range(300)]
-    corpus = [" ".join(rng.choices(words, k=40)) + " https://example.test/a/b?id=12345 | 3.14 |" for _ in range(300)]
-    tk = Tokenizer(models.BPE())
-    tk.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
-    tk.decoder = decoders.ByteLevel()
-    trainer = trainers.BpeTrainer(vocab_size=700, initial_alphabet=pre_tokenizers.ByteLevel.alphabet())
-    tk.train_from_iterator(corpus, trainer)
-    return PreTrainedTokenizerFast(tokenizer_object=tk)
-
-
 @pytest.fixture(scope="module")
 def tokenizer():
-    return _build_tokenizer()
+    return build_tokenizer()
 
 
 @pytest.fixture(autouse=True)
@@ -108,27 +94,18 @@ class TestLimitHolds:
         assert_covers_exactly(source, chunks)
 
     def test_chunk_exactly_at_limit_is_kept_whole(self, tokenizer):
-        text = self._text_with_tokens(tokenizer, LIMIT)
+        text = text_with_tokens(tokenizer, LIMIT)
         chunks = enforce_token_limit([{"content": text, "chunk_index": 0}])
 
         assert [c["content"] for c in chunks] == [text]
 
     def test_chunk_one_token_over_limit_is_split(self, tokenizer):
-        text = self._text_with_tokens(tokenizer, LIMIT + 1)
+        text = text_with_tokens(tokenizer, LIMIT + 1)
         chunks = enforce_token_limit([{"content": text, "chunk_index": 0}])
 
         assert len(chunks) == 2
         assert_all_within_limit(tokenizer, chunks)
         assert_covers_exactly(text, chunks)
-
-    @staticmethod
-    def _text_with_tokens(tokenizer, n: int) -> str:
-        rng = random.Random(11)
-        text = ""
-        while tokens(tokenizer, text) < n:
-            text += rng.choice(string.ascii_lowercase)
-        assert tokens(tokenizer, text) == n
-        return text
 
 
 class TestSplitShape:
@@ -169,7 +146,7 @@ class TestSplitShape:
         assert "".join(c["content"] for c in chunks) == run
 
     def test_pieces_are_balanced_not_a_full_piece_plus_remainder(self, tokenizer):
-        text = TestLimitHolds._text_with_tokens(tokenizer, LIMIT + 5)
+        text = text_with_tokens(tokenizer, LIMIT + 5)
         sizes = [tokens(tokenizer, c["content"]) for c in enforce_token_limit([{"content": text}])]
 
         assert min(sizes) > LIMIT // 4
@@ -267,18 +244,35 @@ class TestMeasure:
 
         assert chunker._get_embedding_tokenizer() is None
 
-    def test_tokenizer_loads_from_the_local_cache_only(self, monkeypatch):
+    def test_tokenizer_loads_the_configured_model_from_the_local_cache_only(self, monkeypatch):
         from unittest.mock import MagicMock
         import transformers
 
+        monkeypatch.setattr(settings, "embedding_model", "synthetic/model")
+        monkeypatch.setattr(settings, "embedding_cache_dir", "/synthetic/cache")
         loader = MagicMock(side_effect=OSError("not cached"))
         monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", loader)
         monkeypatch.setattr(chunker, "_embedding_tokenizer", chunker._UNLOADED)
 
         assert chunker._get_embedding_tokenizer() is None
-        assert loader.call_args.kwargs["local_files_only"] is True
+        loader.assert_called_once_with(
+            "synthetic/model", cache_dir="/synthetic/cache", local_files_only=True
+        )
         assert chunker._get_embedding_tokenizer() is None
         assert loader.call_count == 1  # a miss is remembered, not retried per chunk
+
+    def test_an_unset_cache_dir_means_the_default_cache(self, monkeypatch):
+        from unittest.mock import MagicMock
+        import transformers
+
+        monkeypatch.setattr(settings, "embedding_cache_dir", "")
+        loader = MagicMock(return_value=MagicMock(is_fast=True))
+        monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", loader)
+        monkeypatch.setattr(chunker, "_embedding_tokenizer", chunker._UNLOADED)
+
+        chunker._get_embedding_tokenizer()
+
+        assert loader.call_args.kwargs["cache_dir"] is None
 
     def test_offsets_that_do_not_advance_still_terminate(self, monkeypatch):
         monkeypatch.setattr(chunker, "_token_starts", lambda text: [0] * len(text))

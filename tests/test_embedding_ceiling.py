@@ -1,26 +1,42 @@
 """Tests for the embedding layer's hard cap on input length (embedding_max_seq_length)."""
 import logging
+import threading
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 
 from config.settings import settings
+from tests.tiny_tokenizer import build_tokenizer, text_with_tokens
 
 pytestmark = pytest.mark.unit
 
-CEILING = 1000
+CEILING = 400
 
 
-def fake_model(native: int, lengths_seen=None):
-    """A stand-in SentenceTransformer whose tokenizer reports ``lengths_seen`` per text."""
-    model = MagicMock()
-    model.max_seq_length = native
-    model.encode.side_effect = lambda data, **kw: np.zeros((1 if isinstance(data, str) else len(data), 2))
-    model.tokenizer = MagicMock(
-        side_effect=lambda texts, **kw: {"input_ids": [[7] * n for n in (lengths_seen or [1] * len(texts))]}
-    )
-    return model
+@pytest.fixture(scope="module")
+def tokenizer():
+    # model_max_length equals the ceiling so a length check that truncates cannot see past it
+    return build_tokenizer(model_max_length=CEILING)
+
+
+class FakeModel:
+    """A stand-in SentenceTransformer that encodes the way the real one does.
+
+    ``encode`` tokenizes with truncation and padding set on the model's own
+    (shared) tokenizer, as sentence-transformers does for every call.
+    """
+
+    def __init__(self, tokenizer, native: int = 32768):
+        self.tokenizer = tokenizer
+        self.max_seq_length = native
+        self.calls = []
+
+    def encode(self, data, **kwargs):
+        self.calls.append((data, kwargs))
+        texts = [data] if isinstance(data, str) else list(data)
+        self.tokenizer(texts, truncation=True, max_length=self.max_seq_length, padding=True)
+        return np.zeros((len(texts), 2)) if not isinstance(data, str) else np.zeros(2)
 
 
 @pytest.fixture(autouse=True)
@@ -43,10 +59,14 @@ def service():
     return EmbeddingService(model_name="test-model")
 
 
+def warnings_from(caplog):
+    return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+
+
 class TestCeilingApplied:
     @patch("sentence_transformers.SentenceTransformer")
-    def test_long_context_model_is_capped(self, st_class):
-        model = fake_model(native=32768)
+    def test_long_context_model_is_capped(self, st_class, tokenizer):
+        model = FakeModel(tokenizer, native=32768)
         st_class.return_value = model
 
         service().model
@@ -54,18 +74,18 @@ class TestCeilingApplied:
         assert model.max_seq_length == CEILING
 
     @patch("sentence_transformers.SentenceTransformer")
-    def test_model_with_a_lower_limit_keeps_it(self, st_class):
-        model = fake_model(native=512)
+    def test_model_with_a_lower_limit_keeps_it(self, st_class, tokenizer):
+        model = FakeModel(tokenizer, native=300)
         st_class.return_value = model
 
         service().model
 
-        assert model.max_seq_length == 512
+        assert model.max_seq_length == 300
 
     @patch("sentence_transformers.SentenceTransformer")
-    def test_cpu_fallback_reload_is_capped_too(self, st_class):
-        gpu, cpu = fake_model(native=32768), fake_model(native=32768)
-        gpu.encode.side_effect = RuntimeError("HIP error: invalid device function")
+    def test_cpu_fallback_reload_is_capped_too(self, st_class, tokenizer):
+        gpu, cpu = FakeModel(tokenizer), FakeModel(tokenizer)
+        gpu.encode = MagicMock(side_effect=RuntimeError("HIP error: invalid device function"))
         st_class.side_effect = [gpu, cpu]
 
         service().embed_texts(["hello"])
@@ -73,8 +93,8 @@ class TestCeilingApplied:
         assert cpu.max_seq_length == CEILING
 
     @patch("sentence_transformers.SentenceTransformer")
-    def test_cpu_model_loaded_after_a_gpu_load_failure_is_capped(self, st_class):
-        cpu = fake_model(native=32768)
+    def test_cpu_model_loaded_after_a_gpu_load_failure_is_capped(self, st_class, tokenizer):
+        cpu = FakeModel(tokenizer)
         st_class.side_effect = [RuntimeError("HIP error: out of memory"), cpu]
 
         service().model
@@ -82,58 +102,148 @@ class TestCeilingApplied:
         assert cpu.max_seq_length == CEILING
 
     @patch("sentence_transformers.SentenceTransformer")
-    def test_queries_and_batches_reach_the_model_unchanged(self, st_class):
-        model = fake_model(native=32768)
+    def test_queries_and_batches_reach_the_model_unchanged(self, st_class, tokenizer):
+        model = FakeModel(tokenizer)
         st_class.return_value = model
         svc = service()
 
         svc.embed_text("what did we decide")
         svc.embed_texts(["a", "b"])
 
-        assert model.encode.call_args_list[0].args == ("what did we decide",)
-        assert model.encode.call_args_list[1].args == (["a", "b"],)
+        assert model.calls[0][0] == "what did we decide"
+        assert model.calls[1][0] == ["a", "b"]
 
 
 class TestTruncationIsReported:
     @patch("sentence_transformers.SentenceTransformer")
-    def test_text_over_the_ceiling_is_logged_with_counts_only(self, st_class, caplog):
-        st_class.return_value = fake_model(native=32768, lengths_seen=[10, CEILING + 1, 5000])
-        secret = "synthetic-sentinel-text"
+    def test_text_over_the_ceiling_is_logged_with_counts_only(self, st_class, tokenizer, caplog):
+        st_class.return_value = FakeModel(tokenizer)
+        longest = text_with_tokens(tokenizer, CEILING * 3, seed=1)
+        texts = ["short", text_with_tokens(tokenizer, CEILING + 5, seed=2), longest]
 
         with caplog.at_level(logging.WARNING, logger="api.services.embeddings"):
-            service().embed_texts([secret, secret, secret])
+            service().embed_texts(texts)
 
-        message = " ".join(r.getMessage() for r in caplog.records)
-        assert "2 of 3 texts" in message
-        assert "longest 5000" in message
-        assert str(CEILING) in message
-        assert secret not in message
+        (message,) = warnings_from(caplog)
+        assert "2 of 2 long texts" in message
+        assert f"longest {CEILING * 3} tokens" in message
+        assert f"{CEILING}-token ceiling" in message
+        assert longest not in message and "short" not in message
 
     @patch("sentence_transformers.SentenceTransformer")
-    def test_text_at_the_ceiling_is_not_reported(self, st_class, caplog):
-        st_class.return_value = fake_model(native=32768, lengths_seen=[CEILING, 3])
+    def test_the_ceiling_itself_is_allowed_and_one_more_token_is_not(self, st_class, tokenizer, caplog):
+        st_class.return_value = FakeModel(tokenizer)
+        svc = service()
 
         with caplog.at_level(logging.WARNING, logger="api.services.embeddings"):
-            service().embed_texts(["a", "b"])
+            svc.embed_texts([text_with_tokens(tokenizer, CEILING)])
+            assert not warnings_from(caplog)
+            svc.embed_texts([text_with_tokens(tokenizer, CEILING + 1)])
 
-        assert not caplog.records
+        assert len(warnings_from(caplog)) == 1
 
     @patch("sentence_transformers.SentenceTransformer")
-    def test_a_models_own_lower_limit_is_not_reported_as_the_ceiling(self, st_class, caplog):
-        st_class.return_value = fake_model(native=512, lengths_seen=[5000])
+    def test_text_of_few_characters_but_many_tokens_is_still_measured(self, st_class, tokenizer, caplog):
+        st_class.return_value = FakeModel(tokenizer)
+        emoji = "\U0001F600" * (CEILING // 4 + 10)  # four byte tokens per character
+        assert len(tokenizer(emoji)["input_ids"]) > CEILING > len(emoji) + 8
 
         with caplog.at_level(logging.WARNING, logger="api.services.embeddings"):
-            service().embed_texts(["a"])
+            service().embed_texts([emoji])
 
-        assert not caplog.records
+        assert len(warnings_from(caplog)) == 1
 
     @patch("sentence_transformers.SentenceTransformer")
-    def test_a_failing_length_check_never_blocks_embedding(self, st_class):
-        model = fake_model(native=32768)
-        model.tokenizer.side_effect = ValueError("no tokenizer")
+    def test_a_single_long_query_is_reported_too(self, st_class, tokenizer, caplog):
+        st_class.return_value = FakeModel(tokenizer)
+
+        with caplog.at_level(logging.WARNING, logger="api.services.embeddings"):
+            service().embed_text(text_with_tokens(tokenizer, CEILING * 2))
+
+        assert len(warnings_from(caplog)) == 1
+
+    @patch("sentence_transformers.SentenceTransformer")
+    def test_a_models_own_lower_limit_is_not_reported_as_the_ceiling(self, st_class, tokenizer, caplog):
+        st_class.return_value = FakeModel(tokenizer, native=300)
+
+        with caplog.at_level(logging.WARNING, logger="api.services.embeddings"):
+            service().embed_texts([text_with_tokens(tokenizer, CEILING * 2)])
+
+        assert not warnings_from(caplog)
+
+    @patch("sentence_transformers.SentenceTransformer")
+    def test_a_failing_length_check_never_blocks_embedding(self, st_class, tokenizer):
+        st_class.return_value = FakeModel(tokenizer)
+        svc = service()
+        svc.model
+        svc._length_tokenizer = MagicMock(side_effect=ValueError("broken"))
+
+        assert svc.embed_texts([text_with_tokens(tokenizer, CEILING * 2)]) == [[0.0, 0.0]]
+
+    @patch("sentence_transformers.SentenceTransformer")
+    def test_a_model_whose_tokenizer_cannot_be_copied_still_embeds(self, st_class, tokenizer, caplog):
+        model = FakeModel(MagicMock(__deepcopy__=MagicMock(side_effect=TypeError("no copy"))))
+        model.encode = MagicMock(return_value=np.zeros((1, 2)))
         st_class.return_value = model
 
-        assert service().embed_texts(["a"]) == [[0.0, 0.0]]
+        with caplog.at_level(logging.DEBUG, logger="api.services.embeddings"):
+            assert service().embed_texts([text_with_tokens(tokenizer, CEILING * 2)]) == [[0.0, 0.0]]
+
+        assert not [r for r in caplog.records if "Could not check" in r.getMessage()]
+
+    def test_the_private_tokenizer_starts_with_no_truncation_or_padding(self, tokenizer):
+        from api.services.embeddings import EmbeddingService
+
+        model = FakeModel(tokenizer)
+        model.encode(["some text"])  # leaves truncation and padding set on the shared tokenizer
+        assert tokenizer.backend_tokenizer.truncation is not None
+
+        private = EmbeddingService._private_tokenizer(model)
+
+        assert private is not tokenizer
+        assert private.backend_tokenizer.truncation is None
+        assert private.backend_tokenizer.padding is None
+
+
+class TestCostAndConcurrency:
+    @patch("sentence_transformers.SentenceTransformer")
+    def test_short_texts_are_never_measured(self, st_class, tokenizer):
+        st_class.return_value = FakeModel(tokenizer)
+        svc = service()
+        svc.model
+        measure = MagicMock()
+        svc._length_tokenizer = measure
+
+        svc.embed_text("what did we decide last week")
+        svc.embed_texts(["a short note", "another short note"])
+
+        measure.assert_not_called()
+
+    @patch("sentence_transformers.SentenceTransformer")
+    def test_the_length_check_leaves_the_shared_tokenizer_alone(self, st_class, tokenizer):
+        """Parallel encodes with no cross-process lock must not collide on tokenizer state."""
+        model = FakeModel(tokenizer)
+        st_class.return_value = model
+        svc = service()
+        svc.model
+        long_text = text_with_tokens(tokenizer, CEILING * 2)
+        errors = []
+
+        def hammer():
+            try:
+                for _ in range(250):
+                    svc.embed_text(long_text)
+                    svc.embed_texts([long_text, "short"])
+            except Exception as exc:  # noqa: BLE001 - any failure is the finding
+                errors.append(repr(exc))
+
+        threads = [threading.Thread(target=hammer) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == []
 
 
 class TestSetting:
