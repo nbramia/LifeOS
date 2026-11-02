@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** API Gateway
-> **Last Updated:** 2026-11-01
+> **Last Updated:** 2026-11-02
 
 MCP (Model Context Protocol) server that exposes LifeOS capabilities to AI assistants like Claude Code.
 
@@ -80,7 +80,7 @@ Claude Code  ←→  MCP Protocol  ←→  mcp_server.py  ←→  LifeOS API
 ### People & CRM Tools
 | Tool | Description |
 |------|-------------|
-| `lifeos_people_search` | Search people in network |
+| `lifeos_people_search` | Search people in network by name, email or description |
 | `lifeos_person_profile` | Get full CRM profile for a person |
 | `lifeos_person_facts` | Get extracted facts about a person |
 | `lifeos_person_timeline` | Get chronological interaction history |
@@ -462,7 +462,7 @@ Search for people in your network.
 | q | string | Yes | Name or email to search |
 | limit | integer | No | Max results (default: 10, max: 50) |
 
-A `q` that matches no name and says it wants whoever fits ("who do I know in fundraising", "people in fundraising") returns people whose CRM profile fits it. Any other `q` that matches no name returns nothing.
+A `q` that matches no name and says it wants whoever fits ("who do I know in fundraising", "people in fundraising") returns people whose CRM profile fits it. Any other `q` that matches no name returns nothing. The tool's description names the wordings that qualify. Results for a description are suggestions, and people sharing a first name are not to be presented as one person; the tool's description tells the model both.
 
 ### lifeos_memories_create
 

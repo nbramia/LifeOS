@@ -66,6 +66,7 @@ from api.services.hermes_persona_thread_store import get_persona_thread_store
 from api.services.hermes_question_thread_store import get_question_thread_store
 from api.services.journal_capture import JOURNAL_PERSONA_ID
 from api.services.model_readout import record_hermes_chat_turn_model
+from api.services.person_context import PersonContext, gather_person_context
 from api.services.persona_capabilities import project_persona_tool_capabilities
 from api.services.usage_store import get_usage_store
 from api.services.agent_worker.usage_ledger import (
@@ -83,6 +84,15 @@ logger = logging.getLogger(__name__)
 # costs nothing and the native path's own ids (uuid4, 36 chars) are nowhere
 # near it.
 _MAX_CONVERSATION_ID_LEN = 200
+
+# Personas whose turns carry no person block. A journal turn files a fragment
+# rather than answers. The therapist's Hermes profile is kept away from CRM
+# person data, so the block would hand that path relationship stats and facts
+# it does not otherwise reach.
+_NO_PERSON_CONTEXT_PERSONAS = frozenset({JOURNAL_PERSONA_ID, "therapist"})
+
+# Stored messages read to settle a first name; the same window the native path reads.
+_PERSON_CONTEXT_HISTORY_LIMIT = 10
 
 
 def _stable_proxy_turn_id(
@@ -256,7 +266,35 @@ def _resolve_lifeos_context(
     }
 
 
-def _build_envelope(raw_body: bytes) -> bytes:
+async def _prepare_person_context(raw_body: bytes) -> dict:
+    """`prepare_turn` hook: who this message is about, for `_build_envelope`
+    and `_make_persister`.
+
+    The history read and the lookup both run off the event loop under the
+    budget in `gather_person_context`, which yields None on any failure or
+    overrun, so the turn then goes ahead as if the message named no one. A body
+    or persona `_build_envelope` is going to reject gets no lookup and is left
+    for it to reject.
+    """
+    try:
+        parsed = AskStreamRequest.model_validate(json.loads(raw_body))
+        persona_id = resolve_effective_persona_id(parsed.persona_id, parsed.persona)
+    except (ValueError, HTTPException):
+        return {}
+    if persona_id in _NO_PERSON_CONTEXT_PERSONAS:
+        return {}
+
+    conversation_id = parsed.conversation_id
+    load_history = (
+        (lambda: get_store().get_messages(conversation_id, limit=_PERSON_CONTEXT_HISTORY_LIMIT))
+        if conversation_id else None
+    )
+    # Off-box: Hermes usually answers on a remote provider.
+    person = await gather_person_context(parsed.question, load_history=load_history, offbox=True)
+    return {"person": person} if person else {}
+
+
+def _build_envelope(raw_body: bytes, person: Optional[PersonContext] = None) -> bytes:
     """Attach `lifeos_context` to the forwarded body, resolving the persona.
 
     Runs before the request reaches httpx, so a malformed body or a bad
@@ -264,6 +302,11 @@ def _build_envelope(raw_body: bytes) -> bytes:
     `api/routes/chat.py` uses for the native path (resolve persona before the
     stream opens). Every field the browser sent is preserved untouched; this
     adds exactly one top-level key.
+
+    `person` becomes `turn.person_context`. It is set here rather than in
+    `_resolve_lifeos_context`, which `POST /api/hermes/resolve-persona` shares
+    and whose untagged message must stay independent of a person lookup. Like
+    `caller_session_id`, it is additive at schema_version 1.
     """
     try:
         data = json.loads(raw_body)
@@ -305,6 +348,8 @@ def _build_envelope(raw_body: bytes) -> bytes:
         conversation_id=parsed.conversation_id,
         apply_voice_rules=apply_voice_rules,
     )
+    if person:
+        data["lifeos_context"]["turn"]["person_context"] = person.block
     return json.dumps(data).encode("utf-8")
 
 
@@ -432,8 +477,12 @@ class _HermesTurnPersister:
         persist_usage: bool = True, client_turn_id: Optional[str] = None,
         request_conversation_id: Optional[str] = None,
         attempt_id: Optional[str] = None, turn_id: Optional[str] = None,
+        person_routing: Optional[dict] = None,
     ):
         self._question = question
+        # What the person lookup found, stored on the assistant message so a
+        # later turn can settle a first name from this one.
+        self._person_routing = person_routing
         self._persona_id = persona_id
         self._buf = b""
         self._conversation_id_seen = False
@@ -677,10 +726,10 @@ class _HermesTurnPersister:
             # Mark it the same way the native path marks a cancelled/errored
             # turn, so a genuinely truncated Hermes reply is never presented
             # as if it were whole.
-            routing = None
+            routing = self._person_routing
             if not self._done_seen or self._error_seen:
                 content += TRUNCATION_MARKER
-                routing = truncation_routing("stream_error")
+                routing = {**(routing or {}), **truncation_routing("stream_error")}
             try:
                 store = get_store()
                 store.create_conversation(
@@ -761,7 +810,9 @@ class _HermesTurnPersister:
                 logger.warning("hermes turn persistence: failed to record usage", exc_info=True)
 
 
-def _make_persister(raw_body: bytes) -> Optional[_HermesTurnPersister]:
+def _make_persister(
+    raw_body: bytes, person: Optional[PersonContext] = None,
+) -> Optional[_HermesTurnPersister]:
     """Build this turn's persistence tee from the same raw, pre-
     transform body `_build_envelope` already validated — a malformed body or
     an unknown persona 400s there ahead of this point being reached, so only
@@ -792,6 +843,7 @@ def _make_persister(raw_body: bytes) -> Optional[_HermesTurnPersister]:
         ),
         attempt_id=attempt_id if isinstance(attempt_id, str) else None,
         turn_id=turn_id if isinstance(turn_id, str) else None,
+        person_routing=person.routing_fields() if person else None,
     )
 
 
@@ -805,6 +857,7 @@ router = make_backend_router(
     transform_body=_build_envelope,
     make_observer=_make_persister,
     pre_send=_journal_capture_prelude,
+    prepare_turn=_prepare_person_context,
     # A configured-but-down Hermes must not look "available" — see
     # make_backend_router's docstring and _probe_reachable in _proxy.py.
     probe_reachability=True,

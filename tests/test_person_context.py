@@ -1231,3 +1231,87 @@ class TestTwoCapitalizedWordsAreNotAVerbAndAName:
         add_person(crm, "Anne Alpha", 60.0)
 
         assert build_person_context("Mary Anne Alpha called") is None
+
+
+class TestAliasesInTheProfile:
+    def test_a_confident_block_says_what_else_the_person_goes_by(self, crm):
+        add_person(crm, "Robin Alpha", 60.0, aliases=["Mom", "Birdie"])
+
+        block = build_person_context("Who is Robin Alpha?").block
+
+        assert "Also known as: Mom, Birdie" in block
+
+    def test_a_block_reached_through_the_alias_says_so_too(self, crm):
+        add_person(crm, "Robin Alpha", 60.0, aliases=["Birdie"])
+
+        assert "Also known as: Birdie" in build_person_context("Who is Birdie?").block
+
+    def test_a_conversation_settled_block_carries_aliases(self, crm):
+        add_person(crm, "Robin Alpha", 60.0, aliases=["Birdie"])
+        add_person(crm, "Robin Beta", 55.0)
+        history = [message("user", "Robin Alpha called")]
+
+        context = build_person_context("tell me about Robin", history)
+
+        assert context.tier == FROM_CONVERSATION
+        assert "Also known as: Birdie" in context.block
+
+    def test_uncertain_and_likely_blocks_carry_none(self, crm):
+        add_person(crm, "Robin Alpha", 80.0, aliases=["Birdie"])
+        add_person(crm, "Robin Beta", 75.0, aliases=["Wren"])
+
+        block = build_person_context("tell me about Robin").block
+        assert "Also known as" not in block
+        assert "Birdie" not in block and "Wren" not in block
+
+    @pytest.mark.parametrize("alias", [
+        "   ",
+        "robin.alpha@example.com",
+        "bee@example.com",
+        "@robinalpha",
+        "@beekeeper",
+        "robin_alpha",
+        "bee_keeper",
+        "robin.alpha",
+        "bee.keeper",
+        "bee99",
+        "ralpha",
+        "robinalpha",
+        "RobinAlpha",
+        "robin99",
+        "+15550100",
+        "555-0100",
+        "https://example.com/robin",
+        "Robin",
+        "Alpha",
+        "robin alpha",
+        "Robin A. Alpha",
+    ])
+    def test_addresses_handles_and_their_own_name_are_not_aliases(self, crm, alias):
+        add_person(crm, "Robin Alpha", 60.0, aliases=[alias])
+
+        assert "Also known as" not in build_person_context("Who is Robin Alpha?").block
+
+    @pytest.mark.parametrize("alias", ["Mom", "mom", "Bee", "J.R.", "Dr. Bee", "Aunt Robin", "Rob"])
+    def test_a_real_alias_survives(self, crm, alias):
+        add_person(crm, "Robin Alpha", 60.0, aliases=[alias])
+
+        assert f"Also known as: {alias}" in build_person_context("Who is Robin Alpha?").block
+
+    def test_aliases_are_deduplicated_and_capped(self, crm):
+        from api.services.person_context import MAX_LISTED_ALIASES
+
+        names = ["Bee", "bee", "Birdie", "Wren", "Finch", "Lark", "Dove", "Swift"]
+        add_person(crm, "Robin Alpha", 60.0, aliases=names)
+
+        block = build_person_context("Who is Robin Alpha?").block
+
+        listed = next(line for line in block.splitlines() if line.startswith("Also known as: "))
+        shown = listed.removeprefix("Also known as: ").split(", ")
+        assert shown == ["Bee", "Birdie", "Wren", "Finch", "Lark"]
+        assert len(shown) == MAX_LISTED_ALIASES
+
+    def test_a_person_with_no_aliases_has_no_line(self, crm):
+        add_person(crm, "Robin Alpha", 60.0)
+
+        assert "Also known as" not in build_person_context("Who is Robin Alpha?").block
