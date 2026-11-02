@@ -90,10 +90,55 @@ class TestRanking:
         just_under = _rec(2, day=20, faces=1, size=profile_photo.MIN_AVATAR_FACE_SIZE - 0.01)
         assert _best([just_under, at_minimum]) == _uuid(1)
 
-    def test_a_tiny_solo_still_beats_a_large_pair(self):
-        tiny_solo = _rec(1, day=1, faces=1, size=0.02)
-        large_pair = _rec(2, day=20, faces=2, size=0.4)
-        assert _best([large_pair, tiny_solo]) == _uuid(1)
+    def test_a_solo_below_the_usable_floor_loses_to_a_readable_pair(self):
+        tiny_solo = _rec(1, day=20, faces=1, size=0.02)
+        readable_pair = _rec(2, day=1, faces=2, size=0.3)
+        assert _picks([tiny_solo, readable_pair]) == [_uuid(2), _uuid(1)]
+
+    def test_a_solo_below_the_usable_floor_loses_to_a_readable_group(self):
+        tiny_solo = _rec(1, day=20, faces=1, size=0.03)
+        readable_group = _rec(2, day=1, faces=8, size=0.12)
+        assert _picks([tiny_solo, readable_group]) == [_uuid(2), _uuid(1)]
+
+    def test_a_face_just_above_the_floor_in_a_group_beats_a_tiny_solo(self):
+        tiny_solo = _rec(1, day=1, faces=1, size=0.04)
+        usable_group = _rec(2, day=1, faces=5, size=0.06)
+        assert _best([tiny_solo, usable_group]) == _uuid(2)
+
+    def test_a_face_exactly_at_the_floor_is_usable(self):
+        at_floor = _rec(1, day=1, faces=1, size=profile_photo.MIN_USABLE_FACE_SIZE)
+        just_under = _rec(2, day=20, faces=1, size=profile_photo.MIN_USABLE_FACE_SIZE - 0.001)
+        assert _picks([just_under, at_floor]) == [_uuid(1), _uuid(2)]
+        pair = _rec(3, day=1, faces=2, size=0.3)
+        assert _best([pair, at_floor]) == _uuid(1)
+        assert _best([pair, just_under]) == _uuid(3)
+
+    def test_with_every_face_below_the_floor_the_face_count_order_stands(self):
+        group = _rec(1, day=20, faces=6, size=0.04, quality=0.9)
+        pair = _rec(2, day=10, faces=2, size=0.03)
+        solo = _rec(3, day=1, faces=1, size=0.02, quality=0.1)
+        assert _picks([group, pair, solo]) == [_uuid(3), _uuid(2), _uuid(1)]
+
+    def test_a_readable_solo_still_beats_a_readable_pair(self):
+        solo = _rec(1, day=1, faces=1, size=0.12, quality=0.1)
+        pair = _rec(2, day=20, faces=2, size=0.4, quality=0.9)
+        assert _picks([pair, solo]) == [_uuid(1), _uuid(2)]
+
+    def test_a_usable_but_small_solo_still_beats_a_readable_pair(self):
+        # Above the floor the face count decides, whatever the face size.
+        solo = _rec(1, day=1, faces=1, size=0.06)
+        pair = _rec(2, day=20, faces=2, size=0.4)
+        assert _best([pair, solo]) == _uuid(1)
+
+    def test_the_floor_outranks_eyes_quality_and_recency(self):
+        tiny = _rec(1, day=20, faces=2, size=0.04, quality=0.9, key=True)
+        usable = _rec(2, day=1, faces=2, size=0.06, quality=0.1, eyes_closed=True)
+        assert _best([tiny, usable]) == _uuid(2)
+
+    def test_a_record_without_facts_still_ranks_after_a_tiny_face(self):
+        tiny = _rec(1, day=1, faces=1, size=0.01)
+        no_facts = {"asset_uuid": _uuid(2), "timestamp": _ts(20)}
+        assert _picks([no_facts, tiny]) == [_uuid(1), _uuid(2)]
 
     def test_open_eyes_beat_closed_eyes_even_at_lower_quality(self):
         closed = _rec(1, day=20, eyes_closed=True, quality=0.9)

@@ -8,12 +8,15 @@ same shape, and both feed ``build_picks``.
 
 Ranking, best first (each element breaks ties in the one before):
 
-1. fewest visible faces in the photo (solo, then two-person, then groups)
-2. a face at least ``MIN_AVATAR_FACE_SIZE`` of the image's longer side
-3. eyes open
-4. Apple's key face for the person
-5. higher face quality, in ``QUALITY_LEVELS`` coarse steps
-6. newer photo
+1. a face at least ``MIN_USABLE_FACE_SIZE`` of the image's longer side, so the
+   crop around it has the pixels to look sharp; if no photo clears it, this
+   step ties and the order below decides
+2. fewest visible faces in the photo (solo, then two-person, then groups)
+3. a face at least ``MIN_AVATAR_FACE_SIZE`` of the image's longer side
+4. eyes open
+5. Apple's key face for the person
+6. higher face quality, in ``QUALITY_LEVELS`` coarse steps
+7. newer photo
 
 A trashed or hidden asset is never picked. A record without usable facts (no
 visible-face count, or a face with no measured size) ranks after every record
@@ -42,6 +45,12 @@ from typing import Callable, Iterable, Optional
 
 logger = logging.getLogger(__name__)
 
+# A face smaller than this makes a crop too small to look sharp: the face is
+# 3 face boxes' worth of crop (profile_crop.FACE_CROP_SCALE) of the staged image,
+# which is 1024 px on the long edge for most photos, so 0.05 gives a crop of about
+# 150 px, the 160 device pixels of the 80 px detail avatar. A 2048 px staged image
+# doubles it; the 480 px thumbnail alone halves it.
+MIN_USABLE_FACE_SIZE = 0.05
 # A face this large (fraction of the image's longer side) or larger can read as
 # an avatar. About the median face in single-face photos of a real library.
 MIN_AVATAR_FACE_SIZE = 0.10
@@ -108,12 +117,13 @@ def appearance_from_record(record: dict) -> Optional[Appearance]:
 def rank_key(appearance: Appearance) -> tuple:
     """Sort key: smaller is a better avatar."""
     if not appearance.has_facts:
-        return (1, 0, False, False, False, 0, -appearance.timestamp, appearance.asset_uuid)
+        return (1, False, 0, False, False, False, 0, -appearance.timestamp, appearance.asset_uuid)
     quality = appearance.quality
     if quality is None or quality < 0:
         quality = UNKNOWN_QUALITY
     return (
         0,
+        appearance.face_size < MIN_USABLE_FACE_SIZE,
         appearance.visible_faces,
         appearance.face_size < MIN_AVATAR_FACE_SIZE,
         appearance.eyes_closed,
