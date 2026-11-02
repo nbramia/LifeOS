@@ -180,7 +180,11 @@ class TestFollowUpTurns:
         assert routing["person"] == "Robin Beta"
         assert routing["person_id"] == wanted.id
         assert routing["person_tier"] == "confident"
-        assert routing["fetch_depth"] == "normal"
+        assert {"person_tier", "person", "person_id", "fetch_depth"} & set(routing) == {
+            "person_tier",
+            "person",
+            "person_id",
+        }
 
         await ask("what does Robin do", conversation_id=conv_id)
 
@@ -195,8 +199,8 @@ class TestFollowUpTurns:
         _, frames = await ask("tell me about Robin")
         routing, _ = stored_routing(store, frames)
 
+        assert {"person_tier", "person", "person_id", "fetch_depth"} & set(routing) == {"person_tier"}
         assert routing["person_tier"] == "uncertain"
-        assert "person" not in routing and "person_id" not in routing
 
     async def test_routing_holds_no_person_fields_without_a_person(self, store, crm, loop_calls):
         _, frames = await ask("what is the weather like?")

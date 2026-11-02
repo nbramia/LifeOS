@@ -70,8 +70,6 @@ PERIPHERAL_THRESHOLD = 5.0
 
 CLOSE_RELATIONSHIP_MIN_STRENGTH = 14    # Close enough to settle a first-name tie, or to offer in disambiguation
 CLEARLY_CLOSER_MIN_STRENGTH_LEAD = 30   # Lead that settles a first-name tie between two close people
-DEEP_CONTEXT_MIN_STRENGTH = 53          # Queries about this person fetch deep context by default
-NORMAL_CONTEXT_MIN_STRENGTH = 18        # Below this they fetch shallow context
 MIN_STRENGTH_FOR_INDEX = 9              # Eligible for the people index, with or without recent activity
 
 # Wording of a person's indexed profile, highest band first. Lower reads "Distant".

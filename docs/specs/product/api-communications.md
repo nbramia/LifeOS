@@ -116,7 +116,7 @@ the composer for a subsequent turn.
 
 A lone word after a place or thing lead ("the weather in Austin", "the Chase account") raises nothing. Names come from the message as written, never from follow-up expansion. A hidden or merged person never appears in any of these. `person_info` resolves names the same way, and declines a briefing on a name that is `likely` or `uncertain`. Phrases such as "catch me up" or "phone number" add guidance on how widely to search. The lookup runs under a 500 ms budget; a failure or overrun sends the turn on with no block. Journal turns skip it. See `api/services/person_context.py`.
 
-The stored assistant message's `routing` carries `person_tier` and `fetch_depth`, plus `person` and `person_id` when the person was asserted (`confident` or `conversation`). A later turn uses those to settle a first name. No SSE event changes.
+The stored assistant message's `routing` carries `person_tier`, plus `person` and `person_id` when the person was asserted (`confident` or `conversation`). A later turn uses those to settle a first name. No SSE event changes.
 
 **Prompt caching (Anthropic backend only):** System prompt and tool definitions use Anthropic `cache_control` breakpoints. Cache reads cost 0.1x input price; repeated queries within 5 minutes hit the cache.
 

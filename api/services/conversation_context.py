@@ -35,7 +35,6 @@ class ConversationContext:
 
     # Source context
     last_sources: list[str] = field(default_factory=list)
-    last_fetch_depth: str = "normal"
 
     # Topic context
     last_topics: list[str] = field(default_factory=list)
@@ -81,7 +80,6 @@ class ConversationContext:
             "last_person_name": self.last_person_name,
             "last_person_id": self.last_person_id,
             "last_sources": self.last_sources,
-            "last_fetch_depth": self.last_fetch_depth,
             "last_topics": self.last_topics,
             "last_reminder_id": self.last_reminder_id,
             "last_reminder_name": self.last_reminder_name,
@@ -131,10 +129,6 @@ def extract_context_from_history(
             # Get last sources
             if not context.last_sources and routing.get("sources"):
                 context.last_sources = routing["sources"]
-
-            # Get fetch depth
-            if routing.get("fetch_depth"):
-                context.last_fetch_depth = routing["fetch_depth"]
 
             # Check for reminder in routing (from reminder creation)
             if not context.last_reminder_id and routing.get("created_reminder"):
