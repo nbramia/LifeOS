@@ -154,7 +154,7 @@ class TestSplitShape:
     def test_split_pieces_keep_the_section_header(self, tokenizer):
         filler = "\n".join(f"line {i} {random_run(30, seed=i)}" for i in range(120))
         content = f"## Short\n\nsmall body\n\n## Huge\n\n{filler}\n\n## Tail\n\nlast words\n"
-        chunks = chunk_document(content, is_granola=True)
+        chunks = chunk_document(content, is_meeting=True)
 
         assert_all_within_limit(tokenizer, chunks)
         huge = [c for c in chunks if c["header"] == "Huge"]
@@ -171,7 +171,7 @@ class TestOrdinaryNotesUnchanged:
 
     def test_header_chunked_meeting_note_is_untouched(self):
         content = "## Agenda\n\nOne two three.\n\n## Actions\n\n- do a thing\n- do another\n"
-        chunks = chunk_document(content, is_granola=True)
+        chunks = chunk_document(content, is_meeting=True)
 
         assert [(c["header"], c["content"]) for c in chunks] == [
             ("Agenda", "## Agenda\n\nOne two three."),
