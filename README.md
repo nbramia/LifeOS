@@ -156,7 +156,7 @@ Everything above is built on a nightly sync that pulls from every connected sour
 
 | Source | Method | Data |
 |--------|--------|------|
-| Obsidian | File watcher | Notes, mentions |
+| Obsidian | Nightly vault reindex | Notes, mentions |
 | Gmail (personal + work) | Google API | Emails, threads |
 | Calendar (personal + work) | Google API | Events, attendees |
 | Google Docs / Sheets | Google API | Document + tabular content |
@@ -170,7 +170,7 @@ Everything above is built on a nightly sync that pulls from every connected sour
 | LinkedIn | CSV import, plus optional browser-automated profile enrichment | Connections, roles, education |
 | Monarch | Monarch API | Accounts, transactions, holdings |
 | Apple Health | HealthBridge app / iOS Shortcut | Workouts, sleep, HR, HRV, weight |
-| Meeting notes (Wispr, Granola) | Vault file | Meeting transcripts |
+| Wispr, Granola | Vault file | Meeting transcripts |
 
 - **Entity resolution** links every identifier — an email address, a phone number, "John from the conference" — to one canonical [PersonEntity](docs/specs/product/data-model.md), matching on exact email or phone first and falling back to fuzzy, nickname-aware name matching with relationship-strength-informed disambiguation when two candidates are close. See [Entity Resolution](docs/specs/product/entity-resolution.md).
 - **Hybrid search** fuses ChromaDB vector similarity with SQLite FTS5/BM25 keyword search via Reciprocal Rank Fusion, then re-ranks the fused results with a cross-encoder — while protecting a precise factual match from being displaced by something merely "more semantically similar." See [Search & Indexing](docs/specs/technical/search-indexing.md).
