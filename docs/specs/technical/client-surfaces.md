@@ -425,7 +425,7 @@ The key is absent when the message names no one and on `journal` and `therapist`
 - **Identified person (`confident`, `conversation`):** canonical name, `entity_id` (every `lifeos_person_*` tool takes it), aliases that are not addresses or handles, company, position, relationship strength, days since contact, active and primary channels, per-channel interaction counts over 90 days, and up to 8 person facts, highest confidence first. Withheld from those facts: the whole `dates` category, and any fact whose key or value gives an email, phone number, birthday or street address. A city or region stays.
 - **Unconfirmed (`likely`, `uncertain`):** for each person listed, canonical name, position, company and days since last contact, closest first. No `entity_id`, aliases or facts; the model looks a candidate up by full name.
 
-Emails, phone numbers, birthdays, street addresses, CRM notes, tags and message content are not in it.
+Emails, phone numbers, birthdays, street addresses, CRM notes, tags and message content are not in it. A stored name or role holding an email or phone number is printed without it and any brackets around it, and a name that is nothing else is not printed.
 
 The stored assistant message's `routing` carries the same fields as a native turn: `person_tier`, plus `person` and `person_id` only for an identified person, so a later turn can settle a first name from it.
 
