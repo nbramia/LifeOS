@@ -30,6 +30,7 @@ from api.services.entity_resolver import is_bare_person, is_creatable_person_nam
 from api.services.link_override import LinkOverride, most_specific_override
 from api.services.people import get_person_category
 from api.services.person_entity import PersonEntity
+from api.services.sqlite_connect import connect_closing
 from api.services.vault_listing import vault_relative_path
 from config.employment_history import Employer, EmploymentHistory, get_employment_history
 from config.nickname_lookup import get_name_variants
@@ -182,8 +183,9 @@ def _reads_as_a_person(person: PersonEntity) -> bool:
     return is_creatable_person_name(person.canonical_name)
 
 
-def _read_only(db_path: str | Path) -> sqlite3.Connection:
-    return sqlite3.connect(f"file:{Path(db_path).resolve()}?mode=ro", uri=True, timeout=30.0)
+def _read_only(db_path: str | Path):
+    """Context manager for a read-only connection that closes on the way out."""
+    return connect_closing(f"file:{Path(db_path).resolve()}?mode=ro", uri=True, timeout=30.0)
 
 
 def _has_whole_phrase(text: str, phrase: str) -> bool:
@@ -475,8 +477,7 @@ class MentionResolver:
     def _profile(self, person_id: str) -> Counter:
         if self._contact_profile is None:
             profiles: dict[str, Counter] = defaultdict(Counter)
-            conn = _read_only(self._interaction_db)
-            try:
+            with _read_only(self._interaction_db) as conn:
                 for pid, source, account, count in conn.execute(
                     "SELECT person_id, source_type, source_account, COUNT(*) FROM interactions "
                     "GROUP BY person_id, source_type, source_account"
@@ -485,8 +486,6 @@ class MentionResolver:
                         profiles[pid]["personal"] += count
                     elif source == "slack" or (source in _WORK_ACCOUNT_SOURCES and account == "work"):
                         profiles[pid]["work"] += count
-            finally:
-                conn.close()
             self._contact_profile = profiles
         return self._contact_profile.get(person_id, Counter())
 
@@ -498,8 +497,7 @@ class MentionResolver:
         """
         if self._folder_links is None:
             links: dict[str, Counter] = defaultdict(Counter)
-            conn = _read_only(self._crm_db)
-            try:
+            with _read_only(self._crm_db) as conn:
                 for source_id, person_id, observed, status in conn.execute(
                     "SELECT source_id, canonical_person_id, observed_name, link_status "
                     "FROM source_entities WHERE source_type IN ('vault', 'granola') "
@@ -511,8 +509,6 @@ class MentionResolver:
                     rel = vault_relative_path(note_path, self._vault_root)
                     if rel:
                         links[str(Path(rel).parent)][person_id] += 1
-            finally:
-                conn.close()
             self._folder_links = links
         return self._folder_links
 
@@ -521,8 +517,7 @@ class MentionResolver:
         if employer.name not in self._employer_history:
             counts: Counter = Counter()
             if employer.start:
-                conn = _read_only(self._interaction_db)
-                try:
+                with _read_only(self._interaction_db) as conn:
                     end = employer.end or date.today()
                     for pid, count in conn.execute(
                         "SELECT person_id, COUNT(*) FROM interactions "
@@ -532,8 +527,6 @@ class MentionResolver:
                         (_day_bound(employer.start), _day_bound(end, end=True)),
                     ):
                         counts[pid] = count
-                finally:
-                    conn.close()
             self._employer_history[employer.name] = counts
         return self._employer_history[employer.name]
 
@@ -543,8 +536,7 @@ class MentionResolver:
         end = _day_bound(day + timedelta(days=window), end=True)
         reference = _day_bound(day)
         closest: dict[str, float] = {}
-        conn = _read_only(self._interaction_db)
-        try:
+        with _read_only(self._interaction_db) as conn:
             for i in range(0, len(ids), _SQL_CHUNK):
                 chunk = ids[i:i + _SQL_CHUNK]
                 marks = ",".join("?" * len(chunk))
@@ -556,8 +548,6 @@ class MentionResolver:
                 ):
                     if distance is not None:
                         closest[pid] = distance
-        finally:
-            conn.close()
         return closest
 
     def _meeting_attendees(self, ids: list[str], context: NoteContext) -> set[str]:
@@ -570,8 +560,7 @@ class MentionResolver:
         start = _day_bound(day - timedelta(days=MENTION_MEETING_DAY_WINDOW))
         end = _day_bound(day + timedelta(days=MENTION_MEETING_DAY_WINDOW), end=True)
         found: set[str] = set()
-        conn = _read_only(self._interaction_db)
-        try:
+        with _read_only(self._interaction_db) as conn:
             for i in range(0, len(ids), _SQL_CHUNK):
                 chunk = ids[i:i + _SQL_CHUNK]
                 marks = ",".join("?" * len(chunk))
@@ -585,8 +574,6 @@ class MentionResolver:
                     union = note_words | event_words
                     if union and len(note_words & event_words) / len(union) >= MENTION_MEETING_TITLE_OVERLAP:
                         found.add(pid)
-        finally:
-            conn.close()
         return found
 
     def _pair_strengths(self, ids: list[str], others: frozenset[str] | set[str]) -> dict[str, list[float]]:
@@ -595,8 +582,7 @@ class MentionResolver:
 
         wanted = set(ids)
         pairs: dict[str, list[float]] = defaultdict(list)
-        conn = _read_only(self._crm_db)
-        try:
+        with _read_only(self._crm_db) as conn:
             other_list = sorted(others)
             for i in range(0, len(other_list), _SQL_CHUNK):
                 chunk = other_list[i:i + _SQL_CHUNK]
@@ -612,43 +598,37 @@ class MentionResolver:
                     ):
                         if mine in wanted and other in others:
                             pairs[mine].append(relationship.pair_strength)
-        finally:
-            conn.close()
         return pairs
 
 
 def load_link_overrides(crm_db: str | Path) -> list[LinkOverride]:
     """Read link overrides without touching the database."""
-    conn = _read_only(crm_db)
     try:
-        return [
-            LinkOverride(
-                id=row[0], name_pattern=row[1], source_type=row[2], context_pattern=row[3],
-                preferred_person_id=row[4], rejected_person_id=row[5], reason=row[6],
-            )
-            for row in conn.execute(
-                "SELECT id, name_pattern, source_type, context_pattern, preferred_person_id, "
-                "rejected_person_id, reason FROM link_overrides"
-            )
-        ]
+        with _read_only(crm_db) as conn:
+            return [
+                LinkOverride(
+                    id=row[0], name_pattern=row[1], source_type=row[2], context_pattern=row[3],
+                    preferred_person_id=row[4], rejected_person_id=row[5], reason=row[6],
+                )
+                for row in conn.execute(
+                    "SELECT id, name_pattern, source_type, context_pattern, preferred_person_id, "
+                    "rejected_person_id, reason FROM link_overrides"
+                )
+            ]
     except sqlite3.OperationalError:
         return []
-    finally:
-        conn.close()
 
 
 def load_tag_domain(tags_db: Optional[str | Path], rel_path: str) -> Optional[str]:
     """The tagged domain for one note, or None when there's no store or row."""
     if not tags_db or not Path(tags_db).exists():
         return None
-    conn = _read_only(tags_db)
     try:
-        row = conn.execute("SELECT domain FROM vault_tags WHERE file_path = ?", (rel_path,)).fetchone()
-        return row[0] if row else None
+        with _read_only(tags_db) as conn:
+            row = conn.execute("SELECT domain FROM vault_tags WHERE file_path = ?", (rel_path,)).fetchone()
+            return row[0] if row else None
     except sqlite3.OperationalError:
         return None
-    finally:
-        conn.close()
 
 
 def build_note_context(
