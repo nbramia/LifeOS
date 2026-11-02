@@ -29,7 +29,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Callable, Iterator, Optional
 
@@ -64,6 +64,9 @@ MAX_NAMES_PER_MESSAGE = 3
 # Aliases shown for an identified person.
 MAX_LISTED_ALIASES = 5
 
+# Stands in, off-box, for a stored name that is nothing but an email or phone number.
+UNNAMED_PERSON = "a contact with no name on record"
+
 # Capitalized or captured words that are never a person in a question.
 _NOT_NAMES = frozenset("""
     i me my mine we us our you your he him his she her hers they them their it its this that these those
@@ -81,7 +84,9 @@ _MY_RELATION = re.compile(r"\bmy\s+([^\W\d_]+)\b", re.IGNORECASE)
 _LEADING_MY = re.compile(r"^my\s+", re.IGNORECASE)
 
 _EMAIL = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
-_PHONE = re.compile(r"\+?\d(?:[\s().-]*\d){9,}|\b\d{3}[-.\s]\d{4}\b")
+_PHONE = re.compile(r"\+?\(?\d(?:[\s().-]*\d){9,}|\b\d{3}[-.\s]?\d{4}\b")
+_BRACKETED = re.compile(r"[(\[{<]([^()\[\]{}<>]*)[)\]}>]")
+_SEPARATORS = " ,;:|/·—–-"
 _BIRTHDAY_WORDING = re.compile(r"\b(?:birthdays?|birthdate|birth date|date of birth|dob|bday|b-day)\b", re.IGNORECASE)
 _BORN = re.compile(r"\bborn\b", re.IGNORECASE)
 _DATE_PART = re.compile(
@@ -358,6 +363,35 @@ def _meaningful_aliases(entity) -> list[str]:
     return list(aliases.values())[:MAX_LISTED_ALIASES]
 
 
+def _holds_contact_detail(text: str) -> bool:
+    return bool(_EMAIL.search(text) or _PHONE.search(text))
+
+
+def _scrub_identifiers(text: Optional[str]) -> str:
+    """
+    Text with any email or phone number removed, along with the brackets it sits in.
+
+    Every stored name and role on the off-box path goes through this. An "@" that is
+    not part of an address stays ("Chris @ StubHub"). Empty when nothing but an
+    identifier was there.
+    """
+    if not text or not _holds_contact_detail(text):
+        return text or ""
+    kept = _BRACKETED.sub(lambda m: " " if _holds_contact_detail(m.group(1)) else m.group(0), text)
+    kept = _PHONE.sub(" ", _EMAIL.sub(" ", kept))
+    kept = re.sub(r"\s*,(?:\s*,)+", ",", " ".join(kept.split())).strip(_SEPARATORS)
+    return kept if any(c.isalpha() for c in kept) else ""
+
+
+def _shown_name(person, offbox: bool) -> str:
+    """The name a block prints for a person."""
+    return (_scrub_identifiers(person.canonical_name) or UNNAMED_PERSON) if offbox else person.canonical_name
+
+
+def _offbox_role(person) -> str:
+    return " — ".join(filter(None, [_scrub_identifiers(person.position), _scrub_identifiers(person.company)]))
+
+
 def _is_direct_identifier(fact) -> bool:
     """Whether a fact is, or states, an email address, phone number, birthday or street address."""
     key_words = set(re.split(r"[^a-z]+", (fact.key or "").lower()))
@@ -387,7 +421,7 @@ def format_person_profile(entity, fact_limit: int, offbox: bool = False) -> str:
     from api.services.person_facts import get_person_fact_store, rank_facts
     from api.services.relationship_summary import format_relationship_context, get_relationship_summary
 
-    parts = [f"**{entity.canonical_name}** (entity_id: {entity.id})"]
+    parts = [f"**{_shown_name(entity, offbox)}** (entity_id: {entity.id})"]
 
     if not offbox:
         if entity.emails:
@@ -396,13 +430,15 @@ def format_person_profile(entity, fact_limit: int, offbox: bool = False) -> str:
             parts.append(f"Phones: {', '.join(entity.phone_numbers)}")
         if entity.birthday:
             parts.append(f"Birthday: {entity.birthday}")
-    if entity.company or entity.position:
-        role = " — ".join(filter(None, [entity.position, entity.company]))
+    role = _offbox_role(entity) if offbox else " — ".join(filter(None, [entity.position, entity.company]))
+    if role:
         parts.append(f"Role: {role}")
 
     # Relationship summary
     rel = get_relationship_summary(entity.id)
     if rel:
+        if offbox:
+            rel = replace(rel, person_name=_scrub_identifiers(rel.person_name) or UNNAMED_PERSON)
         parts.append(format_relationship_context(rel))
 
     # Person facts. Ranked by confidence rather than the store's category/key
@@ -442,12 +478,13 @@ def _candidate_line(person) -> str:
 
 def _offbox_candidate_line(person) -> str:
     """A candidate told apart by name, role and recency alone."""
-    details = [" — ".join(filter(None, [person.position, person.company]))]
+    details = [_offbox_role(person)]
     if person.last_seen:
         seen = person.last_seen if person.last_seen.tzinfo else person.last_seen.replace(tzinfo=timezone.utc)
         details.append(f"last contact {(datetime.now(timezone.utc) - seen).days} days ago")
     details = [d for d in details if d]
-    return f"- {person.canonical_name}: {', '.join(details)}" if details else f"- {person.canonical_name}"
+    name = _shown_name(person, offbox=True)
+    return f"- {name}: {', '.join(details)}" if details else f"- {name}"
 
 
 def _candidate_lines(people: list, offbox: bool = False) -> str:
@@ -464,7 +501,8 @@ def describe_unconfirmed(resolution: PersonResolution, offbox: bool = False) -> 
     if resolution.tier == LIKELY:
         person = resolution.person
         others = [p for p in resolution.candidates if p.id != person.id]
-        best_fit = person.canonical_name if offbox else f"{person.canonical_name} (entity_id: {person.id})"
+        name = _shown_name(person, offbox)
+        best_fit = name if offbox else f"{name} (entity_id: {person.id})"
         text = (
             f"'{asked}' does not identify one person for certain. The best fit by closeness is "
             f"{best_fit}, but that is an inference, not a confirmed match."
@@ -478,8 +516,8 @@ def describe_unconfirmed(resolution: PersonResolution, offbox: bool = False) -> 
             "their full name for their details."
         )
         return text + (
-            f"\nIf you go on with {person.canonical_name}, say so in your answer "
-            f"(\"Assuming you mean {person.canonical_name}, ...\") so a wrong guess is "
+            f"\nIf you go on with {name}, say so in your answer "
+            f"(\"Assuming you mean {name}, ...\") so a wrong guess is "
             f"visible. {look_up}"
         )
     look_up = (
@@ -514,11 +552,12 @@ def _render_block(resolution: PersonResolution, depth: str, offbox: bool = False
         return f"## Person in this message (not confirmed)\n\n{describe_unconfirmed(resolution, offbox)}"
 
     person = resolution.person
+    name = _shown_name(person, offbox)
     basis = (
-        f"'{resolution.asked}' is taken to be {person.canonical_name} from the recent conversation, "
+        f"'{resolution.asked}' is taken to be {name} from the recent conversation, "
         "not from the name alone. Say so if the user may mean someone else."
         if resolution.tier == FROM_CONVERSATION
-        else f"'{resolution.asked}' is {person.canonical_name}."
+        else f"'{resolution.asked}' is {name}."
     )
     aliases = _meaningful_aliases(person)
     sections = [

@@ -3871,6 +3871,7 @@ class TestPersonContextLeavesTheContractAlone:
         ("background", _EXTRACTED_KEY, "Reach her at robin.private@example.com"),
         ("background", "mobile", "ask first"),
         ("background", _EXTRACTED_KEY, "Her number is 555-0100"),
+        ("background", _EXTRACTED_KEY, "Her number is 5550100"),
         ("background", _EXTRACTED_KEY, "Her number is (555) 010-0199"),
         ("background", _EXTRACTED_KEY, "Her number is +1 555 010 0199"),
         ("background", "birthday", "the second of January"),
@@ -4132,3 +4133,224 @@ class TestPersonContextIsStored:
         block = (await _person_turn(person_proxy, "tell me about Robin"))["person_context"]
 
         assert "Do not present any of them as the person asked about" in block
+
+
+_EMAIL_NAME = "Robin Alpha (robin.private@example.com)"
+_PHONE_NAME = "Robin Beta +1 (555) 010-0199"
+
+
+def _assert_no_contact_detail(block):
+    assert "@example.com" not in block
+    assert "555" not in block
+
+
+class TestOffboxNamesHoldNoIdentifiers:
+    @pytest.mark.parametrize("stored,shown", [
+        ("Robin Alpha (robin@example.com)", "Robin Alpha"),
+        ("Robin Alpha <robin@example.com>", "Robin Alpha"),
+        ("Robin Alpha [robin@example.com]", "Robin Alpha"),
+        ("Robin Alpha {robin@example.com}", "Robin Alpha"),
+        ("Robin Alpha (work: robin@example.com)", "Robin Alpha"),
+        ("Robin Alpha <work: robin@example.com>", "Robin Alpha"),
+        ("Robin Alpha [work: robin@example.com]", "Robin Alpha"),
+        ("Robin Alpha {work: robin@example.com}", "Robin Alpha"),
+        ("Robin Alpha, (robin@example.com), Jr", "Robin Alpha, Jr"),
+        ("Robin Alpha robin@example.com", "Robin Alpha"),
+        ("robin@example.com Robin Alpha", "Robin Alpha"),
+        ("Robin Alpha - robin@example.com", "Robin Alpha"),
+        ("Robin Alpha, robin@example.com, Jr", "Robin Alpha, Jr"),
+        ("Robin Alpha (UK) robin@example.com", "Robin Alpha (UK)"),
+        ("Robin Alpha +1 (555) 010-0199", "Robin Alpha"),
+        ("Robin Alpha (555) 010-0199", "Robin Alpha"),
+        ("Robin Alpha (555-0100)", "Robin Alpha"),
+        ("Robin Alpha 555.010.0199", "Robin Alpha"),
+        ("Robin Alpha 5550100", "Robin Alpha"),
+    ])
+    def test_an_identifier_and_its_brackets_are_dropped(self, stored, shown):
+        from api.services.person_context import _scrub_identifiers
+
+        assert _scrub_identifiers(stored) == shown
+
+    @pytest.mark.parametrize("stored", [
+        "robin@example.com",
+        "<robin@example.com>",
+        "(robin@example.com)",
+        "+1 555 010 0199",
+        "(555) 010-0199",
+        "555-0100",
+        "robin@example.com / +1 555 010 0199",
+        "robin@example.com (#1)",
+        "",
+        None,
+    ])
+    def test_nothing_but_an_identifier_leaves_nothing(self, stored):
+        from api.services.person_context import _scrub_identifiers
+
+        assert _scrub_identifiers(stored) == ""
+
+    @pytest.mark.parametrize("stored", [
+        "Robin Alpha",
+        "Chris @ StubHub",
+        "Acme (UK)",
+        "Area 51",
+        "3M",
+        "1-800 Flowers",
+        "Web3 Lead - Growth",
+        "Acme -",
+        "007",
+    ])
+    def test_ordinary_text_is_untouched(self, stored):
+        from api.services.person_context import _scrub_identifiers
+
+        assert _scrub_identifiers(stored) == stored
+
+    def test_the_identified_heading_and_basis_are_scrubbed(self, person_crm):
+        from api.services.person_context import build_offbox_person_context
+
+        person = _add_person(person_crm, _EMAIL_NAME, aliases=["Birdie"])
+
+        block = build_offbox_person_context("Who is Birdie?").block
+
+        assert f"**Robin Alpha** (entity_id: {person.id})" in block
+        assert "'Birdie' is Robin Alpha." in block
+        _assert_no_contact_detail(block)
+
+    def test_the_conversation_basis_is_scrubbed(self, person_crm):
+        from types import SimpleNamespace
+
+        from api.services.person_context import FROM_CONVERSATION, build_offbox_person_context
+
+        wanted = _add_person(person_crm, _EMAIL_NAME, 60.0)
+        _add_person(person_crm, "Robin Gamma", 55.0)
+        history = [SimpleNamespace(role="assistant", content="ok", routing={"person_id": wanted.id})]
+
+        context = build_offbox_person_context("tell me about Robin", history)
+
+        assert context.tier == FROM_CONVERSATION
+        assert "'Robin' is taken to be Robin Alpha from the recent conversation" in context.block
+        _assert_no_contact_detail(context.block)
+
+    def test_the_relationship_heading_is_scrubbed(self, person_crm):
+        from api.services.person_context import build_offbox_person_context
+
+        _add_person(person_crm, "Robin Alpha", display_name=_EMAIL_NAME, aliases=["Birdie"])
+
+        block = build_offbox_person_context("Who is Birdie?").block
+
+        assert "## Relationship Context: Robin Alpha\n" in block
+        _assert_no_contact_detail(block)
+
+    def test_uncertain_candidates_are_scrubbed(self, person_crm):
+        from api.services.person_context import build_offbox_person_context
+
+        _add_person(person_crm, _EMAIL_NAME, 80.0, position="Lead robin@example.com")
+        _add_person(person_crm, _PHONE_NAME, 75.0, company="Acme (ops@example.com)")
+
+        block = build_offbox_person_context("tell me about Robin").block
+
+        assert "- Robin Alpha: Lead" in block
+        assert "- Robin Beta: Acme" in block
+        _assert_no_contact_detail(block)
+
+    def test_the_likely_person_and_the_others_are_scrubbed(self, person_crm):
+        from api.services.person_context import build_offbox_person_context
+
+        _add_person(person_crm, _EMAIL_NAME, 90.0)
+        _add_person(person_crm, _PHONE_NAME, 5.0)
+
+        block = build_offbox_person_context("tell me about Robin").block
+
+        assert "The best fit by closeness is Robin Alpha, but" in block
+        assert "If you go on with Robin Alpha, say so" in block
+        assert '"Assuming you mean Robin Alpha, ..."' in block
+        assert "- Robin Beta" in block
+        _assert_no_contact_detail(block)
+
+    def test_a_name_that_is_only_an_identifier_is_not_printed(self, person_crm):
+        from api.services import entity_resolver
+        from api.services.link_override import LinkOverride
+        from api.services.person_context import UNNAMED_PERSON, build_offbox_person_context
+
+        person = _add_person(person_crm, "robin.private@example.com")
+        entity_resolver.get_link_override_store().add(LinkOverride(
+            id=None, name_pattern="Birdie", source_type=None, context_pattern=None,
+            preferred_person_id=person.id, rejected_person_id=None, reason="synthetic",
+        ))
+
+        block = build_offbox_person_context("Who is Birdie?").block
+
+        assert f"**{UNNAMED_PERSON}** (entity_id: {person.id})" in block
+        assert f"'Birdie' is {UNNAMED_PERSON}." in block
+        assert f"## Relationship Context: {UNNAMED_PERSON}\n" in block
+        _assert_no_contact_detail(block)
+
+    def test_a_candidate_that_is_only_an_identifier_is_not_printed(self):
+        from types import SimpleNamespace
+
+        from api.services.person_context import UNNAMED_PERSON, _offbox_candidate_line
+
+        line = _offbox_candidate_line(SimpleNamespace(
+            canonical_name="+1 555 010 0199", position=None, company="Acme", last_seen=None,
+        ))
+
+        assert line == f"- {UNNAMED_PERSON}: Acme"
+
+    def test_a_harmless_at_sign_stays_in_the_name(self, person_crm):
+        from api.services.person_context import build_offbox_person_context
+
+        _add_person(person_crm, "Chris @ StubHub", aliases=["Birdie"])
+
+        assert "**Chris @ StubHub**" in build_offbox_person_context("Who is Birdie?").block
+
+    def test_the_role_line_is_scrubbed(self, person_crm):
+        from api.services.person_context import build_offbox_person_context
+
+        _add_person(
+            person_crm, "Robin Alpha", aliases=["Birdie"],
+            position="Lead (robin@example.com)", company="Acme +1 555 010 0199",
+        )
+
+        block = build_offbox_person_context("Who is Birdie?").block
+
+        assert "Role: Lead — Acme\n" in block
+        _assert_no_contact_detail(block)
+
+    def test_a_role_that_is_only_an_identifier_has_no_line(self, person_crm):
+        from api.services.person_context import build_offbox_person_context
+
+        _add_person(person_crm, "Robin Alpha", aliases=["Birdie"], position="robin@example.com")
+
+        assert "Role:" not in build_offbox_person_context("Who is Birdie?").block
+
+    async def test_a_hermes_turn_carries_the_scrubbed_name(self, person_proxy, person_crm, hermes_store):
+        _add_person(person_crm, _EMAIL_NAME, 80.0)
+        _add_person(person_crm, _PHONE_NAME, 75.0)
+
+        block = (await _person_turn(person_proxy, "tell me about Robin"))["person_context"]
+
+        assert "- Robin Alpha" in block
+        assert "- Robin Beta" in block
+        _assert_no_contact_detail(block)
+
+    def test_the_chat_block_keeps_stored_names_and_roles_as_they_are(self, person_crm):
+        from api.services.person_context import build_person_context
+
+        _add_person(person_crm, _EMAIL_NAME, aliases=["Birdie"], position="Lead (ops@example.com)")
+
+        block = build_person_context("Who is Birdie?").block
+
+        assert f"**{_EMAIL_NAME}**" in block
+        assert f"'Birdie' is {_EMAIL_NAME}." in block
+        assert f"## Relationship Context: {_EMAIL_NAME}\n" in block
+        assert "Lead (ops@example.com)" in block
+
+    def test_chat_candidates_keep_stored_names_as_they_are(self, person_crm):
+        from api.services.person_context import build_person_context
+
+        _add_person(person_crm, _EMAIL_NAME, 90.0)
+        _add_person(person_crm, "Robin Gamma", 5.0)
+
+        block = build_person_context("tell me about Robin").block
+
+        assert f"best fit by closeness is {_EMAIL_NAME} (entity_id:" in block
+        assert f"Assuming you mean {_EMAIL_NAME}, ..." in block
