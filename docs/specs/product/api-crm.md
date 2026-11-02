@@ -225,12 +225,16 @@ Merge two person records. Combines all interactions, relationships, and source e
   "stats": {
     "interactions_updated": 156,
     "source_entities_updated": 12,
+    "facts_moved": 8,
+    "facts_cleared": 1,
     "emails_merged": 3,
     "phones_merged": 1,
     "aliases_added": 2
   }
 }
 ```
+
+Facts are never lost in a merge. The primary's facts stay; each secondary's facts move to the primary (`facts_moved`). When both people have a fact for the same category and key, one survives: a user-confirmed secondary fact replaces an unconfirmed primary fact; in every other case the primary's fact stays and the secondary's duplicate is dropped (`facts_cleared`). Fact associations follow the surviving facts.
 
 ---
 

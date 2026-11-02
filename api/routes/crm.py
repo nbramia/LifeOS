@@ -996,7 +996,11 @@ def merge_people(request: PersonMergeRequest):
     - Merges emails, phones, aliases from all secondaries into primary
     - Updates all interactions to point to primary
     - Updates all source entities to point to primary
-    - Updates all facts to point to primary
+    - Moves the secondaries' facts to the primary. The primary's facts stay;
+      when both have a fact for the same category and key, a user-confirmed
+      secondary fact replaces an unconfirmed primary one, otherwise the
+      primary's fact stays. `stats.facts_moved` counts facts moved and
+      `stats.facts_cleared` counts duplicates dropped.
     - Records the merge for durability (prevents re-creation of duplicates)
     - Deletes the secondary records
 
@@ -1029,6 +1033,7 @@ def merge_people(request: PersonMergeRequest):
         total_stats = {
             'interactions_updated': 0,
             'source_entities_updated': 0,
+            'facts_moved': 0,
             'facts_cleared': 0,
             'tone_rows_cleared': 0,
             'emails_merged': 0,

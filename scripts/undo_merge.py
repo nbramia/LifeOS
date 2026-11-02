@@ -14,6 +14,7 @@ Known limitations:
 - Relationship changes from merge are not reversed (secondary will have no relationships)
 - Notes/tags concatenated during merge are not split back
 - Aliases added to primary during merge are not removed
+- Facts moved to the primary during merge stay with the primary
 
 Usage:
     python scripts/undo_merge.py --secondary <id> [--execute]
