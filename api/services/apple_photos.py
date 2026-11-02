@@ -197,10 +197,11 @@ class ApplePhotosReader:
 
         Records have the shape of the Apple Data Agent export's face
         appearances (``asset_uuid``, ``timestamp``, ``visible_faces``,
-        ``face_size``, ``face_quality``, ``eyes_closed``, ``key_face``), so
+        ``asset_hidden``, ``face_size``, ``face_x``, ``face_y``,
+        ``face_quality``, ``eyes_closed``, ``key_face``), so
         ``api.services.profile_photo`` ranks both the same way. The face
-        facts mirror ``scripts/apple_data_export.py``. A library without the
-        face-quality columns yields an empty list.
+        facts and their meanings mirror ``scripts/apple_data_export.py``. A
+        library without the face columns yields an empty list.
         """
         conn = self._get_connection()
         try:
@@ -208,9 +209,7 @@ class ApplePhotosReader:
                 SELECT
                     a.ZUUID,
                     a.ZDATECREATED,
-                    CASE WHEN COALESCE(a.ZTRASHEDSTATE, 0) = 0
-                          AND COALESCE(a.ZHIDDEN, 0) = 0
-                          AND COALESCE(f.ZHIDDEN, 0) = 0
+                    CASE WHEN COALESCE(f.ZHIDDEN, 0) = 0
                           AND COALESCE(f.ZASSETVISIBLE, 1) = 1
                           AND COALESCE(f.ZISINTRASH, 0) = 0
                          THEN (SELECT COUNT(*) FROM ZDETECTEDFACE o
@@ -218,9 +217,14 @@ class ApplePhotosReader:
                                  AND COALESCE(o.ZHIDDEN, 0) = 0
                                  AND COALESCE(o.ZASSETVISIBLE, 1) = 1
                                  AND COALESCE(o.ZISINTRASH, 0) = 0
-                                 AND COALESCE(o.ZDETECTIONTYPE, 1) = 1)
+                                 AND COALESCE(o.ZDETECTIONTYPE, 1) = 1
+                                 AND COALESCE(o.ZSIZE, 0) > 0)
                          ELSE 0 END AS visible_faces,
+                    (COALESCE(a.ZTRASHEDSTATE, 0) != 0
+                     OR COALESCE(a.ZHIDDEN, 0) != 0) AS asset_hidden,
                     f.ZSIZE AS face_size,
+                    f.ZCENTERX AS face_x,
+                    1.0 - f.ZCENTERY AS face_y,
                     f.ZQUALITY AS face_quality,
                     (COALESCE(f.ZISLEFTEYECLOSED, 0) = 1
                      OR COALESCE(f.ZISRIGHTEYECLOSED, 0) = 1) AS eyes_closed,
@@ -239,13 +243,17 @@ class ApplePhotosReader:
                     "asset_uuid": row["ZUUID"],
                     "timestamp": timestamp.isoformat() if timestamp else None,
                     "visible_faces": row["visible_faces"],
+                    "asset_hidden": row["asset_hidden"],
                     "face_size": row["face_size"],
+                    "face_x": row["face_x"],
+                    "face_y": row["face_y"],
                     "face_quality": row["face_quality"],
                     "eyes_closed": row["eyes_closed"],
                     "key_face": row["key_face"],
                 })
             return records
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as e:
+            logger.warning(f"Photos face facts unavailable: {type(e).__name__}: {e}")
             return []
         finally:
             conn.close()

@@ -471,9 +471,11 @@ def get_profile_photo(person_id: str):
 
     Returns the photo ranked best as an avatar (see
     ``api.services.profile_photo``: fewest faces in the frame, then a face
-    large enough to read, eyes open, quality, recency) when the Photos import
-    stored a pick for this person. Otherwise returns the most recent photo of
-    the person that has a thumbnail available.
+    large enough to read, eyes open, Apple's key face, quality, recency) when
+    the Photos import stored a pick for this person, cropped to a square
+    around the face (``api.services.profile_crop``) when the pick carries the
+    face's position and the crop succeeds. Otherwise returns the most recent
+    photo of the person that has a thumbnail available.
     Use this for avatars/profile pictures in the UI. Also accepts HEAD --
     stacking a `@router.head` registration on the same function (rather than
     branching on the request method ourselves) lets Starlette's `FileResponse`
@@ -486,12 +488,14 @@ def get_profile_photo(person_id: str):
 
     Works without a Photos library: staged thumbnails are served first.
     """
-    from api.services import profile_photo
+    from api.services import profile_crop, profile_photo
     from api.services.interaction_store import get_interaction_store
 
-    for asset_uuid in profile_photo.load_picks().get(person_id, ()):
-        thumb_path = _find_thumbnail_path(asset_uuid)
+    for pick in profile_photo.load_picks().get(person_id, ()):
+        thumb_path = _find_thumbnail_path(str(pick.get("asset", ""))) if isinstance(pick, dict) else None
         if thumb_path:
+            if all(key in pick for key in ("x", "y", "size")):
+                thumb_path = profile_crop.cropped_avatar(person_id, thumb_path, pick) or thumb_path
             return _profile_photo_response(thumb_path)
 
     interaction_store = get_interaction_store()

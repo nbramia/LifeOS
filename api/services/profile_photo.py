@@ -1,29 +1,35 @@
 """Profile photo selection: which of a person's photos makes the best avatar.
 
 A Photos face appearance record carries a few facts about the photo
-(``visible_faces``, ``face_size``, ``face_quality``, ``eyes_closed``,
-``key_face``) next to ``asset_uuid`` and ``timestamp``. The Apple Data Agent
-export and the local Photos reader emit the same shape, and both feed
-``build_picks``.
+(``visible_faces``, ``asset_hidden``, ``face_size``, ``face_x``, ``face_y``,
+``face_quality``, ``eyes_closed``, ``key_face``) next to ``asset_uuid`` and
+``timestamp``. The Apple Data Agent export and the local Photos reader emit the
+same shape, and both feed ``build_picks``.
 
 Ranking, best first (each element breaks ties in the one before):
 
 1. fewest visible faces in the photo (solo, then two-person, then groups)
-2. a face at least ``MIN_AVATAR_FACE_SIZE`` of the frame wide
+2. a face at least ``MIN_AVATAR_FACE_SIZE`` of the image's longer side
 3. eyes open
 4. Apple's key face for the person
 5. higher face quality, in ``QUALITY_LEVELS`` coarse steps
 6. newer photo
 
-A record without usable facts (no visible-face count, or a face with no
-measured size) ranks after every record that has them, so a person whose
-records carry no facts gets no pick and the profile route keeps serving their
-most recent photo.
+A trashed or hidden asset is never picked. A record without usable facts (no
+visible-face count, or a face with no measured size) ranks after every record
+that has them, so a person whose records carry no facts gets no pick and the
+profile route keeps serving their most recent photo.
+
+Ranking needs only the standard library, so the Apple Data Agent export loads
+this file by path to choose which photos to stage in higher resolution; the
+settings import is deferred to the functions that touch the picks file.
 
 The picks live in one small JSON file (``settings.photos_profile_picks_path``):
-``{person_id: [asset_uuid, ...]}``, best first, only assets whose thumbnail is
-available when the file is written. The profile route reads it with one dict
-lookup per avatar request.
+``{person_id: [{"asset": uuid, "x": .., "y": .., "size": ..}, ...]}``, best
+first, only assets whose thumbnail is available when the file is written. ``x``,
+``y`` and ``size`` frame the person's face for ``api.services.profile_crop``
+and are absent when the face has no measured geometry. The profile route reads
+the file with one dict lookup per avatar request.
 """
 import json
 import logging
@@ -34,12 +40,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
-from config.settings import settings
-
 logger = logging.getLogger(__name__)
 
-# A face this wide (fraction of the frame) or wider can read as an avatar. About
-# the median face width in single-face photos of a real library.
+# A face this large (fraction of the image's longer side) or larger can read as
+# an avatar. About the median face in single-face photos of a real library.
 MIN_AVATAR_FACE_SIZE = 0.10
 # Face quality (0..1, higher is better) is compared in this many steps, so
 # recency decides between near-equal faces.
@@ -57,13 +61,23 @@ class Appearance:
     timestamp: float = 0.0
     visible_faces: Optional[int] = None
     face_size: Optional[float] = None
+    face_x: Optional[float] = None
+    face_y: Optional[float] = None
     quality: Optional[float] = None
     eyes_closed: bool = False
     key_face: bool = False
+    asset_hidden: bool = False
 
     @property
     def has_facts(self) -> bool:
         return (self.visible_faces or 0) >= 1 and (self.face_size or 0) > 0
+
+    @property
+    def has_geometry(self) -> bool:
+        return (
+            self.face_x is not None and 0 <= self.face_x <= 1
+            and self.face_y is not None and 0 <= self.face_y <= 1
+        )
 
 
 def appearance_from_record(record: dict) -> Optional[Appearance]:
@@ -82,9 +96,12 @@ def appearance_from_record(record: dict) -> Optional[Appearance]:
         timestamp=timestamp,
         visible_faces=record.get("visible_faces"),
         face_size=record.get("face_size"),
+        face_x=record.get("face_x"),
+        face_y=record.get("face_y"),
         quality=record.get("face_quality"),
         eyes_closed=bool(record.get("eyes_closed")),
         key_face=bool(record.get("key_face")),
+        asset_hidden=bool(record.get("asset_hidden")),
     )
 
 
@@ -111,22 +128,37 @@ def select_profile_photos(
     appearances: Iterable[Appearance],
     has_thumbnail: Callable[[str], bool],
     limit: int = MAX_STORED_PICKS,
-) -> list[str]:
-    """Up to ``limit`` distinct asset UUIDs, best avatar first.
+) -> list[Appearance]:
+    """Up to ``limit`` appearances of distinct assets, best avatar first.
 
-    Only assets with a thumbnail qualify. Empty when the best qualifying
-    asset has no facts, because the person's records carry none.
+    Only visible (not trashed or hidden) assets with a thumbnail qualify. Empty
+    when the best qualifying asset has no facts, because the person's records
+    carry none.
     """
-    picks: list[str] = []
+    picks: list[Appearance] = []
+    chosen: set[str] = set()
     for appearance in sorted(appearances, key=rank_key):
-        if appearance.asset_uuid in picks or not has_thumbnail(appearance.asset_uuid):
+        if (
+            appearance.asset_hidden
+            or appearance.asset_uuid in chosen
+            or not has_thumbnail(appearance.asset_uuid)
+        ):
             continue
         if not picks and not appearance.has_facts:
             return []
-        picks.append(appearance.asset_uuid)
+        picks.append(appearance)
+        chosen.add(appearance.asset_uuid)
         if len(picks) == limit:
             break
     return picks
+
+
+def pick_entry(appearance: Appearance) -> dict:
+    """The stored form of a pick: the asset plus its face geometry, if any."""
+    entry: dict = {"asset": appearance.asset_uuid}
+    if appearance.has_facts and appearance.has_geometry:
+        entry.update(x=appearance.face_x, y=appearance.face_y, size=appearance.face_size)
+    return entry
 
 
 def thumbnail_available(asset_uuid: str) -> bool:
@@ -139,23 +171,29 @@ def thumbnail_available(asset_uuid: str) -> bool:
 def build_picks(
     records_by_person: dict[str, Iterable[dict]],
     has_thumbnail: Callable[[str], bool] = thumbnail_available,
-) -> dict[str, list[str]]:
-    """``{person_id: ranked asset UUIDs}`` for people that have a pick."""
-    picks: dict[str, list[str]] = {}
+) -> dict[str, list[dict]]:
+    """``{person_id: ranked pick entries}`` for people that have a pick."""
+    picks: dict[str, list[dict]] = {}
     for person_id, records in records_by_person.items():
         appearances = [a for a in map(appearance_from_record, records) if a]
         chosen = select_profile_photos(appearances, has_thumbnail)
         if chosen:
-            picks[person_id] = chosen
+            picks[person_id] = [pick_entry(a) for a in chosen]
     return picks
 
 
-def write_picks(picks: dict[str, list[str]]) -> None:
-    """Replace the picks file atomically; remove it when there are no picks."""
-    path = settings.photos_profile_picks_path
+def write_picks(picks: dict[str, list[dict]]) -> None:
+    """Replace the picks file atomically.
+
+    No picks means the data had no usable facts (an export from a Mac that
+    could not read them, a host without a Photos library), so the file stays.
+    """
     if not picks:
-        path.unlink(missing_ok=True)
+        logger.info("No profile photo picks to store; keeping the existing picks file")
         return
+    from config.settings import settings
+
+    path = settings.photos_profile_picks_path
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
     try:
@@ -170,9 +208,11 @@ def write_picks(picks: dict[str, list[str]]) -> None:
 _cache: tuple = (None, {})
 
 
-def load_picks() -> dict[str, list[str]]:
+def load_picks() -> dict[str, list[dict]]:
     """The picks file's contents, re-read only when the file changes."""
     global _cache
+    from config.settings import settings
+
     path = settings.photos_profile_picks_path
     try:
         stat = path.stat()

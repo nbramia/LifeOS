@@ -56,6 +56,9 @@ EXPORT_DIR = PROJECT_ROOT / "data" / "apple-imports"
 # Photos thumbnails staged for the Linux server, as
 # photos_thumbnails/<FIRST_CHAR>/<ASSET_UUID>.jpeg under EXPORT_DIR.
 PHOTOS_THUMBNAILS_SUBDIR = "photos_thumbnails"
+# Larger copies of the photos each person's avatar is likely to come from, as
+# photos_profile_sources/<FIRST_CHAR>/<ASSET_UUID>.jpeg under EXPORT_DIR.
+PHOTOS_PROFILE_SOURCES_SUBDIR = "photos_profile_sources"
 
 
 def _parse_abcdp_labeled(field_dict: dict | None) -> list[dict]:
@@ -588,11 +591,15 @@ def _same_file(src: Path, dest: Path) -> bool:
     )
 
 
-def _stage_photo_thumbnails(library: Path, asset_uuids, dest_root: Path) -> dict:
-    """Copy one small thumbnail per asset into dest_root/<FIRST_CHAR>/<UUID>.jpeg.
+def _stage_photo_thumbnails(
+    library: Path, asset_uuids, dest_root: Path,
+    patterns=photos_origin_helper.THUMBNAIL_DERIVATIVES,
+) -> dict:
+    """Copy one derivative per asset into dest_root/<FIRST_CHAR>/<UUID>.jpeg.
 
-    Prefers the library's masters derivative, then the smaller regular
-    derivatives (photos_origin_helper.THUMBNAIL_DERIVATIVES). A file already
+    Takes the first derivative that exists in ``patterns``: by default the
+    library's masters derivative, then the smaller regular derivatives
+    (photos_origin_helper.THUMBNAIL_DERIVATIVES). A file already
     staged with the same size and mtime is skipped. A copy failure for one
     asset is counted and does not stop the rest. Staged files are never
     removed; the server-bound rsync has no --delete and a stale thumbnail is
@@ -606,9 +613,7 @@ def _stage_photo_thumbnails(library: Path, asset_uuids, dest_root: Path) -> dict
         if not photos_origin_helper.UUID_RE.match(asset_uuid):
             missing += 1
             continue
-        sources = photos_origin_helper.derivative_paths(
-            library, asset_uuid, photos_origin_helper.THUMBNAIL_DERIVATIVES
-        )
+        sources = photos_origin_helper.derivative_paths(library, asset_uuid, patterns)
         if not sources:
             missing += 1
             continue
@@ -625,8 +630,8 @@ def _stage_photo_thumbnails(library: Path, asset_uuids, dest_root: Path) -> dict
             if failed <= 5:
                 logger.warning(f"Could not stage a photo thumbnail: {type(e).__name__}")
     logger.info(
-        f"Photo thumbnails: {copied} copied, {skipped} up to date, "
-        f"{missing} missing, {failed} failed"
+        f"Photo derivatives staged in {dest_root.name}: {copied} copied, "
+        f"{skipped} up to date, {missing} missing, {failed} failed"
     )
     return {
         "status": "ok",
@@ -637,15 +642,68 @@ def _stage_photo_thumbnails(library: Path, asset_uuids, dest_root: Path) -> dict
     }
 
 
-# One row per face of a person: the asset plus the facts that rank it as an
-# avatar. visible_faces counts the unhidden, visible human faces on the asset
-# and is 0 when the asset is trashed or hidden or this face is itself hidden,
-# not visible, or trashed. Mirrored by ApplePhotosReader.get_profile_appearances.
-_FACE_FACT_NAMES = ("visible_faces", "face_size", "face_quality", "eyes_closed", "key_face")
+def _load_profile_ranking():
+    """api/services/profile_photo.py, loaded by path: it needs only the
+    standard library, and importing it as part of the api package would pull in
+    the whole service layer."""
+    import importlib.util
+
+    name = "lifeos_profile_photo_ranking"
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(
+        name, PROJECT_ROOT / "api" / "services" / "profile_photo.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _stage_profile_sources(library: Path, faces_export: list, dest_root: Path) -> dict:
+    """Stage the largest derivative of each person's best avatar candidates.
+
+    Ranks every person's appearances with the server's avatar ranking and
+    stages the top few assets that have a thumbnail, so the server can crop a
+    face out of a larger image than the thumbnail.
+    """
+    ranking = _load_profile_ranking()
+    by_person: dict = {}
+    for face in faces_export:
+        by_person.setdefault(face["person_pk"], []).append(face)
+
+    def has_thumbnail(asset_uuid):
+        return bool(photos_origin_helper.UUID_RE.match(asset_uuid)) and bool(
+            photos_origin_helper.derivative_paths(
+                library, asset_uuid, photos_origin_helper.THUMBNAIL_DERIVATIVES
+            )
+        )
+
+    assets = set()
+    for records in by_person.values():
+        appearances = [a for a in map(ranking.appearance_from_record, records) if a]
+        assets.update(a.asset_uuid for a in ranking.select_profile_photos(appearances, has_thumbnail))
+    return _stage_photo_thumbnails(
+        library, assets, dest_root, photos_origin_helper.PREVIEW_DERIVATIVES
+    )
+
+
+# One row per face of a person: the asset plus the facts that rank and frame it
+# as an avatar. Mirrored by ApplePhotosReader.get_profile_appearances.
+#   visible_faces  unhidden, visible human faces with a measured size on the
+#                  asset (rows with no size are bodies Photos tagged without a
+#                  face); 0 when this face is itself hidden, not visible, or
+#                  trashed
+#   asset_hidden   the asset is trashed or hidden
+#   face_size      face box side as a fraction of the image's longer side
+#   face_x/face_y  face box centre as fractions of width and height, origin
+#                  top-left (Photos stores Y from the bottom)
+_FACE_FACT_NAMES = (
+    "visible_faces", "asset_hidden", "face_size", "face_x", "face_y",
+    "face_quality", "eyes_closed", "key_face",
+)
 _FACE_FACTS_COLUMNS = """,
-                    CASE WHEN COALESCE(a.ZTRASHEDSTATE, 0) = 0
-                          AND COALESCE(a.ZHIDDEN, 0) = 0
-                          AND COALESCE(f.ZHIDDEN, 0) = 0
+                    CASE WHEN COALESCE(f.ZHIDDEN, 0) = 0
                           AND COALESCE(f.ZASSETVISIBLE, 1) = 1
                           AND COALESCE(f.ZISINTRASH, 0) = 0
                          THEN (SELECT COUNT(*) FROM ZDETECTEDFACE o
@@ -653,9 +711,14 @@ _FACE_FACTS_COLUMNS = """,
                                  AND COALESCE(o.ZHIDDEN, 0) = 0
                                  AND COALESCE(o.ZASSETVISIBLE, 1) = 1
                                  AND COALESCE(o.ZISINTRASH, 0) = 0
-                                 AND COALESCE(o.ZDETECTIONTYPE, 1) = 1)
+                                 AND COALESCE(o.ZDETECTIONTYPE, 1) = 1
+                                 AND COALESCE(o.ZSIZE, 0) > 0)
                          ELSE 0 END AS visible_faces,
+                    (COALESCE(a.ZTRASHEDSTATE, 0) != 0
+                     OR COALESCE(a.ZHIDDEN, 0) != 0) AS asset_hidden,
                     f.ZSIZE AS face_size,
+                    f.ZCENTERX AS face_x,
+                    1.0 - f.ZCENTERY AS face_y,
                     f.ZQUALITY AS face_quality,
                     (COALESCE(f.ZISLEFTEYECLOSED, 0) = 1
                      OR COALESCE(f.ZISRIGHTEYECLOSED, 0) = 1) AS eyes_closed,
@@ -720,6 +783,7 @@ def export_photos_faces(dry_run: bool = False) -> dict:
     people_export = []
     faces_export = []
     errors = 0
+    face_facts = True
 
     for person in people_rows:
         contact_uri = person["ZPERSONURI"]
@@ -741,9 +805,15 @@ def export_photos_faces(dry_run: bool = False) -> dict:
                     _FACE_APPEARANCES_SQL.format(facts=_FACE_FACTS_COLUMNS),
                     (person["Z_PK"],),
                 ).fetchall()
-            except sqlite3.OperationalError:
-                # A library without the face-quality columns still exports
-                # its appearances, just without the facts.
+            except sqlite3.OperationalError as e:
+                # A library without the face columns still exports its
+                # appearances, just without the facts.
+                if face_facts:
+                    logger.warning(
+                        f"Photos face facts unavailable, exporting appearances "
+                        f"without them: {type(e).__name__}: {e}"
+                    )
+                    face_facts = False
                 photos = conn.execute(
                     _FACE_APPEARANCES_SQL.format(facts=""), (person["Z_PK"],)
                 ).fetchall()
@@ -783,6 +853,15 @@ def export_photos_faces(dry_run: bool = False) -> dict:
         logger.warning(f"Photo thumbnail staging failed: {e}")
         thumbnails = {"status": "error", "error": str(e)}
 
+    # Like thumbnail staging, best-effort: it never fails the faces export.
+    try:
+        profile_sources = _stage_profile_sources(
+            library, faces_export, EXPORT_DIR / PHOTOS_PROFILE_SOURCES_SUBDIR
+        )
+    except Exception as e:
+        logger.warning(f"Profile photo source staging failed: {e}")
+        profile_sources = {"status": "error", "error": str(e)}
+
     out_path = EXPORT_DIR / "photos_faces.json"
     with open(out_path, "w") as f:
         json.dump({
@@ -801,7 +880,9 @@ def export_photos_faces(dry_run: bool = False) -> dict:
         "people": len(people_export),
         "faces": len(faces_export),
         "path": str(out_path),
+        "face_facts": face_facts,
         "thumbnails": thumbnails,
+        "profile_sources": profile_sources,
     }
 
 
