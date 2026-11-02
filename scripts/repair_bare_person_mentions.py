@@ -10,8 +10,9 @@ phone. This repair, in order:
   notes under _-prefixed folders, for anyone except the protected rows below
 * re-resolves each mention on a bare row, per note, with the mention resolver:
   on a clear winner the source entity moves to that person, along with the
-  note's interaction if this row held it; otherwise the link is removed and the
-  interaction with it
+  note's interaction if this row held it; otherwise the link is removed, and the
+  interaction goes to the first full-name person the note names, or is removed
+  if it names none
 * hides each bare row left with nothing. Hiding is reversible, and consistency
   verification only removes a hidden row's interactions and inferred
   relationships, so nothing of value goes with it
@@ -154,9 +155,18 @@ class Move:
 
 
 @dataclass
+class Handoff:
+    """A note's interaction going to a full-name person the note names."""
+
+    interaction: NoteInteraction
+    to_id: str
+
+
+@dataclass
 class Plan:
     counts: Counter = field(default_factory=Counter)
     moves: list[Move] = field(default_factory=list)
+    handoffs: list[Handoff] = field(default_factory=list)
     unlink_ids: list[str] = field(default_factory=list)
     delete_link_ids: list[str] = field(default_factory=list)
     delete_interaction_ids: list[str] = field(default_factory=list)
@@ -314,9 +324,11 @@ class _FullNames:
 
     def __init__(self, people: list[PersonEntity]):
         self._by_name: dict[str, Optional[PersonEntity]] = {}
+        self.real_ids: set[str] = set()
         for person in people:
             if is_bare_person(person):
                 continue
+            self.real_ids.add(person.id)
             for name in [person.canonical_name, *person.aliases]:
                 key = name.strip().casefold()
                 # A name two people share identifies neither.
@@ -385,12 +397,15 @@ def _plan_mentions(
     links: dict[tuple[str, str], list[Link]] = defaultdict(list)
     held: dict[str, list[NoteInteraction]] = defaultdict(list)
     co_mentioned: set[str] = set()
+    named_in_full: dict[str, str] = {}
     for rows in note_rows:
         for link in rows.links:
             if link.person_id in eligible and link.status == "auto":
                 links[(link.person_id, link.name)].append(link)
             elif link.person_id and link.person_id not in eligible and not is_ambiguous_mention(link.name):
                 co_mentioned.add(link.person_id)
+                if link.person_id in full_names.real_ids:
+                    named_in_full.setdefault(link.name, link.person_id)
         for interaction in rows.interactions:
             if interaction.person_id in eligible:
                 held[interaction.person_id].append(interaction)
@@ -408,6 +423,7 @@ def _plan_mentions(
                 person = full_names.get(name)
                 if person:
                     co_mentioned.add(person.id)
+                    named_in_full.setdefault(name, person.id)
         context = build_note_context(
             rel_path, frontmatter, body,
             note_date=_note_date(vault / rel_path, frontmatter, body),
@@ -438,11 +454,20 @@ def _plan_mentions(
             plan.affected_ids.update((person_id, decision.entity.id))
         else:
             plan.unlink_ids.extend(link.id for link in mention_links)
-            plan.delete_interaction_ids.extend(i.id for i in interactions)
+            # The indexer gives a note's interaction to the first full name in
+            # sort order, so the same person inherits it here.
+            heir = named_in_full[min(named_in_full)] if named_in_full else None
+            if heir:
+                plan.handoffs.extend(Handoff(i, heir) for i in interactions)
+                plan.counts["interactions_handed_to_full_name"] += len(interactions)
+                if interactions:
+                    plan.affected_ids.add(heir)
+            else:
+                plan.delete_interaction_ids.extend(i.id for i in interactions)
+                plan.counts["interactions_removed"] += len(interactions)
             held[person_id] = []
             plan.counts["mentions_unlinked"] += 1
             plan.counts["links_removed"] += len(mention_links)
-            plan.counts["interactions_removed"] += len(interactions)
             reason = decision.reason if decision else "note_not_on_disk"
             plan.counts[f"unlinked:{reason}"] += 1
             plan.affected_ids.add(person_id)
@@ -564,6 +589,10 @@ def _apply_rows(plan: Plan, crm_db: Path, interactions_db: Path) -> None:
                 "UPDATE interactions SET person_id = ? WHERE id = ?",
                 [(move.to_id, interaction_id) for interaction_id in move.interaction_ids],
             )
+        conn.executemany(
+            "UPDATE interactions SET person_id = ? WHERE id = ?",
+            [(handoff.to_id, handoff.interaction.id) for handoff in plan.handoffs],
+        )
         for chunk in _in_chunks(plan.delete_interaction_ids):
             conn.execute(f"DELETE FROM interactions WHERE id IN ({','.join('?' * len(chunk))})", chunk)
         conn.commit()
@@ -597,19 +626,21 @@ def _apply_rows(plan: Plan, crm_db: Path, interactions_db: Path) -> None:
 
 def _apply_people(plan: Plan, store: PersonEntityStore, crm_db: Path) -> None:
     """Credit each target with the notes that moved to them, then hide empty rows."""
-    by_target: dict[str, list[Move]] = defaultdict(list)
+    credits: dict[str, list[tuple[str, str]]] = defaultdict(list)
     for move in plan.moves:
-        by_target[move.to_id].append(move)
-    for target_id, moves in by_target.items():
+        if move.interaction_ids:
+            credits[move.to_id].append((move.note_path, move.source_type))
+    for handoff in plan.handoffs:
+        credits[handoff.to_id].append((handoff.interaction.note_path, handoff.interaction.source_type))
+    for target_id, notes in credits.items():
         person = store.get_by_id(target_id)
         if not person:
             continue
-        for move in moves:
-            if move.interaction_ids:
-                if move.note_path not in person.related_notes:
-                    person.related_notes.append(move.note_path)
-                if move.source_type not in person.sources:
-                    person.sources.append(move.source_type)
+        for note_path, source_type in notes:
+            if note_path not in person.related_notes:
+                person.related_notes.append(note_path)
+            if source_type not in person.sources:
+                person.sources.append(source_type)
         store.update(person)
 
     for person_id in plan.hide_ids:

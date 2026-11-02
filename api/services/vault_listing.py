@@ -59,6 +59,13 @@ def _falsy_marker(value: object) -> bool:
     return not value
 
 
+def _is_explicit_false(value: object) -> bool:
+    """False or the words false/no. A blank value is an empty property, not an answer."""
+    if isinstance(value, str):
+        return value.strip().casefold() in ("false", "no")
+    return value is False
+
+
 def no_people_reason(
     rel_path: str | None,
     frontmatter: dict,
@@ -70,7 +77,7 @@ def no_people_reason(
     with them, so these notes create no people, links, interactions, or source
     entities. A note qualifies by sitting under a configured bulk-content folder
     (``LIFEOS_VAULT_NO_PEOPLE_PATHS``), or by saying so in its frontmatter with
-    ``people: false`` or a ``generated:`` key that isn't itself false. Where a
+    an explicit ``people: false`` or a ``generated:`` key that isn't itself false. Where a
     note came from (``source: llm``, say) doesn't decide it: many such notes
     are about real contact.
 
@@ -88,7 +95,7 @@ def no_people_reason(
             prefix = folder.replace("\\", "/").strip().strip("/").casefold()
             if prefix and folded.startswith(prefix + "/"):
                 return "folder"
-    if "people" in frontmatter and _falsy_marker(frontmatter["people"]) and frontmatter["people"] != []:
+    if _is_explicit_false(frontmatter.get("people")):
         return "people_false"
     if "generated" in frontmatter and not _falsy_marker(frontmatter["generated"]):
         return "generated"

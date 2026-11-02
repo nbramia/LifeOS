@@ -4364,14 +4364,14 @@
             }
 
             peopleList.innerHTML = crmState.people.map(person => {
-                const initials = getInitials(person.canonical_name || person.display_name || '?');
+                const initials = getInitials(personLabel(person) || '?');
                 const isActive = person.id === crmState.selectedPersonId;
 
                 return `
                     <div class="crm-person-card ${isActive ? 'active' : ''}" onclick="selectCrmPerson('${person.id}')">
                         <div class="crm-person-avatar">${initials}</div>
                         <div class="crm-person-info">
-                            <div class="crm-person-name">${escapeHtml(person.canonical_name || person.display_name)}</div>
+                            <div class="crm-person-name">${escapeHtml(personLabel(person))}</div>
                             <div class="crm-person-meta">${escapeHtml(person.company || person.emails?.[0] || '')}</div>
                             <div class="crm-person-stats">
                                 ${person.email_count ? `<span class="crm-person-stat" title="Emails">📧${person.email_count}</span>` : ''}
@@ -4383,6 +4383,12 @@
                     </div>
                 `;
             }).join('');
+        }
+
+        // A person named only after a phone or address shows the name that came with it.
+        function personLabel(person) {
+            const name = person.canonical_name || '';
+            return /^\+?\d|@/.test(name) && person.display_name ? person.display_name : (name || person.display_name);
         }
 
         // Get initials from name
@@ -4452,7 +4458,7 @@
         // Render person header immediately with skeleton placeholders for content
         function renderPersonHeaderWithSkeletons(person) {
             const main = document.getElementById('crmMain');
-            const name = person.canonical_name || person.display_name || 'Loading...';
+            const name = personLabel(person) || 'Loading...';
             const initials = getInitials(name);
             const company = person.company || '';
             const position = person.position || '';
@@ -4499,14 +4505,14 @@
         // Render person detail view
         function renderCrmPersonDetail(person) {
             const main = document.getElementById('crmMain');
-            const initials = getInitials(person.canonical_name || person.display_name || '?');
+            const initials = getInitials(personLabel(person) || '?');
 
             main.innerHTML = `
                 <div class="crm-detail-header">
                     <div style="display: flex; align-items: center; gap: 1rem;">
                         <div class="crm-person-avatar" style="width: 56px; height: 56px; font-size: 1.25rem;">${initials}</div>
                         <div>
-                            <h2 style="font-size: 1.25rem; margin-bottom: 0.25rem;">${escapeHtml(person.canonical_name || person.display_name)}</h2>
+                            <h2 style="font-size: 1.25rem; margin-bottom: 0.25rem;">${escapeHtml(personLabel(person))}</h2>
                             <p style="color: var(--text-secondary); font-size: 0.875rem;">
                                 ${person.position ? escapeHtml(person.position) + ' at ' : ''}
                                 ${person.company ? escapeHtml(person.company) : ''}

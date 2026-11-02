@@ -617,6 +617,19 @@ class SourceEntityStore:
         finally:
             conn.close()
 
+    def has_confirmed_note_link(self, source_type: str, file_path: str, person_id: str) -> bool:
+        """Whether a human confirmed any mention of this person in this note."""
+        prefix = f"{file_path}:"
+        conn = self._get_connection()
+        try:
+            return conn.execute(
+                "SELECT 1 FROM source_entities WHERE source_type = ? AND canonical_person_id = ? "
+                "AND link_status = ? AND substr(source_id, 1, ?) = ? LIMIT 1",
+                (source_type, person_id, LINK_STATUS_CONFIRMED, len(prefix), prefix),
+            ).fetchone() is not None
+        finally:
+            conn.close()
+
     def get_for_person(
         self,
         canonical_person_id: str,

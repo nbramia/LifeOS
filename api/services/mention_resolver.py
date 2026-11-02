@@ -10,9 +10,9 @@ config/relationship_weights.py). A missed link costs little and a wrong one
 costs a lot, so anything less resolves to no one.
 
 Every decision is deterministic and carries its score breakdown. No LLM calls.
-A person known only by one word is never a target, nor is a row that doesn't
-read as a person, nor the owner, whose name in their own notes is not a mention
-of someone else.
+Scoring never picks a person known only by one word, nor a row that doesn't read
+as a person, nor the owner, whose name in their own notes is not a mention of
+someone else. A link override is a human decision and can name anyone visible.
 """
 from __future__ import annotations
 
@@ -228,7 +228,7 @@ class MentionResolver:
     ):
         """
         Args:
-            people: Visible, unmerged people; one-word rows are never targets
+            people: Visible, unmerged people; scoring skips one-word rows
             crm_db: CRM database, read for relationships and folder history
             interaction_db: Interactions database, read for contact history
             vault_root: Vault location, to read stored note paths against
@@ -247,7 +247,7 @@ class MentionResolver:
         self._by_first: dict[str, list[PersonEntity]] = defaultdict(list)
         self._by_last: dict[str, list[PersonEntity]] = defaultdict(list)
         self._by_alias: dict[str, list[PersonEntity]] = defaultdict(list)
-        self._bare_ids: set[str] = set()
+        self._visible: dict[str, PersonEntity] = {}
         self._owner_first = (owner_name or "").strip().casefold() or None
         self._my_person_id = my_person_id
 
@@ -255,9 +255,8 @@ class MentionResolver:
             if person.id == my_person_id:
                 self._owner_first = parse_name(person.canonical_name).first.casefold()
                 continue
-            if is_bare_person(person):
-                self._bare_ids.add(person.id)
-            elif _reads_as_a_person(person):
+            self._visible[person.id] = person
+            if not is_bare_person(person) and _reads_as_a_person(person):
                 self._index_person(person)
 
         self._folder_links: Optional[dict[str, Counter]] = None
@@ -295,11 +294,9 @@ class MentionResolver:
             self._overrides, mention, source_type=None, context_path=context.rel_path
         )
         if override:
-            preferred = self._by_id.get(override.preferred_person_id)
+            preferred = self._visible.get(override.preferred_person_id)
             if preferred:
                 return MentionDecision(mention, REASON_OVERRIDE, preferred, score=100.0)
-            if override.preferred_person_id in self._bare_ids:
-                return MentionDecision(mention, REASON_NO_CANDIDATE)
 
         if self._owner_first and parsed.first.casefold() == self._owner_first and parsed.last is None:
             return MentionDecision(mention, REASON_OWNER)
@@ -582,22 +579,25 @@ class MentionResolver:
 
         wanted = set(ids)
         pairs: dict[str, list[float]] = defaultdict(list)
-        with _read_only(self._crm_db) as conn:
-            other_list = sorted(others)
-            for i in range(0, len(other_list), _SQL_CHUNK):
-                chunk = other_list[i:i + _SQL_CHUNK]
-                marks = ",".join("?" * len(chunk))
-                for row in conn.execute(
-                    f"SELECT * FROM relationships WHERE person_a_id IN ({marks}) OR person_b_id IN ({marks})",
-                    (*chunk, *chunk),
-                ):
-                    relationship = Relationship.from_row(row)
-                    for mine, other in (
-                        (relationship.person_a_id, relationship.person_b_id),
-                        (relationship.person_b_id, relationship.person_a_id),
+        try:
+            with _read_only(self._crm_db) as conn:
+                other_list = sorted(others)
+                for i in range(0, len(other_list), _SQL_CHUNK):
+                    chunk = other_list[i:i + _SQL_CHUNK]
+                    marks = ",".join("?" * len(chunk))
+                    for row in conn.execute(
+                        f"SELECT * FROM relationships WHERE person_a_id IN ({marks}) OR person_b_id IN ({marks})",
+                        (*chunk, *chunk),
                     ):
-                        if mine in wanted and other in others:
-                            pairs[mine].append(relationship.pair_strength)
+                        relationship = Relationship.from_row(row)
+                        for mine, other in (
+                            (relationship.person_a_id, relationship.person_b_id),
+                            (relationship.person_b_id, relationship.person_a_id),
+                        ):
+                            if mine in wanted and other in others:
+                                pairs[mine].append(relationship.pair_strength)
+        except sqlite3.OperationalError:
+            return {}  # A fresh install has no relationships table yet.
         return pairs
 
 

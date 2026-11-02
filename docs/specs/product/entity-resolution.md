@@ -100,7 +100,7 @@ A bare name that matches no one, or a single candidate below the threshold, is a
 
 ## Creating People
 
-`create_if_missing` creates a person from a name alone only when the name reads as a full name (`is_creatable_person_name`): more than one word, no more than six, with no digits or address, path, or markup characters, and no word from `NON_NAME_WORDS` (organization and note-heading words such as "Foundation", "Members", "Next Steps"). A single word never creates a person, on any resolver path. An unknown email or phone alongside any other name still creates one, named from the address or number as under Pass 5.
+`create_if_missing` creates a person from a name alone only when the name reads as a full name (`is_creatable_person_name`): more than one word, no more than six, with no digits or address, path, or markup characters, and no word from `NON_NAME_WORDS` (organization and note-heading words such as "Foundation", "Members", "Next Steps"). A single word never creates a person, on any resolver path. An unknown email or phone alongside any other name still creates one, named from the address or number as under Pass 5. A person named after a phone keeps the name that came with it as `display_name`, which is what the UI shows for them, and it takes no exact matches. A full name arriving later with that phone replaces both.
 
 A person's own full name typed into the CRM (splitting a person, rejecting a link into a new person) is the operator's decision and creates that person directly.
 
@@ -110,7 +110,7 @@ A person's own full name typed into the CRM (splitting a person, rejecting a lin
 
 A vault or Granola note names people in several ways. A full name goes through the resolver above. A first name alone, or a name with only an initial on one side, is ambiguous and goes to the mention resolver (`api/services/mention_resolver.py`), which reads it in the context of its note, per note. It links only on a clear winner and never creates anyone. A mention that means no one clearly keeps an unlinked source entity, and the sweeps that re-match unlinked entities by name alone (`link_source_entities.py`, `relink_source_entities.py`) skip vault and Granola rows.
 
-Valid targets are real people: visible, unmerged, reading as a person. A one-word row with no email or phone is never a target; a one-word row with only an email is a sender, not someone a note calls by first name; the owner's own first name resolves to no one. Link overrides apply first, and a mention a human confirmed or rejected keeps that decision through reindexing.
+Scoring considers real people: visible, unmerged, reading as a person. It never picks a one-word row with no email or phone, or a one-word row with only an email, which is a sender rather than someone a note calls by first name, and the owner's own first name resolves to no one. Link overrides apply first and can name anyone visible, including a one-word row, and a mention a human confirmed or rejected keeps that decision through reindexing.
 
 Each candidate collects points from whichever of these signals apply. Weights are the `MENTION_*` constants in `config/relationship_weights.py`.
 

@@ -1969,6 +1969,23 @@ class InteractionStore:
 
         return enriched
 
+    def reassign(self, interaction_id: str, person_id: str) -> bool:
+        """
+        Move an interaction to another person.
+
+        Returns:
+            True if moved, False if not found
+        """
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute(
+                "UPDATE interactions SET person_id = ? WHERE id = ?", (person_id, interaction_id)
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
     def delete(self, interaction_id: str) -> bool:
         """
         Delete an interaction by ID.

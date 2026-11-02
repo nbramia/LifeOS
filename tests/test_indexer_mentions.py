@@ -46,6 +46,18 @@ class FakeInteractions:
         self.added[interaction.source_id] = interaction.person_id
         return interaction, True
 
+    def get_by_source(self, source_type, source_id):
+        if source_id not in self.added:
+            return None
+        return MagicMock(id=source_id, person_id=self.added[source_id])
+
+    def reassign(self, interaction_id, person_id):
+        self.added[interaction_id] = person_id
+        return True
+
+    def delete(self, interaction_id):
+        return self.added.pop(interaction_id, None) is not None
+
 
 class World:
     def __init__(self, tmp_path: Path):
@@ -101,6 +113,12 @@ class TestNoPeopleRule:
         ("Elsewhere/Work/Knowledge Base/page.md", {}, None),
         ("Work/note.md", {"people": False}, "people_false"),
         ("Work/note.md", {"people": "false"}, "people_false"),
+        ("Work/note.md", {"people": "False"}, "people_false"),
+        ("Work/note.md", {"people": "NO"}, "people_false"),
+        ("Work/note.md", {"people": None}, None),
+        ("Work/note.md", {"people": ""}, None),
+        ("Work/note.md", {"people": "  "}, None),
+        ("Work/note.md", {"people": 0}, None),
         ("Work/note.md", {"people": []}, None),
         ("Work/note.md", {"people": ["Quillon Example"]}, None),
         ("Work/note.md", {"generated": "2026-11-01"}, "generated"),
@@ -154,6 +172,13 @@ class TestBulkContent:
         assert world.people.count() == 0
         assert world.interactions.added == {}
         assert world.source_entity(path, "Robin") is None
+
+    def test_blank_people_property_still_produces_people(self, world):
+        path = world.note("Work/Pages/page.md", "---\npeople:\n---\nQuillon Example opened. **Quillon** closed.\n")
+        real = world.people.add(PersonEntity(canonical_name="Quillon Example"))
+        world.index(path)
+        assert world.source_entity(path, "Quillon").canonical_person_id == real.id
+        assert world.interactions.added[str(path.resolve())] == real.id
 
     def test_generated_key_creates_nothing(self, world):
         path = world.note(
@@ -375,6 +400,133 @@ class TestAmbiguousMentions:
             monkeypatch.setattr(indexer_module, "MENTION_RESOLVER_MAX_AGE_SECONDS", -1)
             world.index(path)
             assert built.call_count == 2
+
+
+class TestNoteInteractionFollowsTheNote:
+    def _reindex(self, world, path, content):
+        path.write_text(content)
+        world.indexer._mention_resolver = None
+        world.indexer.index_file(str(path), skip_stats_refresh=True, skip_summaries=True)
+        return world.indexer.index_file(str(path), skip_stats_refresh=True, skip_summaries=True)
+
+    def _setup(self, world):
+        x = world.people.add(PersonEntity(canonical_name="Quillon Example"))
+        y = world.people.add(PersonEntity(canonical_name="Quillon Sample"))
+        path = world.note("Other/note.md", "Quillon Example opened. **Quillon** closed.\n")
+        world.index(path)
+        assert world.interactions.added[str(path.resolve())] == x.id
+        return x, y, path
+
+    def test_flip_moves_it_to_the_person_resolved_now(self, world):
+        x, y, path = self._setup(world)
+
+        self._reindex(world, path, "Quillon Sample opened. **Quillon** closed.\n")
+
+        assert world.interactions.added[str(path.resolve())] == y.id
+        assert world.source_entity(path, "Quillon").canonical_person_id == y.id
+        assert str(path.resolve()) in world.people.get_by_id(y.id).related_notes
+
+    def test_stats_refresh_reaches_both_sides_of_a_flip(self, world):
+        x, y, path = self._setup(world)
+        path.write_text("Quillon Sample opened. **Quillon** closed.\n")
+        world.indexer._mention_resolver = None
+
+        affected = world.indexer.index_file(str(path), skip_stats_refresh=True, skip_summaries=True)
+
+        assert {x.id, y.id} <= affected
+
+    def test_flip_to_no_one_removes_it(self, world):
+        x, y, path = self._setup(world)
+
+        self._reindex(world, path, "**Quillon** closed.\n")
+
+        assert world.interactions.added == {}
+        assert world.source_entity(path, "Quillon").canonical_person_id is None
+
+    def test_note_that_stops_naming_anyone_removes_it(self, world):
+        x, y, path = self._setup(world)
+
+        self._reindex(world, path, "Nothing here.\n")
+
+        assert world.interactions.added == {}
+
+    def test_full_names_come_first(self, world):
+        x, y, path = self._setup(world)
+        path.write_text("---\npeople: [Mirel Example]\n---\nQuillon Sample opened. **Quillon** closed.\n")
+        world.indexer._mention_resolver = None
+
+        world.indexer.index_file(str(path), skip_stats_refresh=True, skip_summaries=True)
+
+        assert world.interactions.added[str(path.resolve())] == world.people.get_by_name("Mirel Example").id
+
+    def test_holder_who_still_resolves_keeps_it(self, world):
+        x, y, path = self._setup(world)
+
+        self._reindex(world, path, "---\npeople: [Mirel Example]\n---\nQuillon Example opened. **Quillon** closed.\n")
+
+        assert world.interactions.added[str(path.resolve())] == x.id
+
+    def test_holder_with_a_human_confirmed_link_keeps_it(self, world):
+        x, y, path = self._setup(world)
+        world.sources.add(SourceEntity(
+            source_type="vault", source_id=f"{path.resolve()}:Old Name", observed_name="Old Name",
+            canonical_person_id=x.id, link_status=LINK_STATUS_CONFIRMED,
+        ), validate_person=False)
+
+        self._reindex(world, path, "Quillon Sample opened.\n")
+
+        assert world.interactions.added[str(path.resolve())] == x.id
+
+    def test_a_confirmed_link_in_another_note_does_not_count(self, world):
+        x, y, path = self._setup(world)
+        world.sources.add(SourceEntity(
+            source_type="vault", source_id=f"{path.resolve()}.other.md:Old Name", observed_name="Old Name",
+            canonical_person_id=x.id, link_status=LINK_STATUS_CONFIRMED,
+        ), validate_person=False)
+
+        self._reindex(world, path, "Nothing here.\n")
+
+        assert world.interactions.added == {}
+
+    def test_a_failed_mention_leaves_it_alone(self, world):
+        x, y, path = self._setup(world)
+        path.write_text("---\npeople: [Mirel Example]\n---\nbody\n")
+        world.indexer._mention_resolver = None
+
+        with patch.object(world.indexer._entity_resolver, "resolve", side_effect=RuntimeError("synthetic")):
+            world.indexer.index_file(str(path), skip_stats_refresh=True, skip_summaries=True)
+
+        assert world.interactions.added[str(path.resolve())] == x.id
+
+    def test_an_unavailable_mention_resolver_leaves_it_alone(self, world):
+        x, y, path = self._setup(world)
+        path.write_text("**Quillon** closed.\n")
+        world.indexer._mention_resolver = None
+
+        with patch.object(indexer_module, "MentionResolver", side_effect=RuntimeError("boom")):
+            world.indexer.index_file(str(path), skip_stats_refresh=True, skip_summaries=True)
+
+        assert world.interactions.added[str(path.resolve())] == x.id
+
+    def test_bulk_note_is_left_to_the_repair(self, world):
+        x, y, path = self._setup(world)
+
+        self._reindex(world, path, "---\ngenerated: 2026-01-01\n---\nNothing here.\n")
+
+        assert world.interactions.added[str(path.resolve())] == x.id
+
+    def test_store_lookup_only_reaches_this_notes_interaction(self, tmp_path):
+        from api.services.interaction_store import Interaction, InteractionStore
+
+        store = InteractionStore(str(tmp_path / "i.db"), strict=False)
+        email = store.add(Interaction(
+            id="e", person_id="x", timestamp=datetime(2024, 1, 1, tzinfo=timezone.utc),
+            source_type="gmail", title="t", source_id="/not/under/tmp/note.md",
+        ))
+        assert store.get_by_source("vault", email.source_id) is None
+        assert store.reassign("e", "y") is True
+        assert store.get_by_id("e").person_id == "y"
+        assert store.reassign("missing", "y") is False
 
 
 class TestNoteDates:

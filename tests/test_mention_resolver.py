@@ -246,11 +246,17 @@ class TestOverrides:
         assert decision.entity.id == preferred.id
         assert decision.match_type == mr.OVERRIDE_MATCH_TYPE
 
-    def test_override_pointing_at_a_bare_row_links_to_no_one(self, world):
+    def test_override_can_name_a_bare_row(self, world):
         bare = world.person("Robin")
         world.person("Robin Gamma")
         decision = world.resolver(overrides=[self.override(bare.id)]).resolve("Robin", context(text="robin gamma"))
-        assert decision.entity is None
+        assert decision.entity.id == bare.id
+        assert decision.match_type == mr.OVERRIDE_MATCH_TYPE
+
+    def test_override_naming_someone_gone_falls_back_to_scoring(self, world):
+        real = world.person("Robin Gamma")
+        decision = world.resolver(overrides=[self.override("gone")]).resolve("Robin", context(text="robin gamma"))
+        assert decision.entity.id == real.id
 
     def test_rejected_person_is_not_a_candidate(self, world):
         rejected = world.person("Robin Gamma")

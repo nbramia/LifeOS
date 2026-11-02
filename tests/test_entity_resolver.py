@@ -2,6 +2,7 @@
 Tests for EntityResolver.
 """
 import pytest
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 from api.services.person_entity import PersonEntity, PersonEntityStore
@@ -1016,12 +1017,83 @@ class TestNameAloneCreatesOnlyFullNames:
         assert result.entity.canonical_name == "quillon@example.com"
         assert not temp_store.get_by_name("quillon")
 
-    def test_single_word_with_a_phone_goes_by_the_number(self, temp_store):
+    def test_single_word_with_a_phone_goes_by_the_number_and_shows_the_word(self, temp_store):
         result = EntityResolver(temp_store).resolve(
             name="Quillon", phone="+12125550173", create_if_missing=True
         )
         assert result.entity.canonical_name == "+12125550173"
+        assert result.entity.display_name == "Quillon"
+        assert result.entity.aliases == []
         assert result.match_type == "phone_new"
+        stored = temp_store.get_by_id(result.entity.id)
+        assert stored.display_name == "Quillon"
+        assert not temp_store.get_by_name("quillon")
+        assert EntityResolver(temp_store).match_name("Quillon").result is None
+
+    @pytest.mark.parametrize("name", ["+1 212 555 0173", "someone@example.com", "123", "  "])
+    def test_a_name_that_is_no_label_leaves_the_number_showing(self, temp_store, name):
+        result = EntityResolver(temp_store).resolve(
+            name=name, phone="+12125550173", create_if_missing=True
+        )
+        if result:
+            assert result.entity.display_name == "+12125550173"
+
+    def test_full_name_replaces_the_word_on_a_phone_placeholder(self, temp_store):
+        resolver = EntityResolver(temp_store)
+        first = resolver.resolve(name="Quillon", phone="+12125550173", create_if_missing=True)
+
+        second = resolver.resolve(name="Quillon Example", phone="+12125550173", create_if_missing=True)
+
+        assert second.entity.id == first.entity.id
+        stored = temp_store.get_by_id(first.entity.id)
+        assert stored.canonical_name == "Quillon Example"
+        assert stored.display_name == "Quillon Example"
+
+    def test_whatsapp_contact_keeps_its_word_then_takes_a_full_name(self, temp_store):
+        from unittest.mock import MagicMock
+
+        from api.services.whatsapp import _upsert_contact_source
+
+        sources = MagicMock()
+        sources.count_for_person.return_value = 1
+        resolver = EntityResolver(temp_store)
+
+        def contact(name):
+            _upsert_contact_source(
+                sources, temp_store, resolver, Counter(), "jid", None, name, "+12125550173", {}, dry_run=False,
+            )
+
+        contact("Quillon")
+        stored = temp_store.get_by_phone("+12125550173")
+        assert stored.canonical_name == "+12125550173"
+        assert stored.display_name == "Quillon"
+        assert "whatsapp" in stored.sources
+
+        contact("Quillon Example")
+        stored = temp_store.get_by_phone("+12125550173")
+        assert stored.canonical_name == "Quillon Example"
+        assert stored.display_name == "Quillon Example"
+
+    def test_the_word_survives_a_caller_updating_the_person(self, temp_store):
+        """sync_apple_contacts and sync_phone_calls edit and store the person resolve returns."""
+        person = EntityResolver(temp_store).resolve(
+            name="Quillon", phone="+12125550173", create_if_missing=True
+        ).entity
+
+        person.sources.append("phone")
+        temp_store.update(person)
+
+        assert temp_store.get_by_id(person.id).display_name == "Quillon"
+
+    def test_a_repeated_word_leaves_the_placeholder_as_it_is(self, temp_store):
+        resolver = EntityResolver(temp_store)
+        first = resolver.resolve(name="Quillon", phone="+12125550173", create_if_missing=True)
+
+        resolver.resolve(name="Quillon", phone="+12125550173", create_if_missing=True)
+
+        stored = temp_store.get_by_id(first.entity.id)
+        assert stored.canonical_name == "+12125550173"
+        assert stored.display_name == "Quillon"
 
     def test_non_name_with_an_email_does_not_name_the_person(self, temp_store):
         result = EntityResolver(temp_store).resolve(
@@ -1103,6 +1175,7 @@ class TestVaultMentionOfAmbiguousName:
         indexer._interaction_store = MagicMock()
         indexer._interaction_store.db_path = InteractionStore(str(tmp_path / "interactions.db")).db_path
         indexer._interaction_store.add_if_not_exists.return_value = (None, True)
+        indexer._interaction_store.get_by_source.return_value = None
         indexer._source_entity_store = MagicMock()
         indexer._source_entity_store.get_by_source.return_value = None
 

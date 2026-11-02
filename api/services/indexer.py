@@ -514,7 +514,7 @@ class IndexerService:
         # Sync to v2 people system if available. Bulk content stays searchable
         # below but says nothing about contact with anyone.
         affected_person_ids: set[str] = set()
-        if HAS_V2_PEOPLE and all_people and self._no_people_reason(path, frontmatter) is None:
+        if HAS_V2_PEOPLE and self._no_people_reason(path, frontmatter) is None:
             try:
                 from datetime import timezone
                 note_date_str = self._extract_note_date(path, frontmatter, body)
@@ -787,7 +787,9 @@ class IndexerService:
         confirmed or rejected keeps that decision.
 
         A note holds one interaction, which goes to the first person who
-        resolves, full names first.
+        resolves, full names first. It follows the note: a holder the note doesn't
+        resolve to gives it up to whoever comes first, or it goes if no one does.
+        A holder whose link a human confirmed keeps it.
 
         Note: PersonEntity stats (mention_count) are updated via refresh_person_stats()
         after sync completes, not manually here.
@@ -820,6 +822,8 @@ class IndexerService:
         ambiguous = sorted({name for name in people if is_ambiguous_mention(name)})
         full_names = sorted(set(people) - set(ambiguous))
 
+        resolved: list = []
+        complete = True
         co_mentioned_ids: set[str] = set()
         for person_name in full_names:
             try:
@@ -834,15 +838,20 @@ class IndexerService:
                     logger.debug(f"Could not resolve person: {person_name}")
                     continue
                 co_mentioned_ids.add(result.entity.id)
-                self._record_mention(
+                resolved.append(self._record_mention(
                     path, person_name, result.entity, result.confidence, result.match_type,
                     note_date, is_granola, resolver, interaction_store, source_entity_store,
                     affected_person_ids,
-                )
+                ))
             except Exception as e:
+                complete = False
                 logger.warning(f"Failed to sync person '{person_name}' to v2: {e}")
 
         if not ambiguous:
+            if complete:
+                self._settle_note_interaction(
+                    path, resolved, is_granola, resolver, interaction_store, source_entity_store, affected_person_ids
+                )
             return affected_person_ids
 
         mention_resolver = self._get_mention_resolver(resolver, interaction_store)
@@ -853,15 +862,54 @@ class IndexerService:
         for person_name in ambiguous:
             try:
                 decision = mention_resolver.resolve(person_name, context)
-                self._record_mention(
+                resolved.append(self._record_mention(
                     path, person_name, decision.entity, decision.confidence, decision.match_type,
                     note_date, is_granola, resolver, interaction_store, source_entity_store,
                     affected_person_ids,
-                )
+                ))
             except Exception as e:
+                complete = False
                 logger.warning(f"Failed to sync person '{person_name}' to v2: {e}")
 
+        if complete:
+            self._settle_note_interaction(
+                path, resolved, is_granola, resolver, interaction_store, source_entity_store, affected_person_ids
+            )
         return affected_person_ids
+
+    def _settle_note_interaction(
+        self, path, resolved, is_granola, resolver, interaction_store, source_entity_store, affected_person_ids
+    ) -> None:
+        """Make a note's interaction agree with who the note resolves to now.
+
+        Args:
+            resolved: Each mention's person or None, in resolution order
+        """
+        source_type = "granola" if is_granola else "vault"
+        file_path_str = str(path.resolve())
+        current = interaction_store.get_by_source(source_type, file_path_str)
+        people = [entity for entity in resolved if entity is not None]
+        if current is None or current.person_id in {entity.id for entity in people}:
+            return
+        if source_entity_store.has_confirmed_note_link(source_type, file_path_str, current.person_id):
+            return
+
+        affected_person_ids.add(current.person_id)
+        if not people:
+            interaction_store.delete(current.id)
+            return
+        interaction_store.reassign(current.id, people[0].id)
+        self._credit_note(people[0], file_path_str, source_type, resolver, affected_person_ids)
+
+    def _credit_note(self, entity, file_path_str, source_type, resolver, affected_person_ids) -> None:
+        """Record on a person that this note's interaction is theirs."""
+        affected_person_ids.add(entity.id)
+        if file_path_str not in entity.related_notes:
+            entity.related_notes.append(file_path_str)
+        if source_type not in entity.sources:
+            entity.sources.append(source_type)
+        # Persist entity changes (stats updated via refresh_person_stats)
+        resolver.store.update(entity)
 
     def _note_context(self, path, frontmatter, body, note_date, is_granola, co_mentioned_ids):
         """Build the context a note offers for reading its ambiguous mentions."""
@@ -892,8 +940,12 @@ class IndexerService:
         interaction_store,
         source_entity_store,
         affected_person_ids,
-    ) -> None:
-        """Write one mention's source entity and, if it links, the note's interaction."""
+    ):
+        """Write one mention's source entity and, if it links, the note's interaction.
+
+        Returns:
+            The person the mention resolves to, or None
+        """
         file_path_str = str(path.resolve())
         note_title = path.stem  # filename without .md
         source_metadata = {
@@ -922,7 +974,7 @@ class IndexerService:
             source_entity_store.add_or_update(source_entity)
 
         if entity is None:
-            return
+            return None
 
         # Add interaction (avoiding duplicates on re-index)
         interaction = create_vault_interaction(
@@ -936,25 +988,14 @@ class IndexerService:
         _, was_added = interaction_store.add_if_not_exists(interaction)
 
         if was_added:
-            # Track affected person for stats refresh
-            affected_person_ids.add(entity.id)
-
-            # Update related_notes (not a count, just a list)
-            if file_path_str not in entity.related_notes:
-                entity.related_notes.append(file_path_str)
-
-            # Add vault/granola to sources if not present
-            source_type = "granola" if is_granola else "vault"
-            if source_type not in entity.sources:
-                entity.sources.append(source_type)
-
-            # Persist entity changes (stats updated via refresh_person_stats)
-            resolver.store.update(entity)
-
+            self._credit_note(
+                entity, file_path_str, "granola" if is_granola else "vault", resolver, affected_person_ids
+            )
             logger.debug(
                 f"Created interaction for {entity.display_name} "
                 f"({match_type}, conf={confidence:.2f})"
             )
+        return entity
 
     def start_watching(self) -> None:
         """Start watching the vault for changes."""

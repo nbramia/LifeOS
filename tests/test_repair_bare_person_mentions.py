@@ -183,6 +183,77 @@ class TestMentions:
         assert world.se(links[delta_note].id).canonical_person_id == delta.id
         assert world.se(links[neither].id).canonical_person_id is None
 
+    def test_interaction_goes_to_a_full_name_person_linked_in_the_note(self, world):
+        bare = world.person("Quillon")
+        full = world.person("Robin Gamma")
+        path = world.note("Other/a.md", "**Quillon** spoke.")
+        world.mention(path, full)
+        interaction = world.note_interaction(path, bare)
+
+        plan = world.plan()
+        world.execute(plan)
+
+        assert plan.counts["interactions_handed_to_full_name"] == 1
+        assert plan.counts["interactions_removed"] == 0
+        assert interaction.id not in plan.delete_interaction_ids
+        assert world.interaction_rows()[interaction.id] == full.id
+        target = world.row(full)
+        assert target.mention_count == 1
+        assert path in target.related_notes
+        assert "vault" in target.sources
+        assert world.row(bare).hidden is True
+
+    def test_interaction_goes_to_a_full_name_the_note_only_co_mentions(self, world):
+        bare = world.person("Quillon")
+        full = world.person("Robin Gamma")
+        path = world.note("Other/a.md", "**Quillon** spoke.", "people: [Robin Gamma]")
+        interaction = world.note_interaction(path, bare)
+
+        world.execute()
+
+        assert world.interaction_rows()[interaction.id] == full.id
+        assert world.row(full).mention_count == 1
+
+    def test_first_full_name_in_sort_order_inherits_it(self, world):
+        bare = world.person("Quillon")
+        world.person("Robin Gamma")
+        first = world.person("Mirel Example")
+        path = world.note("Other/a.md", "**Quillon** spoke.", "people: [Robin Gamma, Mirel Example]")
+        interaction = world.note_interaction(path, bare)
+
+        world.execute()
+
+        assert world.interaction_rows()[interaction.id] == first.id
+
+    def test_first_name_links_are_no_heir(self, world):
+        bare = world.person("Quillon")
+        real = world.person("Robin Gamma")
+        path = world.note("Other/a.md", "**Quillon** spoke.")
+        world.mention(path, real, name="Robin")
+        interaction = world.note_interaction(path, bare)
+
+        plan = world.plan()
+        world.execute(plan)
+
+        assert plan.counts["interactions_handed_to_full_name"] == 0
+        assert plan.counts["interactions_removed"] == 1
+        assert interaction.id not in world.interaction_rows()
+
+    def test_handed_interactions_show_in_the_dry_run_output(self, world, capsys):
+        bare = world.person("Quillon")
+        full = world.person("Robin Gamma")
+        path = world.note("Other/a.md", "**Quillon** spoke.")
+        world.mention(path, full)
+        world.note_interaction(path, bare)
+
+        repair.main([
+            "--crm-db", str(world.crm_db), "--interactions-db", str(world.interactions_db),
+            "--vault", str(world.vault), "--merged-ids", str(world.merged), "--report", str(world.report),
+        ])
+
+        assert "interactions_handed_to_full_name: 1" in capsys.readouterr().out
+        assert json.loads(world.report.read_text())["counts"]["interactions_handed_to_full_name"] == 1
+
     def test_interaction_on_someone_else_stays_put(self, world):
         bare, real, path = strong_setup(world)
         other = world.person("Quillon Example")
@@ -274,6 +345,18 @@ class TestBulkContent:
         assert world.se(bare_link.id) is None
         assert interaction.id not in world.interaction_rows()
         assert world.row(real).mention_count == 0
+
+    @pytest.mark.parametrize("frontmatter", ["people:", "people: ''", "people: 0", "people: []"])
+    def test_blank_people_property_is_not_bulk_content(self, world, frontmatter):
+        real = world.person("Robin Gamma")
+        path = world.note("Work/Pages/page.md", "Robin Gamma", frontmatter)
+        link = world.mention(path, real)
+        interaction = world.note_interaction(path, real)
+
+        world.execute()
+
+        assert world.se(link.id).canonical_person_id == real.id
+        assert world.interaction_rows()[interaction.id] == real.id
 
     def test_source_llm_alone_is_not_bulk_content(self, world):
         real = world.person("Robin Gamma")

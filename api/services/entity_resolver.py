@@ -948,14 +948,16 @@ class EntityResolver:
             )
 
         # A name reaching this point is tied or can't name a person. The phone
-        # anchors a person of their own, named from the number.
+        # anchors a person of their own, named from the number so the name takes
+        # no exact matches. The name stays what the UI shows for them.
         if name and name.strip() and phone and create_if_missing:
             from api.services.phone_utils import normalize_phone
             norm_phone = normalize_phone(phone)
             if norm_phone:
+                label = name.strip()
                 stored = self._store.add(PersonEntity(
                     canonical_name=norm_phone,
-                    display_name=norm_phone,
+                    display_name=label if re.search(r"[^\W\d_]", label) and "@" not in label else norm_phone,
                     phone_numbers=[norm_phone],
                     phone_primary=norm_phone,
                 ))
@@ -995,7 +997,9 @@ class EntityResolver:
         if holder and holder.id != entity.id:
             return
 
-        if entity.display_name == entity.canonical_name:
+        # A one-word label is what a phone placeholder was created with. A longer
+        # one is a choice someone made.
+        if entity.display_name == entity.canonical_name or parse_name(entity.display_name).last is None:
             entity.display_name = real_name
         entity.canonical_name = real_name
         self._store.update(entity)
