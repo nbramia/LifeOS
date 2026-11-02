@@ -1,18 +1,16 @@
 """
 Indexer service for LifeOS.
 
-Watches the Obsidian vault for file changes and indexes content to ChromaDB.
+Indexes Obsidian vault content to ChromaDB and BM25.
 Supports incremental indexing based on file modification times.
 """
 import gc
 import os
 import json
-import threading
 import logging
+import time
 from pathlib import Path
 from datetime import datetime, timezone
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler, FileSystemEvent
 
 from api.services.chunker import chunk_document, extract_frontmatter, add_context_to_chunks, normalize_tags, tag_phrase_key
 from api.services.vectorstore import VectorStore, is_people_tag
@@ -84,77 +82,6 @@ def _resolve_undated_note_date(path) -> datetime:
     return UNDATED_SENTINEL
 
 
-class VaultEventHandler(FileSystemEventHandler):
-    """Handle file system events in the vault with global batch debouncing.
-
-    Collects all file changes within a window and processes them as a single
-    batch, preventing sustained indexing load from rapid file operations
-    (e.g., bulk imports or external tools moving multiple files).
-    """
-
-    _BATCH_DELAY = 5.0  # seconds - wait for activity to settle before processing
-
-    def __init__(self, indexer: "IndexerService"):
-        self.indexer = indexer
-        self._pending: dict[str, str] = {}  # file_path -> action ("index" or "delete")
-        self._batch_timer: threading.Timer | None = None
-        self._lock = threading.Lock()
-
-    def _queue(self, file_path: str, action: str):
-        """Queue a file change and reset the batch timer."""
-        with self._lock:
-            self._pending[file_path] = action  # latest action wins
-            if self._batch_timer:
-                self._batch_timer.cancel()
-            self._batch_timer = threading.Timer(self._BATCH_DELAY, self._flush)
-            self._batch_timer.daemon = True
-            self._batch_timer.start()
-
-    def _flush(self):
-        """Process all pending file changes as a batch."""
-        with self._lock:
-            batch = dict(self._pending)
-            self._pending.clear()
-            self._batch_timer = None
-
-        if not batch:
-            return
-
-        logger.info(f"Processing batch of {len(batch)} file changes")
-        for file_path, action in batch.items():
-            try:
-                if action == "delete":
-                    self.indexer.delete_file(file_path)
-                else:
-                    self.indexer.index_file(file_path)
-            except Exception as e:
-                logger.error(f"Failed to {action} {file_path}: {e}")
-
-    def on_created(self, event: FileSystemEvent):
-        if not event.is_directory and event.src_path.endswith(".md"):
-            logger.info(f"File created: {event.src_path}")
-            self._queue(event.src_path, "index")
-
-    def on_modified(self, event: FileSystemEvent):
-        if not event.is_directory and event.src_path.endswith(".md"):
-            logger.info(f"File modified: {event.src_path}")
-            self._queue(event.src_path, "index")
-
-    def on_deleted(self, event: FileSystemEvent):
-        if not event.is_directory and event.src_path.endswith(".md"):
-            logger.info(f"File deleted: {event.src_path}")
-            self._queue(event.src_path, "delete")
-
-    def on_moved(self, event: FileSystemEvent):
-        if not event.is_directory:
-            if hasattr(event, 'src_path') and event.src_path.endswith(".md"):
-                logger.info(f"File moved from: {event.src_path}")
-                self._queue(event.src_path, "delete")
-            if hasattr(event, 'dest_path') and event.dest_path.endswith(".md"):
-                logger.info(f"File moved to: {event.dest_path}")
-                self._queue(event.dest_path, "index")
-
-
 # Reserved key in the index state: file path -> tag tuple used at index time.
 TAG_STATE_KEY = "__tag_phrase_keys__"
 
@@ -178,6 +105,7 @@ class IndexerService:
         source_entity_store=None,
         entity_resolver=None,
         tag_store=None,
+        connect_stores: bool = True,
     ):
         """
         Initialize indexer.
@@ -190,6 +118,8 @@ class IndexerService:
             entity_resolver: Optional EntityResolver (uses singleton if None)
             tag_store: Optional VaultTagStore whose tags feed chunk context
                 (opened lazily from the default location if None)
+            connect_stores: If False, open neither the vector store nor BM25.
+                Such an instance can only answer ``scan_changes``.
         """
         self.vault_path = Path(vault_path)
         self.db_path = Path(db_path)
@@ -201,15 +131,12 @@ class IndexerService:
         self._tag_store = tag_store
         self._tag_store_failed = False
 
-        # Initialize vector store
-        self.vector_store = VectorStore()
+        if connect_stores:
+            # Initialize vector store
+            self.vector_store = VectorStore()
 
-        # Initialize BM25 keyword index
-        self.bm25_index = BM25Index()
-
-        # File watcher
-        self._observer: Observer | None = None
-        self._watching = False
+            # Initialize BM25 keyword index
+            self.bm25_index = BM25Index()
 
     def _tag_for(self, path: Path):
         """The file's TagRecord, or None when the store or the row is missing.
@@ -247,28 +174,37 @@ class IndexerService:
         """Save the index state."""
         state_path = Path(self.INDEX_STATE_FILE)
         state_path.parent.mkdir(parents=True, exist_ok=True)
-        state_path.write_text(json.dumps(state, indent=2))
+        # Replaced atomically: a process killed mid-write must not leave a torn
+        # file, which would load as empty state and re-index the whole vault.
+        tmp_path = state_path.with_name(f"{state_path.name}.{os.getpid()}.tmp")
+        tmp_path.write_text(json.dumps(state, indent=2))
+        os.replace(tmp_path, state_path)
 
-    def index_all(self, force: bool = False, skip_summaries: bool = False) -> int:
-        """
-        Index markdown files in the vault.
+    def scan_changes(self) -> dict:
+        """Report what an incremental ``index_all`` would do, changing nothing.
 
-        Uses incremental indexing by default - only indexes files that have
-        changed since the last index run. Use force=True to reindex everything.
-
-        Progress is saved incrementally every 50 files, so crashes don't lose work.
-
-        Args:
-            force: If True, reindex all files regardless of modification time
-            skip_summaries: If True, skip LLM summary generation for faster indexing
+        Needs no vector store or BM25, so a caller can learn that there is no
+        work without loading anything heavy.
 
         Returns:
-            Number of files indexed
+            Dict with ``to_index`` (newest modification time first), ``deleted``
+            and ``file_count``.
         """
-        # Always load existing state - even in force mode, we track progress
-        # so we can resume if interrupted
         index_state = self._load_index_state()
+        files_to_index, deleted_files, _tag_key, file_count = self._find_changes(index_state, force=False)
+        return {
+            "to_index": [path for path, _ in sorted(files_to_index, key=lambda item: item[1], reverse=True)],
+            "deleted": sorted(deleted_files),
+            "file_count": file_count,
+        }
 
+    def _find_changes(self, index_state: dict, force: bool) -> tuple[list, set, dict, int]:
+        """Compare the vault with ``index_state``.
+
+        Returns:
+            ``(files_to_index, deleted_files, current_tag_key, file_count)``,
+            with ``files_to_index`` as ``(path, mtime)`` pairs in vault walk order.
+        """
         # Get all current markdown files with their mtimes
         all_md_files = list(self.vault_path.rglob("*.md"))
         current_files = {str(f): f.stat().st_mtime for f in all_md_files}
@@ -278,7 +214,6 @@ class IndexerService:
         # even when its bytes did not change; no row and no phrase is None on
         # both sides, so untagged files are never re-indexed for it.
         tag_keys: dict = index_state.get(TAG_STATE_KEY) or {}
-        index_state[TAG_STATE_KEY] = tag_keys
         current_tag_key: dict[str, list | None] = {}
 
         # Determine which files need indexing
@@ -301,14 +236,61 @@ class IndexerService:
         # Determine deleted files (in old state but not in current files)
         deleted_files = set(index_state.keys()) - set(current_files.keys()) - {TAG_STATE_KEY}
 
+        return files_to_index, deleted_files, current_tag_key, len(all_md_files)
+
+    def index_all(
+        self,
+        force: bool = False,
+        skip_summaries: bool = False,
+        max_files: int | None = None,
+        newest_first: bool = False,
+        light_pass: bool = False,
+    ) -> int:
+        """
+        Index markdown files in the vault.
+
+        Uses incremental indexing by default - only indexes files that have
+        changed since the last index run. Use force=True to reindex everything.
+
+        Progress is saved incrementally every 50 files, so crashes don't lose work.
+
+        Args:
+            force: If True, reindex all files regardless of modification time
+            skip_summaries: If True, skip LLM summary generation for faster indexing
+            max_files: Index at most this many changed files, leaving the rest
+                for a later run. Deleted files are always processed.
+            newest_first: If True, index changed files by descending modification
+                time. Otherwise they follow vault walk order.
+            light_pass: If True, run as a pass that a later full run completes:
+                see ``index_file``. Summaries are not generated or retried here,
+                and a file that could not be read stays unrecorded so a later
+                run retries it.
+
+        Returns:
+            Number of files indexed
+        """
+        # Always load existing state - even in force mode, we track progress
+        # so we can resume if interrupted
+        index_state = self._load_index_state()
+
+        tag_keys: dict = index_state.get(TAG_STATE_KEY) or {}
+        index_state[TAG_STATE_KEY] = tag_keys
+        files_to_index, deleted_files, current_tag_key, file_count = self._find_changes(index_state, force)
+
         if force:
-            already_done = len(all_md_files) - len(files_to_index)
+            already_done = file_count - len(files_to_index)
             if already_done > 0:
                 logger.info(f"RESUMING FULL REINDEX: {len(files_to_index)} remaining, {already_done} already indexed")
             else:
-                logger.info(f"FULL REINDEX: {len(all_md_files)} files")
+                logger.info(f"FULL REINDEX: {file_count} files")
         else:
-            logger.info(f"Incremental index: {len(files_to_index)} changed, {len(deleted_files)} deleted, {len(all_md_files) - len(files_to_index)} unchanged")
+            logger.info(f"Incremental index: {len(files_to_index)} changed, {len(deleted_files)} deleted, {file_count - len(files_to_index)} unchanged")
+
+        if newest_first:
+            files_to_index.sort(key=lambda item: item[1], reverse=True)
+        if max_files is not None and len(files_to_index) > max_files:
+            logger.info(f"Indexing {max_files} of {len(files_to_index)} changed files this run; the rest wait for a later run")
+            files_to_index = files_to_index[:max_files]
 
         # Delete removed files from index
         for file_path in deleted_files:
@@ -328,7 +310,12 @@ class IndexerService:
 
         for file_path, mtime in files_to_index:
             try:
-                affected_ids = self.index_file(file_path, skip_stats_refresh=True, skip_summaries=skip_summaries)
+                affected_ids = self.index_file(
+                    file_path, skip_stats_refresh=True, skip_summaries=skip_summaries, light_pass=light_pass
+                )
+                # With skip_stats_refresh, None means the file was never indexed.
+                if light_pass and affected_ids is None:
+                    continue
                 if affected_ids:
                     all_affected_person_ids.update(affected_ids)
 
@@ -360,7 +347,7 @@ class IndexerService:
         logger.info(f"Indexed {count} files (final save)")
 
         # Retry failed summaries with simpler prompt and longer timeout
-        if not skip_summaries:
+        if not skip_summaries and not light_pass:
             retry_count = self._retry_failed_summaries()
             if retry_count > 0:
                 logger.info(f"Retried {retry_count} failed summaries")
@@ -374,7 +361,13 @@ class IndexerService:
 
         return count
 
-    def index_file(self, file_path: str, skip_stats_refresh: bool = False, skip_summaries: bool = False) -> set[str] | None:
+    def index_file(
+        self,
+        file_path: str,
+        skip_stats_refresh: bool = False,
+        skip_summaries: bool = False,
+        light_pass: bool = False,
+    ) -> set[str] | None:
         """
         Index a single file.
 
@@ -383,9 +376,13 @@ class IndexerService:
             skip_stats_refresh: If True, return affected person IDs instead of refreshing.
                                Used by index_all() to batch refresh at the end.
             skip_summaries: If True, skip LLM summary generation for faster indexing.
+            light_pass: If True, queue the note for the next full run's summary
+                retry instead of generating a summary, and leave the task index
+                to the task file watcher in the API server.
 
         Returns:
-            Set of affected person IDs if skip_stats_refresh=True, else None
+            Set of affected person IDs if skip_stats_refresh=True and the file was
+            indexed, else None
         """
         path = Path(file_path)
         if not path.exists() or not path.suffix == ".md":
@@ -398,7 +395,7 @@ class IndexerService:
             return
 
         # Reindex task files for the task manager cache
-        if "LifeOS/Tasks/" in str(path):
+        if "LifeOS/Tasks/" in str(path) and not light_pass:
             try:
                 from api.services.task_manager import get_task_manager
                 get_task_manager().reindex_file(str(path))
@@ -502,7 +499,12 @@ class IndexerService:
 
         # Generate document summary for discovery queries (P9.4)
         # Uses tiered summarization: SKIP for archives, HIGH for important content
-        if not skip_summaries:
+        if light_pass:
+            # Not caught: a note that was not queued must not be recorded as
+            # indexed, or nothing would ever summarize it.
+            from api.services.summarizer import queue_summary
+            queue_summary(file_path, path.name, body)
+        elif not skip_summaries:
             try:
                 from api.services.summarizer import (
                     generate_summary, get_summary_tier, SummaryTier, add_summary_failure
@@ -559,16 +561,21 @@ class IndexerService:
 
     def _retry_failed_summaries(self) -> int:
         """
-        Retry summary generation for files that failed in the first pass.
+        Work through the summary queue: first-pass failures and queued notes.
 
-        Uses a simpler prompt and longer timeout for better success rate.
+        Uses a simpler prompt and longer timeout for better success rate. The
+        work is bounded by ``settings.summary_retry_budget_seconds``, and entries
+        not reached stay queued for the next run. While the LLM is unreachable
+        the whole queue stays put, because a retry would store a fallback summary
+        built from the note's first line and drop the entry.
 
         Returns:
             Number of files successfully retried
         """
         from api.services.summarizer import (
-            load_summary_failures, clear_summary_failures, retry_summary
+            is_summarizer_llm_available, load_summary_failures, remove_summary_failures, retry_summary
         )
+        from config.settings import settings
 
         failures = load_summary_failures()
         failed_files = failures.get("files", [])
@@ -576,43 +583,58 @@ class IndexerService:
         if not failed_files:
             return 0
 
+        if not is_summarizer_llm_available():
+            logger.warning(f"Summarizer LLM unreachable; keeping {len(failed_files)} queued summaries for the next run")
+            return 0
+
         logger.info(f"Retrying {len(failed_files)} failed summaries with simpler prompt...")
 
+        deadline = time.monotonic() + settings.summary_retry_budget_seconds
         success_count = 0
+        finished: set[str] = set()
         for failure in failed_files:
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    f"Summary retry budget of {settings.summary_retry_budget_seconds}s used; "
+                    f"{len(failed_files) - len(finished)} summaries stay queued"
+                )
+                break
+
             file_path = failure["file_path"]
             file_name = failure["file_name"]
 
             try:
                 path = Path(file_path)
-                if not path.exists():
-                    continue
+                if path.exists():
+                    content = path.read_text(encoding="utf-8")
+                    # Extract body (skip frontmatter)
+                    from api.services.chunker import extract_frontmatter
+                    frontmatter, body = extract_frontmatter(content)
 
-                content = path.read_text(encoding="utf-8")
-                # Extract body (skip frontmatter)
-                from api.services.chunker import extract_frontmatter
-                frontmatter, body = extract_frontmatter(content)
+                    summary = retry_summary(body, file_name)
+                    if summary:
+                        summary_id = f"{path.resolve()}::summary"
+                        summary_content = f"Document summary for {file_name}: {summary}"
 
-                summary = retry_summary(body, file_name)
-                if summary:
-                    summary_id = f"{path.resolve()}::summary"
-                    summary_content = f"Document summary for {file_name}: {summary}"
-
-                    # Add to BM25 index
-                    self.bm25_index.add_document(
-                        doc_id=summary_id,
-                        content=summary_content,
-                        file_name=file_name,
-                        modified_date=self._extract_note_date(path, frontmatter, body)
-                    )
-                    success_count += 1
+                        # Add to BM25 index
+                        self.bm25_index.add_document(
+                            doc_id=summary_id,
+                            content=summary_content,
+                            file_name=file_name,
+                            modified_date=self._extract_note_date(path, frontmatter, body)
+                        )
+                        success_count += 1
 
             except Exception as e:
                 logger.warning(f"Retry failed for {file_path}: {e}")
 
-        # Clear failures list after processing
-        clear_summary_failures()
-        logger.info(f"Summary retry complete: {success_count}/{len(failed_files)} succeeded")
+            finished.add(file_path)
+            # Saved as it goes, so a run killed here does not repeat the work.
+            if len(finished) % 50 == 0:
+                remove_summary_failures(finished)
+
+        remove_summary_failures(finished)
+        logger.info(f"Summary retry complete: {success_count}/{len(finished)} succeeded")
 
         return success_count
 
@@ -761,33 +783,3 @@ class IndexerService:
                 )
 
         return affected_person_ids
-
-    def start_watching(self) -> None:
-        """Start watching the vault for changes."""
-        if self._watching:
-            return
-
-        self._observer = Observer()
-        event_handler = VaultEventHandler(self)
-        self._observer.schedule(
-            event_handler,
-            str(self.vault_path),
-            recursive=True
-        )
-        self._observer.start()
-        self._watching = True
-        logger.info(f"Started watching {self.vault_path}")
-
-    def stop(self) -> None:
-        """Stop watching and cleanup."""
-        if self._observer:
-            self._observer.stop()
-            self._observer.join(timeout=5)
-            self._observer = None
-        self._watching = False
-        logger.info("Stopped watching")
-
-    @property
-    def is_watching(self) -> bool:
-        """Check if currently watching."""
-        return self._watching

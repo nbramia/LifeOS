@@ -397,5 +397,4 @@ def seed_synthetic_qa_corpus(candidate_base_url):
                     indexer.delete_file(str(path))
                 except Exception:
                     pass
-            indexer.stop()
         _remove_owned_files(corpus, seeded_paths)

@@ -1404,6 +1404,11 @@ class Settings(BaseSettings):
     ollama_timeout: int = Field(default=45, alias="OLLAMA_TIMEOUT")
     ollama_retry_timeout: int = Field(default=60, alias="OLLAMA_RETRY_TIMEOUT")  # Longer timeout for retries
 
+    # Vault index job (scripts/vault_index_job.py) and the summary queue it feeds
+    vault_index_max_files: int = Field(default=200, alias="LIFEOS_VAULT_INDEX_MAX_FILES")
+    vault_index_lock_wait_seconds: int = Field(default=1800, alias="LIFEOS_VAULT_INDEX_LOCK_WAIT_SECONDS")
+    summary_retry_budget_seconds: int = Field(default=3600, alias="LIFEOS_SUMMARY_RETRY_BUDGET_SECONDS")
+
     # Cross-encoder re-ranking (P9.2)
     # Query-aware reranking: protects BM25 exact matches for factual queries
     # Override via LIFEOS_RERANKER_MODEL; set LIFEOS_RERANKER_ENABLED=false to disable

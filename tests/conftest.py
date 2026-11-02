@@ -64,24 +64,6 @@ def pytest_sessionfinish(session, exitstatus):
         shutil.rmtree(os.path.join(project_root, runtime_dir), ignore_errors=True)
 
 
-def wait_for_condition(predicate, timeout: float, interval: float = 0.2):
-    """Poll ``predicate`` until it returns truthy, or ``timeout`` seconds pass.
-
-    Returns the last value ``predicate()`` produced (truthy on success, falsy
-    if the timeout was reached). Used by the file-watcher tests
-    (test_indexer.py, test_integration.py) to wait on the watcher's actual
-    observable output instead of a fixed ``time.sleep`` that can undershoot
-    ``VaultEventHandler``'s batch-processing delay — callers should
-    derive ``timeout`` from that delay rather than guessing a duration.
-    """
-    deadline = time.monotonic() + timeout
-    result = predicate()
-    while not result and time.monotonic() < deadline:
-        time.sleep(interval)
-        result = predicate()
-    return result
-
-
 @pytest.fixture(scope="session")
 def candidate_base_url():
     """Return the URL of the owned candidate, failing closed otherwise.

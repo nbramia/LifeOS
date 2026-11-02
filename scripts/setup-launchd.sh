@@ -578,6 +578,8 @@ echo ""
 echo "Not applicable on macOS (no equivalent hardware/driver):"
 echo "  lifeos-gpu-watchdog: skipped (GPU health check is ROCm/amdgpu-specific, Linux only)"
 echo "  lifeos-network-watchdog: skipped (recovers from a Linux WiFi driver deadlock, not applicable here)"
+echo ""
+echo "Not installed on macOS: lifeos-vault-index (systemd only); notes reach search through the nightly sync."
 
 echo ""
 echo "Setup complete!"

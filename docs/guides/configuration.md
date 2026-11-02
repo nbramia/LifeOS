@@ -1,7 +1,7 @@
 # Configuration Guide
 
 **Status:** Complete
-**Last Updated:** 2026-11-01
+**Last Updated:** 2026-11-02
 **Audience:** Operators
 
 **This is the single authoritative reference for every `LIFEOS_*` environment variable and the third-party service variables (`ANTHROPIC_API_KEY`, `OLLAMA_*`, `SLACK_*`, `TELEGRAM_*`, `MONARCH_*`) that LifeOS reads.** Other guides reference this file rather than restating defaults — when documentation conflicts, this file wins (and `config/settings.py` wins over both, since the code is the source of truth).
@@ -140,7 +140,10 @@ Encoder model selection and search-pipeline knobs. Decision recorded in [ADR-012
 | `LIFEOS_RERANKER_MODEL` | str | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Cross-encoder for the rerank stage. |
 | `LIFEOS_RERANKER_ENABLED` | bool | `true` | Disable to skip the rerank pass (faster, lower precision). |
 | `LIFEOS_SEARCH_FACET_BOOST` | float | `1.2` | Score multiplier applied to search results that match the facets a request passes with `boost=True`. Raise it to favor facet matches more strongly; `1.0` leaves scores unchanged. |
-| `LIFEOS_EMBEDDING_MEMORY_THRESHOLD_MB` | int | `28000` | Pre-flight free-RAM gate before phase 4 (embedding). Below this threshold the phase is skipped to avoid kernel OOM. Read directly from the environment by `scripts/run_all_syncs.py` (not a Pydantic Setting). |
+| `LIFEOS_EMBEDDING_MEMORY_THRESHOLD_MB` | int | `28000` | Minimum free GPU memory for embedding work. Below it the nightly sync stops the LLM before its embedding sources, and the vault index job exits without indexing. Read directly from the environment by `api/services/gpu_memory.py` (not a Pydantic Setting). |
+| `LIFEOS_VAULT_INDEX_MAX_FILES` | int | `200` | Most changed notes one run of the vault index job indexes. The rest wait for later runs, newest first. |
+| `LIFEOS_VAULT_INDEX_LOCK_WAIT_SECONDS` | int | `1800` | How long the nightly vault reindex waits for a running vault index job before exiting non-zero without indexing. Keep it above `TimeoutStartSec` in `lifeos-vault-index.service`. |
+| `LIFEOS_SUMMARY_RETRY_BUDGET_SECONDS` | int | `3600` | Time limit on the summary queue phase at the end of a vault reindex. Entries not reached stay queued for the next run. |
 | `LIFEOS_EMBEDDING_BATCH_SIZE` | int | `8` | Max texts per `model.encode()` batch. Bounds peak VRAM per embedding call so one large document's chunks can't spike GPU memory and exhaust a unified-memory iGPU's SDMA queues, freezing the host. Semantically neutral — only affects peak memory. |
 | `LIFEOS_EMBEDDING_GPU_LOCK_ENABLED` | bool | `true` | Serializes GPU embedding across processes (API server, agent worker, nightly sync, ad-hoc scripts) via a cross-process file lock, so they can't all grab GPU compute queues at once. |
 | `LIFEOS_EMBEDDING_GPU_LOCK_PATH` | str | `./data/gpu_embed.lock` | `flock()` path for the cross-process GPU embedding lock. Relative paths resolve against the process cwd, which every LifeOS process shares. Set to empty to disable the lock. |

@@ -17,7 +17,9 @@ Files are assigned to tiers based on their directory:
 ## Retry Logic
 
 Files that fail summary generation (timeout, etc.) are tracked and can be
-retried with a simpler prompt and longer timeout at the end of indexing.
+retried with a simpler prompt and longer timeout at the end of indexing. The
+15-minute vault index job adds the notes it indexes to the same queue, so the
+nightly run generates their summaries.
 
 ## Usage
 
@@ -30,6 +32,7 @@ retried with a simpler prompt and longer timeout at the end of indexing.
 import httpx
 import json
 import logging
+import os
 from enum import Enum
 from pathlib import Path
 from typing import Optional
@@ -40,6 +43,9 @@ logger = logging.getLogger(__name__)
 
 # Track files that failed summary generation for retry
 SUMMARY_FAILURES_FILE = "data/vault_summary_failures.json"
+
+# Content shorter than this is not worth summarizing and gets no summary.
+MIN_SUMMARY_CONTENT_CHARS = 100
 
 
 class SummaryTier(Enum):
@@ -139,7 +145,7 @@ def generate_summary(
     if timeout is None:
         timeout = settings.ollama_timeout
 
-    if len(content) < 100:
+    if len(content) < MIN_SUMMARY_CONTENT_CHARS:
         # Too short to summarize meaningfully
         return None, True  # Not a failure, just skip
 
@@ -247,7 +253,10 @@ def save_summary_failures(failures: dict) -> None:
     """Save the list of files that failed summary generation."""
     failures_path = Path(SUMMARY_FAILURES_FILE)
     failures_path.parent.mkdir(parents=True, exist_ok=True)
-    failures_path.write_text(json.dumps(failures, indent=2))
+    # Replaced atomically: a torn file would load as an empty queue.
+    tmp_path = failures_path.with_name(f"{failures_path.name}.{os.getpid()}.tmp")
+    tmp_path.write_text(json.dumps(failures, indent=2))
+    os.replace(tmp_path, failures_path)
 
 
 def add_summary_failure(file_path: str, file_name: str) -> None:
@@ -262,9 +271,18 @@ def add_summary_failure(file_path: str, file_name: str) -> None:
         save_summary_failures(failures)
 
 
-def clear_summary_failures() -> None:
-    """Clear the summary failures list."""
-    save_summary_failures({"files": []})
+def queue_summary(file_path: str, file_name: str, body: str) -> None:
+    """Queue a note for the next summary retry, unless it would get no summary anyway."""
+    if get_summary_tier(file_path) == SummaryTier.SKIP or len(body) < MIN_SUMMARY_CONTENT_CHARS:
+        return
+    add_summary_failure(file_path, file_name)
+
+
+def remove_summary_failures(file_paths: set[str]) -> None:
+    """Drop finished entries, keeping any added since the queue was last read."""
+    failures = load_summary_failures()
+    failures["files"] = [f for f in failures["files"] if f["file_path"] not in file_paths]
+    save_summary_failures(failures)
 
 
 def _fallback_summary(content: str, file_name: str) -> str:

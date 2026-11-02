@@ -1,22 +1,15 @@
 """
 Tests for the indexer service.
-P1.1 Acceptance Criteria:
-- Indexer starts and watches vault folder without errors
-- New file creation triggers indexing within 5 seconds
-- File modification triggers re-indexing within 5 seconds
-- File deletion removes chunks from ChromaDB
-- Indexer recovers gracefully from restart (no duplicate chunks)
 
 NOTE: Imports are deferred to avoid loading heavy dependencies (ChromaDB,
 sentence-transformers) during pytest collection, which would slow down unit tests.
 """
 import tempfile
-import time
 from pathlib import Path
 
 import pytest
 
-# These tests require ChromaDB and file watching (slow)
+# These tests require ChromaDB (slow)
 pytestmark = pytest.mark.slow
 
 
@@ -84,7 +77,6 @@ We talked about Q1 targets.
             entity_resolver=mock_entity_resolver,
         )
         yield indexer
-        indexer.stop()
 
     def test_indexes_markdown_files(self, indexer, temp_vault):
         """Should index all markdown files in vault."""
@@ -269,133 +261,3 @@ No frontmatter here, just content.
 
         # Should have same count (no duplicates)
         assert count1 == count2
-        indexer2.stop()
-
-
-class TestFileWatcher:
-    """Test file watching functionality."""
-
-    @pytest.fixture
-    def temp_vault(self):
-        """Create temporary vault directory."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            vault_path = Path(tmpdir) / "vault"
-            vault_path.mkdir()
-            yield vault_path
-
-    @pytest.fixture
-    def temp_db(self):
-        """Create temporary database directory."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
-
-    @pytest.fixture
-    def indexer(self, temp_vault, temp_db):
-        """Create indexer with file watching and mock stores."""
-        from api.services.indexer import IndexerService
-        from unittest.mock import MagicMock
-
-        # Create mock stores to prevent production DB writes
-        mock_interaction_store = MagicMock()
-        mock_interaction_store.add_if_not_exists.return_value = (None, False)
-        mock_source_entity_store = MagicMock()
-        mock_entity_resolver = MagicMock()
-        mock_entity_resolver.resolve.return_value = None
-
-        indexer = IndexerService(
-            vault_path=str(temp_vault),
-            db_path=str(temp_db),
-            interaction_store=mock_interaction_store,
-            source_entity_store=mock_source_entity_store,
-            entity_resolver=mock_entity_resolver,
-        )
-        yield indexer
-        indexer.stop()
-
-    def test_detects_new_file_creation(self, indexer, temp_vault):
-        """New file should be indexed automatically."""
-        from tests.conftest import wait_for_condition
-        from api.services.indexer import VaultEventHandler
-
-        # Start watching
-        indexer.start_watching()
-        time.sleep(0.5)  # Let watcher initialize
-
-        # Create new file
-        new_file = temp_vault / "new_note.md"
-        new_file.write_text("""# Brand New Note
-
-This is freshly created content about testing.
-""")
-
-        # Wait for the watcher's batch debounce to flush and index the file,
-        # rather than sleeping a fixed duration that can undershoot it.
-        def _indexed():
-            return any(fp.endswith("new_note.md") for fp in indexer.vector_store.get_all_file_paths())
-
-        assert wait_for_condition(_indexed, timeout=VaultEventHandler._BATCH_DELAY + 30), (
-            "watcher did not index the new file within the timeout"
-        )
-
-        # Search for the new content
-        results = indexer.vector_store.search("freshly created testing")
-        assert len(results) >= 1
-        assert "new_note.md" in results[0]["file_name"]
-
-    def test_detects_file_modification(self, indexer, temp_vault):
-        """Modified file should be re-indexed."""
-        from tests.conftest import wait_for_condition
-        from api.services.indexer import VaultEventHandler
-        # Create initial file
-        test_file = temp_vault / "modify_test.md"
-        test_file.write_text("# Original\n\nOriginal content.")
-
-        # Index it
-        indexer.index_file(str(test_file))
-
-        # Start watching
-        indexer.start_watching()
-        time.sleep(0.5)
-
-        # Modify the file
-        test_file.write_text("# Modified\n\nCompletely different updated content.")
-
-        def _reindexed():
-            return bool(indexer.vector_store.search("different updated content"))
-
-        assert wait_for_condition(_reindexed, timeout=VaultEventHandler._BATCH_DELAY + 30)
-
-    def test_detects_file_deletion(self, indexer, temp_vault):
-        """Deleted file should be removed from index."""
-        from tests.conftest import wait_for_condition
-        from api.services.indexer import VaultEventHandler
-
-        # Create and index file
-        test_file = temp_vault / "to_delete.md"
-        test_file.write_text("# To Delete\n\nThis will be deleted.")
-        indexer.index_file(str(test_file))
-
-        # Verify it's indexed
-        initial_results = indexer.vector_store.search("will be deleted")
-        assert len(initial_results) >= 1
-
-        # Start watching
-        indexer.start_watching()
-        time.sleep(1)  # Give watcher more time to start
-
-        # Delete the file
-        test_file.unlink()
-
-        # Wait for the watcher's batch debounce to flush and remove the file,
-        # rather than sleeping a fixed duration that can undershoot it.
-        def _removed():
-            return not any(fp.endswith("to_delete.md") for fp in indexer.vector_store.get_all_file_paths())
-
-        assert wait_for_condition(_removed, timeout=VaultEventHandler._BATCH_DELAY + 30), (
-            "watcher did not remove the deleted file from the index within the timeout"
-        )
-
-        # Search should not find the content
-        results = indexer.vector_store.search("will be deleted")
-        deleted_results = [r for r in results if "to_delete.md" in r["file_name"]]
-        assert len(deleted_results) == 0

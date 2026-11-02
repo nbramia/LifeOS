@@ -6,7 +6,6 @@ NOTE: Imports are deferred to avoid loading heavy dependencies (ChromaDB,
 sentence-transformers) during pytest collection, which would slow down unit tests.
 """
 import tempfile
-import time
 from pathlib import Path
 
 import pytest
@@ -134,7 +133,6 @@ This document describes the technical architecture of the LifeOS system.
         )
         assert all(r["note_type"] == "Work" for r in work_results)
 
-        indexer.stop()
 
     def test_granola_chunking(self, test_vault, temp_db):
         """Granola notes should be chunked by headers."""
@@ -155,7 +153,6 @@ This document describes the technical architecture of the LifeOS system.
         assert len(results) >= 1
         assert any("budget proposal" in r["content"].lower() for r in results)
 
-        indexer.stop()
 
     def test_people_filter(self, test_vault, temp_db):
         """Should be able to filter by people in frontmatter."""
@@ -175,7 +172,6 @@ This document describes the technical architecture of the LifeOS system.
         kevin_results = [r for r in results if "Kevin" in str(r.get("people", []))]
         assert len(kevin_results) >= 1
 
-        indexer.stop()
 
     def test_long_note_chunking(self, test_vault, temp_db):
         """Long notes should be chunked appropriately."""
@@ -196,42 +192,3 @@ This document describes the technical architecture of the LifeOS system.
         # Might have multiple chunks with different chunk_index
         assert len(arch_results) >= 1
 
-        indexer.stop()
-
-    def test_watch_and_update(self, test_vault, temp_db):
-        """File changes should be detected and indexed."""
-        from api.services.indexer import IndexerService, VaultEventHandler
-        from tests.conftest import wait_for_condition
-
-        indexer = IndexerService(
-            vault_path=str(test_vault),
-            db_path=str(temp_db)
-        )
-
-        indexer.index_all()
-
-        # Start watching
-        indexer.start_watching()
-        time.sleep(1)
-
-        # Create new file
-        new_file = test_vault / "Personal" / "new_thought.md"
-        new_file.write_text("""# New Insight
-
-Had an interesting thought about product strategy today.
-""")
-
-        # Wait for the watcher's batch debounce to flush and index the file,
-        # rather than sleeping a fixed duration that can undershoot it.
-        def _indexed():
-            return any(fp.endswith("new_thought.md") for fp in indexer.vector_store.get_all_file_paths())
-
-        assert wait_for_condition(_indexed, timeout=VaultEventHandler._BATCH_DELAY + 30), (
-            "watcher did not index the new file within the timeout"
-        )
-
-        # Search should find new content
-        results = indexer.vector_store.search("product strategy insight")
-        assert any("new_thought.md" in r["file_name"] for r in results)
-
-        indexer.stop()

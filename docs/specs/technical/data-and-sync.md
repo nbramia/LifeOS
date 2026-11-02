@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Data Pipeline
-> **Last Updated:** 2026-11-01
+> **Last Updated:** 2026-11-02
 
 How LifeOS ingests and stores data from multiple sources.
 
@@ -37,7 +37,7 @@ How LifeOS ingests and stores data from multiple sources.
 | Vault Notes | Obsidian markdown | Name mentions, context paths |
 | LinkedIn | CSV Import | Connections, companies, titles |
 | LinkedIn Profiles | Browser Scraping | Full profile data (experience, education, skills) |
-| Meeting notes (Wispr, Granola) | Nightly vault reindex (notes placed by the external `local-processing` watchers) | Meeting transcripts, attendees |
+| Meeting notes (Wispr, Granola) | Vault index job and nightly vault reindex (notes placed by the external `local-processing` watchers) | Meeting transcripts, attendees |
 
 ### Example Data Volume
 
@@ -163,9 +163,23 @@ The 7-phase structure ensures correct data flow:
 | ChromaDB Server | Continuous (boot) | HTTP requests | Vector data |
 | systemd/launchd API Service | Continuous (boot) | All data | API logs |
 | Unified Sync | Daily 3:00 AM ET | All sources | All stores |
+| Vault Index Job | Every 15 minutes (systemd) | Changed vault notes | ChromaDB, BM25, people stores, `data/vault_index_state.json`, `data/vault_summary_failures.json` |
 | Calendar Indexer | 8 AM, 12 PM, 3 PM ET | Google Calendar | ChromaDB (`lifeos_calendar`) |
 
-Vault notes reach search through the vault reindex in the unified sync, so a new or edited note is searchable after the next nightly run, or sooner with `POST /api/admin/reindex`. No process watches the vault for search indexing; the task and scheduler file watchers maintain their own indexes only.
+A new or edited vault note reaches search through the vault index job, normally within 15 minutes of arriving on the server, or through the vault reindex in the unified sync. `POST /api/admin/reindex` runs the same reindex on demand. No process watches the vault for search indexing; the task and scheduler file watchers maintain their own indexes only.
+
+### Vault Index Job
+
+`scripts/vault_index_job.py`, run by `lifeos-vault-index.timer` on Linux. macOS hosts do not install it, and their notes reach search through the nightly sync. It runs outside the API server and shares `IndexerService.index_all` and `data/vault_index_state.json` with the nightly reindex, so neither repeats work the other finished.
+
+- **Order and cap.** Each run indexes up to `LIFEOS_VAULT_INDEX_MAX_FILES` changed notes, newest modification time first, and leaves the rest for later runs. Deleted notes are removed from both indexes on every run, outside the cap. A note that fails to index or cannot be read stays unrecorded and is retried. An unreadable note keeps its place at the head of the order, taking one slot of the cap per run until it is fixed.
+- **Summaries.** The job generates no LLM summaries. Each note it indexes joins `data/vault_summary_failures.json`, unless its summary tier is SKIP or it is too short to summarize, and the nightly reindex generates the summary at the end of its run. That phase stops at `LIFEOS_SUMMARY_RETRY_BUDGET_SECONDS`, and entries it did not reach stay queued for the next night. While the summarizer LLM is unreachable the queue stays untouched. Tags and generated index pages stay nightly, and the task index stays with the task file watcher.
+- **Locks.** The job and `sync_vault_reindex.py --execute` exclude each other through a `flock` on `~/.lifeos/vault_index.lock`, which the kernel releases when the holder exits. A job that finds it held exits 0 and tries again next tick. The nightly reindex waits for it, up to `LIFEOS_VAULT_INDEX_LOCK_WAIT_SECONDS`. The job's `TimeoutStartSec` is shorter than that wait, so a timeout means something is wrong beyond a slow run: the reindex then exits non-zero without indexing, the sync records the failure, and the next night runs as normal. The job also holds `~/.lifeos/sync.lock` shared, as a sync does, so auto-deploy defers around it, and exits 0 if a deploy restart holds that lock.
+- **Memory.** When there are notes to index and free GPU memory is below `LIFEOS_EMBEDDING_MEMORY_THRESHOLD_MB`, or free system RAM is below the embedding minimum, the job exits 0 and logs why. It never stops the LLM service. A host with no reading, such as one without an AMD GPU, is not held back.
+- **Idle runs.** The scan compares file modification times and tag rows with the saved state and needs neither ChromaDB nor BM25, so a run with nothing to do exits without loading the embedding model. A vault with no notes at all is treated as unmounted, and nothing is removed.
+- **Failures.** A failure goes to `logs/vault-index.log` and the unit's status, and the next tick tries again. The job sends no alert and records no sync failure.
+
+`--dry-run`, the default, reports what a run would index and writes nothing. `--execute` indexes.
 
 ### Failure Notifications
 
@@ -183,9 +197,9 @@ auto-resolved by the next successful run of that source.
 
 | Store | Location | Purpose | Updated By |
 |-------|----------|---------|------------|
-| ChromaDB | `data/chromadb/` | Vector embeddings | Nightly reindex |
+| ChromaDB | `data/chromadb/` | Vector embeddings | Vault index job, nightly reindex |
 | ChromaDB (Slack) | `lifeos_slack` collection | Slack message vectors | Nightly Slack sync |
-| BM25 Index | `data/chromadb/bm25_index.db` | Keyword search | Nightly reindex |
+| BM25 Index | `data/chromadb/bm25_index.db` | Keyword search | Vault index job, nightly reindex |
 | Vault | Configured via `LIFEOS_VAULT_PATH` | Primary knowledge base | User, external classifier, GDoc Sync |
 | PersonEntity | `data/crm.db` (person_entities table) | Resolved identities | People v2 sync, iMessage sync |
 | SourceEntity | `data/crm.db` | Raw observations | All sync scripts |
@@ -308,7 +322,7 @@ Runs in this order (see [iMessage Sync Ordering](#imessage-sync-ordering) below)
 
 | Script | Purpose | Data Source |
 |--------|---------|-------------|
-| `sync_vault_reindex.py` | Reindex vault to ChromaDB + BM25 | Vault files |
+| `sync_vault_reindex.py` | Reindex vault to ChromaDB + BM25; waits for the vault index lock | Vault files |
 | `sync_vault_tag.py` | Tag changed vault notes into the tag store (`data/vault_tags.db`) | Vault files |
 | `sync_crm_to_vectorstore.py` | Make the people index hold exactly the eligible CRM people | `data/crm.db` |
 

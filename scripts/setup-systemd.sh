@@ -216,6 +216,9 @@ fi
 systemctl enable --now lifeos-sync.timer
 echo "  lifeos-sync.timer: $(systemctl is-active lifeos-sync.timer)"
 
+systemctl enable --now lifeos-vault-index.timer
+echo "  lifeos-vault-index.timer: $(systemctl is-active lifeos-vault-index.timer)"
+
 # MCP HTTP transport is only enabled when a bearer token is configured.
 # The systemd unit reads the live .env at runtime; we check the token here
 # purely to decide whether to enable/start the unit at install time. Without
