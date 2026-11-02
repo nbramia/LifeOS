@@ -426,9 +426,9 @@ class TestMergeSetsSurvivorLastSeen:
 class TestMergePeopleToneAnalysisResults:
     """Merging a person must remove tone_analysis_results rows for the
     absorbed (secondary) person, and must leave the primary's own rows
-    alone (see the code comment in scripts/merge_people.py for why: unlike
-    person_facts, a stale primary row self-heals via the existing
-    interaction-count freshness check the next time tone analysis runs).
+    alone (see the code comment in scripts/merge_people.py for why: a stale
+    primary row self-heals via the existing interaction-count freshness
+    check the next time tone analysis runs).
 
     Unlike TestMergePeople above (which mocks sqlite3.connect entirely),
     this exercises the real SQL against real temporary SQLite files, using
@@ -522,17 +522,19 @@ class TestMergePeopleToneAnalysisResults:
         tone_store = merge_env["tone_store"]
         assert len(tone_store.get_for_person("secondary-person")) == 2  # untouched by dry run
 
-    def test_merge_still_clears_facts_for_both_ids(self, merge_env):
-        """The facts-cleared-for-both-ids behavior (person_facts, above the
-        tone_analysis_results step in scripts/merge_people.py) must be
-        unaffected by that step."""
+    def test_merge_keeps_facts_of_both_people_on_the_primary(self, merge_env):
+        """The person_facts step (above the tone_analysis_results step in
+        scripts/merge_people.py) must be unaffected by that step: both
+        people's facts end up on the primary."""
         from scripts.merge_people import merge_people
 
         stats = merge_people("primary-person", "secondary-person", dry_run=False)
 
-        assert stats["facts_cleared"] == 2  # one from each id
+        assert stats["facts_moved"] == 1
+        assert stats["facts_cleared"] == 0
         fact_store = merge_env["fact_store"]
-        assert fact_store.get_for_person("primary-person") == []
+        keys = {f.key for f in fact_store.get_for_person("primary-person", include_shared=False)}
+        assert keys == {"k1", "k2"}
         assert fact_store.get_for_person("secondary-person") == []
 
     @pytest.fixture
