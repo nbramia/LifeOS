@@ -789,7 +789,8 @@ class IndexerService:
         A note holds one interaction, which goes to the first person who
         resolves, full names first. It follows the note: a holder the note doesn't
         resolve to gives it up to whoever comes first, or it goes if no one does.
-        A holder whose link a human confirmed keeps it.
+        A holder whose link a human confirmed keeps it, as does a visible one-word
+        person the note still names.
 
         Note: PersonEntity stats (mention_count) are updated via refresh_person_stats()
         after sync completes, not manually here.
@@ -850,7 +851,8 @@ class IndexerService:
         if not ambiguous:
             if complete:
                 self._settle_note_interaction(
-                    path, resolved, is_granola, resolver, interaction_store, source_entity_store, affected_person_ids
+                    path, resolved, ambiguous, is_granola, resolver, interaction_store, source_entity_store,
+                    affected_person_ids,
                 )
             return affected_person_ids
 
@@ -873,17 +875,20 @@ class IndexerService:
 
         if complete:
             self._settle_note_interaction(
-                path, resolved, is_granola, resolver, interaction_store, source_entity_store, affected_person_ids
+                path, resolved, ambiguous, is_granola, resolver, interaction_store, source_entity_store,
+                affected_person_ids,
             )
         return affected_person_ids
 
     def _settle_note_interaction(
-        self, path, resolved, is_granola, resolver, interaction_store, source_entity_store, affected_person_ids
+        self, path, resolved, ambiguous, is_granola, resolver, interaction_store, source_entity_store,
+        affected_person_ids,
     ) -> None:
         """Make a note's interaction agree with who the note resolves to now.
 
         Args:
             resolved: Each mention's person or None, in resolution order
+            ambiguous: The note's one-word mentions
         """
         source_type = "granola" if is_granola else "vault"
         file_path_str = str(path.resolve())
@@ -892,6 +897,12 @@ class IndexerService:
         if current is None or current.person_id in {entity.id for entity in people}:
             return
         if source_entity_store.has_confirmed_note_link(source_type, file_path_str, current.person_id):
+            return
+        holder = resolver.store.get_by_id(current.person_id)
+        if (
+            holder and not holder.hidden
+            and holder.canonical_name.strip().casefold() in {name.casefold() for name in ambiguous}
+        ):
             return
 
         affected_person_ids.add(current.person_id)

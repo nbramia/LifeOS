@@ -477,6 +477,44 @@ class TestNoteInteractionFollowsTheNote:
 
         assert world.interactions.added[str(path.resolve())] == x.id
 
+    def _one_word_holder(self, world, name, content):
+        holder = world.people.add(PersonEntity(canonical_name=name))
+        path = world.note("Other/family.md", content)
+        world.interactions.added[str(path.resolve())] = holder.id
+        return holder, path
+
+    def test_visible_one_word_holder_the_note_names_keeps_it(self, world):
+        holder, path = self._one_word_holder(world, "Mirel", "**Mirel** called.\n")
+
+        self._reindex(world, path, "**Mirel** called again.\n")
+
+        assert world.interactions.added[str(path.resolve())] == holder.id
+
+    def test_one_word_holder_the_note_stops_naming_gives_it_up(self, world):
+        holder, path = self._one_word_holder(world, "Mirel", "**Mirel** called.\n")
+
+        self._reindex(world, path, "Nothing here.\n")
+
+        assert world.interactions.added == {}
+
+    def test_hidden_one_word_holder_gives_it_up(self, world):
+        holder, path = self._one_word_holder(world, "Mirel", "**Mirel** called.\n")
+        holder.hidden = True
+        world.people.update(holder)
+
+        self._reindex(world, path, "**Mirel** called again.\n")
+
+        assert world.interactions.added == {}
+
+    def test_one_word_holder_with_a_phone_the_note_names_keeps_it(self, world):
+        holder, path = self._one_word_holder(world, "Mirel", "**Mirel** called.\n")
+        holder.phone_numbers = ["+12125550199"]
+        world.people.update(holder)
+
+        self._reindex(world, path, "**Mirel** called again.\n")
+
+        assert world.interactions.added[str(path.resolve())] == holder.id
+
     def test_a_confirmed_link_in_another_note_does_not_count(self, world):
         x, y, path = self._setup(world)
         world.sources.add(SourceEntity(
