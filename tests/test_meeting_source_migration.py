@@ -1,6 +1,7 @@
 """Tests for the meeting source type, its provider field, and the store migration."""
 import json
 import logging
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -61,6 +62,17 @@ CREATE INDEX idx_source_entities_source_type ON source_entities(source_type);
 """
 
 TS = "2026-03-04T10:00:00+00:00"
+
+
+@pytest.fixture(autouse=True)
+def _no_network(monkeypatch):
+    """Fail any test here that tries to reach a server, such as a live Chroma or API."""
+
+    def refuse(self, address):
+        raise AssertionError(f"this test tried to connect to {address}")
+
+    monkeypatch.setattr(socket.socket, "connect", refuse)
+    monkeypatch.setattr(socket.socket, "connect_ex", refuse)
 
 
 def _write_note(path: Path, frontmatter: str) -> str:
@@ -1404,6 +1416,22 @@ class TestMentionHandling:
         assert person is None
         entity = entities.get_by_source("meeting", f"{note.resolve()}:Alex")
         assert (entity.source_type, entity.provider) == ("meeting", "wispr")
+
+
+class TestNetworkGuard:
+    def test_the_indexer_factory_makes_no_connection(self, tmp_path):
+        indexer = _offline_indexer(
+            tmp_path,
+            _mkdir(tmp_path / "Vault"),
+            entity_resolver=MagicMock(),
+            interaction_store=MagicMock(),
+            source_entity_store=MagicMock(),
+        )
+        assert isinstance(indexer.vector_store, MagicMock)
+
+    def test_a_connection_attempt_fails_the_test(self):
+        with pytest.raises(AssertionError):
+            socket.create_connection(("127.0.0.1", 9), timeout=1)
 
 
 class TestWebUi:
