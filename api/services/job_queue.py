@@ -378,7 +378,13 @@ def _handle_reindex_vault(params: dict) -> dict:
     """Reindex the vault (runs in worker thread)."""
     from api.services.indexer import IndexerService
     from api.services.service_health import enter_maintenance, exit_maintenance
+    from api.services.vault_index_lock import wait_for_vault_index_lock
     from config.settings import settings
+
+    wait_seconds = settings.vault_index_lock_wait_seconds
+    vault_index_lock = wait_for_vault_index_lock(wait_seconds)
+    if vault_index_lock is None:
+        raise RuntimeError(f"Vault index lock still held after {wait_seconds}s; not reindexing")
 
     # Suppress alerts during reindex (heavy ChromaDB writes can cause transient errors)
     enter_maintenance(4 * 3600)
@@ -388,6 +394,7 @@ def _handle_reindex_vault(params: dict) -> dict:
         return {"files_indexed": count}
     finally:
         exit_maintenance()
+        vault_index_lock.close()
 
 
 def _handle_sync_source(params: dict) -> dict:

@@ -84,18 +84,26 @@ CREATE INDEX IF NOT EXISTS idx_vault_tags_project ON vault_tags(project);
 """
 
 
-def get_vault_tags_db_path() -> str:
+def get_vault_tags_db_path(create_dir: bool = True) -> str:
     db_dir = Path(settings.chroma_path).parent
-    db_dir.mkdir(parents=True, exist_ok=True)
+    if create_dir:
+        db_dir.mkdir(parents=True, exist_ok=True)
     return str(db_dir / "vault_tags.db")
 
 
 class VaultTagStore:
     def __init__(self, db_path: str | None = None, read_only: bool = False):
-        """Open the store. ``read_only`` skips schema setup and writes nothing."""
-        self.db_path = db_path or get_vault_tags_db_path()
+        """Open the store.
+
+        ``read_only`` skips schema setup and writes nothing. It raises
+        ``sqlite3.Error`` straight away when the database is absent or lacks a
+        column ``get`` reads, since every later lookup would fail the same way.
+        """
+        self.db_path = db_path or (get_vault_tags_db_path(create_dir=False) if read_only else get_vault_tags_db_path())
         self._read_only = read_only
         if read_only:
+            with self._connect() as conn:
+                conn.execute(f"SELECT {', '.join(_COLUMNS)} FROM vault_tags LIMIT 1").fetchone()
             return
         with self._connect() as conn:
             fresh = conn.execute(

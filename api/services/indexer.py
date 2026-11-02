@@ -130,6 +130,7 @@ class IndexerService:
         self._entity_resolver = entity_resolver
         self._tag_store = tag_store
         self._tag_store_failed = False
+        self._tag_lookup_failed = False
 
         if connect_stores:
             # Initialize vector store
@@ -157,7 +158,10 @@ class IndexerService:
         try:
             key = Path(path).relative_to(self.vault_path).as_posix()
             return self._tag_store.get(key)
-        except Exception:
+        except Exception as e:
+            if not self._tag_lookup_failed:
+                logger.warning(f"Tag lookup failed, treating notes as untagged: {e}")
+                self._tag_lookup_failed = True
             return None
 
     def _load_index_state(self) -> dict:
@@ -180,25 +184,32 @@ class IndexerService:
         tmp_path.write_text(json.dumps(state, indent=2))
         os.replace(tmp_path, state_path)
 
-    def scan_changes(self) -> dict:
+    def scan_changes(self, compare_tags: bool = True) -> dict:
         """Report what an incremental ``index_all`` would do, changing nothing.
 
         Needs no vector store or BM25, so a caller can learn that there is no
         work without loading anything heavy.
+
+        Args:
+            compare_tags: If False, ignore tag phrases and compare modification
+                times only. For a caller that has no tag store to read: treating
+                every note as untagged would report each tagged one as changed.
 
         Returns:
             Dict with ``to_index`` (newest modification time first), ``deleted``
             and ``file_count``.
         """
         index_state = self._load_index_state()
-        files_to_index, deleted_files, _tag_key, file_count = self._find_changes(index_state, force=False)
+        files_to_index, deleted_files, _tag_key, file_count = self._find_changes(
+            index_state, force=False, compare_tags=compare_tags
+        )
         return {
             "to_index": [path for path, _ in sorted(files_to_index, key=lambda item: item[1], reverse=True)],
             "deleted": sorted(deleted_files),
             "file_count": file_count,
         }
 
-    def _find_changes(self, index_state: dict, force: bool) -> tuple[list, set, dict, int]:
+    def _find_changes(self, index_state: dict, force: bool, compare_tags: bool = True) -> tuple[list, set, dict, int]:
         """Compare the vault with ``index_state``.
 
         Returns:
@@ -220,9 +231,11 @@ class IndexerService:
         files_to_index = []
         for file_path, mtime in current_files.items():
             prev_mtime = index_state.get(file_path)
-            key = tag_phrase_key(self._tag_for(Path(file_path)))
-            current_tag_key[file_path] = list(key) if key else None
-            tags_changed = current_tag_key[file_path] != tag_keys.get(file_path)
+            tags_changed = False
+            if compare_tags:
+                key = tag_phrase_key(self._tag_for(Path(file_path)))
+                current_tag_key[file_path] = list(key) if key else None
+                tags_changed = current_tag_key[file_path] != tag_keys.get(file_path)
             if force:
                 # In force mode, reindex if not yet indexed in this run
                 # (allows resuming a force reindex after crash)
@@ -245,6 +258,7 @@ class IndexerService:
         max_files: int | None = None,
         newest_first: bool = False,
         light_pass: bool = False,
+        max_deletions: int | None = None,
     ) -> int:
         """
         Index markdown files in the vault.
@@ -265,6 +279,8 @@ class IndexerService:
                 see ``index_file``. Summaries are not generated or retried here,
                 and a file that could not be read stays unrecorded so a later
                 run retries it.
+            max_deletions: Remove at most this many deleted files from the index,
+                leaving the rest for a later run.
 
         Returns:
             Number of files indexed
@@ -292,8 +308,13 @@ class IndexerService:
             logger.info(f"Indexing {max_files} of {len(files_to_index)} changed files this run; the rest wait for a later run")
             files_to_index = files_to_index[:max_files]
 
-        # Delete removed files from index
-        for file_path in deleted_files:
+        # Delete removed files from index, saving progress so an interrupted run
+        # does not repeat them
+        deleted_this_run = sorted(deleted_files)
+        if max_deletions is not None and len(deleted_this_run) > max_deletions:
+            logger.info(f"Removing {max_deletions} of {len(deleted_this_run)} deleted files this run; the rest wait for a later run")
+            deleted_this_run = deleted_this_run[:max_deletions]
+        for position, file_path in enumerate(deleted_this_run, start=1):
             try:
                 self.delete_file(file_path)
                 # Remove from state
@@ -302,6 +323,10 @@ class IndexerService:
                 logger.info(f"Removed deleted file from index: {file_path}")
             except Exception as e:
                 logger.error(f"Failed to remove {file_path} from index: {e}")
+            if position % 50 == 0:
+                self._save_index_state(index_state)
+        if deleted_this_run:
+            self._save_index_state(index_state)
 
         # Index changed files, saving progress incrementally
         count = 0
@@ -563,11 +588,12 @@ class IndexerService:
         """
         Work through the summary queue: first-pass failures and queued notes.
 
-        Uses a simpler prompt and longer timeout for better success rate. The
-        work is bounded by ``settings.summary_retry_budget_seconds``, and entries
-        not reached stay queued for the next run. While the LLM is unreachable
-        the whole queue stays put, because a retry would store a fallback summary
-        built from the note's first line and drop the entry.
+        Uses a simpler prompt and longer timeout for better success rate. Notes
+        go newest first, so today's notes get summaries ahead of an old backlog.
+        The work is bounded by ``settings.summary_retry_budget_seconds``, and
+        entries not reached stay queued for the next run. While the LLM is
+        unreachable the whole queue stays put, because a retry would store a
+        fallback summary built from the note's first line and drop the entry.
 
         Returns:
             Number of files successfully retried
@@ -589,6 +615,14 @@ class IndexerService:
 
         logger.info(f"Retrying {len(failed_files)} failed summaries with simpler prompt...")
 
+        def _recency(entry: dict) -> float:
+            try:
+                return os.path.getmtime(entry["file_path"])
+            except OSError:
+                # Gone: taken first, since dropping the entry costs nothing.
+                return float("inf")
+
+        failed_files = sorted(failed_files, key=_recency, reverse=True)
         deadline = time.monotonic() + settings.summary_retry_budget_seconds
         success_count = 0
         finished: set[str] = set()
@@ -637,6 +671,16 @@ class IndexerService:
         logger.info(f"Summary retry complete: {success_count}/{len(finished)} succeeded")
 
         return success_count
+
+    def drain_summary_queue(self) -> int:
+        """Work through the summary queue on its own, without indexing anything.
+
+        For a caller that knows the LLM was down during the reindex and is back.
+
+        Returns:
+            Number of summaries generated
+        """
+        return self._retry_failed_summaries()
 
     def _extract_note_date(self, path: Path, frontmatter: dict, body: str = "") -> str:
         """Extract the note date; see `api.utils.date_parser.extract_note_date`."""

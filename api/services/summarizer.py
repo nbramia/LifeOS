@@ -29,13 +29,15 @@ nightly run generates their summaries.
     if tier != SummaryTier.SKIP:
         summary = generate_summary(content, file_name)
 """
+import contextlib
+import fcntl
 import httpx
 import json
 import logging
 import os
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 from config.settings import settings
 
@@ -259,16 +261,31 @@ def save_summary_failures(failures: dict) -> None:
     os.replace(tmp_path, failures_path)
 
 
+@contextlib.contextmanager
+def _summary_queue_lock() -> Iterator[None]:
+    """Serialize read-modify-write of the queue across processes and threads.
+
+    On a sibling file, because the queue file itself is replaced on every save.
+    Held only for one read and one write. The kernel drops it if the holder dies.
+    """
+    lock_path = Path(f"{SUMMARY_FAILURES_FILE}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+
+
 def add_summary_failure(file_path: str, file_name: str) -> None:
     """Add a file to the failure list for retry."""
-    failures = load_summary_failures()
-    # Avoid duplicates
-    if not any(f["file_path"] == file_path for f in failures["files"]):
-        failures["files"].append({
-            "file_path": file_path,
-            "file_name": file_name
-        })
-        save_summary_failures(failures)
+    with _summary_queue_lock():
+        failures = load_summary_failures()
+        # Avoid duplicates
+        if not any(f["file_path"] == file_path for f in failures["files"]):
+            failures["files"].append({
+                "file_path": file_path,
+                "file_name": file_name
+            })
+            save_summary_failures(failures)
 
 
 def queue_summary(file_path: str, file_name: str, body: str) -> None:
@@ -280,9 +297,10 @@ def queue_summary(file_path: str, file_name: str, body: str) -> None:
 
 def remove_summary_failures(file_paths: set[str]) -> None:
     """Drop finished entries, keeping any added since the queue was last read."""
-    failures = load_summary_failures()
-    failures["files"] = [f for f in failures["files"] if f["file_path"] not in file_paths]
-    save_summary_failures(failures)
+    with _summary_queue_lock():
+        failures = load_summary_failures()
+        failures["files"] = [f for f in failures["files"] if f["file_path"] not in file_paths]
+        save_summary_failures(failures)
 
 
 def _fallback_summary(content: str, file_name: str) -> str:

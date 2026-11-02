@@ -94,7 +94,10 @@ def job(tmp_path, vault, summary_queue, vector_store, stats_refresh, monkeypatch
     monkeypatch.setattr(vault_index_lock, "VAULT_INDEX_LOCK_PATH", tmp_path / "locks" / "vault_index.lock")
     monkeypatch.setattr(gpu_memory, "get_available_gpu_memory_mb", lambda: 60_000)
     monkeypatch.setattr(gpu_memory, "get_available_system_ram_mb", lambda: 60_000)
-    return vault_index_job
+    yield vault_index_job
+    # The job enters maintenance mode on the shared per-process registry.
+    from api.services.service_health import exit_maintenance
+    exit_maintenance()
 
 
 @pytest.fixture
@@ -315,6 +318,7 @@ class TestSummaryQueue:
         from api.services import summarizer
         from config.settings import settings
 
+        # Queued oldest first, so only newest-first order reaches the last two.
         notes = [_write_note(vault, f"{i}.md", 1000 + i) for i in range(5)]
         for note in notes:
             summarizer.add_summary_failure(str(note), note.name)
@@ -327,7 +331,7 @@ class TestSummaryQueue:
 
         assert indexer._retry_failed_summaries() == 2
 
-        assert _queued(summary_queue) == [str(n) for n in notes[2:]]
+        assert _queued(summary_queue) == [str(n) for n in notes[:3]]
 
     def test_unreachable_llm_keeps_the_queue_without_fallback_summaries(
         self, indexer, vault, summary_queue, monkeypatch
@@ -362,6 +366,183 @@ class TestSummaryQueue:
         indexer._retry_failed_summaries()
 
         assert _queued(summary_queue) == [str(late)]
+
+
+class TestSummaryQueueAcrossProcesses:
+    def test_concurrent_adds_and_removes_lose_nothing(self, tmp_path, summary_queue):
+        """Adders and a remover in separate processes, started together."""
+        from api.services import summarizer
+
+        doomed = [f"/synthetic/doomed-{i}.md" for i in range(40)]
+        for path in doomed:
+            summarizer.add_summary_failure(path, "doomed.md")
+
+        worker = (
+            "import sys\n"
+            "from api.services import summarizer\n"
+            "summarizer.SUMMARY_FAILURES_FILE = sys.argv[1]\n"
+            "print('ready', flush=True)\n"
+            "sys.stdin.readline()\n"
+            "if sys.argv[2] == 'remove':\n"
+            "    for i in range(40):\n"
+            "        summarizer.remove_summary_failures({f'/synthetic/doomed-{i}.md'})\n"
+            "else:\n"
+            "    for i in range(40):\n"
+            "        summarizer.add_summary_failure(f'/synthetic/{sys.argv[2]}-{i}.md', 'note.md')\n"
+        )
+        env = {**os.environ, "PYTHONPATH": str(REPO_ROOT)}
+        workers = [
+            subprocess.Popen(
+                [sys.executable, "-c", worker, str(summary_queue), role],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, cwd=REPO_ROOT, env=env,
+            )
+            for role in ("a", "b", "c", "remove")
+        ]
+        for process in workers:
+            assert process.stdout.readline().strip() == "ready"
+        for process in workers:
+            process.stdin.write("go\n")
+            process.stdin.flush()
+        for process in workers:
+            process.stdin.close()
+            assert process.wait(timeout=60) == 0
+            process.stdout.close()
+
+        expected = {f"/synthetic/{role}-{i}.md" for role in "abc" for i in range(40)}
+        assert set(_queued(summary_queue)) == expected
+
+
+class TestMassDeletions:
+    def test_more_deletions_than_fit_run_over_several_runs(self, indexer, vault, vector_store):
+        keep = _write_note(vault, "keep.md", 1000)
+        gone = [_write_note(vault, f"gone{i}.md", 1000) for i in range(5)]
+        indexer.index_all(light_pass=True)
+        for note in gone:
+            note.unlink()
+        store = vector_store.return_value
+
+        def _remaining():
+            state = json.loads(_state_file().read_text())
+            return sum(str(note) in state for note in gone)
+
+        indexer.index_all(light_pass=True, max_deletions=2)
+        assert store.delete_document.call_count == 2
+        assert _remaining() == 3
+
+        indexer.index_all(light_pass=True, max_deletions=2)
+        assert store.delete_document.call_count == 4
+        assert _remaining() == 1
+
+        indexer.index_all(light_pass=True, max_deletions=2)
+        assert store.delete_document.call_count == 5
+        assert _remaining() == 0
+
+        # Each note removed exactly once: progress carried between runs.
+        removed = [call.args[0] for call in store.delete_document.call_args_list]
+        assert sorted(removed) == sorted(str(note.resolve()) for note in gone)
+        assert str(keep) in json.loads(_state_file().read_text())
+
+    def test_deletions_are_saved_before_indexing_starts(self, indexer, vault, monkeypatch):
+        """A run killed while indexing must not repeat the deletions next tick."""
+        note = _write_note(vault, "gone.md", 1000)
+        indexer.index_all(light_pass=True)
+        note.unlink()
+        _write_note(vault, "new.md", 2000)
+        monkeypatch.setattr(indexer, "index_file", MagicMock(side_effect=KeyboardInterrupt))
+
+        with pytest.raises(KeyboardInterrupt):
+            indexer.index_all(light_pass=True)
+
+        assert str(note) not in json.loads(_state_file().read_text())
+
+    def test_job_applies_its_deletion_cap(self, job, vault, vector_store, monkeypatch):
+        from config.settings import settings
+
+        monkeypatch.setattr(settings, "vault_index_max_deletions", 2)
+        _write_note(vault, "keep.md", 1000)
+        gone = [_write_note(vault, f"gone{i}.md", 1000) for i in range(3)]
+        job.run_job(dry_run=False)
+        for note in gone:
+            note.unlink()
+
+        job.run_job(dry_run=False)
+
+        assert vector_store.return_value.delete_document.call_count == 2
+
+
+class TestDryRunAgainstRealTagStore:
+    """The real store, opened read-only as the dry run opens it, with no stubs."""
+
+    @staticmethod
+    def _tag(vault: Path, note: Path, topic: str) -> None:
+        from api.services.vault_tag_store import TagRecord, VaultTagStore
+
+        VaultTagStore().upsert(TagRecord(
+            file_path=note.relative_to(vault).as_posix(), content_sha256="synthetic", vocab_version="v",
+            doc_type="meeting", doc_type_conf=0.9, topic=topic, topic_conf=0.9,
+        ))
+
+    def test_read_only_store_returns_what_was_written(self, vault):
+        from api.services.vault_tag_store import VaultTagStore
+
+        note = _write_note(vault, "tagged.md", 1000)
+        self._tag(vault, note, "work/alpha")
+
+        record = VaultTagStore(read_only=True).get("tagged.md")
+
+        assert record is not None
+        assert record.topic == "work/alpha"
+
+    def test_tagged_notes_already_indexed_are_not_reported_as_changed(self, job, vault, caplog):
+        note = _write_note(vault, "tagged.md", 1000)
+        self._tag(vault, note, "work/alpha")
+        assert job.run_job(dry_run=False)["files_indexed"] == 1
+
+        assert job.run_job(dry_run=True)["changed"] == 0
+
+        self._tag(vault, note, "work/beta")
+        assert job.run_job(dry_run=True)["changed"] == 1
+
+    def test_missing_tag_database_counts_by_mtime_and_says_so(self, job, vault, caplog):
+        from api.services.vault_tag_store import get_vault_tags_db_path
+
+        note = _write_note(vault, "tagged.md", 1000)
+        self._tag(vault, note, "work/alpha")
+        job.run_job(dry_run=False)
+        db = Path(get_vault_tags_db_path())
+        db.unlink()
+
+        with caplog.at_level(logging.INFO):
+            assert job.main(["--dry-run"]) == 0
+
+        assert "0 changed" in caplog.text
+        assert "Tag store unreadable" in caplog.text
+        assert not db.exists()
+
+    def test_read_only_store_rejects_an_unusable_database(self, tmp_path):
+        import sqlite3
+
+        from api.services.vault_tag_store import VaultTagStore
+
+        with pytest.raises(sqlite3.Error):
+            VaultTagStore(str(tmp_path / "absent.db"), read_only=True)
+
+        old = tmp_path / "old.db"
+        connection = sqlite3.connect(old)
+        connection.execute("CREATE TABLE vault_tags (file_path TEXT)")
+        connection.close()
+        with pytest.raises(sqlite3.Error):
+            VaultTagStore(str(old), read_only=True)
+
+    def test_failing_tag_lookup_is_logged_once(self, indexer, vault, caplog):
+        for i in range(3):
+            _write_note(vault, f"{i}.md", 1000)
+        indexer._tag_store = MagicMock(get=MagicMock(side_effect=RuntimeError("synthetic")))
+
+        with caplog.at_level(logging.WARNING):
+            indexer.scan_changes()
+
+        assert caplog.text.count("Tag lookup failed") == 1
 
 
 class TestJobGates:
@@ -515,7 +696,7 @@ class TestJobGates:
         assert str(note) in json.loads(_state_file().read_text())
 
     def test_failure_exits_nonzero_with_no_alert_and_no_sync_record(self, job, vault, vector_store, monkeypatch):
-        from api.services import service_health, sync_health
+        from api.services import sync_health
 
         _write_note(vault, "note.md", 1000)
         vector_store.side_effect = ConnectionError("synthetic: ChromaDB is restarting")
@@ -533,9 +714,6 @@ class TestJobGates:
         telegram.assert_not_called()
         for recorder in recorders.values():
             recorder.assert_not_called()
-        # A CRITICAL service failure inside the run stays silent too.
-        assert service_health.get_service_health().in_maintenance
-        service_health.exit_maintenance()
 
     def test_critical_failure_inside_a_run_sends_no_alert(self, job, vault, vector_store, monkeypatch):
         """The chromadb failure VectorStore reports would otherwise pass every
@@ -560,7 +738,16 @@ class TestJobGates:
         assert job.main(["--execute"]) == 1
 
         send_alert.assert_not_called()
-        service_health.exit_maintenance()
+
+    def test_cpu_fallback_is_logged_with_the_run(self, job, vault, caplog, monkeypatch):
+        _write_note(vault, "note.md", 1000)
+        service = MagicMock(using_cpu_fallback=True)
+        monkeypatch.setattr("api.services.embeddings.get_embedding_service", lambda: service)
+
+        with caplog.at_level(logging.INFO):
+            assert job.main(["--execute"]) == 0
+
+        assert "embedded on the CPU" in caplog.text
 
     def test_dry_run_reports_and_writes_nothing(self, job, tmp_path, vault, vector_store, caplog):
         def _snapshot():
@@ -675,6 +862,133 @@ class TestNightlyWaits:
             holder.wait()
 
         assert vault_index_lock.try_flock(lock_path) is not None
+
+
+class TestDrainSummaries:
+    @pytest.fixture
+    def drain(self, vault, summary_queue, vector_store, nightly, monkeypatch):
+        from api.services import summarizer
+        from config.settings import settings
+
+        script, _reindex = nightly
+        monkeypatch.setattr(settings, "vault_path", vault)
+        monkeypatch.setattr(script.time, "sleep", lambda _seconds: None)
+        note = _write_note(vault, "note.md", 1000)
+        summarizer.add_summary_failure(str(note), note.name)
+        monkeypatch.setattr(summarizer, "retry_summary", MagicMock(return_value="A synthetic summary of this note."))
+        return script
+
+    def test_waits_for_a_restarted_llm_then_drains(self, drain, summary_queue, monkeypatch):
+        from api.services import summarizer
+
+        answers = iter([False, False, True, True])
+        monkeypatch.setattr(summarizer, "is_summarizer_llm_available", lambda: next(answers))
+
+        assert drain.main(["--drain-summaries"]) == 0
+
+        assert _queued(summary_queue) == []
+        summarizer.retry_summary.assert_called_once()
+
+    def test_llm_that_never_returns_leaves_the_queue(self, drain, summary_queue, monkeypatch):
+        from api.services import summarizer
+
+        monkeypatch.setattr(summarizer, "is_summarizer_llm_available", lambda: False)
+        monkeypatch.setattr(drain, "LLM_READY_WAIT_SECONDS", 0)
+
+        assert drain.main(["--drain-summaries"]) == 0
+
+        assert len(_queued(summary_queue)) == 1
+        summarizer.retry_summary.assert_not_called()
+
+    def test_takes_the_vault_index_lock(self, drain, summary_queue, monkeypatch):
+        from api.services import summarizer, vault_index_lock
+        from config.settings import settings
+
+        monkeypatch.setattr(settings, "vault_index_lock_wait_seconds", 0)
+        monkeypatch.setattr(summarizer, "is_summarizer_llm_available", lambda: True)
+        held = vault_index_lock.try_flock(vault_index_lock.VAULT_INDEX_LOCK_PATH)
+        assert held is not None
+
+        assert drain.main(["--drain-summaries"]) == 1
+
+        assert len(_queued(summary_queue)) == 1
+        summarizer.retry_summary.assert_not_called()
+
+    def test_does_not_reindex(self, drain, nightly, monkeypatch):
+        from api.services import summarizer
+
+        monkeypatch.setattr(summarizer, "is_summarizer_llm_available", lambda: True)
+
+        drain.main(["--drain-summaries"])
+
+        nightly[1].assert_not_called()
+
+
+class TestApiReindexTakesTheLock:
+    def test_background_job_waits_for_the_lock_and_holds_it(self, vector_store, monkeypatch):
+        from api.services import job_queue, vault_index_lock
+
+        seen = []
+        indexer_class = MagicMock()
+        indexer_class.return_value.index_all.side_effect = lambda: (
+            seen.append(vault_index_lock.try_flock(vault_index_lock.VAULT_INDEX_LOCK_PATH)) or 3
+        )
+        monkeypatch.setattr("api.services.indexer.IndexerService", indexer_class)
+
+        assert job_queue._handle_reindex_vault({}) == {"files_indexed": 3}
+
+        assert seen == [None]
+        released = vault_index_lock.try_flock(vault_index_lock.VAULT_INDEX_LOCK_PATH)
+        assert released is not None
+
+    def test_background_job_gives_up_without_indexing(self, monkeypatch):
+        from api.services import job_queue, vault_index_lock
+        from config.settings import settings
+
+        monkeypatch.setattr(settings, "vault_index_lock_wait_seconds", 0)
+        indexer_class = MagicMock()
+        monkeypatch.setattr("api.services.indexer.IndexerService", indexer_class)
+        held = vault_index_lock.try_flock(vault_index_lock.VAULT_INDEX_LOCK_PATH)
+        assert held is not None
+
+        with pytest.raises(RuntimeError, match="still held"):
+            job_queue._handle_reindex_vault({})
+
+        indexer_class.return_value.index_all.assert_not_called()
+
+    def test_sync_route_reports_busy_without_indexing(self, monkeypatch):
+        import asyncio
+
+        from api.routes import admin
+        from api.services import vault_index_lock
+
+        indexer_class = MagicMock()
+        monkeypatch.setattr(admin, "IndexerService", indexer_class)
+        held = vault_index_lock.try_flock(vault_index_lock.VAULT_INDEX_LOCK_PATH)
+        assert held is not None
+
+        response = asyncio.run(admin.reindex_sync())
+
+        assert response.status == "busy"
+        indexer_class.assert_not_called()
+
+    def test_sync_route_holds_and_releases_the_lock(self, monkeypatch):
+        import asyncio
+
+        from api.routes import admin
+        from api.services import vault_index_lock
+
+        seen = []
+        indexer_class = MagicMock()
+        indexer_class.return_value.index_all.side_effect = lambda: (
+            seen.append(vault_index_lock.try_flock(vault_index_lock.VAULT_INDEX_LOCK_PATH)) or 4
+        )
+        monkeypatch.setattr(admin, "IndexerService", indexer_class)
+
+        assert asyncio.run(admin.reindex_sync()).files_indexed == 4
+
+        assert seen == [None]
+        assert vault_index_lock.try_flock(vault_index_lock.VAULT_INDEX_LOCK_PATH) is not None
 
 
 class TestWatcherRemoved:

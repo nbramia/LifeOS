@@ -32,6 +32,7 @@ import argparse
 import fcntl
 import json
 import logging
+import os
 import re
 import signal
 import subprocess
@@ -64,6 +65,7 @@ from api.services.sync_health import (
     reap_orphan_sync_runs,
     detect_silent_source_entity_drift,
 )
+from api.services import vault_index_lock
 from api.services.gpu_memory import (
     EMBEDDING_MEMORY_THRESHOLD_MB as _EMBEDDING_MEMORY_THRESHOLD_MB,
     EMBEDDING_RAM_THRESHOLD_MB as _EMBEDDING_RAM_THRESHOLD_MB,
@@ -273,6 +275,56 @@ def _start_llm() -> None:
     for model in _ollama_models_unloaded:
         _ollama_warm(model)
     _ollama_models_unloaded = []
+
+
+# Pause between a vault index job's exit and reading free VRAM. The driver frees
+# a finished process's memory a moment after the kernel drops its flock.
+_VRAM_SETTLE_SECONDS = 5
+
+
+def _wait_for_vault_index_job() -> None:
+    """Wait for a running vault index job, so its model does not count as used.
+
+    Otherwise the free-VRAM reading that follows could stop the LLM for memory
+    the job is about to give back. The lock is not kept: the reindex subprocess
+    takes its own, and a job starting in the gap finds the memory decision made.
+    """
+    logger = logging.getLogger(__name__)
+    try:
+        lock = vault_index_lock.try_flock(vault_index_lock.VAULT_INDEX_LOCK_PATH)
+        if lock is None:
+            lock = vault_index_lock.wait_for_vault_index_lock(settings.vault_index_lock_wait_seconds)
+            if lock is None:
+                logger.warning("Vault index lock still held; reading GPU memory anyway")
+                return
+            time.sleep(_VRAM_SETTLE_SECONDS)
+        lock.close()
+    except OSError as e:
+        logger.warning(f"Could not check the vault index lock ({e}); reading GPU memory anyway")
+
+
+def _drain_summary_queue() -> None:
+    """Generate queued summaries now the LLM is back.
+
+    Summaries that came due while the LLM was stopped for embeddings stayed
+    queued. A failure here leaves them queued for the next night and fails nothing.
+    """
+    logger = logging.getLogger(__name__)
+    project_root = Path(__file__).parent.parent
+    # Lock wait + LLM load + the work itself.
+    timeout = settings.vault_index_lock_wait_seconds + 600 + settings.summary_retry_budget_seconds + 300
+    try:
+        result = subprocess.run(
+            [sys.executable, str(project_root / "scripts" / "sync_vault_reindex.py"), "--drain-summaries"],
+            capture_output=True, text=True, timeout=timeout, cwd=str(project_root),
+            env={**os.environ, "PYTHONPATH": str(project_root)},
+        )
+        if result.returncode != 0:
+            logger.warning(f"Summary queue drain failed: {(result.stderr or '')[-500:]}")
+        else:
+            logger.info("Summary queue drain finished")
+    except (OSError, subprocess.TimeoutExpired) as e:
+        logger.warning(f"Summary queue drain did not finish: {e}")
 
 
 # Track current sync run for SIGTERM cleanup
@@ -2258,6 +2310,8 @@ def run_all_syncs(
             if source in EMBEDDING_SOURCES and not dry_run and not llm_memory_checked:
                 llm_memory_checked = True
 
+                _wait_for_vault_index_job()
+
                 # Check system RAM first — insufficient RAM causes kernel OOM kills
                 available_ram = _get_available_system_ram_mb()
                 if available_ram is not None and available_ram < _EMBEDDING_RAM_THRESHOLD_MB:
@@ -2318,6 +2372,7 @@ def run_all_syncs(
                 if not next_is_embedding:
                     _start_llm()
                     _llm_stopped_for_sync = False
+                    _drain_summary_queue()
     finally:
         # Safety net: restart LLM if we stopped it and it's still down
         if _llm_stopped_for_sync and _llm_was_running_before_sync:

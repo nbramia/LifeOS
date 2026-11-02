@@ -1406,6 +1406,7 @@ class Settings(BaseSettings):
 
     # Vault index job (scripts/vault_index_job.py) and the summary queue it feeds
     vault_index_max_files: int = Field(default=200, alias="LIFEOS_VAULT_INDEX_MAX_FILES")
+    vault_index_max_deletions: int = Field(default=300, alias="LIFEOS_VAULT_INDEX_MAX_DELETIONS")
     vault_index_lock_wait_seconds: int = Field(default=1800, alias="LIFEOS_VAULT_INDEX_LOCK_WAIT_SECONDS")
     summary_retry_budget_seconds: int = Field(default=3600, alias="LIFEOS_SUMMARY_RETRY_BUDGET_SECONDS")
 

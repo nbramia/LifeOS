@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import argparse
 import logging
+import sqlite3
 import time
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
@@ -33,7 +34,9 @@ logger = logging.getLogger(__name__)
 # holds it shared, as a sync does, so a deploy does not restart services under it.
 SYNC_LOCK_PATH = Path.home() / ".lifeos" / "sync.lock"
 
-# Alerts stay suppressed for longer than the unit's TimeoutStartSec allows a run.
+# Suppresses CRITICAL alerts raised inside this process only: the API server keeps
+# its own registry and goes on alerting. Longer than the unit's TimeoutStartSec
+# allows a run.
 ALERT_SUPPRESSION_SECONDS = 3600
 
 DRY_RUN_LISTED_FILES = 20
@@ -61,12 +64,30 @@ def _memory_shortfall() -> str | None:
     return None
 
 
-def _report_dry_run(scanner, cap: int) -> dict:
-    changes = scanner.scan_changes()
+def _report_dry_run(vault_path: Path, cap: int, max_deletions: int) -> dict:
+    from api.services.indexer import IndexerService
+    from api.services.vault_tag_store import VaultTagStore, get_vault_tags_db_path
+
+    # The state path follows the working directory and the tag database follows
+    # settings.chroma_path, so a run from another checkout can read mismatched
+    # files. Naming both makes that visible.
+    state_path = Path(IndexerService.INDEX_STATE_FILE).resolve()
+    tag_db_path = get_vault_tags_db_path(create_dir=False)
+    logger.info(f"Index state: {state_path}{'' if state_path.exists() else ' (not found: every note counts as changed)'}")
+    try:
+        tag_store = VaultTagStore(read_only=True)
+        logger.info(f"Tag store: {tag_db_path}")
+    except sqlite3.Error as e:
+        tag_store = None
+        logger.warning(f"Tag store unreadable at {tag_db_path} ({e}); counting by modification time only, so notes whose tags changed are missed")
+
+    scanner = IndexerService(vault_path=vault_path, connect_stores=False, tag_store=tag_store)
+    changes = scanner.scan_changes(compare_tags=tag_store is not None)
     to_index = changes["to_index"]
     logger.info(
         f"DRY RUN - {changes['file_count']} notes in vault, {len(to_index)} changed, "
-        f"{len(changes['deleted'])} deleted; a run would index {min(cap, len(to_index))} (cap {cap})"
+        f"{len(changes['deleted'])} deleted; a run would index {min(cap, len(to_index))} (cap {cap}) "
+        f"and remove {min(max_deletions, len(changes['deleted']))} (cap {max_deletions})"
     )
     for file_path in to_index[:min(cap, DRY_RUN_LISTED_FILES)]:
         logger.info(f"  would index: {file_path}")
@@ -104,12 +125,10 @@ def run_job(dry_run: bool = True, max_files: int | None = None) -> dict:
         logger.error(f"Vault path not found: {vault_path}")
         return {"status": "error", "reason": "vault_not_found"}
 
+    max_deletions = settings.vault_index_max_deletions
+
     if dry_run:
-        from api.services.vault_tag_store import VaultTagStore
-        scanner = IndexerService(
-            vault_path=vault_path, connect_stores=False, tag_store=VaultTagStore(read_only=True)
-        )
-        return _report_dry_run(scanner, cap)
+        return _report_dry_run(vault_path, cap, max_deletions)
 
     # Held for the rest of this call. A crash releases them, since the kernel
     # drops a flock when its process exits.
@@ -146,13 +165,18 @@ def run_job(dry_run: bool = True, max_files: int | None = None) -> dict:
 
     start_time = time.time()
     indexer = IndexerService(vault_path=vault_path)
-    files_indexed = indexer.index_all(max_files=cap, newest_first=True, light_pass=True)
+    files_indexed = indexer.index_all(
+        max_files=cap, newest_first=True, light_pass=True, max_deletions=max_deletions
+    )
     elapsed = time.time() - start_time
 
     logger.info(
         f"Indexed {files_indexed} of {len(to_index)} changed notes, "
-        f"{len(deleted)} deleted, in {elapsed:.1f}s"
+        f"{len(deleted)} deleted notes pending at the start, in {elapsed:.1f}s"
     )
+    from api.services.embeddings import get_embedding_service
+    if get_embedding_service().using_cpu_fallback:
+        logger.warning(f"This run embedded on the CPU, not the GPU: {files_indexed} notes in {elapsed:.1f}s")
     return {
         "status": "indexed",
         "files_indexed": files_indexed,
