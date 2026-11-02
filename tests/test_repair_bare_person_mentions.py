@@ -26,6 +26,8 @@ EMPLOYMENT = parse_employment_history({"employers": [{
     "name": "Sample Labs", "email_domains": ["samplelabs.example"], "start": "2023-01", "vault_folders": ["Work/Sample/"],
 }]})
 
+NO_PEOPLE_PATHS = ["Work/Knowledge Base"]
+
 
 class World:
     def __init__(self, tmp_path: Path):
@@ -91,7 +93,9 @@ class World:
         ))
 
     def plan(self):
-        return repair.build_plan(self.crm_db, self.interactions_db, self.vault, None, self.merged, EMPLOYMENT)
+        return repair.build_plan(
+            self.crm_db, self.interactions_db, self.vault, None, self.merged, EMPLOYMENT, NO_PEOPLE_PATHS
+        )
 
     def execute(self, plan=None):
         return repair.execute_plan(plan or self.plan(), self.crm_db, self.interactions_db, self.merged)
@@ -240,12 +244,17 @@ class TestMentions:
         assert link.id not in plan.unlink_ids
 
 
-class TestGeneratedNotes:
-    @pytest.mark.parametrize("frontmatter", ["source: llm", "generated: 2026-01-01", "source: LLM\ntype: synthesis"])
-    def test_removed_for_real_people_and_bare_rows(self, world, frontmatter):
+class TestBulkContent:
+    @pytest.mark.parametrize("rel,frontmatter", [
+        ("Work/Pages/page.md", "generated: 2026-01-01"),
+        ("Work/Pages/page.md", "people: false"),
+        ("Work/Knowledge Base/page.md", ""),
+        ("Work/Knowledge Base/deep/page.md", "source: gdrive"),
+    ])
+    def test_removed_for_real_people_and_bare_rows(self, world, rel, frontmatter):
         real = world.person("Robin Gamma")
         bare = world.person("Quillon")
-        path = world.note("Work/Pages/page.md", "Robin Gamma", frontmatter)
+        path = world.note(rel, "Robin Gamma", frontmatter)
         real_link = world.mention(path, real)
         bare_link = world.mention(path, bare)
         interaction = world.note_interaction(path, real)
@@ -256,6 +265,76 @@ class TestGeneratedNotes:
         assert world.se(bare_link.id) is None
         assert interaction.id not in world.interaction_rows()
         assert world.row(real).mention_count == 0
+
+    def test_source_llm_alone_is_not_bulk_content(self, world):
+        real = world.person("Robin Gamma")
+        path = world.note("Work/Daily/page.md", "Robin Gamma", "source: llm\ntype: synthesis")
+        link = world.mention(path, real)
+        interaction = world.note_interaction(path, real)
+
+        world.execute()
+
+        assert world.se(link.id).canonical_person_id == real.id
+        assert world.interaction_rows()[interaction.id] == real.id
+
+    def test_mention_on_a_source_llm_note_is_re_resolved(self, world):
+        bare = world.person("Robin")
+        real = world.person("Robin Gamma")
+        path = world.note("Work/Daily/page.md", "Robin Gamma", "source: llm")
+        link = world.mention(path, bare)
+
+        world.execute()
+
+        assert world.se(link.id).canonical_person_id == real.id
+
+    def test_bulk_folder_note_no_longer_on_disk_is_still_bulk(self, world):
+        real = world.person("Robin Gamma")
+        link = world.mention(str(world.vault / "Work/Knowledge Base/gone.md"), real)
+
+        world.execute()
+
+        assert world.se(link.id) is None
+
+    def test_sibling_of_a_bulk_folder_is_untouched(self, world):
+        real = world.person("Robin Gamma")
+        path = world.note("Work/Knowledge Base 2/page.md", "Robin Gamma")
+        link = world.mention(path, real)
+
+        world.execute()
+
+        assert world.se(link.id).canonical_person_id == real.id
+
+    def test_no_folders_configured_leaves_them_alone(self, world):
+        real = world.person("Robin Gamma")
+        path = world.note("Work/Knowledge Base/page.md", "Robin Gamma")
+        link = world.mention(path, real)
+
+        plan = repair.build_plan(world.crm_db, world.interactions_db, world.vault, None, world.merged, EMPLOYMENT, [])
+
+        assert link.id not in plan.delete_link_ids
+
+    def test_setting_supplies_the_folders_by_default(self, world, monkeypatch):
+        monkeypatch.setattr(repair.settings, "vault_no_people_paths_raw", "Work/Knowledge Base")
+        real = world.person("Robin Gamma")
+        link = world.mention(world.note("Work/Knowledge Base/page.md", "Robin Gamma"), real)
+
+        plan = repair.build_plan(world.crm_db, world.interactions_db, world.vault, None, world.merged, EMPLOYMENT)
+
+        assert link.id in plan.delete_link_ids
+
+    def test_counts_say_why(self, world):
+        real = world.person("Robin Gamma")
+        world.mention(world.note("Work/Knowledge Base/a.md", "x"), real)
+        world.mention(world.note("Work/Pages/b.md", "x", "people: false"), real)
+        world.mention(world.note("Work/Pages/c.md", "x", "generated: 2026-01-01"), real)
+        world.mention(world.note("Work/_build/d.md", "x"), real)
+
+        counts = world.plan().counts
+
+        assert counts["no_people_notes:folder"] == 1
+        assert counts["no_people_notes:people_false"] == 1
+        assert counts["no_people_notes:generated"] == 1
+        assert counts["no_people_notes:underscore_dir"] == 1
 
     def test_underscore_folder_counts_as_excluded(self, world):
         real = world.person("Robin Gamma")
@@ -270,18 +349,18 @@ class TestGeneratedNotes:
 
     def test_human_confirmed_link_on_a_generated_note_is_kept(self, world):
         real = world.person("Robin Gamma")
-        path = world.note("Work/Pages/page.md", "x", "source: llm")
+        path = world.note("Work/Pages/page.md", "x", "generated: 2026-01-01")
         link = world.mention(path, real, status="confirmed")
 
         plan = world.plan()
         world.execute(plan)
 
         assert world.se(link.id).canonical_person_id == real.id
-        assert plan.counts["generated_note_links_kept_human"] == 1
+        assert plan.counts["no_people_note_links_kept_human"] == 1
 
     def test_protected_row_keeps_links_from_generated_notes(self, world):
         bare = world.person("Robin", tags=["kept"])
-        path = world.note("Work/Pages/page.md", "x", "source: llm")
+        path = world.note("Work/Pages/page.md", "x", "generated: 2026-01-01")
         link = world.mention(path, bare)
         interaction = world.note_interaction(path, bare)
 
@@ -290,8 +369,8 @@ class TestGeneratedNotes:
 
         assert world.se(link.id).canonical_person_id == bare.id
         assert interaction.id in world.interaction_rows()
-        assert plan.counts["generated_note_links_kept_protected"] == 1
-        assert plan.counts["generated_note_interactions_kept_protected"] == 1
+        assert plan.counts["no_people_note_links_kept_protected"] == 1
+        assert plan.counts["no_people_note_interactions_kept_protected"] == 1
 
     def test_ordinary_note_is_not_treated_as_generated(self, world):
         real = world.person("Robin Gamma")
@@ -569,7 +648,7 @@ class TestSafety:
         protected = world.person("Tamsin", tags=["kept"])
         world.mention(path, bare)
         world.mention(world.note("Other/b.md", "quillon"), other)
-        world.mention(world.note("Other/g.md", "x", "source: llm"), real)
+        world.mention(world.note("Other/g.md", "x", "generated: 2026-01-01"), real)
         world.note_interaction(path, bare)
         world.execute()
         after_first = self._table_rows(world)
@@ -590,7 +669,7 @@ class TestSafety:
         generated_only = world.person("Quillon Example")
         contacted = datetime(2024, 1, 1, tzinfo=timezone.utc)
         world.contact(generated_only, when=contacted)
-        world.note_interaction(world.note("Other/g.md", "x", "source: llm"), generated_only)
+        world.note_interaction(world.note("Other/g.md", "x", "generated: 2026-01-01"), generated_only)
         world.note_interaction(path, bare)
         conn = sqlite3.connect(world.crm_db)
         conn.execute(

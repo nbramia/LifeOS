@@ -5,8 +5,9 @@ Re-resolve note mentions linked to one-word people, and retire the empty rows.
 A bare row is a visible, unmerged person with a one-word name and no email or
 phone. This repair, in order:
 
-* removes interactions and source entities that come from generated notes or
-  from notes under _-prefixed folders, for anyone except the protected rows below
+* removes interactions and source entities that come from bulk-content notes
+  (LIFEOS_VAULT_NO_PEOPLE_PATHS, frontmatter people: false or generated:) or from
+  notes under _-prefixed folders, for anyone except the protected rows below
 * re-resolves each mention on a bare row, per note, with the mention resolver:
   on a clear winner the source entity moves to that person, along with the
   note's interaction if this row held it; otherwise the link is removed and the
@@ -21,6 +22,8 @@ link, person facts, photos, any interaction or source entity outside the vault,
 strength or circle overrides, tags, notes, a birthday, profile fields, family
 category, a relationship that discovery doesn't infer, a review marked kept.
 Those rows go in the report, counted separately.
+
+Set LIFEOS_VAULT_NO_PEOPLE_PATHS before running, so bulk-content folders count.
 
 Dry run by default, using read-only connections and writing only the report.
 --execute backs up both databases first, then applies exactly what a dry run
@@ -69,7 +72,7 @@ from api.services.person_entity import PersonEntity, PersonEntityStore  # noqa: 
 from api.services.relationship import TYPE_COWORKER, TYPE_INFERRED  # noqa: E402
 from api.services.vault_listing import (  # noqa: E402
     in_underscore_dir,
-    is_generated_note,
+    no_people_reason,
     vault_relative_path,
 )
 from api.utils.date_parser import extract_note_date  # noqa: E402
@@ -161,7 +164,7 @@ class Plan:
     affected_ids: set[str] = field(default_factory=set)
     protected: dict[str, list[str]] = field(default_factory=dict)
     unlink_samples: list[dict] = field(default_factory=list)
-    generated_markers: Counter = field(default_factory=Counter)
+    no_people_notes: Counter = field(default_factory=Counter)
 
 
 # ---------------------------------------------------------------------- load
@@ -334,23 +337,23 @@ def _note_date(path: Path, frontmatter: dict, body: str):
     return None if resolved == UNDATED_SENTINEL else resolved.date()
 
 
-def _plan_generated_note(rows: NoteRows, protected: dict, plan: Plan) -> None:
+def _plan_no_people_note(rows: NoteRows, protected: dict, plan: Plan) -> None:
     for link in rows.links:
         if link.status != "auto":
-            plan.counts["generated_note_links_kept_human"] += 1
+            plan.counts["no_people_note_links_kept_human"] += 1
         elif link.person_id in protected:
-            plan.counts["generated_note_links_kept_protected"] += 1
+            plan.counts["no_people_note_links_kept_protected"] += 1
         else:
             plan.delete_link_ids.append(link.id)
-            plan.counts["generated_note_links_removed"] += 1
+            plan.counts["no_people_note_links_removed"] += 1
             if link.person_id:
                 plan.affected_ids.add(link.person_id)
     for interaction in rows.interactions:
         if interaction.person_id in protected:
-            plan.counts["generated_note_interactions_kept_protected"] += 1
+            plan.counts["no_people_note_interactions_kept_protected"] += 1
         else:
             plan.delete_interaction_ids.append(interaction.id)
-            plan.counts["generated_note_interactions_removed"] += 1
+            plan.counts["no_people_note_interactions_removed"] += 1
             plan.affected_ids.add(interaction.person_id)
 
 
@@ -464,9 +467,11 @@ def build_plan(
     tags_db: Optional[Path],
     merged_ids_path: Path,
     employment: Optional[EmploymentHistory] = None,
+    no_people_paths: Optional[list[str]] = None,
 ) -> Plan:
     """Work out the whole repair from read-only connections."""
     employment = employment if employment is not None else get_employment_history()
+    no_people_paths = no_people_paths if no_people_paths is not None else settings.vault_no_people_paths
     merged_ids = load_merged_ids(merged_ids_path)
     people = load_people(crm_db, merged_ids)
     bare = {p.id: p for p in people if is_bare_person(p)}
@@ -501,12 +506,13 @@ def build_plan(
     notes = _load_note_rows(crm_db, interactions_db)
     for rel_path, note_rows in sorted(_group_by_note(notes, vault).items(), key=lambda kv: kv[0] or ""):
         note = _read_note(vault, rel_path)
-        excluded = bool(rel_path) and in_underscore_dir(rel_path)
-        generated = note is not None and is_generated_note(note[0])
-        if generated or excluded:
-            plan.generated_markers["underscore_dir" if excluded else "frontmatter"] += 1
+        reason = "underscore_dir" if rel_path and in_underscore_dir(rel_path) else no_people_reason(
+            rel_path, note[0] if note else {}, no_people_paths
+        )
+        if reason:
+            plan.no_people_notes[reason] += 1
             for rows in note_rows:
-                _plan_generated_note(rows, plan.protected, plan)
+                _plan_no_people_note(rows, plan.protected, plan)
             # Rows left on protected people stay; eligible rows are done.
             continue
         _plan_mentions(
@@ -518,7 +524,8 @@ def build_plan(
     plan.counts["bare_rows_to_hide"] = len(plan.hide_ids)
     plan.counts["people_visible_after"] = len(people) - len(plan.hide_ids)
     plan.counts["move_targets"] = len({m.to_id for m in plan.moves})
-    plan.counts["notes_generated_or_excluded"] = sum(plan.generated_markers.values())
+    for reason, count in plan.no_people_notes.items():
+        plan.counts[f"no_people_notes:{reason}"] = count
     return plan
 
 

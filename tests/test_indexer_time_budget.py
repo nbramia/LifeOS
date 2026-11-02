@@ -203,7 +203,7 @@ class TestOrdering:
         for name, content, mtime in [
             ("older.md", "body", 1000),
             ("newer.md", "body", 2000),
-            ("generated_new.md", "---\nsource: llm\n---\nbody", 3000),
+            ("generated_new.md", "---\npeople: false\n---\nbody", 3000),
             ("generated_old.md", "---\ngenerated: 2026-01-01\n---\nbody", 500),
         ]:
             path = harness.vault / name
@@ -213,6 +213,24 @@ class TestOrdering:
         harness.make().index_all(time_budget_seconds=100.0)
 
         assert harness.indexed == ["newer.md", "older.md", "generated_new.md", "generated_old.md"]
+
+    def test_notes_in_a_bulk_folder_go_after_ordinary_ones(self, harness, monkeypatch):
+        import os
+
+        from config.settings import settings
+
+        monkeypatch.setattr(settings, "vault_no_people_paths_raw", "Bulk")
+        (harness.vault / "Bulk").mkdir()
+        bulk = harness.vault / "Bulk" / "new.md"
+        bulk.write_text("body")
+        os.utime(bulk, (3000, 3000))
+        plain = harness.vault / "old.md"
+        plain.write_text("---\nsource: llm\n---\nbody")
+        os.utime(plain, (1000, 1000))
+
+        harness.make().index_all(time_budget_seconds=100.0)
+
+        assert harness.indexed == ["old.md", "new.md"]
 
 
 class TestUnbudgeted:

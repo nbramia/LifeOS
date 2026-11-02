@@ -15,7 +15,8 @@ from api.services.source_entity import (
     SourceEntity,
     SourceEntityStore,
 )
-from api.services.vault_listing import in_underscore_dir, is_generated_note, vault_relative_path
+from api.services.vault_listing import in_underscore_dir, no_people_reason, vault_relative_path
+from config.settings import settings
 from api.utils.date_parser import extract_note_date
 from config.employment_history import parse_employment_history
 
@@ -88,40 +89,82 @@ def world(tmp_path):
         yield built
 
 
-class TestGeneratedMarkers:
-    @pytest.mark.parametrize("frontmatter,expected", [
-        ({"source": "llm"}, True),
-        ({"source": "LLM"}, True),
-        ({"source": " llm "}, True),
-        ({"generated": "2026-11-01"}, True),
-        ({"generated": date(2026, 11, 1)}, True),
-        ({"generated": True}, True),
-        ({"generated": False}, False),
-        ({"generated": "false"}, False),
-        ({"generated": ""}, False),
-        ({"source": "granola"}, False),
-        ({"source": "manual"}, False),
-        ({"type": "synthesis"}, False),
-        ({"type": "reference"}, False),
-        ({"generated_at": "2026-01-01"}, False),
-        ({}, False),
+class TestNoPeopleRule:
+    BULK = ["Work/Knowledge Base"]
+
+    @pytest.mark.parametrize("rel,frontmatter,expected", [
+        ("Work/Knowledge Base/page.md", {}, "folder"),
+        ("Work/Knowledge Base/deep/page.md", {"source": "gdrive"}, "folder"),
+        ("work/knowledge base/page.md", {}, "folder"),
+        ("Work/Knowledge Base 2/page.md", {}, None),
+        ("Work/Knowledge Base.md", {}, None),
+        ("Elsewhere/Work/Knowledge Base/page.md", {}, None),
+        ("Work/note.md", {"people": False}, "people_false"),
+        ("Work/note.md", {"people": "false"}, "people_false"),
+        ("Work/note.md", {"people": []}, None),
+        ("Work/note.md", {"people": ["Quillon Example"]}, None),
+        ("Work/note.md", {"generated": "2026-11-01"}, "generated"),
+        ("Work/note.md", {"generated": date(2026, 11, 1)}, "generated"),
+        ("Work/note.md", {"generated": True}, "generated"),
+        ("Work/note.md", {"generated": False}, None),
+        ("Work/note.md", {"generated": "false"}, None),
+        ("Work/note.md", {"generated": ""}, None),
+        ("Work/note.md", {"source": "llm"}, None),
+        ("Work/note.md", {"source": "llm", "type": "synthesis"}, None),
+        ("Work/note.md", {"type": "reference"}, None),
+        ("Work/note.md", {"generated_at": "2026-01-01"}, None),
+        ("Work/note.md", {}, None),
+        (None, {"generated": "2026-11-01"}, "generated"),
+        (None, {}, None),
     ])
-    def test_marker(self, frontmatter, expected):
-        assert is_generated_note(frontmatter) is expected
+    def test_rule(self, rel, frontmatter, expected):
+        assert no_people_reason(rel, frontmatter, self.BULK) == expected
+
+    def test_no_folders_configured_by_default(self):
+        assert no_people_reason("Work/Knowledge Base/page.md", {}) is None
+
+    def test_setting_parses_a_comma_separated_list(self, monkeypatch):
+        monkeypatch.setattr(settings, "vault_no_people_paths_raw", " Work/One , Work/Two/,, ")
+        assert settings.vault_no_people_paths == ["Work/One", "Work/Two/"]
+
+    def test_setting_is_empty_by_default(self):
+        from config.settings import Settings
+
+        assert Settings.model_fields["vault_no_people_paths_raw"].default == ""
 
 
-class TestGeneratedNotes:
-    GENERATED = "---\nsource: llm\ntype: synthesis\ngenerated: 2026-11-01\npeople: [Quillon Example]\n---\n**Robin** with Mirel\n"
+class TestBulkContent:
+    CONTENT = "---\npeople: [Quillon Example]\n---\n**Robin** with Mirel\n"
 
-    def test_creates_no_people_links_interactions_or_source_entities(self, world):
-        path = world.note("Work/Pages/page.md", self.GENERATED)
-        world.index(path)
+    def _assert_nothing_recorded(self, world, path):
         assert world.people.count() == 0
         assert world.interactions.added == {}
         assert world.source_entity(path, "Quillon Example") is None
+        assert world.source_entity(path, "Robin") is None
 
-    def test_still_searchable(self, world):
-        path = world.note("Work/Pages/page.md", self.GENERATED)
+    def test_configured_folder_creates_nothing(self, world, monkeypatch):
+        monkeypatch.setattr(settings, "vault_no_people_paths_raw", "Work/Knowledge Base")
+        path = world.note("Work/Knowledge Base/page.md", self.CONTENT)
+        world.index(path)
+        self._assert_nothing_recorded(world, path)
+
+    def test_people_false_creates_nothing(self, world):
+        path = world.note("Work/Pages/page.md", "---\npeople: false\n---\n**Robin** with Mirel\n")
+        world.index(path)
+        assert world.people.count() == 0
+        assert world.interactions.added == {}
+        assert world.source_entity(path, "Robin") is None
+
+    def test_generated_key_creates_nothing(self, world):
+        path = world.note(
+            "Work/Pages/page.md", "---\ngenerated: 2026-11-01\npeople: [Quillon Example]\n---\n**Robin**\n"
+        )
+        world.index(path)
+        self._assert_nothing_recorded(world, path)
+
+    def test_stays_searchable(self, world, monkeypatch):
+        monkeypatch.setattr(settings, "vault_no_people_paths_raw", "Work/Knowledge Base")
+        path = world.note("Work/Knowledge Base/page.md", self.CONTENT)
         world.index(path)
         chunks, metadata = world.indexer.vector_store.update_document.call_args.args
         assert chunks
@@ -129,7 +172,16 @@ class TestGeneratedNotes:
         assert "Quillon Example" in metadata["people"]
         assert world.indexer.bm25_index.add_document.called
 
-    def test_same_note_without_the_marker_does_create(self, world):
+    def test_source_llm_alone_keeps_producing_people(self, world):
+        path = world.note(
+            "Work/Daily/2026-11-01.md", "---\nsource: llm\ntype: synthesis\npeople: [Quillon Example]\n---\nbody\n"
+        )
+        world.index(path)
+        created = world.people.get_by_name("Quillon Example")
+        assert created
+        assert world.interactions.added[str(path.resolve())] == created.id
+
+    def test_ordinary_note_creates_as_usual(self, world):
         path = world.note("Work/Pages/page.md", "---\npeople: [Quillon Example]\n---\nbody\n")
         world.index(path)
         assert world.people.get_by_name("Quillon Example")

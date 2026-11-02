@@ -169,7 +169,10 @@ def people_in_note(frontmatter: dict, body: str) -> list[str]:
 
     listed = frontmatter.get("people") or []
     found = list(extract_people_from_text(body))
-    found += [listed] if isinstance(listed, str) else [str(name) for name in listed if name]
+    if isinstance(listed, str):
+        found += [listed]
+    elif isinstance(listed, (list, tuple)):
+        found += [str(name) for name in listed if name]
     found += people_from_tags(normalize_tags(frontmatter.get("tags")))
     return sorted(set(found))
 

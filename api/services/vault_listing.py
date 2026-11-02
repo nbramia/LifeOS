@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from pathlib import Path
+from typing import Iterable
 
 from api.services.chunker import extract_frontmatter, normalize_tags
 
@@ -52,24 +53,46 @@ def in_underscore_dir(rel_path: Path | str) -> bool:
     return any(part.startswith("_") for part in parts)
 
 
-# Frontmatter ``source`` values naming a generating model or agent.
-GENERATED_NOTE_SOURCES = frozenset({"llm"})
+def _falsy_marker(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().casefold() in ("", "false", "no")
+    return not value
 
 
-def is_generated_note(frontmatter: dict) -> bool:
-    """Whether a note's frontmatter marks it as machine-generated.
+def no_people_reason(
+    rel_path: str | None,
+    frontmatter: dict,
+    no_people_paths: Iterable[str] = (),
+) -> str | None:
+    """Why a note yields no people data, or None when it yields it as usual.
 
-    A generated page is searchable material, but writing about someone is not
-    contact with them, so it creates no people, links, or interactions. The
-    markers are ``source: llm`` and a truthy ``generated:`` key.
+    Bulk content is searchable material, but writing about someone is not contact
+    with them, so these notes create no people, links, interactions, or source
+    entities. A note qualifies by sitting under a configured bulk-content folder
+    (``LIFEOS_VAULT_NO_PEOPLE_PATHS``), or by saying so in its frontmatter with
+    ``people: false`` or a ``generated:`` key that isn't itself false. Where a
+    note came from (``source: llm``, say) doesn't decide it: many such notes
+    are about real contact.
+
+    Args:
+        rel_path: Vault-relative note path, if known
+        frontmatter: Parsed frontmatter
+        no_people_paths: Vault-relative bulk-content folders
+
+    Returns:
+        "folder", "people_false", "generated", or None
     """
-    source = frontmatter.get("source")
-    if isinstance(source, str) and source.strip().casefold() in GENERATED_NOTE_SOURCES:
-        return True
-    generated = frontmatter.get("generated")
-    if isinstance(generated, str):
-        return generated.strip().casefold() not in ("", "false", "no")
-    return bool(generated)
+    if rel_path:
+        folded = rel_path.replace("\\", "/").casefold()
+        for folder in no_people_paths:
+            prefix = folder.replace("\\", "/").strip().strip("/").casefold()
+            if prefix and folded.startswith(prefix + "/"):
+                return "folder"
+    if "people" in frontmatter and _falsy_marker(frontmatter["people"]) and frontmatter["people"] != []:
+        return "people_false"
+    if "generated" in frontmatter and not _falsy_marker(frontmatter["generated"]):
+        return "generated"
+    return None
 
 
 def vault_relative_path(path: str, vault_root: Path) -> str | None:

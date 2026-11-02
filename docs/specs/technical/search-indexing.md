@@ -68,7 +68,7 @@ The query classifier (`api/services/query_classifier.py`) determines whether a q
 
 ### What Gets Indexed
 
-Every `.md` file in the vault except those under `_`-prefixed folders. Generated notes (`source: llm` or a truthy `generated:`) are indexed for search like any other note and contribute no people data; see [Data & Sync](data-and-sync.md).
+Every `.md` file in the vault except those under `_`-prefixed folders. Bulk content (`LIFEOS_VAULT_NO_PEOPLE_PATHS`, frontmatter `people: false` or `generated:`) is indexed for search like any other note and contributes no people data; see [Data & Sync](data-and-sync.md).
 
 ### Vault Tags
 

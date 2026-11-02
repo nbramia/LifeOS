@@ -19,7 +19,7 @@ from api.services.chunker import chunk_document, extract_frontmatter, add_contex
 from api.services.vectorstore import VectorStore, is_people_tag
 from api.services.bm25_index import BM25Index
 from api.services.people import people_in_note
-from api.services.vault_listing import in_underscore_dir, is_generated_note
+from api.services.vault_listing import in_underscore_dir, no_people_reason
 
 # V2 People System integration
 try:
@@ -275,17 +275,17 @@ class IndexerService:
         state_path.write_text(json.dumps(state, indent=2))
 
     def _ordered_for_budget(self, files: list[tuple[str, float]]) -> list[tuple[str, float]]:
-        """Ordinary notes before generated ones, each newest first, so a budget
+        """Ordinary notes before bulk content, each newest first, so a budget
         spent on a bulk load has already covered what the owner wrote."""
-        def is_generated(file_path: str) -> bool:
+        def is_bulk(file_path: str) -> bool:
             try:
                 with open(file_path, encoding="utf-8", errors="replace") as f:
                     head = f.read(BUDGET_ORDER_HEAD_CHARS)
             except OSError:
                 return False
-            return is_generated_note(extract_frontmatter(head)[0])
+            return self._no_people_reason(Path(file_path), extract_frontmatter(head)[0]) is not None
 
-        return sorted(files, key=lambda item: (is_generated(item[0]), -item[1]))
+        return sorted(files, key=lambda item: (is_bulk(item[0]), -item[1]))
 
     def index_all(
         self,
@@ -511,10 +511,10 @@ class IndexerService:
         note_tags = normalize_tags(frontmatter.get("tags"))
         all_people = people_in_note(frontmatter, body)
 
-        # Sync to v2 people system if available. A generated note stays
-        # searchable below but says nothing about contact with anyone.
+        # Sync to v2 people system if available. Bulk content stays searchable
+        # below but says nothing about contact with anyone.
         affected_person_ids: set[str] = set()
-        if HAS_V2_PEOPLE and all_people and not is_generated_note(frontmatter):
+        if HAS_V2_PEOPLE and all_people and self._no_people_reason(path, frontmatter) is None:
             try:
                 from datetime import timezone
                 note_date_str = self._extract_note_date(path, frontmatter, body)
@@ -720,6 +720,18 @@ class IndexerService:
             return "Other"
         return infer_note_type(rel)
 
+    def _rel_path(self, path: Path) -> str | None:
+        """A note's vault-relative POSIX path, or None if it's outside the vault."""
+        try:
+            return path.resolve().relative_to(self.vault_path.resolve()).as_posix()
+        except ValueError:
+            return None
+
+    def _no_people_reason(self, path: Path, frontmatter: dict) -> str | None:
+        from config.settings import settings
+
+        return no_people_reason(self._rel_path(path), frontmatter, settings.vault_no_people_paths)
+
     def _is_excluded_from_index(self, path: Path) -> bool:
         """Whether a file sits under a _-prefixed folder of the vault."""
         try:
@@ -855,13 +867,9 @@ class IndexerService:
         """Build the context a note offers for reading its ambiguous mentions."""
         from config.employment_history import get_employment_history
 
-        try:
-            rel_path = path.resolve().relative_to(self.vault_path.resolve()).as_posix()
-        except ValueError:
-            rel_path = path.name
         tag = self._tag_for(path)
         return build_note_context(
-            rel_path,
+            self._rel_path(path) or path.name,
             frontmatter,
             body,
             note_date=None if note_date == UNDATED_SENTINEL else note_date.date(),
