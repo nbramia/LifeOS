@@ -16,6 +16,9 @@ Example:
 - 29 gmail source entities with alex@oldcompany.com are UNLINKED
 - This script will find and link those entities to Alex's person record.
 
+Note mentions (vault, granola) are out of scope: they resolve from their note's
+context in the indexer, and a bare name re-matched on its own can only guess.
+
 Manual escape hatch: this script queries ALL unlinked entities directly and
 ignores match_attempted_at/match_attempt_count entirely — it neither respects
 the nightly cap/backoff in scripts/link_source_entities.py nor increments the
@@ -74,13 +77,13 @@ def get_all_unlinked_entity_ids(
         if source_type:
             cursor = conn.execute("""
                 SELECT id FROM source_entities
-                WHERE canonical_person_id IS NULL AND source_type = ?
+                WHERE canonical_person_id IS NULL AND source_type = ? AND source_type NOT IN ('vault', 'granola')
                 ORDER BY observed_at DESC
             """, (source_type,))
         else:
             cursor = conn.execute("""
                 SELECT id FROM source_entities
-                WHERE canonical_person_id IS NULL
+                WHERE canonical_person_id IS NULL AND source_type NOT IN ('vault', 'granola')
                 ORDER BY observed_at DESC
             """)
         return [row[0] for row in cursor.fetchall()]
@@ -124,7 +127,7 @@ def count_unlinked_by_source(db_path: str = None) -> dict[str, int]:
         cursor = conn.execute("""
             SELECT source_type, COUNT(*) as count
             FROM source_entities
-            WHERE canonical_person_id IS NULL
+            WHERE canonical_person_id IS NULL AND source_type NOT IN ('vault', 'granola')
             GROUP BY source_type
             ORDER BY count DESC
         """)
@@ -160,7 +163,7 @@ def get_unlinked_entities_batch(
                        observed_phone, metadata, canonical_person_id, link_confidence,
                        link_status, linked_at, observed_at, created_at
                 FROM source_entities
-                WHERE canonical_person_id IS NULL AND source_type = ?
+                WHERE canonical_person_id IS NULL AND source_type = ? AND source_type NOT IN ('vault', 'granola')
                 ORDER BY observed_at DESC
                 LIMIT ? OFFSET ?
             """, (source_type, limit, offset))
@@ -170,7 +173,7 @@ def get_unlinked_entities_batch(
                        observed_phone, metadata, canonical_person_id, link_confidence,
                        link_status, linked_at, observed_at, created_at
                 FROM source_entities
-                WHERE canonical_person_id IS NULL
+                WHERE canonical_person_id IS NULL AND source_type NOT IN ('vault', 'granola')
                 ORDER BY observed_at DESC
                 LIMIT ? OFFSET ?
             """, (limit, offset))

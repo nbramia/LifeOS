@@ -32,12 +32,14 @@ STAT_KEYS = ("tagged", "skipped_unchanged", "skipped_not_allowlisted", "code_onl
 
 
 def _excluded(rel: Path) -> bool:
+    from api.services.vault_listing import in_underscore_dir
+
     rel_s = rel.as_posix()
-    return any(rel_s == d or rel_s.startswith(d + "/") for d in EXCLUDED_DIRS)
+    return in_underscore_dir(rel) or any(rel_s == d or rel_s.startswith(d + "/") for d in EXCLUDED_DIRS)
 
 
 def list_vault_notes(vault: Path) -> list[Path]:
-    """Every ``.md`` file under the vault except the excluded folders."""
+    """Every ``.md`` file under the vault except the excluded and _-prefixed folders."""
     return sorted(p for p in vault.rglob("*.md") if p.is_file() and not _excluded(p.relative_to(vault)))
 
 

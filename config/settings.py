@@ -1576,6 +1576,11 @@ class Settings(BaseSettings):
         )
         return domains
 
+    @property
+    def vault_no_people_paths(self) -> list[str]:
+        """Bulk-content folders from LIFEOS_VAULT_NO_PEOPLE_PATHS."""
+        return [p.strip() for p in (self.vault_no_people_paths_raw or "").split(",") if p.strip()]
+
     def is_sync_enabled(self, account: str, service: str) -> bool:
         """Check if sync is enabled for account+service (gmail/calendar)."""
         if account == "work":
@@ -1638,6 +1643,21 @@ class Settings(BaseSettings):
         default="",
         alias="TELEGRAM_CHAT_ID",
         description="Telegram chat ID for receiving messages"
+    )
+
+    # Vault indexing
+    vault_index_budget_minutes: int = Field(
+        default=30,
+        alias="LIFEOS_VAULT_INDEX_BUDGET_MINUTES",
+        description="Time budget for the nightly vault reindex. Files left over wait for the next "
+                    "run, so a large first load can't stall the sync. 0 turns the budget off.",
+    )
+
+    vault_no_people_paths_raw: str = Field(
+        default="",
+        alias="LIFEOS_VAULT_NO_PEOPLE_PATHS",
+        description="Comma-separated vault-relative folders of bulk content. Notes under them stay "
+                    "searchable but create no people, links, interactions, or source entities.",
     )
 
     # Fitness

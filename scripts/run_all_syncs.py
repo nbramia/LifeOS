@@ -1085,7 +1085,7 @@ SYNC_SCRIPTS = {
     "push_birthdays": ("scripts/push_birthdays_to_contacts.py", ["--execute"]),
 
     # Phase 4: Vector Store Indexing
-    "vault_reindex": ("scripts/sync_vault_reindex.py", ["--execute"]),
+    "vault_reindex": ("scripts/sync_vault_reindex.py", ["--execute", "--budget-minutes"]),
     "vault_tag": ("scripts/sync_vault_tag.py", ["--execute"]),
     "crm_vectorstore": ("scripts/sync_crm_to_vectorstore.py", ["--execute"]),
 

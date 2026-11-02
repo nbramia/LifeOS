@@ -6,7 +6,7 @@ from unittest.mock import patch
 import pytest
 
 from api.services.jev_client import JevClient, JevError
-from api.services.vault_tag_store import VaultTagStore
+from api.services.vault_tag_store import TagRecord, VaultTagStore
 from api.services.vault_taxonomy import load_taxonomy
 from config.settings import settings
 from scripts import sync_vault_tag
@@ -280,3 +280,29 @@ def test_unreadable_vault_has_zero_yield(env, capsys, monkeypatch, tmp_path):
     parsed = _parse_sync_output(capsys.readouterr().out)
     assert parsed["errors"] == 1
     assert _run_yield(parsed) == 0
+
+
+def test_underscore_folders_are_not_notes_but_underscore_files_are(tmp_path):
+    (tmp_path / "Work" / "_build" / "deep").mkdir(parents=True)
+    (tmp_path / "Work" / "_build" / "deep" / "out.md").write_text("working output")
+    (tmp_path / "Work" / "_Registry.md").write_text("a note")
+    (tmp_path / "Work" / "note.md").write_text("a note")
+
+    names = [p.name for p in sync_vault_tag.list_vault_notes(tmp_path)]
+
+    assert names == ["_Registry.md", "note.md"]
+
+
+def test_tags_for_notes_under_underscore_folders_are_pruned(tmp_path):
+    store = VaultTagStore(db_path=str(tmp_path / "tags.db"))
+    (tmp_path / "vault" / "_build").mkdir(parents=True)
+    (tmp_path / "vault" / "_build" / "out.md").write_text("working output")
+    (tmp_path / "vault" / "note.md").write_text("a note")
+    keep = [p.relative_to(tmp_path / "vault").as_posix() for p in sync_vault_tag.list_vault_notes(tmp_path / "vault")]
+
+    store.upsert(TagRecord(file_path="_build/out.md", content_sha256="a", vocab_version="v"))
+    store.upsert(TagRecord(file_path="note.md", content_sha256="b", vocab_version="v"))
+    assert store.delete_missing(keep) == 1
+
+    assert store.get("_build/out.md") is None
+    assert store.get("note.md") is not None
