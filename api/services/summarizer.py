@@ -16,8 +16,9 @@ Files are assigned to tiers based on their directory:
 
 ## Retry Logic
 
-Files that fail summary generation (timeout, etc.) are tracked and can be
-retried with a simpler prompt and longer timeout at the end of indexing.
+Files that fail summary generation (timeout, etc.) join a queue, and so do the
+notes the 15-minute vault index job indexes. The ``vault_summaries`` sync source
+works through it nightly with a simpler prompt and longer timeout.
 
 ## Usage
 
@@ -27,12 +28,16 @@ retried with a simpler prompt and longer timeout at the end of indexing.
     if tier != SummaryTier.SKIP:
         summary = generate_summary(content, file_name)
 """
+import contextlib
+import fcntl
 import httpx
 import json
 import logging
+import os
+import time
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Iterator, Optional
 
 from config.settings import settings
 
@@ -40,6 +45,18 @@ logger = logging.getLogger(__name__)
 
 # Track files that failed summary generation for retry
 SUMMARY_FAILURES_FILE = "data/vault_summary_failures.json"
+
+# Content shorter than this is not worth summarizing and gets no summary.
+MIN_SUMMARY_CONTENT_CHARS = 100
+
+# How long the vault_summaries source waits for an LLM that isn't answering yet.
+# A restarted llama-server takes a while to load its model.
+LLM_READY_WAIT_SECONDS = 600
+
+# How many failures in a row end a drain pass. That many point to a stalled LLM.
+MAX_CONSECUTIVE_SUMMARY_FAILURES = 3
+# Passes a note may fail before it gets a fallback summary and leaves the queue.
+MAX_SUMMARY_ATTEMPTS = 3
 
 
 class SummaryTier(Enum):
@@ -139,7 +156,7 @@ def generate_summary(
     if timeout is None:
         timeout = settings.ollama_timeout
 
-    if len(content) < 100:
+    if len(content) < MIN_SUMMARY_CONTENT_CHARS:
         # Too short to summarize meaningfully
         return None, True  # Not a failure, just skip
 
@@ -213,7 +230,8 @@ def retry_summary(
         max_content_chars: Max chars to send to LLM (smaller for retry)
 
     Returns:
-        Summary string, or fallback summary if retry also fails
+        Summary string, a fallback summary if the content is too short for a
+        real one, or None if the LLM failed
     """
     summary, success = generate_summary(
         content=content,
@@ -223,12 +241,12 @@ def retry_summary(
         use_retry_prompt=True
     )
 
-    if success and summary:
+    if not success:
+        logger.warning(f"Retry failed for {file_name}")
+        return None
+    if summary:
         logger.info(f"Retry succeeded for {file_name}")
         return summary
-
-    # If retry also fails, use fallback
-    logger.warning(f"Retry also failed for {file_name}, using fallback")
     return _fallback_summary(content, file_name)
 
 
@@ -247,24 +265,204 @@ def save_summary_failures(failures: dict) -> None:
     """Save the list of files that failed summary generation."""
     failures_path = Path(SUMMARY_FAILURES_FILE)
     failures_path.parent.mkdir(parents=True, exist_ok=True)
-    failures_path.write_text(json.dumps(failures, indent=2))
+    # Replaced atomically: a torn file would load as an empty queue.
+    tmp_path = failures_path.with_name(f"{failures_path.name}.{os.getpid()}.tmp")
+    tmp_path.write_text(json.dumps(failures, indent=2))
+    os.replace(tmp_path, failures_path)
+
+
+@contextlib.contextmanager
+def _summary_queue_lock() -> Iterator[None]:
+    """Serialize read-modify-write of the queue across processes and threads.
+
+    On a sibling file, because the queue file itself is replaced on every save.
+    Held only for one read and one write. The kernel drops it if the holder dies.
+    """
+    lock_path = Path(f"{SUMMARY_FAILURES_FILE}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+
+
+def _find_entry(failures: dict, file_path: str) -> Optional[dict]:
+    return next((f for f in failures["files"] if f["file_path"] == file_path), None)
+
+
+def _invalidate_entry(entry: dict) -> None:
+    """Mark an entry's note as changed, so a summary in progress is discarded."""
+    entry["generation"] = entry.get("generation", 0) + 1
+    entry.pop("attempts", None)
 
 
 def add_summary_failure(file_path: str, file_name: str) -> None:
-    """Add a file to the failure list for retry."""
-    failures = load_summary_failures()
-    # Avoid duplicates
-    if not any(f["file_path"] == file_path for f in failures["files"]):
-        failures["files"].append({
-            "file_path": file_path,
-            "file_name": file_name
-        })
+    """Queue a file for a summary, or mark it changed if it is already queued."""
+    with _summary_queue_lock():
+        failures = load_summary_failures()
+        entry = _find_entry(failures, file_path)
+        if entry is None:
+            failures["files"].append({
+                "file_path": file_path,
+                "file_name": file_name
+            })
+        else:
+            _invalidate_entry(entry)
         save_summary_failures(failures)
 
 
-def clear_summary_failures() -> None:
-    """Clear the summary failures list."""
-    save_summary_failures({"files": []})
+def invalidate_queued_summary(file_path: str) -> None:
+    """Discard any summary in progress for a note about to be rewritten or removed.
+
+    Called before the note's chunks and summary leave BM25. Any summary the drain
+    wrote earlier is then deleted with them, and any it writes later is refused.
+    """
+    if not Path(SUMMARY_FAILURES_FILE).exists():
+        return
+    with _summary_queue_lock():
+        failures = load_summary_failures()
+        entry = _find_entry(failures, file_path)
+        if entry is not None:
+            _invalidate_entry(entry)
+            save_summary_failures(failures)
+
+
+def queue_summary(file_path: str, file_name: str, body: str) -> None:
+    """Queue a note for a summary, unless it would get none anyway.
+
+    Call before the note's chunks and summary leave BM25: see
+    ``invalidate_queued_summary``.
+    """
+    if get_summary_tier(file_path) == SummaryTier.SKIP or len(body) < MIN_SUMMARY_CONTENT_CHARS:
+        invalidate_queued_summary(file_path)
+        return
+    add_summary_failure(file_path, file_name)
+
+
+def finish_queued_summary(file_path: str, generation: int, write: Optional[Callable[[], None]] = None) -> bool:
+    """Remove an entry if its note is unchanged, first running ``write``.
+
+    Both happen under the queue lock, so no reindex can invalidate the entry
+    between the check and the write.
+
+    Returns:
+        False, without writing, if the note changed since ``generation`` was read
+    """
+    with _summary_queue_lock():
+        failures = load_summary_failures()
+        entry = _find_entry(failures, file_path)
+        if entry is None or entry.get("generation", 0) != generation:
+            return False
+        if write is not None:
+            write()
+        failures["files"].remove(entry)
+        save_summary_failures(failures)
+        return True
+
+
+def _record_failed_attempt(file_path: str, generation: int) -> int:
+    """Count a failed attempt on an unchanged entry and return the total."""
+    with _summary_queue_lock():
+        failures = load_summary_failures()
+        entry = _find_entry(failures, file_path)
+        if entry is None or entry.get("generation", 0) != generation:
+            return 0
+        entry["attempts"] = entry.get("attempts", 0) + 1
+        save_summary_failures(failures)
+        return entry["attempts"]
+
+
+def _drain_order(entry: dict) -> tuple[int, float]:
+    """Entries with the fewest failures first, so a note that keeps failing can't
+    block the rest, then newest first. A vanished note goes early, since dropping
+    it costs nothing."""
+    try:
+        recency = os.path.getmtime(entry["file_path"])
+    except OSError:
+        recency = float("inf")
+    return entry.get("attempts", 0), -recency
+
+
+def drain_summary_queue(bm25_index) -> dict:
+    """Generate queued summaries into BM25, within the configured time budget.
+
+    Holds no lock while the LLM works, so the vault index job keeps running. A
+    note rewritten meanwhile keeps its entry and gets a summary on a later pass.
+    A failed attempt also keeps its entry, and the pass stops after
+    ``MAX_CONSECUTIVE_SUMMARY_FAILURES`` in a row, since the LLM has probably
+    stalled. A note that fails on ``MAX_SUMMARY_ATTEMPTS`` passes gets a fallback
+    summary built from its first line.
+
+    Returns:
+        Dict of counts: generated, fallback, failed, changed_during_pass, remaining,
+        and stopped_on_failures (1 if failures in a row ended the pass, else 0)
+    """
+    from api.services.chunker import extract_frontmatter
+    from api.utils.date_parser import extract_note_date
+
+    stats = {"generated": 0, "fallback": 0, "failed": 0, "changed_during_pass": 0, "stopped_on_failures": 0}
+    deadline = time.monotonic() + settings.summary_retry_budget_seconds
+    consecutive_failures = 0
+
+    for queued in sorted(load_summary_failures().get("files", []), key=_drain_order):
+        if time.monotonic() >= deadline:
+            logger.warning(f"Summary budget of {settings.summary_retry_budget_seconds}s used; the rest stay queued")
+            break
+
+        file_path = queued["file_path"]
+        file_name = queued["file_name"]
+        entry = _find_entry(load_summary_failures(), file_path)
+        if entry is None:
+            continue
+        generation = entry.get("generation", 0)
+
+        path = Path(file_path)
+        try:
+            frontmatter, body = extract_frontmatter(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError) as e:
+            # Gone or unreadable, so no summary can come of it. A later reindex
+            # queues the note again if it comes back.
+            logger.warning(f"Dropping queued summary for {file_path}: {e}")
+            finish_queued_summary(file_path, generation)
+            continue
+
+        summary = retry_summary(body, file_name)
+        counter = "generated"
+        if summary is None:
+            stats["failed"] += 1
+            consecutive_failures += 1
+            if _record_failed_attempt(file_path, generation) >= MAX_SUMMARY_ATTEMPTS:
+                summary = _fallback_summary(body, file_name)
+                counter = "fallback"
+        else:
+            consecutive_failures = 0
+
+        if summary is not None:
+            def write() -> None:
+                bm25_index.add_document(
+                    doc_id=f"{path.resolve()}::summary",
+                    content=f"Document summary for {file_name}: {summary}",
+                    file_name=file_name,
+                    modified_date=extract_note_date(path, frontmatter, body),
+                )
+
+            try:
+                if finish_queued_summary(file_path, generation, write):
+                    stats[counter] += 1
+                else:
+                    stats["changed_during_pass"] += 1
+            except Exception as e:
+                logger.warning(f"Could not store the summary for {file_path}: {e}")
+                stats["failed"] += 1
+                consecutive_failures += 1
+
+        if consecutive_failures >= MAX_CONSECUTIVE_SUMMARY_FAILURES:
+            logger.warning(f"{consecutive_failures} summaries failed in a row; stopping this pass")
+            stats["stopped_on_failures"] = 1
+            break
+
+    stats["remaining"] = len(load_summary_failures().get("files", []))
+    logger.info(f"Summary pass complete: {stats}")
+    return stats
 
 
 def _fallback_summary(content: str, file_name: str) -> str:

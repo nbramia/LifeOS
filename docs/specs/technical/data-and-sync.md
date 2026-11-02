@@ -37,7 +37,7 @@ How LifeOS ingests and stores data from multiple sources.
 | Vault Notes | Obsidian markdown | Name mentions, context paths |
 | LinkedIn | CSV Import | Connections, companies, titles |
 | LinkedIn Profiles | Browser Scraping | Full profile data (experience, education, skills) |
-| Meeting notes (Wispr, Granola) | Nightly vault reindex (notes placed by the external `local-processing` watchers) | Meeting transcripts, attendees |
+| Meeting notes (Wispr, Granola) | Vault index job and nightly vault reindex (notes placed by the external `local-processing` watchers) | Meeting transcripts, attendees |
 
 ### Example Data Volume
 
@@ -163,9 +163,24 @@ The 7-phase structure ensures correct data flow:
 | ChromaDB Server | Continuous (boot) | HTTP requests | Vector data |
 | systemd/launchd API Service | Continuous (boot) | All data | API logs |
 | Unified Sync | Daily 3:00 AM ET | All sources | All stores |
+| Vault Index Job | Every 15 minutes (systemd) | Changed vault notes | ChromaDB, BM25, people stores, `data/vault_index_state.json`, `data/vault_summary_failures.json` |
 | Calendar Indexer | 8 AM, 12 PM, 3 PM ET | Google Calendar | ChromaDB (`lifeos_calendar`) |
 
-Vault notes reach search through the vault reindex in the unified sync, so a new or edited note is searchable after the next nightly run, or sooner with `POST /api/admin/reindex`. No process watches the vault for search indexing; the task and scheduler file watchers maintain their own indexes only.
+A new or edited vault note reaches search through the vault index job, normally within 15 minutes of arriving on the server, or through the vault reindex in the unified sync. `POST /api/admin/reindex` runs the same reindex on demand. No process watches the vault for search indexing; the task and scheduler file watchers maintain their own indexes only.
+
+### Vault Index Job
+
+`scripts/vault_index_job.py`, run by `lifeos-vault-index.timer` on Linux. macOS hosts do not install it, and their notes reach search through the nightly sync. It runs outside the API server and shares `IndexerService.index_all` and `data/vault_index_state.json` with the nightly reindex, so neither repeats work the other finished.
+
+- **Order and cap.** Each run indexes up to `LIFEOS_VAULT_INDEX_MAX_FILES` changed notes, newest modification time first, and leaves the rest for later runs. Each run also removes up to `LIFEOS_VAULT_INDEX_MAX_DELETIONS` deleted notes from both indexes, saving progress before it starts indexing, so a folder move spreads over several runs instead of repeating. A note that fails to index or cannot be read stays unrecorded and is retried. An unreadable note keeps its place at the head of the order, taking one slot of the cap per run until it is fixed.
+- **Summaries.** The job generates no LLM summaries. Each note it indexes joins `data/vault_summary_failures.json`, unless its summary tier is SKIP or it is too short to summarize, and the `vault_summaries` source generates the summary. Tags and generated index pages stay nightly, and the task index stays with the task file watcher.
+- **Locks.** Every vault indexer takes a `flock` on `~/.lifeos/vault_index.lock`, which the kernel releases when the holder exits: the job, `sync_vault_reindex.py`, and both `POST /api/admin/reindex` paths. A job that finds it held exits 0 and tries again next tick. `POST /api/admin/reindex/sync` runs on the event loop, so it returns `status: "busy"` rather than waiting. The nightly reindex and the queued API reindex wait, up to `LIFEOS_VAULT_INDEX_LOCK_WAIT_SECONDS`. The sync also waits for a running job before reading free GPU memory, so the job's loaded model cannot make it stop the LLM. The job's `TimeoutStartSec` is shorter than that wait, so a timeout means something is wrong beyond a slow run: the reindex then exits non-zero without indexing, the sync records the failure, and the next night runs as normal. The job also holds `~/.lifeos/sync.lock` shared, as a sync does, so auto-deploy defers around it, and exits 0 if a deploy restart holds that lock.
+- **Memory.** When there are notes to index and free GPU memory is below `LIFEOS_EMBEDDING_MEMORY_THRESHOLD_MB`, or free system RAM is below the embedding minimum, the job exits 0 and logs why. It never stops the LLM service. A host with no reading, such as one without an AMD GPU, is not held back. A run that falls back to CPU embeddings says so in its log, with its note count and duration.
+- **Idle runs.** The scan compares file modification times and tag rows with the saved state and needs neither ChromaDB nor BM25, so a run with nothing to do exits without loading the embedding model. A vault with no notes at all is treated as unmounted, and nothing is removed.
+- **Tags.** A tag lookup that fails, because the store is locked or unreadable, leaves a note's tag state as recorded instead of making it look changed. This applies to the job and the reindex alike, and it is logged once per run. A note edited during the outage is indexed without its tag phrase, so it records no tag key and is indexed once more when lookups work again.
+- **Failures.** A failure goes to `logs/vault-index.log` and the unit's status, and the next tick tries again. The job sends no alert and records no sync failure.
+
+`--dry-run`, the default, reports what a run would index and writes nothing. It names the index state and tag database it read, because the state path follows the working directory and the tag database follows `LIFEOS_CHROMA_PATH`, which defaults to the checkout holding the code. Run it from another checkout with the working directory and `LIFEOS_CHROMA_PATH` both pointing at the live data. If the tag database cannot be read, it counts by modification time alone and says so. `--execute` indexes.
 
 ### Failure Notifications
 
@@ -183,9 +198,9 @@ auto-resolved by the next successful run of that source.
 
 | Store | Location | Purpose | Updated By |
 |-------|----------|---------|------------|
-| ChromaDB | `data/chromadb/` | Vector embeddings | Nightly reindex |
+| ChromaDB | `data/chromadb/` | Vector embeddings | Vault index job, nightly reindex |
 | ChromaDB (Slack) | `lifeos_slack` collection | Slack message vectors | Nightly Slack sync |
-| BM25 Index | `data/chromadb/bm25_index.db` | Keyword search | Nightly reindex |
+| BM25 Index | `data/chromadb/bm25_index.db` | Keyword search | Vault index job, nightly reindex |
 | Vault | Configured via `LIFEOS_VAULT_PATH` | Primary knowledge base | User, external classifier, GDoc Sync |
 | PersonEntity | `data/crm.db` (person_entities table) | Resolved identities | People v2 sync, iMessage sync |
 | SourceEntity | `data/crm.db` | Raw observations | All sync scripts |
@@ -308,7 +323,7 @@ Runs in this order (see [iMessage Sync Ordering](#imessage-sync-ordering) below)
 
 | Script | Purpose | Data Source |
 |--------|---------|-------------|
-| `sync_vault_reindex.py` | Reindex vault to ChromaDB + BM25 | Vault files |
+| `sync_vault_reindex.py` | Reindex vault to ChromaDB + BM25; waits for the vault index lock | Vault files |
 | `sync_vault_tag.py` | Tag changed vault notes into the tag store (`data/vault_tags.db`) | Vault files |
 | `sync_crm_to_vectorstore.py` | Make the people index hold exactly the eligible CRM people | `data/crm.db` |
 
@@ -316,7 +331,7 @@ Runs in this order (see [iMessage Sync Ordering](#imessage-sync-ordering) below)
 
 **What the reindex skips.** Indexing and tagging leave out every file under a `_`-prefixed folder, which holds working output rather than notes (a `_`-prefixed file in an ordinary folder is still a note). An entry indexed earlier drops out through the deleted-file path. A bulk-content note stays searchable but creates no people, links, interactions, or source entities, because a page written about someone is not contact with them. A note is bulk content when it sits under a folder in `LIFEOS_VAULT_NO_PEOPLE_PATHS`, or its frontmatter has an explicit `people: false` or a `generated:` key. A blank `people:` is an empty property and doesn't count. `source: llm` alone doesn't decide it: daily notes and prep written with a model are about real contact. See [Mentions in Notes](../product/entity-resolution.md#mentions-in-notes) for how the remaining notes resolve their mentions.
 
-**Time budget.** The nightly `vault_reindex` runs under `LIFEOS_VAULT_INDEX_BUDGET_MINUTES`, so a large first load can't hold up later phases. When the budget runs out between files, the run saves its place, refreshes stats for the people it touched, and exits successfully, reporting `files_remaining` in `SYNC_STATS` and the log. Unprocessed files and pending removals stay out of the saved state, so the next run picks them up. Failed-summary retries wait for a run that finishes. A budgeted run indexes ordinary notes before bulk content, newest first. A manual `sync_vault_reindex.py`, including `--force`, is unbudgeted unless given `--budget-minutes`.
+**Time budget.** The nightly `vault_reindex` runs under `LIFEOS_VAULT_INDEX_BUDGET_MINUTES`, so a large first load can't hold up later phases. When the budget runs out between files, the run saves its place, refreshes stats for the people it touched, and exits successfully, reporting `files_remaining` in `SYNC_STATS` and the log. Unprocessed files and pending removals stay out of the saved state, so the next run picks them up. A budgeted run indexes ordinary notes before bulk content, newest first. A manual `sync_vault_reindex.py`, including `--force`, is unbudgeted unless given `--budget-minutes`.
 
 **One interaction per note.** `interactions` is unique on `(source_type, source_id)` and a vault interaction's `source_id` is the note path, so a note holds one interaction however many people it names. It goes to the first person who resolves, full names first, and follows the note on reindexing: a holder the note doesn't resolve to gives it up to whoever comes first, and it is removed if no one does. A holder whose link a human confirmed keeps it. Source entities are per mention.
 
@@ -343,6 +358,20 @@ Runs in this order (see [iMessage Sync Ordering](#imessage-sync-ordering) below)
 | Script | Purpose | Data Source |
 |--------|---------|-------------|
 | `sync_consistency_verify.py` | Cross-store consistency check (orphans, stale merged IDs, cached counts, `last_seen`, vault files that moved or vanished) and auto-fix | `data/crm.db`, `data/interactions.db` |
+
+### Summary Queue
+
+| Script | Purpose | Data Source |
+|--------|---------|-------------|
+| `sync_vault_summaries.py` | Generate queued LLM summaries into BM25 | `data/vault_summary_failures.json`, vault files |
+
+The `vault_summaries` source holds the notes the vault index job indexed and the notes whose summary failed during a reindex. It has its own timeout and sync-health row, and a failure fails only this source. It needs only the LLM to answer: it does not depend on the reindex finishing. With notes queued it waits up to 10 minutes for an LLM that isn't answering, since a restarted one takes a while to load its model, and then reports a skip and leaves the queue alone. Its run time swings widely by design, so duration-collapse detection doesn't apply to it.
+
+It runs last. Its time budget (`LIFEOS_SUMMARY_RETRY_BUDGET_SECONDS`) then delays no other source, and any LLM stopped for embeddings is already back. No later source reads summaries. The vault map pages read them during `vault_reindex`, so a page shows a new summary the night after it is generated. Search reads them from BM25 as soon as they are written.
+
+- **Order.** Notes with the fewest failed attempts first, then newest first, so today's notes come ahead of an old backlog and a note that keeps failing can't block the rest.
+- **Failures.** A note whose summary fails stays queued. Three failures in a row end the pass, since the LLM has probably stalled, and the source reports failure so the night's summary shows it. A note that fails on three passes gets a fallback summary from its first line and leaves the queue. A note too short for a real summary gets the fallback straight away.
+- **Concurrent indexing.** The source holds no vault index lock, so the job keeps running. Each queue entry has a generation. Anything about to rewrite or remove a note in BM25 first raises its generation under the queue's `flock`, and the source writes a summary and removes the entry under that same `flock`, only if the generation is the one it read before it started. Whichever comes first, no summary of old text survives: an earlier write is deleted with the note's old chunks, and a later one is refused, leaving the entry for the next pass.
 
 ### Unified Sync Runner
 
@@ -606,6 +635,9 @@ The unified sync runner (`run_all_syncs.py`) executes `SYNC_ORDER` in this order
 
 **Phase 7: Consistency Verification**
 25. `consistency_verify` - Cross-store consistency check (orphans, stale merged IDs, cached counts, `last_seen`, vault files that moved or vanished) and auto-fix
+
+**Summary Queue**
+26. `vault_summaries` - Generate queued LLM summaries into BM25
 
 **Automated via systemd (Linux) / launchd (macOS):**
 - Service: `lifeos-sync` (systemd) or `com.lifeos.crm-sync` (launchd)

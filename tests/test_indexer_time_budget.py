@@ -23,7 +23,6 @@ class Harness:
         self.now = 0.0
         self.indexed: list[str] = []
         self.deleted: list[str] = []
-        self.retries = 0
         self.fail_on: set[str] = set()
         self.affected = {}
 
@@ -36,7 +35,6 @@ class Harness:
         indexer._clock = lambda: self.now
         indexer.index_file = self._index_file
         indexer.delete_file = self._delete_file
-        indexer._retry_failed_summaries = self._retry
         return indexer
 
     def _index_file(self, path, **kwargs):
@@ -50,10 +48,6 @@ class Harness:
     def _delete_file(self, path):
         self.now += 1.0
         self.deleted.append(path)
-
-    def _retry(self):
-        self.retries += 1
-        return 0
 
     def notes(self, count):
         for i in range(count):
@@ -117,15 +111,6 @@ class TestStoppingEarly:
 
         harness.fail_on = set()
         assert harness.make().index_all(time_budget_seconds=100.0) == 2
-
-    def test_summary_retries_wait_for_a_run_that_finishes(self, harness):
-        harness.notes(3)
-        harness.make().index_all(time_budget_seconds=1.0)
-        assert harness.retries == 0
-
-        harness.now = 0.0
-        harness.make().index_all(time_budget_seconds=100.0)
-        assert harness.retries == 1
 
     def test_stats_refresh_for_people_touched_before_the_stop(self, harness):
         harness.notes(4)
@@ -234,13 +219,12 @@ class TestOrdering:
 
 
 class TestUnbudgeted:
-    def test_no_budget_indexes_everything_and_retries_summaries(self, harness):
+    def test_no_budget_indexes_everything(self, harness):
         harness.notes(5)
         indexer = harness.make()
 
         assert indexer.index_all() == 5
         assert indexer.last_run == {"files_pruned": 0, "files_remaining": 0, "stopped_early": False}
-        assert harness.retries == 1
 
     def test_force_is_unbudgeted_by_default_however_slow(self, harness):
         harness.notes(5)
@@ -264,7 +248,6 @@ class TestUnbudgeted:
         indexer = harness.make()
         assert indexer.index_all(time_budget_seconds=1800.0) == 3
         assert indexer.last_run["stopped_early"] is False
-        assert harness.retries == 1
 
 
 class TestScriptAndOrchestrator:

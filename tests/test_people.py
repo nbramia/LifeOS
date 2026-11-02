@@ -311,8 +311,6 @@ Taking Alice to the park. Jane is making dinner.
             results = indexer.vector_store.search("team standup", top_k=5)
             assert len(results) >= 1
 
-            indexer.stop()
-
 
 # ---------------------------------------------------------------------------
 # GET /api/people/search bounds its results and batches the recency lookup.
