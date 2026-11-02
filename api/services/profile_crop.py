@@ -2,20 +2,26 @@
 
 ``cropped_avatar`` cuts a square headshot around a face out of a thumbnail and
 caches it on disk under ``settings.photos_profile_crops_dir``. It returns None
-whenever a crop cannot be made (no Pillow, unreadable image, bad geometry), so
-the caller serves the uncropped thumbnail instead.
+whenever a crop cannot be made (no Pillow, unreadable image, bad geometry, an
+image that does not frame the photo like the frame the face was measured on), so
+the caller serves the uncropped thumbnail instead. A wrong crop is worse than
+none.
 
 The crop is cut from the staged higher-resolution profile source of the asset
-(``settings.photos_profile_sources_dir``) when there is one with the
-thumbnail's aspect ratio, else from the thumbnail itself.
+(``settings.photos_profile_sources_dir``) when there is one, else from the
+thumbnail; either must have the aspect ratio of the frame the face was measured
+on. Images are read upright (EXIF orientation applied), the way a browser shows
+the uncropped thumbnail.
 
 Geometry: a face is ``(x, y, size)`` with ``x``/``y`` the face box centre as
 fractions of the image width and height (origin top-left) and ``size`` the box
-side as a fraction of the image's longer side.
+side as a fraction of the image's longer side, all on the frame as Photos shows
+it (the orientation is already applied, so no per-orientation mapping applies).
 """
 import hashlib
 import logging
 import os
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -54,8 +60,8 @@ def crop_box(
     return left, top, side
 
 
-# Aspect ratios of a source and the thumbnail may differ by this much (relative)
-# before the source is considered a different framing of the photo.
+# An image may differ from the frame the face was measured on by this much
+# (relative aspect ratio, to allow for rounding) before it is rejected.
 ASPECT_TOLERANCE = 0.02
 
 
@@ -65,19 +71,24 @@ def _staged_source(asset: str) -> Optional[Path]:
     return source if source.is_file() else None
 
 
-def _same_framing(source: Path, thumb_path: Path) -> bool:
-    from PIL import Image
+def _upright_image(path: Path, frame: tuple[int, int]):
+    """The image at ``path`` with its EXIF orientation applied, or None when it
+    cannot be read or does not frame the photo like ``frame``."""
+    from PIL import Image, ImageOps
 
     try:
-        with Image.open(source) as big, Image.open(thumb_path) as small:
-            ratio = (big.width / big.height) / (small.width / small.height)
+        with Image.open(path) as opened:
+            image = ImageOps.exif_transpose(opened)
+            image.load()
     except OSError:
-        return False
-    return abs(ratio - 1) <= ASPECT_TOLERANCE
+        return None
+    ratio = (image.width / image.height) / (frame[0] / frame[1])
+    return image if abs(ratio - 1) <= ASPECT_TOLERANCE else None
 
 
 def _cache_path(
-    person_id: str, thumb_path: Path, source: Optional[Path], x: float, y: float, size: float,
+    person_id: str, thumb_path: Path, source: Optional[Path],
+    x: float, y: float, size: float, frame: tuple[int, int],
 ) -> Path:
     """Where this person's crop of this face of this photo lives.
 
@@ -88,10 +99,10 @@ def _cache_path(
     stats = [thumb_path.stat()] + ([source.stat()] if source else [])
     key = "|".join(map(str, (
         FACE_CROP_SCALE, CROP_LIFT, CROP_MAX_PX, CROP_JPEG_QUALITY,
-        f"{x:.5f}", f"{y:.5f}", f"{size:.5f}",
+        f"{x:.5f}", f"{y:.5f}", f"{size:.5f}", *frame,
         *[(st.st_mtime_ns, st.st_size) for st in stats],
     )))
-    person = hashlib.sha256(person_id.encode()).hexdigest()[:16]
+    person = _person_dir_name(person_id)
     name = hashlib.sha256(key.encode()).hexdigest()[:24]
     return settings.photos_profile_crops_dir / person / f"{name}.jpeg"
 
@@ -101,21 +112,28 @@ def cropped_avatar(person_id: str, thumb_path: Path, pick: dict) -> Optional[Pat
     failure."""
     try:
         x, y, size = pick["x"], pick["y"], pick["size"]
+        frame = (int(pick["fw"]), int(pick["fh"]))
+        if min(frame) <= 0:
+            return None
         source = _staged_source(pick["asset"])
-        target = _cache_path(person_id, thumb_path, source, x, y, size)
+        target = _cache_path(person_id, thumb_path, source, x, y, size, frame)
         if target.is_file():
             return target
 
         from PIL import Image
 
-        image_path = source if source and _same_framing(source, thumb_path) else thumb_path
-        with Image.open(image_path) as image:
-            image.load()
-            box = crop_box(image.width, image.height, x, y, size)
-            if box is None:
-                return None
-            left, top, side = box
-            crop = image.convert("RGB").crop((left, top, left + side, top + side))
+        image = None
+        for candidate in (source, thumb_path):
+            image = candidate and _upright_image(candidate, frame)
+            if image:
+                break
+        if image is None:
+            return None
+        box = crop_box(image.width, image.height, x, y, size)
+        if box is None:
+            return None
+        left, top, side = box
+        crop = image.convert("RGB").crop((left, top, left + side, top + side))
         if side > CROP_MAX_PX:
             crop = crop.resize((CROP_MAX_PX, CROP_MAX_PX), Image.LANCZOS)
 
@@ -135,3 +153,30 @@ def cropped_avatar(person_id: str, thumb_path: Path, pick: dict) -> Optional[Pat
     except Exception as e:
         logger.warning(f"Profile photo crop failed: {type(e).__name__}")
         return None
+
+
+def _person_dir_name(person_id: str) -> str:
+    return hashlib.sha256(person_id.encode()).hexdigest()[:16]
+
+
+def prune(picks: dict) -> None:
+    """Remove staged sources and cached crops that no pick refers to.
+
+    ``picks`` is the full picks mapping, so a source is kept while any person's
+    pick uses its asset and a person's crop directory while the person has a pick.
+    """
+    keep_assets = {
+        str(entry["asset"]).upper()
+        for entries in picks.values() for entry in entries if isinstance(entry, dict) and "asset" in entry
+    }
+    sources = settings.photos_profile_sources_dir
+    if sources.is_dir():
+        for staged in sources.glob("*/*.jpeg"):
+            if staged.stem.upper() not in keep_assets:
+                staged.unlink(missing_ok=True)
+    keep_people = {_person_dir_name(person_id) for person_id in picks}
+    crops = settings.photos_profile_crops_dir
+    if crops.is_dir():
+        for person_dir in crops.iterdir():
+            if person_dir.is_dir() and person_dir.name not in keep_people:
+                shutil.rmtree(person_dir, ignore_errors=True)

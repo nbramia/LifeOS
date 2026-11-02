@@ -20,6 +20,18 @@ pytestmark = pytest.mark.unit
 JPEG = b"\xff\xd8\xff\xe0synthetic-jpeg-bytes\xff\xd9"
 
 
+@pytest.fixture(autouse=True)
+def _private_photo_dirs(tmp_path):
+    """Writing picks prunes staged sources and cached crops: keep that away from
+    the repository's data directory."""
+    from config.settings import Settings
+    with patch.object(Settings, "photos_profile_sources_dir", new_callable=PropertyMock,
+                      return_value=tmp_path / "profile-sources"), \
+         patch.object(Settings, "photos_profile_crops_dir", new_callable=PropertyMock,
+                      return_value=tmp_path / "profile-crops"):
+        yield
+
+
 def _uuid(n: int) -> str:
     return f"{n:08X}-0000-4000-8000-{n:012X}"
 
@@ -29,16 +41,19 @@ def _ts(day: int) -> str:
 
 
 def _rec(n, day, faces=1, size=0.2, quality=0.5, eyes_closed=False, key=False,
-         hidden=False, x=0.5, y=0.4):
+         hidden=False, x=0.5, y=0.4, video=False, frame=(4000, 3000)):
     """An export-shaped appearance record for asset number ``n``."""
     return {
         "asset_uuid": _uuid(n),
         "timestamp": _ts(day),
         "visible_faces": faces,
         "asset_hidden": hidden,
+        "asset_video": video,
         "face_size": size,
         "face_x": x,
         "face_y": y,
+        "frame_width": frame[0],
+        "frame_height": frame[1],
         "face_quality": quality,
         "eyes_closed": eyes_closed,
         "key_face": key,
@@ -206,6 +221,15 @@ class TestSelection:
         visible, hidden = _rec(1, day=1, faces=1), _rec(2, day=2, faces=2, hidden=True)
         assert _picks([visible, hidden], has_thumbnail=lambda u: u != _uuid(1)) == []
 
+    def test_a_video_is_never_picked(self):
+        video = _rec(1, day=20, faces=1, video=True)
+        group = _rec(2, day=1, faces=6, size=0.05)
+        assert _picks([video, group]) == [_uuid(2)]
+
+    def test_a_video_is_not_stored_as_a_later_pick_either(self):
+        visible, video = _rec(1, day=1, faces=1), _rec(2, day=2, faces=2, video=True)
+        assert _picks([visible, video], has_thumbnail=lambda u: u != _uuid(1)) == []
+
     def test_a_person_with_only_hidden_assets_gets_no_pick(self):
         assert _picks([_rec(1, day=1, hidden=True), _rec(2, day=2, hidden=True)]) == []
 
@@ -248,7 +272,11 @@ class TestSelection:
 class TestPickEntries:
     def test_a_measured_face_stores_its_geometry(self):
         entries = _entries([_rec(1, day=1, size=0.25, x=0.3, y=0.7)])
-        assert entries == [{"asset": _uuid(1), "x": 0.3, "y": 0.7, "size": 0.25}]
+        assert entries == [{"asset": _uuid(1), "x": 0.3, "y": 0.7, "size": 0.25, "fw": 4000, "fh": 3000}]
+
+    @pytest.mark.parametrize("frame", [(None, 3000), (4000, None), (0, 3000), (4000, 0), (None, None)])
+    def test_a_face_without_its_frame_stores_only_the_asset(self, frame):
+        assert _entries([_rec(1, day=1, frame=frame)]) == [{"asset": _uuid(1)}]
 
     @pytest.mark.parametrize("x,y", [
         (None, 0.5), (0.5, None), (-0.1, 0.5), (1.2, 0.5), (0.5, -0.1), (0.5, 1.2),
@@ -260,7 +288,9 @@ class TestPickEntries:
         # A person can appear twice in one photo; the asset keeps the better face.
         worse = _rec(1, day=1, size=0.05, x=0.1, y=0.1)
         better = _rec(1, day=1, size=0.3, x=0.6, y=0.5)
-        assert _entries([worse, better]) == [{"asset": _uuid(1), "x": 0.6, "y": 0.5, "size": 0.3}]
+        assert _entries([worse, better]) == [
+            {"asset": _uuid(1), "x": 0.6, "y": 0.5, "size": 0.3, "fw": 4000, "fh": 3000}
+        ]
 
     def test_a_pick_without_facts_stores_no_geometry(self):
         faced = _rec(1, day=1)
@@ -342,12 +372,15 @@ def _library(tmp_path, faces, *, extra_assets=(), derivatives=None):
     for statement in (
         "ALTER TABLE ZASSET ADD COLUMN ZTRASHEDSTATE INTEGER DEFAULT 0",
         "ALTER TABLE ZASSET ADD COLUMN ZHIDDEN INTEGER DEFAULT 0",
+        "ALTER TABLE ZASSET ADD COLUMN ZORIENTATION INTEGER DEFAULT 1",
         "ALTER TABLE ZPERSON ADD COLUMN ZKEYFACE INTEGER",
         "ALTER TABLE ZDETECTEDFACE ADD COLUMN ZHIDDEN INTEGER DEFAULT 0",
         "ALTER TABLE ZDETECTEDFACE ADD COLUMN ZASSETVISIBLE INTEGER DEFAULT 1",
         "ALTER TABLE ZDETECTEDFACE ADD COLUMN ZISINTRASH INTEGER DEFAULT 0",
         "ALTER TABLE ZDETECTEDFACE ADD COLUMN ZDETECTIONTYPE INTEGER DEFAULT 1",
         "ALTER TABLE ZDETECTEDFACE ADD COLUMN ZSIZE REAL",
+        "ALTER TABLE ZDETECTEDFACE ADD COLUMN ZSOURCEWIDTH INTEGER DEFAULT 4032",
+        "ALTER TABLE ZDETECTEDFACE ADD COLUMN ZSOURCEHEIGHT INTEGER DEFAULT 3024",
         "ALTER TABLE ZDETECTEDFACE ADD COLUMN ZCENTERX REAL",
         "ALTER TABLE ZDETECTEDFACE ADD COLUMN ZCENTERY REAL",
         "ALTER TABLE ZDETECTEDFACE ADD COLUMN ZQUALITY REAL",
@@ -444,6 +477,23 @@ class TestExportFacts:
         assert solo["face_x"] == pytest.approx(0.3)
         assert solo["face_y"] == pytest.approx(0.2)  # Photos stores Y from the bottom: 1 - 0.8
 
+    def test_the_frame_the_face_was_measured_on_is_exported(self, tmp_path):
+        faces = [dict(FACES[0], ZSOURCEWIDTH=3024, ZSOURCEHEIGHT=4032)] + FACES[1:]
+        solo = self._export(tmp_path, faces)[UUID_A]
+        assert (solo["frame_width"], solo["frame_height"]) == (3024, 4032)
+
+    def test_a_video_asset_is_flagged(self, tmp_path):
+        def library_with_video(root, faces):
+            library = _library(root, faces)
+            conn = sqlite3.connect(str(library / "database" / "Photos.sqlite"))
+            conn.execute("UPDATE ZASSET SET ZKIND = 1 WHERE ZUUID = ?", (UUID_A,))
+            conn.commit()
+            conn.close()
+
+        appearances = self._export(tmp_path, library_fn=library_with_video)
+        assert appearances[UUID_A]["asset_video"]
+        assert not appearances[UUID_B]["asset_video"]
+
     def test_no_asset_is_hidden_in_the_standard_library(self, tmp_path):
         assert not any(a["asset_hidden"] for a in self._export(tmp_path).values())
 
@@ -503,9 +553,10 @@ class TestExportFacts:
         local = {r["asset_uuid"]: r for r in reader.get_profile_appearances(1)}
         assert set(local) == set(exported)
         for asset_uuid, record in local.items():
-            for fact in ("timestamp", "visible_faces", "face_size", "face_x", "face_y", "face_quality"):
+            for fact in ("timestamp", "visible_faces", "face_size", "face_x", "face_y", "face_quality",
+                         "frame_width", "frame_height"):
                 assert record[fact] == exported[asset_uuid][fact], (asset_uuid, fact)
-            for flag in ("eyes_closed", "key_face", "asset_hidden"):
+            for flag in ("eyes_closed", "key_face", "asset_hidden", "asset_video"):
                 assert bool(record[flag]) == bool(exported[asset_uuid][flag]), (asset_uuid, flag)
 
     @pytest.mark.parametrize("flag", [
@@ -552,13 +603,87 @@ class TestExportFacts:
         assert _best(appearances) == UUID_A
 
 
+class TestFaceGeometryAcrossOrientations:
+    """Photos measures faces on the frame it displays, orientation applied, with
+    Y from the bottom. Exported through the real SQL and cropped, the face must
+    land in the middle of the crop for every orientation, portrait and landscape;
+    patches of other colours sit where a wrong mapping would put it."""
+
+    # orientation, frame, face centre as fractions with the origin top-left
+    CASES = [
+        (1, (400, 300), (0.36, 0.10)),
+        (3, (400, 300), (0.64, 0.90)),
+        (6, (300, 400), (0.10, 0.36)),
+        (8, (300, 400), (0.90, 0.64)),
+    ]
+
+    @pytest.mark.parametrize("orientation,frame,face", CASES)
+    def test_the_face_lands_in_the_crop(self, tmp_path, staged, orientation, frame, face):
+        from PIL import Image
+        from api.services import profile_crop
+        width, height = frame
+        fx, fy = face
+        wrong_places = {
+            "x mirrored": (1 - fx, fy),
+            "y not flipped (as stored)": (fx, 1 - fy),
+            "both mirrored": (1 - fx, 1 - fy),
+            "transposed": (fy, fx),
+            "rotated": (1 - fy, 1 - fx),
+        }
+        centres = [(px * width, py * height) for px, py in [face, *wrong_places.values()]]
+        for i, (ax, ay) in enumerate(centres):
+            for bx, by in centres[i + 1:]:
+                assert max(abs(ax - bx), abs(ay - by)) > 60, "table cases must keep the patches apart"
+
+        image = Image.new("RGB", frame, (255, 255, 255))
+        for name, (px, py) in wrong_places.items():
+            image.paste((20, 20, 220), (int(px * width) - 20, int(py * height) - 20,
+                                        int(px * width) + 20, int(py * height) + 20))
+        image.paste((220, 20, 20), (int(fx * width) - 20, int(fy * height) - 20,
+                                    int(fx * width) + 20, int(fy * height) + 20))
+        staged(UUID_A)
+        from config.settings import settings
+        thumb = settings.photos_thumbnails_dir / UUID_A[0] / f"{UUID_A}.jpeg"
+        image.save(thumb, "JPEG", quality=95)
+
+        faces = [dict(FACES[0], ZSIZE=0.1, ZSOURCEWIDTH=width, ZSOURCEHEIGHT=height,
+                      ZCENTERX=fx, ZCENTERY=1 - fy)]
+
+        def library_with_orientation(root, rows):
+            library = _library(root, rows)
+            conn = sqlite3.connect(str(library / "database" / "Photos.sqlite"))
+            conn.execute("UPDATE ZASSET SET ZORIENTATION = ? WHERE ZUUID = ?", (orientation, UUID_A))
+            conn.commit()
+            conn.close()
+
+        import scripts.apple_data_export as export
+        library_with_orientation(tmp_path, faces)
+        export_dir = tmp_path / "exports"
+        export_dir.mkdir()
+        with patch("scripts.apple_data_export.Path.home", return_value=tmp_path), \
+             patch("scripts.apple_data_export.EXPORT_DIR", export_dir):
+            export.export_photos_faces(dry_run=False)
+        records = [a for a in json.loads((export_dir / "photos_faces.json").read_text())["face_appearances"]
+                   if a["person_pk"] == 1 and a["asset_uuid"] == UUID_A]
+        entry = profile_photo.build_picks({"p": records}, lambda u: True)["p"][0]
+        assert (entry["fw"], entry["fh"]) == frame
+
+        with patch.object(profile_crop, "FACE_CROP_SCALE", 2.0), patch.object(profile_crop, "CROP_LIFT", 0.0):
+            crop = profile_crop.cropped_avatar("p", thumb, entry)
+        assert crop is not None
+        with Image.open(crop) as result:
+            red = result.getpixel((result.width // 2, result.height // 2))
+        assert red[0] > 180 and red[1] < 90 and red[2] < 90, f"crop centre is {red}"
+
+
 class TestExportStagesProfileSources:
     """The export stages the largest derivative of each person's best few
     avatar candidates, so the server can crop from more than the thumbnail."""
 
     SIZES = {MASTERS: b"thumb", SMALL: b"small-1024", MEDIUM: b"medium-2048"}
 
-    def _export(self, tmp_path, faces=FACES, library_fn=None, derivatives=None, extra_assets=()):
+    def _export(self, tmp_path, faces=FACES, library_fn=None, derivatives=None, extra_assets=(),
+                prestage=None):
         import scripts.apple_data_export as export
         derivatives = derivatives if derivatives is not None else {
             u: dict(self.SIZES) for u in (UUID_A, UUID_B, UUID_C, *extra_assets)
@@ -568,10 +693,70 @@ class TestExportStagesProfileSources:
         build(tmp_path, faces)
         export_dir = tmp_path / "exports"
         export_dir.mkdir()
+        if prestage:
+            prestage(export_dir / "photos_profile_sources")
         with patch("scripts.apple_data_export.Path.home", return_value=tmp_path), \
              patch("scripts.apple_data_export.EXPORT_DIR", export_dir):
             self.result = export.export_photos_faces(dry_run=False)
         return export_dir / "photos_profile_sources"
+
+    @staticmethod
+    def _stale(root, asset=_uuid(99)):
+        path = root / asset[0] / f"{asset}.jpeg"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"stale")
+        return path
+
+    def test_files_no_ranking_reaches_any_more_are_pruned(self, tmp_path):
+        stale = []
+        staged_dir = self._export(tmp_path, prestage=lambda root: stale.append(self._stale(root)))
+        assert not stale[0].exists()
+        assert (staged_dir / "A" / f"{UUID_A}.jpeg").exists()
+        assert self.result["profile_sources"]["pruned"] == 1
+
+    def test_a_staged_file_is_matched_to_its_asset_whatever_its_case(self, tmp_path):
+        lowercase = []
+
+        def stage(root):
+            path = root / "a" / f"{UUID_A.lower()}.jpeg"
+            path.parent.mkdir(parents=True)
+            path.write_bytes(b"staged")
+            lowercase.append(path)
+
+        self._export(tmp_path, prestage=stage)
+        assert lowercase[0].exists()
+
+    def test_current_candidates_are_never_pruned(self, tmp_path):
+        staged_dir = self._export(tmp_path)
+        before = sorted(p.name for p in staged_dir.rglob("*.jpeg"))
+        assert before and self.result["profile_sources"]["pruned"] == 0
+
+    def test_a_video_is_not_staged(self, tmp_path):
+        def library_with_video(root, faces):
+            library = _library(root, faces, derivatives={u: dict(self.SIZES) for u in (UUID_A, UUID_B, UUID_C)})
+            conn = sqlite3.connect(str(library / "database" / "Photos.sqlite"))
+            conn.execute("UPDATE ZASSET SET ZKIND = 1 WHERE ZUUID = ?", (UUID_A,))
+            conn.commit()
+            conn.close()
+
+        staged_dir = self._export(tmp_path, library_fn=library_with_video)
+        assert not (staged_dir / "A" / f"{UUID_A}.jpeg").exists()
+
+    def test_an_export_without_face_facts_prunes_nothing(self, tmp_path):
+        import scripts.apple_data_export as export
+        make_library(
+            tmp_path,
+            [{"uuid": UUID_A, "kind": 0, "directory": "A", "filename": "x.jpeg",
+              "original_filename": "x.jpg", "original": None, "derivatives": dict(self.SIZES)}],
+            people=[(1, "Synthetic Person", 1, "SYNTHETIC-CONTACT:ABPerson")], faces=[(1, 1)],
+        )
+        export_dir = tmp_path / "exports"
+        export_dir.mkdir()
+        stale = self._stale(export_dir / "photos_profile_sources")
+        with patch("scripts.apple_data_export.Path.home", return_value=tmp_path), \
+             patch("scripts.apple_data_export.EXPORT_DIR", export_dir):
+            result = export.export_photos_faces(dry_run=False)
+        assert stale.exists() and result["profile_sources"]["pruned"] == 0
 
     def test_the_largest_derivative_is_staged_for_the_best_candidates(self, tmp_path):
         staged_dir = self._export(tmp_path)
@@ -742,6 +927,7 @@ class TestLocalSyncWritesPicks:
         assert _assets(profile_photo.load_picks()) == {"person-1": [UUID_A, UUID_C, UUID_B]}
         assert profile_photo.load_picks()["person-1"][0] == {
             "asset": UUID_A, "x": pytest.approx(0.3), "y": pytest.approx(0.2), "size": pytest.approx(0.25),
+            "fw": 4032, "fh": 3024,
         }
 
     def test_sync_all_writes_the_picks(self, tmp_path, staged):
@@ -762,7 +948,7 @@ class TestLocalSyncWritesPicks:
 
     def test_sync_all_on_a_host_without_a_library_keeps_the_imports_picks(self, tmp_path, staged):
         from api.services.apple_photos_sync import ApplePhotosSync
-        profile_photo.write_picks({"person-1": [_pick(1, x=0.5, y=0.5, size=0.2)]})
+        profile_photo.write_picks({"person-1": [_pick(1, x=0.5, y=0.5, size=0.2, fw=4000, fh=3000)]})
         syncer = ApplePhotosSync()
         syncer._get_photos_reader = MagicMock(side_effect=FileNotFoundError("no library"))
         syncer._get_source_store = MagicMock()
@@ -770,7 +956,9 @@ class TestLocalSyncWritesPicks:
         syncer._write_profile_picks = MagicMock(wraps=syncer._write_profile_picks)
         syncer.sync_all()
         syncer._write_profile_picks.assert_not_called()
-        assert profile_photo.load_picks() == {"person-1": [_pick(1, x=0.5, y=0.5, size=0.2)]}
+        assert profile_photo.load_picks() == {
+            "person-1": [_pick(1, x=0.5, y=0.5, size=0.2, fw=4000, fh=3000)]
+        }
 
     def test_a_library_without_face_facts_keeps_the_existing_picks(self, tmp_path, staged):
         from api.services.apple_photos import ApplePhotosReader

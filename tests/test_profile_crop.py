@@ -52,8 +52,20 @@ def _source(dirs, asset=ASSET, size=(800, 600), patches=()):
     return _image(dirs["sources"] / asset[0] / f"{asset}.jpeg", size, patches)
 
 
-def _pick(x, y, size, asset=ASSET):
-    return {"asset": asset, "x": x, "y": y, "size": size}
+def _pick(x, y, size, asset=ASSET, frame=(400, 300)):
+    return {"asset": asset, "x": x, "y": y, "size": size, "fw": frame[0], "fh": frame[1]}
+
+
+def _exif_image(path: Path, displayed: Image.Image, orientation: int):
+    """Save ``displayed`` as the raw pixels of a JPEG tagged ``orientation``, so
+    that applying the tag gives back ``displayed``."""
+    undo = {1: None, 3: Image.ROTATE_180, 6: Image.ROTATE_90, 8: Image.ROTATE_270}[orientation]
+    raw = displayed.transpose(undo) if undo is not None else displayed
+    exif = Image.Exif()
+    exif[0x0112] = orientation
+    path.parent.mkdir(parents=True, exist_ok=True)
+    raw.save(path, "JPEG", quality=95, exif=exif)
+    return path
 
 
 def _centre_colour(path):
@@ -167,7 +179,7 @@ class TestCroppedAvatar:
 
     def test_a_large_crop_is_downscaled_to_the_maximum(self, dirs, plain_constants):
         thumb = _thumb(dirs, size=(2000, 1500))
-        crop = profile_crop.cropped_avatar("big", thumb, _pick(0.5, 0.5, 0.2))
+        crop = profile_crop.cropped_avatar("big", thumb, _pick(0.5, 0.5, 0.2, frame=(2000, 1500)))
         with Image.open(crop) as image:
             assert image.size == (profile_crop.CROP_MAX_PX, profile_crop.CROP_MAX_PX)
 
@@ -258,15 +270,12 @@ class TestCropSource:
         with Image.open(crop) as image:
             assert image.size == (160, 160)
 
-    def test_replacing_the_thumbnail_with_another_framing_drops_the_source_crop(self, dirs, plain_constants):
+    def test_replacing_the_thumbnail_with_another_framing_stops_the_cropping(self, dirs, plain_constants):
         thumb = _thumb(dirs, size=(400, 300))
-        _source(dirs, size=(800, 600))
         first = profile_crop.cropped_avatar("p1", thumb, _pick(0.5, 0.5, 0.1))
-        _thumb(dirs, size=(300, 300))  # a square thumbnail does not frame the photo like the 4:3 source
-        second = profile_crop.cropped_avatar("p1", thumb, _pick(0.5, 0.5, 0.1))
-        assert second != first
-        with Image.open(second) as image:
-            assert image.size == (60, 60)  # cut from the new thumbnail
+        assert first is not None
+        _thumb(dirs, size=(300, 300))  # a square thumbnail does not frame the 4:3 photo
+        assert profile_crop.cropped_avatar("p1", thumb, _pick(0.5, 0.5, 0.1)) is None
 
     def test_a_source_with_a_different_aspect_ratio_is_ignored(self, dirs, plain_constants):
         thumb = _thumb(dirs, size=(400, 300))
@@ -278,16 +287,187 @@ class TestCropSource:
     def test_a_source_within_the_aspect_tolerance_is_used(self, dirs, plain_constants):
         thumb = _thumb(dirs, size=(480, 360))
         _source(dirs, size=(1024, 770))  # 1.3299 vs 1.3333
-        crop = profile_crop.cropped_avatar("p1", thumb, _pick(0.5, 0.5, 0.1))
+        crop = profile_crop.cropped_avatar("p1", thumb, _pick(0.5, 0.5, 0.1, frame=(480, 360)))
         with Image.open(crop) as image:
             assert image.width == 205
 
     def test_a_source_just_outside_the_aspect_tolerance_is_ignored(self, dirs, plain_constants):
         thumb = _thumb(dirs, size=(480, 360))
         _source(dirs, size=(1024, 740))  # 1.3838 vs 1.3333
-        crop = profile_crop.cropped_avatar("p1", thumb, _pick(0.5, 0.5, 0.1))
+        crop = profile_crop.cropped_avatar("p1", thumb, _pick(0.5, 0.5, 0.1, frame=(480, 360)))
         with Image.open(crop) as image:
             assert image.width == 96
+
+
+class TestFrameCheck:
+    """An image is only cropped when it frames the photo like the frame the face
+    was measured on."""
+
+    def test_a_thumbnail_with_another_aspect_ratio_is_not_cropped(self, dirs):
+        thumb = _thumb(dirs, size=(300, 300))
+        assert profile_crop.cropped_avatar("p1", thumb, _pick(0.5, 0.5, 0.1, frame=(400, 300))) is None
+        assert not dirs["crops"].exists()
+
+    def test_a_portrait_frame_does_not_match_a_landscape_thumbnail(self, dirs):
+        thumb = _thumb(dirs, size=(400, 300))
+        assert profile_crop.cropped_avatar("p1", thumb, _pick(0.5, 0.5, 0.1, frame=(300, 400))) is None
+
+    def test_a_thumbnail_a_hair_off_the_frame_aspect_is_cropped(self, dirs):
+        thumb = _thumb(dirs, size=(480, 359))  # 1.3370 vs 1.3333
+        assert profile_crop.cropped_avatar("p1", thumb, _pick(0.5, 0.5, 0.1, frame=(4032, 3024))) is not None
+
+    def test_a_source_that_matches_is_used_when_the_thumbnail_does_not(self, dirs, plain_constants):
+        thumb = _thumb(dirs, size=(300, 300))
+        _source(dirs, size=(800, 600))
+        crop = profile_crop.cropped_avatar("p1", thumb, _pick(0.5, 0.5, 0.1, frame=(400, 300)))
+        with Image.open(crop) as image:
+            assert image.size == (160, 160)
+
+    def test_the_thumbnail_is_used_when_only_it_matches(self, dirs, plain_constants):
+        thumb = _thumb(dirs, size=(400, 300))
+        _source(dirs, size=(700, 700))
+        crop = profile_crop.cropped_avatar("p1", thumb, _pick(0.5, 0.5, 0.1))
+        with Image.open(crop) as image:
+            assert image.size == (80, 80)
+
+    @pytest.mark.parametrize("frame", [(0, 300), (400, 0), (-400, 300)])
+    def test_an_empty_frame_is_declined_without_a_warning(self, dirs, frame, caplog):
+        with caplog.at_level("WARNING"):
+            assert profile_crop.cropped_avatar("p1", _thumb(dirs), _pick(0.5, 0.5, 0.1, frame=frame)) is None
+        assert not caplog.records
+
+    def test_a_cached_crop_is_not_reused_for_a_frame_the_image_does_not_match(self, dirs):
+        thumb = _thumb(dirs, size=(400, 300))
+        assert profile_crop.cropped_avatar("p1", thumb, _pick(0.5, 0.5, 0.1, frame=(400, 300))) is not None
+        assert profile_crop.cropped_avatar("p1", thumb, _pick(0.5, 0.5, 0.1, frame=(300, 400))) is None
+
+    def test_with_no_matching_image_nothing_is_cropped(self, dirs):
+        thumb = _thumb(dirs, size=(300, 300))
+        _source(dirs, size=(700, 700))
+        assert profile_crop.cropped_avatar("p1", thumb, _pick(0.5, 0.5, 0.1)) is None
+
+
+class TestExifOrientation:
+    """Images are read upright, the way a browser shows the uncropped thumbnail,
+    and the face frame is the upright one."""
+
+    @pytest.mark.parametrize("orientation", [1, 3, 6, 8])
+    def test_a_tagged_image_is_cropped_in_the_displayed_orientation(self, dirs, plain_constants, orientation):
+        displayed = Image.new("RGB", (400, 300), WHITE)
+        displayed.paste(RED, (100, 130, 140, 170))  # centre (120, 150)
+        displayed.paste(BLUE, (260, 130, 300, 170))
+        thumb = _exif_image(dirs["thumbs"] / ASSET[0] / f"{ASSET}.jpeg", displayed, orientation)
+        crop = profile_crop.cropped_avatar("p1", thumb, _pick(0.3, 0.5, 0.1, frame=(400, 300)))
+        assert crop is not None
+        assert _close(_centre_colour(crop), RED)
+        with Image.open(crop) as image:
+            assert image.size == (80, 80)
+
+    def test_the_frame_check_uses_the_displayed_dimensions(self, dirs):
+        displayed = Image.new("RGB", (400, 300), WHITE)
+        thumb = _exif_image(dirs["thumbs"] / ASSET[0] / f"{ASSET}.jpeg", displayed, 6)
+        with Image.open(thumb) as raw:
+            assert raw.size == (300, 400)  # the stored pixels are portrait
+        assert profile_crop.cropped_avatar("p1", thumb, _pick(0.5, 0.5, 0.1, frame=(400, 300))) is not None
+        assert profile_crop.cropped_avatar("p2", thumb, _pick(0.5, 0.5, 0.1, frame=(300, 400))) is None
+
+    def test_a_tagged_staged_source_is_read_upright_too(self, dirs, plain_constants):
+        thumb = _thumb(dirs, size=(400, 300))
+        displayed = Image.new("RGB", (800, 600), WHITE)
+        displayed.paste(RED, (200, 260, 280, 340))  # centre (240, 300)
+        _exif_image(dirs["sources"] / ASSET[0] / f"{ASSET}.jpeg", displayed, 6)
+        crop = profile_crop.cropped_avatar("p1", thumb, _pick(0.3, 0.5, 0.1))
+        with Image.open(crop) as image:
+            assert image.size == (160, 160)  # cut from the 800 px source
+        assert _close(_centre_colour(crop), RED)
+
+
+class TestPrune:
+    def _stage(self, dirs, asset):
+        path = dirs["sources"] / asset[0].upper() / f"{asset.upper()}.jpeg"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"source")
+        return path
+
+    def test_sources_no_pick_uses_are_removed_and_the_rest_kept(self, dirs):
+        other = "BBBBBBBB-0000-4000-8000-000000000002"
+        kept, dropped = self._stage(dirs, ASSET), self._stage(dirs, other)
+        profile_crop.prune({"p1": [{"asset": ASSET}]})
+        assert kept.exists() and not dropped.exists()
+
+    def test_a_staged_file_is_matched_to_its_asset_whatever_its_case(self, dirs):
+        lowercase = dirs["sources"] / "a" / f"{ASSET.lower()}.jpeg"
+        lowercase.parent.mkdir(parents=True)
+        lowercase.write_bytes(b"source")
+        profile_crop.prune({"p1": [{"asset": ASSET}]})
+        assert lowercase.exists()
+
+    def test_a_source_any_person_still_uses_is_kept(self, dirs):
+        staged = self._stage(dirs, ASSET)
+        profile_crop.prune({"p1": [{"asset": "CCCCCCCC-0000-4000-8000-000000000003"}], "p2": [{"asset": ASSET.lower()}]})
+        assert staged.exists()
+
+    def test_crop_directories_of_people_without_a_pick_are_removed(self, dirs):
+        thumb = _thumb(dirs)
+        gone = profile_crop.cropped_avatar("gone", thumb, _pick(0.5, 0.5, 0.1))
+        kept = profile_crop.cropped_avatar("kept", thumb, _pick(0.5, 0.5, 0.1))
+        profile_crop.prune({"kept": [{"asset": ASSET}]})
+        assert kept.exists() and not gone.exists() and not gone.parent.exists()
+
+    def test_missing_directories_and_malformed_entries_are_tolerated(self, dirs):
+        profile_crop.prune({"p1": ["not-a-dict", {"no-asset": 1}, {"asset": ASSET}]})
+
+    def test_writing_picks_prunes(self, dirs):
+        other = "BBBBBBBB-0000-4000-8000-000000000002"
+        kept, dropped = self._stage(dirs, ASSET), self._stage(dirs, other)
+        profile_photo.write_picks({"p1": [{"asset": ASSET}]})
+        assert kept.exists() and not dropped.exists()
+
+    def test_writing_no_picks_prunes_nothing(self, dirs):
+        staged = self._stage(dirs, ASSET)
+        profile_photo.write_picks({})
+        assert staged.exists()
+
+    def test_a_failing_prune_does_not_fail_the_write(self, dirs):
+        with patch("api.services.profile_crop.prune", side_effect=RuntimeError("boom")):
+            profile_photo.write_picks({"p1": [{"asset": ASSET}]})
+        assert profile_photo.load_picks() == {"p1": [{"asset": ASSET}]}
+
+
+class TestCropWrites:
+    def test_the_crop_appears_only_once_it_is_complete(self, dirs):
+        thumb = _thumb(dirs)
+        seen = {}
+        real_save = Image.Image.save
+
+        def spying_save(image, fp, *args, **kwargs):
+            real_save(image, fp, *args, **kwargs)
+            seen["files"] = sorted(p.name for p in dirs["crops"].rglob("*") if p.is_file())
+
+        with patch("PIL.Image.Image.save", spying_save):
+            crop = profile_crop.cropped_avatar("p1", thumb, _pick(0.5, 0.5, 0.1))
+        assert len(seen["files"]) == 1 and seen["files"][0].endswith(".tmp")
+        assert crop.exists() and crop.name not in seen["files"]
+
+    def test_a_write_that_fails_midway_leaves_no_partial_crop(self, dirs):
+        thumb = _thumb(dirs)
+
+        def partial_save(image, fp, *args, **kwargs):
+            fp.write(b"\xff\xd8partial")
+            raise OSError("disk full")
+
+        with patch("PIL.Image.Image.save", partial_save):
+            assert profile_crop.cropped_avatar("p1", thumb, _pick(0.5, 0.5, 0.1)) is None
+        assert not [p for p in dirs["crops"].rglob("*") if p.is_file()]
+
+    def test_a_failed_replace_leaves_the_previous_crop_serving(self, dirs):
+        thumb = _thumb(dirs)
+        first = profile_crop.cropped_avatar("p1", thumb, _pick(0.5, 0.5, 0.1))
+        before = first.read_bytes()
+        with patch("api.services.profile_crop.os.replace", side_effect=OSError("busy")):
+            assert profile_crop.cropped_avatar("p1", thumb, _pick(0.6, 0.5, 0.1)) is None
+        assert first.read_bytes() == before
+        assert [p.name for p in first.parent.iterdir()] == [first.name]
 
 
 class TestCropFallbacks:
@@ -307,10 +487,13 @@ class TestCropFallbacks:
         assert profile_crop.cropped_avatar("p1", dirs["thumbs"] / "nope.jpeg", _pick(0.5, 0.5, 0.1)) is None
 
     @pytest.mark.parametrize("pick", [
-        {"asset": ASSET, "x": 1.5, "y": 0.5, "size": 0.1},
-        {"asset": ASSET, "x": 0.5, "y": 0.5, "size": 0},
-        {"asset": ASSET, "x": 0.5, "y": 0.5},
-        {"asset": ASSET, "x": None, "y": 0.5, "size": 0.1},
+        {"asset": ASSET, "x": 1.5, "y": 0.5, "size": 0.1, "fw": 400, "fh": 300},
+        {"asset": ASSET, "x": 0.5, "y": 0.5, "size": 0, "fw": 400, "fh": 300},
+        {"asset": ASSET, "x": 0.5, "y": 0.5, "fw": 400, "fh": 300},
+        {"asset": ASSET, "x": None, "y": 0.5, "size": 0.1, "fw": 400, "fh": 300},
+        {"asset": ASSET, "x": 0.5, "y": 0.5, "size": 0.1},
+        {"asset": ASSET, "x": 0.5, "y": 0.5, "size": 0.1, "fw": 0, "fh": 300},
+        {"asset": ASSET, "x": 0.5, "y": 0.5, "size": 0.1, "fw": 400, "fh": -1},
     ])
     def test_unusable_geometry_has_no_crop(self, dirs, pick):
         assert profile_crop.cropped_avatar("p1", _thumb(dirs), pick) is None
@@ -369,12 +552,22 @@ class TestProfileRouteCrop:
         self._picks({"asset": ASSET})
         assert self._get(client).content == thumb.read_bytes()
 
-    def test_a_pick_without_geometry_is_never_sent_to_the_cropper(self, client, dirs):
+    @pytest.mark.parametrize("entry", [
+        {"asset": ASSET},
+        {"asset": ASSET, "x": 0.3, "y": 0.5, "size": 0.1},  # no frame
+    ])
+    def test_a_pick_without_complete_geometry_is_never_sent_to_the_cropper(self, client, dirs, entry):
         _thumb(dirs)
-        self._picks({"asset": ASSET})
+        self._picks(entry)
         with patch("api.services.profile_crop.cropped_avatar") as cropper:
             self._get(client)
         cropper.assert_not_called()
+
+    def test_a_thumbnail_that_does_not_match_the_frame_is_served_uncropped(self, client, dirs):
+        thumb = _thumb(dirs, size=(300, 300))
+        self._picks(_pick(0.3, 0.5, 0.1, frame=(400, 300)))
+        response = self._get(client)
+        assert response.status_code == 200 and response.content == thumb.read_bytes()
 
     def test_a_failed_crop_serves_the_thumbnail(self, client, dirs):
         thumb = _thumb(dirs)

@@ -683,9 +683,26 @@ def _stage_profile_sources(library: Path, faces_export: list, dest_root: Path) -
     for records in by_person.values():
         appearances = [a for a in map(ranking.appearance_from_record, records) if a]
         assets.update(a.asset_uuid for a in ranking.select_profile_photos(appearances, has_thumbnail))
-    return _stage_photo_thumbnails(
+    result = _stage_photo_thumbnails(
         library, assets, dest_root, photos_origin_helper.PREVIEW_DERIVATIVES
     )
+    # Files for assets no person's ranking reaches any more are dropped, unless
+    # there are no candidates at all (facts unavailable), which keeps what is staged.
+    result["pruned"] = _prune_staged(dest_root, {a.upper() for a in assets}) if assets else 0
+    return result
+
+
+def _prune_staged(dest_root: Path, keep_assets: set) -> int:
+    """Delete staged files whose asset is not in keep_assets; returns the count."""
+    pruned = 0
+    for staged in dest_root.glob("*/*.jpeg"):
+        if staged.stem.upper() not in keep_assets:
+            try:
+                staged.unlink()
+                pruned += 1
+            except OSError:
+                pass
+    return pruned
 
 
 # One row per face of a person: the asset plus the facts that rank and frame it
@@ -695,12 +712,16 @@ def _stage_profile_sources(library: Path, faces_export: list, dest_root: Path) -
 #                  face); 0 when this face is itself hidden, not visible, or
 #                  trashed
 #   asset_hidden   the asset is trashed or hidden
+#   asset_video    the asset is a video (its poster frame is not an avatar)
 #   face_size      face box side as a fraction of the image's longer side
 #   face_x/face_y  face box centre as fractions of width and height, origin
 #                  top-left (Photos stores Y from the bottom)
+#   frame_width/   pixel size of the frame the face was measured on: the photo
+#   frame_height   as Photos displays it, orientation applied, so the
+#                  coordinates need no per-orientation mapping
 _FACE_FACT_NAMES = (
-    "visible_faces", "asset_hidden", "face_size", "face_x", "face_y",
-    "face_quality", "eyes_closed", "key_face",
+    "visible_faces", "asset_hidden", "asset_video", "face_size", "face_x", "face_y",
+    "frame_width", "frame_height", "face_quality", "eyes_closed", "key_face",
 )
 _FACE_FACTS_COLUMNS = """,
                     CASE WHEN COALESCE(f.ZHIDDEN, 0) = 0
@@ -716,9 +737,12 @@ _FACE_FACTS_COLUMNS = """,
                          ELSE 0 END AS visible_faces,
                     (COALESCE(a.ZTRASHEDSTATE, 0) != 0
                      OR COALESCE(a.ZHIDDEN, 0) != 0) AS asset_hidden,
+                    (COALESCE(a.ZKIND, 0) != 0) AS asset_video,
                     f.ZSIZE AS face_size,
                     f.ZCENTERX AS face_x,
                     1.0 - f.ZCENTERY AS face_y,
+                    f.ZSOURCEWIDTH AS frame_width,
+                    f.ZSOURCEHEIGHT AS frame_height,
                     f.ZQUALITY AS face_quality,
                     (COALESCE(f.ZISLEFTEYECLOSED, 0) = 1
                      OR COALESCE(f.ZISRIGHTEYECLOSED, 0) = 1) AS eyes_closed,

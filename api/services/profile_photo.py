@@ -18,7 +18,7 @@ Ranking, best first (each element breaks ties in the one before):
 6. higher face quality, in ``QUALITY_LEVELS`` coarse steps
 7. newer photo
 
-A trashed or hidden asset is never picked. A record without usable facts (no
+A trashed or hidden asset, and a video, is never picked. A record without usable facts (no
 visible-face count, or a face with no measured size) ranks after every record
 that has them, so a person whose records carry no facts gets no pick and the
 profile route keeps serving their most recent photo.
@@ -28,10 +28,11 @@ this file by path to choose which photos to stage in higher resolution; the
 settings import is deferred to the functions that touch the picks file.
 
 The picks live in one small JSON file (``settings.photos_profile_picks_path``):
-``{person_id: [{"asset": uuid, "x": .., "y": .., "size": ..}, ...]}``, best
-first, only assets whose thumbnail is available when the file is written. ``x``,
-``y`` and ``size`` frame the person's face for ``api.services.profile_crop``
-and are absent when the face has no measured geometry. The profile route reads
+``{person_id: [{"asset": uuid, "x": .., "y": .., "size": .., "fw": .., "fh": ..},
+...]}``, best first, only assets whose thumbnail is available when the file is
+written. ``x``, ``y`` and ``size`` frame the person's face for
+``api.services.profile_crop`` and ``fw``/``fh`` are the pixel size of the frame
+they were measured on; all are absent when the face has no measured geometry. The profile route reads
 the file with one dict lookup per avatar request.
 """
 import json
@@ -76,6 +77,9 @@ class Appearance:
     eyes_closed: bool = False
     key_face: bool = False
     asset_hidden: bool = False
+    asset_video: bool = False
+    frame_width: Optional[int] = None
+    frame_height: Optional[int] = None
 
     @property
     def has_facts(self) -> bool:
@@ -83,9 +87,11 @@ class Appearance:
 
     @property
     def has_geometry(self) -> bool:
+        """Whether the face position and the frame it was measured on are known."""
         return (
             self.face_x is not None and 0 <= self.face_x <= 1
             and self.face_y is not None and 0 <= self.face_y <= 1
+            and (self.frame_width or 0) > 0 and (self.frame_height or 0) > 0
         )
 
 
@@ -111,6 +117,9 @@ def appearance_from_record(record: dict) -> Optional[Appearance]:
         eyes_closed=bool(record.get("eyes_closed")),
         key_face=bool(record.get("key_face")),
         asset_hidden=bool(record.get("asset_hidden")),
+        asset_video=bool(record.get("asset_video")),
+        frame_width=record.get("frame_width"),
+        frame_height=record.get("frame_height"),
     )
 
 
@@ -141,7 +150,8 @@ def select_profile_photos(
 ) -> list[Appearance]:
     """Up to ``limit`` appearances of distinct assets, best avatar first.
 
-    Only visible (not trashed or hidden) assets with a thumbnail qualify. Empty
+    Only photos (not videos) that are not trashed or hidden and have a thumbnail
+    qualify. Empty
     when the best qualifying asset has no facts, because the person's records
     carry none.
     """
@@ -150,6 +160,7 @@ def select_profile_photos(
     for appearance in sorted(appearances, key=rank_key):
         if (
             appearance.asset_hidden
+            or appearance.asset_video
             or appearance.asset_uuid in chosen
             or not has_thumbnail(appearance.asset_uuid)
         ):
@@ -167,7 +178,10 @@ def pick_entry(appearance: Appearance) -> dict:
     """The stored form of a pick: the asset plus its face geometry, if any."""
     entry: dict = {"asset": appearance.asset_uuid}
     if appearance.has_facts and appearance.has_geometry:
-        entry.update(x=appearance.face_x, y=appearance.face_y, size=appearance.face_size)
+        entry.update(
+            x=appearance.face_x, y=appearance.face_y, size=appearance.face_size,
+            fw=appearance.frame_width, fh=appearance.frame_height,
+        )
     return entry
 
 
@@ -197,6 +211,7 @@ def write_picks(picks: dict[str, list[dict]]) -> None:
 
     No picks means the data had no usable facts (an export from a Mac that
     could not read them, a host without a Photos library), so the file stays.
+    Staged sources and cached crops that no pick refers to are removed.
     """
     if not picks:
         logger.info("No profile photo picks to store; keeping the existing picks file")
@@ -213,6 +228,12 @@ def write_picks(picks: dict[str, list[dict]]) -> None:
     except BaseException:
         Path(tmp_name).unlink(missing_ok=True)
         raise
+    try:
+        from api.services import profile_crop
+
+        profile_crop.prune(picks)
+    except Exception as e:
+        logger.warning(f"Profile photo cleanup failed: {type(e).__name__}")
 
 
 _cache: tuple = (None, {})

@@ -197,7 +197,8 @@ class ApplePhotosReader:
 
         Records have the shape of the Apple Data Agent export's face
         appearances (``asset_uuid``, ``timestamp``, ``visible_faces``,
-        ``asset_hidden``, ``face_size``, ``face_x``, ``face_y``,
+        ``asset_hidden``, ``asset_video``, ``face_size``, ``face_x``,
+        ``face_y``, ``frame_width``, ``frame_height``,
         ``face_quality``, ``eyes_closed``, ``key_face``), so
         ``api.services.profile_photo`` ranks both the same way. The face
         facts and their meanings mirror ``scripts/apple_data_export.py``. A
@@ -222,9 +223,12 @@ class ApplePhotosReader:
                          ELSE 0 END AS visible_faces,
                     (COALESCE(a.ZTRASHEDSTATE, 0) != 0
                      OR COALESCE(a.ZHIDDEN, 0) != 0) AS asset_hidden,
+                    (COALESCE(a.ZKIND, 0) != 0) AS asset_video,
                     f.ZSIZE AS face_size,
                     f.ZCENTERX AS face_x,
                     1.0 - f.ZCENTERY AS face_y,
+                    f.ZSOURCEWIDTH AS frame_width,
+                    f.ZSOURCEHEIGHT AS frame_height,
                     f.ZQUALITY AS face_quality,
                     (COALESCE(f.ZISLEFTEYECLOSED, 0) = 1
                      OR COALESCE(f.ZISRIGHTEYECLOSED, 0) = 1) AS eyes_closed,
@@ -244,9 +248,12 @@ class ApplePhotosReader:
                     "timestamp": timestamp.isoformat() if timestamp else None,
                     "visible_faces": row["visible_faces"],
                     "asset_hidden": row["asset_hidden"],
+                    "asset_video": row["asset_video"],
                     "face_size": row["face_size"],
                     "face_x": row["face_x"],
                     "face_y": row["face_y"],
+                    "frame_width": row["frame_width"],
+                    "frame_height": row["frame_height"],
                     "face_quality": row["face_quality"],
                     "eyes_closed": row["eyes_closed"],
                     "key_face": row["key_face"],

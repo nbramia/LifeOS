@@ -470,8 +470,9 @@ def get_profile_photo(person_id: str):
     Get a profile photo thumbnail for a person.
 
     Returns the photo ranked best as an avatar (see
-    ``api.services.profile_photo``: fewest faces in the frame, then a face
-    large enough to read, eyes open, Apple's key face, quality, recency) when
+    ``api.services.profile_photo``: a face large enough to crop sharply,
+    then fewest faces in the frame, a face large enough to read, eyes open,
+    Apple's key face, quality, recency) when
     the Photos import stored a pick for this person, cropped to a square
     around the face (``api.services.profile_crop``) when the pick carries the
     face's position and the crop succeeds. Otherwise returns the most recent
@@ -494,7 +495,7 @@ def get_profile_photo(person_id: str):
     for pick in profile_photo.load_picks().get(person_id, ()):
         thumb_path = _find_thumbnail_path(str(pick.get("asset", ""))) if isinstance(pick, dict) else None
         if thumb_path:
-            if all(key in pick for key in ("x", "y", "size")):
+            if all(key in pick for key in ("x", "y", "size", "fw", "fh")):
                 thumb_path = profile_crop.cropped_avatar(person_id, thumb_path, pick) or thumb_path
             return _profile_photo_response(thumb_path)
 
