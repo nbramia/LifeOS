@@ -732,6 +732,19 @@ def import_photos_faces(dry_run: bool = False) -> dict:
         ia_store.add_if_not_exists(interaction)
         interactions_created += 1
 
+    # Avatar picks come from every exported appearance, not just the new ones.
+    try:
+        from api.services import profile_photo
+
+        records_by_person: dict[str, list[dict]] = {}
+        for face in faces:
+            person_id = pk_to_person.get(face.get("person_pk"))
+            if person_id:
+                records_by_person.setdefault(person_id, []).append(face)
+        profile_photo.write_picks(profile_photo.build_picks(records_by_person))
+    except Exception as e:
+        logger.warning(f"Profile photo selection failed: {e}")
+
     logger.info(
         f"Photos: {sources_created} sources, {interactions_created} interactions created, "
         f"{skipped} skipped"

@@ -277,6 +277,9 @@ class ApplePhotosSync:
             logger.error(f"Error in Photos sync: {e}")
             stats.errors += 1
 
+        if photos_person_to_entity:
+            self._write_profile_picks(photos_person_to_entity)
+
         # Refresh stats for all people who got photo interactions
         affected_person_ids = list(photos_person_to_entity.values())
         if affected_person_ids and stats.interactions_created > 0:
@@ -289,6 +292,21 @@ class ApplePhotosSync:
             f"{stats.interactions_created} interactions created"
         )
         return stats
+
+    def _write_profile_picks(self, photos_person_to_entity: dict[int, str]) -> None:
+        """Rank each matched person's photos as avatars and store the picks."""
+        from api.services import profile_photo
+
+        try:
+            reader = self._get_photos_reader()
+            records: dict[str, list[dict]] = {}
+            for photos_pk, entity_id in photos_person_to_entity.items():
+                records.setdefault(entity_id, []).extend(
+                    reader.get_profile_appearances(photos_pk)
+                )
+            profile_photo.write_picks(profile_photo.build_picks(records))
+        except Exception as e:
+            logger.warning(f"Profile photo selection failed: {e}")
 
     def _sync_person_photos(
         self,

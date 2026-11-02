@@ -2141,6 +2141,24 @@ class Settings(BaseSettings):
         return _REPO_ROOT / "data" / "apple-imports" / "photos_thumbnails"
 
     @property
+    def photos_profile_picks_path(self) -> Path:
+        """Derived file mapping person id -> ranked avatar asset UUIDs, written
+        by the Photos import/sync (see api/services/profile_photo.py)."""
+        return _REPO_ROOT / "data" / "photos_profile_picks.json"
+
+    @property
+    def photos_profile_sources_dir(self) -> Path:
+        """Higher-resolution photos staged by the Apple Data Agent export for
+        avatar crops (<FIRST_CHAR>/<ASSET_UUID>.jpeg), synced to the server
+        with the rest of data/apple-imports/."""
+        return _REPO_ROOT / "data" / "apple-imports" / "photos_profile_sources"
+
+    @property
+    def photos_profile_crops_dir(self) -> Path:
+        """Cache of face-centred avatar crops (see api/services/profile_crop.py)."""
+        return _REPO_ROOT / "data" / "photos_profile_crops"
+
+    @property
     def photos_thumbnails_available(self) -> bool:
         """Whether any staged Photos thumbnail exists."""
         directory = self.photos_thumbnails_dir
