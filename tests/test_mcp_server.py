@@ -1593,3 +1593,51 @@ def test_path_param_exact_dotdot_is_rejected_before_any_request():
 
     assert called == [], f"upstream request was made: {called}"
     assert "error" in result
+
+
+@pytest.mark.unit
+def test_people_search_description_states_what_it_finds_and_how_to_read_it():
+    """What a tool-picking agent has to know: descriptions work, their results are
+    suggestions, and a shared first name is not one person."""
+    import importlib.util
+
+    from api.services.mcp_tool_tier import OAUTH_TOOL_TIER
+
+    spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    description = next(
+        c for c in module.CURATED_ENDPOINTS.values() if c["name"] == "lifeos_people_search"
+    )["description"]
+
+    assert len(description.split()) <= 30
+    assert "description worded like" in description
+    assert "(three or more words)" in description
+    assert "gives suggestions" in description
+    assert "sharing a first name as one person" in description
+    assert "entity_id" in description
+    assert "lifeos_person_*" in description
+    assert OAUTH_TOOL_TIER["lifeos_people_search"].allowed
+    assert OAUTH_TOOL_TIER["lifeos_people_search"].read_only
+
+
+@pytest.mark.unit
+def test_the_description_example_is_one_the_search_runs_as_a_description():
+    """The route answers a description only when it asks who fits, so the example must."""
+    import importlib.util
+    import re
+
+    from api.services.person_indexer import asks_who_fits
+
+    spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    description = next(
+        c for c in module.CURATED_ENDPOINTS.values() if c["name"] == "lifeos_people_search"
+    )["description"]
+
+    example = re.search(r"'([^']+)'", description).group(1)
+
+    assert len(example.split()) >= 3
+    assert asks_who_fits(example)

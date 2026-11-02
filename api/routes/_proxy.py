@@ -8,7 +8,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import Callable, Optional
+from typing import Awaitable, Callable, Optional
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request
@@ -137,6 +137,7 @@ def make_backend_router(
     transform_body: Optional[Callable[[bytes], bytes]] = None,
     make_observer: Optional[Callable[[bytes], Optional[object]]] = None,
     pre_send: Optional[Callable[[bytes], list]] = None,
+    prepare_turn: Optional[Callable[[bytes], Awaitable[dict]]] = None,
     probe_reachability: bool = False,
 ):
     """Build a `status` + `ask/stream` reverse-proxy router for a text backend.
@@ -240,6 +241,13 @@ def make_backend_router(
     that returns `[]` for this particular request — e.g. every non-journal
     Hermes turn) takes the plain path, completely unchanged.
 
+    `prepare_turn` is the one awaited hook, for per-request work that must
+    stay off the event loop: `transform_body` and `make_observer` run inline
+    in this route. Awaited once with the same raw body, ahead of both, and the
+    dict it returns is passed to each of them as keyword arguments. It must
+    not raise: a body it can't use returns `{}`, leaving `transform_body` to
+    reject that body. Its absence (the Agent route's default) passes nothing.
+
     `probe_reachability` opts `/status` into a cached reachability
     probe (see `_probe_reachable`) rather than reporting configuration alone.
     Default False leaves a caller (the Agent backend) with `available`
@@ -290,8 +298,9 @@ def make_backend_router(
         # make_observer and pre_send share this same raw body
         # rather than a second/third request.body() read.
         raw_body = await request.body() if (transform_body or make_observer or pre_send) else None
-        body = transform_body(raw_body) if transform_body else request.stream()
-        observer = make_observer(raw_body) if make_observer else None
+        prepared = await prepare_turn(raw_body) if prepare_turn else {}
+        body = transform_body(raw_body, **prepared) if transform_body else request.stream()
+        observer = make_observer(raw_body, **prepared) if make_observer else None
         # pre_send may itself raise HTTPException (e.g. a journal capture
         # write failure) — like transform_body's, that happens before
         # client_factory() below, so the backend is never contacted.

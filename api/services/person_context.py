@@ -15,8 +15,8 @@ Resolution tiers:
 - ``uncertain``: several people fit, or the only fit is a one-word row.
 - ``none``: no live person fits.
 
-The chat stream reaches this through ``gather_person_context``, which runs
-without an LLM call, is bounded by a short time budget, and returns ``None`` on
+The native chat stream and the Hermes proxy reach this through
+``gather_person_context``, which runs without an LLM call, is bounded by a short time budget, and returns ``None`` on
 any failure so the turn proceeds without a person block.
 """
 from __future__ import annotations
@@ -26,7 +26,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Iterator, Optional
+from typing import Callable, Iterator, Optional
 
 from config.relationship_weights import (
     CLEARLY_CLOSER_MIN_STRENGTH_LEAD,
@@ -605,13 +605,24 @@ def build_person_context(question: str, history: Optional[list] = None) -> Optio
     return None
 
 
-async def gather_person_context(question: str, history: Optional[list] = None) -> Optional[PersonContext]:
-    """Build the person block off the event loop. Any failure or overrun yields None."""
+async def gather_person_context(
+    question: str,
+    history: Optional[list] = None,
+    load_history: Optional[Callable[[], list]] = None,
+) -> Optional[PersonContext]:
+    """
+    Build the person block off the event loop. Any failure or overrun yields None.
+
+    Args:
+        question: The message as written
+        history: Recent conversation messages, when the caller already holds them
+        load_history: Reads the history instead, inside the same thread and time budget
+    """
+    def build() -> Optional[PersonContext]:
+        return build_person_context(question, load_history() if load_history else history)
+
     try:
-        return await asyncio.wait_for(
-            asyncio.to_thread(build_person_context, question, history),
-            timeout=PERSON_CONTEXT_TIMEOUT_SECONDS,
-        )
+        return await asyncio.wait_for(asyncio.to_thread(build), timeout=PERSON_CONTEXT_TIMEOUT_SECONDS)
     except Exception as e:
         # The type only: the message can carry a name.
         logger.warning("Person context skipped: %s", type(e).__name__)
