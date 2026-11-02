@@ -423,7 +423,8 @@ def _plan_mentions(
         decision = _decide(name, context, resolver, full_names) if context else None
         if decision is not None and decision.entity is not None:
             source_type = interactions[0].source_type if interactions else "vault"
-            note_path = (mention_links[0].note_path if mention_links else interactions[0].note_path)
+            # An interaction holds the note's current path; a source entity may not.
+            note_path = interactions[0].note_path if interactions else mention_links[0].note_path
             plan.moves.append(Move(
                 from_id=person_id, to_id=decision.entity.id, mention=name, rel_path=rel_path,
                 note_path=note_path, source_type=source_type, decision=decision,

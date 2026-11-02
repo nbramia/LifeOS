@@ -210,6 +210,15 @@ class TestMentions:
 
         assert world.se(link.id).canonical_person_id == real.id
 
+    def test_related_notes_get_the_current_path_of_a_note(self, world):
+        bare, real, path = strong_setup(world)
+        world.mention(f"/Elsewhere/older/{world.vault.name}/Work/Sample/2024-06-15 standup.md", bare)
+        world.note_interaction(path, bare)
+
+        world.execute()
+
+        assert world.row(real).related_notes == [path]
+
     def test_note_no_longer_on_disk_unlinks(self, world):
         bare = world.person("Robin")
         world.person("Robin Gamma")
