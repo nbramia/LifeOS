@@ -656,6 +656,19 @@ class SourceEntityStore:
         finally:
             conn.close()
 
+    def has_confirmed_note_link(self, source_type: str, file_path: str, person_id: str) -> bool:
+        """Whether a human confirmed any mention of this person in this note."""
+        prefix = f"{file_path}:"
+        conn = self._get_connection()
+        try:
+            return conn.execute(
+                "SELECT 1 FROM source_entities WHERE source_type IN (?, ?) AND canonical_person_id = ? "
+                "AND link_status = ? AND substr(source_id, 1, ?) = ? LIMIT 1",
+                (*_type_pair(source_type), person_id, LINK_STATUS_CONFIRMED, len(prefix), prefix),
+            ).fetchone() is not None
+        finally:
+            conn.close()
+
     def get_for_person(
         self,
         canonical_person_id: str,
@@ -1111,6 +1124,10 @@ class SourceEntityStore:
         """
         Get unlinked entities eligible for re-matching.
 
+        Note mentions (vault, meeting) are never eligible: they resolve from
+        their note's context in the indexer, and a bare name re-matched on its
+        own can only guess.
+
         Below ``max_attempts``, behavior is unchanged: eligible once
         ``min_days_since_attempt`` has elapsed since the last attempt.
 
@@ -1173,6 +1190,7 @@ class SourceEntityStore:
                     SELECT * FROM source_entities
                     WHERE canonical_person_id IS NULL
                       AND source_type IN (?, ?)
+                      AND source_type NOT IN ('vault', 'meeting', 'granola')
                       AND (match_attempted_at IS NULL OR match_attempted_at < ?)
                     ORDER BY observed_at DESC
                 """, (*_type_pair(source_type), base_cutoff))
@@ -1180,6 +1198,7 @@ class SourceEntityStore:
                 cursor = conn.execute("""
                     SELECT * FROM source_entities
                     WHERE canonical_person_id IS NULL
+                      AND source_type NOT IN ('vault', 'meeting', 'granola')
                       AND (match_attempted_at IS NULL OR match_attempted_at < ?)
                     ORDER BY observed_at DESC
                 """, (base_cutoff,))
@@ -1291,12 +1310,14 @@ class SourceEntityStore:
                     SELECT observed_email FROM source_entities
                     WHERE canonical_person_id IS NULL
                       AND source_type IN (?, ?)
+                      AND source_type NOT IN ('vault', 'meeting', 'granola')
                       AND match_attempt_count >= ?
                 """, (*_type_pair(source_type), max_attempts))
             else:
                 cursor = conn.execute("""
                     SELECT observed_email FROM source_entities
                     WHERE canonical_person_id IS NULL
+                      AND source_type NOT IN ('vault', 'meeting', 'granola')
                       AND match_attempt_count >= ?
                 """, (max_attempts,))
 

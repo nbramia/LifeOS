@@ -66,6 +66,10 @@ The query classifier (`api/services/query_classifier.py`) determines whether a q
 
 ---
 
+### What Gets Indexed
+
+Every `.md` file in the vault except those under `_`-prefixed folders. Bulk content (`LIFEOS_VAULT_NO_PEOPLE_PATHS`, frontmatter `people: false` or `generated:`) is indexed for search like any other note and contributes no people data; see [Data & Sync](data-and-sync.md).
+
 ### Vault Tags
 
 `api/services/vault_tagger.py` derives per-note facets (document type, domain, primary and secondary topics, project, actionability, has-decision, sensitivity) into `data/vault_tags.db` via `api/services/vault_tag_store.py`, a database separate from `bm25_index.db`. Rows are keyed by file path and current while the content hash and the taxonomy `vocab_version` match; modification time never triggers re-tagging. Closed-set facets come from one Jev call per note, gated by `LIFEOS_JEV_VAULT_TAGGING`, a folder allowlist, and an on-box sensitivity rule; raw probabilities are stored so thresholds can change without re-inference. Tags are never written to frontmatter. See [configuration.md](../../guides/configuration.md) for the privacy contract.

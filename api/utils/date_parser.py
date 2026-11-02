@@ -266,7 +266,7 @@ def extract_note_date(path: Path, frontmatter: dict, body: str = "") -> str:
     for field in ['created', 'date', 'created_at', 'creation_date']:
         if field in frontmatter:
             value = frontmatter[field]
-            if isinstance(value, datetime):
+            if isinstance(value, date):  # YAML reads a bare date as date, not datetime
                 return value.strftime("%Y-%m-%d")
             if isinstance(value, str):
                 parsed = parse_note_date(value)

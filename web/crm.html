@@ -9876,7 +9876,7 @@
                          onclick="event.stopPropagation(); toggleMergeSelection('${person.id}')"></div>
                     <div class="person-avatar ${avatarImg ? 'has-photo' : 'no-photo'}" data-person-id="${person.id}" style="${getAvatarStyle(person.category)}">${getInitials(person.canonical_name)}${avatarImg}</div>
                     <div class="person-info">
-                        <div class="person-name">${escapeHtml(person.canonical_name)}</div>
+                        <div class="person-name">${escapeHtml(personLabel(person))}</div>
                         <div class="person-company">${escapeHtml(person.company || '')}</div>
                     </div>
                     <div class="dunbar-badge circle-${person.dunbar_circle ?? 7}" title="Dunbar Circle ${person.dunbar_circle ?? 7} (${getDunbarCircleSize(person.dunbar_circle ?? 7)})">${person.dunbar_circle ?? 7}</div>
@@ -10803,8 +10803,8 @@
                 document.getElementById('detailName').textContent = 'My Dashboard';
                 document.getElementById('detailCompany').textContent = 'Personal CRM Overview';
             } else {
-                document.getElementById('detailAvatar').textContent = getInitials(person.canonical_name);
-                document.getElementById('detailName').innerHTML = escapeHtml(person.canonical_name) + ' <span class="name-edit-btn" onclick="editDisplayName()" title="Edit name">✎</span>';
+                document.getElementById('detailAvatar').textContent = getInitials(personLabel(person));
+                document.getElementById('detailName').innerHTML = escapeHtml(personLabel(person)) + ' <span class="name-edit-btn" onclick="editDisplayName()" title="Edit name">✎</span>';
                 document.getElementById('detailCompany').textContent = [person.company, person.position].filter(Boolean).join(' · ');
                 // Load profile photo for detail avatar
                 loadDetailProfilePhoto(person.id);
@@ -20027,6 +20027,12 @@
         function getAvatarStyle(category) {
             const colors = avatarColors[category] || avatarColors.personal;
             return `background: ${colors.bg}; color: ${colors.text};`;
+        }
+
+        // A person named only after a phone or address shows the name that came with it.
+        function personLabel(person) {
+            const name = person.canonical_name || '';
+            return /^\+?\d|@/.test(name) && person.display_name ? person.display_name : name;
         }
 
         function escapeHtml(text) {

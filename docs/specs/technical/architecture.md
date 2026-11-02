@@ -90,6 +90,7 @@ Per-backend capabilities (personas, handoff, history ownership, usage capture) a
 - `person_entity.py` - PersonEntity model and store
 - `people_aggregator.py` - Multi-source aggregation
 - `entity_resolver.py` - Entity resolution logic
+- `mention_resolver.py` - Reads first-name mentions in notes in the note's context
 - `person_facts.py` - Fact extraction and storage
 - `person_indexer.py` - Person search indexing
 - `person_stats.py` - Statistics computation

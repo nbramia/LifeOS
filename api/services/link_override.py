@@ -11,7 +11,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 from api.services.meeting_source import normalize_source_type
 
@@ -58,6 +58,30 @@ class LinkOverride:
                 return False
 
         return True
+
+
+def most_specific_override(
+    overrides: Iterable[LinkOverride],
+    name: str,
+    source_type: str = None,
+    context_path: str = None,
+) -> Optional[LinkOverride]:
+    """The matching override naming the most of source type and context, if any."""
+    matches = []
+    for override in overrides:
+        if override.matches(name, source_type, context_path):
+            specificity = 0
+            if override.source_type:
+                specificity += 1
+            if override.context_pattern:
+                specificity += 1
+            matches.append((specificity, override))
+
+    if not matches:
+        return None
+
+    matches.sort(key=lambda x: -x[0])
+    return matches[0][1]
 
 
 class LinkOverrideStore:
@@ -164,25 +188,7 @@ class LinkOverrideStore:
         Returns:
             Most specific matching override, or None
         """
-        overrides = self.get_all()
-
-        # Score each override by specificity
-        matches = []
-        for override in overrides:
-            if override.matches(name, source_type, context_path):
-                specificity = 0
-                if override.source_type:
-                    specificity += 1
-                if override.context_pattern:
-                    specificity += 1
-                matches.append((specificity, override))
-
-        if not matches:
-            return None
-
-        # Return most specific
-        matches.sort(key=lambda x: -x[0])
-        return matches[0][1]
+        return most_specific_override(self.get_all(), name, source_type, context_path)
 
     def delete(self, override_id: str) -> bool:
         """Delete a link override rule."""

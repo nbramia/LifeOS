@@ -1163,6 +1163,63 @@ class TestEquivalentBehavior:
         assert not any(buckets.values())
 
 
+class TestMentionHandling:
+    """Note mentions stay out of the evidence that only real contact may supply."""
+
+    @pytest.mark.parametrize("source_type", ["vault", "meeting", "granola"])
+    def test_a_note_is_not_contact_evidence(self, tmp_path, vault, source_type):
+        from datetime import date
+
+        from api.services.mention_resolver import MentionResolver
+
+        day = "2026-03-04T10:00:00+00:00"
+        db = _interactions_db(tmp_path, [("n1", "p1", source_type, "/synthetic/n.md")])
+        conn = sqlite3.connect(db)
+        conn.execute("UPDATE interactions SET timestamp = ?", (day,))
+        conn.commit()
+        conn.close()
+        resolver = MentionResolver(
+            [], crm_db=_crm_db(tmp_path), interaction_db=db, vault_root=vault
+        )
+        assert resolver._closest_contact(["p1"], date(2026, 3, 4), 7) == {}
+
+    @pytest.mark.parametrize("name", ["meeting", "granola"])
+    def test_confirmed_note_link_is_found_under_either_label(self, tmp_path, name):
+        db = _crm_db(
+            tmp_path,
+            [
+                ("s1", "p1", "granola", "/synthetic/a.md:Alex", "confirmed"),
+                ("s2", "p2", "meeting", "/synthetic/b.md:Blair", "confirmed"),
+            ],
+        )
+        with patch.object(ms, "_rename_rows", side_effect=RuntimeError("boom")):
+            store = SourceEntityStore(db_path=db)
+        assert store.has_confirmed_note_link(name, "/synthetic/a.md", "p1") is True
+        assert store.has_confirmed_note_link(name, "/synthetic/b.md", "p2") is True
+
+    def test_unlinked_meeting_mention_keeps_type_and_provider(self, tmp_path):
+        from api.services.indexer import IndexerService
+
+        vault_root = _mkdir(tmp_path / "Vault")
+        note = vault_root / "Work" / "w.md"
+        _write_note(note, "wispr_id: w-1")
+        entities = SourceEntityStore(db_path=str(tmp_path / "c.db"))
+        indexer = IndexerService(
+            vault_path=str(vault_root),
+            db_path=str(tmp_path / "chroma"),
+            entity_resolver=MagicMock(),
+            interaction_store=MagicMock(),
+            source_entity_store=entities,
+        )
+        person = indexer._record_mention(
+            note, "Alex", None, 0.0, None, datetime(2026, 3, 4, tzinfo=timezone.utc),
+            True, "wispr", MagicMock(), MagicMock(), entities, set(),
+        )
+        assert person is None
+        entity = entities.get_by_source("meeting", f"{note.resolve()}:Alex")
+        assert (entity.source_type, entity.provider) == ("meeting", "wispr")
+
+
 class TestWebUi:
     """The pages read `meeting`; a leftover `granola` key would silently undercount."""
 
