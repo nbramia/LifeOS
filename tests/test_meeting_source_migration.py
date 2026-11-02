@@ -770,6 +770,16 @@ class TestCommandLine:
         assert not (tmp_path / "no.db").exists()
 
 
+def _offline_indexer(tmp_path, vault_root, **stores):
+    """A real IndexerService with its Chroma store stubbed, so no server is contacted."""
+    from api.services.indexer import IndexerService
+
+    with patch("api.services.indexer.VectorStore", MagicMock()):
+        return IndexerService(
+            vault_path=str(vault_root), db_path=str(tmp_path / "chroma"), **stores
+        )
+
+
 def _person_store_stub():
     stub = MagicMock()
     stub.get_canonical_id.side_effect = lambda person_id: person_id
@@ -962,8 +972,6 @@ class TestIndexing:
 
     @pytest.fixture
     def indexed(self, tmp_path):
-        from api.services.indexer import IndexerService
-
         vault_root = tmp_path / "Vault"
         vault_root.mkdir()
         interactions = InteractionStore(db_path=str(tmp_path / "i.db"), strict=False)
@@ -971,9 +979,9 @@ class TestIndexing:
         resolver = MagicMock()
         person = PersonEntity(id="p1", canonical_name="Alex Example", display_name="Alex Example")
         resolver.resolve.return_value = MagicMock(entity=person, confidence=1.0, match_type="exact")
-        indexer = IndexerService(
-            vault_path=str(vault_root),
-            db_path=str(tmp_path / "chroma"),
+        indexer = _offline_indexer(
+            tmp_path,
+            vault_root,
             entity_resolver=resolver,
             interaction_store=interactions,
             source_entity_store=entities,
@@ -1035,17 +1043,14 @@ class TestIndexFileClassification:
     def test_index_file_passes_classification_to_people_sync(
         self, tmp_path, relative, frontmatter, is_meeting, provider
     ):
-        from api.services.indexer import IndexerService
-
         vault_root = tmp_path / "Vault"
-        indexer = IndexerService(
-            vault_path=str(_mkdir(vault_root)),
-            db_path=str(tmp_path / "chroma"),
+        indexer = _offline_indexer(
+            tmp_path,
+            _mkdir(vault_root),
             entity_resolver=MagicMock(),
             interaction_store=MagicMock(),
             source_entity_store=MagicMock(),
         )
-        indexer.vector_store = MagicMock()
         note = vault_root / relative
         _write_note(note, f"{frontmatter}\npeople: [Alex Example]")
         with patch.object(indexer, "_sync_people_to_v2", return_value=set()) as sync:
@@ -1198,15 +1203,13 @@ class TestMentionHandling:
         assert store.has_confirmed_note_link(name, "/synthetic/b.md", "p2") is True
 
     def test_unlinked_meeting_mention_keeps_type_and_provider(self, tmp_path):
-        from api.services.indexer import IndexerService
-
         vault_root = _mkdir(tmp_path / "Vault")
         note = vault_root / "Work" / "w.md"
         _write_note(note, "wispr_id: w-1")
         entities = SourceEntityStore(db_path=str(tmp_path / "c.db"))
-        indexer = IndexerService(
-            vault_path=str(vault_root),
-            db_path=str(tmp_path / "chroma"),
+        indexer = _offline_indexer(
+            tmp_path,
+            vault_root,
             entity_resolver=MagicMock(),
             interaction_store=MagicMock(),
             source_entity_store=entities,
