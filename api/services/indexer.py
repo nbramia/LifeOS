@@ -94,6 +94,9 @@ def _resolve_undated_note_date(path) -> datetime:
 # Reserved key in the index state: file path -> tag tuple used at index time.
 TAG_STATE_KEY = "__tag_phrase_keys__"
 
+# What a tag lookup gives when the store failed, as opposed to having no row.
+_TAG_LOOKUP_FAILED = object()
+
 # How much of a note to read when ordering files for a time budget: enough for
 # frontmatter. A note whose frontmatter runs longer sorts as ordinary.
 BUDGET_ORDER_HEAD_CHARS = 8192
@@ -164,29 +167,34 @@ class IndexerService:
             self.bm25_index = BM25Index()
 
     def _tag_for(self, path: Path):
-        """The file's TagRecord, or None when the store or the row is missing.
+        """The file's TagRecord, or None when the store or the row is missing."""
+        tag = self._lookup_tag(path)
+        return None if tag is _TAG_LOOKUP_FAILED else tag
+
+    def _lookup_tag(self, path: Path):
+        """The file's TagRecord, None if it has no row, or ``_TAG_LOOKUP_FAILED``.
 
         Rows are keyed by vault-relative POSIX path, the same key
         ``scripts/sync_vault_tag.py`` writes.
         """
         if self._tag_store is None:
             if self._tag_store_failed:
-                return None
+                return _TAG_LOOKUP_FAILED
             try:
                 from api.services.vault_tag_store import VaultTagStore
                 self._tag_store = VaultTagStore()
             except Exception as e:
                 logger.warning(f"Tag store unavailable, indexing without tag phrases: {e}")
                 self._tag_store_failed = True
-                return None
+                return _TAG_LOOKUP_FAILED
         try:
             key = Path(path).relative_to(self.vault_path).as_posix()
             return self._tag_store.get(key)
         except Exception as e:
             if not self._tag_lookup_failed:
-                logger.warning(f"Tag lookup failed, treating notes as untagged: {e}")
+                logger.warning(f"Tag lookup failed, leaving tag state as recorded: {e}")
                 self._tag_lookup_failed = True
-            return None
+            return _TAG_LOOKUP_FAILED
 
     def _load_index_state(self) -> dict:
         """Load the index state (file paths -> last indexed mtime)."""
@@ -275,9 +283,14 @@ class IndexerService:
             prev_mtime = index_state.get(file_path)
             tags_changed = False
             if compare_tags:
-                key = tag_phrase_key(self._tag_for(Path(file_path)))
+                tag = self._lookup_tag(Path(file_path))
+                key = None if tag is _TAG_LOOKUP_FAILED else tag_phrase_key(tag)
                 current_tag_key[file_path] = list(key) if key else None
-                tags_changed = current_tag_key[file_path] != tag_keys.get(file_path)
+                # A failed lookup says nothing about the tags, so it can't make a
+                # note look changed. A note indexed for another reason meanwhile
+                # has no phrase in its chunks and records no key, so the next
+                # good lookup indexes it once more to restore the phrase.
+                tags_changed = tag is not _TAG_LOOKUP_FAILED and current_tag_key[file_path] != tag_keys.get(file_path)
             if force:
                 # In force mode, reindex if not yet indexed in this run
                 # (allows resuming a force reindex after crash)
@@ -315,8 +328,7 @@ class IndexerService:
         ends normally. A file counts as done only when the saved state says so,
         so whatever it didn't reach, including removals of deleted files, the
         next run picks up. Stats still refresh for the people it touched, since
-        their files won't come round again. Failed-summary retries wait for a
-        run that finishes. ``last_run`` reports what was left.
+        their files won't come round again. ``last_run`` reports what was left.
 
         Args:
             force: If True, reindex all files regardless of modification time
@@ -326,10 +338,9 @@ class IndexerService:
                 for a later run.
             newest_first: If True, index changed files by descending modification
                 time. Otherwise they follow vault walk order.
-            light_pass: If True, run as a pass that a later full run completes:
-                see ``index_file``. Summaries are not generated or retried here,
-                and a file that could not be read stays unrecorded so a later
-                run retries it.
+            light_pass: If True, run as a pass a later run completes: see
+                ``index_file``. A file that could not be read stays unrecorded so
+                a later run retries it.
             max_deletions: Remove at most this many deleted files from the index,
                 leaving the rest for a later run.
 
@@ -451,13 +462,6 @@ class IndexerService:
         if stopped_early and deadline is not None:
             logger.info(f"Time budget reached: {files_remaining} files remain for the next run")
 
-        # Retry failed summaries with simpler prompt and longer timeout
-        if not skip_summaries and not light_pass and not stopped_early:
-            retry_count = self._retry_failed_summaries()
-            if retry_count > 0:
-                logger.info(f"Retried {retry_count} failed summaries")
-            gc.collect()  # Clean up after retry phase
-
         # Batch refresh all affected person stats ONCE at the end
         if all_affected_person_ids:
             from api.services.person_stats import refresh_person_stats
@@ -481,8 +485,8 @@ class IndexerService:
             skip_stats_refresh: If True, return affected person IDs instead of refreshing.
                                Used by index_all() to batch refresh at the end.
             skip_summaries: If True, skip LLM summary generation for faster indexing.
-            light_pass: If True, queue the note for the next full run's summary
-                retry instead of generating a summary, and leave the task index
+            light_pass: If True, queue the note for the ``vault_summaries`` sync
+                source instead of generating a summary, and leave the task index
                 to the task file watcher in the API server.
 
         Returns:
@@ -584,6 +588,16 @@ class IndexerService:
         # Add contextual prefixes to chunks (P9.1 - boosts retrieval accuracy)
         chunks = add_context_to_chunks(chunks, path, metadata, tags=self._tag_for(path))
 
+        # Before the old summary leaves BM25, so the queue drain can't leave a
+        # summary of the old text behind.
+        if light_pass:
+            # Not caught: a note that was not queued must not be recorded as
+            # indexed, or nothing would ever summarize it.
+            from api.services.summarizer import queue_summary
+            queue_summary(file_path, path.name, body)
+        else:
+            self._invalidate_queued_summary(file_path)
+
         # Update in vector store (handles deletion of old chunks)
         self.vector_store.update_document(chunks, metadata)
 
@@ -605,12 +619,7 @@ class IndexerService:
 
         # Generate document summary for discovery queries (P9.4)
         # Uses tiered summarization: SKIP for archives, HIGH for important content
-        if light_pass:
-            # Not caught: a note that was not queued must not be recorded as
-            # indexed, or nothing would ever summarize it.
-            from api.services.summarizer import queue_summary
-            queue_summary(file_path, path.name, body)
-        elif not skip_summaries:
+        if not skip_summaries and not light_pass:
             try:
                 from api.services.summarizer import (
                     generate_summary, get_summary_tier, SummaryTier, add_summary_failure
@@ -656,6 +665,8 @@ class IndexerService:
         Args:
             file_path: Path to the deleted file
         """
+        self._invalidate_queued_summary(file_path)
+
         # Use os.path.realpath to resolve symlinks (e.g., /var -> /private/var on macOS)
         # This works even for non-existent files
         real_path = os.path.realpath(file_path)
@@ -665,103 +676,15 @@ class IndexerService:
 
         logger.debug(f"Deleted {file_path} from index (resolved: {real_path})")
 
-    def _retry_failed_summaries(self) -> int:
-        """
-        Work through the summary queue: first-pass failures and queued notes.
+    @staticmethod
+    def _invalidate_queued_summary(file_path: str) -> None:
+        """See ``summarizer.invalidate_queued_summary``. Never stops indexing."""
+        from api.services.summarizer import invalidate_queued_summary
 
-        Uses a simpler prompt and longer timeout for better success rate. Notes
-        go newest first, so today's notes get summaries ahead of an old backlog.
-        The work is bounded by ``settings.summary_retry_budget_seconds``, and
-        entries not reached stay queued for the next run. While the LLM is
-        unreachable the whole queue stays put, because a retry would store a
-        fallback summary built from the note's first line and drop the entry.
-
-        Returns:
-            Number of files successfully retried
-        """
-        from api.services.summarizer import (
-            is_summarizer_llm_available, load_summary_failures, remove_summary_failures, retry_summary
-        )
-        from config.settings import settings
-
-        failures = load_summary_failures()
-        failed_files = failures.get("files", [])
-
-        if not failed_files:
-            return 0
-
-        if not is_summarizer_llm_available():
-            logger.warning(f"Summarizer LLM unreachable; keeping {len(failed_files)} queued summaries for the next run")
-            return 0
-
-        logger.info(f"Retrying {len(failed_files)} failed summaries with simpler prompt...")
-
-        def _recency(entry: dict) -> float:
-            try:
-                return os.path.getmtime(entry["file_path"])
-            except OSError:
-                # Gone: taken first, since dropping the entry costs nothing.
-                return float("inf")
-
-        failed_files = sorted(failed_files, key=_recency, reverse=True)
-        deadline = time.monotonic() + settings.summary_retry_budget_seconds
-        success_count = 0
-        finished: set[str] = set()
-        for failure in failed_files:
-            if time.monotonic() >= deadline:
-                logger.warning(
-                    f"Summary retry budget of {settings.summary_retry_budget_seconds}s used; "
-                    f"{len(failed_files) - len(finished)} summaries stay queued"
-                )
-                break
-
-            file_path = failure["file_path"]
-            file_name = failure["file_name"]
-
-            try:
-                path = Path(file_path)
-                if path.exists():
-                    content = path.read_text(encoding="utf-8")
-                    # Extract body (skip frontmatter)
-                    from api.services.chunker import extract_frontmatter
-                    frontmatter, body = extract_frontmatter(content)
-
-                    summary = retry_summary(body, file_name)
-                    if summary:
-                        summary_id = f"{path.resolve()}::summary"
-                        summary_content = f"Document summary for {file_name}: {summary}"
-
-                        # Add to BM25 index
-                        self.bm25_index.add_document(
-                            doc_id=summary_id,
-                            content=summary_content,
-                            file_name=file_name,
-                            modified_date=self._extract_note_date(path, frontmatter, body)
-                        )
-                        success_count += 1
-
-            except Exception as e:
-                logger.warning(f"Retry failed for {file_path}: {e}")
-
-            finished.add(file_path)
-            # Saved as it goes, so a run killed here does not repeat the work.
-            if len(finished) % 50 == 0:
-                remove_summary_failures(finished)
-
-        remove_summary_failures(finished)
-        logger.info(f"Summary retry complete: {success_count}/{len(finished)} succeeded")
-
-        return success_count
-
-    def drain_summary_queue(self) -> int:
-        """Work through the summary queue on its own, without indexing anything.
-
-        For a caller that knows the LLM was down during the reindex and is back.
-
-        Returns:
-            Number of summaries generated
-        """
-        return self._retry_failed_summaries()
+        try:
+            invalidate_queued_summary(file_path)
+        except Exception as e:
+            logger.warning(f"Could not update the summary queue for {file_path}: {e}")
 
     def _extract_note_date(self, path: Path, frontmatter: dict, body: str = "") -> str:
         """Extract the note date; see `api.utils.date_parser.extract_note_date`."""

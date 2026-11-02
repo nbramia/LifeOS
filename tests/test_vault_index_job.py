@@ -154,14 +154,13 @@ class TestCapAndOrder:
         stats_refresh.assert_called_once_with(["person-a"])
 
     def test_no_arguments_keep_walk_order_and_full_behaviour(self, indexer, vault, monkeypatch):
-        """Walk order, no cap, summaries generated rather than queued, retry run."""
+        """Walk order, no cap, summaries generated rather than queued."""
         from api.services import summarizer
 
         for i, name in enumerate(["c.md", "a.md", "d.md", "b.md"]):
             _write_note(vault, name, 4000 - i)
         generate = MagicMock(return_value=("A synthetic generated summary of this note.", True))
         monkeypatch.setattr(summarizer, "generate_summary", generate)
-        monkeypatch.setattr(indexer, "_retry_failed_summaries", MagicMock(return_value=0))
         walk_order = [str(f) for f in vault.rglob("*.md")]
         seen = []
         real_index_file = indexer.index_file
@@ -176,7 +175,6 @@ class TestCapAndOrder:
 
         assert seen == walk_order
         assert generate.call_count == 4
-        indexer._retry_failed_summaries.assert_called_once()
 
 
 class TestStateAndFailures:
@@ -263,7 +261,6 @@ class TestSummaryQueue:
         retry = MagicMock()
         monkeypatch.setattr(summarizer, "generate_summary", generate)
         monkeypatch.setattr(summarizer, "retry_summary", retry)
-        monkeypatch.setattr(summarizer, "is_summarizer_llm_available", lambda: True)
 
         indexer.index_all(light_pass=True)
 
@@ -295,79 +292,6 @@ class TestSummaryQueue:
 
         get_manager.assert_not_called()
 
-    def test_nightly_run_generates_the_queued_summary(self, indexer, vault, summary_queue, monkeypatch):
-        """Job indexes and queues; the following no-argument run finds nothing
-        changed and still produces the summary."""
-        from api.services import summarizer
-
-        note = _write_note(vault, "note.md", 1000)
-        indexer.index_all(light_pass=True)
-        assert _queued(summary_queue) == [str(note)]
-
-        generate = MagicMock(return_value=("A synthetic quokka summary of this note.", True))
-        monkeypatch.setattr(summarizer, "generate_summary", generate)
-        monkeypatch.setattr(summarizer, "is_summarizer_llm_available", lambda: True)
-
-        assert indexer.index_all() == 0
-
-        generate.assert_called_once()
-        assert any(hit["doc_id"].endswith("::summary") for hit in indexer.bm25_index.search("quokka"))
-        assert _queued(summary_queue) == []
-
-    def test_retry_stops_at_its_budget_and_keeps_the_rest(self, indexer, vault, summary_queue, monkeypatch):
-        from api.services import summarizer
-        from config.settings import settings
-
-        # Queued oldest first, so only newest-first order reaches the last two.
-        notes = [_write_note(vault, f"{i}.md", 1000 + i) for i in range(5)]
-        for note in notes:
-            summarizer.add_summary_failure(str(note), note.name)
-        monkeypatch.setattr(summarizer, "is_summarizer_llm_available", lambda: True)
-        monkeypatch.setattr(settings, "summary_retry_budget_seconds", 100)
-        clock = iter(range(0, 10_000, 40))
-        monkeypatch.setattr("api.services.indexer.time.monotonic", lambda: next(clock))
-        retry = MagicMock(return_value="A synthetic summary of this note.")
-        monkeypatch.setattr(summarizer, "retry_summary", retry)
-
-        assert indexer._retry_failed_summaries() == 2
-
-        assert _queued(summary_queue) == [str(n) for n in notes[:3]]
-
-    def test_unreachable_llm_keeps_the_queue_without_fallback_summaries(
-        self, indexer, vault, summary_queue, monkeypatch
-    ):
-        from api.services import summarizer
-
-        note = _write_note(vault, "note.md", 1000)
-        summarizer.add_summary_failure(str(note), note.name)
-        monkeypatch.setattr(summarizer, "is_summarizer_llm_available", lambda: False)
-        retry = MagicMock()
-        monkeypatch.setattr(summarizer, "retry_summary", retry)
-
-        assert indexer._retry_failed_summaries() == 0
-
-        retry.assert_not_called()
-        assert _queued(summary_queue) == [str(note)]
-
-    def test_entry_added_during_retry_survives(self, indexer, vault, summary_queue, monkeypatch):
-        from api.services import summarizer
-
-        first = _write_note(vault, "first.md", 1000)
-        late = _write_note(vault, "late.md", 1000)
-        summarizer.add_summary_failure(str(first), first.name)
-        monkeypatch.setattr(summarizer, "is_summarizer_llm_available", lambda: True)
-
-        def _retry(body, file_name):
-            summarizer.add_summary_failure(str(late), late.name)
-            return "A synthetic summary of this note."
-
-        monkeypatch.setattr(summarizer, "retry_summary", _retry)
-
-        indexer._retry_failed_summaries()
-
-        assert _queued(summary_queue) == [str(late)]
-
-
 class TestWithMainIndexerFeatures:
     def test_underscore_folder_is_not_listed_and_drops_out_through_deletions(self, indexer, vault, vector_store):
         note = _write_note(vault, "Work/note.md", 1000)
@@ -394,7 +318,6 @@ class TestWithMainIndexerFeatures:
         monkeypatch.setattr(indexer, "_ordered_for_budget", ordered)
         seen = []
         monkeypatch.setattr(indexer, "index_file", lambda path, **kwargs: seen.append(Path(path).name) or set())
-        monkeypatch.setattr(indexer, "_retry_failed_summaries", MagicMock(return_value=0))
 
         indexer.index_all(time_budget_seconds=60, max_files=2, newest_first=True)
 
@@ -426,7 +349,7 @@ class TestSummaryQueueAcrossProcesses:
             "sys.stdin.readline()\n"
             "if sys.argv[2] == 'remove':\n"
             "    for i in range(40):\n"
-            "        summarizer.remove_summary_failures({f'/synthetic/doomed-{i}.md'})\n"
+            "        assert summarizer.finish_queued_summary(f'/synthetic/doomed-{i}.md', 0)\n"
             "else:\n"
             "    for i in range(40):\n"
             "        summarizer.add_summary_failure(f'/synthetic/{sys.argv[2]}-{i}.md', 'note.md')\n"
@@ -915,64 +838,424 @@ class TestNightlyWaits:
         assert vault_index_lock.try_flock(lock_path) is not None
 
 
-class TestDrainSummaries:
-    @pytest.fixture
-    def drain(self, vault, summary_queue, vector_store, nightly, monkeypatch):
-        from api.services import summarizer
-        from config.settings import settings
+def _summary_docs(indexer, word: str) -> list:
+    return [hit for hit in indexer.bm25_index.search(word) if hit["doc_id"].endswith("::summary")]
 
-        script, _reindex = nightly
-        monkeypatch.setattr(settings, "vault_path", vault)
-        monkeypatch.setattr(script.time, "sleep", lambda _seconds: None)
+
+class TestDrain:
+    """The queue drain, against a real BM25 index and queue file."""
+
+    @staticmethod
+    def _answers(monkeypatch, *answers):
+        """Stub the LLM with one (summary, success) per call, or a callable."""
+        from api.services import summarizer
+
+        calls = iter(answers)
+
+        def _generate(content, file_name, **kwargs):
+            answer = next(calls)
+            return answer() if callable(answer) else answer
+
+        monkeypatch.setattr(summarizer, "generate_summary", _generate)
+
+    @staticmethod
+    def _drain(indexer):
+        from api.services.summarizer import drain_summary_queue
+
+        return drain_summary_queue(indexer.bm25_index)
+
+    def test_job_then_drain_produces_the_summary(self, indexer, vault, summary_queue, monkeypatch):
         note = _write_note(vault, "note.md", 1000)
-        summarizer.add_summary_failure(str(note), note.name)
-        monkeypatch.setattr(summarizer, "retry_summary", MagicMock(return_value="A synthetic summary of this note."))
-        return script
+        indexer.index_all(light_pass=True)
+        assert _queued(summary_queue) == [str(note)]
+        self._answers(monkeypatch, ("A synthetic quokka summary of this note.", True))
 
-    def test_waits_for_a_restarted_llm_then_drains(self, drain, summary_queue, monkeypatch):
+        stats = self._drain(indexer)
+
+        assert stats["generated"] == 1
+        assert _summary_docs(indexer, "quokka")
+        assert _queued(summary_queue) == []
+
+    def test_index_all_leaves_the_queue_to_the_drain(self, indexer, vault, summary_queue, monkeypatch):
         from api.services import summarizer
 
-        answers = iter([False, False, True, True])
-        monkeypatch.setattr(summarizer, "is_summarizer_llm_available", lambda: next(answers))
+        note = _write_note(vault, "note.md", 1000)
+        indexer.index_all(light_pass=True)
+        retry = MagicMock()
+        monkeypatch.setattr(summarizer, "retry_summary", retry)
 
-        assert drain.main(["--drain-summaries"]) == 0
+        assert indexer.index_all() == 0
+
+        retry.assert_not_called()
+        assert _queued(summary_queue) == [str(note)]
+
+    def test_llm_stall_keeps_entries_and_stops_the_pass(self, indexer, vault, summary_queue, monkeypatch):
+        """The first answers, then it stalls: nothing after that gets a fallback."""
+        from api.services import summarizer
+
+        notes = [_write_note(vault, f"n{i}.md", 2000 - i) for i in range(6)]
+        for note in notes:
+            summarizer.add_summary_failure(str(note), note.name)
+        failed = (None, False)
+        self._answers(monkeypatch, ("A synthetic walrus summary of this note.", True), failed, failed, failed)
+
+        stats = self._drain(indexer)
+
+        assert stats == {"generated": 1, "fallback": 0, "failed": 3, "changed_during_pass": 0, "remaining": 5}
+        assert _queued(summary_queue) == [str(n) for n in notes[1:]]
+        docs = [hit for hit in indexer.bm25_index.search("Document") if hit["doc_id"].endswith("::summary")]
+        assert len(docs) == 1
+        assert "walrus" in docs[0]["content"]
+
+    def test_a_good_answer_resets_the_failure_streak(self, indexer, vault, summary_queue, monkeypatch):
+        from api.services import summarizer
+
+        notes = [_write_note(vault, f"n{i}.md", 2000 - i) for i in range(5)]
+        for note in notes:
+            summarizer.add_summary_failure(str(note), note.name)
+        failed = (None, False)
+        good = ("A synthetic summary of this note.", True)
+        self._answers(monkeypatch, failed, failed, good, failed, good)
+
+        stats = self._drain(indexer)
+
+        assert stats["generated"] == 2
+        assert stats["failed"] == 3
+
+    def test_too_short_note_keeps_its_fallback(self, indexer, vault, summary_queue, monkeypatch):
+        """Too short is an answer, not a failure: the note leaves the queue."""
+        from api.services import summarizer
+
+        note = _write_note(vault, "short.md", 1000, body="A short synthetic line of words.")
+        summarizer.add_summary_failure(str(note), note.name)
+        self._answers(monkeypatch, (None, True))
+
+        stats = self._drain(indexer)
+
+        assert stats["generated"] == 1
+        assert _queued(summary_queue) == []
+        assert _summary_docs(indexer, "short")
+
+    def test_note_that_keeps_failing_gets_a_fallback_eventually(self, indexer, vault, summary_queue, monkeypatch):
+        from api.services import summarizer
+
+        note = _write_note(vault, "stubborn.md", 1000)
+        summarizer.add_summary_failure(str(note), note.name)
+        failed = (None, False)
+        self._answers(monkeypatch, failed, failed, failed)
+
+        for _ in range(summarizer.MAX_SUMMARY_ATTEMPTS - 1):
+            assert self._drain(indexer)["fallback"] == 0
+            assert _queued(summary_queue) == [str(note)]
+        assert self._drain(indexer)["fallback"] == 1
 
         assert _queued(summary_queue) == []
-        summarizer.retry_summary.assert_called_once()
+        assert _summary_docs(indexer, "stubborn")
 
-    def test_llm_that_never_returns_leaves_the_queue(self, drain, summary_queue, monkeypatch):
+    def test_notes_that_keep_failing_do_not_block_the_rest(self, indexer, vault, summary_queue, monkeypatch):
         from api.services import summarizer
 
-        monkeypatch.setattr(summarizer, "is_summarizer_llm_available", lambda: False)
-        monkeypatch.setattr(drain, "LLM_READY_WAIT_SECONDS", 0)
+        stubborn = [_write_note(vault, f"s{i}.md", 9000 + i) for i in range(3)]
+        older = _write_note(vault, "older.md", 1000)
+        for note in [*stubborn, older]:
+            summarizer.add_summary_failure(str(note), note.name)
+        failed = (None, False)
+        otter = ("A synthetic otter summary of this note.", True)
+        self._answers(monkeypatch, failed, failed, failed, otter, failed, failed, failed)
 
-        assert drain.main(["--drain-summaries"]) == 0
+        self._drain(indexer)
+        assert not _summary_docs(indexer, "otter")
+        self._drain(indexer)
 
-        assert len(_queued(summary_queue)) == 1
-        summarizer.retry_summary.assert_not_called()
+        assert [hit["doc_id"] for hit in _summary_docs(indexer, "otter")] == [f"{older.resolve()}::summary"]
 
-    def test_takes_the_vault_index_lock(self, drain, summary_queue, monkeypatch):
-        from api.services import summarizer, vault_index_lock
+    def test_budget_takes_newest_first_and_keeps_the_rest(self, indexer, vault, summary_queue, monkeypatch):
+        from api.services import summarizer
         from config.settings import settings
 
-        monkeypatch.setattr(settings, "vault_index_lock_wait_seconds", 0)
+        # Queued oldest first, so only newest-first order reaches the last two.
+        notes = [_write_note(vault, f"{i}.md", 1000 + i) for i in range(5)]
+        for note in notes:
+            summarizer.add_summary_failure(str(note), note.name)
+        monkeypatch.setattr(settings, "summary_retry_budget_seconds", 100)
+        clock = iter(range(0, 10_000, 40))
+        monkeypatch.setattr("api.services.summarizer.time.monotonic", lambda: next(clock))
+        good = ("A synthetic summary of this note.", True)
+        self._answers(monkeypatch, good, good)
+
+        assert self._drain(indexer)["generated"] == 2
+
+        assert _queued(summary_queue) == [str(n) for n in notes[:3]]
+
+    def test_note_rewritten_during_its_summary_stays_correct(self, indexer, vault, summary_queue, monkeypatch):
+        """The job reindexes the note while the LLM works on its old text. The old
+        summary is refused, the entry stays, and the next pass gets the new text."""
+        note = _write_note(vault, "note.md", 1000, body=LONG_BODY + " oldtextmarker")
+        indexer.index_all(light_pass=True)
+
+        def _rewrite_midway():
+            _write_note(vault, "note.md", 2000, body=LONG_BODY + " newtextmarker")
+            assert indexer.index_all(light_pass=True) == 1
+            return "A synthetic staleanswer summary of the old text.", True
+
+        self._answers(monkeypatch, _rewrite_midway, ("A synthetic freshanswer summary of the new text.", True))
+
+        first = self._drain(indexer)
+
+        assert first["changed_during_pass"] == 1
+        assert not _summary_docs(indexer, "staleanswer")
+        assert _queued(summary_queue) == [str(note)]
+
+        self._drain(indexer)
+
+        assert _summary_docs(indexer, "freshanswer")
+        assert not _summary_docs(indexer, "staleanswer")
+        assert _queued(summary_queue) == []
+
+    def test_full_reindex_during_a_summary_refuses_it_too(self, indexer, vault, summary_queue, monkeypatch):
+        from api.services import summarizer
+
+        note = _write_note(vault, "note.md", 1000)
+        summarizer.add_summary_failure(str(note), note.name)
+
+        def _reindex_midway():
+            indexer.index_file(str(note), skip_stats_refresh=True, skip_summaries=True)
+            return "A synthetic staleanswer summary of the old text.", True
+
+        self._answers(monkeypatch, _reindex_midway)
+
+        assert self._drain(indexer)["changed_during_pass"] == 1
+        assert not _summary_docs(indexer, "staleanswer")
+
+    def test_note_removed_during_a_summary_leaves_none_behind(self, indexer, vault, summary_queue, monkeypatch):
+        from api.services import summarizer
+
+        note = _write_note(vault, "note.md", 1000)
+        summarizer.add_summary_failure(str(note), note.name)
+
+        def _remove_midway():
+            note.unlink()
+            indexer.delete_file(str(note))
+            return "A synthetic staleanswer summary of the old text.", True
+
+        self._answers(monkeypatch, _remove_midway)
+
+        self._drain(indexer)
+
+        assert not _summary_docs(indexer, "staleanswer")
+
+    def test_queue_entry_is_updated_before_the_old_summary_is_deleted(self, indexer, vault, summary_queue, monkeypatch):
+        """That order closes the gap in which a finished drain could leave a summary
+        of the old text: the delete that follows removes it."""
+        note = _write_note(vault, "note.md", 1000)
+        indexer.index_all(light_pass=True)
+        _write_note(vault, "note.md", 2000, body=LONG_BODY + " edited")
+        generations = []
+        real_delete = indexer.bm25_index.delete_by_path
+
+        def _spy(path):
+            generations.append(json.loads(summary_queue.read_text())["files"][0].get("generation"))
+            return real_delete(path)
+
+        monkeypatch.setattr(indexer.bm25_index, "delete_by_path", _spy)
+
+        indexer.index_all(light_pass=True)
+
+        assert generations == [1]
+        assert _queued(summary_queue) == [str(note)]
+
+    def test_vanished_note_leaves_the_queue(self, indexer, vault, summary_queue, monkeypatch):
+        from api.services import summarizer
+
+        summarizer.add_summary_failure(str(vault / "gone.md"), "gone.md")
+
+        self._drain(indexer)
+
+        assert _queued(summary_queue) == []
+
+
+class TestDrainScript:
+    @pytest.fixture
+    def script(self, summary_queue, monkeypatch):
+        sys.path.insert(0, str(REPO_ROOT / "scripts"))
+        import sync_vault_summaries
+        sys.path.remove(str(REPO_ROOT / "scripts"))
+        return sync_vault_summaries
+
+    def test_reports_generated_summaries(self, script, vault, summary_queue, monkeypatch, capsys):
+        from api.services import summarizer
+
+        note = _write_note(vault, "note.md", 1000)
+        summarizer.add_summary_failure(str(note), note.name)
         monkeypatch.setattr(summarizer, "is_summarizer_llm_available", lambda: True)
+        monkeypatch.setattr(summarizer, "generate_summary", lambda *a, **k: ("A synthetic summary of this note.", True))
+
+        assert script.main(["--execute"]) == 0
+
+        line = next(row for row in capsys.readouterr().out.splitlines() if row.startswith("SYNC_STATS:"))
+        assert json.loads(line[len("SYNC_STATS:"):])["processed"] == 1
+        assert _queued(summary_queue) == []
+
+    def test_unreachable_llm_skips_and_keeps_the_queue(self, script, vault, summary_queue, monkeypatch, capsys):
+        from api.services import summarizer
+
+        note = _write_note(vault, "note.md", 1000)
+        summarizer.add_summary_failure(str(note), note.name)
+        monkeypatch.setattr(summarizer, "is_summarizer_llm_available", lambda: False)
+        generate = MagicMock()
+        monkeypatch.setattr(summarizer, "generate_summary", generate)
+
+        assert script.main(["--execute"]) == 0
+
+        assert "SYNC_SKIPPED" in capsys.readouterr().out
+        generate.assert_not_called()
+        assert _queued(summary_queue) == [str(note)]
+
+    def test_runs_while_the_vault_index_lock_is_held(self, script, vault, summary_queue, monkeypatch):
+        from api.services import summarizer, vault_index_lock
+
+        note = _write_note(vault, "note.md", 1000)
+        summarizer.add_summary_failure(str(note), note.name)
+        monkeypatch.setattr(summarizer, "is_summarizer_llm_available", lambda: True)
+        monkeypatch.setattr(summarizer, "generate_summary", lambda *a, **k: ("A synthetic summary of this note.", True))
         held = vault_index_lock.try_flock(vault_index_lock.VAULT_INDEX_LOCK_PATH)
         assert held is not None
 
-        assert drain.main(["--drain-summaries"]) == 1
+        assert script.main(["--execute"]) == 0
 
-        assert len(_queued(summary_queue)) == 1
-        summarizer.retry_summary.assert_not_called()
+        assert _queued(summary_queue) == []
 
-    def test_does_not_reindex(self, drain, nightly, monkeypatch):
+    def test_empty_queue_never_asks_the_llm(self, script, summary_queue, monkeypatch):
         from api.services import summarizer
 
-        monkeypatch.setattr(summarizer, "is_summarizer_llm_available", lambda: True)
+        available = MagicMock()
+        monkeypatch.setattr(summarizer, "is_summarizer_llm_available", available)
 
-        drain.main(["--drain-summaries"])
+        assert script.main(["--execute"]) == 0
 
-        nightly[1].assert_not_called()
+        available.assert_not_called()
+
+    def test_without_execute_changes_nothing(self, script, vault, summary_queue, monkeypatch):
+        from api.services import summarizer
+
+        note = _write_note(vault, "note.md", 1000)
+        summarizer.add_summary_failure(str(note), note.name)
+        generate = MagicMock()
+        monkeypatch.setattr(summarizer, "generate_summary", generate)
+
+        assert script.main([]) == 0
+
+        generate.assert_not_called()
+
+
+class TestDrainIsItsOwnSource:
+    def test_runs_last_with_its_own_timeout_and_health_row(self):
+        from api.services.sync_health import SYNC_SOURCES
+        from config.settings import settings
+        from scripts import run_all_syncs
+
+        assert run_all_syncs.SYNC_ORDER[-1] == "vault_summaries"
+        assert run_all_syncs.SYNC_SCRIPTS["vault_summaries"] == ("scripts/sync_vault_summaries.py", ["--execute"])
+        assert run_all_syncs.SYNC_TIMEOUTS["vault_summaries"] > settings.summary_retry_budget_seconds
+        assert SYNC_SOURCES["vault_summaries"]["idle_is_normal"] is True
+
+    def test_nothing_waits_on_it_and_it_waits_on_nothing(self):
+        """A failure stays its own, and a failed reindex doesn't hold it back."""
+        from api.services.sync_health import SYNC_SOURCES
+
+        assert SYNC_SOURCES["vault_summaries"]["depends_on"] == []
+        assert not [
+            name for name, source in SYNC_SOURCES.items()
+            if "vault_summaries" in source.get("depends_on", [])
+        ]
+
+
+class TestTagLookupFailure:
+    """Real tag store, indexed once with tags, then made unreadable."""
+
+    @staticmethod
+    def _tagged(vault: Path, name: str):
+        from api.services.vault_tag_store import TagRecord, VaultTagStore
+
+        note = _write_note(vault, name, 1000)
+        VaultTagStore().upsert(TagRecord(
+            file_path=name, content_sha256="synthetic", vocab_version="v",
+            doc_type="meeting", doc_type_conf=0.9, topic="work/alpha", topic_conf=0.9,
+        ))
+        return note
+
+    @pytest.fixture
+    def tagged_index(self, vault, summary_queue, vector_store, stats_refresh):
+        from api.services.indexer import IndexerService
+
+        self._tagged(vault, "tagged.md")
+        _write_note(vault, "untagged.md", 1000)
+        resolver = MagicMock()
+        resolver.resolve.return_value = None
+
+        def _new(**kwargs):
+            return IndexerService(
+                vault_path=str(vault), interaction_store=MagicMock(), source_entity_store=MagicMock(),
+                entity_resolver=resolver, **kwargs,
+            )
+
+        assert _new().index_all(light_pass=True) == 2
+        return _new
+
+    @staticmethod
+    def _broken_store():
+        return MagicMock(get=MagicMock(side_effect=RuntimeError("synthetic: database is locked")))
+
+    def test_failed_lookups_reindex_nothing_and_keep_recorded_keys(self, tagged_index, vector_store, caplog):
+        recorded = json.loads(_state_file().read_text())["__tag_phrase_keys__"]
+        assert recorded
+        vector_store.return_value.update_document.reset_mock()
+        indexer = tagged_index(tag_store=self._broken_store())
+
+        with caplog.at_level(logging.WARNING):
+            assert indexer.scan_changes()["to_index"] == []
+            assert indexer.index_all() == 0
+
+        vector_store.return_value.update_document.assert_not_called()
+        assert json.loads(_state_file().read_text())["__tag_phrase_keys__"] == recorded
+        assert caplog.text.count("Tag lookup failed") == 1
+
+    def test_store_that_cannot_open_reindexes_nothing(self, tagged_index, vector_store, monkeypatch):
+        recorded = json.loads(_state_file().read_text())["__tag_phrase_keys__"]
+        vector_store.return_value.update_document.reset_mock()
+        monkeypatch.setattr(
+            "api.services.vault_tag_store.VaultTagStore", MagicMock(side_effect=OSError("synthetic: unreadable"))
+        )
+
+        assert tagged_index().index_all(light_pass=True) == 0
+
+        vector_store.return_value.update_document.assert_not_called()
+        assert json.loads(_state_file().read_text())["__tag_phrase_keys__"] == recorded
+
+    def test_real_change_is_noticed_once_lookups_work_again(self, tagged_index, vault):
+        from api.services.vault_tag_store import TagRecord, VaultTagStore
+
+        tagged_index(tag_store=self._broken_store()).index_all()
+        VaultTagStore().upsert(TagRecord(
+            file_path="tagged.md", content_sha256="synthetic", vocab_version="v",
+            doc_type="meeting", doc_type_conf=0.9, topic="work/beta", topic_conf=0.9,
+        ))
+
+        assert tagged_index().scan_changes()["to_index"] == [str(vault / "tagged.md")]
+
+    def test_note_edited_during_an_outage_is_indexed_once_more_after_it(self, tagged_index, vault):
+        """Indexed without its phrase, so it records no key and gets the phrase back."""
+        _write_note(vault, "tagged.md", 2000, body=LONG_BODY + " edited")
+
+        assert tagged_index(tag_store=self._broken_store()).index_all() == 1
+        assert tagged_index().index_all() == 1
+        assert tagged_index().index_all() == 0
+
+    def test_a_note_with_no_row_stays_unchanged_without_any_warning(self, tagged_index, caplog):
+        with caplog.at_level(logging.WARNING):
+            assert tagged_index().scan_changes()["to_index"] == []
+
+        assert "Tag lookup failed" not in caplog.text
 
 
 class TestApiReindexTakesTheLock:

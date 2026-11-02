@@ -269,7 +269,8 @@ Example:
 
 | Script | Purpose |
 |--------|---------|
-| `sync_vault_reindex.py` | Reindex vault to ChromaDB + BM25 (`--execute`), or work through the summary queue only (`--drain-summaries`) |
+| `sync_vault_reindex.py` | Reindex vault to ChromaDB + BM25 |
+| `sync_vault_summaries.py` | Generate queued LLM summaries into BM25 (`--execute`; reports the queue size otherwise). Runs last in the nightly sync |
 | `vault_index_job.py` | Index changed vault notes, newest first and capped, without LLM summaries (`--execute`, or `--dry-run` to report only). Run every 15 minutes by `lifeos-vault-index.timer`; see [the job's design](../specs/technical/data-and-sync.md#vault-index-job) |
 | `sync_vault_tag.py` | Tag changed vault notes (`--execute`, or `--dry-run` to count only; skipped when tagging is unconfigured) |
 | `sync_crm_to_vectorstore.py` | Make the people index hold exactly the eligible CRM people (`--execute`; a dry run otherwise). `--allow-large-removal` accepts removing more than half the index |

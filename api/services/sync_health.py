@@ -313,6 +313,14 @@ SYNC_SOURCES = {
         "phase": 7,
         "depends_on": ["entity_cleanup"],
     },
+    "vault_summaries": {
+        "description": "Generate queued LLM summaries for vault notes",
+        "script": "scripts/sync_vault_summaries.py",
+        "frequency": "daily",
+        "phase": 7,
+        "depends_on": [],  # Needs only the LLM, so a failed reindex doesn't hold it back
+        "idle_is_normal": True,  # An empty queue is a healthy night
+    },
 }
 
 

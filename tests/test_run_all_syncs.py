@@ -611,39 +611,42 @@ class TestLLMMemoryGating:
         assert "_llm_stopped" not in result.get("results", {})
         assert "_llm_was_running" not in result.get("results", {})
 
-    def test_summary_queue_drains_after_the_llm_is_restarted(self):
+    def test_summary_source_runs_after_the_llm_is_restarted(self):
         """Queued summaries can only be generated once the LLM is back up."""
         from scripts.run_all_syncs import _EMBEDDING_MEMORY_THRESHOLD_MB
 
         events = []
-        with patch(
-            "scripts.run_all_syncs._drain_summary_queue", side_effect=lambda: events.append("drain")
+        real_side_effect = _make_run_sync_side_effect(set())
+
+        def _run_sync(source, dry_run=False):
+            events.append(source)
+            return real_side_effect(source, dry_run=dry_run)
+
+        order = [*LLM_TEST_SYNC_ORDER, "vault_summaries"]
+        sources = {**LLM_TEST_SYNC_SOURCES, "vault_summaries": {"description": "S", "phase": 7, "frequency": "daily"}}
+        with (
+            patch(f"{__name__}.LLM_TEST_SYNC_ORDER", order),
+            patch(f"{__name__}.LLM_TEST_SYNC_SOURCES", sources),
+            patch(f"{__name__}._make_run_sync_side_effect", return_value=_run_sync),
         ):
             _run_llm_test(
                 llm_running=True, gpu_memory_mb=_EMBEDDING_MEMORY_THRESHOLD_MB - 1000,
-                on_llm_start=lambda: events.append("start"),
+                on_llm_start=lambda: events.append("llm_start"),
             )
 
-        assert events == ["start", "drain"]
+        assert events.index("llm_start") < events.index("vault_summaries")
 
-    def test_no_separate_drain_when_the_llm_stayed_up(self):
-        """The reindex generates summaries itself while the LLM is running."""
-        from scripts.run_all_syncs import _EMBEDDING_MEMORY_THRESHOLD_MB
+    def test_summary_failure_fails_only_its_own_source(self):
+        order = [*LLM_TEST_SYNC_ORDER, "vault_summaries"]
+        sources = {**LLM_TEST_SYNC_SOURCES, "vault_summaries": {"description": "S", "phase": 7, "frequency": "daily"}}
+        with (
+            patch(f"{__name__}.LLM_TEST_SYNC_ORDER", order),
+            patch(f"{__name__}.LLM_TEST_SYNC_SOURCES", sources),
+        ):
+            result, _, _, _, _ = _run_llm_test(fail_sources={"vault_summaries"}, llm_running=False)
 
-        with patch("scripts.run_all_syncs._drain_summary_queue") as drain:
-            _run_llm_test(llm_running=True, gpu_memory_mb=_EMBEDDING_MEMORY_THRESHOLD_MB + 10_000)
-
-        drain.assert_not_called()
-
-    def test_drain_runs_the_reindex_script_and_a_failure_fails_nothing(self):
-        from scripts.run_all_syncs import _drain_summary_queue
-
-        with patch("scripts.run_all_syncs.subprocess.run", return_value=MagicMock(returncode=1, stderr="x")) as run:
-            _drain_summary_queue()
-
-        command = run.call_args.args[0]
-        assert command[1].endswith("sync_vault_reindex.py")
-        assert command[2:] == ["--drain-summaries"]
+        assert result["results"]["vault_summaries"]["success"] is False
+        assert result["results"]["vault_reindex"]["success"] is True
 
     def test_waits_for_the_vault_index_job_before_reading_memory(self):
         """A job's loaded model must not count as memory the LLM has to free."""

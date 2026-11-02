@@ -25,9 +25,8 @@ LIFEOS_VAULT_INDEX_LOCK_WAIT_SECONDS the run exits non-zero without indexing, an
 the sync records the failure: the job's own timeout is shorter than that wait,
 so something is wrong, and running alongside it would overwrite its saved state.
 
---drain-summaries works through the summary queue and indexes nothing. The nightly
-sync runs it after restarting an LLM it stopped for embeddings, because the
-reindex itself could not generate summaries with the LLM down.
+Summaries that failed here, and those the job queued, wait for the
+vault_summaries sync source.
 """
 import sys
 from pathlib import Path
@@ -205,34 +204,6 @@ def clear_bm25_index():
     logger.info(f"BM25 index cleared: {before} rows dropped")
 
 
-# How long --drain-summaries waits for a restarted LLM to finish loading its model.
-LLM_READY_WAIT_SECONDS = 600
-
-
-def drain_summaries() -> dict:
-    """Generate queued summaries once the LLM answers. Indexes nothing."""
-    from config.settings import settings
-    from api.services.indexer import IndexerService
-    from api.services.summarizer import is_summarizer_llm_available, load_summary_failures
-
-    queued = len(load_summary_failures().get("files", []))
-    if not queued:
-        logger.info("Summary queue is empty")
-        return {"status": "success", "summaries": 0}
-
-    deadline = time.monotonic() + LLM_READY_WAIT_SECONDS
-    while not is_summarizer_llm_available():
-        if time.monotonic() >= deadline:
-            logger.warning(f"LLM not ready after {LLM_READY_WAIT_SECONDS}s; {queued} summaries stay queued")
-            return {"status": "skipped", "summaries": 0}
-        time.sleep(5)
-
-    indexer = IndexerService(vault_path=settings.vault_path)
-    summaries = indexer.drain_summary_queue()
-    logger.info(f"Drained summary queue: {summaries} summaries generated")
-    return {"status": "success", "summaries": summaries}
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description='Reindex Obsidian vault')
     parser.add_argument('--execute', action='store_true', help='Actually perform reindex')
@@ -243,12 +214,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--budget-minutes', nargs='?', type=float, const=BUDGET_FROM_SETTING, default=None,
                         help='Stop after this many minutes, leaving the rest for the next run. '
                              'Bare, uses LIFEOS_VAULT_INDEX_BUDGET_MINUTES. Omitted, runs to completion.')
-    parser.add_argument('--drain-summaries', action='store_true', help='Work through the summary queue only, indexing nothing')
     args = parser.parse_args(argv)
 
     # Covers the clears too, and is held until this function returns.
     vault_index_lock = None
-    if args.execute or args.drain_summaries:
+    if args.execute:
         from api.services.vault_index_lock import wait_for_vault_index_lock
         from config.settings import settings
 
@@ -257,10 +227,6 @@ def main(argv: list[str] | None = None) -> int:
         if vault_index_lock is None:
             logger.error(f"Vault index lock still held after {wait_seconds}s; not reindexing")
             return 1
-
-    if args.drain_summaries:
-        drain_summaries()
-        return 0
 
     if args.clear_vectors and args.execute:
         clear_vector_store()

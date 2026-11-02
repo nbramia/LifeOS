@@ -32,7 +32,6 @@ import argparse
 import fcntl
 import json
 import logging
-import os
 import re
 import signal
 import subprocess
@@ -301,30 +300,6 @@ def _wait_for_vault_index_job() -> None:
         lock.close()
     except OSError as e:
         logger.warning(f"Could not check the vault index lock ({e}); reading GPU memory anyway")
-
-
-def _drain_summary_queue() -> None:
-    """Generate queued summaries now the LLM is back.
-
-    Summaries that came due while the LLM was stopped for embeddings stayed
-    queued. A failure here leaves them queued for the next night and fails nothing.
-    """
-    logger = logging.getLogger(__name__)
-    project_root = Path(__file__).parent.parent
-    # Lock wait + LLM load + the work itself.
-    timeout = settings.vault_index_lock_wait_seconds + 600 + settings.summary_retry_budget_seconds + 300
-    try:
-        result = subprocess.run(
-            [sys.executable, str(project_root / "scripts" / "sync_vault_reindex.py"), "--drain-summaries"],
-            capture_output=True, text=True, timeout=timeout, cwd=str(project_root),
-            env={**os.environ, "PYTHONPATH": str(project_root)},
-        )
-        if result.returncode != 0:
-            logger.warning(f"Summary queue drain failed: {(result.stderr or '')[-500:]}")
-        else:
-            logger.info("Summary queue drain finished")
-    except (OSError, subprocess.TimeoutExpired) as e:
-        logger.warning(f"Summary queue drain did not finish: {e}")
 
 
 # Track current sync run for SIGTERM cleanup
@@ -1059,6 +1034,12 @@ SYNC_ORDER = [
     # === Phase 7: Consistency Verification ===
     # Verify cross-store data consistency after all syncs complete
     "consistency_verify",       # Check orphans, stale merged IDs, cached counts
+
+    # === Summary Queue ===
+    # Last, so its budget delays no other source, and after any LLM restart.
+    # Nothing later reads summaries. The vault map pages read them during
+    # vault_reindex, so they pick up tonight's summaries tomorrow.
+    "vault_summaries",          # Generate queued LLM summaries into BM25
 ]
 
 # Scripts that can be run directly
@@ -1097,6 +1078,7 @@ SYNC_SCRIPTS = {
     "vault_reindex": ("scripts/sync_vault_reindex.py", ["--execute", "--budget-minutes"]),
     "vault_tag": ("scripts/sync_vault_tag.py", ["--execute"]),
     "crm_vectorstore": ("scripts/sync_crm_to_vectorstore.py", ["--execute"]),
+    "vault_summaries": ("scripts/sync_vault_summaries.py", ["--execute"]),
 
     # Phase 5: Content Sync
     "google_docs": ("scripts/sync_google_docs.py", ["--execute"]),
@@ -1118,6 +1100,8 @@ SYNC_TIMEOUTS = {
     "vault_reindex": 14400,          # 4 hours - incremental is typically 10-30min, but a
                                      #            `--force` full reindex of a ~6K-file vault
                                      #            plus per-file summary calls fits in ~3-4h
+    # Its own budget, plus the longest single LLM call and a margin.
+    "vault_summaries": settings.summary_retry_budget_seconds + settings.ollama_retry_timeout + 300,
     "vault_tag": 3600,               # 1 hour - nightly delta is ~tens of notes; a full backfill is ~8 min
     "slack": 7200,                   # 2 hours - ~100 linked DMs + group DMs, rate-limited
     "google_docs": 300,              # 5 minutes - normally takes ~9s, hangs on expired OAuth
@@ -2372,7 +2356,6 @@ def run_all_syncs(
                 if not next_is_embedding:
                     _start_llm()
                     _llm_stopped_for_sync = False
-                    _drain_summary_queue()
     finally:
         # Safety net: restart LLM if we stopped it and it's still down
         if _llm_stopped_for_sync and _llm_was_running_before_sync:
