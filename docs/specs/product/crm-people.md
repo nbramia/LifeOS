@@ -423,7 +423,7 @@ Multi-select people from the list view and perform bulk merge or hide operations
 - Checkbox on each person card for multi-selection.
 - A floating toolbar appears when 1+ people are selected, showing the count and action buttons.
 - **Actions:** Merge selected (combines into one PersonEntity), Hide selected (soft-deletes), Clear selection.
-- **Facts:** a merge keeps every fact. The primary's facts stay and the absorbed people's facts move to it. For a fact present on both (same category and key), a user-confirmed absorbed fact replaces an unconfirmed primary fact; otherwise the primary's fact stays. Re-running extraction afterwards refreshes unconfirmed facts only; confirmed facts are never overwritten.
+- **Facts:** a merge moves the absorbed people's facts onto the primary and keeps the primary's own. For a fact present on both (same category and key), a user-confirmed absorbed fact replaces an unconfirmed primary fact; otherwise the primary's fact stays. Re-running extraction afterwards refreshes unconfirmed facts only; confirmed facts are never overwritten.
 
 ---
 

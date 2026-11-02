@@ -668,4 +668,5 @@ def _make_mock_store(people: dict):
     from unittest.mock import MagicMock
     store = MagicMock()
     store.get_by_id.side_effect = lambda pid: people.get(pid)
+    store.get_by_id_unresolved.side_effect = lambda pid: people.get(pid)
     return store

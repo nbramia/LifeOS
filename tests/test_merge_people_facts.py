@@ -49,6 +49,7 @@ def env(tmp_path, monkeypatch):
 
     merged_ids = tmp_path / "merged_ids.json"
     merge_log = tmp_path / "merge_log.json"
+    monkeypatch.setattr(PersonEntityStore, "MERGED_IDS_PATH", merged_ids)
     monkeypatch.setattr("scripts.merge_people.get_person_entity_store", lambda: person_store)
     monkeypatch.setattr("scripts.merge_people.get_crm_db_path", lambda: crm_db_path)
     monkeypatch.setattr("scripts.merge_people.get_interaction_db_path", lambda: interactions_db_path)
@@ -63,6 +64,8 @@ def env(tmp_path, monkeypatch):
         "facts": fact_store,
         "people": person_store,
         "merge_log": merge_log,
+        "merged_ids": merged_ids,
+        "monkeypatch": monkeypatch,
     }
 
 
@@ -109,6 +112,16 @@ def _orphan_associations(env):
         ).fetchone()[0]
     finally:
         conn.close()
+
+
+def _restart(env):
+    """Simulate a process restart: a fresh store that reads the merged-ids file from disk."""
+    from api.services.person_entity import PersonEntityStore
+
+    store = PersonEntityStore(env["crm"])
+    env["people"] = store
+    env["monkeypatch"].setattr("scripts.merge_people.get_person_entity_store", lambda: store)
+    return store
 
 
 def _merge(dry_run=False):
@@ -326,28 +339,46 @@ class TestDryRun:
 
 
 class TestInterruptedMergeRecovery:
-    def test_failed_crm_transaction_rolls_facts_back_and_recovery_finishes(self, env, monkeypatch):
-        import scripts.merge_people as mp
-
+    def _seed_clash(self, env):
         _add(env, PRIMARY, "work", "role", "primary role", confirmed=True)
         _add(env, SECONDARY, "work", "role", "secondary role")
         _add(env, SECONDARY, "travel", "trip", "secondary trip")
-        before = (_owned(env, PRIMARY), _owned(env, SECONDARY))
 
-        real_apply = mp._apply_fact_merge
+    def _crash_after_the_fact_step(self, monkeypatch):
+        """Run a merge that dies inside the CRM transaction, once the facts have been rewritten."""
+        import scripts.merge_people as mp
 
-        def apply_then_crash(*args, **kwargs):
-            real_apply(*args, **kwargs)
+        real = mp._tone_analysis_results_table_exists
+
+        def boom(_conn):
             raise RuntimeError("simulated crash mid-transaction")
 
-        monkeypatch.setattr(mp, "_apply_fact_merge", apply_then_crash)
-        with pytest.raises(RuntimeError):
-            _merge()
+        monkeypatch.setattr(mp, "_tone_analysis_results_table_exists", boom)
+        try:
+            with pytest.raises(RuntimeError):
+                _merge()
+        finally:
+            monkeypatch.setattr(mp, "_tone_analysis_results_table_exists", real)
+
+    def test_crash_after_the_fact_step_rolls_the_facts_back(self, env, monkeypatch):
+        self._seed_clash(env)
+        before = (_owned(env, PRIMARY), _owned(env, SECONDARY))
+
+        self._crash_after_the_fact_step(monkeypatch)
 
         assert (_owned(env, PRIMARY), _owned(env, SECONDARY)) == before
         assert env["merge_log"].exists()
 
-        monkeypatch.setattr(mp, "_apply_fact_merge", real_apply)
+    def test_recovery_in_a_restarted_process_moves_the_facts(self, env, monkeypatch):
+        import scripts.merge_people as mp
+
+        self._seed_clash(env)
+        self._crash_after_the_fact_step(monkeypatch)
+        # The merged-ids entry was written before the crash; a new process resolves
+        # the secondary to the primary.
+        store = _restart(env)
+        assert store.get_by_id(SECONDARY).id == PRIMARY
+
         assert mp.recover_incomplete_merge() is True
 
         assert _owned(env, PRIMARY) == {
@@ -356,13 +387,58 @@ class TestInterruptedMergeRecovery:
         }
         assert _owned(env, SECONDARY) == {}
         assert not env["merge_log"].exists()
+        hidden = store.get_by_id_unresolved(SECONDARY)
+        assert hidden.hidden and hidden.hidden_reason == f"merged_into:{PRIMARY}"
+        assert store.get_by_id_unresolved(PRIMARY).hidden is False
 
-    def test_recovery_after_the_crm_commit_keeps_the_moved_facts(self, env):
+    def test_recovery_run_twice_changes_nothing_the_second_time(self, env, monkeypatch):
+        import scripts.merge_people as mp
+
+        self._seed_clash(env)
+        self._crash_after_the_fact_step(monkeypatch)
+        _restart(env)
+        log_text = env["merge_log"].read_text()
+
+        assert mp.recover_incomplete_merge() is True
+        after_first = (_owned(env, PRIMARY), _owned(env, SECONDARY))
+        env["merge_log"].write_text(log_text)  # the log survives a crash during recovery
+        _restart(env)
+        assert mp.recover_incomplete_merge() is True
+
+        assert (_owned(env, PRIMARY), _owned(env, SECONDARY)) == after_first
+        assert len(after_first[0]) == 2
+
+    def test_recovery_resumes_for_a_secondary_hidden_for_another_reason(self, env, monkeypatch):
+        import scripts.merge_people as mp
+
+        self._seed_clash(env)
+        conn = sqlite3.connect(env["crm"])
+        conn.execute(
+            "UPDATE person_entities SET hidden = 1, hidden_reason = 'duplicate' WHERE id = ?",
+            (SECONDARY,),
+        )
+        conn.commit()
+        conn.close()
+        self._crash_after_the_fact_step(monkeypatch)
+        _restart(env)
+
+        assert mp.recover_incomplete_merge() is True
+
+        assert set(_owned(env, PRIMARY)) == {("work", "role"), ("travel", "trip")}
+        assert _owned(env, SECONDARY) == {}
+
+    def test_recovery_after_the_crm_commit_keeps_the_moved_facts(self, env, monkeypatch):
         import scripts.merge_people as mp
 
         _add(env, PRIMARY, "work", "role", "primary role")
         _add(env, SECONDARY, "travel", "trip", "secondary trip")
         _merge()
+        _restart(env)
+
+        def fail(*_a, **_k):
+            raise AssertionError("a committed merge must not be re-run")
+
+        monkeypatch.setattr(mp, "merge_people", fail)
         env["merge_log"].write_text(json.dumps({
             "operation": "merge",
             "primary_id": PRIMARY,
@@ -375,31 +451,81 @@ class TestInterruptedMergeRecovery:
 
         assert set(_owned(env, PRIMARY)) == {("work", "role"), ("travel", "trip")}
 
-    def test_re_running_the_merge_loses_nothing(self, env):
-        _add(env, PRIMARY, "work", "role", "primary role")
+
+class TestRepeatedMergeIsRefused:
+    def _assert_survivor_intact(self, env, expected_facts):
+        assert _owned(env, PRIMARY) == expected_facts
+        assert not env["merge_log"].exists()
+        merged = json.loads(env["merged_ids"].read_text())
+        assert merged == {SECONDARY: PRIMARY}
+        assert env["people"].get_by_id_unresolved(PRIMARY).hidden is False
+
+    def test_second_merge_after_a_restart_is_refused_and_changes_nothing(self, env):
+        from scripts.merge_people import SamePersonError
+
+        _add(env, PRIMARY, "work", "role", "primary role", confirmed=True)
         _add(env, SECONDARY, "travel", "trip", "secondary trip")
+        _merge()
+        expected = _owned(env, PRIMARY)
+        _restart(env)
 
-        first = _merge()
-        second = _merge()
+        with pytest.raises(SamePersonError):
+            _merge()
+        with pytest.raises(SamePersonError):
+            _merge(dry_run=True)
 
-        assert set(_owned(env, PRIMARY)) == {("work", "role"), ("travel", "trip")}
-        assert first["facts_moved"] == 1
-        assert (second["facts_moved"], second["facts_cleared"]) == (0, 0)
+        assert len(expected) == 2
+        self._assert_survivor_intact(env, expected)
+
+    def test_stale_ancestor_merged_into_the_final_survivor_is_refused(self, env):
+        from api.services.person_entity import PersonEntity
+        from scripts.merge_people import SamePersonError, merge_people
+
+        env["people"].add(PersonEntity(id="grand-person", canonical_name="Grand Person"))
+        _add(env, "grand-person", "family", "pet", "grand pet", confirmed=True)
+        _add(env, PRIMARY, "work", "role", "primary role")
+        merge_people("grand-person", PRIMARY, dry_run=False)   # PRIMARY -> grand-person
+        _restart(env)
+
+        with pytest.raises(SamePersonError):
+            merge_people("grand-person", PRIMARY, dry_run=False)
+
+        assert _owned(env, "grand-person") == {
+            ("family", "pet"): ("grand pet", True),
+            ("work", "role"): ("primary role", False),
+        }
+        assert env["people"].get_by_id_unresolved("grand-person").hidden is False
+        assert "grand-person" not in json.loads(env["merged_ids"].read_text())
+
+    def test_fact_plan_refuses_a_person_merged_into_themselves(self, env):
+        from scripts.merge_people import SamePersonError, _plan_fact_merge
+
+        _add(env, PRIMARY, "work", "role", "primary role", confirmed=True)
+        conn = sqlite3.connect(env["crm"])
+        try:
+            with pytest.raises(SamePersonError):
+                _plan_fact_merge(conn, PRIMARY, PRIMARY)
+        finally:
+            conn.close()
+        assert _owned(env, PRIMARY) == {("work", "role"): ("primary role", True)}
 
 
 class TestMergeRoute:
-    def test_route_merge_keeps_facts_and_reports_both_counters(self, env, monkeypatch):
+    def _client(self, env, monkeypatch):
         from api.routes.crm import router as crm_router
 
         monkeypatch.setattr("api.routes.crm.get_person_entity_store", lambda: env["people"])
         monkeypatch.setattr("api.routes.crm.get_source_entity_store", lambda: object())
+        app = FastAPI()
+        app.include_router(crm_router)
+        return TestClient(app)
+
+    def test_route_merge_keeps_facts_and_reports_both_counters(self, env, monkeypatch):
         _add(env, PRIMARY, "work", "role", "primary role", confirmed=True)
         _add(env, SECONDARY, "work", "role", "secondary role")
         _add(env, SECONDARY, "travel", "trip", "secondary trip")
 
-        app = FastAPI()
-        app.include_router(crm_router)
-        with TestClient(app) as client:
+        with self._client(env, monkeypatch) as client:
             response = client.post(
                 "/api/crm/people/merge",
                 json={"primary_id": PRIMARY, "secondary_ids": [SECONDARY]},
@@ -414,3 +540,21 @@ class TestMergeRoute:
             ("work", "role"): ("primary role", True),
             ("travel", "trip"): ("secondary trip", False),
         }
+
+    def test_route_rejects_a_repeat_merge_after_a_restart_with_a_client_error(self, env, monkeypatch):
+        _add(env, PRIMARY, "work", "role", "primary role", confirmed=True)
+        _add(env, SECONDARY, "travel", "trip", "secondary trip")
+        body = {"primary_id": PRIMARY, "secondary_ids": [SECONDARY]}
+        with self._client(env, monkeypatch) as client:
+            assert client.post("/api/crm/people/merge", json=body).status_code == 200
+        expected = _owned(env, PRIMARY)
+        _restart(env)
+
+        with self._client(env, monkeypatch) as client:
+            response = client.post("/api/crm/people/merge", json=body)
+
+        assert response.status_code == 400, response.text
+        assert response.json() == {"detail": "Cannot merge a person into itself"}
+        assert _owned(env, PRIMARY) == expected
+        assert len(expected) == 2
+        assert env["people"].get_by_id_unresolved(PRIMARY).hidden is False

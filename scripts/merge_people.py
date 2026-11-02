@@ -151,6 +151,8 @@ def _plan_fact_merge(conn: sqlite3.Connection, primary_id: str, secondary_id: st
     (primary facts displaced by a confirmed secondary fact). Read-only, so the
     dry run and the execute path act on the same plan.
     """
+    if primary_id == secondary_id:
+        raise SamePersonError(f"Cannot merge facts of {primary_id} into itself")
     plan: dict = {'move': [], 'drop': [], 'replace': []}
     rows = conn.execute(
         """
@@ -356,7 +358,11 @@ def _latest(a: str | None, b: str | None) -> str | None:
     return a if a > b else b
 
 
-def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> dict:
+class SamePersonError(ValueError):
+    """Both IDs resolve to the same canonical person, so there is nothing to merge."""
+
+
+def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True, resume: bool = False) -> dict:
     """
     Merge secondary person into primary person.
 
@@ -364,9 +370,17 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
         primary_id: ID of the person to keep (survivor)
         secondary_id: ID of the person to merge and delete
         dry_run: If True, don't actually make changes
+        resume: Finish an interrupted merge whose merged-ids entry is already
+            written: the secondary is looked up under its own ID instead of
+            being resolved through the merge chain (which leads to the
+            primary)
 
     Returns:
         Stats dict
+
+    Raises:
+        SamePersonError: both IDs resolve to the same person (e.g. the
+            secondary was already merged into the primary)
     """
     stats = {
         'interactions_updated': 0,
@@ -383,12 +397,16 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
 
     store = get_person_entity_store()
     primary = store.get_by_id(primary_id)
-    secondary = store.get_by_id(secondary_id)
+    secondary = store.get_by_id_unresolved(secondary_id) if resume else store.get_by_id(secondary_id)
 
     if not primary:
         raise ValueError(f"Primary person not found: {primary_id}")
     if not secondary:
         raise ValueError(f"Secondary person not found: {secondary_id}")
+    if primary.id == secondary.id:
+        raise SamePersonError(
+            f"Cannot merge a person into itself: {secondary_id} already resolves to {primary.id}"
+        )
 
     # Use the canonical IDs from the resolved entities (follows merge chains)
     # This ensures if B was already merged into C, merging A→B actually goes to C
@@ -880,30 +898,20 @@ def recover_incomplete_merge() -> bool:
     store = get_person_entity_store()
     primary = store.get_by_id(primary_id)
 
-    # IMPORTANT: Don't use get_by_id(secondary_id) — it follows the merge chain.
-    # If merged_person_ids.json was already written, get_by_id(secondary) resolves
-    # to the primary, causing a self-merge that deletes the primary.
-    # Instead: check if secondary_id is in the merge map. If so, it's logically gone.
-    merged_ids = load_merged_ids()
-    secondary_is_merged = secondary_id in merged_ids
-
-    if secondary_is_merged:
-        # The secondary was already recorded as merged. Check if its physical
-        # record still exists by doing a raw lookup (not following merge chain).
-        secondary_result = store.get_by_id(secondary_id)
-        # get_by_id follows chain, so if it returns the primary, secondary is gone
-        secondary_exists = secondary_result is not None and secondary_result.id == secondary_id
-    else:
-        secondary_result = store.get_by_id(secondary_id)
-        secondary_exists = secondary_result is not None
-
     if not primary:
         # Primary doesn't exist — can't recover meaningfully
         logger.error(f"Recovery failed: primary person {primary_id} not found")
         clear_merge_log()
         return False
 
-    if not secondary_exists:
+    # IMPORTANT: Look the secondary up under its own ID. get_by_id(secondary_id)
+    # follows the merge chain, and once merged_person_ids.json has been written
+    # it resolves to the primary. The CRM transaction is atomic, so the merge is
+    # finished exactly when the secondary row is gone or soft-deleted as merged.
+    secondary = store.get_by_id_unresolved(secondary_id)
+    crm_step_done = secondary is None or secondary.hidden_reason.startswith("merged_into:")
+
+    if crm_step_done:
         # Secondary already deleted — merge was mostly/fully done.
         # Run post-merge cleanup and clear log.
         logger.info("Secondary already deleted — running cleanup steps only")
@@ -917,9 +925,9 @@ def recover_incomplete_merge() -> bool:
         clear_merge_log()
         return True
 
-    # Both exist — re-run the full merge (all steps are idempotent)
+    # The CRM transaction never committed — re-run the full merge (all steps are idempotent)
     logger.info("Re-running merge for crash recovery...")
-    merge_people(primary_id, secondary_id, dry_run=False)
+    merge_people(primary_id, secondary_id, dry_run=False, resume=True)
     return True
 
 

@@ -1011,7 +1011,7 @@ def merge_people(request: PersonMergeRequest):
         import sys
         from pathlib import Path
         sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-        from scripts.merge_people import merge_people as do_merge
+        from scripts.merge_people import SamePersonError, merge_people as do_merge
 
         person_store = get_person_entity_store()
         _source_store = get_source_entity_store()  # noqa: F841
@@ -1050,6 +1050,8 @@ def merge_people(request: PersonMergeRequest):
                 merged_ids.append(sec_id)
                 for key in total_stats:
                     total_stats[key] += stats.get(key, 0)
+            except SamePersonError:
+                raise HTTPException(status_code=400, detail="Cannot merge a person into itself")
             except Exception as e:
                 logger.error(f"Failed to merge {sec_id} into {request.primary_id}: {e}")
                 raise HTTPException(status_code=500, detail=f"Merge failed for {sec_id}: {str(e)}")
