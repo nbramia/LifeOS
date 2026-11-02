@@ -177,6 +177,22 @@ class TestSchedulerStoreCRUD:
         assert entry.created_at
         assert entry.action == "notify"  # mapped from static
 
+    def test_create_disabled_has_no_next_fire(self, store):
+        """A disabled entry has no next fire from the moment it is created,
+        matching update() and rebuild_index(), so a create reply never
+        shows one."""
+        future = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+        entry = store.create(
+            name="Disabled", schedule_type="once", schedule_value=future,
+            message_type="static", message_content="Hi", enabled=False,
+        )
+        assert entry.next_trigger_at is None
+        enabled = store.create(
+            name="Enabled", schedule_type="once", schedule_value=future,
+            message_type="static", message_content="Hi",
+        )
+        assert enabled.next_trigger_at is not None
+
     def test_create_with_explicit_action(self, store):
         entry = store.create(
             name="Agent job",

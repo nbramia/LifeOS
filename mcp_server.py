@@ -15,6 +15,7 @@ import hashlib
 import re
 import json
 import sys
+import time
 import httpx
 import hmac
 import logging
@@ -110,6 +111,13 @@ def _task_status_symbol(status: str) -> str:
         "cancelled": "[-]", "deferred": "[>]", "blocked": "[?]",
         "urgent": "[!]",
     }.get(status, "[ ]")
+
+
+def _next_trigger_text(entry: dict) -> str:
+    """A reminder's next fire for a create/update reply: none while disabled."""
+    if entry.get("enabled") is False:
+        return "none (disabled)"
+    return entry.get("next_trigger_at") or "not scheduled"
 
 
 def _format_task_collection(
@@ -666,7 +674,7 @@ _CHATGPT_FETCHABLE_MAX = 2048
 class LifeOSMCPServer:
     """MCP Server that dynamically discovers LifeOS API endpoints."""
 
-    def __init__(self, *, trusted_session_id: str | None = None):
+    def __init__(self, *, trusted_session_id: str | None = None, spec_wait_seconds: float = 0.0):
         self.client = httpx.Client(timeout=30.0)
         self.openapi_spec: dict | None = None
         self.tools: list[dict] = []
@@ -695,6 +703,7 @@ class LifeOSMCPServer:
             self._result_cache = SessionToolResultCache()
         except Exception:  # pragma: no cover — keep server bootable without agent worker
             self._result_cache = None
+        self._spec_wait_seconds = spec_wait_seconds
         self._load_openapi_spec()
         self._cap_people_search_limit()
         self._register_inter_agent_tools()
@@ -795,15 +804,39 @@ class LifeOSMCPServer:
         return host_tools.call(self._host_tools_config, name, arguments, caller=caller)
 
     def _load_openapi_spec(self):
-        """Load OpenAPI spec from LifeOS API."""
+        """Load OpenAPI spec from LifeOS API.
+
+        A `spec_wait_seconds` > 0 given to the constructor keeps retrying
+        while the API refuses connections, for up to that long. The HTTP
+        service is restarted right after the API on a deploy, and the API
+        takes several seconds to start listening, so a single attempt usually
+        fell back to the curated schemas."""
+        deadline = time.monotonic() + max(0.0, getattr(self, "_spec_wait_seconds", 0.0))
+        delay = 0.5
+        while True:
+            try:
+                resp = self.client.get(OPENAPI_URL)
+                resp.raise_for_status()
+                self.openapi_spec = resp.json()
+                break
+            except httpx.TransportError as e:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.warning(f"Could not load OpenAPI spec: {e}. Using curated endpoints only.")
+                    self._build_tools_fallback()
+                    return
+                time.sleep(min(delay, remaining))
+                delay = min(delay * 2, 5.0)
+            except Exception as e:
+                logger.warning(f"Could not load OpenAPI spec: {e}. Using curated endpoints only.")
+                self._build_tools_fallback()
+                return
         try:
-            resp = self.client.get(OPENAPI_URL)
-            resp.raise_for_status()
-            self.openapi_spec = resp.json()
             self._build_tools_from_spec()
             logger.info(f"Loaded OpenAPI spec: {len(self.tools)} tools available")
         except Exception as e:
             logger.warning(f"Could not load OpenAPI spec: {e}. Using curated endpoints only.")
+            self.tools = []
             self._build_tools_fallback()
 
     def _build_tools_from_spec(self):
@@ -1895,7 +1928,12 @@ class LifeOSMCPServer:
         `agent_session_id` (optional) is the in-process local executor's own
         caller identity override for `AGENT_SESSION_HEADER` — see
         `_resolve_agent_session_header`.
+
+        `arguments` is copied first: path parameters and header arguments are
+        popped below, and the caller's dict must keep them (the HTTP audit
+        log reads the same request after dispatch).
         """
+        arguments = dict(arguments or {})
         # Custom handlers for tools that don't map 1:1 to endpoints
         if tool_name == "lifeos_sync_trigger":
             return self._handle_sync_trigger(arguments)
@@ -2583,8 +2621,7 @@ class LifeOSMCPServer:
 
         elif tool_name == "lifeos_reminder_create":
             name = data.get("name", "")
-            next_trigger = data.get("next_trigger_at", "not scheduled")
-            return f"Reminder created: **{name}** (ID: {data.get('id', '')})\nNext trigger: {next_trigger}"
+            return f"Reminder created: **{name}** (ID: {data.get('id', '')})\nNext trigger: {_next_trigger_text(data)}"
 
         elif tool_name == "lifeos_reminder_list":
             reminders = data.get("reminders", [])
@@ -2605,8 +2642,7 @@ class LifeOSMCPServer:
 
         elif tool_name == "lifeos_reminder_update":
             name = data.get("name", "")
-            next_trigger = data.get("next_trigger_at", "not scheduled")
-            return f"Reminder updated: **{name}** (ID: {data.get('id', '')})\nNext trigger: {next_trigger}"
+            return f"Reminder updated: **{name}** (ID: {data.get('id', '')})\nNext trigger: {_next_trigger_text(data)}"
 
         elif tool_name == "lifeos_reminder_delete":
             return f"Reminder deleted: {data.get('id', 'unknown')}"
@@ -3037,7 +3073,9 @@ WORKER_REACHING_TOOLS = frozenset({
 
 
 # Host tools that write files or run commands; their HTTP calls are also
-# audit-logged at WARNING (api/services/host_tools.HOST_WRITE_TOOLS).
+# audit-logged at WARNING (api/services/host_tools.HOST_WRITE_TOOLS). A shell
+# call that ran under a read-only allowlist rule is not counted as a host
+# write (host_tools.READ_ONLY_SHELL_RULES).
 _HOST_WRITE_TOOLS = frozenset({"lifeos_fs_write", "lifeos_shell"})
 
 
@@ -3068,12 +3106,14 @@ def _audit_token(value: object) -> str:
     return _AUDIT_UNSAFE.sub("_", text)[:64]
 
 
-def _audit_tool_call(request_obj: object, response: dict | None, *, caller: str, edge: str | None) -> None:
-    """Log one HTTP tools/call: who, through which edge, which tool, what argument
-    keys. Argument values stay out of the log (they can hold personal data); a
-    hash lets a call be matched to the worker transcript it produced."""
+def _audit_summary(request_obj: object) -> dict | None:
+    """What the audit line records about a tools/call request: tool name,
+    argument keys and argument hash.
+
+    Taken before dispatch, because handlers may consume arguments (path
+    parameters, header arguments) from the request they were given."""
     if not isinstance(request_obj, dict) or request_obj.get("method") != "tools/call":
-        return
+        return None
     params = request_obj.get("params") or {}
     tool = params.get("name") if isinstance(params, dict) else None
     arguments = params.get("arguments") if isinstance(params, dict) else None
@@ -3084,18 +3124,53 @@ def _audit_tool_call(request_obj: object, response: dict | None, *, caller: str,
         ).hexdigest()[:16]
     except (TypeError, ValueError):
         digest = "unhashable"
+    return {"tool": tool, "keys": keys, "digest": digest}
+
+
+def _host_write(tool: object, response: dict | None) -> bool:
+    """Whether a host tool call writes. A shell call that ran under a read-only
+    allowlist rule (its result names the rule) does not; any other shell
+    outcome, including a refusal or a pending approval, counts as a write."""
+    if tool not in _HOST_WRITE_TOOLS:
+        return False
+    if tool != "lifeos_shell":
+        return True
+    result = response.get("result") if isinstance(response, dict) else None
+    structured = result.get("structuredContent") if isinstance(result, dict) else None
+    rule = structured.get("rule") if isinstance(structured, dict) else None
+    try:
+        from api.services.host_tools import READ_ONLY_SHELL_RULES
+    except Exception:  # pragma: no cover — host tools absent: assume a write
+        return True
+    return rule not in READ_ONLY_SHELL_RULES
+
+
+def _audit_tool_call(
+    request_obj: object, response: dict | None, *, caller: str, edge: str | None,
+    summary: dict | None = None,
+) -> None:
+    """Log one HTTP tools/call: who, through which edge, which tool, what argument
+    keys. Argument values stay out of the log (they can hold personal data); a
+    hash lets a call be matched to the worker transcript it produced. Pass the
+    `summary` taken before dispatch; without one it is taken now."""
+    if summary is None:
+        summary = _audit_summary(request_obj)
+    if summary is None:
+        return
+    tool = summary["tool"]
     failed = bool(
         response is None
         or "error" in response
         or (isinstance(response.get("result"), dict) and response["result"].get("isError"))
     )
     worker = reaches_worker(tool)
-    host_write = tool in _HOST_WRITE_TOOLS
+    host_write = _host_write(tool, response)
     logger.log(
         logging.WARNING if worker or host_write else logging.INFO,
         "mcp audit: caller=%s edge=%s tool=%s reaches_worker=%s host_write=%s "
         "arg_keys=%s args_sha256=%s failed=%s",
-        caller, edge or "local", _audit_token(tool), worker, host_write, ",".join(keys), digest, failed,
+        caller, edge or "local", _audit_token(tool), worker, host_write,
+        ",".join(summary["keys"]), summary["digest"], failed,
     )
 
 
@@ -3210,11 +3285,12 @@ def build_http_app(
             return _parse_error_response()
 
         def _dispatch_audited(req: object) -> dict | None:
+            summary = _audit_summary(req)
             if isinstance(req, dict):
                 outcome = respond(server, req, access=access, caller=caller)
             else:
                 outcome = dispatch(server, req, access=access, caller=caller)
-            _audit_tool_call(req, outcome, caller=caller, edge=edge)
+            _audit_tool_call(req, outcome, caller=caller, edge=edge, summary=summary)
             return None if isinstance(req, dict) and req.get("id") is None else outcome
 
         async def _run(req: object) -> dict | None:
@@ -3358,7 +3434,12 @@ def main():
     )
     args = parser.parse_args()
 
-    server = LifeOSMCPServer()
+    # The HTTP service starts alongside the API (boot, deploys), so it waits
+    # for the API to come up before falling back to the curated schemas.
+    # Stdio clients start while the API is normally already up: no wait.
+    server = LifeOSMCPServer(
+        spec_wait_seconds=_spec_wait_seconds() if args.transport == "http" else 0.0,
+    )
 
     if args.transport == "stdio":
         run_stdio(server)
@@ -3388,6 +3469,17 @@ def main():
         server, host=args.host, port=args.port, bearer_token=bearer_token,
         oauth=_oauth_config_from_settings(), uds=uds, allow_public_bearer=allow_public_bearer,
     )
+
+
+def _spec_wait_seconds() -> float:
+    """`LIFEOS_MCP_SPEC_WAIT_SECONDS` (default 90): how long the HTTP service
+    waits for the API's OpenAPI spec at startup."""
+    raw = os.environ.get("LIFEOS_MCP_SPEC_WAIT_SECONDS", "").strip()
+    try:
+        return max(0.0, float(raw)) if raw else 90.0
+    except ValueError:
+        logger.warning("LIFEOS_MCP_SPEC_WAIT_SECONDS is not a number; using 90")
+        return 90.0
 
 
 def _oauth_config_from_settings():

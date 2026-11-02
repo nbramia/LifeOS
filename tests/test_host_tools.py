@@ -640,6 +640,54 @@ def test_host_write_sent_as_a_notification_runs_once_and_is_audited(monkeypatch,
     assert "failed=False" in message
 
 
+def _shell_audit_line(monkeypatch, config, caplog, argv):
+    import logging
+
+    from fastapi.testclient import TestClient
+
+    srv = _server(monkeypatch, True)
+    srv._host_tools_config = config
+    client = TestClient(mcp_server.build_http_app(srv, bearer_token="synthetic-token"))
+    caplog.set_level(logging.INFO, logger=mcp_server.logger.name)
+    client.post("/mcp", headers={"Authorization": "Bearer synthetic-token"}, json={
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "lifeos_shell", "arguments": {"argv": argv, "cwd_root": "scratch"}},
+    })
+    (line,) = [r for r in caplog.records if r.getMessage().startswith("mcp audit:")]
+    return line
+
+
+@pytest.mark.parametrize("argv", [["ls"], ["git", "status"]])
+def test_read_only_shell_rule_is_not_audited_as_a_host_write(monkeypatch, config, run_as_ok, roots, caplog, argv):
+    import logging
+
+    roots["scratch"].mkdir(exist_ok=True)
+    line = _shell_audit_line(monkeypatch, config, caplog, argv)
+    assert "host_write=False" in line.getMessage()
+    assert line.levelno == logging.INFO
+
+
+@pytest.mark.parametrize("argv", [["systemctl", "restart", "lifeos-api"], ["rm", "-rf", "x"]])
+def test_restart_and_refused_shell_calls_are_still_host_writes(monkeypatch, config, run_as_ok, roots, caplog, argv):
+    import logging
+
+    roots["scratch"].mkdir(exist_ok=True)
+    line = _shell_audit_line(monkeypatch, config, caplog, argv)
+    assert "host_write=True" in line.getMessage()
+    assert line.levelno == logging.WARNING
+
+
+def test_read_only_shell_rules_are_rules_the_allowlist_reports(config, roots):
+    roots["scratch"].mkdir(exist_ok=True)
+    cwd = roots["scratch"]
+    reported = {
+        host_tools.match_allowlist(config, argv, cwd)[1]
+        for argv in (["ls"], ["tail", "x"], ["git", "status"], ["git", "log"], ["git", "diff"],
+                     ["git", "show"], ["systemctl", "status", "lifeos-api"])
+    }
+    assert reported == host_tools.READ_ONLY_SHELL_RULES
+
+
 def test_oauth_clients_get_host_tools_only_when_the_operator_lists_them(monkeypatch, config):
     from config.settings import settings
 
