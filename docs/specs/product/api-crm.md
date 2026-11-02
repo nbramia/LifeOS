@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-11-01
+**Last Updated:** 2026-11-02
 
 Every `/api/crm/*` HTTP endpoint. Split out of the main [api-reference.md](api-reference.md) because the CRM endpoint catalog is large enough to deserve its own file. For the consumer view of the CRM features these endpoints back, see the [CRM specs](crm-ui.md).
 
@@ -165,7 +165,7 @@ Contact sources are the meaningful units for entity splitting — each represent
 - `phone` — Phone number in E.164 format (appears in imessage, whatsapp, phone)
 - `slack_user` — Slack workspace user ID
 - `linkedin_profile` — LinkedIn profile URL
-- `name_only` — Vault/Granola mentions with no email/phone
+- `name_only` — Vault and meeting note mentions with no email/phone
 
 ### POST /api/crm/people/split
 
@@ -405,6 +405,8 @@ Reject an entity link (mark as incorrect, will be unlinked).
 ### GET /api/crm/data-health
 
 Data coverage and sync health report.
+
+`meeting_source_migration` reports raw counts for `interactions` and `source_entities`: `state` (`complete`, `not_migrated`, `provider_deferred`, or `unavailable`), `legacy_rows`, `meeting_rows`, `null_provider`, and `provider_backfill_pending`. `source_entities` also has `person_sources_legacy`. Everywhere else, `granola` reads as `meeting`, so this is where a failed migration shows.
 
 ### GET /api/crm/data-health/summary
 

@@ -219,7 +219,7 @@ class TestApplyCountsToEntity:
             'gmail': 10,
             'calendar': 5,
             'vault': 3,
-            'granola': 2,
+            'meeting': 2,
             'imessage': 7,
             'whatsapp': 4,
             'phone': 1,
@@ -229,7 +229,7 @@ class TestApplyCountsToEntity:
         _apply_counts_to_entity(entity, counts)
         assert entity.email_count == 10
         assert entity.meeting_count == 5
-        assert entity.mention_count == 5  # vault + granola
+        assert entity.mention_count == 5  # vault + meeting
         assert entity.message_count == 18  # imessage + whatsapp + phone + slack
         assert entity.photo_count == 8
 

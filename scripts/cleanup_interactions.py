@@ -4,7 +4,7 @@ Clean up polluted interactions from the production database.
 
 Three passes:
   a) Delete interactions with temp-dir source_id (test artifacts)
-  b) Delete vault/granola interactions where source_id file doesn't exist on disk
+  b) Delete vault/meeting interactions where source_id file doesn't exist on disk
   c) Delete interactions whose person_id isn't in PersonEntity store
 
 Usage:
@@ -19,6 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from api.services.interaction_store import get_interaction_db_path, InteractionStore
+from api.services.meeting_source import COLLISION_SUFFIX
 from api.services.person_entity import get_person_entity_store
 
 
@@ -54,21 +55,22 @@ def cleanup_interactions(dry_run: bool = True) -> dict:
         """)
         print(f"    Deleted: {conn.total_changes}")
 
-    # --- Pass B: vault/granola with missing source_id files ---
-    cursor = conn.execute("""
+    # --- Pass B: vault/meeting with missing source_id files ---
+    cursor = conn.execute(f"""
         SELECT id, source_id FROM interactions
-        WHERE source_type IN ('vault', 'granola')
+        WHERE source_type IN ('vault', 'meeting', 'granola')
           AND source_id IS NOT NULL
           AND source_id != ''
+          AND source_id NOT LIKE '%{COLLISION_SUFFIX}%'
     """)
     missing_files = []
     for row in cursor.fetchall():
         source_id = row['source_id']
-        # source_id for vault/granola is an absolute file path
+        # source_id for vault/meeting is an absolute file path
         if source_id and not Path(source_id).exists():
             missing_files.append(row['id'])
 
-    print(f"[B] Vault/granola with missing files: {len(missing_files)}")
+    print(f"[B] Vault/meeting with missing files: {len(missing_files)}")
     stats['missing_files'] = len(missing_files)
 
     if not dry_run and missing_files:

@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** CRM
-> **Last Updated:** 2026-11-01
+> **Last Updated:** 2026-11-02
 
 LifeOS uses a two-tier data model to separate raw observations from canonical records.
 
@@ -30,7 +30,9 @@ LifeOS uses a two-tier data model to separate raw observations from canonical re
 
 Source entities are tagged with one of the following types:
 
-`gmail`, `calendar`, `slack`, `imessage`, `whatsapp`, `signal`, `contacts`, `phone_contacts`, `linkedin`, `vault`, `granola`, `phone_call`, `phone`, `photos`
+`gmail`, `calendar`, `slack`, `imessage`, `whatsapp`, `signal`, `contacts`, `phone_contacts`, `linkedin`, `vault`, `meeting`, `phone_call`, `phone`, `photos`
+
+`meeting` marks a meeting note, one with `wispr_id` or `granola_id` in its frontmatter or filed under a `Granola` folder. Meeting source entities and interactions also carry a `provider`: `wispr`, `granola`, or null when the note names neither. Omi and Limitless notes are also transcripts but stay under `vault`. API filters accept `granola` as an alias of `meeting`.
 
 ---
 

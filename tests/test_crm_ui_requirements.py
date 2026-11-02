@@ -198,7 +198,7 @@ class TestStatsMatchDatabase:
             SELECT person_id,
                    SUM(CASE WHEN source_type = 'gmail' THEN 1 ELSE 0 END) as gmail,
                    SUM(CASE WHEN source_type = 'calendar' THEN 1 ELSE 0 END) as calendar,
-                   SUM(CASE WHEN source_type IN ('vault', 'granola') THEN 1 ELSE 0 END) as mentions
+                   SUM(CASE WHEN source_type IN ('vault', 'meeting') THEN 1 ELSE 0 END) as mentions
             FROM interactions
             GROUP BY person_id
             HAVING gmail > 10 AND calendar > 5

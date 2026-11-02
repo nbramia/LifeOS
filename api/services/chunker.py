@@ -241,7 +241,7 @@ def has_meeting_id(metadata: dict) -> bool:
 
 def chunk_document(
     content: str,
-    is_granola: bool = False,
+    is_meeting: bool = False,
     chunk_size: int = 500,
     chunk_overlap: int = 50
 ) -> list[dict]:
@@ -249,13 +249,13 @@ def chunk_document(
     Main chunking dispatcher.
 
     Determines chunking strategy based on document type and size:
-    - Granola notes: chunk by headers
+    - Meeting notes: chunk by headers
     - Long notes (>chunk_size tokens): chunk by tokens with overlap
     - Short notes: single chunk
 
     Args:
         content: Document content
-        is_granola: Whether this is a Granola meeting note
+        is_meeting: Whether this is a meeting note
         chunk_size: Target tokens per chunk (for long notes)
         chunk_overlap: Token overlap for long notes
 
@@ -269,7 +269,7 @@ def chunk_document(
     metadata, body = extract_frontmatter(content)
 
     # Meeting note: granola_id or wispr_id in frontmatter, or explicit flag
-    if is_granola or has_meeting_id(metadata):
+    if is_meeting or has_meeting_id(metadata):
         chunks = chunk_by_headers(body)
     else:
         # Check document length
@@ -428,7 +428,7 @@ def generate_chunk_context(
             context = f"This chunk is from {file_name}, a daily log containing activities and notes."
 
     elif "Meetings" in str(file_path) or "Meeting" in file_name:
-        # Meeting notes (non-Granola)
+        # Meeting notes without a recorder id
         topic = _infer_topic(file_name, chunk_content)
         people = metadata.get("people", [])
         if people:

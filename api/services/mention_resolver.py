@@ -76,7 +76,7 @@ OVERRIDE_MATCH_TYPE = "link_override"
 WORK_TAG_DOMAINS = frozenset({"work"})
 PERSONAL_TAG_DOMAINS = frozenset({"home_food", "relationships", "health", "growth", "money_admin"})
 
-MENTION_SOURCE_TYPES = ("vault", "granola")
+MENTION_SOURCE_TYPES = ("vault", "meeting", "granola")
 # Sources showing direct personal contact.
 _PERSONAL_CONTACT_SOURCES = frozenset({"imessage", "whatsapp", "signal", "phone_call", "phone"})
 _WORK_ACCOUNT_SOURCES = ("gmail", "calendar", "slack")
@@ -497,7 +497,7 @@ class MentionResolver:
             with _read_only(self._crm_db) as conn:
                 for source_id, person_id, observed, status in conn.execute(
                     "SELECT source_id, canonical_person_id, observed_name, link_status "
-                    "FROM source_entities WHERE source_type IN ('vault', 'granola') "
+                    "FROM source_entities WHERE source_type IN ('vault', 'meeting', 'granola') "
                     "AND canonical_person_id IS NOT NULL"
                 ):
                     if status != "confirmed" and is_ambiguous_mention(observed or ""):
@@ -539,7 +539,7 @@ class MentionResolver:
                 marks = ",".join("?" * len(chunk))
                 for pid, distance in conn.execute(
                     f"SELECT person_id, MIN(ABS(julianday(timestamp) - julianday(?))) FROM interactions "
-                    f"WHERE person_id IN ({marks}) AND source_type NOT IN ('vault', 'granola') "
+                    f"WHERE person_id IN ({marks}) AND source_type NOT IN ('vault', 'meeting', 'granola') "
                     f"AND timestamp >= ? AND timestamp <= ? GROUP BY person_id",
                     (reference, *chunk, start, end),
                 ):
@@ -640,7 +640,7 @@ def build_note_context(
     tag_domain: Optional[str],
     employment: EmploymentHistory,
     co_mentioned_ids: Iterable[str] = (),
-    is_granola: bool = False,
+    is_meeting: bool = False,
 ) -> NoteContext:
     """
     Assemble what a note offers for reading its mentions.
@@ -656,7 +656,7 @@ def build_note_context(
         tag_domain: vault_tags.domain for the note, if tagged
         employment: Employment history
         co_mentioned_ids: People the note names in full
-        is_granola: Whether this is a meeting transcript
+        is_meeting: Whether this is a meeting transcript
 
     Returns:
         The note's context
@@ -674,6 +674,6 @@ def build_note_context(
         employers=employers,
         text=re.sub(r"\s+", " ", f"{people_text} {body}").casefold(),
         co_mentioned_ids=frozenset(co_mentioned_ids),
-        is_meeting=is_granola or str(frontmatter.get("type", "")).casefold() == "meeting",
+        is_meeting=is_meeting or str(frontmatter.get("type", "")).casefold() == "meeting",
         title=str(frontmatter.get("title") or Path(rel_path).stem),
     )

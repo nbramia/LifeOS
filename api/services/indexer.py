@@ -11,10 +11,12 @@ import logging
 import time
 from pathlib import Path
 from datetime import datetime, timezone
+from typing import Optional
 
 from api.services.chunker import chunk_document, extract_frontmatter, add_context_to_chunks, normalize_tags, tag_phrase_key
 from api.services.vectorstore import VectorStore, is_people_tag
 from api.services.bm25_index import BM25Index
+from api.services.meeting_source import MEETING_SOURCE_TYPE, meeting_provider
 from api.services.people import people_in_note
 from api.services.vault_listing import in_underscore_dir, no_people_reason
 
@@ -32,7 +34,7 @@ try:
         LINK_STATUS_CONFIRMED,
         get_source_entity_store,
         create_vault_source_entity,
-        create_granola_source_entity,
+        create_meeting_source_entity,
     )
     from api.services.mention_resolver import (
         MentionResolver,
@@ -516,15 +518,12 @@ class IndexerService:
         # Extract frontmatter
         frontmatter, body = extract_frontmatter(content)
 
-        # Determine if Granola note
-        is_granola = (
-            "granola_id" in frontmatter or
-            "wispr_id" in frontmatter or
-            "Granola" in str(path)
-        )
+        # A recorder id in frontmatter or a Granola folder makes this a meeting note
+        provider = meeting_provider(frontmatter)
+        is_meeting = provider is not None or "Granola" in str(path)
 
         # Chunk the document
-        chunks = chunk_document(content, is_granola=is_granola)
+        chunks = chunk_document(content, is_meeting=is_meeting)
 
         # People named in the body, frontmatter, and tags
         note_tags = normalize_tags(frontmatter.get("tags"))
@@ -562,7 +561,7 @@ class IndexerService:
                         logger.debug(f"Undated note (mtime {note_date.date()}): {path.name}")
 
                 affected_person_ids = self._sync_people_to_v2(
-                    path, all_people, note_date, is_granola, frontmatter=frontmatter, body=body
+                    path, all_people, note_date, is_meeting, provider, frontmatter=frontmatter, body=body
                 )
 
                 # Refresh stats for affected people (unless caller will batch refresh)
@@ -754,7 +753,8 @@ class IndexerService:
         path: Path,
         people: list[str],
         note_date: datetime,
-        is_granola: bool = False,
+        is_meeting: bool = False,
+        provider: Optional[str] = None,
         frontmatter: dict | None = None,
         body: str = "",
     ) -> set[str]:
@@ -781,7 +781,8 @@ class IndexerService:
             path: Path to the note file
             people: List of extracted person names
             note_date: Date of the note (for interaction timestamp)
-            is_granola: Whether this is a Granola meeting note
+            is_meeting: Whether this is a meeting note
+            provider: Tool that recorded a meeting note, if the note names one
             frontmatter: Parsed frontmatter, read as context for ambiguous mentions
             body: Note body, read as context for ambiguous mentions
 
@@ -823,7 +824,7 @@ class IndexerService:
                 co_mentioned_ids.add(result.entity.id)
                 resolved.append(self._record_mention(
                     path, person_name, result.entity, result.confidence, result.match_type,
-                    note_date, is_granola, resolver, interaction_store, source_entity_store,
+                    note_date, is_meeting, provider, resolver, interaction_store, source_entity_store,
                     affected_person_ids,
                 ))
             except Exception as e:
@@ -833,7 +834,7 @@ class IndexerService:
         if not ambiguous:
             if complete:
                 self._settle_note_interaction(
-                    path, resolved, ambiguous, is_granola, resolver, interaction_store, source_entity_store,
+                    path, resolved, ambiguous, is_meeting, resolver, interaction_store, source_entity_store,
                     affected_person_ids,
                 )
             return affected_person_ids
@@ -842,13 +843,13 @@ class IndexerService:
         if mention_resolver is None:
             return affected_person_ids
 
-        context = self._note_context(path, frontmatter or {}, body, note_date, is_granola, co_mentioned_ids)
+        context = self._note_context(path, frontmatter or {}, body, note_date, is_meeting, co_mentioned_ids)
         for person_name in ambiguous:
             try:
                 decision = mention_resolver.resolve(person_name, context)
                 resolved.append(self._record_mention(
                     path, person_name, decision.entity, decision.confidence, decision.match_type,
-                    note_date, is_granola, resolver, interaction_store, source_entity_store,
+                    note_date, is_meeting, provider, resolver, interaction_store, source_entity_store,
                     affected_person_ids,
                 ))
             except Exception as e:
@@ -857,13 +858,13 @@ class IndexerService:
 
         if complete:
             self._settle_note_interaction(
-                path, resolved, ambiguous, is_granola, resolver, interaction_store, source_entity_store,
+                path, resolved, ambiguous, is_meeting, resolver, interaction_store, source_entity_store,
                 affected_person_ids,
             )
         return affected_person_ids
 
     def _settle_note_interaction(
-        self, path, resolved, ambiguous, is_granola, resolver, interaction_store, source_entity_store,
+        self, path, resolved, ambiguous, is_meeting, resolver, interaction_store, source_entity_store,
         affected_person_ids,
     ) -> None:
         """Make a note's interaction agree with who the note resolves to now.
@@ -872,7 +873,7 @@ class IndexerService:
             resolved: Each mention's person or None, in resolution order
             ambiguous: The note's one-word mentions
         """
-        source_type = "granola" if is_granola else "vault"
+        source_type = MEETING_SOURCE_TYPE if is_meeting else "vault"
         file_path_str = str(path.resolve())
         current = interaction_store.get_by_source(source_type, file_path_str)
         people = [entity for entity in resolved if entity is not None]
@@ -904,7 +905,7 @@ class IndexerService:
         # Persist entity changes (stats updated via refresh_person_stats)
         resolver.store.update(entity)
 
-    def _note_context(self, path, frontmatter, body, note_date, is_granola, co_mentioned_ids):
+    def _note_context(self, path, frontmatter, body, note_date, is_meeting, co_mentioned_ids):
         """Build the context a note offers for reading its ambiguous mentions."""
         from config.employment_history import get_employment_history
 
@@ -917,7 +918,7 @@ class IndexerService:
             tag_domain=getattr(tag, "domain", None),
             employment=get_employment_history(),
             co_mentioned_ids=co_mentioned_ids,
-            is_granola=is_granola,
+            is_meeting=is_meeting,
         )
 
     def _record_mention(
@@ -928,7 +929,8 @@ class IndexerService:
         confidence,
         match_type,
         note_date,
-        is_granola,
+        is_meeting,
+        provider,
         resolver,
         interaction_store,
         source_entity_store,
@@ -943,15 +945,23 @@ class IndexerService:
         note_title = path.stem  # filename without .md
         source_metadata = {
             "note_title": note_title,
-            "is_granola": is_granola,
+            "is_meeting": is_meeting,
         }
-        create_source_entity = create_granola_source_entity if is_granola else create_vault_source_entity
-        source_entity = create_source_entity(
-            file_path=file_path_str,
-            person_name=person_name,
-            observed_at=note_date,
-            metadata=source_metadata,
-        )
+        if is_meeting:
+            source_entity = create_meeting_source_entity(
+                file_path=file_path_str,
+                person_name=person_name,
+                observed_at=note_date,
+                metadata=source_metadata,
+                provider=provider,
+            )
+        else:
+            source_entity = create_vault_source_entity(
+                file_path=file_path_str,
+                person_name=person_name,
+                observed_at=note_date,
+                metadata=source_metadata,
+            )
 
         existing = source_entity_store.get_by_source(source_entity.source_type, source_entity.source_id)
         if existing is not None and existing.link_status != LINK_STATUS_AUTO:
@@ -976,13 +986,14 @@ class IndexerService:
             title=note_title,
             timestamp=note_date,
             snippet=None,  # Could extract first N chars if desired
-            is_granola=is_granola,
+            is_meeting=is_meeting,
+            provider=provider,
         )
         _, was_added = interaction_store.add_if_not_exists(interaction)
 
         if was_added:
             self._credit_note(
-                entity, file_path_str, "granola" if is_granola else "vault", resolver, affected_person_ids
+                entity, file_path_str, MEETING_SOURCE_TYPE if is_meeting else "vault", resolver, affected_person_ids
             )
             logger.debug(
                 f"Created interaction for {entity.display_name} "

@@ -51,7 +51,7 @@ class TestR1CleanDatabase:
         conn = sqlite3.connect(get_interaction_db_path())
         cursor = conn.execute("""
             SELECT source_id, title FROM interactions
-            WHERE source_type IN ('vault', 'granola')
+            WHERE source_type IN ('vault', 'meeting')
             AND source_id LIKE '/%'
         """)
 
@@ -158,7 +158,7 @@ class TestR2EntityResolution:
         conn = sqlite3.connect(get_interaction_db_path())
         rows = conn.execute("""
             SELECT id, person_id, source_id FROM interactions
-            WHERE source_type IN ('vault', 'granola')
+            WHERE source_type IN ('vault', 'meeting')
             AND source_id LIKE '/%'
         """).fetchall()
         conn.close()
@@ -232,7 +232,7 @@ class TestR3VaultLinks:
         conn = sqlite3.connect(get_interaction_db_path())
         cursor = conn.execute("""
             SELECT source_id FROM interactions
-            WHERE source_type IN ('vault', 'granola')
+            WHERE source_type IN ('vault', 'meeting')
             LIMIT 100
         """)
 
@@ -255,7 +255,7 @@ class TestR3VaultLinks:
         conn = sqlite3.connect(get_interaction_db_path())
         cursor = conn.execute("""
             SELECT source_id FROM interactions
-            WHERE source_type IN ('vault', 'granola')
+            WHERE source_type IN ('vault', 'meeting')
             AND source_id LIKE '/%'
             LIMIT 1
         """)
@@ -375,7 +375,7 @@ class TestR6InteractionCounts:
 
             actual_email = actual_counts.get('gmail', 0)
             actual_meeting = actual_counts.get('calendar', 0)
-            actual_mention = actual_counts.get('vault', 0) + actual_counts.get('granola', 0)
+            actual_mention = actual_counts.get('vault', 0) + actual_counts.get('meeting', 0)
 
             if (person.email_count != actual_email or
                 person.meeting_count != actual_meeting or
@@ -461,7 +461,7 @@ class TestR7CanonicalContact:
         conn = sqlite3.connect(get_interaction_db_path())
         cursor = conn.execute("""
             SELECT source_id, title FROM interactions
-            WHERE person_id = ? AND source_type IN ('vault', 'granola')
+            WHERE person_id = ? AND source_type IN ('vault', 'meeting')
             AND source_id LIKE '/%'
         """, (person.id,))
 
@@ -566,7 +566,7 @@ class TestR8Top10Verification:
             # Check for at least one valid vault interaction
             cursor2 = conn.execute("""
                 SELECT source_id FROM interactions
-                WHERE person_id = ? AND source_type IN ('vault', 'granola')
+                WHERE person_id = ? AND source_type IN ('vault', 'meeting')
                 AND source_id LIKE '/%'
                 LIMIT 5
             """, (person_id,))

@@ -13,6 +13,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Optional
 
+from api.services.meeting_source import expand_source_types
+
 logger = logging.getLogger(__name__)
 
 # Sync health database path
@@ -1093,9 +1095,11 @@ def detect_silent_source_entity_drift(
             for source_type, latest_interaction in active:
                 if not source_type or not latest_interaction:
                     continue
+                types = expand_source_types([source_type])
                 row = c_conn.execute(
-                    "SELECT MAX(created_at) FROM source_entities WHERE source_type = ?",
-                    (source_type,),
+                    "SELECT MAX(created_at) FROM source_entities "
+                    f"WHERE source_type IN ({','.join('?' * len(types))})",
+                    types,
                 ).fetchone()
                 latest_se = row[0] if row else None
 

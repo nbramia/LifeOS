@@ -68,6 +68,7 @@ from api.services.mention_resolver import (  # noqa: E402
     load_link_overrides,
     load_tag_domain,
 )
+from api.services.meeting_source import COLLISION_SUFFIX  # noqa: E402
 from api.services.people import people_in_note  # noqa: E402
 from api.services.person_entity import PersonEntity, PersonEntityStore  # noqa: E402
 from api.services.relationship import TYPE_COWORKER, TYPE_INFERRED  # noqa: E402
@@ -87,7 +88,7 @@ from config.settings import settings  # noqa: E402
 logger = logging.getLogger(__name__)
 
 HIDDEN_REASON = "one-word row from note mentions with nothing left after mention repair"
-MENTION_SOURCES = ("vault", "granola")
+MENTION_SOURCES = ("vault", "meeting", "granola")
 SAMPLE_SIZE = 40
 SAMPLE_SEED = 20261102
 DEFAULT_REPORT_DIR = Path.home() / ".lifeos-private" / "mention-repair"
@@ -285,7 +286,8 @@ def _load_note_rows(crm_db: Path, interactions_db: Path) -> dict[str, NoteRows]:
     try:
         for link_id, source_id, observed, person_id, status in conn.execute(
             "SELECT id, source_id, observed_name, canonical_person_id, link_status "
-            "FROM source_entities WHERE source_type IN ('vault', 'granola')"
+            "FROM source_entities WHERE source_type IN ('vault', 'meeting', 'granola') "
+            f"AND source_id NOT LIKE '%{COLLISION_SUFFIX}%'"
         ):
             note_path, name = _note_path_and_name(source_id or "")
             notes[note_path].links.append(Link(link_id, note_path, observed or name, person_id, status))
@@ -295,7 +297,8 @@ def _load_note_rows(crm_db: Path, interactions_db: Path) -> dict[str, NoteRows]:
     try:
         for interaction_id, person_id, source_type, source_id in conn.execute(
             "SELECT id, person_id, source_type, source_id FROM interactions "
-            "WHERE source_type IN ('vault', 'granola')"
+            "WHERE source_type IN ('vault', 'meeting', 'granola') "
+            f"AND source_id NOT LIKE '%{COLLISION_SUFFIX}%'"
         ):
             notes[source_id or ""].interactions.append(
                 NoteInteraction(interaction_id, source_id or "", person_id, source_type)
@@ -430,7 +433,7 @@ def _plan_mentions(
             tag_domain=load_tag_domain(tags_db, rel_path),
             employment=employment,
             co_mentioned_ids=co_mentioned,
-            is_granola="granola_id" in frontmatter or "wispr_id" in frontmatter or "Granola" in rel_path,
+            is_meeting="granola_id" in frontmatter or "wispr_id" in frontmatter or "Granola" in rel_path,
         )
 
     for (person_id, name), mention_links in sorted(links.items()):

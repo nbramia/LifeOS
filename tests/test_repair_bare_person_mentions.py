@@ -640,7 +640,7 @@ class TestProtectedRows:
         self._assert_untouched(world, world.person("Robin", sources=["manual_fix"]), "manual_source")
 
     def test_note_only_sources_do_not_protect(self, world):
-        bare = world.person("Robin", sources=["vault", "granola"])
+        bare = world.person("Robin", sources=["vault", "meeting"])
         assert bare.id not in world.plan().protected
 
 

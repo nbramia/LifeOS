@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
 
+from api.services.meeting_source import fold_legacy_counts
 from api.services.person_entity import PersonEntityStore
 
 logger = logging.getLogger(__name__)
@@ -296,7 +297,7 @@ def _apply_counts_to_entity(entity, counts: dict[str, int]) -> None:
     Maps source_type to the appropriate count field:
     - gmail -> email_count
     - calendar -> meeting_count
-    - vault, granola -> mention_count
+    - vault, meeting -> mention_count
     - imessage, whatsapp, phone, slack -> message_count
     - photos -> photo_count
 
@@ -305,7 +306,8 @@ def _apply_counts_to_entity(entity, counts: dict[str, int]) -> None:
     """
     entity.email_count = counts.get('gmail', 0)
     entity.meeting_count = counts.get('calendar', 0)
-    entity.mention_count = counts.get('vault', 0) + counts.get('granola', 0)
+    counts = fold_legacy_counts(counts)
+    entity.mention_count = counts.get('vault', 0) + counts.get('meeting', 0)
     entity.message_count = (
         counts.get('imessage', 0) +
         counts.get('whatsapp', 0) +
@@ -365,11 +367,11 @@ def verify_person_stats(fix: bool = False) -> dict:
             GROUP BY source_type
         """, tuple(variant_ids))
 
-        counts = {row[0]: row[1] for row in cursor}
+        counts = fold_legacy_counts({row[0]: row[1] for row in cursor})
 
         computed_email = counts.get('gmail', 0)
         computed_meeting = counts.get('calendar', 0)
-        computed_mention = counts.get('vault', 0) + counts.get('granola', 0)
+        computed_mention = counts.get('vault', 0) + counts.get('meeting', 0)
         computed_message = (
             counts.get('imessage', 0) +
             counts.get('whatsapp', 0) +

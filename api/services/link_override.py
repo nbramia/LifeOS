@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
 
+from api.services.meeting_source import normalize_source_type
+
 logger = logging.getLogger(__name__)
 
 
@@ -47,7 +49,7 @@ class LinkOverride:
 
         # Source type must match if specified
         if self.source_type and source_type:
-            if self.source_type.lower() != source_type.lower():
+            if normalize_source_type(self.source_type.lower()) != normalize_source_type(source_type.lower()):
                 return False
 
         # Context pattern must be in path if specified

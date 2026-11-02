@@ -16,7 +16,7 @@ Example:
 - 29 gmail source entities with alex@oldcompany.com are UNLINKED
 - This script will find and link those entities to Alex's person record.
 
-Note mentions (vault, granola) are out of scope: they resolve from their note's
+Note mentions (vault, meeting) are out of scope: they resolve from their note's
 context in the indexer, and a bare name re-matched on its own can only guess.
 
 Manual escape hatch: this script queries ALL unlinked entities directly and
@@ -56,6 +56,7 @@ from api.services.source_entity import (
     LINK_STATUS_AUTO,
 )
 from api.services.entity_resolver import get_entity_resolver
+from api.services.meeting_source import normalize_source_type
 from api.utils.db_paths import get_crm_db_path
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
@@ -77,13 +78,13 @@ def get_all_unlinked_entity_ids(
         if source_type:
             cursor = conn.execute("""
                 SELECT id FROM source_entities
-                WHERE canonical_person_id IS NULL AND source_type = ? AND source_type NOT IN ('vault', 'granola')
+                WHERE canonical_person_id IS NULL AND source_type = ? AND source_type NOT IN ('vault', 'meeting', 'granola')
                 ORDER BY observed_at DESC
             """, (source_type,))
         else:
             cursor = conn.execute("""
                 SELECT id FROM source_entities
-                WHERE canonical_person_id IS NULL AND source_type NOT IN ('vault', 'granola')
+                WHERE canonical_person_id IS NULL AND source_type NOT IN ('vault', 'meeting', 'granola')
                 ORDER BY observed_at DESC
             """)
         return [row[0] for row in cursor.fetchall()]
@@ -127,7 +128,7 @@ def count_unlinked_by_source(db_path: str = None) -> dict[str, int]:
         cursor = conn.execute("""
             SELECT source_type, COUNT(*) as count
             FROM source_entities
-            WHERE canonical_person_id IS NULL AND source_type NOT IN ('vault', 'granola')
+            WHERE canonical_person_id IS NULL AND source_type NOT IN ('vault', 'meeting', 'granola')
             GROUP BY source_type
             ORDER BY count DESC
         """)
@@ -163,7 +164,7 @@ def get_unlinked_entities_batch(
                        observed_phone, metadata, canonical_person_id, link_confidence,
                        link_status, linked_at, observed_at, created_at
                 FROM source_entities
-                WHERE canonical_person_id IS NULL AND source_type = ? AND source_type NOT IN ('vault', 'granola')
+                WHERE canonical_person_id IS NULL AND source_type = ? AND source_type NOT IN ('vault', 'meeting', 'granola')
                 ORDER BY observed_at DESC
                 LIMIT ? OFFSET ?
             """, (source_type, limit, offset))
@@ -173,7 +174,7 @@ def get_unlinked_entities_batch(
                        observed_phone, metadata, canonical_person_id, link_confidence,
                        link_status, linked_at, observed_at, created_at
                 FROM source_entities
-                WHERE canonical_person_id IS NULL AND source_type NOT IN ('vault', 'granola')
+                WHERE canonical_person_id IS NULL AND source_type NOT IN ('vault', 'meeting', 'granola')
                 ORDER BY observed_at DESC
                 LIMIT ? OFFSET ?
             """, (limit, offset))
@@ -370,9 +371,9 @@ Examples:
     )
     parser.add_argument(
         '--source-type',
-        type=str,
+        type=normalize_source_type,
         choices=['gmail', 'calendar', 'slack', 'imessage', 'whatsapp', 'signal',
-                 'contacts', 'phone_contacts', 'linkedin', 'vault', 'granola',
+                 'contacts', 'phone_contacts', 'linkedin', 'vault', 'meeting',
                  'phone_call', 'phone', 'photos'],
         help='Only process entities from this source type'
     )

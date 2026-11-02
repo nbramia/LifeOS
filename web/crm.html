@@ -4300,7 +4300,7 @@
         .channel-phone { background: linear-gradient(135deg, #ff9500 0%, #ff6b00 100%); }
         .channel-slack { background: linear-gradient(135deg, #e01e5a 0%, #d91a52 100%); }
         .channel-vault { background: linear-gradient(135deg, #00bcd4 0%, #0097a7 100%); }
-        .channel-granola { background: linear-gradient(135deg, #8b5cf6 0%, #7c3aed 100%); }
+        .channel-meeting { background: linear-gradient(135deg, #8b5cf6 0%, #7c3aed 100%); }
         .channel-linkedin { background: linear-gradient(135deg, #0077b5 0%, #005582 100%); }
         .channel-photos { background: linear-gradient(135deg, #e040fb 0%, #aa00ff 100%); }
         .channel-other { background: linear-gradient(135deg, #6b7280 0%, #4b5563 100%); }
@@ -5582,7 +5582,7 @@
         .bar-phone { background: #30b0c7; }
         .bar-whatsapp { background: #25d366; }
         .bar-linkedin { background: #0077b5; }
-        .bar-granola { background: #8b5cf6; }
+        .bar-meeting { background: #8b5cf6; }
         .bar-contacts { background: #64748b; }
         .bar-other { background: #64748b; }
 
@@ -11173,7 +11173,7 @@
             const messageCount = (sourceTotals['imessage'] || 0) + (sourceTotals['whatsapp'] || 0);
             const phoneCount = (sourceTotals['phone'] || 0);
             const slackCount = (sourceTotals['slack'] || 0);
-            const notesCount = (sourceTotals['vault'] || 0) + (sourceTotals['granola'] || 0);
+            const notesCount = (sourceTotals['vault'] || 0) + (sourceTotals['meeting'] || 0);
             const contactsCount = (sourceTotals['contacts'] || 0);
             const linkedinCount = (sourceTotals['linkedin'] || 0);
             const photosCount = (sourceTotals['photos'] || 0);
@@ -11219,7 +11219,7 @@
         function updateSecondaryHeroStats() {
             const phoneCount = (sourceTotals['phone'] || 0);
             const slackCount = (sourceTotals['slack'] || 0);
-            const notesCount = (sourceTotals['vault'] || 0) + (sourceTotals['granola'] || 0);
+            const notesCount = (sourceTotals['vault'] || 0) + (sourceTotals['meeting'] || 0);
             const contactsCount = (sourceTotals['contacts'] || 0);
             const linkedinCount = (sourceTotals['linkedin'] || 0);
             const photosCount = (sourceTotals['photos'] || 0);
@@ -11274,7 +11274,7 @@
                 messageCount = (counts['imessage'] || 0) + (counts['whatsapp'] || 0);
                 phoneCount = counts['phone'] || 0;
                 slackCount = counts['slack'] || 0;
-                notesCount = (counts['vault'] || 0) + (counts['granola'] || 0);
+                notesCount = (counts['vault'] || 0) + (counts['meeting'] || 0);
                 photosCount = counts['photos'] || 0;
             } else {
                 // No date filter - use global sourceTotals
@@ -11283,7 +11283,7 @@
                 messageCount = (sourceTotals['imessage'] || 0) + (sourceTotals['whatsapp'] || 0);
                 phoneCount = (sourceTotals['phone'] || 0);
                 slackCount = (sourceTotals['slack'] || 0);
-                notesCount = (sourceTotals['vault'] || 0) + (sourceTotals['granola'] || 0);
+                notesCount = (sourceTotals['vault'] || 0) + (sourceTotals['meeting'] || 0);
                 photosCount = (sourceTotals['photos'] || 0);
             }
 
@@ -11639,7 +11639,7 @@
             'slack': { badge: String.fromCodePoint(0x1F4BC), label: 'Slack' },
             'linkedin': { badge: String.fromCodePoint(0x1F517), label: 'LinkedIn' },
             'vault': { badge: String.fromCodePoint(0x1F4DD), label: 'Notes' },
-            'granola': { badge: String.fromCodePoint(0x1F4DD), label: 'Notes' },
+            'meeting': { badge: String.fromCodePoint(0x1F4DD), label: 'Notes' },
             'whatsapp': { badge: String.fromCodePoint(0x1F4F1), label: 'WhatsApp' },
             'signal': { badge: String.fromCodePoint(0x1F510), label: 'Signal' },
             'phone': { badge: String.fromCodePoint(0x1F4DE), label: 'Calls' },
@@ -14343,7 +14343,7 @@
             phone: 'channel-phone',
             slack: 'channel-slack',
             vault: 'channel-vault',
-            granola: 'channel-granola',
+            meeting: 'channel-meeting',
             linkedin: 'channel-linkedin',
             photos: 'channel-photos',
         };
@@ -14356,7 +14356,7 @@
             phone: '📞 Phone',
             slack: '💼 Slack',
             vault: '📝 Notes',
-            granola: '🥣 Granola',
+            meeting: '📝 Meetings',
             linkedin: '🔗 LinkedIn',
             photos: '📷 Photos',
         };
@@ -16532,7 +16532,7 @@
             // Compound filters that map to multiple source types
             const compoundFilters = {
                 'messages': 'imessage,whatsapp',  // Both messaging platforms
-                'notes': 'vault,granola',          // Both note types
+                'notes': 'vault,meeting',          // Both note types
             };
 
             return compoundFilters[filter] || filter;

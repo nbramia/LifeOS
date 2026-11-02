@@ -41,7 +41,7 @@ class TestPhase9Integration:
 ## Action Items
 - Kevin: Send proposal
 """
-        chunks = chunk_document(content, is_granola=True)
+        chunks = chunk_document(content, is_meeting=True)
 
         # Add context
         metadata = {"note_type": "Granola", "people": ["Kevin"]}
@@ -275,7 +275,7 @@ class TestPhase9EndToEnd:
 
         # 1. Create content with context
         content = "# Kevin Smith\n\nPhone: 555-1234\nEmail: kevin@example.com"
-        chunks = chunk_document(content, is_granola=False)
+        chunks = chunk_document(content, is_meeting=False)
         chunks = add_context_to_chunks(
             chunks,
             Path("/vault/People/Kevin Smith.md"),

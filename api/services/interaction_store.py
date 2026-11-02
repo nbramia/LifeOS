@@ -20,6 +20,14 @@ from config.people_config import InteractionConfig
 
 from api.utils.datetime_utils import make_aware as _make_aware
 from api.services import backup_retention as _backup_retention
+from api.services.meeting_source import (
+    ensure_provider_column,
+    expand_source_types,
+    fold_legacy_counts,
+    migrate_interactions_db,
+    normalize_source_type,
+    run_at_store_init,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +40,7 @@ TEMP_PREFIXES = ('/tmp', '/private/var/folders', '/var/folders')
 
 # Valid source types for interactions
 VALID_SOURCE_TYPES = frozenset({
-    "gmail", "calendar", "vault", "granola", "imessage",
+    "gmail", "calendar", "vault", "meeting", "imessage",
     "whatsapp", "contacts", "phone", "photos", "slack",
 })
 
@@ -189,7 +197,7 @@ class Interaction:
     id: str
     person_id: str  # FK to PersonEntity.id
     timestamp: datetime
-    source_type: str  # "gmail", "calendar", "vault", "granola"
+    source_type: str  # "gmail", "calendar", "vault", "meeting"
 
     # Metadata (not full content)
     title: str  # Email subject, meeting title, note filename
@@ -207,6 +215,10 @@ class Interaction:
     # Calendar: number of other attendees. WhatsApp: group size for a group
     # message (0 when the group's membership isn't known), NULL for a direct one.
     attendee_count: Optional[int] = None
+
+    # Meeting notes only: the tool that recorded the note ("wispr", "granola"),
+    # NULL when the note names neither.
+    provider: Optional[str] = None
 
     def to_dict(self) -> dict:
         """Convert to dict for JSON serialization."""
@@ -235,15 +247,16 @@ class Interaction:
         created_at = datetime.fromisoformat(row[8]) if row[8] else datetime.now(timezone.utc)
         created_at = _make_aware(created_at)
 
-        # Handle optional new columns (source_account at index 9, attendee_count at index 10)
+        # Handle optional columns (source_account 9, attendee_count 10, provider 11)
         source_account = row[9] if len(row) > 9 else None
         attendee_count = row[10] if len(row) > 10 else None
+        provider = row[11] if len(row) > 11 else None
 
         return cls(
             id=row[0],
             person_id=row[1],
             timestamp=timestamp,
-            source_type=row[3],
+            source_type=normalize_source_type(row[3]),
             title=row[4],
             snippet=row[5],
             source_link=row[6] or "",
@@ -251,6 +264,7 @@ class Interaction:
             created_at=created_at,
             source_account=source_account,
             attendee_count=attendee_count,
+            provider=provider,
         )
 
     def validate(self) -> None:
@@ -284,7 +298,7 @@ class Interaction:
             "gmail": "📧",
             "calendar": "📅",
             "vault": "📝",
-            "granola": "📝",
+            "meeting": "📝",
             "imessage": "💬",
             "whatsapp": "💬",
             "contacts": "📇",
@@ -483,10 +497,13 @@ class InteractionStore:
                 """)
                 logger.info("Migration: created UNIQUE index idx_interactions_source_unique")
 
+            ensure_provider_column(conn, "interactions")
+
             conn.commit()
             logger.info(f"Initialized interaction database at {self.db_path}")
         finally:
             conn.close()
+        run_at_store_init(migrate_interactions_db, self.db_path)
 
     def _get_connection(self) -> sqlite3.Connection:
         """Get a database connection."""
@@ -532,8 +549,8 @@ class InteractionStore:
                 """
                 INSERT INTO interactions
                 (id, person_id, timestamp, source_type, title, snippet, source_link, source_id, created_at,
-                 source_account, attendee_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 source_account, attendee_count, provider)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source_type, source_id) DO UPDATE SET
                     timestamp = excluded.timestamp
                 WHERE interactions.timestamp = ? AND excluded.timestamp != ?
@@ -550,6 +567,7 @@ class InteractionStore:
                     interaction.created_at.isoformat(),
                     interaction.source_account,
                     interaction.attendee_count,
+                    interaction.provider,
                     UNDATED_SENTINEL.isoformat(),
                     UNDATED_SENTINEL.isoformat(),
                 ),
@@ -582,9 +600,23 @@ class InteractionStore:
                 interaction.source_type, interaction.source_id
             )
             if existing:
+                if interaction.provider and existing.provider != interaction.provider:
+                    self._set_provider(existing.id, interaction.provider)
+                    existing.provider = interaction.provider
                 return existing, False
 
         return self.add(interaction), True
+
+    def _set_provider(self, interaction_id: str, provider: str) -> None:
+        conn = self._get_connection()
+        try:
+            conn.execute(
+                "UPDATE interactions SET provider = ? WHERE id = ?",
+                (provider, interaction_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     def _prepare_rows(
         self, interactions: list[Interaction]
@@ -627,6 +659,7 @@ class InteractionStore:
                 interaction.created_at.isoformat(),
                 interaction.source_account,
                 interaction.attendee_count,
+                interaction.provider,
             ))
             affected_person_ids.add(resolved_id)
 
@@ -663,8 +696,8 @@ class InteractionStore:
                 """
                 INSERT INTO interactions
                 (id, person_id, timestamp, source_type, title, snippet,
-                 source_link, source_id, created_at, source_account, attendee_count)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 source_link, source_id, created_at, source_account, attendee_count, provider)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source_type, source_id) DO NOTHING
                 """,
                 rows,
@@ -691,7 +724,7 @@ class InteractionStore:
         rolled back — no partial state.
 
         Args:
-            source_type: The source type to replace (e.g., "vault", "granola").
+            source_type: The source type to replace (e.g., "vault", "meeting").
             interactions: Complete set of interactions for this source type.
                 All interactions must have source_type matching the parameter.
 
@@ -703,6 +736,9 @@ class InteractionStore:
         Raises:
             ValueError: If any interaction has a mismatched source_type.
         """
+        source_type = normalize_source_type(source_type)
+        replaced_types = expand_source_types([source_type])
+        replaced_marks = ",".join("?" * len(replaced_types))
         mismatched = [i for i in interactions if i.source_type != source_type]
         if mismatched:
             raise ValueError(
@@ -716,15 +752,15 @@ class InteractionStore:
         try:
             # Collect person_ids being deleted so their stats get refreshed too
             cursor = conn.execute(
-                "SELECT DISTINCT person_id FROM interactions WHERE source_type = ?",
-                (source_type,),
+                f"SELECT DISTINCT person_id FROM interactions WHERE source_type IN ({replaced_marks})",
+                replaced_types,
             )
             for row in cursor:
                 affected_person_ids.add(row[0])
 
             delete_cursor = conn.execute(
-                "DELETE FROM interactions WHERE source_type = ?",
-                (source_type,),
+                f"DELETE FROM interactions WHERE source_type IN ({replaced_marks})",
+                replaced_types,
             )
             deleted = delete_cursor.rowcount
 
@@ -735,8 +771,8 @@ class InteractionStore:
                     """
                     INSERT INTO interactions
                     (id, person_id, timestamp, source_type, title, snippet,
-                     source_link, source_id, created_at, source_account, attendee_count)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     source_link, source_id, created_at, source_account, attendee_count, provider)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(source_type, source_id) DO NOTHING
                     """,
                     rows,
@@ -772,12 +808,18 @@ class InteractionStore:
     def get_by_source(
         self, source_type: str, source_id: str
     ) -> Optional[Interaction]:
-        """Get interaction by source type and ID."""
+        """Get interaction by source type and ID. Either meeting name finds either row."""
+        types = expand_source_types([source_type])
         conn = self._get_connection()
         try:
             cursor = conn.execute(
-                "SELECT * FROM interactions WHERE source_type = ? AND source_id = ?",
-                (source_type, source_id),
+                f"""
+                SELECT * FROM interactions
+                WHERE source_type IN ({",".join("?" * len(types))}) AND source_id = ?
+                ORDER BY source_type = ? DESC
+                LIMIT 1
+                """,
+                (*types, source_id, normalize_source_type(source_type)),
             )
             row = cursor.fetchone()
             if row:
@@ -839,7 +881,9 @@ class InteractionStore:
             # This enables compound filters like "messages" = imessage + whatsapp
             source_types = None
             if source_type:
-                source_types = [s.strip() for s in source_type.split(",") if s.strip()]
+                source_types = expand_source_types(
+                    s.strip() for s in source_type.split(",") if s.strip()
+                )
 
             # Build query based on filters
             if specific_date:
@@ -941,7 +985,9 @@ class InteractionStore:
         try:
             source_types = None
             if source_type:
-                source_types = [s.strip() for s in source_type.split(",") if s.strip()]
+                source_types = expand_source_types(
+                    s.strip() for s in source_type.split(",") if s.strip()
+                )
 
             query = """
                 SELECT * FROM interactions
@@ -1009,7 +1055,9 @@ class InteractionStore:
         try:
             source_types = None
             if source_type:
-                source_types = [s.strip() for s in source_type.split(",") if s.strip()]
+                source_types = expand_source_types(
+                    s.strip() for s in source_type.split(",") if s.strip()
+                )
 
             query = """
                 SELECT strftime('%Y-%m', timestamp) AS month_key, COUNT(*)
@@ -1060,7 +1108,7 @@ class InteractionStore:
                 (person_id, cutoff.isoformat()),
             )
 
-            return {row[0]: row[1] for row in cursor.fetchall()}
+            return fold_legacy_counts({row[0]: row[1] for row in cursor.fetchall()})
         finally:
             conn.close()
 
@@ -1114,15 +1162,20 @@ class InteractionStore:
                 ),
             )
 
-            results = []
+            results: dict[tuple, dict] = {}
             for row in cursor.fetchall():
-                results.append({
-                    "source_type": row[0],
-                    "source_account": row[1],
-                    "subtype": row[2],
-                    "count": row[3],
-                })
-            return results
+                source_type = normalize_source_type(row[0])
+                entry = results.setdefault(
+                    (source_type, row[1], row[2]),
+                    {
+                        "source_type": source_type,
+                        "source_account": row[1],
+                        "subtype": row[2],
+                        "count": 0,
+                    },
+                )
+                entry["count"] += row[3]
+            return list(results.values())
         finally:
             conn.close()
 
@@ -1192,7 +1245,7 @@ class InteractionStore:
                 ),
             ):
                 inputs.setdefault(pid, StrengthInputs()).buckets.append(
-                    StrengthBucket(source_type, subtype, account, day, count)
+                    StrengthBucket(normalize_source_type(source_type), subtype, account, day, count)
                 )
             return inputs
         finally:
@@ -1304,11 +1357,12 @@ class InteractionStore:
             )
             result = {}
             for row in cursor.fetchall():
-                source_type = row[0]
+                source_type = normalize_source_type(row[0])
                 ts_str = row[1]
                 if ts_str:
-                    dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                    result[source_type] = _make_aware(dt)
+                    dt = _make_aware(datetime.fromisoformat(ts_str.replace("Z", "+00:00")))
+                    if source_type not in result or dt > result[source_type]:
+                        result[source_type] = dt
             return result
         finally:
             conn.close()
@@ -1357,12 +1411,14 @@ class InteractionStore:
                 )
                 for row in cursor.fetchall():
                     person_id = row[0]
-                    source_type = row[1]
+                    source_type = normalize_source_type(row[1])
                     ts_str = row[2]
                     if not ts_str:
                         continue
                     dt = _make_aware(datetime.fromisoformat(ts_str.replace("Z", "+00:00")))
-                    result.setdefault(person_id, {})[source_type] = dt
+                    by_source = result.setdefault(person_id, {})
+                    if source_type not in by_source or dt > by_source[source_type]:
+                        by_source[source_type] = dt
             return result
         finally:
             conn.close()
@@ -1507,7 +1563,7 @@ class InteractionStore:
             params.extend(ids)
 
         if source_types:
-            types = list(source_types)
+            types = expand_source_types(source_types)
             clauses.append(f"source_type IN ({','.join('?' * len(types))})")
             params.extend(types)
 
@@ -1596,7 +1652,11 @@ class InteractionStore:
                 """,
                 params,
             )
-            return [(row[0], row[1], row[2]) for row in cursor.fetchall()]
+            folded: dict[tuple[str, str], int] = {}
+            for day, source_type, count in cursor.fetchall():
+                key = (day, normalize_source_type(source_type))
+                folded[key] = folded.get(key, 0) + count
+            return [(day, source_type, count) for (day, source_type), count in folded.items()]
         finally:
             conn.close()
 
@@ -1642,7 +1702,14 @@ class InteractionStore:
                 """,
                 params,
             )
-            return [(row[0], row[1], row[2], row[3]) for row in cursor.fetchall()]
+            folded: dict[tuple[str, str, str], int] = {}
+            for day, person_id, source_type, count in cursor.fetchall():
+                key = (day, person_id, normalize_source_type(source_type))
+                folded[key] = folded.get(key, 0) + count
+            return [
+                (day, person_id, source_type, count)
+                for (day, person_id, source_type), count in folded.items()
+            ]
         finally:
             conn.close()
 
@@ -2028,15 +2095,17 @@ class InteractionStore:
         date extraction logic.
 
         Args:
-            source_type: The source type to delete (e.g., "vault", "granola")
+            source_type: The source type to delete (e.g., "vault", "meeting")
 
         Returns:
             Number of interactions deleted
         """
+        types = expand_source_types([source_type])
         conn = self._get_connection()
         try:
             cursor = conn.execute(
-                "DELETE FROM interactions WHERE source_type = ?", (source_type,)
+                f"DELETE FROM interactions WHERE source_type IN ({','.join('?' * len(types))})",
+                types,
             )
             conn.commit()
             return cursor.rowcount
@@ -2095,6 +2164,7 @@ class InteractionStore:
             )
             for row in cursor.fetchall():
                 by_source[row[0]] = row[1]
+            by_source = fold_legacy_counts(by_source)
 
             # Unique people
             unique_people = conn.execute(
@@ -2181,13 +2251,13 @@ class InteractionStore:
             # Build query - use < for specific date (exclusive upper bound), <= otherwise
             if use_less_than:
                 query = """
-                    SELECT id, person_id, timestamp, source_type, title, snippet, source_link, source_id
+                    SELECT id, person_id, timestamp, source_type, title, snippet, source_link, source_id, provider
                     FROM interactions
                     WHERE timestamp >= ? AND timestamp < ?
                 """
             else:
                 query = """
-                    SELECT id, person_id, timestamp, source_type, title, snippet, source_link, source_id
+                    SELECT id, person_id, timestamp, source_type, title, snippet, source_link, source_id, provider
                     FROM interactions
                     WHERE timestamp >= ? AND timestamp <= ?
                 """
@@ -2210,7 +2280,9 @@ class InteractionStore:
 
             # Filter by source type(s) - supports comma-separated values
             if source_type:
-                source_types = [s.strip() for s in source_type.split(",") if s.strip()]
+                source_types = expand_source_types(
+                    s.strip() for s in source_type.split(",") if s.strip()
+                )
                 if source_types:
                     placeholders = ','.join('?' * len(source_types))
                     query += f" AND source_type IN ({placeholders})"
@@ -2231,11 +2303,12 @@ class InteractionStore:
                     id=row['id'],
                     person_id=row['person_id'],
                     timestamp=datetime.fromisoformat(row['timestamp']),
-                    source_type=row['source_type'],
+                    source_type=normalize_source_type(row['source_type']),
                     title=row['title'],
                     snippet=row['snippet'],
                     source_link=row['source_link'],
                     source_id=row['source_id'],
+                    provider=row['provider'],
                 ))
 
             return interactions
@@ -2272,8 +2345,8 @@ class InteractionStore:
             count_parts.append(f"📧 {counts['gmail']} emails")
         if counts.get("calendar", 0):
             count_parts.append(f"📅 {counts['calendar']} meetings")
-        if counts.get("vault", 0) or counts.get("granola", 0):
-            notes = counts.get("vault", 0) + counts.get("granola", 0)
+        if counts.get("vault", 0) or counts.get("meeting", 0):
+            notes = counts.get("vault", 0) + counts.get("meeting", 0)
             count_parts.append(f"📝 {notes} notes")
 
         last_str = ""
@@ -2299,7 +2372,7 @@ class InteractionStore:
             badge = interaction.source_badge
 
             if interaction.source_link:
-                if interaction.source_type in ("vault", "granola"):
+                if interaction.source_type in ("vault", "meeting"):
                     lines.append(
                         f"- {badge} {date_str}: {interaction.title} — [[{interaction.title}]]"
                     )
@@ -2413,7 +2486,8 @@ def create_vault_interaction(
     title: str,
     timestamp: datetime,
     snippet: Optional[str] = None,
-    is_granola: bool = False,
+    is_meeting: bool = False,
+    provider: Optional[str] = None,
 ) -> Interaction:
     """
     Create an interaction from a vault note.
@@ -2424,7 +2498,8 @@ def create_vault_interaction(
         title: Note title (usually filename without .md)
         timestamp: Note date (from frontmatter or filename)
         snippet: First part of note content
-        is_granola: Whether this is a Granola meeting note
+        is_meeting: Whether this is a meeting note
+        provider: Tool that recorded a meeting note, if the note names one
 
     Returns:
         Interaction ready to be stored
@@ -2433,9 +2508,10 @@ def create_vault_interaction(
         id=str(uuid.uuid4()),
         person_id=person_id,
         timestamp=timestamp,
-        source_type="granola" if is_granola else "vault",
+        source_type="meeting" if is_meeting else "vault",
         title=title,
         snippet=snippet[:InteractionConfig.SNIPPET_LENGTH] if snippet else None,
         source_link=build_obsidian_link(file_path),
         source_id=file_path,
+        provider=provider,
     )

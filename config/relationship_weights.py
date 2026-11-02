@@ -208,7 +208,7 @@ INTERACTION_TYPE_WEIGHTS: dict[str, float] = {
 
     # Written content (you wrote about them - shows they're on your mind)
     "vault": 0.7,             # Mentioned in your notes
-    "granola": 0.8,           # Meeting notes (AI-generated)
+    "meeting": 0.8,           # Meeting notes (AI-generated)
 
     # Photos (face recognition - in photos together)
     "photos": 5.0,            # In photos together

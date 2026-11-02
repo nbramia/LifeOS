@@ -604,7 +604,8 @@ class TestRematchingLeavesMentionsAlone:
     def test_note_mentions_are_never_eligible(self, tmp_path):
         sources = SourceEntityStore(str(tmp_path / "crm.db"))
         self._unlinked(sources, "vault", "a")
-        self._unlinked(sources, "granola", "b")
+        self._unlinked(sources, "meeting", "b")
+        self._unlinked(sources, "granola", "d")
         self._unlinked(sources, "gmail", "c")
         eligible = sources.get_unlinked_for_rematching(max_capped_per_run=None)
         assert [e.source_type for e in eligible] == ["gmail"]
