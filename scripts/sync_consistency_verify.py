@@ -452,6 +452,7 @@ def _classify_missing_vault_files() -> dict:
                   guess; left alone for a human
     """
     from api.services.interaction_store import get_interaction_db_path
+    from api.services.meeting_source import COLLISION_SUFFIX
     from config.settings import settings
 
     conn = sqlite3.connect(get_interaction_db_path(), timeout=60.0)
@@ -459,7 +460,8 @@ def _classify_missing_vault_files() -> dict:
         known_paths = {
             row[0] for row in conn.execute(
                 "SELECT DISTINCT source_id FROM interactions "
-                "WHERE source_type IN ('vault', 'granola') AND source_id IS NOT NULL"
+                "WHERE source_type IN ('vault', 'meeting', 'granola') AND source_id IS NOT NULL "
+                f"AND source_id NOT LIKE '%{COLLISION_SUFFIX}%'"
             )
         }
     finally:

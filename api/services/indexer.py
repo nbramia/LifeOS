@@ -11,12 +11,14 @@ import threading
 import logging
 from pathlib import Path
 from datetime import datetime, timezone
+from typing import Optional
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler, FileSystemEvent
 
 from api.services.chunker import chunk_document, extract_frontmatter, add_context_to_chunks, normalize_tags, tag_phrase_key
 from api.services.vectorstore import VectorStore, is_people_tag
 from api.services.bm25_index import BM25Index
+from api.services.meeting_source import MEETING_SOURCE_TYPE, meeting_provider
 from api.services.people import extract_people_from_text, people_from_tags
 
 # V2 People System integration
@@ -31,7 +33,7 @@ try:
     from api.services.source_entity import (
         get_source_entity_store,
         create_vault_source_entity,
-        create_granola_source_entity,
+        create_meeting_source_entity,
     )
     HAS_V2_PEOPLE = True
 except ImportError:
@@ -408,15 +410,12 @@ class IndexerService:
         # Extract frontmatter
         frontmatter, body = extract_frontmatter(content)
 
-        # Determine if Granola note
-        is_granola = (
-            "granola_id" in frontmatter or
-            "wispr_id" in frontmatter or
-            "Granola" in str(path)
-        )
+        # A recorder id in frontmatter or a Granola folder makes this a meeting note
+        provider = meeting_provider(frontmatter)
+        is_meeting = provider is not None or "Granola" in str(path)
 
         # Chunk the document
-        chunks = chunk_document(content, is_granola=is_granola)
+        chunks = chunk_document(content, is_meeting=is_meeting)
 
         # Extract people from content (in addition to frontmatter)
         extracted_people = extract_people_from_text(body)
@@ -456,7 +455,9 @@ class IndexerService:
                     else:
                         logger.debug(f"Undated note (mtime {note_date.date()}): {path.name}")
 
-                affected_person_ids = self._sync_people_to_v2(path, all_people, note_date, is_granola)
+                affected_person_ids = self._sync_people_to_v2(
+                    path, all_people, note_date, is_meeting, provider
+                )
 
                 # Refresh stats for affected people (unless caller will batch refresh)
                 if affected_person_ids and not skip_stats_refresh:
@@ -637,7 +638,8 @@ class IndexerService:
         path: Path,
         people: list[str],
         note_date: datetime,
-        is_granola: bool = False,
+        is_meeting: bool = False,
+        provider: Optional[str] = None,
     ) -> set[str]:
         """
         Resolve extracted people and create vault mention interactions and source entities.
@@ -645,7 +647,7 @@ class IndexerService:
         Hooks into the v2 people system to:
         1. Resolve each person name to a PersonEntity (creating if needed)
         2. Create an interaction record for the vault mention
-        3. Create a source entity for the vault/granola mention (for split UI)
+        3. Create a source entity for the vault/meeting mention (for split UI)
 
         Note: PersonEntity stats (mention_count) are updated via refresh_person_stats()
         after sync completes, not manually here.
@@ -654,7 +656,8 @@ class IndexerService:
             path: Path to the note file
             people: List of extracted person names
             note_date: Date of the note (for interaction timestamp)
-            is_granola: Whether this is a Granola meeting note
+            is_meeting: Whether this is a meeting note
+            provider: Tool that recorded a meeting note, if the note names one
 
         Returns:
             Set of affected person IDs (for stats refresh)
@@ -697,7 +700,8 @@ class IndexerService:
                     title=note_title,
                     timestamp=note_date,
                     snippet=None,  # Could extract first N chars if desired
-                    is_granola=is_granola,
+                    is_meeting=is_meeting,
+                    provider=provider,
                 )
 
                 # Add interaction (avoiding duplicates on re-index)
@@ -711,14 +715,15 @@ class IndexerService:
                 # This uses add_or_update so re-indexing won't create duplicates
                 source_metadata = {
                     "note_title": note_title,
-                    "is_granola": is_granola,
+                    "is_meeting": is_meeting,
                 }
-                if is_granola:
-                    source_entity = create_granola_source_entity(
+                if is_meeting:
+                    source_entity = create_meeting_source_entity(
                         file_path=file_path_str,
                         person_name=person_name,
                         observed_at=note_date,
                         metadata=source_metadata,
+                        provider=provider,
                     )
                 else:
                     source_entity = create_vault_source_entity(
@@ -742,8 +747,8 @@ class IndexerService:
                     if file_path_str not in entity.related_notes:
                         entity.related_notes.append(file_path_str)
 
-                    # Add vault/granola to sources if not present
-                    source_type = "granola" if is_granola else "vault"
+                    # Add vault/meeting to sources if not present
+                    source_type = MEETING_SOURCE_TYPE if is_meeting else "vault"
                     if source_type not in entity.sources:
                         entity.sources.append(source_type)
 

@@ -147,7 +147,7 @@ def main():
         # Get all vault interactions for this entity
         cursor = conn.execute("""
             SELECT id, source_id, title FROM interactions
-            WHERE person_id = ? AND source_type IN ('vault', 'granola')
+            WHERE person_id = ? AND source_type IN ('vault', 'meeting', 'granola')
         """, (source_id,))
         interactions = cursor.fetchall()
 
@@ -176,7 +176,7 @@ def main():
 
             conn.execute("""
                 UPDATE interactions SET person_id = ?
-                WHERE person_id = ? AND source_type IN ('vault', 'granola')
+                WHERE person_id = ? AND source_type IN ('vault', 'meeting', 'granola')
             """, (target_id, source_id))
             affected_person_ids.add(source_id)
             affected_person_ids.add(target_id)
@@ -231,7 +231,7 @@ def main():
             # Delete all incorrectly linked interactions
             conn.execute("""
                 DELETE FROM interactions
-                WHERE person_id = ? AND source_type IN ('vault', 'granola')
+                WHERE person_id = ? AND source_type IN ('vault', 'meeting', 'granola')
             """, (source_id,))
             affected_person_ids.add(source_id)
             print(f"  -> Deleted {len(interactions)} (no match)")

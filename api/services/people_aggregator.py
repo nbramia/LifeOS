@@ -5,7 +5,7 @@ Aggregates people from:
 - LinkedIn connections CSV
 - Gmail contacts (last 2 years)
 - Calendar attendees
-- Granola meeting notes (via Obsidian)
+- Meeting notes (via Obsidian)
 - Obsidian note mentions
 """
 import csv
@@ -904,7 +904,7 @@ class PeopleAggregator:
 
         Args:
             name: Person's name
-            source: Source identifier (gmail, calendar, linkedin, obsidian, granola)
+            source: Source identifier (gmail, calendar, linkedin, obsidian, meeting)
             email: Email address
             company: Company name
             position: Job position
@@ -1020,7 +1020,7 @@ class PeopleAggregator:
         people = extract_people_from_text(content)
 
         # Determine source based on path
-        source = 'granola' if 'granola' in file_path.lower() else 'obsidian'
+        source = 'meeting' if 'granola' in file_path.lower() else 'obsidian'
 
         for name in people:
             self.add_person_from_source(

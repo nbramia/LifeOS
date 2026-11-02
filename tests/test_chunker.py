@@ -461,7 +461,7 @@ Summary content here.
 - Item 1
 - Item 2
 """
-        chunks = chunk_document(content, is_granola=True)
+        chunks = chunk_document(content, is_meeting=True)
 
         assert len(chunks) >= 2
         headers = [c.get("header", "") for c in chunks]
@@ -486,7 +486,7 @@ Summary content here.
         assert len(chunks) > 1
 
     def test_chunk_explicit_granola_flag(self):
-        """Test explicit is_granola flag."""
+        """Test explicit is_meeting flag."""
         content = """## Section One
 
 Content
@@ -495,7 +495,7 @@ Content
 
 More content
 """
-        chunks = chunk_document(content, is_granola=True)
+        chunks = chunk_document(content, is_meeting=True)
 
         # Should chunk by headers even without frontmatter
         assert len(chunks) >= 2
@@ -510,8 +510,8 @@ granola_id: auto-detected
 
 ## Second
 """
-        # Not passing is_granola, should detect from frontmatter
-        chunks = chunk_document(content, is_granola=False)
+        # Not passing is_meeting, should detect from frontmatter
+        chunks = chunk_document(content, is_meeting=False)
 
         # Should still chunk by headers due to granola_id
         assert len(chunks) >= 2
@@ -527,7 +527,7 @@ source: wispr
 
 ## Second
 """
-        chunks = chunk_document(content, is_granola=False)
+        chunks = chunk_document(content, is_meeting=False)
 
         assert len(chunks) >= 2
 
@@ -545,7 +545,7 @@ Content
 
 Content
 """
-        chunks = chunk_document(content, is_granola=True)
+        chunks = chunk_document(content, is_meeting=True)
 
         for i, chunk in enumerate(chunks):
             assert "chunk_index" in chunk
@@ -789,7 +789,7 @@ We discussed the Q1 roadmap and priorities.
 Follow up meeting scheduled for next week.
 """
         # Chunk the document
-        chunks = chunk_document(content, is_granola=True)
+        chunks = chunk_document(content, is_meeting=True)
 
         # Add context
         file_path = Path("/vault/Meetings/Q1-planning.md")

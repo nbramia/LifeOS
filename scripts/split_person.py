@@ -7,7 +7,7 @@ or creates a new person if needed.
 
 Usage:
     # Move vault sources from person A to person B
-    uv run python scripts/split_person.py --from-person "Hayley" --to-person "Hayleycurrier" --source-types vault granola
+    uv run python scripts/split_person.py --from-person "Hayley" --to-person "Hayleycurrier" --source-types vault meeting
 
     # Move sources to a new person
     uv run python scripts/split_person.py --from-person "Hayley" --to-person NEW --new-name "Hayley Currier" --source-types vault
@@ -32,6 +32,7 @@ from api.services.person_entity import get_person_entity_store, PersonEntity
 from api.services.source_entity import get_source_entity_store
 from api.services.interaction_store import get_interaction_db_path
 from api.services.link_override import get_link_override_store, LinkOverride
+from api.services.meeting_source import expand_source_types, normalize_source_type
 from config.settings import settings
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
@@ -178,7 +179,7 @@ def create_link_overrides(
     patterns = {}
     for se in source_entities:
         name = se.get('observed_name', '')
-        source_type = se.get('source_type', '')
+        source_type = normalize_source_type(se.get('source_type', ''))
         source_id = se.get('source_id', '')
 
         if not name:
@@ -193,7 +194,7 @@ def create_link_overrides(
             }
 
         # Extract context from source_id (for vault sources)
-        if source_type in ('vault', 'granola') and source_id:
+        if source_type in ('vault', 'meeting') and source_id:
             _work = settings.current_work_path.rstrip('/')
             if _work in source_id:
                 patterns[key]['contexts'].add(f'{_work}/')
@@ -246,7 +247,7 @@ def split_person(from_name: str, to_name: str, source_types: list[str],
     Args:
         from_name: Name of person to take sources from
         to_name: Name of person to give sources to, or "NEW" to create new
-        source_types: List of source types to move (e.g., ["vault", "granola"])
+        source_types: List of source types to move (e.g., ["vault", "meeting"])
         new_person_name: Name for new person if to_name is "NEW"
         dry_run: If True, don't make changes
 
@@ -306,6 +307,7 @@ def split_person(from_name: str, to_name: str, source_types: list[str],
         logger.info(f"To person: {to_person.canonical_name} ({to_person.id[:8]})")
 
     # Get source entities to be moved
+    source_types = expand_source_types(source_types)
     source_entities = get_source_entities_for_person(from_person.id, source_types)
     logger.info(f"\nSource entities to move ({len(source_entities)}):")
     for se in source_entities[:10]:
@@ -385,7 +387,7 @@ def main():
     parser = argparse.ArgumentParser(description='Split incorrectly merged person entities')
     parser.add_argument('--from-person', required=True, help='Name of person to take sources from')
     parser.add_argument('--to-person', required=True, help='Name of person to give sources to, or NEW')
-    parser.add_argument('--source-types', nargs='+', required=True, help='Source types to move (e.g., vault granola)')
+    parser.add_argument('--source-types', nargs='+', required=True, help='Source types to move (e.g., vault meeting)')
     parser.add_argument('--new-name', help='Name for new person if --to-person is NEW')
     parser.add_argument('--no-overrides', action='store_true', help='Skip creating link override rules')
     parser.add_argument('--execute', action='store_true', help='Actually apply changes')

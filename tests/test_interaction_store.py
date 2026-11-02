@@ -52,7 +52,7 @@ class TestInteraction:
             "gmail": "📧",
             "calendar": "📅",
             "vault": "📝",
-            "granola": "📝",
+            "meeting": "📝",
         }
 
         for source_type, expected_badge in badges.items():
@@ -830,24 +830,26 @@ class TestInteractionFactories:
             title="Meeting Notes",
             timestamp=datetime(2024, 6, 15),
             snippet="We discussed...",
-            is_granola=False,
+            is_meeting=False,
         )
 
         assert interaction.source_type == "vault"
         assert interaction.title == "Meeting Notes"
         assert "obsidian://" in interaction.source_link
 
-    def test_create_granola_interaction(self):
-        """Test Granola (meeting note) interaction factory."""
+    def test_create_meeting_interaction(self):
+        """A meeting note gets the meeting source type and its provider."""
         interaction = create_vault_interaction(
             person_id="person-123",
             file_path="/Users/test/vault/Granola/meeting.md",
             title="Standup",
             timestamp=datetime(2024, 6, 15),
-            is_granola=True,
+            is_meeting=True,
+            provider="wispr",
         )
 
-        assert interaction.source_type == "granola"
+        assert interaction.source_type == "meeting"
+        assert interaction.provider == "wispr"
 
 
 class TestTimezoneHandling:

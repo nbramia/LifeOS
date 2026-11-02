@@ -20,6 +20,7 @@ import time
 from fastapi import APIRouter, HTTPException, Query, UploadFile, File
 from pydantic import BaseModel, Field
 
+from api.services.meeting_source import fold_legacy_counts, normalize_source_type
 from api.services.person_entity import PersonEntity, get_person_entity_store, compute_person_category
 from api.services.interaction_store import get_interaction_store
 from api.services.aggregate_cache import cached_aggregate
@@ -794,7 +795,8 @@ def list_people(
 
     # Apply source filter
     if source:
-        people = [p for p in people if source in p.sources]
+        wanted_source = normalize_source_type(source)
+        people = [p for p in people if wanted_source in p.sources]
 
     # Apply interactions filter (boolean)
     if has_interactions is not None:
@@ -1122,7 +1124,7 @@ def _recalculate_relationship_with_me(person_id: str, my_person_id: str, int_con
         GROUP BY source_type
     """, (person_id,))
 
-    counts = {row[0]: row[1] for row in cursor.fetchall()}
+    counts = fold_legacy_counts({row[0]: row[1] for row in cursor.fetchall()})
 
     # Get timestamps
     cursor = int_conn.execute("""
@@ -1285,7 +1287,7 @@ def get_person_contact_sources(person_id: str):
     aggregated: dict[tuple[str, str], dict] = {}
 
     for row in cursor:
-        source_type = row['source_type']
+        source_type = normalize_source_type(row['source_type'])
         observed_email = row['observed_email']
         observed_phone = row['observed_phone']
         source_id = row['source_id']
@@ -1305,8 +1307,8 @@ def get_person_contact_sources(person_id: str):
             key = ('slack_user', source_id)
         elif source_type == 'linkedin' and source_id:
             key = ('linkedin_profile', source_id)
-        elif source_type in ('vault', 'granola') and observed_name:
-            # For vault/granola, group by name since there's no email/phone
+        elif source_type in ('vault', 'meeting') and observed_name:
+            # For vault/meeting, group by name since there's no email/phone
             key = ('name_only', observed_name.lower())
         else:
             # Skip entities without meaningful identifiers
@@ -1423,7 +1425,7 @@ def get_person_source_entities(
 
         source_entities.append({
             'id': row['id'],
-            'source_type': row['source_type'],
+            'source_type': normalize_source_type(row['source_type']),
             'source_id': source_id,
             'source_id_display': source_id_display,
             'observed_name': row['observed_name'],
@@ -1631,7 +1633,7 @@ def split_person(request: PersonSplitRequest):
             patterns = {}
             for se in source_entity_details:
                 name = se.get('observed_name', '')
-                source_type = se.get('source_type', '')
+                source_type = normalize_source_type(se.get('source_type', ''))
                 source_id = se.get('source_id', '')
 
                 if not name:
@@ -1642,7 +1644,7 @@ def split_person(request: PersonSplitRequest):
                     patterns[key] = {'name': name, 'source_type': source_type, 'contexts': set()}
 
                 # Extract context patterns from source_id
-                if source_type in ('vault', 'granola') and source_id:
+                if source_type in ('vault', 'meeting') and source_id:
                     _work = settings.current_work_path.rstrip('/')
                     if _work in source_id:
                         patterns[key]['contexts'].add(f'{_work}/')
@@ -1739,7 +1741,7 @@ def get_person_timeline(
     source_type: Optional[str] = Query(
         default=None,
         description="Filter by source type. Supports comma-separated values for compound "
-                    "filters (e.g., 'imessage,whatsapp' for all messages, 'vault,granola' for notes)"
+                    "filters (e.g., 'imessage,whatsapp' for all messages, 'vault,meeting' for notes)"
     ),
     days_back: int = Query(
         default=InteractionConfig.DEFAULT_WINDOW_DAYS,
@@ -1756,7 +1758,7 @@ def get_person_timeline(
 
     Returns emails, meetings, notes, and other interactions in timeline format.
 
-    Source types: gmail, calendar, imessage, whatsapp, phone, slack, vault, granola
+    Source types: gmail, calendar, imessage, whatsapp, phone, slack, vault, meeting
     Compound filters: Use comma-separated values like "imessage,whatsapp" for messages.
     """
     start_time = time.time()
@@ -1805,7 +1807,7 @@ SOURCE_BADGES = {
     "gmail": "📧",
     "calendar": "📅",
     "vault": "📝",
-    "granola": "📝",
+    "meeting": "📝",
     "imessage": "💬",
     "whatsapp": "💬",
     "contacts": "📇",
@@ -3442,7 +3444,7 @@ def get_me_timeline(
     source_type: Optional[str] = Query(
         default=None,
         description="Filter by source type. Supports comma-separated values for compound "
-                    "filters (e.g., 'imessage,whatsapp' for all messages, 'vault,granola' for notes)"
+                    "filters (e.g., 'imessage,whatsapp' for all messages, 'vault,meeting' for notes)"
     ),
     days_back: int = Query(
         default=InteractionConfig.DEFAULT_WINDOW_DAYS,
@@ -3460,7 +3462,7 @@ def get_me_timeline(
     Returns ALL interactions across all people (since all interactions involve the owner).
     This is different from /people/{id}/timeline which only shows interactions with one person.
 
-    Source types: gmail, calendar, imessage, whatsapp, phone, slack, vault, granola
+    Source types: gmail, calendar, imessage, whatsapp, phone, slack, vault, meeting
     Compound filters: Use comma-separated values like "imessage,whatsapp" for messages.
     """
     from datetime import timedelta
@@ -5090,6 +5092,12 @@ def get_data_health():
         """)
         for row in cursor.fetchall():
             source_type, total, earliest, latest = row
+            source_type = normalize_source_type(source_type)
+            existing = result["sources"].get(source_type)
+            if existing:
+                total += existing["total_interactions"]
+                earliest = min(earliest, existing["earliest"])
+                latest = max(latest, existing["latest"])
             result["sources"][source_type] = {
                 "total_interactions": total,
                 "earliest": earliest,
@@ -5150,6 +5158,11 @@ def get_data_health():
         result["source_entities"] = {}
         for row in cursor.fetchall():
             source_type, total, linked = row
+            source_type = normalize_source_type(source_type)
+            existing = result["source_entities"].get(source_type)
+            if existing:
+                total += existing["total"]
+                linked = (linked or 0) + existing["linked"]
             result["source_entities"][source_type] = {
                 "total": total,
                 "linked": linked or 0,

@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-11-01
+**Last Updated:** 2026-11-02
 
 Every `/api/crm/*` HTTP endpoint. Split out of the main [api-reference.md](api-reference.md) because the CRM endpoint catalog is large enough to deserve its own file. For the consumer view of the CRM features these endpoints back, see the [CRM specs](crm-ui.md).
 
@@ -165,7 +165,7 @@ Contact sources are the meaningful units for entity splitting — each represent
 - `phone` — Phone number in E.164 format (appears in imessage, whatsapp, phone)
 - `slack_user` — Slack workspace user ID
 - `linkedin_profile` — LinkedIn profile URL
-- `name_only` — Vault/Granola mentions with no email/phone
+- `name_only` — Vault and meeting note mentions with no email/phone
 
 ### POST /api/crm/people/split
 

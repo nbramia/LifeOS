@@ -55,6 +55,7 @@ _ALLOWLIST_VERIFIED_SAFE = frozenset({
     "api/services/interaction_store.py",
     "api/services/job_queue.py",
     "api/services/journal_ingest_store.py",
+    "api/services/meeting_source.py",
     "api/services/person_facts.py",
     "api/services/relationship.py",
     "api/services/relationship_insights.py",

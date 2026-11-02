@@ -17,6 +17,16 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
+from api.services.meeting_source import (
+    LEGACY_MEETING_SOURCE_TYPE,
+    MEETING_SOURCE_TYPE,
+    ensure_provider_column,
+    expand_source_types,
+    fold_legacy_counts,
+    migrate_crm_db,
+    normalize_source_type,
+    run_at_store_init,
+)
 from api.utils.datetime_utils import make_aware as _make_aware
 from api.utils.db_paths import get_crm_db_path
 from config.marketing_patterns import is_blocklisted_domain
@@ -36,11 +46,17 @@ SOURCE_TYPES = {
     "phone_contacts",
     "linkedin",
     "vault",
-    "granola",
+    "meeting",
     "phone_call",
     "phone",
     "photos",
 }
+
+
+def _type_pair(source_type: str) -> tuple[str, str]:
+    """Two values for ``source_type IN (?, ?)``; meeting names match rows under either."""
+    types = expand_source_types([source_type])
+    return (types[0], types[-1])
 
 
 def _is_blocklisted_entity(entity: "SourceEntity") -> bool:
@@ -99,6 +115,10 @@ class SourceEntity:
     match_attempted_at: Optional[datetime] = None
     match_attempt_count: int = 0
 
+    # Meeting notes only: the tool that recorded the note ("wispr", "granola"),
+    # NULL when the note names neither.
+    provider: Optional[str] = None
+
     def __post_init__(self):
         """Validate source type."""
         if self.source_type and self.source_type not in SOURCE_TYPES:
@@ -138,7 +158,8 @@ class SourceEntity:
         # Row order: id, source_type, source_id, observed_name, observed_email,
         #            observed_phone, metadata, canonical_person_id, link_confidence,
         #            link_status, linked_at, observed_at, created_at,
-        #            match_attempted_at[13], match_attempt_count[14], link_method[15]
+        #            match_attempted_at[13], match_attempt_count[14], link_method[15],
+        #            provider[16]
 
         observed_at = datetime.fromisoformat(row[11]) if row[11] else datetime.now(timezone.utc)
         created_at = datetime.fromisoformat(row[12]) if row[12] else datetime.now(timezone.utc)
@@ -148,10 +169,11 @@ class SourceEntity:
         )
         match_attempt_count = row[14] if len(row) > 14 and row[14] is not None else 0
         link_method = row[15] if len(row) > 15 else None
+        provider = row[16] if len(row) > 16 else None
 
         return cls(
             id=row[0],
-            source_type=row[1],
+            source_type=normalize_source_type(row[1]),
             source_id=row[2],
             observed_name=row[3],
             observed_email=row[4],
@@ -166,6 +188,7 @@ class SourceEntity:
             created_at=_make_aware(created_at),
             match_attempted_at=_make_aware(match_attempted_at),
             match_attempt_count=match_attempt_count,
+            provider=provider,
         )
 
     @property
@@ -181,7 +204,7 @@ class SourceEntity:
             "contacts": "📱",
             "linkedin": "💼",
             "vault": "📝",
-            "granola": "📝",
+            "meeting": "📝",
             "phone_call": "📞",
             "photos": "📷",
         }
@@ -315,10 +338,13 @@ class SourceEntityStore:
                 WHERE canonical_person_id IS NULL
             """)
 
+            ensure_provider_column(conn, "source_entities")
+
             conn.commit()
             logger.info(f"Initialized source entity database at {self.db_path}")
         finally:
             conn.close()
+        run_at_store_init(migrate_crm_db, self.db_path)
 
     def _get_connection(self) -> sqlite3.Connection:
         """Get a database connection."""
@@ -368,8 +394,8 @@ class SourceEntityStore:
                 INSERT INTO source_entities
                 (id, source_type, source_id, observed_name, observed_email,
                  observed_phone, metadata, canonical_person_id, link_confidence,
-                 link_status, link_method, linked_at, observed_at, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 link_status, link_method, linked_at, observed_at, created_at, provider)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 entity.id,
                 entity.source_type,
@@ -385,6 +411,7 @@ class SourceEntityStore:
                 entity.linked_at.isoformat() if entity.linked_at else None,
                 entity.observed_at.isoformat(),
                 entity.created_at.isoformat(),
+                entity.provider,
             ))
             conn.commit()
             return entity
@@ -457,7 +484,7 @@ class SourceEntityStore:
         try:
             conn.execute("""
                 UPDATE source_entities SET
-                    source_type = ?,
+                    source_type = CASE WHEN source_type = ? AND ? = ? THEN source_type ELSE ? END,
                     source_id = ?,
                     observed_name = ?,
                     observed_email = ?,
@@ -468,9 +495,15 @@ class SourceEntityStore:
                     link_status = ?,
                     link_method = ?,
                     linked_at = ?,
-                    observed_at = ?
+                    observed_at = ?,
+                    provider = COALESCE(?, provider)
                 WHERE id = ?
             """, (
+                # A row still awaiting migration keeps its label, so the migration
+                # relabels it and assigns its provider.
+                LEGACY_MEETING_SOURCE_TYPE,
+                entity.source_type,
+                MEETING_SOURCE_TYPE,
                 entity.source_type,
                 entity.source_id,
                 entity.observed_name,
@@ -483,6 +516,7 @@ class SourceEntityStore:
                 entity.link_method,
                 entity.linked_at.isoformat() if entity.linked_at else None,
                 entity.observed_at.isoformat(),
+                entity.provider,
                 entity.id,
             ))
             conn.commit()
@@ -601,14 +635,19 @@ class SourceEntityStore:
             conn.close()
 
     def get_by_source(self, source_type: str, source_id: str) -> Optional[SourceEntity]:
-        """Get entity by source type and ID."""
+        """Get entity by source type and ID. Either meeting name finds either row."""
         if not source_id:
             return None
         conn = self._get_connection()
         try:
             cursor = conn.execute(
-                "SELECT * FROM source_entities WHERE source_type = ? AND source_id = ?",
-                (source_type, source_id)
+                """
+                SELECT * FROM source_entities
+                WHERE source_type IN (?, ?) AND source_id = ?
+                ORDER BY source_type = ? DESC
+                LIMIT 1
+                """,
+                (*_type_pair(source_type), source_id, normalize_source_type(source_type)),
             )
             row = cursor.fetchone()
             if row:
@@ -640,16 +679,16 @@ class SourceEntityStore:
                 if limit:
                     cursor = conn.execute("""
                         SELECT * FROM source_entities
-                        WHERE canonical_person_id = ? AND source_type = ?
+                        WHERE canonical_person_id = ? AND source_type IN (?, ?)
                         ORDER BY observed_at DESC
                         LIMIT ?
-                    """, (canonical_person_id, source_type, limit))
+                    """, (canonical_person_id, *_type_pair(source_type), limit))
                 else:
                     cursor = conn.execute("""
                         SELECT * FROM source_entities
-                        WHERE canonical_person_id = ? AND source_type = ?
+                        WHERE canonical_person_id = ? AND source_type IN (?, ?)
                         ORDER BY observed_at DESC
-                    """, (canonical_person_id, source_type))
+                    """, (canonical_person_id, *_type_pair(source_type)))
             else:
                 if limit:
                     cursor = conn.execute("""
@@ -767,10 +806,10 @@ class SourceEntityStore:
             if source_type:
                 cursor = conn.execute("""
                     SELECT * FROM source_entities
-                    WHERE canonical_person_id IS NULL AND source_type = ?
+                    WHERE canonical_person_id IS NULL AND source_type IN (?, ?)
                     ORDER BY observed_at DESC
                     LIMIT ?
-                """, (source_type, limit))
+                """, (*_type_pair(source_type), limit))
             else:
                 cursor = conn.execute("""
                     SELECT * FROM source_entities
@@ -1133,10 +1172,10 @@ class SourceEntityStore:
                 cursor = conn.execute("""
                     SELECT * FROM source_entities
                     WHERE canonical_person_id IS NULL
-                      AND source_type = ?
+                      AND source_type IN (?, ?)
                       AND (match_attempted_at IS NULL OR match_attempted_at < ?)
                     ORDER BY observed_at DESC
-                """, (source_type, base_cutoff))
+                """, (*_type_pair(source_type), base_cutoff))
             else:
                 cursor = conn.execute("""
                     SELECT * FROM source_entities
@@ -1251,9 +1290,9 @@ class SourceEntityStore:
                 cursor = conn.execute("""
                     SELECT observed_email FROM source_entities
                     WHERE canonical_person_id IS NULL
-                      AND source_type = ?
+                      AND source_type IN (?, ?)
                       AND match_attempt_count >= ?
-                """, (source_type, max_attempts))
+                """, (*_type_pair(source_type), max_attempts))
             else:
                 cursor = conn.execute("""
                     SELECT observed_email FROM source_entities
@@ -1337,6 +1376,7 @@ class SourceEntityStore:
             """)
             for row in cursor.fetchall():
                 by_source[row[0]] = row[1]
+            by_source = fold_legacy_counts(by_source)
 
             by_status = {}
             cursor = conn.execute("""
@@ -1544,7 +1584,7 @@ def create_vault_source_entity(
         file_path: Path to the vault note file
         person_name: Name of the person mentioned
         observed_at: When the note was created/modified
-        metadata: Additional metadata (note_title, is_granola, etc.)
+        metadata: Additional metadata (note_title, is_meeting, etc.)
 
     Returns:
         SourceEntity for this vault mention
@@ -1561,30 +1601,33 @@ def create_vault_source_entity(
     )
 
 
-def create_granola_source_entity(
+def create_meeting_source_entity(
     file_path: str,
     person_name: str,
     observed_at: Optional[datetime] = None,
     metadata: Optional[dict] = None,
+    provider: Optional[str] = None,
 ) -> SourceEntity:
     """
-    Create a source entity from a Granola meeting note mention.
+    Create a source entity from a meeting note mention.
 
     Args:
-        file_path: Path to the Granola note file
+        file_path: Path to the meeting note file
         person_name: Name of the person mentioned
         observed_at: When the meeting occurred
-        metadata: Additional metadata (note_title, granola_id, etc.)
+        metadata: Additional metadata (note_title, is_meeting, etc.)
+        provider: Tool that recorded the note, if the note names one
 
     Returns:
-        SourceEntity for this Granola mention
+        SourceEntity for this meeting mention
     """
     # Use file_path:person_name as unique source_id
     source_id = f"{file_path}:{person_name}"
     return SourceEntity(
-        source_type="granola",
+        source_type=MEETING_SOURCE_TYPE,
         source_id=source_id,
         observed_name=person_name,
         observed_at=observed_at or datetime.now(timezone.utc),
         metadata=metadata or {},
+        provider=provider,
     )

@@ -22,6 +22,11 @@ from typing import Iterable, Optional, TYPE_CHECKING
 if TYPE_CHECKING:
     from api.services.people_aggregator import PersonRecord
 
+from api.services.meeting_source import (
+    migrate_crm_db,
+    normalize_sources,
+    run_at_store_init,
+)
 from api.utils.datetime_utils import make_aware as _make_aware
 
 logger = logging.getLogger(__name__)
@@ -74,7 +79,7 @@ class PersonEntity:
     vault_contexts: list[str] = field(default_factory=list)  # ["Work/ML/", "Personal/"]
 
     # Source tracking
-    sources: list[str] = field(default_factory=list)  # linkedin, gmail, calendar, vault, granola
+    sources: list[str] = field(default_factory=list)  # linkedin, gmail, calendar, vault, meeting
 
     # Timestamps
     first_seen: Optional[datetime] = None
@@ -615,6 +620,7 @@ class PersonEntityStore:
             conn.commit()
         finally:
             conn.close()
+        run_at_store_init(migrate_crm_db, str(self.db_path))
 
     def _get_connection(self) -> sqlite3.Connection:
         """Get a new SQLite connection with WAL mode and row factory."""
@@ -667,7 +673,7 @@ class PersonEntityStore:
             entity.linkedin_url,
             entity.category,
             json.dumps(entity.vault_contexts),
-            json.dumps(entity.sources),
+            json.dumps(normalize_sources(entity.sources)),
             entity.first_seen.isoformat() if entity.first_seen else None,
             entity.meeting_count,
             entity.email_count,
@@ -700,6 +706,7 @@ class PersonEntityStore:
                            'aliases', 'phone_numbers', 'tags'):
             val = data.get(list_field)
             data[list_field] = json.loads(val) if val else []
+        data['sources'] = normalize_sources(data['sources'])
         # Convert SQLite integer to boolean
         data['hidden'] = bool(data.get('hidden', 0))
         data['is_peripheral_contact'] = bool(data.get('is_peripheral_contact', 0))
@@ -1423,7 +1430,7 @@ class PersonEntityStore:
             by_source: dict[str, int] = {}
             for row in conn.execute("SELECT sources FROM person_entities"):
                 sources = json.loads(row['sources']) if row['sources'] else []
-                for source in sources:
+                for source in normalize_sources(sources):
                     by_source[source] = by_source.get(source, 0) + 1
 
             return {

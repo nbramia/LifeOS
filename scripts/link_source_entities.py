@@ -45,6 +45,7 @@ from api.services.source_entity import (
     LINK_STATUS_AUTO,
 )
 from api.services.entity_resolver import get_entity_resolver
+from api.services.meeting_source import normalize_source_type
 from config.marketing_patterns import is_blocklisted_domain
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
@@ -303,9 +304,9 @@ Examples:
     )
     parser.add_argument(
         '--source-type',
-        type=str,
+        type=normalize_source_type,
         choices=['gmail', 'calendar', 'slack', 'imessage', 'whatsapp', 'signal',
-                 'contacts', 'phone_contacts', 'linkedin', 'vault', 'granola',
+                 'contacts', 'phone_contacts', 'linkedin', 'vault', 'meeting',
                  'phone_call', 'phone', 'photos'],
         help='Only process entities from this source type'
     )

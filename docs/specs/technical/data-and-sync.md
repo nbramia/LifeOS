@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Data Pipeline
-> **Last Updated:** 2026-11-01
+> **Last Updated:** 2026-11-02
 
 How LifeOS ingests and stores data from multiple sources.
 
@@ -37,7 +37,7 @@ How LifeOS ingests and stores data from multiple sources.
 | Vault Notes | Obsidian markdown | Name mentions, context paths |
 | LinkedIn | CSV Import | Connections, companies, titles |
 | LinkedIn Profiles | Browser Scraping | Full profile data (experience, education, skills) |
-| Granola | Vault file watcher (notes placed by external classifier) | Meeting transcripts, attendees |
+| Meeting notes (Wispr, Granola) | Vault file watcher (notes placed by external classifier) | Meeting transcripts, attendees |
 
 ### Example Data Volume
 
@@ -205,6 +205,20 @@ auto-resolved by the next successful run of that source.
 | `result` | TEXT | JSON-encoded scores for the period |
 | `model` | TEXT | LLM model that produced `result` |
 | `created_at` / `updated_at` | TEXT | Timestamps |
+
+### Meeting Source Type
+
+Meeting rows in `interactions` and `source_entities` carry source type `meeting` and a `provider` read from the note's frontmatter. A store initializing runs `api/services/meeting_source.py`, which relabels any `granola` rows and rewrites person `sources` lists:
+
+- **One transaction per database.** `crm.db` holds source entities and person entities, so both change together. A failure rolls back, logs `MEETING SOURCE MIGRATION FAILED`, and is retried by the next store initialization.
+- **Concurrency.** The transaction is `BEGIN IMMEDIATE`, so concurrent initializers serialize and the later one finds nothing to do. Under WAL, readers are not blocked. Person updates change only `sources` under that lock, and `PersonEntityStore` normalizes `sources` on every read and write.
+- **Providers.** Each distinct note's frontmatter is read once, before the transaction opens. `wispr_id` gives `wispr`; anything else, including a missing note, gives `granola`. Paths stored by another machine are also tried under this vault by the vault folder's name. If the vault is missing, empty, or contains none of 20 or more notes, rows are relabelled with a null provider, listed in `meeting_provider_backfill`, and completed at a later initialization.
+- **Collisions.** A migrated row keeps its id and `source_id`. A `meeting` row with the same `source_id` and the same person link is a duplicate and is removed. One with a different link stays, with `#dup-<id>` appended to its `source_id`, which path checks skip.
+- **Cost once complete.** An indexed existence check per row table and a `sqlite_master` lookup, with no scanning or writing. The existence check also catches a `granola` row written by a process that hasn't restarted yet.
+
+Reads treat `granola` as `meeting` (row types, filters, and counts), so meeting data stays visible while a store awaits migration.
+
+`scripts/migrate_meeting_source_type.py` runs the migration or `--rollback` against explicitly named database files, and reports counts per source type and per person before and after. Rollback belongs before reverting the code, with services stopped, because a store initializing on this code relabels the rows again.
 
 ### Backups
 

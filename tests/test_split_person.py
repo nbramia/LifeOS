@@ -258,7 +258,7 @@ class TestSplitPersonConsistency:
 
 
 class TestVaultSourceEntityCreation:
-    """Tests for vault/granola source entity factory functions."""
+    """Tests for vault/meeting source entity factory functions."""
 
     def test_vault_source_entity_has_correct_type(self):
         """Vault source entity has source_type='vault'."""
@@ -300,28 +300,30 @@ class TestVaultSourceEntityCreation:
         entity = create_vault_source_entity(
             file_path="/vault/note.md",
             person_name="John Doe",
-            metadata={"note_title": "Meeting Notes", "is_granola": False},
+            metadata={"note_title": "Meeting Notes", "is_meeting": False},
         )
 
         assert entity.metadata["note_title"] == "Meeting Notes"
-        assert entity.metadata["is_granola"] is False
+        assert entity.metadata["is_meeting"] is False
 
-    def test_granola_source_entity_has_correct_type(self):
-        """Granola source entity has source_type='granola'."""
-        from api.services.source_entity import create_granola_source_entity
+    def test_meeting_source_entity_has_correct_type(self):
+        """Meeting source entity has source_type='meeting' and its provider."""
+        from api.services.source_entity import create_meeting_source_entity
 
-        entity = create_granola_source_entity(
+        entity = create_meeting_source_entity(
             file_path="/vault/meeting.md",
             person_name="Jane Smith",
+            provider="wispr",
         )
 
-        assert entity.source_type == "granola"
+        assert entity.source_type == "meeting"
+        assert entity.provider == "wispr"
 
-    def test_granola_source_entity_has_unique_source_id(self):
-        """Granola source ID combines file path and person name."""
-        from api.services.source_entity import create_granola_source_entity
+    def test_meeting_source_entity_has_unique_source_id(self):
+        """Meeting source ID combines file path and person name."""
+        from api.services.source_entity import create_meeting_source_entity
 
-        entity = create_granola_source_entity(
+        entity = create_meeting_source_entity(
             file_path="/vault/meeting.md",
             person_name="Jane Smith",
         )

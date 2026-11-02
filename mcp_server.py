@@ -2353,7 +2353,7 @@ class LifeOSMCPServer:
                     "calendar": "📅",
                     "slack": "💼",
                     "vault": "📝",
-                    "granola": "📝",
+                    "meeting": "📝",
                 }.get(source, "•")
                 text += f"{emoji} **{timestamp}** [{source}]\n"
                 text += f"   {summary}\n\n"

@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** CRM
-**Last Updated:** 2026-11-01
+**Last Updated:** 2026-11-02
 
 People management: the list and detail views at `/crm`, the contact-source model behind entity splitting/merging, the relationship-strength score that drives ranking and Dunbar circles, and the multi-stage fact-extraction pipeline that surfaces memorable personal details.
 
@@ -301,7 +301,7 @@ Returns aggregated **contact sources** — the splittable units behind a person.
 | Phone number | `+15550123` across iMessage, WhatsApp, Phone |
 | Slack user | `U012345` in Slack |
 | LinkedIn profile | LinkedIn connection |
-| Name only | Vault/Granola mentions (no email/phone) |
+| Name only | Vault and meeting note mentions (no email/phone) |
 
 **Why aggregate?** A person like Alex Chen might have 50,000+ individual `SourceEntity` rows. For entity-management UX, what matters is identifiers, not individual messages.
 

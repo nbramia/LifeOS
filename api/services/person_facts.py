@@ -527,7 +527,7 @@ class PersonFactExtractor:
     MAX_INTERACTIONS_PER_BATCH = 300  # Single batch for most people
 
     # High-value sources get priority allocation in budget distribution
-    PRIORITY_SOURCES = {"calendar", "vault", "granola"}
+    PRIORITY_SOURCES = {"calendar", "vault", "meeting"}
     PRIORITY_BONUS = 1.5  # Priority sources get 50% more of their share
 
     # Model options (kept for compatibility, actual model is local)
@@ -887,7 +887,7 @@ class PersonFactExtractor:
         The budget (300 interactions) is distributed across source types based on
         how many sources the person has:
         - 1 source: gets all 300
-        - 3 sources: ~100 each (with priority bonus for calendar/vault/granola)
+        - 3 sources: ~100 each (with priority bonus for calendar/vault/meeting)
         - 10 sources: ~30 each (with priority bonuses)
 
         This ensures someone who only uses iMessage gets more iMessages sampled
