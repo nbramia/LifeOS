@@ -494,6 +494,8 @@ def _run_llm_test(
     gpu_memory_mb: int | None = 2000,
     stop_succeeds: bool = True,
     system_ram_mb: int | None = 16_000,
+    on_llm_start=None,
+    on_llm_check=None,
 ):
     """Run run_all_syncs with LLM memory gating mocks (dry_run=False).
 
@@ -524,11 +526,11 @@ def _run_llm_test(
         patch("scripts.run_all_syncs.detect_silent_source_entity_drift", return_value=[]),
         patch("scripts.run_all_syncs.subprocess.run", return_value=fake_restart),
         patch("urllib.request.urlopen"),
-        patch("scripts.run_all_syncs._is_llm_running", return_value=llm_running),
+        patch("scripts.run_all_syncs._is_llm_running", return_value=llm_running, side_effect=on_llm_check),
         patch("scripts.run_all_syncs._get_available_gpu_memory_mb", return_value=gpu_memory_mb),
         patch("scripts.run_all_syncs._get_available_system_ram_mb", return_value=system_ram_mb),
         patch("scripts.run_all_syncs._stop_llm_for_embeddings", return_value=stop_succeeds) as stop_mock,
-        patch("scripts.run_all_syncs._start_llm") as start_mock,
+        patch("scripts.run_all_syncs._start_llm", side_effect=on_llm_start) as start_mock,
         patch("scripts.run_all_syncs.get_sync_health") as health_mock,
     ):
         # Make get_sync_health return "not recently synced" so sources aren't skipped
@@ -608,6 +610,81 @@ class TestLLMMemoryGating:
 
         assert "_llm_stopped" not in result.get("results", {})
         assert "_llm_was_running" not in result.get("results", {})
+
+    def test_summary_source_runs_after_the_llm_is_restarted(self):
+        """Queued summaries can only be generated once the LLM is back up."""
+        from scripts.run_all_syncs import _EMBEDDING_MEMORY_THRESHOLD_MB
+
+        events = []
+        real_side_effect = _make_run_sync_side_effect(set())
+
+        def _run_sync(source, dry_run=False):
+            events.append(source)
+            return real_side_effect(source, dry_run=dry_run)
+
+        order = [*LLM_TEST_SYNC_ORDER, "vault_summaries"]
+        sources = {**LLM_TEST_SYNC_SOURCES, "vault_summaries": {"description": "S", "phase": 7, "frequency": "daily"}}
+        with (
+            patch(f"{__name__}.LLM_TEST_SYNC_ORDER", order),
+            patch(f"{__name__}.LLM_TEST_SYNC_SOURCES", sources),
+            patch(f"{__name__}._make_run_sync_side_effect", return_value=_run_sync),
+        ):
+            _run_llm_test(
+                llm_running=True, gpu_memory_mb=_EMBEDDING_MEMORY_THRESHOLD_MB - 1000,
+                on_llm_start=lambda: events.append("llm_start"),
+            )
+
+        assert events.index("llm_start") < events.index("vault_summaries")
+
+    def test_summary_failure_fails_only_its_own_source(self):
+        order = [*LLM_TEST_SYNC_ORDER, "vault_summaries"]
+        sources = {**LLM_TEST_SYNC_SOURCES, "vault_summaries": {"description": "S", "phase": 7, "frequency": "daily"}}
+        with (
+            patch(f"{__name__}.LLM_TEST_SYNC_ORDER", order),
+            patch(f"{__name__}.LLM_TEST_SYNC_SOURCES", sources),
+        ):
+            result, _, _, _, _ = _run_llm_test(fail_sources={"vault_summaries"}, llm_running=False)
+
+        assert result["results"]["vault_summaries"]["success"] is False
+        assert result["results"]["vault_reindex"]["success"] is True
+
+    def test_waits_for_the_vault_index_job_before_reading_memory(self):
+        """A job's loaded model must not count as memory the LLM has to free."""
+        from scripts.run_all_syncs import _EMBEDDING_MEMORY_THRESHOLD_MB
+
+        events = []
+        with patch(
+            "scripts.run_all_syncs._wait_for_vault_index_job", side_effect=lambda: events.append("wait")
+        ):
+            def _checked():
+                events.append("read")
+                return True
+
+            _run_llm_test(
+                llm_running=True, gpu_memory_mb=_EMBEDDING_MEMORY_THRESHOLD_MB + 10_000,
+                on_llm_check=_checked,
+            )
+
+        assert events[:2] == ["wait", "read"]
+
+    def test_wait_for_job_blocks_until_the_lock_is_released(self):
+        import threading
+
+        from api.services import vault_index_lock
+        from scripts.run_all_syncs import _wait_for_vault_index_job
+
+        held = vault_index_lock.try_flock(vault_index_lock.VAULT_INDEX_LOCK_PATH)
+        assert held is not None
+        with patch("scripts.run_all_syncs._VRAM_SETTLE_SECONDS", 0):
+            waiter = threading.Thread(target=_wait_for_vault_index_job)
+            waiter.start()
+            time.sleep(0.3)
+            assert waiter.is_alive()
+            held.close()
+            waiter.join(timeout=10)
+
+        assert not waiter.is_alive()
+        assert vault_index_lock.try_flock(vault_index_lock.VAULT_INDEX_LOCK_PATH) is not None
 
     def test_safety_net_restarts_llm_on_stop_failure(self):
         """If stop succeeds but normal restart path is missed, safety net fires."""

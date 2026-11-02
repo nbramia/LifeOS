@@ -95,6 +95,11 @@ class EmbeddingService:
         self._load_lock = threading.Lock()
 
     @property
+    def using_cpu_fallback(self) -> bool:
+        """True once this process has fallen back from the GPU to the CPU."""
+        return self._force_cpu
+
+    @property
     def model(self) -> "SentenceTransformer":
         """Lazy-load the model, falling back to CPU if GPU fails."""
         if self._model is None:

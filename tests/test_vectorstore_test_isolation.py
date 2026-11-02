@@ -85,10 +85,7 @@ def test_bare_indexer_service_never_reaches_a_production_collection_name(tmp_pat
             patch("api.services.embeddings.get_embedding_service", return_value=MagicMock()):
         mock_client.return_value.get_or_create_collection.return_value = object()
         indexer = IndexerService(vault_path=str(tmp_path / "vault"), db_path=str(tmp_path / "db"))
-        try:
-            assert indexer.vector_store.collection_name != "lifeos_vault"
-        finally:
-            indexer.stop()
+        assert indexer.vector_store.collection_name != "lifeos_vault"
 
 
 @pytest.mark.unit

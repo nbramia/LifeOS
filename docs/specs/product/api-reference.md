@@ -1008,7 +1008,7 @@ Enqueue a vault reindex job. Returns immediately with a job ID. Use `GET /api/jo
 
 ### POST /api/admin/reindex/sync
 
-Trigger vault reindex (blocking). Use for initial setup only.
+Trigger vault reindex (blocking). Use for initial setup only. Returns `status: "busy"`, without indexing, while the vault index job or the nightly reindex holds the vault index lock.
 
 ### GET /api/admin/calendar/status
 

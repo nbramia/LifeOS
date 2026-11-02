@@ -22,7 +22,6 @@ import re
 import shutil
 import subprocess
 import tempfile
-import time
 
 import pytest
 # pytest-playwright registers as a pytest plugin via entry_points, so it is
@@ -62,24 +61,6 @@ def pytest_sessionfinish(session, exitstatus):
         return
     for runtime_dir in ("data", "vault", "logs"):
         shutil.rmtree(os.path.join(project_root, runtime_dir), ignore_errors=True)
-
-
-def wait_for_condition(predicate, timeout: float, interval: float = 0.2):
-    """Poll ``predicate`` until it returns truthy, or ``timeout`` seconds pass.
-
-    Returns the last value ``predicate()`` produced (truthy on success, falsy
-    if the timeout was reached). Used by the file-watcher tests
-    (test_indexer.py, test_integration.py) to wait on the watcher's actual
-    observable output instead of a fixed ``time.sleep`` that can undershoot
-    ``VaultEventHandler``'s batch-processing delay — callers should
-    derive ``timeout`` from that delay rather than guessing a duration.
-    """
-    deadline = time.monotonic() + timeout
-    result = predicate()
-    while not result and time.monotonic() < deadline:
-        time.sleep(interval)
-        result = predicate()
-    return result
 
 
 @pytest.fixture(scope="session")
@@ -710,11 +691,13 @@ def _isolate_vault_indexer_stores(tmp_path, monkeypatch):
         indexer_mod, "BM25Index", lambda *a, **k: BM25Index(db_path=bm25_db)
     )
 
-    from api.services import vault_tag_store as tag_store_mod
+    from api.services import vault_index_lock, vault_tag_store as tag_store_mod
+
+    monkeypatch.setattr(vault_index_lock, "VAULT_INDEX_LOCK_PATH", tmp_path / "vault_index.lock")
 
     tags_db = str(tmp_path / "vault_tags.db")
     monkeypatch.setattr(
-        tag_store_mod, "get_vault_tags_db_path", lambda: tags_db
+        tag_store_mod, "get_vault_tags_db_path", lambda *args, **kwargs: tags_db
     )
 
     collection = "test_vault_" + re.sub(r"[^A-Za-z0-9]", "_", tmp_path.name)[:400]

@@ -18,6 +18,15 @@ the budget; a manual run finishes a large load during the day without it.
 
 Should run AFTER all CRM data collection is complete so that entity
 resolution has access to the latest people data.
+
+An --execute run waits for the vault index lock, since the 15-minute vault index
+job rewrites the same state and chunks. If the lock stays held past
+LIFEOS_VAULT_INDEX_LOCK_WAIT_SECONDS the run exits non-zero without indexing, and
+the sync records the failure: the job's own timeout is shorter than that wait,
+so something is wrong, and running alongside it would overwrite its saved state.
+
+Summaries that failed here, and those the job queued, wait for the
+vault_summaries sync source.
 """
 import sys
 from pathlib import Path
@@ -195,7 +204,7 @@ def clear_bm25_index():
     logger.info(f"BM25 index cleared: {before} rows dropped")
 
 
-if __name__ == '__main__':
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description='Reindex Obsidian vault')
     parser.add_argument('--execute', action='store_true', help='Actually perform reindex')
     parser.add_argument('--force', action='store_true', help='Force full reindex (not incremental)')
@@ -205,7 +214,19 @@ if __name__ == '__main__':
     parser.add_argument('--budget-minutes', nargs='?', type=float, const=BUDGET_FROM_SETTING, default=None,
                         help='Stop after this many minutes, leaving the rest for the next run. '
                              'Bare, uses LIFEOS_VAULT_INDEX_BUDGET_MINUTES. Omitted, runs to completion.')
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+
+    # Covers the clears too, and is held until this function returns.
+    vault_index_lock = None
+    if args.execute:
+        from api.services.vault_index_lock import wait_for_vault_index_lock
+        from config.settings import settings
+
+        wait_seconds = settings.vault_index_lock_wait_seconds
+        vault_index_lock = wait_for_vault_index_lock(wait_seconds)
+        if vault_index_lock is None:
+            logger.error(f"Vault index lock still held after {wait_seconds}s; not reindexing")
+            return 1
 
     if args.clear_vectors and args.execute:
         clear_vector_store()
@@ -228,3 +249,9 @@ if __name__ == '__main__':
     # the line emission unconditional makes ad-hoc test runs less surprising.
     from api.services.sync_health import emit_sync_stats
     emit_sync_stats(sync_stats(result))
+    del vault_index_lock
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

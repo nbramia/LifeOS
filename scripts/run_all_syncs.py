@@ -64,6 +64,14 @@ from api.services.sync_health import (
     reap_orphan_sync_runs,
     detect_silent_source_entity_drift,
 )
+from api.services import vault_index_lock
+from api.services.gpu_memory import (
+    EMBEDDING_MEMORY_THRESHOLD_MB as _EMBEDDING_MEMORY_THRESHOLD_MB,
+    EMBEDDING_RAM_THRESHOLD_MB as _EMBEDDING_RAM_THRESHOLD_MB,
+    get_available_gpu_memory_mb as _get_available_gpu_memory_mb,
+    get_available_system_ram_mb as _get_available_system_ram_mb,
+)
+from api.services.summarizer import LLM_READY_WAIT_SECONDS
 from api.services.log_redaction import (
     REDACTED_TOKEN,
     TELEGRAM_TOKEN_PATTERN,
@@ -77,25 +85,6 @@ from config.settings import settings
 
 # Embedding phases that need GPU memory — LLM may need to yield
 EMBEDDING_SOURCES = {"vault_reindex", "crm_vectorstore"}
-
-# Minimum free GPU memory (MB) required to run embeddings alongside the LLM.
-# Modern sentence-transformer embedding models can peak at 15-22 GB transient
-# allocations during forward pass on long sequences, well beyond the model's
-# resident weights (3-4 GB). If less than this is free, we free the LLM
-# rather than risk a HIP/CUDA OOM that falls back to CPU (~10x slower, OOM-risky).
-#
-# Override with LIFEOS_EMBEDDING_MEMORY_THRESHOLD_MB if your embedding model
-# / batch size has a different working-set ceiling.
-_EMBEDDING_MEMORY_THRESHOLD_MB = int(
-    __import__("os").environ.get("LIFEOS_EMBEDDING_MEMORY_THRESHOLD_MB", "28000")
-)
-
-# Minimum free system RAM (MB) required to run embedding phases.
-# Model loading temporarily needs ~4 GB system RAM even when targeting GPU.
-# Below this threshold, embedding phases are skipped to avoid OOM-killing
-# other processes (Chrome, Claude Code, etc.).
-_EMBEDDING_RAM_THRESHOLD_MB = 4_000
-
 
 def _ollama_host() -> str:
     """Return the configured ollama host, falling back to the standard default."""
@@ -171,36 +160,6 @@ def _is_llm_running() -> bool:
     if available is None:
         return False
     return available < _EMBEDDING_MEMORY_THRESHOLD_MB
-
-
-def _get_available_gpu_memory_mb() -> int | None:
-    """Get available GPU memory in MB from AMDGPU sysfs, or None if unavailable."""
-    try:
-        # AMDGPU exposes VRAM info via sysfs
-        for card_dir in Path("/sys/class/drm").iterdir():
-            vram_total = card_dir / "device" / "mem_info_vram_total"
-            vram_used = card_dir / "device" / "mem_info_vram_used"
-            if vram_total.exists() and vram_used.exists():
-                total = int(vram_total.read_text().strip())
-                used = int(vram_used.read_text().strip())
-                return (total - used) // (1024 * 1024)
-    except Exception:
-        pass
-    return None
-
-
-def _get_available_system_ram_mb() -> int | None:
-    """Get available system RAM in MB from /proc/meminfo, or None if unavailable."""
-    try:
-        meminfo = Path("/proc/meminfo").read_text()
-        for line in meminfo.splitlines():
-            if line.startswith("MemAvailable:"):
-                # MemAvailable is in kB
-                kb = int(line.split()[1])
-                return kb // 1024
-    except Exception:
-        pass
-    return None
 
 
 # Track ollama models we unloaded so _start_llm can re-warm them
@@ -316,6 +275,32 @@ def _start_llm() -> None:
     for model in _ollama_models_unloaded:
         _ollama_warm(model)
     _ollama_models_unloaded = []
+
+
+# Pause between a vault index job's exit and reading free VRAM. The driver frees
+# a finished process's memory a moment after the kernel drops its flock.
+_VRAM_SETTLE_SECONDS = 5
+
+
+def _wait_for_vault_index_job() -> None:
+    """Wait for a running vault index job, so its model does not count as used.
+
+    Otherwise the free-VRAM reading that follows could stop the LLM for memory
+    the job is about to give back. The lock is not kept: the reindex subprocess
+    takes its own, and a job starting in the gap finds the memory decision made.
+    """
+    logger = logging.getLogger(__name__)
+    try:
+        lock = vault_index_lock.try_flock(vault_index_lock.VAULT_INDEX_LOCK_PATH)
+        if lock is None:
+            lock = vault_index_lock.wait_for_vault_index_lock(settings.vault_index_lock_wait_seconds)
+            if lock is None:
+                logger.warning("Vault index lock still held; reading GPU memory anyway")
+                return
+            time.sleep(_VRAM_SETTLE_SECONDS)
+        lock.close()
+    except OSError as e:
+        logger.warning(f"Could not check the vault index lock ({e}); reading GPU memory anyway")
 
 
 # Track current sync run for SIGTERM cleanup
@@ -1050,6 +1035,12 @@ SYNC_ORDER = [
     # === Phase 7: Consistency Verification ===
     # Verify cross-store data consistency after all syncs complete
     "consistency_verify",       # Check orphans, stale merged IDs, cached counts
+
+    # === Summary Queue ===
+    # Last, so its budget delays no other source, and after any LLM restart.
+    # Nothing later reads summaries. The vault map pages read them during
+    # vault_reindex, so they pick up tonight's summaries tomorrow.
+    "vault_summaries",          # Generate queued LLM summaries into BM25
 ]
 
 # Scripts that can be run directly
@@ -1088,6 +1079,7 @@ SYNC_SCRIPTS = {
     "vault_reindex": ("scripts/sync_vault_reindex.py", ["--execute", "--budget-minutes"]),
     "vault_tag": ("scripts/sync_vault_tag.py", ["--execute"]),
     "crm_vectorstore": ("scripts/sync_crm_to_vectorstore.py", ["--execute"]),
+    "vault_summaries": ("scripts/sync_vault_summaries.py", ["--execute"]),
 
     # Phase 5: Content Sync
     "google_docs": ("scripts/sync_google_docs.py", ["--execute"]),
@@ -1109,6 +1101,11 @@ SYNC_TIMEOUTS = {
     "vault_reindex": 14400,          # 4 hours - incremental is typically 10-30min, but a
                                      #            `--force` full reindex of a ~6K-file vault
                                      #            plus per-file summary calls fits in ~3-4h
+    # The wait for a restarting LLM, its own budget, the longest single LLM call,
+    # and a margin.
+    "vault_summaries": (
+        LLM_READY_WAIT_SECONDS + settings.summary_retry_budget_seconds + settings.ollama_retry_timeout + 300
+    ),
     "vault_tag": 3600,               # 1 hour - nightly delta is ~tens of notes; a full backfill is ~8 min
     "slack": 7200,                   # 2 hours - ~100 linked DMs + group DMs, rate-limited
     "google_docs": 300,              # 5 minutes - normally takes ~9s, hangs on expired OAuth
@@ -1184,8 +1181,13 @@ DURATION_COLLAPSE_MAX_ELAPSED_SECONDS = 2.0
 def _detect_duration_collapse(source: str, elapsed_seconds: float) -> dict | None:
     """Return collapse info if this run finished suspiciously fast, else None.
 
+    A source whose SYNC_SOURCES entry sets ``duration_varies`` is exempt: a short
+    run is ordinary for it, so its typical duration says nothing.
+
     Never raises — a sync_health DB hiccup must not fail the sync itself.
     """
+    if SYNC_SOURCES.get(source, {}).get("duration_varies"):
+        return None
     try:
         typical = get_typical_duration_seconds(source)
     except Exception as e:
@@ -2300,6 +2302,8 @@ def run_all_syncs(
             # Memory-gated LLM management for embedding phases (after skip guards)
             if source in EMBEDDING_SOURCES and not dry_run and not llm_memory_checked:
                 llm_memory_checked = True
+
+                _wait_for_vault_index_job()
 
                 # Check system RAM first — insufficient RAM causes kernel OOM kills
                 available_ram = _get_available_system_ram_mb()

@@ -156,7 +156,7 @@ Everything above is built on a nightly sync that pulls from every connected sour
 
 | Source | Method | Data |
 |--------|--------|------|
-| Obsidian | Nightly vault reindex | Notes, mentions |
+| Obsidian | Vault index job every 15 minutes, nightly vault reindex | Notes, mentions |
 | Gmail (personal + work) | Google API | Emails, threads |
 | Calendar (personal + work) | Google API | Events, attendees |
 | Google Docs / Sheets | Google API | Document + tabular content |

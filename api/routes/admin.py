@@ -13,7 +13,9 @@ from typing import Optional
 import logging
 from pathlib import Path
 
+from api.services import vault_index_lock as lock_module
 from api.services.indexer import IndexerService
+from api.services.vault_index_lock import try_flock
 from api.services.vectorstore import VectorStore
 from api.services.job_queue import get_job_queue, is_stale_running_job
 from config.settings import settings
@@ -117,8 +119,16 @@ async def reindex_sync() -> ReindexResponse:
     """
     Trigger a synchronous reindex of the vault.
 
-    Blocks until complete. Use for initial setup.
+    Blocks until complete. Use for initial setup. Reports ``busy`` rather than
+    waiting when another vault indexer holds the lock, because this runs on the
+    event loop and a wait would stall every other request.
     """
+    vault_index_lock = try_flock(lock_module.VAULT_INDEX_LOCK_PATH)
+    if vault_index_lock is None:
+        return ReindexResponse(
+            status="busy",
+            message="Another vault index run holds the lock. Try again when it finishes.",
+        )
     try:
         indexer = IndexerService(vault_path=settings.vault_path)
         count = indexer.index_all()
@@ -134,6 +144,8 @@ async def reindex_sync() -> ReindexResponse:
             status="error",
             message=f"Reindex failed: {str(e)}",
         )
+    finally:
+        vault_index_lock.close()
 
 
 # ============ Maintenance Mode Endpoints ============
