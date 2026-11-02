@@ -12,6 +12,7 @@ Key features:
 - Maintains topic context for coherent conversations
 """
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -153,7 +154,6 @@ def extract_context_from_history(
         # Extract person from content (as fallback)
         if not context.last_person_name and hasattr(msg, 'content') and msg.content:
             # Look for "about [Name]" or "with [Name]" patterns
-            import re
             patterns = [
                 r"about\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)",
                 r"with\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)",
@@ -232,11 +232,12 @@ def expand_followup_with_context(
 
     expanded = query
     for pronoun, replacement in pronoun_replacements:
-        if pronoun in query_lower:
+        # A whole word only: "he " is also the tail of "the ".
+        pattern = r"\b" + re.escape(pronoun)
+        if re.search(pattern, query_lower):
             # Case-insensitive replacement while preserving case of rest
-            import re
             expanded = re.sub(
-                re.escape(pronoun),
+                pattern,
                 replacement,
                 expanded,
                 flags=re.IGNORECASE,

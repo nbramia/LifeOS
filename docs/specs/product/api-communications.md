@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-09-20
+**Last Updated:** 2026-11-02
 
 Chat/search, Google integration (Calendar/Gmail/Drive), and messaging (iMessage/Slack) HTTP endpoints, with request/response shapes. Split out of [api-reference.md](api-reference.md) alongside its other adjacent catalogs (CRM, MCP tools, agent activity) because the combined file was over the product-spec size target.
 
@@ -91,7 +91,7 @@ the composer for a subsequent turn.
 | `search_slack` | Slack messages |
 | `search_web` | Web search (weather, news, public info) |
 | `get_message_history` | iMessage/WhatsApp (requires entity_id) |
-| `person_info` | Lookup or briefing (action: lookup/briefing) |
+| `person_info` | Lookup or briefing (action: lookup/briefing). A first name that does not identify one person returns options rather than a profile; a question describing someone returns suggested people |
 | `search_finances` | Monarch Money live data (action: accounts/transactions/cashflow/budgets) |
 | `manage_tasks` | Create, list, or complete tasks (action: create/list/complete) |
 | `manage_human_queue` | File, list, or resolve Human-queue cards — things only the operator can do (action: add/list/resolve) |
@@ -104,6 +104,19 @@ the composer for a subsequent turn.
 | `save_memory` | Save a memory for future reference |
 | `search_memories` | Search saved memories |
 | `manage_workouts` | Log and query the workout log and fitness metrics (action: log/update/list/history/summary/log_metric/metrics/get_profile/set_profile/readiness) |
+
+**Who the message is about:** On a native turn, a message that names someone gets a "Person in this message" block in the system prompt, built without an LLM call. How it reads depends on how sure the name is:
+
+| Tier | When | What the model gets |
+|------|------|---------------------|
+| `confident` | Full name, an alias other than the person's own first name, or an unscoped link override | The person as fact: identifiers, relationship summary, top facts |
+| `conversation` | The recent conversation names exactly one of the people a first name could mean | The same, marked as taken from the conversation |
+| `likely` | One person is the best fit: the only one with that first name, clearly closer than the rest, or put forward by a source- or folder-scoped override | Stated as an assumption, with the alternatives and no facts |
+| `uncertain` | Several people fit, the conversation names more than one of them, or the only fit is a one-word row | The options, closest first, with an instruction not to pick one, and no facts |
+
+A lone word after a place or thing lead ("the weather in Austin", "the Chase account") raises nothing. Names come from the message as written, never from follow-up expansion. A hidden or merged person never appears in any of these. `person_info` resolves names the same way, and declines a briefing on a name that is `likely` or `uncertain`. Phrases such as "catch me up" or "phone number" add guidance on how widely to search. The lookup runs under a 500 ms budget; a failure or overrun sends the turn on with no block. Journal turns skip it. See `api/services/person_context.py`.
+
+The stored assistant message's `routing` carries `person_tier` and `fetch_depth`, plus `person` and `person_id` when the person was asserted (`confident` or `conversation`). A later turn uses those to settle a first name. No SSE event changes.
 
 **Prompt caching (Anthropic backend only):** System prompt and tool definitions use Anthropic `cache_control` breakpoints. Cache reads cost 0.1x input price; repeated queries within 5 minutes hit the cache.
 

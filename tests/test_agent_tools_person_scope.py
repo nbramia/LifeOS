@@ -107,6 +107,7 @@ def fake_person(monkeypatch):
             birthday=None,
             company="Tidewater Press",
             position="Editor",
+            hidden=False,
         ),
         resolved=True,
         resolve_calls=[],
@@ -115,11 +116,11 @@ def fake_person(monkeypatch):
     )
 
     class FakeResolver:
-        def resolve(self, name=None, email=None):
-            state.resolve_calls.append({"name": name, "email": email})
+        def match_name(self, name):
+            state.resolve_calls.append({"name": name, "email": None})
             if not state.resolved:
-                return None
-            return SimpleNamespace(entity=state.entity)
+                return entity_resolver_mod.NameMatch()
+            return entity_resolver_mod.NameMatch(SimpleNamespace(entity=state.entity, match_type="name_exact"))
 
     class FakeFactStore:
         def get_for_person(self, person_id, include_shared=True):

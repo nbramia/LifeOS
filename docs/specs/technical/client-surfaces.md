@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Platform
-> **Last Updated:** 2026-09-22
+> **Last Updated:** 2026-11-02
 
 LifeOS exposes the orchestrator to **HTTP consumers** — thin clients that submit text and consume SSE without importing LifeOS Python modules. Endpoint and event **shapes** are defined in [api-reference.md](../product/api-reference.md); this doc covers **who consumes them**, **whisper-relay integration**, and **breaking-change policy**.
 
@@ -224,6 +224,8 @@ proxy; the Agent backend is unaffected (below).
 ### LifeOS
 
 The native orchestrator (`POST /api/ask/stream`, documented above and in [api-reference.md](../product/api-reference.md)). Full personas (including orchestrating ones, which spawn a background Claude Code session — see the Persona contract above), spoken-style rules on voice turns, the per-turn model picker, CLI-engine handoff, and conversation history that has always lived in LifeOS's own `ConversationStore`. Every other backend is described relative to this one.
+
+Native turns also carry a server-side person block in the system prompt ([tiers](../product/api-communications.md#post-apiaskstream)). It adds no SSE event, field or header, so a connected client's frames are unchanged; the only client-visible trace is additive keys in a stored message's `routing`. Hermes does not get this block: `lifeos_context.turn` is a cross-repo contract and does not carry it, so a Hermes turn relies on the LifeOS MCP people tools.
 
 One additive SSE event is emitted only on the `journal` persona's turns: `journal_capture` (`path`, `created`), sent right after `conversation_id`, once LifeOS has written the fragment to `LifeOS/Log/Journal/YYYY-MM-DD.md` in code — capture does not depend on the model calling a tool. It is proof of a completed write, not a status hint: `api/routes/journal_ingest.py` refuses to report `status: "logged"`, or to burn a delivery's idempotency key, without it. A capture failure is raised **before the stream opens**, so it surfaces as an HTTP 500, never as a mid-stream `error` frame. Clients that don't know this event type simply ignore it.
 

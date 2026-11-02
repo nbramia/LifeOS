@@ -1238,6 +1238,15 @@ async def ask_stream(request: AskStreamRequest):
             )
             await turn.emit(f"data: {json.dumps({'type': 'routing', 'sources': ['agent'], 'reasoning': _routing_reason, 'latency_ms': 0})}\n\n")
 
+            # Who the message is about, for the system prompt. Names come from what
+            # the user wrote, not the expanded question, whose additions are guesses.
+            # Journal turns file a fragment rather than answer, so they go without.
+            person_context = None
+            if _effective_pid != JOURNAL_PERSONA_ID:
+                from api.services.person_context import gather_person_context
+                with trace_span("person_context"):
+                    person_context = await gather_person_context(request.question, conversation_history)
+
             # Consume the async generator from the agent loop
             agent_result = None
             # LIFEOS_JEV_ORCHESTRATOR=shadow pre-turn judgment: started here,
@@ -1261,7 +1270,10 @@ async def ask_stream(request: AskStreamRequest):
                     model=orchestrator_model if escalated else "",
                     persona=persona_preamble,
                     voice_rules=voice_rules,
-                    personal_context=personal_context,
+                    personal_context="\n\n".join(filter(None, [
+                        personal_context,
+                        person_context.block if person_context else "",
+                    ])),
                     force_local=force_local,
                     force_remote=force_remote,
                     persona_id=_effective_pid or "",
@@ -1373,6 +1385,8 @@ async def ask_stream(request: AskStreamRequest):
                 "reasoning": f"agentic ({orchestrator_model})",
                 "tool_rounds": len(agent_result.tool_calls_log),
             }
+            if person_context:
+                routing_metadata.update(person_context.routing_fields())
             # On an agent-loop failure, ``full_text`` may not contain the
             # current round because its normal accumulator advances only at a
             # round boundary.  ``partial_text`` is the exact sanitized stream

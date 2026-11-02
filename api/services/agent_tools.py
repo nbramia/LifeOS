@@ -385,6 +385,9 @@ TOOL_DEFINITIONS = [
             "Use 'lookup' for any query mentioning a person — returns entity_id, emails, phones, "
             "relationship strength, days since last contact, interaction counts per channel (90 days), "
             "and known facts (highest-confidence first; the output says so when it truncates). "
+            "A first name that fits several people returns those people as options instead of "
+            "a profile, and a question describing someone ('who do I know in fundraising') "
+            "returns suggested people. "
             "Use 'briefing' for meeting prep or deep dives — it searches the last 90 days of "
             "interactions and widens automatically if that window is empty; pass interaction_days "
             "to pin a specific window instead."
@@ -399,7 +402,11 @@ TOOL_DEFINITIONS = [
                 },
                 "name": {
                     "type": "string",
-                    "description": "Person's name.",
+                    "description": (
+                        "Person's name. For 'lookup', when the user describes someone rather "
+                        "than naming them, pass it as a question, such as 'who do I know in "
+                        "fundraising' or 'that lawyer from the old office'."
+                    ),
                 },
                 "email": {
                     "type": "string",
@@ -2522,66 +2529,72 @@ _PERSON_FACT_LIMIT = 15
 _BRIEFING_MAX_DAYS = 3650
 
 
-def _lookup_person(inp: dict) -> str:
-    from api.services.entity_resolver import get_entity_resolver
-    from api.services.relationship_summary import get_relationship_summary, format_relationship_context
-    from api.services.person_facts import get_person_fact_store, rank_facts
+# People suggested when a lookup term describes someone rather than naming them.
+_PERSON_DESCRIPTION_LIMIT = 5
 
-    resolver = get_entity_resolver()
-    name = inp["name"]
-    result = resolver.resolve(name=name)
-    if not result or not result.entity:
-        # Name the term searched: the model needs to tell "that spelling didn't
-        # match" from "this person isn't in the index" before it decides whether
-        # to retry, and downstream tools depend on the entity_id this returns.
-        return (
-            f"No person found matching '{name}'. That exact term was searched "
-            "against the people index and nothing matched it closely enough to be "
-            "treated as the same person. Try a fuller name, a different spelling, "
-            "or pass the person's email address."
+
+def _describe_person_matches(term: str) -> str | None:
+    """People whose profile fits a description, or None when there are none."""
+    from api.services.person_indexer import asks_who_fits, find_people_by_description
+
+    if not asks_who_fits(term):
+        return None
+    matches = find_people_by_description(term, top_k=_PERSON_DESCRIPTION_LIMIT)
+    if not matches:
+        return None
+    lines = []
+    for match in matches:
+        fit = f"mentions {', '.join(match.matched_words)}. " if match.matched_words else ""
+        profile = " ".join(match.profile.split())[:200]
+        lines.append(
+            f"- {match.person.canonical_name} (entity_id: {match.person.id}): {fit}{profile}"
         )
+    return (
+        f"No one is named '{term}'. These people's CRM profiles fit it as a description. They "
+        "are suggestions to check, not confirmed matches:\n" + "\n".join(lines)
+    )
 
-    entity = result.entity
-    parts = [f"**{entity.canonical_name}** (entity_id: {entity.id})"]
 
-    if entity.emails:
-        parts.append(f"Emails: {', '.join(entity.emails)}")
-    if entity.phone_numbers:
-        parts.append(f"Phones: {', '.join(entity.phone_numbers)}")
-    if entity.birthday:
-        parts.append(f"Birthday: {entity.birthday}")
-    if entity.company or entity.position:
-        role = " — ".join(filter(None, [entity.position, entity.company]))
-        parts.append(f"Role: {role}")
+def _lookup_person(inp: dict) -> str:
+    from api.services.person_context import (
+        CONFIDENT,
+        LIKELY,
+        UNCERTAIN,
+        describe_unconfirmed,
+        format_person_profile,
+        resolve_person_mention,
+    )
 
-    # Relationship summary
-    rel = get_relationship_summary(entity.id)
-    if rel:
-        parts.append(format_relationship_context(rel))
+    name = inp["name"]
+    resolution = resolve_person_mention(name)
+    if resolution.tier == CONFIDENT:
+        return format_person_profile(resolution.person, _PERSON_FACT_LIMIT)
+    if resolution.tier in (LIKELY, UNCERTAIN):
+        return describe_unconfirmed(resolution)
 
-    # Person facts. Ranked by confidence rather than the store's category/key
-    # order: an alphabetical cut can drop "family: spouse" for a work fact purely
-    # on spelling, and the model then answers that it doesn't know.
-    fact_store = get_person_fact_store()
-    facts = rank_facts(fact_store.get_for_person(entity.id))
-    if facts:
-        shown = facts[:_PERSON_FACT_LIMIT]
-        header = "Known facts:"
-        if len(facts) > len(shown):
-            header = (
-                f"Known facts ({len(shown)} of {len(facts)} shown, "
-                "highest-confidence first; the rest were truncated for length — "
-                "ask for a specific category to see more):"
-            )
-        parts.append(header + "\n" + "\n".join(
-            f"- {f.category}: {f.key} = {f.value}" for f in shown
-        ))
-
-    return "\n\n".join(parts)
+    # Name the term searched: the model needs to tell "that spelling didn't
+    # match" from "this person isn't in the index" before it decides whether
+    # to retry, and downstream tools depend on the entity_id this returns.
+    return _describe_person_matches(name) or (
+        f"No person found matching '{name}'. That exact term was searched "
+        "against the people index and nothing matched it closely enough to be "
+        "treated as the same person. Try a fuller name, a different spelling, "
+        "or pass the person's email address. If this describes someone rather than "
+        "naming them, pass it as a question, such as 'who do I know in fundraising'."
+    )
 
 
 async def _briefing_person(inp: dict) -> str:
     from api.services.briefings import get_briefings_service
+    from api.services.entity_resolver import parse_name
+    from api.services.person_context import LIKELY, UNCERTAIN, describe_unconfirmed, resolve_person_mention
+
+    # A briefing reads a person's emails, messages and meetings, so a first name
+    # that does not identify one person stops here rather than briefing on a guess.
+    if not inp.get("email") and parse_name(inp["name"]).last is None:
+        resolution = resolve_person_mention(inp["name"])
+        if resolution.tier in (LIKELY, UNCERTAIN):
+            return "No briefing generated. " + describe_unconfirmed(resolution)
 
     # A window is a scope, not a cap, so clamping is out — but unlike
     # search_calendar's days_range, an unusable window here is refused outright
