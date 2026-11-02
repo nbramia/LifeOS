@@ -1040,6 +1040,16 @@ class PersonEntityStore:
         finally:
             conn.close()
 
+    def get_by_id_unresolved(self, entity_id: str) -> Optional[PersonEntity]:
+        """Get the row stored under exactly this ID, without following the merge chain."""
+        conn = self._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT * FROM person_entities WHERE id = ?", (entity_id,)).fetchone()
+            return self._row_to_entity(row) if row else None
+        finally:
+            conn.close()
+
     def get_by_ids(self, ids: Iterable[str], exclude_hidden: bool = False) -> dict[str, PersonEntity]:
         """
         Batch version of get_by_id(): one query for many ids instead of N.

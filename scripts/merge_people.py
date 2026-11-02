@@ -127,6 +127,98 @@ def clear_merge_log():
         MERGE_LOG_FILE.unlink()
 
 
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    """True if the connected database has a table called ``name``."""
+    return conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone() is not None
+
+
+def _plan_fact_merge(conn: sqlite3.Connection, primary_id: str, secondary_id: str) -> dict:
+    """Decide what happens to each person_facts row when ``secondary_id`` is absorbed.
+
+    ``person_facts`` is unique on (person_id, category, key), so a secondary
+    fact either has no counterpart on the primary (it moves over), or collides
+    with one and exactly one of the two survives:
+
+    - the secondary's fact is user-confirmed and the primary's is not: the
+      secondary's fact replaces the primary's;
+    - otherwise (the primary's is confirmed, both are, or neither is): the
+      primary's fact stays and the secondary's is dropped.
+
+    Returns lists of fact ids: ``move`` (secondary facts re-owned by the
+    primary), ``drop`` (secondary facts that lost a collision) and ``replace``
+    (primary facts displaced by a confirmed secondary fact). Read-only, so the
+    dry run and the execute path act on the same plan.
+    """
+    if primary_id == secondary_id:
+        raise SamePersonError(f"Cannot merge facts of {primary_id} into itself")
+    plan: dict = {'move': [], 'drop': [], 'replace': []}
+    rows = conn.execute(
+        """
+        SELECT s.id, s.confirmed_by_user,
+               p.id, p.confirmed_by_user
+        FROM person_facts s
+        LEFT JOIN person_facts p
+               ON p.person_id = ? AND p.category = s.category AND p.key = s.key
+        WHERE s.person_id = ?
+        ORDER BY s.id
+        """,
+        (primary_id, secondary_id),
+    ).fetchall()
+    for secondary_fact_id, secondary_confirmed, primary_fact_id, primary_confirmed in rows:
+        if primary_fact_id is None:
+            plan['move'].append(secondary_fact_id)
+        elif secondary_confirmed and not primary_confirmed:
+            plan['replace'].append(primary_fact_id)
+            plan['move'].append(secondary_fact_id)
+        else:
+            plan['drop'].append(secondary_fact_id)
+    return plan
+
+
+def _apply_fact_merge(conn: sqlite3.Connection, primary_id: str, secondary_id: str, plan: dict) -> None:
+    """Carry out ``plan`` and re-point fact associations from secondary to primary.
+
+    A fact that loses a collision takes its ``person_fact_associations`` rows
+    with it. Every remaining association row naming the secondary is re-pointed
+    at the primary; where the primary already has a row for the same fact the
+    duplicate is dropped and ``is_primary`` is kept if either row had it.
+    """
+    has_associations = _table_exists(conn, 'person_fact_associations')
+    for fact_id in plan['drop'] + plan['replace']:
+        if has_associations:
+            conn.execute("DELETE FROM person_fact_associations WHERE fact_id = ?", (fact_id,))
+        conn.execute("DELETE FROM person_facts WHERE id = ?", (fact_id,))
+    for fact_id in plan['move']:
+        conn.execute("UPDATE person_facts SET person_id = ? WHERE id = ?", (primary_id, fact_id))
+    if not has_associations:
+        return
+    conn.execute(
+        """
+        UPDATE person_fact_associations SET is_primary = 1
+        WHERE person_id = ? AND fact_id IN (
+            SELECT fact_id FROM person_fact_associations
+            WHERE person_id = ? AND is_primary
+        )
+        """,
+        (primary_id, secondary_id),
+    )
+    conn.execute(
+        """
+        DELETE FROM person_fact_associations
+        WHERE person_id = ? AND fact_id IN (
+            SELECT fact_id FROM person_fact_associations WHERE person_id = ?
+        )
+        """,
+        (secondary_id, primary_id),
+    )
+    conn.execute(
+        "UPDATE person_fact_associations SET person_id = ? WHERE person_id = ?",
+        (primary_id, secondary_id),
+    )
+
+
 def _tone_analysis_results_table_exists(conn: sqlite3.Connection) -> bool:
     """True if crm.db has a tone_analysis_results table.
 
@@ -136,9 +228,7 @@ def _tone_analysis_results_table_exists(conn: sqlite3.Connection) -> bool:
     present, so a crm.db where tone analysis has never run doesn't have it
     yet.
     """
-    return conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='tone_analysis_results'"
-    ).fetchone() is not None
+    return _table_exists(conn, 'tone_analysis_results')
 
 
 def get_canonical_person_id(person_id: str) -> str:
@@ -268,7 +358,11 @@ def _latest(a: str | None, b: str | None) -> str | None:
     return a if a > b else b
 
 
-def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> dict:
+class SamePersonError(ValueError):
+    """Both IDs resolve to the same canonical person, so there is nothing to merge."""
+
+
+def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True, resume: bool = False) -> dict:
     """
     Merge secondary person into primary person.
 
@@ -276,13 +370,22 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
         primary_id: ID of the person to keep (survivor)
         secondary_id: ID of the person to merge and delete
         dry_run: If True, don't actually make changes
+        resume: Finish an interrupted merge whose merged-ids entry is already
+            written: the secondary is looked up under its own ID instead of
+            being resolved through the merge chain (which leads to the
+            primary)
 
     Returns:
         Stats dict
+
+    Raises:
+        SamePersonError: both IDs resolve to the same person (e.g. the
+            secondary was already merged into the primary)
     """
     stats = {
         'interactions_updated': 0,
         'source_entities_updated': 0,
+        'facts_moved': 0,
         'facts_cleared': 0,
         'tone_rows_cleared': 0,
         'emails_merged': 0,
@@ -294,12 +397,16 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
 
     store = get_person_entity_store()
     primary = store.get_by_id(primary_id)
-    secondary = store.get_by_id(secondary_id)
+    secondary = store.get_by_id_unresolved(secondary_id) if resume else store.get_by_id(secondary_id)
 
     if not primary:
         raise ValueError(f"Primary person not found: {primary_id}")
     if not secondary:
         raise ValueError(f"Secondary person not found: {secondary_id}")
+    if primary.id == secondary.id:
+        raise SamePersonError(
+            f"Cannot merge a person into itself: {secondary_id} already resolves to {primary.id}"
+        )
 
     # Use the canonical IDs from the resolved entities (follows merge chains)
     # This ensures if B was already merged into C, merging A→B actually goes to C
@@ -418,11 +525,13 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
             (canonical_secondary_id,)
         ).fetchone()[0]
         logger.info(f"\n3. {stats['source_entities_updated']} source entities to update")
-        stats['facts_cleared'] = crm_conn.execute(
-            "SELECT COUNT(*) FROM person_facts WHERE person_id IN (?, ?)",
-            (canonical_primary_id, canonical_secondary_id)
-        ).fetchone()[0]
-        logger.info(f"4. {stats['facts_cleared']} facts to clear")
+        fact_plan = _plan_fact_merge(crm_conn, canonical_primary_id, canonical_secondary_id)
+        stats['facts_moved'] = len(fact_plan['move'])
+        stats['facts_cleared'] = len(fact_plan['drop']) + len(fact_plan['replace'])
+        logger.info(
+            f"4. {stats['facts_moved']} facts to move, "
+            f"{stats['facts_cleared']} duplicates to drop"
+        )
         stats['tone_rows_cleared'] = 0
         if _tone_analysis_results_table_exists(crm_conn):
             stats['tone_rows_cleared'] = crm_conn.execute(
@@ -456,7 +565,7 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
         logger.info(f"Secondary: {secondary.canonical_name} ({canonical_secondary_id})")
         logger.info(f"Interactions: {stats['interactions_updated']}")
         logger.info(f"Source entities: {stats['source_entities_updated']}")
-        logger.info(f"Facts: {stats['facts_cleared']}")
+        logger.info(f"Facts: {stats['facts_moved']} moved, {stats['facts_cleared']} duplicates dropped")
         logger.info(f"Tone analysis rows: {stats['tone_rows_cleared']}")
         logger.info(f"Relationships: {stats['relationships_updated']} transfer, {stats['relationships_merged']} merge, {stats['relationships_deleted']} delete")
         logger.info(f"Emails: +{stats['emails_merged']}, Phones: +{stats['phones_merged']}, Aliases: +{stats['aliases_added']}")
@@ -533,22 +642,19 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
             )
         logger.info(f"   Source entities: {stats['source_entities_updated']} updated")
 
-        # 4b. Clear facts
-        cursor = crm_conn.execute(
-            "SELECT COUNT(*) FROM person_facts WHERE person_id IN (?, ?)",
-            (canonical_primary_id, canonical_secondary_id)
+        # 4b. Move the secondary's facts onto the primary; the primary's own
+        # facts stay (see _plan_fact_merge for the collision rule).
+        fact_plan = _plan_fact_merge(crm_conn, canonical_primary_id, canonical_secondary_id)
+        _apply_fact_merge(crm_conn, canonical_primary_id, canonical_secondary_id, fact_plan)
+        stats['facts_moved'] = len(fact_plan['move'])
+        stats['facts_cleared'] = len(fact_plan['drop']) + len(fact_plan['replace'])
+        logger.info(
+            f"   Facts: {stats['facts_moved']} moved, "
+            f"{stats['facts_cleared']} duplicates dropped"
         )
-        stats['facts_cleared'] = cursor.fetchone()[0]
-        if stats['facts_cleared'] > 0:
-            crm_conn.execute(
-                "DELETE FROM person_facts WHERE person_id IN (?, ?)",
-                (canonical_primary_id, canonical_secondary_id)
-            )
-        logger.info(f"   Facts cleared: {stats['facts_cleared']}")
 
         # 4b-2. Remove tone analysis results for the absorbed person only.
-        # Unlike facts (cleared for *both* ids, above), the
-        # primary's own tone_analysis_results rows are deliberately left
+        # The primary's own tone_analysis_results rows are deliberately left
         # alone: each row's freshness is already keyed to a stored
         # interaction_count compared against the person's *current*
         # interaction count (api/routes/crm.py's analyze_relationship_tone_detailed).
@@ -761,7 +867,7 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
     logger.info(f"Secondary: {secondary.canonical_name} ({canonical_secondary_id})")
     logger.info(f"Interactions updated: {stats['interactions_updated']}")
     logger.info(f"Source entities updated: {stats['source_entities_updated']}")
-    logger.info(f"Facts cleared: {stats['facts_cleared']} (will regenerate)")
+    logger.info(f"Facts moved: {stats['facts_moved']}, duplicates dropped: {stats['facts_cleared']}")
     logger.info(f"Tone analysis rows cleared: {stats['tone_rows_cleared']}")
     logger.info(f"Relationships: {stats['relationships_updated']} transferred, {stats['relationships_merged']} merged, {stats['relationships_deleted']} deleted")
     logger.info(f"Emails merged: {stats['emails_merged']}")
@@ -792,30 +898,20 @@ def recover_incomplete_merge() -> bool:
     store = get_person_entity_store()
     primary = store.get_by_id(primary_id)
 
-    # IMPORTANT: Don't use get_by_id(secondary_id) — it follows the merge chain.
-    # If merged_person_ids.json was already written, get_by_id(secondary) resolves
-    # to the primary, causing a self-merge that deletes the primary.
-    # Instead: check if secondary_id is in the merge map. If so, it's logically gone.
-    merged_ids = load_merged_ids()
-    secondary_is_merged = secondary_id in merged_ids
-
-    if secondary_is_merged:
-        # The secondary was already recorded as merged. Check if its physical
-        # record still exists by doing a raw lookup (not following merge chain).
-        secondary_result = store.get_by_id(secondary_id)
-        # get_by_id follows chain, so if it returns the primary, secondary is gone
-        secondary_exists = secondary_result is not None and secondary_result.id == secondary_id
-    else:
-        secondary_result = store.get_by_id(secondary_id)
-        secondary_exists = secondary_result is not None
-
     if not primary:
         # Primary doesn't exist — can't recover meaningfully
         logger.error(f"Recovery failed: primary person {primary_id} not found")
         clear_merge_log()
         return False
 
-    if not secondary_exists:
+    # IMPORTANT: Look the secondary up under its own ID. get_by_id(secondary_id)
+    # follows the merge chain, and once merged_person_ids.json has been written
+    # it resolves to the primary. The CRM transaction is atomic, so the merge is
+    # finished exactly when the secondary row is gone or soft-deleted as merged.
+    secondary = store.get_by_id_unresolved(secondary_id)
+    crm_step_done = secondary is None or secondary.hidden_reason.startswith("merged_into:")
+
+    if crm_step_done:
         # Secondary already deleted — merge was mostly/fully done.
         # Run post-merge cleanup and clear log.
         logger.info("Secondary already deleted — running cleanup steps only")
@@ -829,9 +925,9 @@ def recover_incomplete_merge() -> bool:
         clear_merge_log()
         return True
 
-    # Both exist — re-run the full merge (all steps are idempotent)
+    # The CRM transaction never committed — re-run the full merge (all steps are idempotent)
     logger.info("Re-running merge for crash recovery...")
-    merge_people(primary_id, secondary_id, dry_run=False)
+    merge_people(primary_id, secondary_id, dry_run=False, resume=True)
     return True
 
 

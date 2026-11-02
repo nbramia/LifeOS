@@ -92,7 +92,16 @@ def _create_crm_db(db_path: str):
             value TEXT NOT NULL,
             confidence REAL DEFAULT 0.5,
             source_interaction_id TEXT,
-            source_quote TEXT
+            source_quote TEXT,
+            confirmed_by_user INTEGER DEFAULT 0,
+            UNIQUE(person_id, category, key)
+        );
+
+        CREATE TABLE IF NOT EXISTS person_fact_associations (
+            fact_id TEXT NOT NULL,
+            person_id TEXT NOT NULL,
+            is_primary BOOLEAN DEFAULT 0,
+            PRIMARY KEY (fact_id, person_id)
         );
 
         CREATE TABLE IF NOT EXISTS relationships (
@@ -331,10 +340,11 @@ class TestCrmSingleTransaction:
             "UPDATE source_entities SET canonical_person_id = ? WHERE canonical_person_id = ?",
             (primary_id, secondary_id))
 
-        # Facts
-        conn.execute(
-            "DELETE FROM person_facts WHERE person_id IN (?, ?)",
-            (primary_id, secondary_id))
+        # Facts: both people hold the same (category, key), so the primary's
+        # fact stays and the secondary's duplicate is dropped
+        from scripts.merge_people import _apply_fact_merge, _plan_fact_merge
+        _apply_fact_merge(conn, primary_id, secondary_id,
+                          _plan_fact_merge(conn, primary_id, secondary_id))
 
         # Relationships: transfer secondary->other to primary->other
         norm_a, norm_b = (primary_id, other_id) if primary_id < other_id else (other_id, primary_id)
@@ -374,8 +384,9 @@ class TestCrmSingleTransaction:
         assert conn.execute(
             "SELECT COUNT(*) FROM source_entities WHERE canonical_person_id = ?",
             (primary_id,)).fetchone()[0] == 1
-        # Facts cleared
-        assert conn.execute("SELECT COUNT(*) FROM person_facts").fetchone()[0] == 0
+        # Facts: one survivor, owned by the primary
+        assert conn.execute(
+            "SELECT person_id FROM person_facts").fetchall() == [(primary_id,)]
         # Relationships transferred
         assert conn.execute(
             "SELECT COUNT(*) FROM relationships WHERE person_a_id = ? OR person_b_id = ?",
@@ -410,9 +421,9 @@ class TestCrmSingleTransaction:
         conn.execute(
             "UPDATE source_entities SET canonical_person_id = ? WHERE canonical_person_id = ?",
             (primary_id, secondary_id))
-        conn.execute(
-            "DELETE FROM person_facts WHERE person_id IN (?, ?)",
-            (primary_id, secondary_id))
+        from scripts.merge_people import _apply_fact_merge, _plan_fact_merge
+        _apply_fact_merge(conn, primary_id, secondary_id,
+                          _plan_fact_merge(conn, primary_id, secondary_id))
 
         # Simulate crash: rollback instead of commit
         conn.rollback()
@@ -657,4 +668,5 @@ def _make_mock_store(people: dict):
     from unittest.mock import MagicMock
     store = MagicMock()
     store.get_by_id.side_effect = lambda pid: people.get(pid)
+    store.get_by_id_unresolved.side_effect = lambda pid: people.get(pid)
     return store
