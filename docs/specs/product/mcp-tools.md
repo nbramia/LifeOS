@@ -462,6 +462,8 @@ Search for people in your network.
 | q | string | Yes | Name or email to search |
 | limit | integer | No | Max results (default: 10, max: 50) |
 
+A `q` that matches no name and says it wants whoever fits ("who do I know in fundraising", "people in fundraising") returns people whose CRM profile fits it. Any other `q` that matches no name returns nothing.
+
 ### lifeos_memories_create
 
 Save a memory for future reference.

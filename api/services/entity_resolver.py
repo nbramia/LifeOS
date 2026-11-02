@@ -388,6 +388,10 @@ class EntityResolver:
             match_type=top.match_type,
         ))
 
+    def candidates_for_name(self, name: str) -> list[ResolutionCandidate]:
+        """Every live person a name could mean. Hidden and merged people never count."""
+        return self._score_candidates(resolve_person_name(name), None).candidates
+
     def _score_candidates(
         self, name: str, context_path: Optional[str]
     ) -> ScoredCandidates:

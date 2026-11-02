@@ -219,6 +219,16 @@ def search_people(
     )
     results = candidates[:limit]
 
+    # Nothing here marks a result as a suggestion, so only a term that says it wants
+    # whoever fits gets them. A name that was not found stays an empty result.
+    described: list = []
+    if not results:
+        from api.services.person_indexer import asks_who_fits, find_people_by_description
+
+        if asks_who_fits(q):
+            described = [m.person for m in find_people_by_description(q, top_k=limit)]
+            results = described
+
     # Batch the recency-by-source lookup for the whole page in one query
     # instead of one per person (the old N+1 cost). A person absent from the
     # batch result genuinely has no interactions -- get_last_interaction_by_
@@ -232,7 +242,7 @@ def search_people(
         [e.id for e in results if e.id]
     )
 
-    total = store.count_search(q)
+    total = len(described) if described else store.count_search(q)
 
     return SearchResponse(
         people=[

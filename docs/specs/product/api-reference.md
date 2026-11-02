@@ -281,7 +281,12 @@ Get a specific person by name.
 ### GET /api/people/search
 
 Search people by name, email, alias, or display name. Matches sort exact
-canonical-name matches first, then most recently seen.
+canonical-name matches first, then most recently seen. When nothing matches and
+`q` says it wants whoever fits ("who do I know in fundraising", "people in
+fundraising"), the same fields come back for people whose CRM profile fits it,
+best fit first. These are suggestions, not name matches. Any other `q` that
+matches no name returns an empty list, including wording in front of a name ("who
+is Robin Example"), as does an unreachable index.
 
 **Query Parameters:**
 - `q` (string, required): Search text

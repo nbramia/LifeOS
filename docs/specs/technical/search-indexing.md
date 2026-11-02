@@ -121,6 +121,7 @@ A facet set that matches zero files returns `[]` immediately; nothing is recorde
 | `api/services/query_classifier.py` | Factual vs semantic detection |
 | `api/services/reranker.py` | Cross-encoder re-ranking service |
 | `api/services/query_router.py` | LLM-based source routing + person name extraction |
+| `api/services/person_indexer.py` | People index: search and finding people by description (see [Data & Sync](data-and-sync.md)) |
 | `api/services/vault_tagger.py`, `api/services/vault_tag_store.py` | Per-note facet tagging and its rebuildable store |
 
 ## Related Documents

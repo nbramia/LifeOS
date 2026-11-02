@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Platform
-> **Last Updated:** 2026-09-08
+> **Last Updated:** 2026-11-02
 
 Codebase organization and module structure for efficient navigation.
 
@@ -92,7 +92,8 @@ Per-backend capabilities (personas, handoff, history ownership, usage capture) a
 - `entity_resolver.py` - Entity resolution logic
 - `mention_resolver.py` - Reads first-name mentions in notes in the note's context
 - `person_facts.py` - Fact extraction and storage
-- `person_indexer.py` - Person search indexing
+- `person_indexer.py` - Person search indexing, and finding people by description
+- `person_context.py` - Who a chat message is about and how sure that is; builds the system-prompt person block
 - `person_stats.py` - Statistics computation
 - `aggregate_cache.py` - Response cache for the heaviest CRM aggregate endpoints (see below)
 
