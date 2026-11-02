@@ -21,7 +21,8 @@ any failure so the turn proceeds without a person block.
 
 A turn that may leave the box, such as one Hermes sends to a remote provider,
 gets the off-box rendering: the same resolution and tiers with no emails, phone
-numbers or birthdays, which reach that model only when it calls a tool for them.
+numbers, birthdays or street addresses, which reach that model only when it calls
+a tool for them.
 """
 from __future__ import annotations
 
@@ -81,11 +82,34 @@ _LEADING_MY = re.compile(r"^my\s+", re.IGNORECASE)
 
 _EMAIL = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
 _PHONE = re.compile(r"\+?\d(?:[\s().-]*\d){9,}|\b\d{3}[-.\s]\d{4}\b")
-_BIRTHDAY_WORDING = re.compile(r"\b(?:birthday|birthdate|date of birth|dob|born on)\b", re.IGNORECASE)
+_BIRTHDAY_WORDING = re.compile(r"\b(?:birthdays?|birthdate|birth date|date of birth|dob|bday|b-day)\b", re.IGNORECASE)
+_BORN = re.compile(r"\bborn\b", re.IGNORECASE)
+_DATE_PART = re.compile(
+    r"\d|\b(?:jan|january|feb|february|mar|march|apr|april|may|jun|june|jul|july|aug|august"
+    r"|sep|sept|september|oct|october|nov|november|dec|december)\b",
+    re.IGNORECASE,
+)
+_STREET_ADDRESS = re.compile(
+    r"\b\d+[a-z]?\s+(?:(?!(?:the|a|an|on|in|at|of|to|and|or|per)\b)[\w.'-]+\s+){0,3}"
+    r"(?:street|st|avenue|ave|road|rd|boulevard|blvd|lane|ln|drive|dr|court|ct|place|pl|way|terrace|ter"
+    r"|circle|cir|parkway|pkwy|highway|hwy|square|sq)\b"
+    r"|\b(?:home|street|mailing|postal)\s+address\b"
+    r"|\blives\s+at\s+\d"
+    r"|\bp\.?\s?o\.?\s+box\b",
+    re.IGNORECASE,
+)
 _HANDLE = re.compile(r"[@\d_/:]|^\S+\.[^\W\d_]{2,}\S*$")
 
-# Words in a fact's key that say its value is a direct identifier.
-_IDENTIFIER_KEY_WORDS = frozenset("email phone telephone mobile cell birthday birthdate birth dob born".split())
+# Words in a fact's key that say its value is a direct identifier. Extracted facts
+# carry a hash for a key, so this catches only facts written with a named key.
+_IDENTIFIER_KEY_WORDS = frozenset(
+    "email phone telephone mobile cell birthday birthdate birth dob born bday "
+    "address street residence zip zipcode postcode".split()
+)
+
+# Fact categories withheld whole. A date holds no word to say whose or of what, and
+# this is where extraction files a birthday.
+_IDENTIFIER_FACT_CATEGORIES = frozenset({"dates"})
 
 # Lowercase words that can sit inside a full name.
 _NAME_PARTICLES = frozenset("bin da de del der di du la le van von".split())
@@ -335,14 +359,17 @@ def _meaningful_aliases(entity) -> list[str]:
 
 
 def _is_direct_identifier(fact) -> bool:
-    """Whether a fact is, or states, an email address, phone number or birthday."""
+    """Whether a fact is, or states, an email address, phone number, birthday or street address."""
     key_words = set(re.split(r"[^a-z]+", (fact.key or "").lower()))
     value = str(fact.value or "")
     return bool(
-        key_words & _IDENTIFIER_KEY_WORDS
+        (fact.category or "").lower() in _IDENTIFIER_FACT_CATEGORIES
+        or key_words & _IDENTIFIER_KEY_WORDS
         or _EMAIL.search(value)
         or _PHONE.search(value)
         or _BIRTHDAY_WORDING.search(value)
+        or (_BORN.search(value) and _DATE_PART.search(value))
+        or _STREET_ADDRESS.search(value)
     )
 
 
@@ -353,7 +380,8 @@ def format_person_profile(entity, fact_limit: int, offbox: bool = False) -> str:
     Args:
         entity: The identified PersonEntity
         fact_limit: Most facts to show
-        offbox: Leave out emails, phone numbers and birthdays, including any held in a fact.
+        offbox: Leave out emails, phone numbers and birthdays, and any fact holding one of
+            those or a street address.
             The entity_id stays: every lifeos_person_* tool takes it.
     """
     from api.services.person_facts import get_person_fact_store, rank_facts
@@ -498,9 +526,9 @@ def _render_block(resolution: PersonResolution, depth: str, offbox: bool = False
         basis,
         *([f"Also known as: {', '.join(aliases)}"] if aliases else []),
         format_person_profile(person, PROFILE_FACT_LIMIT, offbox),
-        "Use this entity_id with the lifeos_person_* tools. Emails, phone numbers and birthdays "
-        "are left out here; lifeos_person_profile and lifeos_person_facts return them if the "
-        "question needs them."
+        "Use this entity_id with the lifeos_person_* tools. Emails, phone numbers, birthdays, "
+        "street addresses and dated facts are left out here; lifeos_person_profile and "
+        "lifeos_person_facts return what is on record if the question needs them."
         if offbox else
         "Use this entity_id and these identifiers directly; person_info(lookup) would return "
         "the same profile.",

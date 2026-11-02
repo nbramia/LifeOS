@@ -286,7 +286,7 @@ CURATED_ENDPOINTS = {
     },
     "/api/people/search": {
         "name": "lifeos_people_search",
-        "description": "Find people by name/email; description worded like 'people in fundraising' (three or more words) gives suggestions. Returns entity_id for lifeos_person_*. Never present people sharing a first name as one person.",
+        "description": "Find people by name/email; a description worded 'people in X' or 'who ...' gives suggestions. Returns entity_id for lifeos_person_*. Never present people sharing a first name as one person.",
         "method": "GET"
     },
     "/api/crm/people/{entity_id}:PATCH": {

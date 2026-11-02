@@ -416,16 +416,16 @@ The `turn` object above — identical in shape to the response body of [`GET /ap
 
 #### Person context on Hermes turns
 
-`person_context` is the off-box rendering of the block the native path puts in its system prompt, with the same resolution and [tiers](../product/api-communications.md#post-apiaskstream): `build_offbox_person_context()` in `api/services/person_context.py`. Emails, phone numbers and birthdays reach a Hermes model only when it calls a tool for them, so the block leaves them out, and the native block keeps them. `POST /api/hermes/ask/stream` reads the conversation's recent messages and runs the lookup off the event loop under one 500 ms budget before it builds the envelope. A failure or overrun forwards the turn with no key and logs only the exception type.
+`person_context` is the off-box rendering of the block the native path puts in its system prompt, with the same resolution and [tiers](../product/api-communications.md#post-apiaskstream): `build_offbox_person_context()` in `api/services/person_context.py`. Emails, phone numbers, birthdays and street addresses reach a Hermes model only when it calls a tool for them, so the block leaves them out, and the native block keeps them. `POST /api/hermes/ask/stream` reads the conversation's recent messages and runs the lookup off the event loop under one 500 ms budget before it builds the envelope. A failure or overrun forwards the turn with no key and logs only the exception type.
 
 The key is absent when the message names no one and on `journal` and `therapist` turns, whether selected by `persona_id` or a raw `persona` preamble; the therapist's Hermes profile is meant to stay away from CRM person data. `POST /api/hermes/resolve-persona` and board-assigned Hermes sessions, which call `_build_envelope` directly, never carry it. The Hermes adapter reads only the `turn` keys it knows, so the field reaches a model only where Hermes renders it.
 
 **What it sends.** A Hermes turn can be answered by a remote provider, so this is the data the field adds to that request:
 
-- **Identified person (`confident`, `conversation`):** canonical name, `entity_id` (every `lifeos_person_*` tool takes it), aliases that are not addresses or handles, company, position, relationship strength, days since contact, active and primary channels, per-channel interaction counts over 90 days, and up to 8 person facts, highest confidence first. A fact that is or states an email, phone number or birthday is left out.
+- **Identified person (`confident`, `conversation`):** canonical name, `entity_id` (every `lifeos_person_*` tool takes it), aliases that are not addresses or handles, company, position, relationship strength, days since contact, active and primary channels, per-channel interaction counts over 90 days, and up to 8 person facts, highest confidence first. Withheld from those facts: the whole `dates` category, and any fact whose key or value gives an email, phone number, birthday or street address. A city or region stays.
 - **Unconfirmed (`likely`, `uncertain`):** for each person listed, canonical name, position, company and days since last contact, closest first. No `entity_id`, aliases or facts; the model looks a candidate up by full name.
 
-Emails, phone numbers, birthdays, CRM notes, tags and message content are not in it.
+Emails, phone numbers, birthdays, street addresses, CRM notes, tags and message content are not in it.
 
 The stored assistant message's `routing` carries the same fields as a native turn: `person_tier`, plus `person` and `person_id` only for an identified person, so a later turn can settle a first name from it.
 

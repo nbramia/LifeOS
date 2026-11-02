@@ -3358,6 +3358,8 @@ async def test_deposit_answer_rejects_an_empty_answer(resolve_client, agent_sess
 # ---------------------------------------------------------------------------
 
 _PERSON_FACT = "Allergic to synthetic peanuts"
+# Extraction stores a hash of category and value as the key, which says nothing about the fact.
+_EXTRACTED_KEY = "a1b2c3d4e5f6"
 _OTHER_PERSON_FACT = "Collects synthetic stamps"
 _PERSON_CONV_ID = "hermes-person-conv"
 
@@ -3841,29 +3843,44 @@ class TestPersonContextLeavesTheContractAlone:
             "SYNTHETIC-NOTE", "synthetic-tag", "example.com/in/synthetic",
         ):
             assert withheld not in block
+        assert "Emails, phone numbers, birthdays, street addresses and dated facts are left out" in block
         assert "lifeos_person_profile" in block
         assert "person_info" not in block
 
-    @pytest.mark.parametrize("key,value", [
-        ("personal_email", "synthetic note"),
-        ("note", "Reach her at robin.private@example.com"),
-        ("mobile", "ask first"),
-        ("note", "Her number is 555-0100"),
-        ("note", "Her number is (555) 010-0199"),
-        ("note", "Her number is +1 555 010 0199"),
-        ("birthday", "January 2"),
-        ("spouse_birthday", "January 2"),
-        ("note", "Her birthday is January 2"),
+    @pytest.mark.parametrize("category,key,value", [
+        ("background", "personal_email", "synthetic note"),
+        ("background", _EXTRACTED_KEY, "Reach her at robin.private@example.com"),
+        ("background", "mobile", "ask first"),
+        ("background", _EXTRACTED_KEY, "Her number is 555-0100"),
+        ("background", _EXTRACTED_KEY, "Her number is (555) 010-0199"),
+        ("background", _EXTRACTED_KEY, "Her number is +1 555 010 0199"),
+        ("background", "birthday", "the second of January"),
+        ("background", "spouse_bday", "the second of January"),
+        ("background", _EXTRACTED_KEY, "Her birthday is January 2"),
+        ("background", _EXTRACTED_KEY, "DOB 01/02"),
+        ("background", _EXTRACTED_KEY, "Born March 4, 1980"),
+        ("background", _EXTRACTED_KEY, "Was born 3/4/1980"),
+        ("family", _EXTRACTED_KEY, "Daughter was born in June"),
+        ("dates", _EXTRACTED_KEY, "March 4, 1980"),
+        ("Dates", _EXTRACTED_KEY, "Fourth of March"),
+        ("dates", _EXTRACTED_KEY, "Celebrates every spring"),
+        ("background", _EXTRACTED_KEY, "Lives at 12 Oak Street, Springfield"),
+        ("background", _EXTRACTED_KEY, "Moved to 350 5th Ave last year"),
+        ("background", _EXTRACTED_KEY, "Her place is 1600 Example Boulevard"),
+        ("background", _EXTRACTED_KEY, "lives at 12b oak"),
+        ("background", _EXTRACTED_KEY, "Home address is the blue house"),
+        ("background", _EXTRACTED_KEY, "Mail goes to P.O. Box 12"),
+        ("background", "home_address", "the blue house"),
     ])
     async def test_a_fact_that_is_a_direct_identifier_is_filtered(
-        self, person_proxy, person_crm, hermes_store, key, value,
+        self, person_proxy, person_crm, hermes_store, category, key, value,
     ):
         from api.services.person_facts import PersonFact, get_person_fact_store
 
         person = _add_person(person_crm, "Robin Alpha")
         _add_fact(person)
         get_person_fact_store().upsert(PersonFact(
-            person_id=person.id, category="dates", key=key, value=value, confidence=0.99,
+            person_id=person.id, category=category, key=key, value=value, confidence=0.99,
         ))
 
         block = (await _person_turn(person_proxy, "Who is Robin Alpha?"))["person_context"]
@@ -3874,8 +3891,13 @@ class TestPersonContextLeavesTheContractAlone:
     @pytest.mark.parametrize("key,value", [
         ("cello_teacher", "Sam Example"),
         ("years_at_company", "2019-2021"),
-        ("anniversary", "March 3"),
         ("hometown", "Exampleville"),
+        (_EXTRACTED_KEY, "Lives in Springfield"),
+        (_EXTRACTED_KEY, "Based in DC"),
+        (_EXTRACTED_KEY, "Born in Chicago"),
+        (_EXTRACTED_KEY, "Ran 5 miles on the road"),
+        (_EXTRACTED_KEY, "Has 2 dogs"),
+        (_EXTRACTED_KEY, "Gave the keynote address"),
     ])
     async def test_an_ordinary_fact_is_not_filtered(self, person_proxy, person_crm, hermes_store, key, value):
         from api.services.person_facts import PersonFact, get_person_fact_store
@@ -3894,7 +3916,8 @@ class TestPersonContextLeavesTheContractAlone:
         person = _add_person(person_crm, "Robin Alpha")
         for index in range(PROFILE_FACT_LIMIT):
             get_person_fact_store().upsert(PersonFact(
-                person_id=person.id, category="dates", key=f"phone_{index}", value=f"hidden {index}", confidence=0.99,
+                person_id=person.id, category="background", key=f"phone_{index}", value=f"hidden {index}",
+                confidence=0.99,
             ))
         _add_fact(person)
 
@@ -3950,13 +3973,19 @@ class TestPersonContextLeavesTheContractAlone:
             person_crm, "Robin Alpha",
             emails=["robin.alpha@example.com"], phone_numbers=["+15550100"], birthday="01-02",
         )
-        get_person_fact_store().upsert(PersonFact(
-            person_id=person.id, category="dates", key="birthday", value="January 2", confidence=0.9,
-        ))
+        for key, category, value in (
+            ("birthday", "dates", "January 2"),
+            ("a1b2c3d4e5f6", "background", "Lives at 12 Oak Street, Springfield"),
+        ):
+            get_person_fact_store().upsert(PersonFact(
+                person_id=person.id, category=category, key=key, value=value, confidence=0.9,
+            ))
 
         block = build_person_context("Who is Robin Alpha?").block
 
-        for carried in ("robin.alpha@example.com", "+15550100", "01-02", "January 2", "person_info(lookup)"):
+        for carried in (
+            "robin.alpha@example.com", "+15550100", "01-02", "January 2", "12 Oak Street", "person_info(lookup)",
+        ):
             assert carried in block
 
     async def test_native_candidates_keep_their_details(self, person_crm):

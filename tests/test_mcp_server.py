@@ -1612,8 +1612,7 @@ def test_people_search_description_states_what_it_finds_and_how_to_read_it():
     )["description"]
 
     assert len(description.split()) <= 30
-    assert "description worded like" in description
-    assert "(three or more words)" in description
+    assert "description worded" in description
     assert "gives suggestions" in description
     assert "sharing a first name as one person" in description
     assert "entity_id" in description
@@ -1637,7 +1636,12 @@ def test_the_description_example_is_one_the_search_runs_as_a_description():
         c for c in module.CURATED_ENDPOINTS.values() if c["name"] == "lifeos_people_search"
     )["description"]
 
-    example = re.search(r"'([^']+)'", description).group(1)
+    wordings = re.findall(r"'([^']+)'", description)
+    assert len(wordings) >= 2
+    for wording in wordings:
+        assert asks_who_fits(wording.replace("X", "fundraising").replace("...", "invests")), wording
 
-    assert len(example.split()) >= 3
-    assert asks_who_fits(example)
+    # The gate reads wording, not length, so the description must not promise a length.
+    assert asks_who_fits("who invests")
+    assert not asks_who_fits("do i know bankers")
+    assert not re.search(r"\b(?:one|two|three|four|\d\+?)\b.*\bwords?\b", description)
