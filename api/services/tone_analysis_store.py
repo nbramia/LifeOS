@@ -18,11 +18,11 @@ decide whether a stored month is still fresh.
 
 Rows for a merged-away or deleted person don't orphan: when two
 people are merged, `scripts/merge_people.py` deletes the absorbed
-person's rows here in the same crm.db transaction it clears
+person's rows here in the same crm.db transaction it moves
 `person_facts` in -- deliberately *not* re-keyed onto the survivor (a
 re-keyed row could collide with a `period_key` the survivor already has,
 since the primary key here is `(person_id, period_key)`) and deliberately
-leaving the survivor's own rows untouched (unlike `person_facts`, a
+leaving the survivor's own rows untouched (a
 survivor's stale row self-heals via the ordinary interaction-count
 freshness check in `api/routes/crm.py`'s
 `analyze_relationship_tone_detailed` the next time tone analysis runs for

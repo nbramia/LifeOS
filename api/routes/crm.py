@@ -996,7 +996,11 @@ def merge_people(request: PersonMergeRequest):
     - Merges emails, phones, aliases from all secondaries into primary
     - Updates all interactions to point to primary
     - Updates all source entities to point to primary
-    - Updates all facts to point to primary
+    - Moves the secondaries' facts to the primary. The primary's facts stay;
+      when both have a fact for the same category and key, a user-confirmed
+      secondary fact replaces an unconfirmed primary one, otherwise the
+      primary's fact stays. `stats.facts_moved` counts facts moved and
+      `stats.facts_cleared` counts duplicates dropped.
     - Records the merge for durability (prevents re-creation of duplicates)
     - Deletes the secondary records
 
@@ -1007,7 +1011,7 @@ def merge_people(request: PersonMergeRequest):
         import sys
         from pathlib import Path
         sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-        from scripts.merge_people import merge_people as do_merge
+        from scripts.merge_people import SamePersonError, merge_people as do_merge
 
         person_store = get_person_entity_store()
         _source_store = get_source_entity_store()  # noqa: F841
@@ -1029,6 +1033,7 @@ def merge_people(request: PersonMergeRequest):
         total_stats = {
             'interactions_updated': 0,
             'source_entities_updated': 0,
+            'facts_moved': 0,
             'facts_cleared': 0,
             'tone_rows_cleared': 0,
             'emails_merged': 0,
@@ -1045,6 +1050,8 @@ def merge_people(request: PersonMergeRequest):
                 merged_ids.append(sec_id)
                 for key in total_stats:
                     total_stats[key] += stats.get(key, 0)
+            except SamePersonError:
+                raise HTTPException(status_code=400, detail="Cannot merge a person into itself")
             except Exception as e:
                 logger.error(f"Failed to merge {sec_id} into {request.primary_id}: {e}")
                 raise HTTPException(status_code=500, detail=f"Merge failed for {sec_id}: {str(e)}")
