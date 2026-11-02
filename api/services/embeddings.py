@@ -86,6 +86,7 @@ class EmbeddingService:
         self.cache_dir = cache_dir or getattr(settings, 'embedding_cache_dir', None) or None
         self._model: Any = None
         self._force_cpu: bool = False
+        self._ceiling: int | None = None
         # Serialize lazy loads. Searches run through execute_tool_parallel →
         # asyncio.to_thread, so concurrent first-use from multiple tool threads
         # would otherwise race the (meta-device) model init and leave params on
@@ -124,6 +125,7 @@ class EmbeddingService:
                 load_kwargs["device"] = "cpu"
 
             self._model = self._load_with_offline_retry(SentenceTransformer, load_kwargs)
+            self._apply_sequence_ceiling(self._model)
             from api.services.service_health import mark_service_healthy
             mark_service_healthy("embedding_model")
         except RuntimeError as e:
@@ -139,6 +141,7 @@ class EmbeddingService:
                         local_files_only=True,
                     )
                     self._model = self._load_with_offline_retry(SentenceTransformer, cpu_kwargs)
+                    self._apply_sequence_ceiling(self._model)
                     self._force_cpu = True
                     from api.services.service_health import mark_service_healthy
                     mark_service_healthy("embedding_model")
@@ -155,6 +158,40 @@ class EmbeddingService:
             from api.services.service_health import mark_service_failed, Severity
             mark_service_failed("embedding_model", str(e), Severity.CRITICAL)
             raise
+
+    def _apply_sequence_ceiling(self, model) -> None:
+        """Cap the model's input length at ``settings.embedding_max_seq_length``.
+
+        A model whose own limit is lower keeps it. ``self._ceiling`` records the
+        cap only when it is the binding limit, so truncation is reported only
+        when it comes from this setting rather than from the model.
+        """
+        ceiling = settings.embedding_max_seq_length
+        native = getattr(model, "max_seq_length", None)
+        if isinstance(native, int) and native > ceiling:
+            model.max_seq_length = ceiling
+            self._ceiling = ceiling
+        else:
+            self._ceiling = None
+
+    def _warn_if_truncated(self, data) -> None:
+        """Log (counts only, never text) when ``data`` exceeds the ceiling."""
+        _ = self.model  # a first call loads the model, which sets the ceiling
+        if self._ceiling is None:
+            return
+        try:
+            texts = [data] if isinstance(data, str) else list(data)
+            ids = self.model.tokenizer(texts, truncation=False, verbose=False)["input_ids"]
+            longest = max((len(i) for i in ids), default=0)
+            over = sum(len(i) > self._ceiling for i in ids)
+            if over:
+                logger.warning(
+                    "Embedding input over the %d-token ceiling: %d of %d texts, longest %d "
+                    "tokens; the excess is left out of the vector (keyword search still "
+                    "sees all of it)", self._ceiling, over, len(texts), longest,
+                )
+        except Exception:
+            logger.debug("Could not check embedding input length", exc_info=True)
 
     def _load_with_offline_retry(self, st_cls, load_kwargs: dict):
         """Load the SentenceTransformer, retrying with HF_HUB_OFFLINE=1 on network errors.
@@ -318,6 +355,11 @@ class EmbeddingService:
             except OSError:
                 pass
 
+    def _encode(self, data, **kwargs):
+        """``model.encode`` after reporting any input the ceiling will trim."""
+        self._warn_if_truncated(data)
+        return self.model.encode(data, **kwargs)
+
     def _encode_with_fallback(self, data, **kwargs):
         """Encode with GPU→CPU fallback on RuntimeError, serialized against
         other processes' GPU embedding via a cross-process lock.
@@ -336,7 +378,7 @@ class EmbeddingService:
         if self._force_cpu:
             # Already on CPU — nothing to serialize (the lock only protects
             # concurrent GPU access), so skip the flock overhead entirely.
-            return self.model.encode(data, **kwargs)
+            return self._encode(data, **kwargs)
 
         with self._acquire_gpu_lock() as outcome:
             if outcome == _LOCK_TIMEOUT:
@@ -351,12 +393,12 @@ class EmbeddingService:
                 )
                 self._model = None
                 self._force_cpu = True
-                return self.model.encode(data, **kwargs)
+                return self._encode(data, **kwargs)
 
             # ACQUIRED, DISABLED, or ERROR all proceed on GPU as before — the
             # existing GPU->CPU RuntimeError fallback still applies.
             try:
-                return self.model.encode(data, **kwargs)
+                return self._encode(data, **kwargs)
             except RuntimeError as e:
                 error_msg = str(e).lower()
                 if self._force_cpu or not any(kw in error_msg for kw in _GPU_ERROR_KEYWORDS):
@@ -370,7 +412,7 @@ class EmbeddingService:
                 )
                 self._model = None
                 self._force_cpu = True
-                return self.model.encode(data, **kwargs)
+                return self._encode(data, **kwargs)
 
     def embed_text(self, text: str) -> list[float]:
         """

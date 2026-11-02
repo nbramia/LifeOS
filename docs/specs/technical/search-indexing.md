@@ -70,6 +70,16 @@ The query classifier (`api/services/query_classifier.py`) determines whether a q
 
 Every `.md` file in the vault except those under `_`-prefixed folders. Bulk content (`LIFEOS_VAULT_NO_PEOPLE_PATHS`, frontmatter `people: false` or `generated:`) is indexed for search like any other note and contributes no people data; see [Data & Sync](data-and-sync.md).
 
+### Chunking and the embedding ceiling
+
+`api/services/chunker.py` cuts a note into chunks before embedding. A note of 500 tokens or fewer (by `tiktoken`) is one chunk. A longer note is cut into windows of about 384 words with a 38-word overlap. A meeting note (frontmatter `granola_id` or `wispr_id`) is cut by header, and a section over 500 tokens is cut into windows the same way. Each chunk then gets its contextual prefix, and every chunk goes to the keyword index as well as the vector store.
+
+Every chunk is held to a hard limit of `LIFEOS_EMBEDDING_MAX_SEQ_LENGTH` minus 256 tokens (1,792 by default), counted in the embedding model's own tokens from its locally cached tokenizer, never downloaded. The 256 are room for the prefix. A chunk over the limit, such as a long table, a URL or an unbroken run of text, is split on token boundaries into near-equal pieces that share up to 50 tokens, with its header carried to each piece; a chunk within the limit is untouched. No text is dropped: the keyword index and the summarizer receive all of it. If the model's tokenizer is not cached, sizes are measured with `tiktoken`, and with a four-characters-per-token estimate if that is missing too.
+
+`LIFEOS_EMBEDDING_MAX_SEQ_LENGTH` (2,048 by default) is also the embedding service's ceiling on the tokens of any text it encodes, queries included. The model is held to the lower of this and its own limit. Text over the ceiling is cut off from its vector, and the service logs how many texts and how long (never the text). The chunk limit keeps chunked notes under the ceiling, so the log appears only for text that bypassed the chunker.
+
+Chunks are cut when a note is indexed. Chunks already stored are replaced only when their note changes,. A chunk within the limit is never altered, so nothing is re-embedded because of the limit.
+
 ### Vault Tags
 
 `api/services/vault_tagger.py` derives per-note facets (document type, domain, primary and secondary topics, project, actionability, has-decision, sensitivity) into `data/vault_tags.db` via `api/services/vault_tag_store.py`, a database separate from `bm25_index.db`. Rows are keyed by file path and current while the content hash and the taxonomy `vocab_version` match; modification time never triggers re-tagging. Closed-set facets come from one Jev call per note, gated by `LIFEOS_JEV_VAULT_TAGGING`, a folder allowlist, and an on-box sensitivity rule; raw probabilities are stored so thresholds can change without re-inference. Tags are never written to frontmatter. See [configuration.md](../../guides/configuration.md) for the privacy contract.
