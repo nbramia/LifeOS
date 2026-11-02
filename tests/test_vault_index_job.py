@@ -901,7 +901,7 @@ class TestDrain:
 
         stats = self._drain(indexer)
 
-        assert stats == {"generated": 1, "fallback": 0, "failed": 3, "changed_during_pass": 0, "remaining": 5}
+        assert stats == {"generated": 1, "fallback": 0, "failed": 3, "changed_during_pass": 0, "stopped_on_failures": 1, "remaining": 5}
         assert _queued(summary_queue) == [str(n) for n in notes[1:]]
         docs = [hit for hit in indexer.bm25_index.search("Document") if hit["doc_id"].endswith("::summary")]
         assert len(docs) == 1
@@ -1102,6 +1102,7 @@ class TestDrainScript:
         note = _write_note(vault, "note.md", 1000)
         summarizer.add_summary_failure(str(note), note.name)
         monkeypatch.setattr(summarizer, "is_summarizer_llm_available", lambda: False)
+        monkeypatch.setattr(summarizer, "LLM_READY_WAIT_SECONDS", 0)
         generate = MagicMock()
         monkeypatch.setattr(summarizer, "generate_summary", generate)
 
@@ -1110,6 +1111,66 @@ class TestDrainScript:
         assert "SYNC_SKIPPED" in capsys.readouterr().out
         generate.assert_not_called()
         assert _queued(summary_queue) == [str(note)]
+
+    def test_slow_llm_start_gets_drained_rather_than_skipped(self, script, vault, summary_queue, monkeypatch, capsys):
+        from api.services import summarizer
+
+        note = _write_note(vault, "note.md", 1000)
+        summarizer.add_summary_failure(str(note), note.name)
+        answers = iter([False, False, False, True])
+        monkeypatch.setattr(summarizer, "is_summarizer_llm_available", lambda: next(answers))
+        monkeypatch.setattr(script.time, "sleep", lambda _seconds: None)
+        monkeypatch.setattr(summarizer, "generate_summary", lambda *a, **k: ("A synthetic summary of this note.", True))
+
+        assert script.main(["--execute"]) == 0
+
+        assert "SYNC_SKIPPED" not in capsys.readouterr().out
+        assert _queued(summary_queue) == []
+
+    def test_llm_that_never_answers_skips_at_the_end_of_the_wait(self, script, vault, summary_queue, monkeypatch, capsys):
+        from api.services import summarizer
+
+        note = _write_note(vault, "note.md", 1000)
+        summarizer.add_summary_failure(str(note), note.name)
+        monkeypatch.setattr(summarizer, "is_summarizer_llm_available", lambda: False)
+        clock = iter(range(0, 10_000, 200))
+        monkeypatch.setattr(script.time, "monotonic", lambda: next(clock))
+        slept = []
+        monkeypatch.setattr(script.time, "sleep", slept.append)
+
+        assert script.main(["--execute"]) == 0
+
+        assert "SYNC_SKIPPED" in capsys.readouterr().out
+        assert len(slept) == 2
+        assert _queued(summary_queue) == [str(note)]
+
+    def test_healthy_llm_that_keeps_failing_reports_a_failure(self, script, vault, summary_queue, monkeypatch, capsys):
+        from api.services import summarizer
+
+        notes = [_write_note(vault, f"n{i}.md", 1000 + i) for i in range(4)]
+        for note in notes:
+            summarizer.add_summary_failure(str(note), note.name)
+        monkeypatch.setattr(summarizer, "is_summarizer_llm_available", lambda: True)
+        monkeypatch.setattr(summarizer, "generate_summary", lambda *a, **k: (None, False))
+
+        assert script.main(["--execute"]) == 1
+
+        captured = capsys.readouterr()
+        assert "Summary pass stopped" in captured.err
+        assert "SYNC_SKIPPED" not in captured.out
+        line = next(row for row in captured.out.splitlines() if row.startswith("SYNC_STATS:"))
+        assert json.loads(line[len("SYNC_STATS:"):])["errors"] == 3
+        assert len(_queued(summary_queue)) == 4
+
+    def test_failures_short_of_a_stop_stay_a_success(self, script, vault, summary_queue, monkeypatch):
+        from api.services import summarizer
+
+        note = _write_note(vault, "note.md", 1000)
+        summarizer.add_summary_failure(str(note), note.name)
+        monkeypatch.setattr(summarizer, "is_summarizer_llm_available", lambda: True)
+        monkeypatch.setattr(summarizer, "generate_summary", lambda *a, **k: (None, False))
+
+        assert script.main(["--execute"]) == 0
 
     def test_runs_while_the_vault_index_lock_is_held(self, script, vault, summary_queue, monkeypatch):
         from api.services import summarizer, vault_index_lock
@@ -1150,14 +1211,25 @@ class TestDrainScript:
 
 class TestDrainIsItsOwnSource:
     def test_runs_last_with_its_own_timeout_and_health_row(self):
+        from api.services.summarizer import LLM_READY_WAIT_SECONDS
         from api.services.sync_health import SYNC_SOURCES
         from config.settings import settings
         from scripts import run_all_syncs
 
         assert run_all_syncs.SYNC_ORDER[-1] == "vault_summaries"
         assert run_all_syncs.SYNC_SCRIPTS["vault_summaries"] == ("scripts/sync_vault_summaries.py", ["--execute"])
-        assert run_all_syncs.SYNC_TIMEOUTS["vault_summaries"] > settings.summary_retry_budget_seconds
+        assert run_all_syncs.SYNC_TIMEOUTS["vault_summaries"] > (
+            LLM_READY_WAIT_SECONDS + settings.summary_retry_budget_seconds + settings.ollama_retry_timeout
+        )
         assert SYNC_SOURCES["vault_summaries"]["idle_is_normal"] is True
+
+    def test_short_run_is_not_a_duration_collapse_but_others_still_are(self, monkeypatch):
+        from scripts import run_all_syncs
+
+        monkeypatch.setattr(run_all_syncs, "get_typical_duration_seconds", lambda source: 3000.0)
+
+        assert run_all_syncs._detect_duration_collapse("vault_summaries", 1.0) is None
+        assert run_all_syncs._detect_duration_collapse("vault_reindex", 1.0) is not None
 
     def test_nothing_waits_on_it_and_it_waits_on_nothing(self):
         """A failure stays its own, and a failed reindex doesn't hold it back."""

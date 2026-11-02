@@ -49,6 +49,10 @@ SUMMARY_FAILURES_FILE = "data/vault_summary_failures.json"
 # Content shorter than this is not worth summarizing and gets no summary.
 MIN_SUMMARY_CONTENT_CHARS = 100
 
+# How long the vault_summaries source waits for an LLM that isn't answering yet.
+# A restarted llama-server takes a while to load its model.
+LLM_READY_WAIT_SECONDS = 600
+
 # How many failures in a row end a drain pass. That many point to a stalled LLM.
 MAX_CONSECUTIVE_SUMMARY_FAILURES = 3
 # Passes a note may fail before it gets a fallback summary and leaves the queue.
@@ -389,12 +393,13 @@ def drain_summary_queue(bm25_index) -> dict:
     summary built from its first line.
 
     Returns:
-        Dict of counts: generated, fallback, failed, changed_during_pass, remaining
+        Dict of counts: generated, fallback, failed, changed_during_pass, remaining,
+        and stopped_on_failures (1 if failures in a row ended the pass, else 0)
     """
     from api.services.chunker import extract_frontmatter
     from api.utils.date_parser import extract_note_date
 
-    stats = {"generated": 0, "fallback": 0, "failed": 0, "changed_during_pass": 0}
+    stats = {"generated": 0, "fallback": 0, "failed": 0, "changed_during_pass": 0, "stopped_on_failures": 0}
     deadline = time.monotonic() + settings.summary_retry_budget_seconds
     consecutive_failures = 0
 
@@ -452,6 +457,7 @@ def drain_summary_queue(bm25_index) -> dict:
 
         if consecutive_failures >= MAX_CONSECUTIVE_SUMMARY_FAILURES:
             logger.warning(f"{consecutive_failures} summaries failed in a row; stopping this pass")
+            stats["stopped_on_failures"] = 1
             break
 
     stats["remaining"] = len(load_summary_failures().get("files", []))

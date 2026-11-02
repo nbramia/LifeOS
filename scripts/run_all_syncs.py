@@ -71,6 +71,7 @@ from api.services.gpu_memory import (
     get_available_gpu_memory_mb as _get_available_gpu_memory_mb,
     get_available_system_ram_mb as _get_available_system_ram_mb,
 )
+from api.services.summarizer import LLM_READY_WAIT_SECONDS
 from api.services.log_redaction import (
     REDACTED_TOKEN,
     TELEGRAM_TOKEN_PATTERN,
@@ -1100,8 +1101,11 @@ SYNC_TIMEOUTS = {
     "vault_reindex": 14400,          # 4 hours - incremental is typically 10-30min, but a
                                      #            `--force` full reindex of a ~6K-file vault
                                      #            plus per-file summary calls fits in ~3-4h
-    # Its own budget, plus the longest single LLM call and a margin.
-    "vault_summaries": settings.summary_retry_budget_seconds + settings.ollama_retry_timeout + 300,
+    # The wait for a restarting LLM, its own budget, the longest single LLM call,
+    # and a margin.
+    "vault_summaries": (
+        LLM_READY_WAIT_SECONDS + settings.summary_retry_budget_seconds + settings.ollama_retry_timeout + 300
+    ),
     "vault_tag": 3600,               # 1 hour - nightly delta is ~tens of notes; a full backfill is ~8 min
     "slack": 7200,                   # 2 hours - ~100 linked DMs + group DMs, rate-limited
     "google_docs": 300,              # 5 minutes - normally takes ~9s, hangs on expired OAuth
@@ -1177,8 +1181,13 @@ DURATION_COLLAPSE_MAX_ELAPSED_SECONDS = 2.0
 def _detect_duration_collapse(source: str, elapsed_seconds: float) -> dict | None:
     """Return collapse info if this run finished suspiciously fast, else None.
 
+    A source whose SYNC_SOURCES entry sets ``duration_varies`` is exempt: a short
+    run is ordinary for it, so its typical duration says nothing.
+
     Never raises — a sync_health DB hiccup must not fail the sync itself.
     """
+    if SYNC_SOURCES.get(source, {}).get("duration_varies"):
+        return None
     try:
         typical = get_typical_duration_seconds(source)
     except Exception as e:

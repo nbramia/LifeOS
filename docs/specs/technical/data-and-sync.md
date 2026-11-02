@@ -365,12 +365,12 @@ Runs in this order (see [iMessage Sync Ordering](#imessage-sync-ordering) below)
 |--------|---------|-------------|
 | `sync_vault_summaries.py` | Generate queued LLM summaries into BM25 | `data/vault_summary_failures.json`, vault files |
 
-The `vault_summaries` source holds the notes the vault index job indexed and the notes whose summary failed during a reindex. It has its own timeout and sync-health row, and a failure fails only this source. It needs only the LLM to answer: it does not depend on the reindex finishing, and when the LLM doesn't answer it reports a skip and leaves the queue alone.
+The `vault_summaries` source holds the notes the vault index job indexed and the notes whose summary failed during a reindex. It has its own timeout and sync-health row, and a failure fails only this source. It needs only the LLM to answer: it does not depend on the reindex finishing. With notes queued it waits up to 10 minutes for an LLM that isn't answering, since a restarted one takes a while to load its model, and then reports a skip and leaves the queue alone. Its run time swings widely by design, so duration-collapse detection doesn't apply to it.
 
 It runs last. Its time budget (`LIFEOS_SUMMARY_RETRY_BUDGET_SECONDS`) then delays no other source, and any LLM stopped for embeddings is already back. No later source reads summaries. The vault map pages read them during `vault_reindex`, so a page shows a new summary the night after it is generated. Search reads them from BM25 as soon as they are written.
 
 - **Order.** Notes with the fewest failed attempts first, then newest first, so today's notes come ahead of an old backlog and a note that keeps failing can't block the rest.
-- **Failures.** A note whose summary fails stays queued. Three failures in a row end the pass, since the LLM has probably stalled. A note that fails on three passes gets a fallback summary from its first line and leaves the queue. A note too short for a real summary gets the fallback straight away.
+- **Failures.** A note whose summary fails stays queued. Three failures in a row end the pass, since the LLM has probably stalled, and the source reports failure so the night's summary shows it. A note that fails on three passes gets a fallback summary from its first line and leaves the queue. A note too short for a real summary gets the fallback straight away.
 - **Concurrent indexing.** The source holds no vault index lock, so the job keeps running. Each queue entry has a generation. Anything about to rewrite or remove a note in BM25 first raises its generation under the queue's `flock`, and the source writes a summary and removes the entry under that same `flock`, only if the generation is the one it read before it started. Whichever comes first, no summary of old text survives: an earlier write is deleted with the note's old chunks, and a later one is refused, leaving the entry for the next pass.
 
 ### Unified Sync Runner

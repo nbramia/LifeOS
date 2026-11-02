@@ -320,6 +320,7 @@ SYNC_SOURCES = {
         "phase": 7,
         "depends_on": [],  # Needs only the LLM, so a failed reindex doesn't hold it back
         "idle_is_normal": True,  # An empty queue is a healthy night
+        "duration_varies": True,  # Seconds on a quiet night, up to its budget on a busy one
     },
 }
 
