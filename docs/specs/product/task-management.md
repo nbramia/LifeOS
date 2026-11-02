@@ -378,7 +378,7 @@ undercount hidden children.
 
 - Task files are the source of truth (markdown in vault); writes are atomic (a reader never sees a partial file)
 - `data/task_index.json` is a query cache rebuilt from markdown
-- Vault file watcher triggers automatic reindexing on changes
+- The task file watcher rebuilds `data/task_index.json` when task files change
 - A task keeps its identity across an external edit that shifts its line number — writes locate it by id, not by a cached position
 - Compatible with Obsidian Tasks plugin for viewing/editing in Obsidian
 - Uses Dataview inline field format for metadata
