@@ -422,6 +422,18 @@ class Settings(BaseSettings):
                     "freezing the host (issue #483). Semantically neutral — "
                     "batching changes only peak memory, not the embedding values."
     )
+    embedding_max_seq_length: int = Field(
+        default=2048,
+        ge=384,  # leaves the chunker a limit of at least 128 tokens after its prefix reserve
+        alias="LIFEOS_EMBEDDING_MAX_SEQ_LENGTH",
+        description="Hard ceiling on tokens per text the embedding model sees. "
+                    "The model's own limit can be tens of thousands of tokens, "
+                    "and one long text pads its whole batch to that length, so "
+                    "peak memory grows steeply with it. The chunker keeps every "
+                    "chunk below this (minus room for the contextual prefix), so "
+                    "it only trims text that bypassed the chunker. A model with a "
+                    "smaller limit of its own keeps it."
+    )
     embedding_gpu_lock_enabled: bool = Field(
         default=True,
         alias="LIFEOS_EMBEDDING_GPU_LOCK_ENABLED",

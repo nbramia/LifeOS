@@ -6,15 +6,27 @@ Chunking strategies:
 - Long notes (>500 tokens): ~500 token chunks with overlap
 - Short notes (<500 tokens): whole note as single chunk
 
+Every chunk is held to a hard token limit (``max_chunk_tokens``), measured in
+the embedding model's own tokens, whatever the strategy produced: tables, URLs
+and unbroken runs of text split on token boundaries, so no chunk can reach the
+embedding model longer than the limit and no text is dropped.
+
 Contextual chunking (P9.1):
 - Each chunk is prefixed with 1-2 sentences describing document context
 - This helps embeddings understand what document the chunk is from
 - Expected to improve retrieval accuracy by 35-50%
 """
+import logging
+import math
 import re
+import threading
 from pathlib import Path
 import frontmatter
 import tiktoken
+
+from config.settings import settings
+
+logger = logging.getLogger(__name__)
 
 
 # Use cl100k_base tokenizer (same as GPT-4/Claude)
@@ -30,6 +42,132 @@ def count_tokens(text: str) -> int:
         # Fallback: rough estimate of 4 chars per token
         return len(text) // 4
     return len(TOKENIZER.encode(text))
+
+
+# Tokens kept free below the embedding ceiling for the contextual prefix that
+# add_context_to_chunks() prepends after chunking (file name, attendees, tag
+# phrase, part counter), so a chunk at the limit still fits once prefixed.
+CONTEXT_PREFIX_RESERVE_TOKENS = 256
+
+# Characters per token assumed when no tokenizer is available at all (the same
+# rough figure count_tokens() falls back to).
+FALLBACK_CHARS_PER_TOKEN = 4
+
+
+def max_chunk_tokens() -> int:
+    """Hard limit on a chunk's embedding-model tokens, before its contextual prefix."""
+    return settings.embedding_max_seq_length - CONTEXT_PREFIX_RESERVE_TOKENS
+
+
+_UNLOADED = object()
+_embedding_tokenizer = _UNLOADED
+_tokenizer_lock = threading.Lock()
+
+
+def _get_embedding_tokenizer():
+    """The embedding model's fast tokenizer from the local cache, or None.
+
+    Never touches the network (``local_files_only``): the embedding service
+    loads the model the same way, so a host that can embed has these files.
+    """
+    global _embedding_tokenizer
+    if _embedding_tokenizer is _UNLOADED:
+        with _tokenizer_lock:
+            if _embedding_tokenizer is _UNLOADED:
+                try:
+                    from transformers import AutoTokenizer
+                    tokenizer = AutoTokenizer.from_pretrained(
+                        settings.embedding_model,
+                        cache_dir=settings.embedding_cache_dir or None,
+                        local_files_only=True,
+                    )
+                    _embedding_tokenizer = tokenizer if tokenizer.is_fast else None
+                except Exception as exc:
+                    logger.warning(
+                        "Embedding tokenizer unavailable (%s); chunk sizes are measured "
+                        "with the fallback tokenizer", exc.__class__.__name__,
+                    )
+                    _embedding_tokenizer = None
+    return _embedding_tokenizer
+
+
+def _token_starts(text: str) -> list[int]:
+    """Character offset where each token of ``text`` begins."""
+    tokenizer = _get_embedding_tokenizer()
+    if tokenizer is not None:
+        encoded = tokenizer(
+            text, add_special_tokens=False, return_offsets_mapping=True, verbose=False
+        )
+        return [start for start, _end in encoded["offset_mapping"]]
+    if TOKENIZER is not None:
+        _decoded, offsets = TOKENIZER.decode_with_offsets(TOKENIZER.encode(text))
+        return list(offsets)
+    return list(range(0, len(text), FALLBACK_CHARS_PER_TOKEN))
+
+
+def _count_embedding_tokens(texts: list[str]) -> list[int]:
+    """Token count of each text, in the tokens the embedding model sees."""
+    tokenizer = _get_embedding_tokenizer()
+    if tokenizer is not None and texts:
+        ids = tokenizer(texts, add_special_tokens=False, verbose=False)["input_ids"]
+        return [len(i) for i in ids]
+    return [len(_token_starts(text)) for text in texts]
+
+
+def _split_to_limit(text: str, limit: int, overlap: int) -> list[str]:
+    """Split ``text`` into pieces of at most ``limit`` tokens, on token boundaries.
+
+    Pieces are of near-equal size (no short remainder) and consecutive pieces
+    share ``overlap`` tokens, so every character of ``text`` lies in a piece.
+    """
+    starts = _token_starts(text)
+    n = len(starts)
+    if n <= limit:
+        return [text]
+
+    overlap = min(overlap, limit // 4)
+    pieces_needed = math.ceil((n - overlap) / (limit - overlap))
+    stride = math.ceil((n - overlap) / pieces_needed)
+
+    pieces = []
+    for i in range(pieces_needed):
+        first = i * stride
+        last = min(n, first + stride + overlap)
+        lo = 0 if i == 0 else starts[first]
+        hi = len(text) if last >= n else starts[last]
+        pieces.append(text[lo:hi].strip())
+    pieces = [piece for piece in pieces if piece]
+
+    if len(pieces) < 2 or any(len(piece) >= len(text.strip()) for piece in pieces):
+        # Offsets that do not advance (a tokenizer reporting none): cut by characters.
+        size = math.ceil(len(text) / pieces_needed)
+        pieces = [text[i:i + size].strip() for i in range(0, len(text), size)]
+        pieces = [piece for piece in pieces if piece]
+
+    # A piece re-tokenized alone can differ by a token at its cut; re-check it.
+    result: list[str] = []
+    for piece in pieces:
+        result.extend(_split_to_limit(piece, limit, overlap))
+    return result
+
+
+def enforce_token_limit(chunks: list[dict], limit: int | None = None, overlap: int = 50) -> list[dict]:
+    """Split every chunk longer than ``limit`` embedding tokens.
+
+    Chunks within the limit are returned untouched. A split chunk keeps its
+    other fields (e.g. ``header``) on each piece; ``chunk_index`` is left for
+    the caller to renumber.
+    """
+    limit = limit or max_chunk_tokens()
+    counts = _count_embedding_tokens([chunk["content"] for chunk in chunks])
+    limited: list[dict] = []
+    for chunk, count in zip(chunks, counts):
+        if count <= limit:
+            limited.append(chunk)
+            continue
+        for piece in _split_to_limit(chunk["content"], limit, overlap):
+            limited.append({**chunk, "content": piece})
+    return limited
 
 
 def extract_frontmatter(content: str) -> tuple[dict, str]:
@@ -284,6 +422,8 @@ def chunk_document(
         else:
             # Long note: chunk by tokens
             chunks = chunk_by_tokens(body, chunk_size, chunk_overlap)
+
+    chunks = enforce_token_limit(chunks, overlap=chunk_overlap)
 
     # Ensure all chunks have chunk_index
     for i, chunk in enumerate(chunks):

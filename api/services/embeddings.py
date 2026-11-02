@@ -7,6 +7,7 @@ Model files are cached at settings.embedding_cache_dir to save internal disk spa
 NOTE: sentence_transformers is imported lazily to avoid slow startup.
 This allows tests to import this module without loading the ML library.
 """
+import copy
 import errno
 import fcntl
 import logging
@@ -61,6 +62,12 @@ if TYPE_CHECKING:
     from sentence_transformers import SentenceTransformer
 
 
+# Most tokens one character can become (a four-byte character as byte tokens);
+# with the slack for special tokens it bounds which texts can reach the ceiling.
+_MAX_TOKENS_PER_CHAR = 4
+_SPECIAL_TOKEN_SLACK = 8
+
+
 # Model dimension lookup (for known models)
 MODEL_DIMENSIONS = {
     "all-MiniLM-L6-v2": 384,
@@ -86,6 +93,8 @@ class EmbeddingService:
         self.cache_dir = cache_dir or getattr(settings, 'embedding_cache_dir', None) or None
         self._model: Any = None
         self._force_cpu: bool = False
+        self._ceiling: int | None = None
+        self._length_tokenizer: Any = None
         # Serialize lazy loads. Searches run through execute_tool_parallel →
         # asyncio.to_thread, so concurrent first-use from multiple tool threads
         # would otherwise race the (meta-device) model init and leave params on
@@ -124,6 +133,7 @@ class EmbeddingService:
                 load_kwargs["device"] = "cpu"
 
             self._model = self._load_with_offline_retry(SentenceTransformer, load_kwargs)
+            self._apply_sequence_ceiling(self._model)
             from api.services.service_health import mark_service_healthy
             mark_service_healthy("embedding_model")
         except RuntimeError as e:
@@ -139,6 +149,7 @@ class EmbeddingService:
                         local_files_only=True,
                     )
                     self._model = self._load_with_offline_retry(SentenceTransformer, cpu_kwargs)
+                    self._apply_sequence_ceiling(self._model)
                     self._force_cpu = True
                     from api.services.service_health import mark_service_healthy
                     mark_service_healthy("embedding_model")
@@ -155,6 +166,65 @@ class EmbeddingService:
             from api.services.service_health import mark_service_failed, Severity
             mark_service_failed("embedding_model", str(e), Severity.CRITICAL)
             raise
+
+    def _apply_sequence_ceiling(self, model) -> None:
+        """Cap the model's input length at ``settings.embedding_max_seq_length``.
+
+        A model whose own limit is lower keeps it. ``self._ceiling`` records the
+        cap only when it is the binding limit, so truncation is reported only
+        when it comes from this setting rather than from the model.
+        """
+        ceiling = settings.embedding_max_seq_length
+        native = getattr(model, "max_seq_length", None)
+        self._length_tokenizer = None
+        if isinstance(native, int) and native > ceiling:
+            model.max_seq_length = ceiling
+            self._ceiling = ceiling
+            self._length_tokenizer = self._private_tokenizer(model)
+        else:
+            self._ceiling = None
+
+    @staticmethod
+    def _private_tokenizer(model):
+        """A copy of the model's tokenizer for measuring input length, or None.
+
+        The model's own tokenizer is shared by every thread that encodes, and
+        each encode sets its truncation and padding on it, which a concurrent
+        call with different settings contends with ("Already borrowed"). The
+        copy is fixed to no truncation and no padding, so measuring never
+        writes to it and never touches the shared one.
+        """
+        try:
+            private = copy.deepcopy(model.tokenizer)
+            private.backend_tokenizer.no_truncation()
+            private.backend_tokenizer.no_padding()
+            return private
+        except Exception:
+            logger.debug("No private tokenizer for input length checks", exc_info=True)
+            return None
+
+    def _warn_if_truncated(self, data) -> None:
+        """Log (counts only, never text) when ``data`` exceeds the ceiling."""
+        _ = self.model  # a first call loads the model, which sets the ceiling
+        if self._ceiling is None or self._length_tokenizer is None:
+            return
+        try:
+            texts = [data] if isinstance(data, str) else list(data)
+            # A text this short cannot reach the ceiling, so queries cost nothing.
+            texts = [t for t in texts if len(t) * _MAX_TOKENS_PER_CHAR + _SPECIAL_TOKEN_SLACK > self._ceiling]
+            if not texts:
+                return
+            ids = self._length_tokenizer(texts, verbose=False)["input_ids"]
+            longest = max(len(i) for i in ids)
+            over = sum(len(i) > self._ceiling for i in ids)
+            if over:
+                logger.warning(
+                    "Embedding input over the %d-token ceiling: %d of %d long texts, longest %d "
+                    "tokens; the excess is left out of the vector (the stored text is unchanged)",
+                    self._ceiling, over, len(texts), longest,
+                )
+        except Exception:
+            logger.debug("Could not check embedding input length", exc_info=True)
 
     def _load_with_offline_retry(self, st_cls, load_kwargs: dict):
         """Load the SentenceTransformer, retrying with HF_HUB_OFFLINE=1 on network errors.
@@ -318,6 +388,11 @@ class EmbeddingService:
             except OSError:
                 pass
 
+    def _encode(self, data, **kwargs):
+        """``model.encode`` after reporting any input the ceiling will trim."""
+        self._warn_if_truncated(data)
+        return self.model.encode(data, **kwargs)
+
     def _encode_with_fallback(self, data, **kwargs):
         """Encode with GPU→CPU fallback on RuntimeError, serialized against
         other processes' GPU embedding via a cross-process lock.
@@ -336,7 +411,7 @@ class EmbeddingService:
         if self._force_cpu:
             # Already on CPU — nothing to serialize (the lock only protects
             # concurrent GPU access), so skip the flock overhead entirely.
-            return self.model.encode(data, **kwargs)
+            return self._encode(data, **kwargs)
 
         with self._acquire_gpu_lock() as outcome:
             if outcome == _LOCK_TIMEOUT:
@@ -351,12 +426,12 @@ class EmbeddingService:
                 )
                 self._model = None
                 self._force_cpu = True
-                return self.model.encode(data, **kwargs)
+                return self._encode(data, **kwargs)
 
             # ACQUIRED, DISABLED, or ERROR all proceed on GPU as before — the
             # existing GPU->CPU RuntimeError fallback still applies.
             try:
-                return self.model.encode(data, **kwargs)
+                return self._encode(data, **kwargs)
             except RuntimeError as e:
                 error_msg = str(e).lower()
                 if self._force_cpu or not any(kw in error_msg for kw in _GPU_ERROR_KEYWORDS):
@@ -370,7 +445,7 @@ class EmbeddingService:
                 )
                 self._model = None
                 self._force_cpu = True
-                return self.model.encode(data, **kwargs)
+                return self._encode(data, **kwargs)
 
     def embed_text(self, text: str) -> list[float]:
         """
