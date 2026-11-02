@@ -91,7 +91,7 @@ CLI handoffs run as async worker sessions and report results via Telegram and `/
 
 **Router Prompt:** Configurable at `config/prompts/query_router.txt`
 
-**Person Name Extraction:** The LLM router extracts person names from queries as part of routing (via `people_mentioned` in the JSON response). Falls back to regex patterns when the local LLM is unavailable.
+**Person Name Extraction:** The LLM router extracts person names from queries as part of routing (via `people_mentioned` in the JSON response). The value is kept as `extracted_person_name` on the routing result, and the keyword fallback extracts none. The person block on native chat turns reads names from the message itself (see `api/services/person_context.py`).
 
 **Fallback:** If the local LLM is unavailable, keyword-based routing kicks in automatically.
 

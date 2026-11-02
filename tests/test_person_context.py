@@ -245,7 +245,7 @@ class TestFirstNames:
         assert resolution.person.id == close.id
         assert other.id in [p.id for p in resolution.candidates]
 
-    @pytest.mark.parametrize(("top", "second", "tier"), [(50.0, 20.0, LIKELY), (50.0, 20.1, UNCERTAIN)])
+    @pytest.mark.parametrize(("top", "second", "tier"), [(50.0, 20.0, LIKELY), (50.0, 20.1, UNCERTAIN), (14.0, 14.0, UNCERTAIN)])
     def test_the_closeness_lead_decides_between_likely_and_uncertain(self, crm, top, second, tier):
         add_person(crm, "Robin Alpha", top)
         add_person(crm, "Robin Beta", second)

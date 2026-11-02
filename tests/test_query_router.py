@@ -553,7 +553,9 @@ class TestRouteReadsNoPeople:
             read.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_llm_routing_of_a_named_person_reads_nothing(self, people_reads):
+    async def test_llm_routing_of_a_named_person_reads_nothing(self, people_reads, caplog):
+        import logging
+
         from api.services.query_router import QueryRouter
 
         reply = (
@@ -563,9 +565,12 @@ class TestRouteReadsNoPeople:
         with (
             patch("api.services.query_router.is_local_routing_llm_available", return_value=True),
             patch("api.services.query_router.generate_text", AsyncMock(return_value=reply)),
+            caplog.at_level(logging.DEBUG, logger="api.services.query_router"),
         ):
             result = await QueryRouter().route("how is that going")
 
+        assert result.extracted_person_name == "Robin Example"
+        assert "Robin" not in caplog.text
         assert result.sources == ["people", "gmail"]
         assert result.reasoning == "asks about a person"
         assert result.action_after == "compose"
