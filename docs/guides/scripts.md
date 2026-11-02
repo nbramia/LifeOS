@@ -306,6 +306,7 @@ The display `sources` column stores each call as `tool(json-args)` cut to 80 cha
 | Script | Purpose |
 |--------|---------|
 | `backup.sh` | Backup data directory |
+| `sync_vault_reindex.py` | Reindex the vault. `--execute` runs to completion; `--budget-minutes [N]` stops after N minutes (default `LIFEOS_VAULT_INDEX_BUDGET_MINUTES`) with the rest left for the next run, which is how the nightly sync calls it. To finish a large load by hand, run it with `--execute` alone. |
 | `repair_bare_person_mentions.py` | One-time repair: re-resolves note mentions on one-word people per note, removes people data from generated notes and `_`-prefixed folders, hides the rows left empty. Dry run by default; `--execute` backs up first. Requires `--crm-db`, `--interactions-db`, `--vault`; writes a private report outside the repo. Rebuild derived data afterwards with `sync_strengths.py --execute` and `sync_crm_to_vectorstore.py --execute`. |
 | `setup_identity.py` | Guided first-run identity setup: search+pick yourself, your partner, and family in the vault; set work email domain(s); writes `LIFEOS_MY_PERSON_ID`/`LIFEOS_PARTNER_NAME`/`LIFEOS_WORK_DOMAIN*` to `.env` and merges `config/family_members.json`/`config/relationship_overrides.json`. Run once, after the first sync/index — requires the API server up. |
 | `monarch_reauth.py` | Non-interactive Monarch Money MFA re-auth (the interactive `interactive_login` flow needs a real TTY, which agent shells don't have) — see [operations.md](operations.md#monarch-money-financial-data). |

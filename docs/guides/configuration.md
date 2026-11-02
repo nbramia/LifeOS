@@ -382,6 +382,7 @@ Both binary settings resolve the same way (`api/services/agent_worker/binary_res
 | `LIFEOS_CURRENT_WORK_PATH` | str | `Work/` | Work folder prefix in the vault. |
 | `LIFEOS_PERSONAL_ARCHIVE_PATH` | str | `Personal/zArchive/` | Personal archive folder prefix. |
 | `LIFEOS_RELATIONSHIP_FOLDER` | str | `Relationship` | Relationship folder name. |
+| `LIFEOS_VAULT_INDEX_BUDGET_MINUTES` | int | `30` | Time budget for the nightly vault reindex. When it runs out the run saves its place and ends normally, and the remaining files wait for the next run. `0` turns it off. A manual `sync_vault_reindex.py` is unbudgeted unless given `--budget-minutes`. |
 | `LIFEOS_VAULT_MTIME_TRUSTED_AFTER` | date | — | For undated notes, trust the file's mtime as the interaction date only when the mtime is strictly later than this `YYYY-MM-DD` cutoff; otherwise the note falls back to the 1970 "undated" sentinel. Set to a date after your last bulk migration (clone/restore/mass-rename) so migration-era mtimes don't show up as recent activity. Leave unset to keep all undated notes on the sentinel. Read directly from the environment by `api/services/indexer.py` (not a Pydantic Setting). |
 
 ## Vault Taxonomy

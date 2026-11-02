@@ -168,6 +168,10 @@ class VaultEventHandler(FileSystemEventHandler):
 # Reserved key in the index state: file path -> tag tuple used at index time.
 TAG_STATE_KEY = "__tag_phrase_keys__"
 
+# How much of a note to read when ordering files for a time budget: enough for
+# frontmatter. A note whose frontmatter runs longer sorts as ordinary.
+BUDGET_ORDER_HEAD_CHARS = 8192
+
 # How long one built MentionResolver stands in for the people store.
 MENTION_RESOLVER_MAX_AGE_SECONDS = 600
 
@@ -185,6 +189,11 @@ class IndexerService:
 
     _mention_resolver: "MentionResolver | None" = None
     _mention_resolver_built_at = 0.0
+
+    # Budgets are measured on this clock.
+    _clock = staticmethod(time.monotonic)
+    # What the latest index_all did beyond its return value.
+    last_run: dict = {"files_pruned": 0, "files_remaining": 0, "stopped_early": False}
 
     def __init__(
         self,
@@ -265,7 +274,25 @@ class IndexerService:
         state_path.parent.mkdir(parents=True, exist_ok=True)
         state_path.write_text(json.dumps(state, indent=2))
 
-    def index_all(self, force: bool = False, skip_summaries: bool = False) -> int:
+    def _ordered_for_budget(self, files: list[tuple[str, float]]) -> list[tuple[str, float]]:
+        """Ordinary notes before generated ones, each newest first, so a budget
+        spent on a bulk load has already covered what the owner wrote."""
+        def is_generated(file_path: str) -> bool:
+            try:
+                with open(file_path, encoding="utf-8", errors="replace") as f:
+                    head = f.read(BUDGET_ORDER_HEAD_CHARS)
+            except OSError:
+                return False
+            return is_generated_note(extract_frontmatter(head)[0])
+
+        return sorted(files, key=lambda item: (is_generated(item[0]), -item[1]))
+
+    def index_all(
+        self,
+        force: bool = False,
+        skip_summaries: bool = False,
+        time_budget_seconds: float | None = None,
+    ) -> int:
         """
         Index markdown files in the vault.
 
@@ -274,13 +301,26 @@ class IndexerService:
 
         Progress is saved incrementally every 50 files, so crashes don't lose work.
 
+        With a time budget the run stops between files once it is spent, and
+        ends normally. A file counts as done only when the saved state says so,
+        so whatever it didn't reach, including removals of deleted files, the
+        next run picks up. Stats still refresh for the people it touched, since
+        their files won't come round again. Failed-summary retries wait for a
+        run that finishes. ``last_run`` reports what was left.
+
         Args:
             force: If True, reindex all files regardless of modification time
             skip_summaries: If True, skip LLM summary generation for faster indexing
+            time_budget_seconds: How long the run may take. None runs to completion.
 
         Returns:
             Number of files indexed
         """
+        deadline = None if time_budget_seconds is None else self._clock() + time_budget_seconds
+
+        def out_of_time() -> bool:
+            return deadline is not None and self._clock() >= deadline
+
         # Always load existing state - even in force mode, we track progress
         # so we can resume if interrupted
         index_state = self._load_index_state()
@@ -331,23 +371,39 @@ class IndexerService:
         else:
             logger.info(f"Incremental index: {len(files_to_index)} changed, {len(deleted_files)} deleted, {len(all_md_files) - len(files_to_index)} unchanged")
 
+        save_interval = 10  # Save state every N files (small to survive timeouts)
+
         # Delete removed files from index
+        pruned = 0
+        prunes_attempted = 0
         for file_path in deleted_files:
+            if out_of_time():
+                break
+            prunes_attempted += 1
             try:
                 self.delete_file(file_path)
                 # Remove from state
                 index_state.pop(file_path, None)
                 tag_keys.pop(file_path, None)
+                pruned += 1
                 logger.info(f"Removed deleted file from index: {file_path}")
+                if pruned % save_interval == 0:
+                    self._save_index_state(index_state)
             except Exception as e:
                 logger.error(f"Failed to remove {file_path} from index: {e}")
 
+        if time_budget_seconds is not None:
+            files_to_index = self._ordered_for_budget(files_to_index)
+
         # Index changed files, saving progress incrementally
         count = 0
+        attempted = 0
         all_affected_person_ids: set[str] = set()
-        save_interval = 10  # Save state every N files (small to survive timeouts)
 
         for file_path, mtime in files_to_index:
+            if out_of_time():
+                break
+            attempted += 1
             try:
                 affected_ids = self.index_file(file_path, skip_stats_refresh=True, skip_summaries=skip_summaries)
                 if affected_ids:
@@ -380,8 +436,18 @@ class IndexerService:
         self._save_index_state(index_state)
         logger.info(f"Indexed {count} files (final save)")
 
+        files_remaining = (len(files_to_index) - attempted) + (len(deleted_files) - prunes_attempted)
+        stopped_early = files_remaining > 0
+        self.last_run = {
+            "files_pruned": pruned,
+            "files_remaining": files_remaining,
+            "stopped_early": stopped_early,
+        }
+        if stopped_early:
+            logger.info(f"Time budget reached: {files_remaining} files remain for the next run")
+
         # Retry failed summaries with simpler prompt and longer timeout
-        if not skip_summaries:
+        if not skip_summaries and not stopped_early:
             retry_count = self._retry_failed_summaries()
             if retry_count > 0:
                 logger.info(f"Retried {retry_count} failed summaries")

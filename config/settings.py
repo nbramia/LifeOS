@@ -1640,6 +1640,14 @@ class Settings(BaseSettings):
         description="Telegram chat ID for receiving messages"
     )
 
+    # Vault indexing
+    vault_index_budget_minutes: int = Field(
+        default=30,
+        alias="LIFEOS_VAULT_INDEX_BUDGET_MINUTES",
+        description="Time budget for the nightly vault reindex. Files left over wait for the next "
+                    "run, so a large first load can't stall the sync. 0 turns the budget off.",
+    )
+
     # Fitness
     fitness_sheet_id: str = Field(
         default="",
