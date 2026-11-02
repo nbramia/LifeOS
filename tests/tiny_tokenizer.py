@@ -27,7 +27,7 @@ def text_with_tokens(tokenizer, n: int, seed: int = 11) -> str:
     """Random lowercase text that ``tokenizer`` encodes to exactly ``n`` tokens."""
     rng = random.Random(seed)
     text = ""
-    while len(tokenizer(text, add_special_tokens=False)["input_ids"]) < n:
+    while len(tokenizer(text, add_special_tokens=False, verbose=False)["input_ids"]) < n:
         text += rng.choice(string.ascii_lowercase)
-    assert len(tokenizer(text, add_special_tokens=False)["input_ids"]) == n
+    assert len(tokenizer(text, add_special_tokens=False, verbose=False)["input_ids"]) == n
     return text

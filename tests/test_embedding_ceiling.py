@@ -35,7 +35,7 @@ class FakeModel:
     def encode(self, data, **kwargs):
         self.calls.append((data, kwargs))
         texts = [data] if isinstance(data, str) else list(data)
-        self.tokenizer(texts, truncation=True, max_length=self.max_seq_length, padding=True)
+        self.tokenizer(texts, truncation=True, max_length=self.max_seq_length, padding=True, verbose=False)
         return np.zeros((len(texts), 2)) if not isinstance(data, str) else np.zeros(2)
 
 
@@ -60,7 +60,11 @@ def service():
 
 
 def warnings_from(caplog):
-    return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    """Warnings from the embedding service itself, not from libraries it calls."""
+    return [
+        r.getMessage() for r in caplog.records
+        if r.levelno >= logging.WARNING and r.name == "api.services.embeddings"
+    ]
 
 
 class TestCeilingApplied:
@@ -146,7 +150,7 @@ class TestTruncationIsReported:
     def test_text_of_few_characters_but_many_tokens_is_still_measured(self, st_class, tokenizer, caplog):
         st_class.return_value = FakeModel(tokenizer)
         emoji = "\U0001F600" * (CEILING // 4 + 10)  # four byte tokens per character
-        assert len(tokenizer(emoji)["input_ids"]) > CEILING > len(emoji) + 8
+        assert len(tokenizer(emoji, verbose=False)["input_ids"]) > CEILING > len(emoji) + 8
 
         with caplog.at_level(logging.WARNING, logger="api.services.embeddings"):
             service().embed_texts([emoji])
