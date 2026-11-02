@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import sqlite3
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -3352,7 +3352,7 @@ async def test_deposit_answer_rejects_an_empty_answer(resolve_client, agent_sess
 
 
 # ---------------------------------------------------------------------------
-# `lifeos_context.turn.person_context`: the native person block on a Hermes
+# `lifeos_context.turn.person_context`: the off-box person block on a Hermes
 # turn. These run the real resolver, CRM stores and conversation store against
 # throwaway databases; only the upstream is stubbed. Everyone here is synthetic.
 # ---------------------------------------------------------------------------
@@ -3429,13 +3429,13 @@ def lookups(monkeypatch):
     from api.services import person_context
 
     seen = []
-    real = person_context.build_person_context
+    real = person_context.build_offbox_person_context
 
     def recording(question, history=None):
         seen.append(question)
         return real(question, history)
 
-    monkeypatch.setattr(person_context, "build_person_context", recording)
+    monkeypatch.setattr(person_context, "build_offbox_person_context", recording)
     return seen
 
 
@@ -3478,10 +3478,10 @@ def _register_persona(tmp_path, monkeypatch, name, body):
 
 
 class TestPersonContextTiers:
-    async def test_a_full_name_carries_the_native_block_as_fact(self, person_proxy, person_crm, hermes_store):
-        from api.services.person_context import build_person_context
+    async def test_a_full_name_carries_the_person_as_fact(self, person_proxy, person_crm, hermes_store):
+        from api.services.person_context import build_offbox_person_context
 
-        wanted = _add_person(person_crm, "Robin Alpha", 30.0, emails=["robin.alpha@example.com"])
+        wanted = _add_person(person_crm, "Robin Alpha", 30.0, position="Synthetic Lead")
         _add_fact(wanted)
         namesake = _add_person(person_crm, "Robin Beta", 90.0)
         _add_fact(namesake, _OTHER_PERSON_FACT)
@@ -3489,10 +3489,10 @@ class TestPersonContextTiers:
         turn = await _person_turn(person_proxy, "Who is Robin Alpha?")
 
         block = turn["person_context"]
-        assert block == build_person_context("Who is Robin Alpha?").block
+        assert block == build_offbox_person_context("Who is Robin Alpha?").block
         assert "'Robin Alpha' is Robin Alpha." in block
         assert wanted.id in block
-        assert "robin.alpha@example.com" in block
+        assert "Synthetic Lead" in block
         assert _PERSON_FACT in block
         assert "Robin Beta" not in block
         assert _OTHER_PERSON_FACT not in block
@@ -3511,10 +3511,7 @@ class TestPersonContextTiers:
         assert "' is Robin" not in block
         assert _PERSON_FACT not in block
         assert _OTHER_PERSON_FACT not in block
-        routing = _stored_routing(hermes_store)
-        assert routing["person_tier"] == "uncertain"
-        assert "person" not in routing
-        assert "person_id" not in routing
+        assert _stored_routing(hermes_store) == {"person_tier": "uncertain"}
 
     async def test_one_clearly_closest_person_is_only_an_assumption(self, person_proxy, person_crm, hermes_store):
         closest = _add_person(person_crm, "Robin Alpha", 90.0)
@@ -3528,10 +3525,7 @@ class TestPersonContextTiers:
         assert "Others it could mean" in block
         assert "Robin Beta" in block
         assert _PERSON_FACT not in block
-        routing = _stored_routing(hermes_store)
-        assert routing["person_tier"] == "likely"
-        assert "person" not in routing
-        assert "person_id" not in routing
+        assert _stored_routing(hermes_store) == {"person_tier": "likely"}
 
     async def test_a_message_naming_no_one_has_no_key(self, person_proxy, person_crm, hermes_store):
         _add_person(person_crm, "Robin Alpha")
@@ -3618,7 +3612,7 @@ class TestPersonContextDegradation:
         def boom(*args):
             raise RuntimeError("no row for Robin Alpha")
 
-        monkeypatch.setattr(person_context, "build_person_context", boom)
+        monkeypatch.setattr(person_context, "build_offbox_person_context", boom)
 
         with caplog.at_level(logging.DEBUG):
             resp = await person_proxy.post("/api/hermes/ask/stream", json={"question": "Who is Robin Alpha?"})
@@ -3642,7 +3636,7 @@ class TestPersonContextDegradation:
 
         release = threading.Event()
         monkeypatch.setattr(person_context, "PERSON_CONTEXT_TIMEOUT_SECONDS", 0.05)
-        monkeypatch.setattr(person_context, "build_person_context", lambda *args: release.wait(10))
+        monkeypatch.setattr(person_context, "build_offbox_person_context", lambda *args: release.wait(10))
 
         started = time.monotonic()
         try:
@@ -3703,7 +3697,7 @@ class TestPersonContextDegradation:
         release = threading.Event()
         monkeypatch.setattr(person_context, "PERSON_CONTEXT_TIMEOUT_SECONDS", budget)
         if slow_part == "lookup":
-            monkeypatch.setattr(person_context, "build_person_context", lambda *args: release.wait(10))
+            monkeypatch.setattr(person_context, "build_offbox_person_context", lambda *args: release.wait(10))
         else:
             monkeypatch.setattr(hermes_store, "get_messages", lambda *args, **kwargs: release.wait(10))
 
@@ -3827,7 +3821,9 @@ class TestPersonContextLeavesTheContractAlone:
         assert lookups == []
         assert _person_requests == []
 
-    async def test_the_block_holds_no_crm_notes_tags_or_links(self, person_proxy, person_crm, hermes_store):
+    async def test_an_identified_person_keeps_role_stats_and_facts_but_no_direct_identifiers(
+        self, person_proxy, person_crm, hermes_store,
+    ):
         person = _add_person(
             person_crm, "Robin Alpha",
             emails=["robin.alpha@example.com"], phone_numbers=["+15550100"], birthday="01-02",
@@ -3838,10 +3834,159 @@ class TestPersonContextLeavesTheContractAlone:
 
         block = (await _person_turn(person_proxy, "Who is Robin Alpha?"))["person_context"]
 
-        for carried in ("robin.alpha@example.com", "+15550100", "01-02", "Synthetic Lead", "Example Co", _PERSON_FACT):
+        for carried in (person.id, "Synthetic Lead", "Example Co", "**Strength**", _PERSON_FACT):
             assert carried in block
-        for withheld in ("SYNTHETIC-NOTE", "synthetic-tag", "example.com/in/synthetic"):
+        for withheld in (
+            "robin.alpha@example.com", "+15550100", "01-02", "Emails:", "Phones:", "Birthday:",
+            "SYNTHETIC-NOTE", "synthetic-tag", "example.com/in/synthetic",
+        ):
             assert withheld not in block
+        assert "lifeos_person_profile" in block
+        assert "person_info" not in block
+
+    @pytest.mark.parametrize("key,value", [
+        ("personal_email", "synthetic note"),
+        ("note", "Reach her at robin.private@example.com"),
+        ("mobile", "ask first"),
+        ("note", "Her number is 555-0100"),
+        ("note", "Her number is (555) 010-0199"),
+        ("note", "Her number is +1 555 010 0199"),
+        ("birthday", "January 2"),
+        ("spouse_birthday", "January 2"),
+        ("note", "Her birthday is January 2"),
+    ])
+    async def test_a_fact_that_is_a_direct_identifier_is_filtered(
+        self, person_proxy, person_crm, hermes_store, key, value,
+    ):
+        from api.services.person_facts import PersonFact, get_person_fact_store
+
+        person = _add_person(person_crm, "Robin Alpha")
+        _add_fact(person)
+        get_person_fact_store().upsert(PersonFact(
+            person_id=person.id, category="dates", key=key, value=value, confidence=0.99,
+        ))
+
+        block = (await _person_turn(person_proxy, "Who is Robin Alpha?"))["person_context"]
+
+        assert value not in block
+        assert _PERSON_FACT in block
+
+    @pytest.mark.parametrize("key,value", [
+        ("cello_teacher", "Sam Example"),
+        ("years_at_company", "2019-2021"),
+        ("anniversary", "March 3"),
+        ("hometown", "Exampleville"),
+    ])
+    async def test_an_ordinary_fact_is_not_filtered(self, person_proxy, person_crm, hermes_store, key, value):
+        from api.services.person_facts import PersonFact, get_person_fact_store
+
+        person = _add_person(person_crm, "Robin Alpha")
+        get_person_fact_store().upsert(PersonFact(
+            person_id=person.id, category="background", key=key, value=value, confidence=0.9,
+        ))
+
+        assert value in (await _person_turn(person_proxy, "Who is Robin Alpha?"))["person_context"]
+
+    async def test_filtered_facts_do_not_use_up_the_fact_limit(self, person_proxy, person_crm, hermes_store):
+        from api.services.person_context import PROFILE_FACT_LIMIT
+        from api.services.person_facts import PersonFact, get_person_fact_store
+
+        person = _add_person(person_crm, "Robin Alpha")
+        for index in range(PROFILE_FACT_LIMIT):
+            get_person_fact_store().upsert(PersonFact(
+                person_id=person.id, category="dates", key=f"phone_{index}", value=f"hidden {index}", confidence=0.99,
+            ))
+        _add_fact(person)
+
+        block = (await _person_turn(person_proxy, "Who is Robin Alpha?"))["person_context"]
+
+        assert _PERSON_FACT in block
+        assert "hidden" not in block
+        assert "of" not in block.split("Known facts")[1].split(":")[0]
+
+    @pytest.mark.parametrize("strengths,tier_text", [
+        ((80.0, 75.0), "Do not present any of them"),
+        ((90.0, 5.0), "Assuming you mean Robin Alpha"),
+    ])
+    async def test_candidates_are_told_apart_by_name_role_and_recency_only(
+        self, person_proxy, person_crm, hermes_store, strengths, tier_text,
+    ):
+        details = dict(
+            emails=["robin@privatecorp.example"], phone_numbers=["+15550100"], birthday="01-02",
+            aliases=["Birdie"], category="work",
+        )
+        alpha = _add_person(person_crm, "Robin Alpha", strengths[0], company="Alpha Co", **details)
+        beta = _add_person(person_crm, "Robin Beta", strengths[1], position="Beta Lead", **{
+            **details, "emails": ["beta@privatecorp.example"], "phone_numbers": ["+15550101"], "aliases": ["Wren"],
+        })
+        for person in (alpha, beta):
+            conn = person_crm._get_connection()
+            conn.execute(
+                "UPDATE person_entities SET last_seen = ? WHERE id = ?",
+                ((datetime.now(timezone.utc) - timedelta(days=3)).isoformat(), person.id),
+            )
+            conn.commit()
+            conn.close()
+        person_crm.save()
+
+        block = (await _person_turn(person_proxy, "tell me about Robin"))["person_context"]
+
+        assert tier_text in block
+        assert "Robin Alpha" in block and "Robin Beta" in block
+        assert "Beta Lead" in block
+        assert "last contact" in block
+        for withheld in (
+            "privatecorp.example", "+1555", "01-02", "Birdie", "Wren", "entity_id", alpha.id, beta.id,
+            "/100", "work",
+        ):
+            assert withheld not in block
+
+    async def test_the_native_block_for_the_same_person_keeps_its_identifiers(self, person_crm):
+        """The chat path stays on the box, so only the off-box rendering withholds these."""
+        from api.services.person_context import build_person_context
+        from api.services.person_facts import PersonFact, get_person_fact_store
+
+        person = _add_person(
+            person_crm, "Robin Alpha",
+            emails=["robin.alpha@example.com"], phone_numbers=["+15550100"], birthday="01-02",
+        )
+        get_person_fact_store().upsert(PersonFact(
+            person_id=person.id, category="dates", key="birthday", value="January 2", confidence=0.9,
+        ))
+
+        block = build_person_context("Who is Robin Alpha?").block
+
+        for carried in ("robin.alpha@example.com", "+15550100", "01-02", "January 2", "person_info(lookup)"):
+            assert carried in block
+
+    async def test_native_candidates_keep_their_details(self, person_crm):
+        from api.services.person_context import build_person_context
+
+        alpha = _add_person(person_crm, "Robin Alpha", 80.0, emails=["robin@privatecorp.example"])
+        _add_person(person_crm, "Robin Beta", 75.0)
+
+        block = build_person_context("tell me about Robin").block
+
+        assert "privatecorp.example" in block
+        assert alpha.id in block
+        assert "closeness 80/100" in block
+        assert "returns this same list" in block
+
+    async def test_an_identified_person_carries_meaningful_aliases(self, person_proxy, person_crm, hermes_store):
+        _add_person(person_crm, "Robin Alpha", aliases=["Mom", "Birdie"])
+
+        block = (await _person_turn(person_proxy, "Who is Robin Alpha?"))["person_context"]
+
+        assert "Also known as: Mom, Birdie" in block
+
+    async def test_an_unconfirmed_person_carries_no_aliases(self, person_proxy, person_crm, hermes_store):
+        _add_person(person_crm, "Robin Alpha", 90.0, aliases=["Birdie"])
+        _add_person(person_crm, "Robin Beta", 5.0, aliases=["Wren"])
+
+        block = (await _person_turn(person_proxy, "tell me about Robin"))["person_context"]
+
+        assert "Also known as" not in block
+        assert "Birdie" not in block and "Wren" not in block
 
 
 class TestPersonContextIsStored:
@@ -3852,10 +3997,9 @@ class TestPersonContextIsStored:
 
         await _person_turn(person_proxy, "Who is Robin Alpha?")
 
-        routing = _stored_routing(hermes_store)
-        assert routing["person_tier"] == "confident"
-        assert routing["person"] == "Robin Alpha"
-        assert routing["person_id"] == person.id
+        assert _stored_routing(hermes_store) == {
+            "person_tier": "confident", "person": "Robin Alpha", "person_id": person.id,
+        }
 
     async def test_a_truncated_turn_keeps_the_person_and_the_truncation(
         self, person_proxy, person_crm, hermes_store,

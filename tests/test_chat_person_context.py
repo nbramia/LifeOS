@@ -104,6 +104,33 @@ def stored_routing(store, frames):
 
 
 class TestPromptWiring:
+    async def test_an_identified_persons_aliases_reach_the_model(self, store, crm, loop_calls):
+        from api.services.person_entity import PersonEntity
+
+        person = PersonEntity(canonical_name="Robin Alpha", aliases=["Mom"])
+        person.relationship_strength = 60.0
+        crm.add(person)
+
+        await ask("Who is Robin Alpha to me?")
+
+        assert "Also known as: Mom" in loop_calls[0]["personal_context"]
+
+    async def test_the_chat_block_keeps_direct_identifiers(self, store, crm, loop_calls):
+        from api.services.person_entity import PersonEntity
+
+        person = PersonEntity(
+            canonical_name="Robin Alpha", aliases=[],
+            emails=["robin.alpha@example.com"], phone_numbers=["+15550100"], birthday="01-02",
+        )
+        person.relationship_strength = 60.0
+        crm.add(person)
+
+        await ask("Who is Robin Alpha?")
+
+        block = loop_calls[0]["personal_context"]
+        for carried in ("robin.alpha@example.com", "+15550100", "01-02"):
+            assert carried in block
+
     async def test_a_full_name_reaches_the_model_as_an_asserted_person(self, store, crm, loop_calls):
         person = add_person(crm, "Robin Alpha", 60.0)
 

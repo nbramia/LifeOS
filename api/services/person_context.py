@@ -18,6 +18,10 @@ Resolution tiers:
 The native chat stream and the Hermes proxy reach this through
 ``gather_person_context``, which runs without an LLM call, is bounded by a short time budget, and returns ``None`` on
 any failure so the turn proceeds without a person block.
+
+A turn that may leave the box, such as one Hermes sends to a remote provider,
+gets the off-box rendering: the same resolution and tiers with no emails, phone
+numbers or birthdays, which reach that model only when it calls a tool for them.
 """
 from __future__ import annotations
 
@@ -56,6 +60,9 @@ CONVERSATION_LOOKBACK = 6
 # Names tried per message, each of which can cost a scan of every person.
 MAX_NAMES_PER_MESSAGE = 3
 
+# Aliases shown for an identified person.
+MAX_LISTED_ALIASES = 5
+
 # Capitalized or captured words that are never a person in a question.
 _NOT_NAMES = frozenset("""
     i me my mine we us our you your he him his she her hers they them their it its this that these those
@@ -71,6 +78,14 @@ _POSSESSIVE = re.compile(r"['’]s$", re.IGNORECASE)
 _WORD = re.compile(r"[^\W\d_][\w'’.-]*")
 _MY_RELATION = re.compile(r"\bmy\s+([^\W\d_]+)\b", re.IGNORECASE)
 _LEADING_MY = re.compile(r"^my\s+", re.IGNORECASE)
+
+_EMAIL = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
+_PHONE = re.compile(r"\+?\d(?:[\s().-]*\d){9,}|\b\d{3}[-.\s]\d{4}\b")
+_BIRTHDAY_WORDING = re.compile(r"\b(?:birthday|birthdate|date of birth|dob|born on)\b", re.IGNORECASE)
+_HANDLE = re.compile(r"[@\d_/:]|^\S+\.[^\W\d_]{2,}\S*$")
+
+# Words in a fact's key that say its value is a direct identifier.
+_IDENTIFIER_KEY_WORDS = frozenset("email phone telephone mobile cell birthday birthdate birth dob born".split())
 
 # Lowercase words that can sit inside a full name.
 _NAME_PARTICLES = frozenset("bin da de del der di du la le van von".split())
@@ -299,19 +314,60 @@ def resolve_person_mention(name: str, history: Optional[list] = None) -> PersonR
     return resolution
 
 
-def format_person_profile(entity, fact_limit: int) -> str:
-    """An identified person's identifiers, relationship summary and strongest facts."""
+def _meaningful_aliases(entity) -> list[str]:
+    """What else a person goes by: not an address, a handle or a variant of their own name."""
+    from api.services.entity_resolver import parse_name
+
+    own_words = {word.strip(".,").lower() for word in entity.canonical_name.split()}
+    last_name = (parse_name(entity.canonical_name).last or "").lower()
+    aliases: dict[str, str] = {}
+    for alias in entity.aliases or []:
+        words = [word.strip(".,").lower() for word in alias.split()]
+        if not words or _HANDLE.search(alias):
+            continue
+        if words[0] in own_words and words[-1] in own_words:
+            continue
+        # One word running a surname into something else: "ralpha", "robinalpha".
+        if len(words) == 1 and last_name and last_name in words[0] and words[0] != last_name:
+            continue
+        aliases.setdefault(alias.lower(), alias)
+    return list(aliases.values())[:MAX_LISTED_ALIASES]
+
+
+def _is_direct_identifier(fact) -> bool:
+    """Whether a fact is, or states, an email address, phone number or birthday."""
+    key_words = set(re.split(r"[^a-z]+", (fact.key or "").lower()))
+    value = str(fact.value or "")
+    return bool(
+        key_words & _IDENTIFIER_KEY_WORDS
+        or _EMAIL.search(value)
+        or _PHONE.search(value)
+        or _BIRTHDAY_WORDING.search(value)
+    )
+
+
+def format_person_profile(entity, fact_limit: int, offbox: bool = False) -> str:
+    """
+    An identified person's identifiers, relationship summary and strongest facts.
+
+    Args:
+        entity: The identified PersonEntity
+        fact_limit: Most facts to show
+        offbox: Leave out emails, phone numbers and birthdays, including any held in a fact.
+            The entity_id stays: every lifeos_person_* tool takes it.
+    """
     from api.services.person_facts import get_person_fact_store, rank_facts
     from api.services.relationship_summary import format_relationship_context, get_relationship_summary
 
     parts = [f"**{entity.canonical_name}** (entity_id: {entity.id})"]
 
-    if entity.emails:
-        parts.append(f"Emails: {', '.join(entity.emails)}")
-    if entity.phone_numbers:
-        parts.append(f"Phones: {', '.join(entity.phone_numbers)}")
-    if entity.birthday:
-        parts.append(f"Birthday: {entity.birthday}")
+    if not offbox:
+        if entity.emails:
+            parts.append(f"Emails: {', '.join(entity.emails)}")
+        if entity.phone_numbers:
+            parts.append(f"Phones: {', '.join(entity.phone_numbers)}")
+        if entity.birthday:
+            parts.append(f"Birthday: {entity.birthday}")
     if entity.company or entity.position:
         role = " — ".join(filter(None, [entity.position, entity.company]))
         parts.append(f"Role: {role}")
@@ -326,6 +382,8 @@ def format_person_profile(entity, fact_limit: int) -> str:
     # on spelling, and the model then answers that it doesn't know.
     fact_store = get_person_fact_store()
     facts = rank_facts(fact_store.get_for_person(entity.id))
+    if offbox:
+        facts = [f for f in facts if not _is_direct_identifier(f)]
     if facts:
         shown = facts[:fact_limit]
         header = "Known facts:"
@@ -354,38 +412,60 @@ def _candidate_line(person) -> str:
     return f"- {person.canonical_name} (entity_id: {person.id}): {', '.join(details)}"
 
 
-def _candidate_lines(people: list) -> str:
-    lines = [_candidate_line(p) for p in people[:MAX_LISTED_CANDIDATES]]
+def _offbox_candidate_line(person) -> str:
+    """A candidate told apart by name, role and recency alone."""
+    details = [" — ".join(filter(None, [person.position, person.company]))]
+    if person.last_seen:
+        seen = person.last_seen if person.last_seen.tzinfo else person.last_seen.replace(tzinfo=timezone.utc)
+        details.append(f"last contact {(datetime.now(timezone.utc) - seen).days} days ago")
+    details = [d for d in details if d]
+    return f"- {person.canonical_name}: {', '.join(details)}" if details else f"- {person.canonical_name}"
+
+
+def _candidate_lines(people: list, offbox: bool = False) -> str:
+    render = _offbox_candidate_line if offbox else _candidate_line
+    lines = [render(p) for p in people[:MAX_LISTED_CANDIDATES]]
     if len(people) > MAX_LISTED_CANDIDATES:
         lines.append(f"- and {len(people) - MAX_LISTED_CANDIDATES} less close people with that name")
     return "\n".join(lines)
 
 
-def describe_unconfirmed(resolution: PersonResolution) -> str:
+def describe_unconfirmed(resolution: PersonResolution, offbox: bool = False) -> str:
     """How a likely or uncertain name reads to the model. Never asserts a person."""
     asked = resolution.asked
     if resolution.tier == LIKELY:
-        others = [p for p in resolution.candidates if p.id != resolution.person.id]
+        person = resolution.person
+        others = [p for p in resolution.candidates if p.id != person.id]
+        best_fit = person.canonical_name if offbox else f"{person.canonical_name} (entity_id: {person.id})"
         text = (
             f"'{asked}' does not identify one person for certain. The best fit by closeness is "
-            f"{resolution.person.canonical_name} (entity_id: {resolution.person.id}), but that is "
-            "an inference, not a confirmed match."
+            f"{best_fit}, but that is an inference, not a confirmed match."
         )
         if others:
-            text += f"\nOthers it could mean:\n{_candidate_lines(others)}"
-        return text + (
-            f"\nIf you go on with {resolution.person.canonical_name}, say so in your answer "
-            f"(\"Assuming you mean {resolution.person.canonical_name}, ...\") so a wrong guess is "
-            f"visible. Looking up '{asked}' again returns this same text; look someone up by "
+            text += f"\nOthers it could mean:\n{_candidate_lines(others, offbox)}"
+        look_up = (
+            "Look someone up by their full name for their details."
+            if offbox else
+            f"Looking up '{asked}' again returns this same text; look someone up by "
             "their full name for their details."
         )
+        return text + (
+            f"\nIf you go on with {person.canonical_name}, say so in your answer "
+            f"(\"Assuming you mean {person.canonical_name}, ...\") so a wrong guess is "
+            f"visible. {look_up}"
+        )
+    look_up = (
+        "Look someone up by their full name for their details."
+        if offbox else
+        f"Looking up '{asked}' again returns this same list; look someone up by their "
+        "full name for their details."
+    )
     return (
         f"'{asked}' does not identify one person. People it could mean, closest first:\n"
-        f"{_candidate_lines(resolution.candidates)}\n"
+        f"{_candidate_lines(resolution.candidates, offbox)}\n"
         "Do not present any of them as the person asked about. Settle it from the rest of the "
         "message and the conversation; if nothing does, ask which one is meant, naming these "
-        f"options. Looking up '{asked}' again returns this same list; look someone up by their "
-        "full name for their details."
+        f"options. {look_up}"
     )
 
 
@@ -401,9 +481,9 @@ _DEPTH_GUIDANCE = {
 }
 
 
-def _render_block(resolution: PersonResolution, depth: str) -> str:
+def _render_block(resolution: PersonResolution, depth: str, offbox: bool = False) -> str:
     if resolution.tier in (LIKELY, UNCERTAIN):
-        return f"## Person in this message (not confirmed)\n\n{describe_unconfirmed(resolution)}"
+        return f"## Person in this message (not confirmed)\n\n{describe_unconfirmed(resolution, offbox)}"
 
     person = resolution.person
     basis = (
@@ -412,10 +492,16 @@ def _render_block(resolution: PersonResolution, depth: str) -> str:
         if resolution.tier == FROM_CONVERSATION
         else f"'{resolution.asked}' is {person.canonical_name}."
     )
+    aliases = _meaningful_aliases(person)
     sections = [
         "## Person in this message",
         basis,
-        format_person_profile(person, PROFILE_FACT_LIMIT),
+        *([f"Also known as: {', '.join(aliases)}"] if aliases else []),
+        format_person_profile(person, PROFILE_FACT_LIMIT, offbox),
+        "Use this entity_id with the lifeos_person_* tools. Emails, phone numbers and birthdays "
+        "are left out here; lifeos_person_profile and lifeos_person_facts return them if the "
+        "question needs them."
+        if offbox else
         "Use this entity_id and these identifiers directly; person_info(lookup) would return "
         "the same profile.",
     ]
@@ -579,6 +665,15 @@ def build_person_context(question: str, history: Optional[list] = None) -> Optio
     Returns:
         PersonContext for the first name that resolves, or None
     """
+    return _build(question, history, offbox=False)
+
+
+def build_offbox_person_context(question: str, history: Optional[list] = None) -> Optional[PersonContext]:
+    """The same as build_person_context, for a turn that may leave the box: no direct identifiers."""
+    return _build(question, history, offbox=True)
+
+
+def _build(question: str, history: Optional[list], offbox: bool) -> Optional[PersonContext]:
     from api.services.query_router import QueryRouter
 
     tried: set[str] = set()
@@ -597,7 +692,7 @@ def build_person_context(question: str, history: Optional[list] = None) -> Optio
         depth = QueryRouter()._determine_fetch_depth(question)
         identified = resolution.tier in (CONFIDENT, FROM_CONVERSATION)
         return PersonContext(
-            block=_render_block(resolution, depth),
+            block=_render_block(resolution, depth, offbox),
             tier=resolution.tier,
             person_name=resolution.person.canonical_name if identified else None,
             person_id=resolution.person.id if identified else None,
@@ -609,6 +704,7 @@ async def gather_person_context(
     question: str,
     history: Optional[list] = None,
     load_history: Optional[Callable[[], list]] = None,
+    offbox: bool = False,
 ) -> Optional[PersonContext]:
     """
     Build the person block off the event loop. Any failure or overrun yields None.
@@ -617,9 +713,11 @@ async def gather_person_context(
         question: The message as written
         history: Recent conversation messages, when the caller already holds them
         load_history: Reads the history instead, inside the same thread and time budget
+        offbox: Build the rendering for a turn that may leave the box
     """
     def build() -> Optional[PersonContext]:
-        return build_person_context(question, load_history() if load_history else history)
+        builder = build_offbox_person_context if offbox else build_person_context
+        return builder(question, load_history() if load_history else history)
 
     try:
         return await asyncio.wait_for(asyncio.to_thread(build), timeout=PERSON_CONTEXT_TIMEOUT_SECONDS)

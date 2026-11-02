@@ -87,8 +87,8 @@ _MAX_CONVERSATION_ID_LEN = 200
 
 # Personas whose turns carry no person block. A journal turn files a fragment
 # rather than answers. The therapist's Hermes profile is kept away from CRM
-# person data, so the block would hand that path contact details and facts it
-# does not otherwise reach.
+# person data, so the block would hand that path relationship stats and facts
+# it does not otherwise reach.
 _NO_PERSON_CONTEXT_PERSONAS = frozenset({JOURNAL_PERSONA_ID, "therapist"})
 
 # Stored messages read to settle a first name; the same window the native path reads.
@@ -289,7 +289,8 @@ async def _prepare_person_context(raw_body: bytes) -> dict:
         (lambda: get_store().get_messages(conversation_id, limit=_PERSON_CONTEXT_HISTORY_LIMIT))
         if conversation_id else None
     )
-    person = await gather_person_context(parsed.question, load_history=load_history)
+    # Off-box: Hermes usually answers on a remote provider.
+    person = await gather_person_context(parsed.question, load_history=load_history, offbox=True)
     return {"person": person} if person else {}
 
 

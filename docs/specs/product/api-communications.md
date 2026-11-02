@@ -105,11 +105,11 @@ the composer for a subsequent turn.
 | `search_memories` | Search saved memories |
 | `manage_workouts` | Log and query the workout log and fitness metrics (action: log/update/list/history/summary/log_metric/metrics/get_profile/set_profile/readiness) |
 
-**Who the message is about:** On a native turn, a message that names someone gets a "Person in this message" block in the system prompt, built without an LLM call. A turn sent through `POST /api/hermes/ask/stream` carries the same block as `lifeos_context.turn.person_context`, on every persona except `journal` and `therapist` ([what it sends](../technical/client-surfaces.md#person-context-on-hermes-turns)). How it reads depends on how sure the name is:
+**Who the message is about:** On a native turn, a message that names someone gets a "Person in this message" block in the system prompt, built without an LLM call. A turn sent through `POST /api/hermes/ask/stream` carries the block without emails, phone numbers or birthdays as `lifeos_context.turn.person_context`, on every persona except `journal` and `therapist` ([what it sends](../technical/client-surfaces.md#person-context-on-hermes-turns)). How it reads depends on how sure the name is:
 
 | Tier | When | What the model gets |
 |------|------|---------------------|
-| `confident` | Full name, an alias other than the person's own first name, or an unscoped link override | The person as fact: identifiers, relationship summary, top facts |
+| `confident` | Full name, an alias other than the person's own first name, or an unscoped link override | The person as fact: identifiers, aliases, relationship summary, top facts |
 | `conversation` | The recent conversation names exactly one of the people a first name could mean | The same, marked as taken from the conversation |
 | `likely` | One person is the best fit: the only one with that first name, clearly closer than the rest, or put forward by a source- or folder-scoped override | Stated as an assumption, with the alternatives and no facts |
 | `uncertain` | Several people fit, the conversation names more than one of them, or the only fit is a one-word row | The options, closest first, with an instruction not to pick one, and no facts |
