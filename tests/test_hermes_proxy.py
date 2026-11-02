@@ -3628,28 +3628,32 @@ class TestPersonContextDegradation:
         assert "Person context skipped: RuntimeError" in caplog.text
         assert "Robin" not in caplog.text
 
-    async def test_a_lookup_past_the_budget_forwards_the_turn_at_the_budget_and_logs_no_name(
+    async def test_a_lookup_past_the_budget_forwards_the_turn_while_it_is_still_blocked_and_logs_no_name(
         self, person_proxy, person_crm, hermes_store, monkeypatch, caplog,
     ):
         import threading
-        import time
 
         from api.services import person_context
 
         release = threading.Event()
-        monkeypatch.setattr(person_context, "PERSON_CONTEXT_TIMEOUT_SECONDS", 0.05)
-        monkeypatch.setattr(person_context, "build_offbox_person_context", lambda *args: release.wait(10))
+        finished = threading.Event()
 
-        started = time.monotonic()
+        def held(*args):
+            release.wait(30)
+            finished.set()
+
+        monkeypatch.setattr(person_context, "PERSON_CONTEXT_TIMEOUT_SECONDS", 0.05)
+        monkeypatch.setattr(person_context, "build_offbox_person_context", held)
+
         try:
             with caplog.at_level(logging.DEBUG):
                 resp = await person_proxy.post("/api/hermes/ask/stream", json={"question": "Who is Robin Alpha?"})
-            elapsed = time.monotonic() - started
+            still_blocked = not finished.is_set()
         finally:
             release.set()
 
         assert resp.status_code == 200
-        assert elapsed < 5
+        assert still_blocked
         assert "person_context" not in _person_requests[-1]["lifeos_context"]["turn"]
         assert _stored_routing(hermes_store) is None
         assert "Robin" not in caplog.text
@@ -3673,7 +3677,8 @@ class TestPersonContextDegradation:
             return []
 
         monkeypatch.setattr(hermes_store, "get_messages", bad_read)
-        monkeypatch.setattr(person_context, "PERSON_CONTEXT_TIMEOUT_SECONDS", 0.05)
+        if failure == "overruns":
+            monkeypatch.setattr(person_context, "PERSON_CONTEXT_TIMEOUT_SECONDS", 0.05)
         try:
             turn = await _person_turn(person_proxy, "Who is Robin Alpha?", conversation_id=_PERSON_CONV_ID)
         finally:
@@ -3686,51 +3691,65 @@ class TestPersonContextDegradation:
 
         assert PERSON_CONTEXT_TIMEOUT_SECONDS == 0.5
 
-    @pytest.mark.parametrize("slow_part", ["lookup", "history"])
-    async def test_a_lookup_using_its_whole_budget_does_not_hold_up_other_requests(
-        self, person_proxy, person_crm, hermes_store, monkeypatch, slow_part,
+    @pytest.mark.parametrize("held_part", ["lookup", "history"])
+    async def test_a_blocked_lookup_does_not_hold_up_other_requests(
+        self, person_proxy, person_crm, hermes_store, monkeypatch, held_part,
     ):
+        """Another turn finishes while this one's lookup is still blocked.
+
+        On the event loop the hold would stop everything until its timeout, so
+        the other turn could only finish after it.
+        """
         import threading
-        import time
 
         from api.services import person_context
 
-        budget = 0.4
+        entered = threading.Event()
         release = threading.Event()
-        monkeypatch.setattr(person_context, "PERSON_CONTEXT_TIMEOUT_SECONDS", budget)
-        if slow_part == "lookup":
-            monkeypatch.setattr(person_context, "build_offbox_person_context", lambda *args: release.wait(10))
+        finished = threading.Event()
+        held_question = "Who is Robin Alpha?"
+
+        def hold():
+            entered.set()
+            release.wait(30)
+            finished.set()
+
+        if held_part == "lookup":
+            def lookup(question, history=None):
+                if question == held_question:
+                    hold()
+
+            monkeypatch.setattr(person_context, "build_offbox_person_context", lookup)
         else:
-            monkeypatch.setattr(hermes_store, "get_messages", lambda *args, **kwargs: release.wait(10))
+            def read_history(*args, **kwargs):
+                hold()
+                return []
 
-        gaps = []
+            monkeypatch.setattr(hermes_store, "get_messages", read_history)
 
-        async def heartbeat():
-            last = time.monotonic()
-            while True:
-                await asyncio.sleep(0.01)
-                now = time.monotonic()
-                gaps.append(now - last)
-                last = now
+        async def wait_until_entered():
+            while not entered.is_set():
+                await asyncio.sleep(0.001)
 
-        beat = asyncio.create_task(heartbeat())
-        await asyncio.sleep(0.02)  # The heartbeat must be running before the turn starts.
-        assert gaps, "heartbeat never started"
-        started = time.monotonic()
+        blocked_turn = asyncio.create_task(person_proxy.post(
+            "/api/hermes/ask/stream",
+            json={"question": held_question, "conversation_id": _PERSON_CONV_ID},
+        ))
         try:
-            resp = await person_proxy.post(
-                "/api/hermes/ask/stream",
-                json={"question": "Who is Robin Alpha?", "conversation_id": _PERSON_CONV_ID},
+            await asyncio.wait_for(wait_until_entered(), timeout=30)
+            other = await person_proxy.post(
+                "/api/hermes/ask/stream", json={"question": "what is on my calendar"},
             )
-            elapsed = time.monotonic() - started
+            still_blocked = not finished.is_set()
         finally:
             release.set()
-            beat.cancel()
+        resp = await blocked_turn
 
+        assert other.status_code == 200
+        assert still_blocked
         assert resp.status_code == 200
-        assert elapsed >= budget
-        assert max(gaps) < budget / 2
         assert "person_context" not in _person_requests[-1]["lifeos_context"]["turn"]
+        assert _person_requests[-1]["question"] == held_question
 
 
 class TestPersonContextLeavesTheContractAlone:
