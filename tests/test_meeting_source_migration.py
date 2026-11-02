@@ -427,7 +427,60 @@ class TestCollisions:
             ],
         )
         ms.migrate_crm_db(db, vault)
-        assert _dump(db, "source_entities")["new"]["link_status"] == "confirmed"
+        rows = _dump(db, "source_entities")
+        assert rows["new"]["link_status"] == "confirmed"
+        assert rows["new"]["source_id"] == source_id
+        assert rows["old"]["source_id"] == f"{source_id}{ms.COLLISION_SUFFIX}old"
+        assert {r["source_type"] for r in rows.values()} == {"meeting"}
+        assert rows["old"]["provider"] == "granola"
+
+    def test_a_confirmed_legacy_link_keeps_the_canonical_source_id(self, tmp_path, vault):
+        note = _write_note(vault / "Work" / "w.md", "granola_id: g-1")
+        source_id = f"{note}:Alex"
+        db = _crm_db(
+            tmp_path,
+            [
+                ("old", "p1", "granola", source_id, "confirmed"),
+                ("new", "p2", "meeting", source_id, "auto"),
+            ],
+        )
+        ms.migrate_crm_db(db, vault)
+        rows = _dump(db, "source_entities")
+        assert rows["old"]["source_id"] == source_id
+        assert rows["new"]["source_id"] == f"{source_id}{ms.COLLISION_SUFFIX}new"
+
+    def test_a_rejected_meeting_row_is_not_displaced_by_an_automatic_one(self, tmp_path, vault):
+        note = _write_note(vault / "Work" / "w.md", "granola_id: g-1")
+        source_id = f"{note}:Alex"
+        db = _crm_db(
+            tmp_path,
+            [
+                ("old", "p1", "granola", source_id, "auto"),
+                ("new", "p1", "meeting", source_id, "rejected"),
+            ],
+        )
+        ms.migrate_crm_db(db, vault)
+        rows = _dump(db, "source_entities")
+        assert rows["new"]["source_id"] == source_id
+        assert rows["old"]["source_id"] == f"{source_id}{ms.COLLISION_SUFFIX}old"
+
+    def test_confirmed_beats_rejected_and_two_confirmed_keep_the_legacy_row(self, tmp_path, vault):
+        note = _write_note(vault / "Work" / "w.md", "granola_id: g-1")
+        confirmed_over_rejected = f"{note}:Alex"
+        both_confirmed = f"{note}:Blair"
+        db = _crm_db(
+            tmp_path,
+            [
+                ("o1", "p1", "granola", confirmed_over_rejected, "rejected"),
+                ("n1", "p2", "meeting", confirmed_over_rejected, "confirmed"),
+                ("o2", "p1", "granola", both_confirmed, "confirmed"),
+                ("n2", "p2", "meeting", both_confirmed, "confirmed"),
+            ],
+        )
+        ms.migrate_crm_db(db, vault)
+        rows = _dump(db, "source_entities")
+        assert rows["n1"]["source_id"] == confirmed_over_rejected
+        assert rows["o2"]["source_id"] == both_confirmed
 
     def test_second_run_after_a_collision_changes_nothing(self, tmp_path, vault):
         note = _write_note(vault / "Work" / "w.md", "granola_id: g-1")
@@ -579,6 +632,136 @@ class TestFailClosed:
             store = InteractionStore(db_path=db, strict=False)
         assert "MEETING SOURCE MIGRATION FAILED" in caplog.text
         assert store.get_by_id("i1").source_type == "meeting"
+
+
+class TestFailureAlert:
+    @pytest.fixture
+    def failing_db(self, tmp_path):
+        return _interactions_db(tmp_path, [("i1", "p1", "granola", "/synthetic/w.md")])
+
+    def _fail(self, db, vault):
+        with patch.object(ms, "_rename_rows", side_effect=RuntimeError("boom")), \
+                patch.object(ms, "_default_vault_root", return_value=vault):
+            ms.run_at_store_init(ms.migrate_interactions_db, db)
+
+    def test_failure_sends_one_alert_across_processes_and_restarts(self, failing_db, vault):
+        with patch("api.services.telegram.send_message", return_value=True) as send:
+            for _ in range(5):
+                self._fail(failing_db, vault)
+        assert send.call_count == 1
+        message = send.call_args.args[0]
+        assert "MEETING SOURCE MIGRATION FAILED" in message
+        assert "synthetic" not in message
+
+    def test_each_database_has_its_own_window(self, tmp_path, failing_db, vault):
+        other = tmp_path / "other"
+        other.mkdir()
+        second = _interactions_db(other, [("i1", "p1", "granola", "/synthetic/w.md")])
+        with patch("api.services.telegram.send_message", return_value=True) as send:
+            self._fail(failing_db, vault)
+            self._fail(second, vault)
+        assert send.call_count == 2
+
+    def test_alert_returns_after_the_window(self, failing_db, vault):
+        with patch("api.services.telegram.send_message", return_value=True) as send:
+            self._fail(failing_db, vault)
+            marker = f"{failing_db}{ms.ALERT_MARKER_SUFFIX}"
+            expired = Path(marker).stat().st_mtime - ms.ALERT_WINDOW_SECONDS - 1
+            import os
+
+            os.utime(marker, (expired, expired))
+            self._fail(failing_db, vault)
+        assert send.call_count == 2
+
+    @pytest.mark.parametrize(
+        "behavior", [{"side_effect": RuntimeError("telegram down")}, {"return_value": False}]
+    )
+    def test_a_failed_send_never_raises_and_gives_the_window_back(self, failing_db, vault, behavior):
+        with patch("api.services.telegram.send_message", **behavior) as send:
+            self._fail(failing_db, vault)
+            self._fail(failing_db, vault)
+        assert send.call_count == 2
+        assert not Path(f"{failing_db}{ms.ALERT_MARKER_SUFFIX}").exists()
+
+    def test_an_unwritable_marker_never_raises(self, failing_db, vault):
+        with patch.object(ms.os, "open", side_effect=PermissionError("read-only")), \
+                patch("api.services.telegram.send_message") as send:
+            self._fail(failing_db, vault)
+        send.assert_not_called()
+
+    def test_a_hung_send_does_not_hold_up_startup(self, failing_db, vault, monkeypatch):
+        import threading
+        import time as time_module
+
+        release = threading.Event()
+        monkeypatch.setattr(ms, "ALERT_SEND_WAIT_SECONDS", 0.05)
+        with patch("api.services.telegram.send_message", side_effect=lambda _: release.wait(5)):
+            started = time_module.monotonic()
+            self._fail(failing_db, vault)
+            elapsed = time_module.monotonic() - started
+            release.set()
+        assert elapsed < 2
+
+    def test_a_deferred_provider_does_not_alert(self, tmp_path, failing_db):
+        with patch("api.services.telegram.send_message") as send, \
+                patch.object(ms, "_default_vault_root", return_value=tmp_path / "not-mounted"):
+            ms.run_at_store_init(ms.migrate_interactions_db, failing_db)
+            ms.run_at_store_init(ms.migrate_interactions_db, failing_db)
+        send.assert_not_called()
+        assert _dump(failing_db, "interactions")["i1"]["source_type"] == "meeting"
+
+    def test_success_does_not_alert(self, failing_db, vault):
+        with patch("api.services.telegram.send_message") as send, \
+                patch.object(ms, "_default_vault_root", return_value=vault):
+            ms.run_at_store_init(ms.migrate_interactions_db, failing_db)
+        send.assert_not_called()
+
+
+class TestMigrationStatus:
+    """Raw counts must tell migrated from failed, which folded reads can't."""
+
+    def test_a_failed_migration_shows_legacy_rows(self, tmp_path, vault):
+        interactions = _interactions_db(tmp_path, [("i1", "p1", "granola", "/synthetic/w.md")])
+        crm = _crm_db(tmp_path, [("s1", "p1", "granola", "/synthetic/w.md:Alex")], [("p1", ["granola"])])
+        with patch.object(ms, "_rename_rows", side_effect=RuntimeError("boom")):
+            InteractionStore(db_path=interactions, strict=False)
+        status = ms.migration_status(interactions, crm)
+        assert status["interactions"]["state"] == "not_migrated"
+        assert status["interactions"]["legacy_rows"] == 1
+        assert status["source_entities"]["legacy_rows"] == 1
+        assert status["source_entities"]["person_sources_legacy"] == 1
+
+    def test_a_deferred_provider_is_its_own_state(self, tmp_path, vault):
+        interactions = _interactions_db(tmp_path, [("i1", "p1", "granola", "/synthetic/w.md")])
+        crm = _crm_db(tmp_path)
+        ms.migrate_interactions_db(interactions, tmp_path / "not-mounted")
+        status = ms.migration_status(interactions, crm)["interactions"]
+        assert status == {
+            "state": "provider_deferred",
+            "legacy_rows": 0,
+            "meeting_rows": 1,
+            "null_provider": 1,
+            "provider_backfill_pending": 1,
+        }
+
+    def test_a_complete_migration(self, tmp_path, vault):
+        note = _write_note(vault / "Work" / "w.md", "wispr_id: w-1")
+        interactions = _interactions_db(tmp_path, [("i1", "p1", "granola", note)])
+        crm = _crm_db(tmp_path, [("s1", "p1", "granola", f"{note}:Alex")], [("p1", ["granola"])])
+        ms.migrate_interactions_db(interactions, vault)
+        ms.migrate_crm_db(crm, vault)
+        status = ms.migration_status(interactions, crm)
+        assert status["interactions"]["state"] == "complete"
+        assert status["interactions"]["null_provider"] == 0
+        assert status["source_entities"]["state"] == "complete"
+        assert status["source_entities"]["person_sources_legacy"] == 0
+
+    def test_a_store_not_yet_created_or_without_the_column_is_reported(self, tmp_path):
+        interactions = _interactions_db(tmp_path, [("i1", "p1", "granola", "/n.md")])
+        status = ms.migration_status(interactions, str(tmp_path / "absent.db"))
+        assert status["source_entities"] == {"state": "unavailable"}
+        assert not (tmp_path / "absent.db").exists()
+        assert status["interactions"]["null_provider"] is None
 
 
 class TestConcurrentInitializers:

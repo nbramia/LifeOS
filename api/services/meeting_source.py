@@ -28,8 +28,10 @@ if the migration has failed or has not reached a store yet.
 
 import json
 import logging
+import os
 import re
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,6 +68,18 @@ _ROW_TABLE_LINK_COLUMNS = {
     "interactions": ("person_id",),
     "source_entities": ("canonical_person_id", "link_status"),
 }
+
+# A human's decision outranks an automatic link when two rows share a source_id:
+# the indexer leaves a non-auto row alone but overwrites an auto one.
+_LINK_STATUS_RANK = {"confirmed": 2, "rejected": 1}
+
+# One failure alert per database per window, however many processes and restarts
+# hit the failure. Claimed through a marker file beside the database, which works
+# when the database itself is what is failing.
+ALERT_WINDOW_SECONDS = 24 * 60 * 60
+ALERT_MARKER_SUFFIX = ".meeting-migration-alert"
+# Store init waits this long for the send, then moves on and leaves it running.
+ALERT_SEND_WAIT_SECONDS = 10.0
 
 _FRONTMATTER_KEY = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)[ \t]*:", re.MULTILINE)
 
@@ -257,16 +271,21 @@ def _provider_for(source_id: Optional[str], providers: Optional[dict[str, str]])
     return providers.get(path)
 
 
+def _link_rank(link: dict) -> int:
+    return _LINK_STATUS_RANK.get(link.get("link_status"), 0)
+
+
 def _resolve_collisions(
     conn: sqlite3.Connection, table: str, result: MigrationResult
 ) -> dict[str, str]:
     """
     Clear the way for legacy rows whose source_id already has a ``meeting`` row.
 
-    The legacy row keeps its id and source_id. When both rows hold the same link
-    the ``meeting`` row is a duplicate and goes, handing over its provider (the
-    returned map of legacy row id to provider). When they differ, both links must
-    survive, so the ``meeting`` row stays under a suffixed source_id.
+    When both rows hold the same link the ``meeting`` row is a duplicate and goes,
+    handing over its provider (the returned map of legacy row id to provider). When
+    they differ, both links must survive, so one row takes a suffixed source_id: the
+    ``meeting`` row, unless it holds the stronger human decision, in which case the
+    legacy row does and the decision stays on the source_id the indexer looks up.
     """
     links = _ROW_TABLE_LINK_COLUMNS[table]
     legacy_links = ", ".join(f"old.{column}" for column in links)
@@ -283,16 +302,18 @@ def _resolve_collisions(
 
     inherited: dict[str, str] = {}
     for legacy_id, meeting_id, provider, *link_values in rows:
-        midpoint = len(link_values) // 2
-        if link_values[:midpoint] == link_values[midpoint:]:
+        legacy_link = dict(zip(links, link_values[: len(links)]))
+        meeting_link = dict(zip(links, link_values[len(links) :]))
+        if legacy_link == meeting_link:
             conn.execute(f"DELETE FROM {table} WHERE id = ?", (meeting_id,))
             if provider:
                 inherited[legacy_id] = provider
             result.collisions_merged += 1
         else:
+            displaced = legacy_id if _link_rank(meeting_link) > _link_rank(legacy_link) else meeting_id
             conn.execute(
                 f"UPDATE {table} SET source_id = source_id || ? || id WHERE id = ?",
-                (COLLISION_SUFFIX, meeting_id),
+                (COLLISION_SUFFIX, displaced),
             )
             result.collisions_kept_apart += 1
     return inherited
@@ -505,16 +526,128 @@ def migrate_crm_db(
     return _migrate(db_path, "source_entities", True, vault_root, busy_timeout)
 
 
+def _claim_alert(db_path: str) -> bool:
+    """Take the alert window for this database. Only the claimant sends."""
+    marker = f"{db_path}{ALERT_MARKER_SUFFIX}"
+    try:
+        if time.time() - os.stat(marker).st_mtime < ALERT_WINDOW_SECONDS:
+            return False
+        os.unlink(marker)
+    except FileNotFoundError:
+        pass
+    try:
+        os.close(os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+    except FileExistsError:
+        return False
+    return True
+
+
+def _deliver_alert(db_path: str, error: BaseException) -> None:
+    """Send the Telegram alert, giving the window back if it doesn't go out."""
+    sent = False
+    try:
+        from api.services.telegram import send_message
+
+        sent = send_message(
+            f"MEETING SOURCE MIGRATION FAILED on {Path(db_path).name}: {type(error).__name__}. "
+            "The database is unchanged and reads treat granola rows as meeting. The next store "
+            "initialization retries. See the server log, and meeting_source_migration in "
+            "/api/crm/data-health."
+        )
+    except Exception:
+        logger.exception("Could not send the meeting source migration alert")
+    if not sent:
+        logger.warning("Meeting source migration alert was not sent")
+        try:
+            os.unlink(f"{db_path}{ALERT_MARKER_SUFFIX}")
+        except OSError:
+            pass
+
+
+def _alert_migration_failure(db_path: str, error: BaseException) -> None:
+    """Alert on a failed migration, debounced. Nothing here can reach the caller."""
+    try:
+        if _claim_alert(db_path):
+            sender = threading.Thread(target=_deliver_alert, args=(db_path, error), daemon=True)
+            sender.start()
+            sender.join(ALERT_SEND_WAIT_SECONDS)
+    except Exception:
+        logger.exception("Could not raise the meeting source migration alert")
+
+
 def run_at_store_init(migrate, db_path: str) -> None:
-    """Run a migration from a store's init. A failure is logged, never raised."""
+    """
+    Run a migration from a store's init. A failure is logged and alerted, never raised.
+
+    A provider deferred because the vault is unavailable is not a failure: it logs a
+    warning and retries, with no alert, so a sync lag doesn't page anyone.
+    """
     try:
         migrate(db_path)
-    except Exception:
+    except Exception as error:
         logger.exception(
             "MEETING SOURCE MIGRATION FAILED on %s. The database is unchanged and the next "
             "store initialization retries. Reads treat granola rows as meeting until then.",
             Path(db_path).name,
         )
+        _alert_migration_failure(db_path, error)
+
+
+def _row_table_status(db_path: str, table: str) -> dict:
+    """Unfolded counts for one row table, read directly from the database."""
+    status: dict = {"state": "unavailable"}
+    if not Path(db_path).is_file():
+        return status
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        if not _table_exists(conn, table):
+            return status
+        counts = dict(
+            conn.execute(
+                f"SELECT source_type, COUNT(*) FROM {table} WHERE source_type IN (?, ?) GROUP BY 1",
+                (LEGACY_MEETING_SOURCE_TYPE, MEETING_SOURCE_TYPE),
+            ).fetchall()
+        )
+        columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        null_provider = None
+        if "provider" in columns:
+            null_provider = conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE source_type = ? AND provider IS NULL",
+                (MEETING_SOURCE_TYPE,),
+            ).fetchone()[0]
+        pending = 0
+        if _table_exists(conn, BACKFILL_TABLE):
+            pending = conn.execute(f"SELECT COUNT(*) FROM {BACKFILL_TABLE}").fetchone()[0]
+        legacy = counts.get(LEGACY_MEETING_SOURCE_TYPE, 0)
+        status = {
+            "state": "not_migrated" if legacy else "provider_deferred" if pending else "complete",
+            "legacy_rows": legacy,
+            "meeting_rows": counts.get(MEETING_SOURCE_TYPE, 0),
+            "null_provider": null_provider,
+            "provider_backfill_pending": pending,
+        }
+        if table == "source_entities" and _table_exists(conn, "person_entities"):
+            status["person_sources_legacy"] = conn.execute(
+                "SELECT COUNT(*) FROM person_entities WHERE sources LIKE ?",
+                (f'%"{LEGACY_MEETING_SOURCE_TYPE}"%',),
+            ).fetchone()[0]
+        return status
+    finally:
+        conn.close()
+
+
+def migration_status(interactions_db: str, crm_db: str) -> dict:
+    """
+    Raw migration state per store, the one view that doesn't treat granola as meeting.
+
+    ``not_migrated`` means legacy rows remain, because a migration failed or hasn't
+    reached the store. ``provider_deferred`` means rows await a provider from the vault.
+    A null provider is also normal for a meeting note that names no recorder.
+    """
+    return {
+        "interactions": _row_table_status(interactions_db, "interactions"),
+        "source_entities": _row_table_status(crm_db, "source_entities"),
+    }
 
 
 def rollback_interactions_db(db_path: str) -> int:

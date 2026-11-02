@@ -406,6 +406,8 @@ Reject an entity link (mark as incorrect, will be unlinked).
 
 Data coverage and sync health report.
 
+`meeting_source_migration` reports raw counts for `interactions` and `source_entities`: `state` (`complete`, `not_migrated`, `provider_deferred`, or `unavailable`), `legacy_rows`, `meeting_rows`, `null_provider`, and `provider_backfill_pending`. `source_entities` also has `person_sources_legacy`. Everywhere else, `granola` reads as `meeting`, so this is where a failed migration shows.
+
 ### GET /api/crm/data-health/summary
 
 Summary for UI display.

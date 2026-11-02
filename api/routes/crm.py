@@ -20,7 +20,7 @@ import time
 from fastapi import APIRouter, HTTPException, Query, UploadFile, File
 from pydantic import BaseModel, Field
 
-from api.services.meeting_source import fold_legacy_counts, normalize_source_type
+from api.services.meeting_source import fold_legacy_counts, migration_status, normalize_source_type
 from api.services.person_entity import PersonEntity, get_person_entity_store, compute_person_category
 from api.services.interaction_store import get_interaction_store
 from api.services.aggregate_cache import cached_aggregate
@@ -5084,6 +5084,9 @@ def get_data_health():
         "relationships": {},
         "people": {},
         "sync_recommendations": [],
+        "meeting_source_migration": migration_status(
+            str(data_dir / "interactions.db"), str(data_dir / "crm.db")
+        ),
     }
 
     # Interaction stats by source

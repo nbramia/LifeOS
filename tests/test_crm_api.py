@@ -709,6 +709,7 @@ class TestDataHealth:
         assert response.status_code == 200
         data = response.json()
         assert isinstance(data, dict)
+        assert set(data["meeting_source_migration"]) == {"interactions", "source_entities"}
 
     def test_get_data_health_summary(self, client):
         """GET /data-health/summary returns summary stats."""
