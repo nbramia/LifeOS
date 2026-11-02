@@ -125,7 +125,11 @@ def test_fast_config_request_not_blocked_by_concurrent_slow_people_list(monkeypa
 
     store = get_person_entity_store()
 
-    gate = _SlowGate()
+    # `/people?limit=300` is single-flighted by `cached_aggregate` whenever the
+    # watched databases exist, so one handler reaches `get_all` and the rest
+    # wait on it; without them all four do. One held handler is the count
+    # that holds in both cases.
+    gate = _SlowGate(expected_entries=1)
 
     def slow_get_all(*args, **kwargs):
         # Blocks only — deliberately does not fall through to the real
