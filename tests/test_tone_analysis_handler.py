@@ -25,9 +25,9 @@ from api.services import tone_analysis_store as tone_analysis_store_module
 from api.services.interaction_store import Interaction, get_interaction_store
 from api.services.tone_analysis_store import ToneAnalysisStore
 from tests.test_route_handlers_concurrency import (
-    SLEEP_SECONDS,
     _assert_fast_request_not_blocked,
     _router_only_app,
+    _SlowGate,
 )
 
 pytestmark = pytest.mark.unit
@@ -936,14 +936,19 @@ class TestConcurrency:
         self, tone_store, patch_partner, patch_interactions, monkeypatch,
     ):
         """The LLM call itself (not just the interaction fetch) must run off
-        the event loop: a slow, patched LLM client in progress must not
-        push GET /api/crm/config past the 100ms bound."""
+        the event loop: GET /api/crm/config must complete while the patched
+        LLM client is still blocked inside a call.
+
+        The per-person lock serializes the LLM call, so exactly one of the
+        concurrent requests is inside the client at a time."""
         month_a = _two_distinct_months()[0]
         patch_interactions(_interactions_for_months([month_a]))
 
+        gate = _SlowGate(expected_entries=1)
+
         class _SlowLLMClient:
             def create(self, *args, **kwargs):
-                time.sleep(SLEEP_SECONDS)
+                gate.block()
                 return SimpleNamespace(
                     text=json.dumps({"monthly_scores": []}),
                     model="fake-slow-model",
@@ -954,6 +959,7 @@ class TestConcurrency:
         with TestClient(_router_only_app()) as client:
             _assert_fast_request_not_blocked(
                 client,
+                gate,
                 slow_request=lambda c: c.post("/api/crm/relationship/tone-analysis-detailed"),
             )
 
