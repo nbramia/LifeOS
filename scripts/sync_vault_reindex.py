@@ -11,6 +11,11 @@ This script triggers indexing of vault notes, which:
 By default uses incremental indexing (only changed files).
 Use --force for full reindex (required when changing embedding models).
 
+Runs to completion unless given --budget-minutes, which stops between files once
+the budget is spent and leaves the rest for the next run. A partial run is a
+success: it reports files_remaining and exits normally. The nightly sync uses
+the budget; a manual run finishes a large load during the day without it.
+
 Should run AFTER all CRM data collection is complete so that entity
 resolution has access to the latest people data.
 
@@ -36,6 +41,8 @@ import time
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
+
+BUDGET_FROM_SETTING = -1.0
 
 
 def clear_vector_store():
@@ -67,19 +74,28 @@ def backfill_search_keys(indexer) -> int:
         return 0
 
 
-def sync_vault_reindex(dry_run: bool = True, force: bool = False, skip_summaries: bool = False) -> dict:
+def sync_vault_reindex(
+    dry_run: bool = True,
+    force: bool = False,
+    skip_summaries: bool = False,
+    budget_minutes: float | None = None,
+) -> dict:
     """
     Reindex the Obsidian vault.
 
     Args:
         dry_run: If True, just report what would happen
         force: If True, do full reindex (not incremental)
+        skip_summaries: If True, skip LLM summary generation
+        budget_minutes: How long the run may take. It stops between files and
+            leaves the rest for the next run. None or zero runs to completion.
 
     Returns:
         Stats dict
     """
     from config.settings import settings
     from api.services.indexer import IndexerService
+    from api.services.vault_listing import in_underscore_dir
 
     vault_path = settings.vault_path
 
@@ -88,7 +104,10 @@ def sync_vault_reindex(dry_run: bool = True, force: bool = False, skip_summaries
         return {"status": "error", "reason": "vault_not_found"}
 
     # Count markdown files
-    md_files = list(Path(vault_path).rglob("*.md"))
+    md_files = [
+        f for f in Path(vault_path).rglob("*.md")
+        if not in_underscore_dir(f.relative_to(vault_path))
+    ]
     logger.info(f"Found {len(md_files)} markdown files in vault")
 
     if dry_run:
@@ -110,7 +129,12 @@ def sync_vault_reindex(dry_run: bool = True, force: bool = False, skip_summaries
     start_time = time.time()
 
     indexer = IndexerService(vault_path=vault_path)
-    files_indexed = indexer.index_all(force=force, skip_summaries=skip_summaries)
+    files_indexed = indexer.index_all(
+        force=force,
+        skip_summaries=skip_summaries,
+        time_budget_seconds=budget_minutes * 60 if budget_minutes else None,
+    )
+    run = indexer.last_run
 
     index_pages = None
     try:
@@ -135,15 +159,38 @@ def sync_vault_reindex(dry_run: bool = True, force: bool = False, skip_summaries
 
     logger.info("\n=== Vault Reindex Results ===")
     logger.info(f"  Files indexed: {files_indexed}")
+    logger.info(f"  Files pruned: {run['files_pruned']}")
+    logger.info(f"  Files remaining: {run['files_remaining']}")
     logger.info(f"  Search keys backfilled: {search_keys_backfilled}")
     logger.info(f"  Time elapsed: {elapsed:.1f}s ({elapsed/60:.1f} min)")
 
     return {
         "status": "success",
         "files_indexed": files_indexed,
+        "files_pruned": run["files_pruned"],
+        "files_remaining": run["files_remaining"],
+        "stopped_early": run["stopped_early"],
         "index_pages": index_pages,
         "search_keys_backfilled": search_keys_backfilled,
         "elapsed_seconds": round(elapsed, 1),
+    }
+
+
+def resolve_budget(flag, default_minutes: int) -> float | None:
+    """The run's budget in minutes: None without the flag, the setting with it bare."""
+    if flag is None:
+        return None
+    minutes = default_minutes if flag == BUDGET_FROM_SETTING else flag
+    return minutes if minutes > 0 else None
+
+
+def sync_stats(result: dict) -> dict:
+    """The canonical stats line. Pruned files count as work, so a run whose budget
+    went to removals still shows it did something."""
+    return {
+        "processed": int(result.get("files_indexed", 0) or 0) + int(result.get("files_pruned", 0) or 0),
+        "files_remaining": int(result.get("files_remaining", 0) or 0),
+        "search_keys_backfilled": int(result.get("search_keys_backfilled", 0) or 0),
     }
 
 
@@ -193,6 +240,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--clear-vectors', action='store_true', help='Clear vector store before indexing (use when changing embedding model)')
     parser.add_argument('--clear-bm25', action='store_true', help='Clear BM25 index before indexing (use to drop stale doc_ids from a previous vault path)')
     parser.add_argument('--skip-summaries', action='store_true', help='Skip LLM summary generation for faster indexing')
+    parser.add_argument('--budget-minutes', nargs='?', type=float, const=BUDGET_FROM_SETTING, default=None,
+                        help='Stop after this many minutes, leaving the rest for the next run. '
+                             'Bare, uses LIFEOS_VAULT_INDEX_BUDGET_MINUTES. Omitted, runs to completion.')
     parser.add_argument('--drain-summaries', action='store_true', help='Work through the summary queue only, indexing nothing')
     args = parser.parse_args(argv)
 
@@ -217,7 +267,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.clear_bm25 and args.execute:
         clear_bm25_index()
 
-    result = sync_vault_reindex(dry_run=not args.execute, force=args.force, skip_summaries=args.skip_summaries)
+    from config.settings import settings as _settings
+
+    result = sync_vault_reindex(
+        dry_run=not args.execute,
+        force=args.force,
+        skip_summaries=args.skip_summaries,
+        budget_minutes=resolve_budget(args.budget_minutes, _settings.vault_index_budget_minutes),
+    )
 
     # Canonical line consumed by run_all_syncs._parse_sync_output. "processed"
     # is the file count so the orchestrator's generic counter matches reality.
@@ -225,10 +282,7 @@ def main(argv: list[str] | None = None) -> int:
     # never invokes the script with --dry-run during a real sync, but keeping
     # the line emission unconditional makes ad-hoc test runs less surprising.
     from api.services.sync_health import emit_sync_stats
-    emit_sync_stats({
-        "processed": int(result.get("files_indexed", 0) or 0),
-        "search_keys_backfilled": int(result.get("search_keys_backfilled", 0) or 0),
-    })
+    emit_sync_stats(sync_stats(result))
     del vault_index_lock
     return 0
 

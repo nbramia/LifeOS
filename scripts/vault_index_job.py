@@ -171,8 +171,8 @@ def run_job(dry_run: bool = True, max_files: int | None = None) -> dict:
     elapsed = time.time() - start_time
 
     logger.info(
-        f"Indexed {files_indexed} of {len(to_index)} changed notes, "
-        f"{len(deleted)} deleted notes pending at the start, in {elapsed:.1f}s"
+        f"Indexed {files_indexed} of {len(to_index)} changed notes and removed "
+        f"{indexer.last_run['files_pruned']} of {len(deleted)} deleted, in {elapsed:.1f}s"
     )
     from api.services.embeddings import get_embedding_service
     if get_embedding_service().using_cpu_fallback:

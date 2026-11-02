@@ -386,6 +386,8 @@ Both binary settings resolve the same way (`api/services/agent_worker/binary_res
 | `LIFEOS_CURRENT_WORK_PATH` | str | `Work/` | Work folder prefix in the vault. |
 | `LIFEOS_PERSONAL_ARCHIVE_PATH` | str | `Personal/zArchive/` | Personal archive folder prefix. |
 | `LIFEOS_RELATIONSHIP_FOLDER` | str | `Relationship` | Relationship folder name. |
+| `LIFEOS_VAULT_NO_PEOPLE_PATHS` | str | — | Comma-separated vault-relative folders of bulk content, such as a generated knowledge base. Notes under them stay searchable but create no people, links, interactions, or source entities. A single note can opt out with an explicit frontmatter `people: false` or a `generated:` key. After adding a folder, `scripts/repair_bare_person_mentions.py` removes what its notes already created. |
+| `LIFEOS_VAULT_INDEX_BUDGET_MINUTES` | int | `30` | Time budget for the nightly vault reindex. When it runs out the run saves its place and ends normally, and the remaining files wait for the next run. `0` turns it off. A manual `sync_vault_reindex.py` is unbudgeted unless given `--budget-minutes`. |
 | `LIFEOS_VAULT_MTIME_TRUSTED_AFTER` | date | — | For undated notes, trust the file's mtime as the interaction date only when the mtime is strictly later than this `YYYY-MM-DD` cutoff; otherwise the note falls back to the 1970 "undated" sentinel. Set to a date after your last bulk migration (clone/restore/mass-rename) so migration-era mtimes don't show up as recent activity. Leave unset to keep all undated notes on the sentinel. Read directly from the environment by `api/services/indexer.py` (not a Pydantic Setting). |
 
 ## Vault Taxonomy
@@ -557,6 +559,7 @@ A handful of operator-tunable files live alongside the env vars. All are gitigno
 |---|---|
 | `config/people_dictionary.json` | Nickname/alias lookup (e.g., `"Al": "Alex"`). Restart server after edits. Template at `config/people_dictionary.example.json`. |
 | `config/relationship_overrides.json` | Force relationship strength/circle for specific person UUIDs. Template at `config/relationship_overrides.example.json`. |
+| `config/employment_history.json` | Your employers: name, email domains, start and end dates, vault folders. Reading a first-name mention, a work note's employer comes from its folder or date. Without the file that signal stays silent and everything else still works. Template at `config/employment_history.example.json`. |
 | `config/family_members.json` | Family member person UUIDs for special handling. Template at `config/family_members.example.json`. |
 | `config/crm_settings.yaml` | CRM-side tunables (filters, dashboards). |
 | `config/gdoc_sync.example.yaml`, `config/gsheet_sync.example.yaml` | Templates for Google Docs/Sheets sync configs. |

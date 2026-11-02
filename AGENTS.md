@@ -60,6 +60,7 @@ Runs on Linux or macOS. Optionally, a Mac can act as an Apple Data Agent for iMe
 | What API endpoints exist? | [specs/product/api-reference.md](docs/specs/product/api-reference.md) |
 | What must not break for external chat clients? | [specs/technical/client-surfaces.md](docs/specs/technical/client-surfaces.md) |
 | How does the sync pipeline work? | [specs/technical/data-and-sync.md](docs/specs/technical/data-and-sync.md) |
+| How do names and first-name note mentions become people? | [specs/product/entity-resolution.md](docs/specs/product/entity-resolution.md) |
 | What does the code structure look like? | [specs/technical/architecture.md](docs/specs/technical/architecture.md) |
 | How does hybrid search work internally? | [specs/technical/search-indexing.md](docs/specs/technical/search-indexing.md) |
 | How is perf traced and monitored? | [specs/technical/observability.md](docs/specs/technical/observability.md) |

@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** CRM
-> **Last Updated:** 2026-11-01
+> **Last Updated:** 2026-11-02
 
 How LifeOS links source entities from different data sources to canonical person records.
 
@@ -94,7 +94,54 @@ When the query is a single word (e.g., "Sarah" with no last name), special disam
 | Multiple passing, truly ambiguous | Ambiguous: returns no link and creates no one |
 | Multiple candidates, none passing | Ambiguous: returns no link and creates no one |
 
-A bare name that matches no one, or a single candidate below the threshold, is an unknown name: `create_if_missing` creates a person for it.
+A bare name that matches no one, or a single candidate below the threshold, is an unknown name, and `create_if_missing` creates no one from it (see [Creating People](#creating-people)). A hidden one-word row does not answer to its name in any of this; a hidden full name does, so syncs cannot recreate the person.
+
+---
+
+## Creating People
+
+`create_if_missing` creates a person from a name alone only when the name reads as a full name (`is_creatable_person_name`): more than one word, no more than six, with no digits or address, path, or markup characters, and no word from `NON_NAME_WORDS` (organization and note-heading words such as "Foundation", "Members", "Next Steps"). A single word never creates a person, on any resolver path. An unknown email or phone alongside any other name still creates one, named from the address or number as under Pass 5. A person named after a phone keeps the name that came with it as `display_name`, which is what the UI shows for them, and it takes no exact matches. A full name arriving later with that phone replaces both.
+
+A person's own full name typed into the CRM (splitting a person, rejecting a link into a new person) is the operator's decision and creates that person directly.
+
+---
+
+## Mentions in Notes
+
+A vault or Granola note names people in several ways. A full name goes through the resolver above. A first name alone, or a name with only an initial on one side, is ambiguous and goes to the mention resolver (`api/services/mention_resolver.py`), which reads it in the context of its note, per note. It links only on a clear winner and never creates anyone. A mention that means no one clearly keeps an unlinked source entity, and the sweeps that re-match unlinked entities by name alone (`link_source_entities.py`, `relink_source_entities.py`) skip vault and Granola rows.
+
+Scoring considers real people: visible, unmerged, reading as a person. It never picks a one-word row with no email or phone, or a one-word row with only an email, which is a sender rather than someone a note calls by first name, and the owner's own first name resolves to no one. Link overrides apply first and can name anyone visible, including a one-word row, and a mention a human confirmed or rejected keeps that decision through reindexing.
+
+Each candidate collects points from whichever of these signals apply. Weights are the `MENTION_*` constants in `config/relationship_weights.py`.
+
+| Signal | Applies when | Points |
+|--------|--------------|--------|
+| `name_first` | Mention equals their first name | 10 |
+| `name_alias` | Mention equals an alias on them | 10 |
+| `name_nickname` | Mention is only a known variant of their first name, and nobody goes by it as given | -20 |
+| `name_initial` | The other half of "Robin G" or "R Gamma" agrees | 15 |
+| `only_candidate` | Nobody else real could be meant | 15 |
+| `dictionary_category` | The people dictionary lists the name in their category | 15 |
+| `domain_match` / `domain_mismatch` | Their contact evidence fits, or goes against, the note's work or personal context | +10 / -15 |
+| `family_in_personal` | Family, in a personal note | 20 |
+| `employer_email` | They have an address at the note's employer | 30 |
+| `employer_history` | Three or more work-account emails, calendar events, or Slack messages with them during that tenure | 20 |
+| `employer_company` | Their company names that employer | 15 |
+| `other_employer` | Their only known employer domain is a different one | -10 |
+| `interaction_near` | Closest non-note interaction within 7 / 30 / 90 days of the note's date | 25 / 15 / 8 |
+| `meeting_same_day` | In a meeting note, they were on a small calendar event within a day whose title agrees with the note's | 30 |
+| `full_name_in_note` | Their full name or email address appears in the note | 50 |
+| `co_mention` | Recorded relationship with a person the note names in full: 15 at pair strength 20 or more, otherwise 6, capped at 30 | up to 30 |
+| `person_path` | Their full name is in the note's path | 40 |
+| `folder_links` | Three or more notes in this folder name them in full or carry a confirmed link to them | 15 |
+
+The top candidate links when they reach `MENTION_MIN_SCORE` (50) and lead the runner-up by `MENTION_MIN_LEAD` (25). Anything less links to no one. A missed link costs little and a wrong one costs a lot, so no single weak signal clears the bar.
+
+**Note context.** The note's folder decides work or personal: `Work/` and an employer's folder read as work, `Personal/` as personal, and `vault_tags.domain` fills in for folders that say nothing. A work tag on a note in `Personal/` leaves it undecided, and an undecided note earns no domain signal.
+
+**Employer.** `config/employment_history.json` (gitignored; template `config/employment_history.example.json`) lists the owner's employers: name, email domains, start and end dates, vault folders. A note's employer comes from its folder, or, for a dated work note in no employer's folder, from the employers current on its date; overlapping tenures all count. With no history configured, the employer signals stay silent and the others carry on, so a fresh install links less but no worse.
+
+**Note date.** The date comes from `extract_note_date` (filename, then frontmatter `created`, `date`, `created_at`, `creation_date`, then body text), or file time only past `LIFEOS_VAULT_MTIME_TRUSTED_AFTER`. An undated note earns no interaction signal.
 
 ---
 
@@ -132,9 +179,11 @@ All scoring constants are defined in `config/relationship_weights.py`:
 | `FIRST_NAME_ONLY_BOOST_MULTIPLIER` | 1.5 | Extra relationship boost for first-name queries |
 | `CLOSE_RELATIONSHIP_MIN_STRENGTH` | 14 | Strength that makes a first-name candidate "close" |
 | `CLEARLY_CLOSER_MIN_STRENGTH_LEAD` | 30 | Strength lead that settles a tie between close candidates |
+| `MENTION_MIN_SCORE` | 50 | Minimum score for a note mention to link |
+| `MENTION_MIN_LEAD` | 25 | Minimum lead over the runner-up for a note mention to link |
 
 ## Related Documents
 
 - [Data Model](data-model.md) -- Two-tier data model (SourceEntity / PersonEntity)
-- [Data & Sync](../technical/data-and-sync.md) -- Sync pipeline and entity processing
+- [Data & Sync](../technical/data-and-sync.md) -- Sync pipeline, entity processing, and what indexing skips
 - [ADR-003: Two-Tier Data Model](../../adr/003-two-tier-data-model.md) -- Why SourceEntity and PersonEntity are separate

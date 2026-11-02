@@ -368,6 +368,47 @@ class TestSummaryQueue:
         assert _queued(summary_queue) == [str(late)]
 
 
+class TestWithMainIndexerFeatures:
+    def test_underscore_folder_is_not_listed_and_drops_out_through_deletions(self, indexer, vault, vector_store):
+        note = _write_note(vault, "Work/note.md", 1000)
+        indexer.index_all(light_pass=True)
+        moved = _write_note(vault, "_output/note.md", 1000)
+        state = json.loads(_state_file().read_text())
+        state[str(moved)] = 1000
+        _state_file().write_text(json.dumps(state))
+
+        changes = indexer.scan_changes()
+
+        assert changes["to_index"] == []
+        assert changes["deleted"] == [str(moved)]
+
+        indexer.index_all(light_pass=True)
+
+        assert str(moved) not in json.loads(_state_file().read_text())
+        assert str(note) in json.loads(_state_file().read_text())
+
+    def test_time_budget_keeps_its_own_order_under_a_cap(self, indexer, vault, monkeypatch):
+        for i in range(3):
+            _write_note(vault, f"{i}.md", 1000 + i)
+        ordered = MagicMock(side_effect=lambda files: sorted(files, key=lambda item: item[1]))
+        monkeypatch.setattr(indexer, "_ordered_for_budget", ordered)
+        seen = []
+        monkeypatch.setattr(indexer, "index_file", lambda path, **kwargs: seen.append(Path(path).name) or set())
+        monkeypatch.setattr(indexer, "_retry_failed_summaries", MagicMock(return_value=0))
+
+        indexer.index_all(time_budget_seconds=60, max_files=2, newest_first=True)
+
+        assert seen == ["0.md", "1.md"]
+
+    def test_cap_reports_what_it_left(self, indexer, vault):
+        for i in range(3):
+            _write_note(vault, f"{i}.md", 1000 + i)
+
+        indexer.index_all(max_files=1, newest_first=True, light_pass=True)
+
+        assert indexer.last_run["files_remaining"] == 2
+
+
 class TestSummaryQueueAcrossProcesses:
     def test_concurrent_adds_and_removes_lose_nothing(self, tmp_path, summary_queue):
         """Adders and a remover in separate processes, started together."""
@@ -826,6 +867,16 @@ class TestNightlyWaits:
         assert script.main(["--execute"]) == 0
 
         assert seen == [None]
+
+    def test_nightly_arguments_still_reach_the_time_budget(self, nightly):
+        """The orchestrator passes a bare --budget-minutes, meaning the setting."""
+        from config.settings import settings
+
+        script, reindex = nightly
+
+        assert script.main(["--execute", "--budget-minutes"]) == 0
+
+        assert reindex.call_args.kwargs["budget_minutes"] == settings.vault_index_budget_minutes
 
     def test_nightly_dry_run_needs_no_lock(self, nightly):
         from api.services import vault_index_lock

@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Search Pipeline
-> **Last Updated:** 2026-02-19
+> **Last Updated:** 2026-11-02
 
 How LifeOS searches across vault content using hybrid vector + keyword search.
 
@@ -65,6 +65,10 @@ The query classifier (`api/services/query_classifier.py`) determines whether a q
 - **Semantic queries**: All results are eligible for reranking reorder
 
 ---
+
+### What Gets Indexed
+
+Every `.md` file in the vault except those under `_`-prefixed folders. Bulk content (`LIFEOS_VAULT_NO_PEOPLE_PATHS`, frontmatter `people: false` or `generated:`) is indexed for search like any other note and contributes no people data; see [Data & Sync](data-and-sync.md).
 
 ### Vault Tags
 

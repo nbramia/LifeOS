@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from pathlib import Path
+from typing import Iterable
 
 from api.services.chunker import extract_frontmatter, normalize_tags
 
@@ -40,6 +41,80 @@ def infer_note_type(rel_path: Path | str) -> str:
         if parts and parts[0] == name.casefold():
             return name
     return "Other"
+
+
+def in_underscore_dir(rel_path: Path | str) -> bool:
+    """Whether a vault-relative note sits under a ``_``-prefixed folder.
+
+    Those folders hold working output, not notes. A ``_``-prefixed file in an
+    ordinary folder is still a note.
+    """
+    parts = Path(str(rel_path).replace("\\", "/")).parts[:-1]
+    return any(part.startswith("_") for part in parts)
+
+
+def _falsy_marker(value: object) -> bool:
+    if isinstance(value, str):
+        return value.strip().casefold() in ("", "false", "no")
+    return not value
+
+
+def _is_explicit_false(value: object) -> bool:
+    """False or the words false/no. A blank value is an empty property, not an answer."""
+    if isinstance(value, str):
+        return value.strip().casefold() in ("false", "no")
+    return value is False
+
+
+def no_people_reason(
+    rel_path: str | None,
+    frontmatter: dict,
+    no_people_paths: Iterable[str] = (),
+) -> str | None:
+    """Why a note yields no people data, or None when it yields it as usual.
+
+    Bulk content is searchable material, but writing about someone is not contact
+    with them, so these notes create no people, links, interactions, or source
+    entities. A note qualifies by sitting under a configured bulk-content folder
+    (``LIFEOS_VAULT_NO_PEOPLE_PATHS``), or by saying so in its frontmatter with
+    an explicit ``people: false`` or a ``generated:`` key that isn't itself false. Where a
+    note came from (``source: llm``, say) doesn't decide it: many such notes
+    are about real contact.
+
+    Args:
+        rel_path: Vault-relative note path, if known
+        frontmatter: Parsed frontmatter
+        no_people_paths: Vault-relative bulk-content folders
+
+    Returns:
+        "folder", "people_false", "generated", or None
+    """
+    if rel_path:
+        folded = rel_path.replace("\\", "/").casefold()
+        for folder in no_people_paths:
+            prefix = folder.replace("\\", "/").strip().strip("/").casefold()
+            if prefix and folded.startswith(prefix + "/"):
+                return "folder"
+    if _is_explicit_false(frontmatter.get("people")):
+        return "people_false"
+    if "generated" in frontmatter and not _falsy_marker(frontmatter["generated"]):
+        return "generated"
+    return None
+
+
+def vault_relative_path(path: str, vault_root: Path) -> str | None:
+    """Vault-relative POSIX path for a stored note path, or None if outside it.
+
+    A stored path may name an earlier location of the vault, which still ends
+    with the vault's own folder name followed by the note's relative path.
+    """
+    normalized = str(path).replace("\\", "/")
+    root = str(vault_root).replace("\\", "/").rstrip("/")
+    if normalized.startswith(root + "/"):
+        return normalized[len(root) + 1:]
+    marker = f"/{Path(root).name}/"
+    position = normalized.rfind(marker)
+    return normalized[position + len(marker):] if position >= 0 else None
 
 
 def resolve_vault_dir(vault_root: Path, rel_path: str) -> tuple[Path, Path]:

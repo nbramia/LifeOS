@@ -15,7 +15,8 @@ from datetime import datetime, timezone
 from api.services.chunker import chunk_document, extract_frontmatter, add_context_to_chunks, normalize_tags, tag_phrase_key
 from api.services.vectorstore import VectorStore, is_people_tag
 from api.services.bm25_index import BM25Index
-from api.services.people import extract_people_from_text, people_from_tags
+from api.services.people import people_in_note
+from api.services.vault_listing import in_underscore_dir, no_people_reason
 
 # V2 People System integration
 try:
@@ -27,9 +28,17 @@ try:
         UNDATED_SENTINEL,
     )
     from api.services.source_entity import (
+        LINK_STATUS_AUTO,
+        LINK_STATUS_CONFIRMED,
         get_source_entity_store,
         create_vault_source_entity,
         create_granola_source_entity,
+    )
+    from api.services.mention_resolver import (
+        MentionResolver,
+        build_note_context,
+        is_ambiguous_mention,
+        load_link_overrides,
     )
     HAS_V2_PEOPLE = True
 except ImportError:
@@ -85,6 +94,13 @@ def _resolve_undated_note_date(path) -> datetime:
 # Reserved key in the index state: file path -> tag tuple used at index time.
 TAG_STATE_KEY = "__tag_phrase_keys__"
 
+# How much of a note to read when ordering files for a time budget: enough for
+# frontmatter. A note whose frontmatter runs longer sorts as ordinary.
+BUDGET_ORDER_HEAD_CHARS = 8192
+
+# How long one built MentionResolver stands in for the people store.
+MENTION_RESOLVER_MAX_AGE_SECONDS = 600
+
 
 class IndexerService:
     """
@@ -96,6 +112,14 @@ class IndexerService:
 
     # State file for tracking indexed files
     INDEX_STATE_FILE = "data/vault_index_state.json"
+
+    _mention_resolver: "MentionResolver | None" = None
+    _mention_resolver_built_at = 0.0
+
+    # Budgets are measured on this clock.
+    _clock = staticmethod(time.monotonic)
+    # What the latest index_all did beyond its return value.
+    last_run: dict = {"files_pruned": 0, "files_remaining": 0, "stopped_early": False}
 
     def __init__(
         self,
@@ -184,6 +208,19 @@ class IndexerService:
         tmp_path.write_text(json.dumps(state, indent=2))
         os.replace(tmp_path, state_path)
 
+    def _ordered_for_budget(self, files: list[tuple[str, float]]) -> list[tuple[str, float]]:
+        """Ordinary notes before bulk content, each newest first, so a budget
+        spent on a bulk load has already covered what the owner wrote."""
+        def is_bulk(file_path: str) -> bool:
+            try:
+                with open(file_path, encoding="utf-8", errors="replace") as f:
+                    head = f.read(BUDGET_ORDER_HEAD_CHARS)
+            except OSError:
+                return False
+            return self._no_people_reason(Path(file_path), extract_frontmatter(head)[0]) is not None
+
+        return sorted(files, key=lambda item: (is_bulk(item[0]), -item[1]))
+
     def scan_changes(self, compare_tags: bool = True) -> dict:
         """Report what an incremental ``index_all`` would do, changing nothing.
 
@@ -216,8 +253,13 @@ class IndexerService:
             ``(files_to_index, deleted_files, current_tag_key, file_count)``,
             with ``files_to_index`` as ``(path, mtime)`` pairs in vault walk order.
         """
-        # Get all current markdown files with their mtimes
-        all_md_files = list(self.vault_path.rglob("*.md"))
+        # Get all current markdown files with their mtimes. A file under a
+        # _-prefixed folder isn't a note, so an indexed one drops out through
+        # the deleted-file path below.
+        all_md_files = [
+            f for f in self.vault_path.rglob("*.md")
+            if not in_underscore_dir(f.relative_to(self.vault_path))
+        ]
         current_files = {str(f): f.stat().st_mtime for f in all_md_files}
 
         # Tag tuples used at index time live under a reserved key beside the
@@ -255,6 +297,7 @@ class IndexerService:
         self,
         force: bool = False,
         skip_summaries: bool = False,
+        time_budget_seconds: float | None = None,
         max_files: int | None = None,
         newest_first: bool = False,
         light_pass: bool = False,
@@ -268,11 +311,19 @@ class IndexerService:
 
         Progress is saved incrementally every 50 files, so crashes don't lose work.
 
+        With a time budget the run stops between files once it is spent, and
+        ends normally. A file counts as done only when the saved state says so,
+        so whatever it didn't reach, including removals of deleted files, the
+        next run picks up. Stats still refresh for the people it touched, since
+        their files won't come round again. Failed-summary retries wait for a
+        run that finishes. ``last_run`` reports what was left.
+
         Args:
             force: If True, reindex all files regardless of modification time
             skip_summaries: If True, skip LLM summary generation for faster indexing
+            time_budget_seconds: How long the run may take. None runs to completion.
             max_files: Index at most this many changed files, leaving the rest
-                for a later run. Deleted files are always processed.
+                for a later run.
             newest_first: If True, index changed files by descending modification
                 time. Otherwise they follow vault walk order.
             light_pass: If True, run as a pass that a later full run completes:
@@ -285,6 +336,11 @@ class IndexerService:
         Returns:
             Number of files indexed
         """
+        deadline = None if time_budget_seconds is None else self._clock() + time_budget_seconds
+
+        def out_of_time() -> bool:
+            return deadline is not None and self._clock() >= deadline
+
         # Always load existing state - even in force mode, we track progress
         # so we can resume if interrupted
         index_state = self._load_index_state()
@@ -302,38 +358,52 @@ class IndexerService:
         else:
             logger.info(f"Incremental index: {len(files_to_index)} changed, {len(deleted_files)} deleted, {file_count - len(files_to_index)} unchanged")
 
-        if newest_first:
-            files_to_index.sort(key=lambda item: item[1], reverse=True)
-        if max_files is not None and len(files_to_index) > max_files:
-            logger.info(f"Indexing {max_files} of {len(files_to_index)} changed files this run; the rest wait for a later run")
-            files_to_index = files_to_index[:max_files]
+        save_interval = 10  # Save state every N files (small to survive timeouts)
 
         # Delete removed files from index, saving progress so an interrupted run
         # does not repeat them
+        pruned = 0
+        prunes_attempted = 0
         deleted_this_run = sorted(deleted_files)
         if max_deletions is not None and len(deleted_this_run) > max_deletions:
             logger.info(f"Removing {max_deletions} of {len(deleted_this_run)} deleted files this run; the rest wait for a later run")
             deleted_this_run = deleted_this_run[:max_deletions]
-        for position, file_path in enumerate(deleted_this_run, start=1):
+        for file_path in deleted_this_run:
+            if out_of_time():
+                break
+            prunes_attempted += 1
             try:
                 self.delete_file(file_path)
                 # Remove from state
                 index_state.pop(file_path, None)
                 tag_keys.pop(file_path, None)
+                pruned += 1
                 logger.info(f"Removed deleted file from index: {file_path}")
+                if pruned % save_interval == 0:
+                    self._save_index_state(index_state)
             except Exception as e:
                 logger.error(f"Failed to remove {file_path} from index: {e}")
-            if position % 50 == 0:
-                self._save_index_state(index_state)
-        if deleted_this_run:
+        if prunes_attempted:
             self._save_index_state(index_state)
+
+        if time_budget_seconds is not None:
+            files_to_index = self._ordered_for_budget(files_to_index)
+        elif newest_first:
+            files_to_index = sorted(files_to_index, key=lambda item: item[1], reverse=True)
+        files_changed = len(files_to_index)
+        if max_files is not None and files_changed > max_files:
+            logger.info(f"Indexing {max_files} of {files_changed} changed files this run; the rest wait for a later run")
+            files_to_index = files_to_index[:max_files]
 
         # Index changed files, saving progress incrementally
         count = 0
+        attempted = 0
         all_affected_person_ids: set[str] = set()
-        save_interval = 10  # Save state every N files (small to survive timeouts)
 
         for file_path, mtime in files_to_index:
+            if out_of_time():
+                break
+            attempted += 1
             try:
                 affected_ids = self.index_file(
                     file_path, skip_stats_refresh=True, skip_summaries=skip_summaries, light_pass=light_pass
@@ -371,8 +441,18 @@ class IndexerService:
         self._save_index_state(index_state)
         logger.info(f"Indexed {count} files (final save)")
 
+        files_remaining = (files_changed - attempted) + (len(deleted_files) - prunes_attempted)
+        stopped_early = files_remaining > 0
+        self.last_run = {
+            "files_pruned": pruned,
+            "files_remaining": files_remaining,
+            "stopped_early": stopped_early,
+        }
+        if stopped_early and deadline is not None:
+            logger.info(f"Time budget reached: {files_remaining} files remain for the next run")
+
         # Retry failed summaries with simpler prompt and longer timeout
-        if not skip_summaries and not light_pass:
+        if not skip_summaries and not light_pass and not stopped_early:
             retry_count = self._retry_failed_summaries()
             if retry_count > 0:
                 logger.info(f"Retried {retry_count} failed summaries")
@@ -412,6 +492,8 @@ class IndexerService:
         path = Path(file_path)
         if not path.exists() or not path.suffix == ".md":
             return
+        if self._is_excluded_from_index(path):
+            return
 
         try:
             content = path.read_text(encoding="utf-8")
@@ -440,17 +522,14 @@ class IndexerService:
         # Chunk the document
         chunks = chunk_document(content, is_granola=is_granola)
 
-        # Extract people from content (in addition to frontmatter)
-        extracted_people = extract_people_from_text(body)
-        frontmatter_people = frontmatter.get("people", [])
-
-        # Merge people lists (unique)
+        # People named in the body, frontmatter, and tags
         note_tags = normalize_tags(frontmatter.get("tags"))
-        all_people = list(set(extracted_people + frontmatter_people + people_from_tags(note_tags)))
+        all_people = people_in_note(frontmatter, body)
 
-        # Sync to v2 people system if available
+        # Sync to v2 people system if available. Bulk content stays searchable
+        # below but says nothing about contact with anyone.
         affected_person_ids: set[str] = set()
-        if HAS_V2_PEOPLE and all_people:
+        if HAS_V2_PEOPLE and self._no_people_reason(path, frontmatter) is None:
             try:
                 from datetime import timezone
                 note_date_str = self._extract_note_date(path, frontmatter, body)
@@ -478,7 +557,9 @@ class IndexerService:
                     else:
                         logger.debug(f"Undated note (mtime {note_date.date()}): {path.name}")
 
-                affected_person_ids = self._sync_people_to_v2(path, all_people, note_date, is_granola)
+                affected_person_ids = self._sync_people_to_v2(
+                    path, all_people, note_date, is_granola, frontmatter=frontmatter, body=body
+                )
 
                 # Refresh stats for affected people (unless caller will batch refresh)
                 if affected_person_ids and not skip_stats_refresh:
@@ -698,20 +779,77 @@ class IndexerService:
             return "Other"
         return infer_note_type(rel)
 
+    def _rel_path(self, path: Path) -> str | None:
+        """A note's vault-relative POSIX path, or None if it's outside the vault."""
+        try:
+            return path.resolve().relative_to(self.vault_path.resolve()).as_posix()
+        except ValueError:
+            return None
+
+    def _no_people_reason(self, path: Path, frontmatter: dict) -> str | None:
+        from config.settings import settings
+
+        return no_people_reason(self._rel_path(path), frontmatter, settings.vault_no_people_paths)
+
+    def _is_excluded_from_index(self, path: Path) -> bool:
+        """Whether a file sits under a _-prefixed folder of the vault."""
+        try:
+            return in_underscore_dir(path.relative_to(self.vault_path))
+        except ValueError:
+            return False
+
+    def _get_mention_resolver(self, resolver, interaction_store) -> "MentionResolver | None":
+        """A resolver over the current people, rebuilt once it has aged out.
+
+        None when it can't be built, in which case mentions needing context stay
+        as they are until a later run.
+        """
+        age = time.monotonic() - self._mention_resolver_built_at
+        if self._mention_resolver is not None and age < MENTION_RESOLVER_MAX_AGE_SECONDS:
+            return self._mention_resolver
+        try:
+            from config.settings import settings
+
+            crm_db = resolver.store.db_path
+            self._mention_resolver = MentionResolver(
+                resolver.store.get_all(),
+                crm_db=crm_db,
+                interaction_db=interaction_store.db_path,
+                vault_root=self.vault_path,
+                overrides=load_link_overrides(crm_db),
+                my_person_id=settings.my_person_id or None,
+                owner_name=settings.user_name or None,
+            )
+            self._mention_resolver_built_at = time.monotonic()
+        except Exception as e:
+            logger.warning(f"Mention resolver unavailable: {e}")
+            self._mention_resolver = None
+        return self._mention_resolver
+
     def _sync_people_to_v2(
         self,
         path: Path,
         people: list[str],
         note_date: datetime,
         is_granola: bool = False,
+        frontmatter: dict | None = None,
+        body: str = "",
     ) -> set[str]:
         """
-        Resolve extracted people and create vault mention interactions and source entities.
+        Resolve a note's people and record their mentions.
 
-        Hooks into the v2 people system to:
-        1. Resolve each person name to a PersonEntity (creating if needed)
-        2. Create an interaction record for the vault mention
-        3. Create a source entity for the vault/granola mention (for split UI)
+        A full name resolves through the entity resolver, which may create the
+        person. A first name or initial is ambiguous: it goes to the mention
+        resolver, which reads it in the note's context, links only on a clear
+        winner, and creates no one. Each mention gets a source entity (for the
+        split UI), unlinked when it means no one clearly. A mention a human
+        confirmed or rejected keeps that decision.
+
+        A note holds one interaction, which goes to the first person who
+        resolves, full names first. It follows the note: a holder the note doesn't
+        resolve to gives it up to whoever comes first, or it goes if no one does.
+        A holder whose link a human confirmed keeps it, as does a visible one-word
+        person the note still names.
 
         Note: PersonEntity stats (mention_count) are updated via refresh_person_stats()
         after sync completes, not manually here.
@@ -721,6 +859,8 @@ class IndexerService:
             people: List of extracted person names
             note_date: Date of the note (for interaction timestamp)
             is_granola: Whether this is a Granola meeting note
+            frontmatter: Parsed frontmatter, read as context for ambiguous mentions
+            body: Note body, read as context for ambiguous mentions
 
         Returns:
             Set of affected person IDs (for stats refresh)
@@ -734,13 +874,18 @@ class IndexerService:
         interaction_store = self._interaction_store or get_interaction_store()
         source_entity_store = self._source_entity_store or get_source_entity_store()
         file_path_str = str(path.resolve())
-        note_title = path.stem  # filename without .md
 
         logger.debug(
             f"Syncing {len(people)} people to v2 from {path.name}"
         )
 
-        for person_name in people:
+        ambiguous = sorted({name for name in people if is_ambiguous_mention(name)})
+        full_names = sorted(set(people) - set(ambiguous))
+
+        resolved: list = []
+        complete = True
+        co_mentioned_ids: set[str] = set()
+        for person_name in full_names:
             try:
                 # Resolve person with context path for domain boosting
                 # e.g., file in Work/ folders will boost work domain (LIFEOS_WORK_DOMAIN) matches
@@ -749,81 +894,175 @@ class IndexerService:
                     context_path=file_path_str,
                     create_if_missing=True,
                 )
-
                 if not result:
                     logger.debug(f"Could not resolve person: {person_name}")
                     continue
-
-                entity = result.entity
-
-                # Create vault interaction
-                interaction = create_vault_interaction(
-                    person_id=entity.id,
-                    file_path=file_path_str,
-                    title=note_title,
-                    timestamp=note_date,
-                    snippet=None,  # Could extract first N chars if desired
-                    is_granola=is_granola,
-                )
-
-                # Add interaction (avoiding duplicates on re-index)
-                _, was_added = interaction_store.add_if_not_exists(interaction)
-
-                # Track affected person for stats refresh
-                if was_added:
-                    affected_person_ids.add(entity.id)
-
-                # Create source entity for split UI visibility
-                # This uses add_or_update so re-indexing won't create duplicates
-                source_metadata = {
-                    "note_title": note_title,
-                    "is_granola": is_granola,
-                }
-                if is_granola:
-                    source_entity = create_granola_source_entity(
-                        file_path=file_path_str,
-                        person_name=person_name,
-                        observed_at=note_date,
-                        metadata=source_metadata,
-                    )
-                else:
-                    source_entity = create_vault_source_entity(
-                        file_path=file_path_str,
-                        person_name=person_name,
-                        observed_at=note_date,
-                        metadata=source_metadata,
-                    )
-
-                # Link to the resolved person
-                source_entity.canonical_person_id = entity.id
-                source_entity.link_confidence = result.confidence
-                source_entity.link_method = result.match_type
-                source_entity.linked_at = datetime.now(timezone.utc)
-
-                # Add or update (handles duplicates on re-index)
-                source_entity_store.add_or_update(source_entity)
-
-                if was_added:
-                    # Update related_notes (not a count, just a list)
-                    if file_path_str not in entity.related_notes:
-                        entity.related_notes.append(file_path_str)
-
-                    # Add vault/granola to sources if not present
-                    source_type = "granola" if is_granola else "vault"
-                    if source_type not in entity.sources:
-                        entity.sources.append(source_type)
-
-                    # Persist entity changes (stats updated via refresh_person_stats)
-                    resolver.store.update(entity)
-
-                    logger.debug(
-                        f"Created interaction for {entity.display_name} "
-                        f"({result.match_type}, conf={result.confidence:.2f})"
-                    )
-
+                co_mentioned_ids.add(result.entity.id)
+                resolved.append(self._record_mention(
+                    path, person_name, result.entity, result.confidence, result.match_type,
+                    note_date, is_granola, resolver, interaction_store, source_entity_store,
+                    affected_person_ids,
+                ))
             except Exception as e:
-                logger.warning(
-                    f"Failed to sync person '{person_name}' to v2: {e}"
-                )
+                complete = False
+                logger.warning(f"Failed to sync person '{person_name}' to v2: {e}")
 
+        if not ambiguous:
+            if complete:
+                self._settle_note_interaction(
+                    path, resolved, ambiguous, is_granola, resolver, interaction_store, source_entity_store,
+                    affected_person_ids,
+                )
+            return affected_person_ids
+
+        mention_resolver = self._get_mention_resolver(resolver, interaction_store)
+        if mention_resolver is None:
+            return affected_person_ids
+
+        context = self._note_context(path, frontmatter or {}, body, note_date, is_granola, co_mentioned_ids)
+        for person_name in ambiguous:
+            try:
+                decision = mention_resolver.resolve(person_name, context)
+                resolved.append(self._record_mention(
+                    path, person_name, decision.entity, decision.confidence, decision.match_type,
+                    note_date, is_granola, resolver, interaction_store, source_entity_store,
+                    affected_person_ids,
+                ))
+            except Exception as e:
+                complete = False
+                logger.warning(f"Failed to sync person '{person_name}' to v2: {e}")
+
+        if complete:
+            self._settle_note_interaction(
+                path, resolved, ambiguous, is_granola, resolver, interaction_store, source_entity_store,
+                affected_person_ids,
+            )
         return affected_person_ids
+
+    def _settle_note_interaction(
+        self, path, resolved, ambiguous, is_granola, resolver, interaction_store, source_entity_store,
+        affected_person_ids,
+    ) -> None:
+        """Make a note's interaction agree with who the note resolves to now.
+
+        Args:
+            resolved: Each mention's person or None, in resolution order
+            ambiguous: The note's one-word mentions
+        """
+        source_type = "granola" if is_granola else "vault"
+        file_path_str = str(path.resolve())
+        current = interaction_store.get_by_source(source_type, file_path_str)
+        people = [entity for entity in resolved if entity is not None]
+        if current is None or current.person_id in {entity.id for entity in people}:
+            return
+        if source_entity_store.has_confirmed_note_link(source_type, file_path_str, current.person_id):
+            return
+        holder = resolver.store.get_by_id(current.person_id)
+        if (
+            holder and not holder.hidden
+            and holder.canonical_name.strip().casefold() in {name.casefold() for name in ambiguous}
+        ):
+            return
+
+        affected_person_ids.add(current.person_id)
+        if not people:
+            interaction_store.delete(current.id)
+            return
+        interaction_store.reassign(current.id, people[0].id)
+        self._credit_note(people[0], file_path_str, source_type, resolver, affected_person_ids)
+
+    def _credit_note(self, entity, file_path_str, source_type, resolver, affected_person_ids) -> None:
+        """Record on a person that this note's interaction is theirs."""
+        affected_person_ids.add(entity.id)
+        if file_path_str not in entity.related_notes:
+            entity.related_notes.append(file_path_str)
+        if source_type not in entity.sources:
+            entity.sources.append(source_type)
+        # Persist entity changes (stats updated via refresh_person_stats)
+        resolver.store.update(entity)
+
+    def _note_context(self, path, frontmatter, body, note_date, is_granola, co_mentioned_ids):
+        """Build the context a note offers for reading its ambiguous mentions."""
+        from config.employment_history import get_employment_history
+
+        tag = self._tag_for(path)
+        return build_note_context(
+            self._rel_path(path) or path.name,
+            frontmatter,
+            body,
+            note_date=None if note_date == UNDATED_SENTINEL else note_date.date(),
+            tag_domain=getattr(tag, "domain", None),
+            employment=get_employment_history(),
+            co_mentioned_ids=co_mentioned_ids,
+            is_granola=is_granola,
+        )
+
+    def _record_mention(
+        self,
+        path,
+        person_name,
+        entity,
+        confidence,
+        match_type,
+        note_date,
+        is_granola,
+        resolver,
+        interaction_store,
+        source_entity_store,
+        affected_person_ids,
+    ):
+        """Write one mention's source entity and, if it links, the note's interaction.
+
+        Returns:
+            The person the mention resolves to, or None
+        """
+        file_path_str = str(path.resolve())
+        note_title = path.stem  # filename without .md
+        source_metadata = {
+            "note_title": note_title,
+            "is_granola": is_granola,
+        }
+        create_source_entity = create_granola_source_entity if is_granola else create_vault_source_entity
+        source_entity = create_source_entity(
+            file_path=file_path_str,
+            person_name=person_name,
+            observed_at=note_date,
+            metadata=source_metadata,
+        )
+
+        existing = source_entity_store.get_by_source(source_entity.source_type, source_entity.source_id)
+        if existing is not None and existing.link_status != LINK_STATUS_AUTO:
+            confirmed = existing.link_status == LINK_STATUS_CONFIRMED and existing.canonical_person_id
+            entity = resolver.store.get_by_id(existing.canonical_person_id) if confirmed else None
+        else:
+            if entity is not None:
+                source_entity.canonical_person_id = entity.id
+                source_entity.link_confidence = confidence
+                source_entity.link_method = match_type
+                source_entity.linked_at = datetime.now(timezone.utc)
+            # Add or update (handles duplicates on re-index)
+            source_entity_store.add_or_update(source_entity)
+
+        if entity is None:
+            return None
+
+        # Add interaction (avoiding duplicates on re-index)
+        interaction = create_vault_interaction(
+            person_id=entity.id,
+            file_path=file_path_str,
+            title=note_title,
+            timestamp=note_date,
+            snippet=None,  # Could extract first N chars if desired
+            is_granola=is_granola,
+        )
+        _, was_added = interaction_store.add_if_not_exists(interaction)
+
+        if was_added:
+            self._credit_note(
+                entity, file_path_str, "granola" if is_granola else "vault", resolver, affected_person_ids
+            )
+            logger.debug(
+                f"Created interaction for {entity.display_name} "
+                f"({match_type}, conf={confidence:.2f})"
+            )
+        return entity
