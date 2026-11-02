@@ -1072,6 +1072,10 @@ class SourceEntityStore:
         """
         Get unlinked entities eligible for re-matching.
 
+        Note mentions (vault, granola) are never eligible: they resolve from
+        their note's context in the indexer, and a bare name re-matched on its
+        own can only guess.
+
         Below ``max_attempts``, behavior is unchanged: eligible once
         ``min_days_since_attempt`` has elapsed since the last attempt.
 
@@ -1134,6 +1138,7 @@ class SourceEntityStore:
                     SELECT * FROM source_entities
                     WHERE canonical_person_id IS NULL
                       AND source_type = ?
+                      AND source_type NOT IN ('vault', 'granola')
                       AND (match_attempted_at IS NULL OR match_attempted_at < ?)
                     ORDER BY observed_at DESC
                 """, (source_type, base_cutoff))
@@ -1141,6 +1146,7 @@ class SourceEntityStore:
                 cursor = conn.execute("""
                     SELECT * FROM source_entities
                     WHERE canonical_person_id IS NULL
+                      AND source_type NOT IN ('vault', 'granola')
                       AND (match_attempted_at IS NULL OR match_attempted_at < ?)
                     ORDER BY observed_at DESC
                 """, (base_cutoff,))
@@ -1252,12 +1258,14 @@ class SourceEntityStore:
                     SELECT observed_email FROM source_entities
                     WHERE canonical_person_id IS NULL
                       AND source_type = ?
+                      AND source_type NOT IN ('vault', 'granola')
                       AND match_attempt_count >= ?
                 """, (source_type, max_attempts))
             else:
                 cursor = conn.execute("""
                     SELECT observed_email FROM source_entities
                     WHERE canonical_person_id IS NULL
+                      AND source_type NOT IN ('vault', 'granola')
                       AND match_attempt_count >= ?
                 """, (max_attempts,))
 

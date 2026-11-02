@@ -1,7 +1,7 @@
 # Configuration Guide
 
 **Status:** Complete
-**Last Updated:** 2026-11-01
+**Last Updated:** 2026-11-02
 **Audience:** Operators
 
 **This is the single authoritative reference for every `LIFEOS_*` environment variable and the third-party service variables (`ANTHROPIC_API_KEY`, `OLLAMA_*`, `SLACK_*`, `TELEGRAM_*`, `MONARCH_*`) that LifeOS reads.** Other guides reference this file rather than restating defaults — when documentation conflicts, this file wins (and `config/settings.py` wins over both, since the code is the source of truth).
@@ -553,6 +553,7 @@ A handful of operator-tunable files live alongside the env vars. All are gitigno
 |---|---|
 | `config/people_dictionary.json` | Nickname/alias lookup (e.g., `"Al": "Alex"`). Restart server after edits. Template at `config/people_dictionary.example.json`. |
 | `config/relationship_overrides.json` | Force relationship strength/circle for specific person UUIDs. Template at `config/relationship_overrides.example.json`. |
+| `config/employment_history.json` | Your employers: name, email domains, start and end dates, vault folders. Reading a first-name mention, a work note's employer comes from its folder or date. Without the file that signal stays silent and everything else still works. Template at `config/employment_history.example.json`. |
 | `config/family_members.json` | Family member person UUIDs for special handling. Template at `config/family_members.example.json`. |
 | `config/crm_settings.yaml` | CRM-side tunables (filters, dashboards). |
 | `config/gdoc_sync.example.yaml`, `config/gsheet_sync.example.yaml` | Templates for Google Docs/Sheets sync configs. |

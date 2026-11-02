@@ -5,6 +5,9 @@ Implements three-pass entity resolution:
 1. Email anchoring - exact email match across sources
 2. Fuzzy name matching with context boost - for names without email
 3. Disambiguation - a name that fits several people about equally links to no one
+
+A name alone creates a person only when it reads as a full name. A single word
+never does, and neither do obvious non-names; see is_creatable_person_name().
 """
 import logging
 import re
@@ -26,6 +29,25 @@ NAME_SUFFIXES = {
     'esq', 'mph', 'dds', 'dmd', 'do', 'rn', 'cpa',
     'mba', 'jd', 'llm', 'msw', 'lcsw', 'psyd', 'edd',
 }
+
+# A name holding one of these reads as an organization or a note heading.
+NON_NAME_WORDS = frozenset({
+    'accounts', 'action', 'admin', 'agenda', 'alerts', 'association', 'attendees',
+    'billing', 'board', 'bot', 'calendar', 'capital', 'college', 'committee', 'company',
+    'corp', 'corporation', 'council', 'customer', 'department', 'everyone', 'executive',
+    'foundation', 'fund', 'funds', 'group', 'help', 'holdings', 'hq', 'inc',
+    'incorporated', 'info', 'institute', 'items', 'llc', 'llp', 'ltd', 'marketing',
+    'meeting', 'members', 'news', 'newsletter', 'next', 'noreply', 'notes',
+    'notifications', 'office', 'operations', 'overview', 'pac', 'participants',
+    'partners', 'people', 'prerequisites', 'reply', 'room', 'sales', 'services', 'staff',
+    'steps', 'summary', 'support', 'system', 'team', 'terms', 'trust', 'university',
+    'updates', 'vacation', 'ventures',
+})
+
+# Characters no person's name holds: addresses, paths, markup, templating.
+_NON_NAME_CHARACTERS = re.compile(r"[\d@/\\:#\[\]{}<>|=*_]")
+
+MAX_PERSON_NAME_WORDS = 6
 
 
 @dataclass
@@ -93,6 +115,41 @@ def parse_name(name: str) -> ParsedName:
             last=parts[-1],
             original=original,
         )
+
+
+def is_creatable_person_name(name: str) -> bool:
+    """
+    Whether a name is enough, with no identifier, to create a person from.
+
+    A single word could be any number of people, so it never is. Neither is
+    anything that fails to read as a person's name.
+
+    Args:
+        name: Name to check
+
+    Returns:
+        True for a multi-word name that reads as a person's
+    """
+    if not name or _NON_NAME_CHARACTERS.search(name) or not re.search(r"[^\W\d_]", name):
+        return False
+    parsed = parse_name(name)
+    if parsed.last is None:
+        return False
+    words = [parsed.first, *parsed.middles, parsed.last]
+    if len(words) > MAX_PERSON_NAME_WORDS:
+        return False
+    return not any(word.casefold().strip(".,'\"()") in NON_NAME_WORDS for word in words)
+
+
+def is_bare_person(entity: PersonEntity) -> bool:
+    """A person known only by one word: no last name, email, or phone."""
+    return (
+        not entity.emails
+        and not entity.phone_numbers
+        and parse_name(entity.canonical_name).last is None
+    )
+
+
 from api.services.people import resolve_person_name  # noqa: E402
 from api.services.link_override import get_link_override_store  # noqa: E402
 from config.people_config import (  # noqa: E402
@@ -226,12 +283,14 @@ class EntityResolver:
 
         A name that fits several existing people about equally never creates a
         person: there is no one to link it to and a new row would only add one
-        more candidate.
+        more candidate. An unknown name creates one only if it passes
+        is_creatable_person_name().
 
         Args:
             name: Name to resolve (will be canonicalized)
             context_path: Vault path for context boost (e.g., "Work/ML/meeting.md")
-            create_if_missing: Create new entity if the name matches no one
+            create_if_missing: Create new entity if the name matches no one and
+                reads as a full name
 
         Returns:
             ResolutionResult with matched/created entity, or None
@@ -246,7 +305,9 @@ class EntityResolver:
         if match.result:
             return match.result
         if create_if_missing:
-            return self._create_new_entity(resolve_person_name(name), context_path)
+            canonical = resolve_person_name(name)
+            if is_creatable_person_name(canonical):
+                return self._create_new_entity(canonical, context_path)
         return None
 
     def match_name(self, name: str, context_path: Optional[str] = None) -> NameMatch:
@@ -264,8 +325,10 @@ class EntityResolver:
         canonical = resolve_person_name(name)
 
         # Check for exact name/alias match in store
+        # Hiding a one-word person retires that word as a name for them, while a
+        # hidden full name keeps its row so syncs can't recreate the person.
         exact_match = self._store.get_by_name(canonical)
-        if exact_match:
+        if exact_match and not (exact_match.hidden and parse_name(canonical).last is None):
             return NameMatch(ResolutionResult(
                 entity=exact_match,
                 is_new=False,
@@ -754,13 +817,14 @@ class EntityResolver:
         4. Fuzzy name match with context boost
         5. Create new entity from email or name (if create_if_missing)
 
-        A name that fits several existing people never creates a person from
-        the name. An unknown email or phone next to it still anchors a new
-        person of their own, named from the address or number so the tied name
-        is not added as another exact match. A tied name with no identifier
-        returns None. With create_if_missing, a person named only after their
-        identifier takes the real multi-word name of a call that matches them by
-        it. Without it, nothing is written.
+        A name creates a person on its own only when it reads as a full name
+        (is_creatable_person_name) and fits no one already known. An unknown
+        email or phone next to any other name still anchors a new person of
+        their own, named from the address or number so the name is not added as
+        an exact match. Such a name with no identifier returns None. With
+        create_if_missing, a person named only after their identifier takes the
+        real multi-word name of a call that matches them by it. Without it,
+        nothing is written.
 
         Phone-only never creates a PersonEntity. A raw phone
         observation with no name or email tells you very little about who the
@@ -845,9 +909,9 @@ class EntityResolver:
                 )
 
             name_from_email = self._extract_name_from_email(email)
-            # A name reaching this point is tied. A person named after it, or
-            # after any bare first name, would take its exact matches from here
-            # on, so they go by the address instead.
+            # A name reaching this point is tied or can't name a person. A person
+            # named after it, or after any bare first name, would take its exact
+            # matches from here on, so they go by the address instead.
             if name and name.strip() and (
                 not parse_name(name_from_email).last
                 or name_from_email.lower() == name.strip().lower()
@@ -883,8 +947,8 @@ class EntityResolver:
                 match_type="email_new",
             )
 
-        # A name reaching this point is tied: an unknown one was created above.
-        # The phone anchors a person of their own, named from the number.
+        # A name reaching this point is tied or can't name a person. The phone
+        # anchors a person of their own, named from the number.
         if name and name.strip() and phone and create_if_missing:
             from api.services.phone_utils import normalize_phone
             norm_phone = normalize_phone(phone)
@@ -973,11 +1037,13 @@ class EntityResolver:
         company: Optional[str],
         position: Optional[str],
         linkedin_url: Optional[str],
-    ) -> ResolutionResult:
+    ) -> Optional[ResolutionResult]:
         """
         Resolve a person from LinkedIn data.
 
         Uses company normalization to infer email domains and vault contexts.
+        A connection with no email and no match creates a person only if their
+        name passes is_creatable_person_name().
 
         Args:
             first_name: First name from LinkedIn
@@ -988,7 +1054,7 @@ class EntityResolver:
             linkedin_url: LinkedIn profile URL
 
         Returns:
-            ResolutionResult with matched/created entity
+            ResolutionResult with matched/created entity, or None
         """
         full_name = f"{first_name} {last_name}".strip()
 
@@ -1084,6 +1150,9 @@ class EntityResolver:
                     disambiguation_applied=result.disambiguation_applied,
                 )
             return result
+
+        if not email and not is_creatable_person_name(full_name):
+            return None
 
         # Create new entity
         category = "work" if vault_contexts else "unknown"

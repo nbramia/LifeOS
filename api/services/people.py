@@ -163,6 +163,17 @@ def people_from_tags(tags) -> list[str]:
     return names
 
 
+def people_in_note(frontmatter: dict, body: str) -> list[str]:
+    """Every person a note names: body text, frontmatter ``people``, ``people/`` tags."""
+    from api.services.chunker import normalize_tags
+
+    listed = frontmatter.get("people") or []
+    found = list(extract_people_from_text(body))
+    found += [listed] if isinstance(listed, str) else [str(name) for name in listed if name]
+    found += people_from_tags(normalize_tags(frontmatter.get("tags")))
+    return sorted(set(found))
+
+
 def _is_excluded(name: str) -> bool:
     """Check if a name should be excluded (e.g., self-references)."""
     info = PEOPLE_DICTIONARY.get(name)

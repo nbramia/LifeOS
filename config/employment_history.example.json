@@ -1,0 +1,18 @@
+{
+  "employers": [
+    {
+      "name": "Example Analytics",
+      "email_domains": ["example-analytics.example"],
+      "start": "2016-03",
+      "end": "2019-10",
+      "vault_folders": ["Archive/Example Analytics/"]
+    },
+    {
+      "name": "Sample Labs",
+      "email_domains": ["samplelabs.example", "samplelabs-mail.example"],
+      "start": "2019-11",
+      "end": null,
+      "vault_folders": ["Work/Sample Labs/"]
+    }
+  ]
+}

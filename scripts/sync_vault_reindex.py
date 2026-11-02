@@ -70,6 +70,7 @@ def sync_vault_reindex(dry_run: bool = True, force: bool = False, skip_summaries
     """
     from config.settings import settings
     from api.services.indexer import IndexerService
+    from api.services.vault_listing import in_underscore_dir
 
     vault_path = settings.vault_path
 
@@ -78,7 +79,10 @@ def sync_vault_reindex(dry_run: bool = True, force: bool = False, skip_summaries
         return {"status": "error", "reason": "vault_not_found"}
 
     # Count markdown files
-    md_files = list(Path(vault_path).rglob("*.md"))
+    md_files = [
+        f for f in Path(vault_path).rglob("*.md")
+        if not in_underscore_dir(f.relative_to(vault_path))
+    ]
     logger.info(f"Found {len(md_files)} markdown files in vault")
 
     if dry_run:

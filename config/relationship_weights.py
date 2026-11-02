@@ -118,6 +118,61 @@ STRENGTH_OVERRIDES_BY_ID, CIRCLE_OVERRIDES_BY_ID = _load_relationship_overrides(
 
 
 # =============================================================================
+# MENTION RESOLUTION (first-name mentions in vault notes)
+# =============================================================================
+# Points for each signal api/services/mention_resolver.py can check about a
+# candidate. A mention links only when the top candidate reaches
+# MENTION_MIN_SCORE and leads the runner-up by MENTION_MIN_LEAD, so no single
+# weak signal can carry a link on its own.
+
+MENTION_MIN_SCORE = 50
+MENTION_MIN_LEAD = 25
+
+# The name itself
+MENTION_WEIGHT_FIRST_NAME = 10          # Mention equals the candidate's first name
+MENTION_WEIGHT_NICKNAME = 5             # Mention is a known variant of it, and nobody goes by it as given
+MENTION_WEIGHT_ALIAS = 10               # Mention equals an alias on the person
+MENTION_WEIGHT_INITIAL = 15             # "Robin G" or "R Gamma" agrees with the other part of the name
+MENTION_WEIGHT_ONLY_CANDIDATE = 15      # Nobody else real carries this name
+MENTION_WEIGHT_DICTIONARY_CATEGORY = 15 # People dictionary lists this name in the candidate's category
+
+# Personal vs work context
+MENTION_WEIGHT_DOMAIN_MATCH = 10
+MENTION_WEIGHT_FAMILY_IN_PERSONAL = 20
+MENTION_PENALTY_DOMAIN_MISMATCH = -15
+
+# The employer current on the note's date, or owning its folder
+MENTION_WEIGHT_EMPLOYER_EMAIL = 30      # Candidate has an address at that employer
+MENTION_WEIGHT_EMPLOYER_HISTORY = 20    # Work-account email/calendar with them during that tenure
+MENTION_WEIGHT_EMPLOYER_COMPANY = 15    # Candidate's company names that employer
+MENTION_PENALTY_OTHER_EMPLOYER = -10    # Their only known employer domain is a different one
+MENTION_EMPLOYER_HISTORY_MIN_INTERACTIONS = 3
+
+# Real interaction near the note's date, by the closest one
+MENTION_INTERACTION_TIERS: tuple[tuple[int, int], ...] = (
+    (7, 25),    # within a week
+    (30, 15),   # within a month
+    (90, 8),    # within a quarter
+)
+MENTION_WEIGHT_MEETING_SAME_DAY = 30    # They were on the calendar event a meeting note records
+MENTION_MEETING_DAY_WINDOW = 1
+MENTION_MEETING_MAX_ATTENDEES = 12
+MENTION_MEETING_TITLE_OVERLAP = 0.5     # Shared words over all words, event title vs note title
+
+# Who else the note names
+MENTION_WEIGHT_FULL_NAME_IN_NOTE = 50   # Their full name or email address appears in this note
+MENTION_COMENTION_STRONG_PAIR = 20      # Pair strength at or above this counts in full
+MENTION_WEIGHT_COMENTION_STRONG = 15
+MENTION_WEIGHT_COMENTION_WEAK = 6       # Any recorded relationship with a person the note fully names
+MENTION_COMENTION_CAP = 30
+
+# Where the note lives
+MENTION_WEIGHT_PERSON_PATH = 40         # Their full name is in the note's path
+MENTION_WEIGHT_FOLDER_LINKS = 15        # This folder's notes already name them in full
+MENTION_FOLDER_MIN_LINKS = 3
+
+
+# =============================================================================
 # INTERACTION TYPE WEIGHTS
 # =============================================================================
 # Weight applied to each interaction when calculating frequency scores.

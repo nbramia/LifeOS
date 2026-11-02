@@ -73,6 +73,7 @@ token-*.json
 config/people_dictionary.json
 config/relationship_overrides.json
 config/relationship_overrides.json.bak.*
+config/employment_history.json
 config/family_members.json
 config/family_members.json.bak.*
 config/linkedin_tags.json

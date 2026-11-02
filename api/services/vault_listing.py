@@ -42,6 +42,51 @@ def infer_note_type(rel_path: Path | str) -> str:
     return "Other"
 
 
+def in_underscore_dir(rel_path: Path | str) -> bool:
+    """Whether a vault-relative note sits under a ``_``-prefixed folder.
+
+    Those folders hold working output, not notes. A ``_``-prefixed file in an
+    ordinary folder is still a note.
+    """
+    parts = Path(str(rel_path).replace("\\", "/")).parts[:-1]
+    return any(part.startswith("_") for part in parts)
+
+
+# Frontmatter ``source`` values naming a generating model or agent.
+GENERATED_NOTE_SOURCES = frozenset({"llm"})
+
+
+def is_generated_note(frontmatter: dict) -> bool:
+    """Whether a note's frontmatter marks it as machine-generated.
+
+    A generated page is searchable material, but writing about someone is not
+    contact with them, so it creates no people, links, or interactions. The
+    markers are ``source: llm`` and a truthy ``generated:`` key.
+    """
+    source = frontmatter.get("source")
+    if isinstance(source, str) and source.strip().casefold() in GENERATED_NOTE_SOURCES:
+        return True
+    generated = frontmatter.get("generated")
+    if isinstance(generated, str):
+        return generated.strip().casefold() not in ("", "false", "no")
+    return bool(generated)
+
+
+def vault_relative_path(path: str, vault_root: Path) -> str | None:
+    """Vault-relative POSIX path for a stored note path, or None if outside it.
+
+    A stored path may name an earlier location of the vault, which still ends
+    with the vault's own folder name followed by the note's relative path.
+    """
+    normalized = str(path).replace("\\", "/")
+    root = str(vault_root).replace("\\", "/").rstrip("/")
+    if normalized.startswith(root + "/"):
+        return normalized[len(root) + 1:]
+    marker = f"/{Path(root).name}/"
+    position = normalized.rfind(marker)
+    return normalized[position + len(marker):] if position >= 0 else None
+
+
 def resolve_vault_dir(vault_root: Path, rel_path: str) -> tuple[Path, Path]:
     """Resolve `rel_path` under the vault root, returning (resolved_root, resolved_dir).
 
