@@ -637,6 +637,44 @@ def _stage_photo_thumbnails(library: Path, asset_uuids, dest_root: Path) -> dict
     }
 
 
+# One row per face of a person: the asset plus the facts that rank it as an
+# avatar. visible_faces counts the unhidden, visible human faces on the asset
+# and is 0 when the asset is trashed or hidden or this face is itself hidden,
+# not visible, or trashed. Mirrored by ApplePhotosReader.get_profile_appearances.
+_FACE_FACT_NAMES = ("visible_faces", "face_size", "face_quality", "eyes_closed", "key_face")
+_FACE_FACTS_COLUMNS = """,
+                    CASE WHEN COALESCE(a.ZTRASHEDSTATE, 0) = 0
+                          AND COALESCE(a.ZHIDDEN, 0) = 0
+                          AND COALESCE(f.ZHIDDEN, 0) = 0
+                          AND COALESCE(f.ZASSETVISIBLE, 1) = 1
+                          AND COALESCE(f.ZISINTRASH, 0) = 0
+                         THEN (SELECT COUNT(*) FROM ZDETECTEDFACE o
+                               WHERE o.ZASSETFORFACE = a.Z_PK
+                                 AND COALESCE(o.ZHIDDEN, 0) = 0
+                                 AND COALESCE(o.ZASSETVISIBLE, 1) = 1
+                                 AND COALESCE(o.ZISINTRASH, 0) = 0
+                                 AND COALESCE(o.ZDETECTIONTYPE, 1) = 1)
+                         ELSE 0 END AS visible_faces,
+                    f.ZSIZE AS face_size,
+                    f.ZQUALITY AS face_quality,
+                    (COALESCE(f.ZISLEFTEYECLOSED, 0) = 1
+                     OR COALESCE(f.ZISRIGHTEYECLOSED, 0) = 1) AS eyes_closed,
+                    (f.Z_PK = (SELECT p.ZKEYFACE FROM ZPERSON p
+                               WHERE p.Z_PK = f.ZPERSONFORFACE)) AS key_face"""
+_FACE_APPEARANCES_SQL = """
+                SELECT
+                    a.ZUUID,
+                    a.ZDATECREATED,
+                    a.ZLATITUDE,
+                    a.ZLONGITUDE{facts}
+                FROM ZASSET a
+                JOIN ZDETECTEDFACE f ON f.ZASSETFORFACE = a.Z_PK
+                WHERE f.ZPERSONFORFACE = ?
+                ORDER BY a.ZDATECREATED DESC
+                LIMIT 5000
+            """
+
+
 def export_photos_faces(dry_run: bool = False) -> dict:
     """Export Photos face recognition data as JSON.
 
@@ -698,18 +736,17 @@ def export_photos_faces(dry_run: bool = False) -> dict:
 
         # Get face appearances for this person
         try:
-            photos = conn.execute("""
-                SELECT
-                    a.ZUUID,
-                    a.ZDATECREATED,
-                    a.ZLATITUDE,
-                    a.ZLONGITUDE
-                FROM ZASSET a
-                JOIN ZDETECTEDFACE f ON f.ZASSETFORFACE = a.Z_PK
-                WHERE f.ZPERSONFORFACE = ?
-                ORDER BY a.ZDATECREATED DESC
-                LIMIT 5000
-            """, (person["Z_PK"],)).fetchall()
+            try:
+                photos = conn.execute(
+                    _FACE_APPEARANCES_SQL.format(facts=_FACE_FACTS_COLUMNS),
+                    (person["Z_PK"],),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                # A library without the face-quality columns still exports
+                # its appearances, just without the facts.
+                photos = conn.execute(
+                    _FACE_APPEARANCES_SQL.format(facts=""), (person["Z_PK"],)
+                ).fetchall()
 
             for photo in photos:
                 ts = None
@@ -717,13 +754,17 @@ def export_photos_faces(dry_run: bool = False) -> dict:
                     unix_ts = photo["ZDATECREATED"] + APPLE_EPOCH_OFFSET
                     ts = datetime.fromtimestamp(unix_ts, tz=timezone.utc).isoformat()
 
-                faces_export.append({
+                appearance = {
                     "person_pk": person["Z_PK"],
                     "asset_uuid": photo["ZUUID"],
                     "timestamp": ts,
                     "latitude": photo["ZLATITUDE"],
                     "longitude": photo["ZLONGITUDE"],
-                })
+                }
+                if "visible_faces" in photo.keys():
+                    for fact in _FACE_FACT_NAMES:
+                        appearance[fact] = photo[fact]
+                faces_export.append(appearance)
         except Exception as e:
             errors += 1
             if errors <= 5:

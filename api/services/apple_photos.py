@@ -191,6 +191,65 @@ class ApplePhotosReader:
         finally:
             conn.close()
 
+    def get_profile_appearances(self, person_pk: int, limit: int = 5000) -> list[dict]:
+        """
+        Photos of a person with the facts that rank them as an avatar.
+
+        Records have the shape of the Apple Data Agent export's face
+        appearances (``asset_uuid``, ``timestamp``, ``visible_faces``,
+        ``face_size``, ``face_quality``, ``eyes_closed``, ``key_face``), so
+        ``api.services.profile_photo`` ranks both the same way. The face
+        facts mirror ``scripts/apple_data_export.py``. A library without the
+        face-quality columns yields an empty list.
+        """
+        conn = self._get_connection()
+        try:
+            cursor = conn.execute("""
+                SELECT
+                    a.ZUUID,
+                    a.ZDATECREATED,
+                    CASE WHEN COALESCE(a.ZTRASHEDSTATE, 0) = 0
+                          AND COALESCE(a.ZHIDDEN, 0) = 0
+                          AND COALESCE(f.ZHIDDEN, 0) = 0
+                          AND COALESCE(f.ZASSETVISIBLE, 1) = 1
+                          AND COALESCE(f.ZISINTRASH, 0) = 0
+                         THEN (SELECT COUNT(*) FROM ZDETECTEDFACE o
+                               WHERE o.ZASSETFORFACE = a.Z_PK
+                                 AND COALESCE(o.ZHIDDEN, 0) = 0
+                                 AND COALESCE(o.ZASSETVISIBLE, 1) = 1
+                                 AND COALESCE(o.ZISINTRASH, 0) = 0
+                                 AND COALESCE(o.ZDETECTIONTYPE, 1) = 1)
+                         ELSE 0 END AS visible_faces,
+                    f.ZSIZE AS face_size,
+                    f.ZQUALITY AS face_quality,
+                    (COALESCE(f.ZISLEFTEYECLOSED, 0) = 1
+                     OR COALESCE(f.ZISRIGHTEYECLOSED, 0) = 1) AS eyes_closed,
+                    (f.Z_PK = (SELECT p.ZKEYFACE FROM ZPERSON p
+                               WHERE p.Z_PK = f.ZPERSONFORFACE)) AS key_face
+                FROM ZASSET a
+                JOIN ZDETECTEDFACE f ON f.ZASSETFORFACE = a.Z_PK
+                WHERE f.ZPERSONFORFACE = ?
+                ORDER BY a.ZDATECREATED DESC
+                LIMIT ?
+            """, (person_pk, limit))
+            records = []
+            for row in cursor:
+                timestamp = apple_timestamp_to_datetime(row["ZDATECREATED"])
+                records.append({
+                    "asset_uuid": row["ZUUID"],
+                    "timestamp": timestamp.isoformat() if timestamp else None,
+                    "visible_faces": row["visible_faces"],
+                    "face_size": row["face_size"],
+                    "face_quality": row["face_quality"],
+                    "eyes_closed": row["eyes_closed"],
+                    "key_face": row["key_face"],
+                })
+            return records
+        except sqlite3.OperationalError:
+            return []
+        finally:
+            conn.close()
+
     def get_people_in_photo(self, asset_pk: int) -> list[PhotosPerson]:
         """
         Get all named people detected in a specific photo.

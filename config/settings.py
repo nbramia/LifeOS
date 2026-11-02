@@ -2141,6 +2141,12 @@ class Settings(BaseSettings):
         return _REPO_ROOT / "data" / "apple-imports" / "photos_thumbnails"
 
     @property
+    def photos_profile_picks_path(self) -> Path:
+        """Derived file mapping person id -> ranked avatar asset UUIDs, written
+        by the Photos import/sync (see api/services/profile_photo.py)."""
+        return _REPO_ROOT / "data" / "photos_profile_picks.json"
+
+    @property
     def photos_thumbnails_available(self) -> bool:
         """Whether any staged Photos thumbnail exists."""
         directory = self.photos_thumbnails_dir

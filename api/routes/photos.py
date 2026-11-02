@@ -454,13 +454,26 @@ def get_photo_thumbnail(uuid: str):
     )
 
 
+def _profile_photo_response(thumb_path: Path) -> FileResponse:
+    media_type = "image/png" if thumb_path.suffix.lower() == ".png" else "image/jpeg"
+    return FileResponse(
+        thumb_path,
+        media_type=media_type,
+        headers={"Cache-Control": "public, max-age=3600"},  # Cache for 1 hour
+    )
+
+
 @router.get("/profile/{person_id}")
 @router.head("/profile/{person_id}", include_in_schema=False)
 def get_profile_photo(person_id: str):
     """
     Get a profile photo thumbnail for a person.
 
-    Returns the most recent photo of the person that has a thumbnail available.
+    Returns the photo ranked best as an avatar (see
+    ``api.services.profile_photo``: fewest faces in the frame, then a face
+    large enough to read, eyes open, quality, recency) when the Photos import
+    stored a pick for this person. Otherwise returns the most recent photo of
+    the person that has a thumbnail available.
     Use this for avatars/profile pictures in the UI. Also accepts HEAD --
     stacking a `@router.head` registration on the same function (rather than
     branching on the request method ourselves) lets Starlette's `FileResponse`
@@ -473,7 +486,13 @@ def get_profile_photo(person_id: str):
 
     Works without a Photos library: staged thumbnails are served first.
     """
+    from api.services import profile_photo
     from api.services.interaction_store import get_interaction_store
+
+    for asset_uuid in profile_photo.load_picks().get(person_id, ()):
+        thumb_path = _find_thumbnail_path(asset_uuid)
+        if thumb_path:
+            return _profile_photo_response(thumb_path)
 
     interaction_store = get_interaction_store()
 
@@ -488,16 +507,7 @@ def get_profile_photo(person_id: str):
         if interaction.source_id:
             thumb_path = _find_thumbnail_path(_asset_uuid(interaction.source_id))
             if thumb_path and thumb_path.exists():
-                suffix = thumb_path.suffix.lower()
-                media_type = "image/jpeg"
-                if suffix == ".png":
-                    media_type = "image/png"
-
-                return FileResponse(
-                    thumb_path,
-                    media_type=media_type,
-                    headers={"Cache-Control": "public, max-age=3600"}  # Cache for 1 hour
-                )
+                return _profile_photo_response(thumb_path)
 
     # No photo available. Cache the miss too, so repeated list renders for
     # people without a photo don't re-request it every time.
