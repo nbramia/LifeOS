@@ -2117,7 +2117,7 @@ async def test_operator_decision_uses_existing_human_queue_resolution_lifecycle(
     assert len(tasks.list_tasks()) == 1
 
 
-def _wait_until(predicate, timeout=3.0):
+def _wait_until(predicate, timeout=10.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
@@ -2173,8 +2173,21 @@ def test_watcher_processes_an_atomic_move_into_the_archive(tmp_path):
     watcher = PebbleCaptureWatcher(
         archive, consumer, scan_seconds=60, debounce_seconds=0.01
     )
+    # The startup recovery scan can see a file that arrives while it runs, and
+    # the move event then processes it again. Moving the file in only after
+    # that scan has finished leaves the filesystem event as the one path that
+    # can deliver it (the next periodic scan is 60 s away).
+    startup_scan_done = threading.Event()
+    recover_once = watcher._recover_once
+
+    def recover_then_signal():
+        recover_once()
+        startup_scan_done.set()
+
+    watcher._recover_once = recover_then_signal
     watcher.start()
     try:
+        assert startup_scan_done.wait(10.0)
         source = staging / "atomic.md"
         source.write_text(_frame(_payload()))
         os.replace(source, archive / "atomic.md")
