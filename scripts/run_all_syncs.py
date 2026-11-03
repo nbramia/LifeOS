@@ -752,6 +752,7 @@ def send_sync_summary_telegram(result: dict, trigger: str = "unknown"):
         and not result.get("repeated_yield_sources")
         and not result.get("apple_agent_sha_drift")
         and not result.get("results", {}).get("crm_vectorstore", {}).get("removal_skipped")
+        and not result.get("results", {}).get("strengths", {}).get("service_senders_held_back")
         else "⚠️"
     )
     lines = [
@@ -830,6 +831,14 @@ def send_sync_summary_telegram(result: dict, trigger: str = "unknown"):
         lines.append("")
         lines.append(f"⚠️ *People index not pruned:* {people_index.get('people_stale', 0)} stale entries kept")
         lines.append("  Safety limit hit — manual review needed")
+
+    # New services stay visible and keep taking circle slots until someone runs the
+    # reviewed repair, so a hold-back has to reach an operator.
+    held_back = result.get("results", {}).get("strengths", {}).get("service_senders_held_back")
+    if held_back:
+        lines.append("")
+        lines.append(f"⚠️ *Service filter held back:* {held_back} rows waiting")
+        lines.append("  Review and run repair_service_senders.py")
 
     # Investments-snapshot freshness — surface the stale WARNING here so
     # it reaches the operator (the bare log line does not feed any batched report).

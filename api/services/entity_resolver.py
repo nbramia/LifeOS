@@ -17,7 +17,7 @@ from typing import Optional
 
 from rapidfuzz import fuzz
 
-from api.services.person_entity import PersonEntity, PersonEntityStore, get_person_entity_store
+from api.services.person_entity import PersonEntity, PersonEntityStore, get_person_entity_store, is_hidden_service
 from config.nickname_lookup import are_name_variants
 
 # Name prefixes to strip before parsing (case-insensitive)
@@ -326,9 +326,12 @@ class EntityResolver:
 
         # Check for exact name/alias match in store
         # Hiding a one-word person retires that word as a name for them, while a
-        # hidden full name keeps its row so syncs can't recreate the person.
+        # hidden full name keeps its row so syncs can't recreate the person. A
+        # hidden service never answers to a name: it holds its addresses and no more.
         exact_match = self._store.get_by_name(canonical)
-        if exact_match and not (exact_match.hidden and parse_name(canonical).last is None):
+        if exact_match and not is_hidden_service(exact_match) and not (
+            exact_match.hidden and parse_name(canonical).last is None
+        ):
             return NameMatch(ResolutionResult(
                 entity=exact_match,
                 is_new=False,

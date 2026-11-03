@@ -42,6 +42,15 @@ logger = logging.getLogger(__name__)
 SQL_IN_CLAUSE_CHUNK_SIZE = 900
 
 
+# Every row hidden as a service or newsletter has a hidden_reason starting with this.
+HIDDEN_SERVICE_REASON_PREFIX = "service sender: "
+
+
+def is_hidden_service(entity) -> bool:
+    """A row hidden as a service: it keeps its interactions and answers to no name."""
+    return bool(entity.hidden) and str(entity.hidden_reason).startswith(HIDDEN_SERVICE_REASON_PREFIX)
+
+
 def _escape_like_pattern(text: str) -> str:
     """Escape SQL LIKE wildcards (`%`, `_`) and the escape character itself.
 
@@ -728,6 +737,14 @@ class PersonEntityStore:
                 conn.execute(
                     "INSERT OR REPLACE INTO person_phones (phone, person_id) VALUES (?, ?)",
                     (phone, pid))
+        if is_hidden_service(entity):
+            # A name a hidden service gave up goes back to a visible namesake.
+            conn.execute(
+                "INSERT OR IGNORE INTO person_names (name, person_id) "
+                "SELECT lower(canonical_name), id FROM person_entities "
+                "WHERE hidden = 0 AND lower(canonical_name) = ? LIMIT 1",
+                ((entity.canonical_name or "").lower(),))
+            return
         if entity.canonical_name:
             conn.execute(
                 "INSERT OR REPLACE INTO person_names (name, person_id) VALUES (?, ?)",
@@ -782,7 +799,9 @@ class PersonEntityStore:
         self._bump_get_all_cache_generation()
         self._blocklist.add(identifier)
 
-    def hide_person(self, entity_id: str, reason: str = "") -> Optional[PersonEntity]:
+    def hide_person(
+        self, entity_id: str, reason: str = "", keep_unblocked: Iterable[str] = ()
+    ) -> Optional[PersonEntity]:
         """
         Hide a person (soft delete) and blocklist their identifiers.
 
@@ -792,6 +811,7 @@ class PersonEntityStore:
         Args:
             entity_id: ID of the person to hide
             reason: Optional reason for hiding (e.g., "fake marketing persona")
+            keep_unblocked: Addresses on the row that stay off the blocklist
 
         Returns:
             The hidden PersonEntity, or None if not found
@@ -806,8 +826,10 @@ class PersonEntityStore:
         entity.hidden_reason = reason
 
         # Add all emails and phones to blocklist
+        unblocked = {email.lower() for email in keep_unblocked}
         for email in entity.emails:
-            self._add_to_blocklist(email, "email", entity.canonical_name, reason)
+            if email.lower() not in unblocked:
+                self._add_to_blocklist(email, "email", entity.canonical_name, reason)
         for phone in entity.phone_numbers:
             self._add_to_blocklist(phone, "phone", entity.canonical_name, reason)
 
@@ -816,6 +838,35 @@ class PersonEntityStore:
 
         logger.info(f"Hidden person '{entity.canonical_name}' (ID: {entity_id[:8]}), "
                     f"blocklisted {len(entity.emails)} emails, {len(entity.phone_numbers)} phones")
+        return entity
+
+    def unhide_person(self, entity_id: str) -> Optional[PersonEntity]:
+        """
+        Reverse hide_person: show the person and unblock their identifiers.
+
+        Args:
+            entity_id: ID of the person to show
+
+        Returns:
+            The visible PersonEntity, or None if not found
+        """
+        entity = self.get_by_id(entity_id)
+        if not entity:
+            return None
+
+        identifiers = {i.lower() for i in (*entity.emails, *entity.phone_numbers)}
+        conn = self._get_connection()
+        try:
+            conn.executemany("DELETE FROM person_blocklist WHERE identifier = ?", [(i,) for i in identifiers])
+            conn.commit()
+        finally:
+            conn.close()
+        self._blocklist -= identifiers
+
+        entity.hidden = False
+        entity.hidden_at = None
+        entity.hidden_reason = ""
+        self.update(entity)
         return entity
 
     def purge_hidden(self, older_than_days: int = 90) -> int:

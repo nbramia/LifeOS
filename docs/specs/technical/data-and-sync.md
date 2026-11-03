@@ -334,7 +334,7 @@ Runs in this order (see [iMessage Sync Ordering](#imessage-sync-ordering) below)
 |--------|---------|-------------|
 | `sync_person_stats.py` | Full refresh of all PersonEntity counts and timestamps | `data/interactions.db` |
 | `sync_relationship_discovery.py` | Discover relationships and populate edge weights | All interactions |
-| `sync_strengths.py` | Recalculate relationship strengths | `data/crm.db` |
+| `sync_strengths.py` | Hide new services and newsletters, then recalculate relationship strengths | `data/crm.db` |
 | `push_birthdays_to_contacts.py` | Push LifeOS birthdays to Apple Contacts (macOS-only — `skipped` on Linux) | `data/crm.db` |
 
 ### Phase 4: Vector Store Indexing
@@ -582,7 +582,67 @@ the iMessage, Gmail, Calendar, phone, and WhatsApp syncs insert none for them
 resolved to the surviving person, whose `hidden` flag decides and whose id the
 iMessage rows carry; the other sources receive survivors from the entity
 resolver. Sync counters (`interactions_created`, `source_entities_created`)
-count rows and entities actually created.
+count rows and entities actually created. Hidden services are the exception; see
+below.
+
+#### Services and newsletters
+
+`api/services/service_sender.py` decides whether an email sender is a service or
+newsletter rather than a person, from generic signals and no list of brands. The line
+is a person's own address: a mailbox provider, their own site, or a local part
+carrying their name.
+
+- **A service-shaped address is judged by its shape.** Automated local parts
+  (`no-reply`), generated tokens, mailing list hosts, sending hosts (`e.`, `mail.`,
+  `service.` below the registered name, never on `.edu`, `.gov`, `.mil`), and role
+  mailboxes (`support@`) are services whatever name is on them, and even with threads
+  and replies.
+- **An own address is judged by what came back.** With no thread and no sent mail, at
+  least `ONE_WAY_MIN_RECEIVED` messages make it a service. So does repeated one-way
+  mail on a sending host. Anything else leaves a person. On a domain matching the
+  sender's name, the local part has to look personal too: their name or initials, a
+  greeting such as `hello@` with repeated replies or threads, or real history. A role
+  mailbox like `support@` never does.
+- **A reply counts on anything but a role, automated, or generated address**, under a
+  person's name and at no less than 1% of what came in. A sending host takes three
+  replies and no bulk mail.
+- **Bulk headers count as a share.** `GmailService` reads `List-Unsubscribe`,
+  `List-Post`, and `Precedence` into `EmailMessage.bulk`, and a sender's source
+  entities record it as `metadata.bulk`. A `List-Post` address marks a discussion
+  list, whose posts stay their authors' own messages. At least three messages have to
+  be checked, or all of them if there are fewer.
+
+A row is out of scope, however it looks, with any of these: a reply that counts (a `→`
+title or a `<message>:<recipient>` source id); a phone number;
+one-to-one iMessage, WhatsApp, phone, or Slack contact, or photos; an iMessage, phone,
+photo, or LinkedIn source; a human's link on an own address; a link override; a
+confirmed fact; a strength, circle, or tag override; tags, notes, a birthday, or profile
+fields; the owner or family; a non-inferred relationship; a review marked kept; or a
+merge target. A real meeting (a meeting note, or a calendar event of up to five)
+protects a row with an own address. A confirmed link on a service's address says that
+message belongs to that row, not that the row is a person, and calendar invites,
+contact-book entries, and note mentions vouch for nobody.
+
+| Where | What happens |
+|-------|--------------|
+| Gmail sync | Mail the owner sends is always recorded. An unknown address with service evidence or on the blocklist creates no person, interaction, or source entity, and joins the skip cache, unless someone of that full name with a phone number is known. This runs before name matching. When an address gains a person, its skipped mail is released and judged again on the next run |
+| `sync_strengths.py` | `hide_service_senders()` first restores any hidden service with a reply that counts, then hides new services before scoring and ranking. Past `NIGHTLY_MAX_HIDES` rows it hides nothing, records a sync error, and the sync summary says so |
+| `repair_service_senders.py` | The reviewed path for existing rows. See [scripts](../../guides/scripts.md#utility-scripts) |
+
+Hiding clears the row's strength and circle and takes it out of name lookups, so a
+different address or a visible namesake never lands on it. The row takes on the
+service-shaped addresses it wrote from, unless someone else holds one, and only those
+are blocked; an own address that a newsletter merged into the row stays open.
+
+A hidden service keeps its interactions and source entities, and Gmail and Calendar
+keep adding to them, which also means its mail isn't fetched again every run.
+Its `hidden_reason` starts with `service sender: `, which consistency verification
+checks before removing interactions. Consistency verification and relationship
+discovery do remove its inferred relationships; discovery rebuilds what it still
+produces from the interactions after a restore. Gmail search reads Gmail directly, so nothing stops being
+searchable. `repair_service_senders.py --restore` shows the row again, unblocks its
+addresses, tags it `confirmed-person`, which keeps the nightly pass off it, and says what
+came back. iMessage, WhatsApp, and phone contact while hidden isn't recorded.
 
 ### Slack Sync
 

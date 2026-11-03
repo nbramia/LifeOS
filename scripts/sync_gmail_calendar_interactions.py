@@ -29,7 +29,8 @@ from api.services.gmail import GmailService
 from api.services.calendar import CalendarService
 from api.services.google_auth import GoogleAccount
 from api.services.entity_resolver import get_entity_resolver
-from api.services.person_entity import get_person_entity_store
+from api.services.person_entity import get_person_entity_store, is_hidden_service
+from api.services.service_sender import is_known_sender, is_unknown_service_sender
 from api.services.interaction_store import get_interaction_db_path
 from config.people_config import InteractionConfig
 from api.services.gmail_skip_cache import get_gmail_skip_cache
@@ -102,6 +103,28 @@ def is_marketing_email(email: str, sender_name: str = None) -> bool:
     return False
 
 
+def _gets_no_interactions(entity) -> bool:
+    """Hidden people get none. A hidden service keeps its record so a restore loses nothing."""
+    return bool(entity.hidden) and not is_hidden_service(entity)
+
+
+def _release_skipped_mail(gmail, skip_cache, account: str, addresses: set[str], after_date: datetime) -> None:
+    """
+    Let mail skipped before these addresses had a person be judged again next run.
+
+    Only the skip cache's own window is in reach, which is what the cache holds.
+    """
+    for address in addresses:
+        found = gmail.service.users().messages().list(
+            userId="me",
+            q=f"from:{address} after:{after_date.strftime('%Y/%m/%d')}",
+            maxResults=500,
+        ).execute().get("messages", [])
+        released = skip_cache.forget(account, [m["id"] for m in found])
+        if released:
+            logger.info(f"Released {released} skipped messages for a newly created person")
+
+
 def sync_gmail_interactions(
     account_type: GoogleAccount,
     days_back: int = 3650,
@@ -130,10 +153,13 @@ def sync_gmail_interactions(
         'errors': 0,
         'source_entities_created': 0,
         'marketing_skipped': 0,
+        'service_skipped': 0,
     }
 
     # Track affected person_ids for stats refresh
     affected_person_ids: set[str] = set()
+    # Addresses that gained a person this run, whose earlier mail may be in the skip cache
+    newly_known_addresses: set[str] = set()
 
     db_path = get_interaction_db_path()
     conn = sqlite3.connect(db_path)
@@ -280,20 +306,32 @@ def sync_gmail_interactions(
                     stats['errors'] += 1
                     continue
 
-                # Skip marketing/promotional emails (check both email and sender name)
-                if is_marketing_email(email.sender, email.sender_name):
+                # Skip marketing/promotional emails (check both email and sender name).
+                # An address someone holds isn't a stranger's marketing, whatever its shape.
+                sender_label = email.sender_name if email.sender_name != email.sender else None
+                if is_marketing_email(email.sender, email.sender_name) and not is_known_sender(
+                    resolver.store, email.sender, sender_label
+                ):
                     stats['marketing_skipped'] += 1
+                    newly_skipped.append(message_id)
+                    continue
+
+                # An unknown service sender creates no person. The mail stays in Gmail.
+                if is_unknown_service_sender(resolver.store, email.sender, sender_label, email.bulk):
+                    stats['service_skipped'] += 1
                     newly_skipped.append(message_id)
                     continue
 
                 # Resolve the sender
                 sender_result = resolver.resolve(
-                    name=email.sender_name if email.sender_name != email.sender else None,
+                    name=sender_label,
                     email=email.sender,
                     create_if_missing=True,
                 )
                 sender_person_id = sender_result.entity.id if sender_result and sender_result.entity else None
-                sender_hidden = bool(sender_result and sender_result.entity and sender_result.entity.hidden)
+                sender_hidden = bool(sender_result and sender_result.entity and _gets_no_interactions(sender_result.entity))
+                if sender_result and sender_result.is_new is True:
+                    newly_known_addresses.add(email.sender.lower())
 
                 timestamp = email.date.isoformat()
                 source_link = f"https://mail.google.com/mail/u/0/#inbox/{message_id}"
@@ -334,7 +372,7 @@ def sync_gmail_interactions(
                                 sender_email=email.sender,
                                 sender_name=email.sender_name if email.sender_name != email.sender else None,
                                 observed_at=email.date,
-                                metadata={"subject": subject[:100] if subject else None},
+                                metadata={"subject": subject[:100] if subject else None, "bulk": email.bulk},
                             )
                             source_entity.canonical_person_id = sender_person_id
                             source_entity.link_confidence = sender_result.confidence if sender_result else 1.0
@@ -356,6 +394,8 @@ def sync_gmail_interactions(
                         # Skip marketing/automated addresses
                         if is_marketing_email(participant_email, participant_name):
                             continue
+                        if is_unknown_service_sender(resolver.store, participant_email, participant_name):
+                            continue
 
                         # Use source_id format: message_id:cc:email for CC participants
                         participant_source_id = f"{message_id}:cc:{participant_email}"
@@ -374,10 +414,13 @@ def sync_gmail_interactions(
                         if participant_result.entity.id == sender_person_id:
                             continue  # Already created interaction with sender
 
+                        if participant_result.is_new is True:
+                            newly_known_addresses.add(participant_email.lower())
+
                         # Hidden people get no interactions (consistency
                         # verification removes them); their source entity is
                         # still linked below.
-                        if not participant_result.entity.hidden:
+                        if not _gets_no_interactions(participant_result.entity):
                             # Use ↔ arrow to indicate shared thread (not direct send/receive)
                             batch.append((
                                 str(uuid.uuid4()),
@@ -429,10 +472,9 @@ def sync_gmail_interactions(
 
                     created_for_this_email = 0
                     for recipient_name, recipient_email in recipients:
-                        # Skip marketing/promotional recipients
-                        if is_marketing_email(recipient_email, recipient_name):
-                            stats['marketing_skipped'] += 1
-                            continue
+                        # Everyone the owner writes to is recorded, whatever their
+                        # address looks like. The service-sender rules decide what
+                        # that means.
 
                         # Skip duplicates within same email
                         source_id = f"{message_id}:{recipient_email}"
@@ -450,10 +492,13 @@ def sync_gmail_interactions(
                         if recipient_result.entity.id == my_person_id:
                             continue  # Skip myself
 
+                        if recipient_result.is_new is True:
+                            newly_known_addresses.add(recipient_email.lower())
+
                         # Hidden people get no interactions (consistency
                         # verification removes them); their source entity is
                         # still linked below.
-                        if not recipient_result.entity.hidden:
+                        if not _gets_no_interactions(recipient_result.entity):
                             # Use → arrow to indicate sent (like iMessage)
                             batch.append((
                                 str(uuid.uuid4()),
@@ -528,6 +573,7 @@ def sync_gmail_interactions(
                     f"Recorded {len(newly_skipped)} newly skipped marketing "
                     "messages in the skip cache"
                 )
+            _release_skipped_mail(gmail, skip_cache, account_type.value, newly_known_addresses, after_date)
 
     except Exception as e:
         logger.error(f"Failed to sync Gmail: {e}")
@@ -681,7 +727,7 @@ def sync_calendar_interactions(
 
                 # Hidden people get no interactions (consistency verification
                 # removes them); their source entity is still linked below.
-                if not result.entity.hidden:
+                if not _gets_no_interactions(result.entity):
                     # Track for stats refresh
                     affected_person_ids.add(person_id)
 

@@ -249,3 +249,97 @@ def is_blocklisted_domain(email: str) -> bool:
             return True
 
     return False
+
+
+# =============================================================================
+# SERVICE-SENDER SIGNALS
+# =============================================================================
+# Generic shapes of addresses that belong to a mail system rather than a person.
+# api/services/service_sender.py weighs them with the sender's name and history.
+
+# Matched anywhere in the local part, separators removed.
+AUTOMATED_LOCAL_SUBSTRINGS = frozenset({
+    'noreply', 'donotreply', 'dontreply', 'mailerdaemon', 'newsletter',
+    'notification', 'unsubscribe', 'autoreply', 'autoconfirm', 'autoresponder',
+})
+
+# Matched against a whole separator-delimited word of the local part.
+AUTOMATED_LOCAL_WORDS = frozenset({
+    'mailer', 'bounce', 'bounces', 'notify', 'postmaster', 'digest', 'daemon',
+})
+
+# Shared mailboxes. A person can answer one, so a role address needs more evidence.
+ROLE_LOCAL_WORDS = frozenset({
+    'account', 'accounts', 'admin', 'alert', 'alerts', 'alumni', 'billing', 'care',
+    'careers', 'community', 'concierge', 'confirm', 'confirmation', 'contact',
+    'contactus', 'customercare', 'customerservice', 'deals', 'developer', 'donate',
+    'email', 'emails', 'event', 'events', 'experience', 'feedback', 'giving', 'hello',
+    'help', 'helpdesk', 'hey', 'hi', 'info', 'information', 'invoice', 'invoices',
+    'jobs', 'learn', 'loyalty', 'mail', 'marketing', 'member', 'members', 'membership',
+    'message', 'messages', 'messaging', 'news', 'offers', 'office', 'order', 'orders',
+    'partnerships', 'payment', 'payments', 'press', 'product', 'promo', 'promotions',
+    'receipt', 'receipts', 'registration', 'research', 'reservation', 'reservations', 'rewards',
+    'sales', 'security', 'service', 'services', 'shipping', 'shop', 'solutions',
+    'staff', 'statements', 'store', 'success', 'support', 'survey', 'surveys', 'team',
+    'tickets', 'transactional', 'update', 'updates', 'verify', 'verification',
+})
+
+# Role words long enough to recognize inside a compound local part.
+ROLE_LOCAL_COMPOUND_WORDS = frozenset({
+    'account', 'billing', 'concierge', 'experience', 'feedback', 'giving', 'loyalty',
+    'marketing', 'member', 'rewards', 'security', 'service', 'services', 'support',
+})
+
+# Host labels that mark a dedicated sending host, ignoring a trailing number
+# (e1, em7, info15). Any single letter also counts.
+SENDING_HOST_LABELS = frozenset({
+    'alert', 'alerts', 'app', 'bounce', 'comms', 'communication', 'communications', 'connect',
+    'em', 'eml', 'engage', 'experience', 'express', 'feedback', 'go', 'groups', 'info', 'lists',
+    'marketing', 'message', 'messages', 'messaging', 'mg', 'mkt', 'mktg', 'msg', 'notice',
+    'notices', 'notify', 'offers', 'post', 'promo', 'read', 'reply', 'send', 'sender',
+    'service', 'services', 'transact', 'transactional', 'update', 'updates',
+})
+
+# The same, matched anywhere in a host label: enews, lyrisappmail, mynotifications, emessaging.
+SENDING_HOST_SUBSTRINGS = frozenset({'mail', 'messag', 'news', 'notification'})
+
+# Registered domains that exist to carry mailing lists.
+LIST_HOST_DOMAINS = frozenset({'googlegroups.com', 'groups.io'})
+
+# Domains reserved for documentation and testing (RFC 2606).
+RESERVED_DOMAINS = frozenset({'example.com', 'example.net', 'example.org'})
+RESERVED_TLDS = frozenset({'example', 'invalid', 'localhost', 'test'})
+
+# Mailbox providers: the address says nothing about who is behind it.
+PERSONAL_MAIL_DOMAINS = frozenset({
+    '126.com', '163.com', 'aim.com', 'aol.com', 'att.net', 'bellsouth.net',
+    'btinternet.com', 'charter.net', 'comcast.net', 'cox.net', 'duck.com',
+    'earthlink.net', 'email.com', 'fastmail.com', 'fastmail.fm', 'free.fr', 'gmail.com',
+    'gmx.com', 'gmx.de', 'gmx.net', 'googlemail.com', 'hey.com', 'hotmail.com',
+    'hushmail.com', 'icloud.com', 'inbox.com', 'laposte.net', 'libero.it', 'live.com',
+    'mac.com', 'mail.com', 'mail.de', 'mail.ru', 'mailbox.org', 'mailfence.com', 'me.com',
+    'msn.com', 'naver.com', 'netzero.net', 'optonline.net', 'orange.fr', 'outlook.com',
+    'pm.me', 'posteo.de', 'proton.me', 'protonmail.com', 'qq.com', 'rediffmail.com',
+    'rocketmail.com', 'rogers.com', 'runbox.com', 'sbcglobal.net', 'seznam.cz', 'shaw.ca',
+    'sky.com', 't-online.de', 'telus.net', 'tutanota.com', 'verizon.net',
+    'virginmedia.com', 'wanadoo.fr', 'web.de', 'yahoo.com', 'yandex.com', 'yandex.ru',
+    'ymail.com', 'zoho.com', 'zohomail.com',
+})
+
+# Words in a sender's name that describe an organization or a mail program, on top
+# of the words the entity resolver already refuses in a person's name.
+ORGANIZATION_NAME_WORDS = frozenset({
+    'academy', 'airline', 'airlines', 'airways', 'alert', 'alliance', 'alumni', 'app', 'bank', 'cellars',
+    'center', 'church', 'club', 'community', 'cooperative', 'credit', 'developer',
+    'energy', 'events', 'gallery', 'giving', 'hospital', 'hotel', 'hotels', 'insurance',
+    'labs', 'lending', 'loyalty', 'mortgage', 'museum', 'network', 'payments',
+    'pharmacy', 'platform', 'program', 'receipts', 'research', 'restaurant', 'rewards', 'school',
+    'security', 'service', 'shop', 'statement', 'store', 'theatre', 'theater', 'tickets',
+    'tracking', 'travel',
+})
+
+# Local parts someone uses on a site named after them.
+PERSONAL_SITE_LOCALS = frozenset({'contact', 'founder', 'hello', 'hey', 'hi', 'mail', 'me'})
+
+# How a sender's name presents a brand behind a first name.
+PERSONA_NAME_MARKERS = frozenset({'via', 'at', 'from', '@', 'c/o'})
