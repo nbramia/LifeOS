@@ -1102,6 +1102,7 @@ class TestRepairScript:
         world.person(name="Sample One", emails=[], phone_numbers=["+15555550100"], relationship_strength=90.0)
         world.person(name="Sample Two", emails=["sample.two@gmail.com"], relationship_strength=70.0)
         world.person(name="Sample Three", emails=[], relationship_strength=50.0)
+        world.person(name="Sample Five", emails=[], relationship_strength=30.0)
         hidden = world.person(name="Sample Four", emails=[], relationship_strength=99.0)
         world.people.hide_person(hidden.id, "x")
         assert repair.top_rank_strength(world.crm_db) == 70.0
@@ -1307,8 +1308,8 @@ class TestAddressAndNameEdges:
         assert result.reason == "personal_address"
 
     def test_an_automated_address_is_not_personal_whatever_it_spells(self):
-        mixed = {"noreply@northwindtrading.com": 4, "desk@northwindtrading.com": 5}
-        assert verdict("Pat Reply", mixed, 9).reason != "personal_address"
+        mixed = {"bounce@northwindtrading.com": 4, "desk@northwindtrading.com": 5}
+        assert verdict("Pat Bounce", mixed, 9).reason == "no_service_evidence"
 
     def test_a_generated_address_is_not_personal_whatever_it_spells(self):
         assert verdict("Jane Sample", "jane+a1b2c3d4e5f6@paymentsplatform.com").reason == "generated_address"
