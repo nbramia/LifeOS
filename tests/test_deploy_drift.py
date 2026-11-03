@@ -1155,3 +1155,357 @@ def test_worker_busy_true_when_active_work_sits_alongside_a_yielded_session(tmp_
     if not AUTO_DEPLOY.exists():
         pytest.skip("scripts/auto-deploy.sh not present")
     assert "rc=0" in _worker_busy_rc(tmp_path, [STATUS_YIELDED, STATUS_CLAIMED])
+
+
+# ---------------------------------------------------------------------------
+# A deploy that defers for the sync lock leaves a pending marker, which the
+# vault index job honours (see tests/test_vault_index_job.py). The lock itself
+# still blocks the deploy for as long as a real sync holds it.
+# ---------------------------------------------------------------------------
+def _pending_marker(repo: Path) -> Path:
+    return repo / "home" / ".lifeos" / "deploy-pending"
+
+
+def _stale_api_repo(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A policy repo whose one active service is stale, so an unblocked tick restarts it."""
+    repo, state, code_epoch = _make_policy_repo(tmp_path)
+    (state / "active_lifeos-api").touch()
+    (state / "since_lifeos-api").write_text(str(code_epoch - 3600))
+    return repo, state, _venv_with_python(tmp_path)
+
+
+def _systemctl_override(state: Path, unit: str, active_state: str) -> dict:
+    """PATH entry answering ``systemctl show <unit>`` itself and deferring the rest to the policy stub."""
+    _write_policy_stubs(state)
+    override = state / "override-bin"
+    override.mkdir(exist_ok=True)
+    _stub_bin(
+        override,
+        "systemctl",
+        f'if [ "$1" = show ] && [ "$2" = "{unit}" ]; then echo {active_state}; exit 0; fi\n'
+        f'exec "{state}/bin/systemctl" "$@"\n',
+    )
+    return {"PATH": f"{override}:{state}/bin:{os.environ['PATH']}"}
+
+
+def _restarts(state: Path) -> str:
+    return (state / "restart.log").read_text() if (state / "restart.log").exists() else ""
+
+
+def _hold_sync_lock(repo: Path) -> subprocess.Popen:
+    lock_path = repo / "home" / ".lifeos" / "sync.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    holder = _start_shared_lock_holder(lock_path)
+    try:
+        _wait_until_lock_held(lock_path)
+    except BaseException:
+        holder.kill()
+        raise
+    return holder
+
+
+def _release(holder: subprocess.Popen) -> None:
+    holder.terminate()
+    holder.wait(timeout=5)
+
+
+@pytest.mark.unit
+def test_deferring_for_the_lock_leaves_the_pending_marker(tmp_path: Path):
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo, state, venv = _stale_api_repo(tmp_path)
+    holder = _hold_sync_lock(repo)
+    try:
+        result = _run_main(repo, state, venv)
+    finally:
+        _release(holder)
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert _pending_marker(repo).exists()
+    assert "restart lifeos-api" not in _restarts(state)
+
+
+@pytest.mark.unit
+def test_a_real_sync_blocks_the_deploy_on_every_tick_however_long_it_runs(tmp_path: Path):
+    """A pending marker never opens the lock: tick after tick the deploy
+    defers, refreshes the marker, and restarts nothing until the sync ends."""
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo, state, venv = _stale_api_repo(tmp_path)
+    holder = _hold_sync_lock(repo)
+    try:
+        for _ in range(3):
+            assert _run_main(repo, state, venv).returncode == 0
+            assert time.time() - _pending_marker(repo).stat().st_mtime < 60
+            os.utime(_pending_marker(repo), (1, 1))  # as if that tick were hours ago
+        assert "restart lifeos-api" not in _restarts(state)
+    finally:
+        _release(holder)
+
+    assert _run_main(repo, state, venv).returncode == 0
+    assert "restart lifeos-api" in _restarts(state)
+
+
+@pytest.mark.unit
+def test_a_deploy_that_holds_the_lock_clears_the_pending_marker(tmp_path: Path):
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo, state, venv = _stale_api_repo(tmp_path)
+    _pending_marker(repo).parent.mkdir(parents=True, exist_ok=True)
+    _pending_marker(repo).touch()
+
+    result = _run_main(repo, state, venv)
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert not _pending_marker(repo).exists()
+    assert "restart lifeos-api" in _restarts(state)
+
+
+@pytest.mark.unit
+def test_deferring_for_the_nightly_sync_unit_leaves_the_pending_marker(tmp_path: Path):
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo, state, venv = _stale_api_repo(tmp_path)
+
+    result = _run_main(repo, state, venv, _systemctl_override(state, "lifeos-sync.service", "active"))
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert _pending_marker(repo).exists()
+    assert "nightly sync in progress" in (repo / "logs" / "auto-deploy.log").read_text()
+    assert "restart lifeos-api" not in _restarts(state)
+
+
+@pytest.mark.unit
+def test_unexpected_flock_failure_defers_without_a_pending_marker(tmp_path: Path):
+    """Only a held lock announces a deploy; a broken lock tool is not a holder to stand aside for."""
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo = _make_repo_for_drift(tmp_path)
+    bindir = repo / "stubbin"
+    bindir.mkdir(exist_ok=True)
+    _stub_bin(bindir, "flock", "exit 2\n")
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+
+    result = _run_sourced(repo, 'sync_in_progress_lock_acquire; echo "rc=$?"', env)
+
+    assert "rc=0" in result.stdout, result.stdout
+    assert not _pending_marker(repo).exists()
+
+
+@pytest.mark.unit
+def test_deferral_log_names_the_vault_index_job_when_its_unit_is_running(tmp_path: Path):
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo = _make_repo_for_drift(tmp_path)
+    bindir = repo / "stubbin"
+    bindir.mkdir(exist_ok=True)
+    _stub_bin(bindir, "systemctl", "echo activating\n")
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+    holder = _hold_sync_lock(repo)
+    try:
+        result = _run_sourced(repo, 'sync_in_progress_lock_acquire; echo "rc=$?"', env)
+    finally:
+        _release(holder)
+
+    assert "rc=0" in result.stdout, result.stdout
+    log = (repo / "logs" / "auto-deploy.log").read_text()
+    assert "vault index job is running" in log, log
+    assert "nightly" not in log, log
+
+
+@pytest.mark.unit
+def test_deferral_log_calls_any_other_holder_a_sync(tmp_path: Path):
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo = _make_repo_for_drift(tmp_path)
+    bindir = repo / "stubbin"
+    bindir.mkdir(exist_ok=True)
+    _stub_bin(bindir, "systemctl", "echo inactive\n")
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}:{env['PATH']}"
+    holder = _hold_sync_lock(repo)
+    try:
+        _run_sourced(repo, "sync_in_progress_lock_acquire", env)
+    finally:
+        _release(holder)
+
+    log = (repo / "logs" / "auto-deploy.log").read_text()
+    assert "a sync is running" in log, log
+    assert "vault index job" not in log, log
+
+
+# A held lock announces a deploy only when the tick would otherwise deploy.
+def _current_api_repo(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A policy repo whose active service is newer than the code and .env: nothing to deploy."""
+    repo, state, _code_epoch = _make_policy_repo(tmp_path)
+    (state / "active_lifeos-api").touch()
+    (state / "since_lifeos-api").write_text(str(int(time.time()) + 60))
+    return repo, state, _venv_with_python(tmp_path)
+
+
+def _tick_with_lock_held(repo: Path, state: Path, venv: Path, env_extra: dict | None = None):
+    holder = _hold_sync_lock(repo)
+    try:
+        result = _run_main(repo, state, venv, env_extra)
+    finally:
+        _release(holder)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    return result
+
+
+@pytest.mark.unit
+def test_held_lock_with_nothing_to_deploy_leaves_no_pending_marker(tmp_path: Path):
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo, state, venv = _current_api_repo(tmp_path)
+
+    _tick_with_lock_held(repo, state, venv)
+
+    assert not _pending_marker(repo).exists()
+
+
+@pytest.mark.unit
+def test_held_lock_withdraws_an_earlier_announcement_when_nothing_is_left_to_deploy(tmp_path: Path):
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo, state, venv = _current_api_repo(tmp_path)
+    _pending_marker(repo).parent.mkdir(parents=True, exist_ok=True)
+    _pending_marker(repo).touch()
+
+    _tick_with_lock_held(repo, state, venv)
+
+    assert not _pending_marker(repo).exists()
+
+
+@pytest.mark.unit
+def test_held_lock_on_a_feature_branch_leaves_no_pending_marker(tmp_path: Path):
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo, state, venv = _stale_api_repo(tmp_path)
+    _git(repo, "checkout", "-qb", "some-feature")
+
+    _tick_with_lock_held(repo, state, venv)
+
+    assert not _pending_marker(repo).exists()
+
+
+@pytest.mark.unit
+def test_held_lock_with_local_edits_to_tracked_files_leaves_no_pending_marker(tmp_path: Path):
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo, state, venv = _stale_api_repo(tmp_path)
+    (repo / "api" / "a.py").write_text("edited\n")
+
+    _tick_with_lock_held(repo, state, venv)
+
+    assert not _pending_marker(repo).exists()
+
+
+@pytest.mark.unit
+def test_held_lock_with_an_unreachable_origin_leaves_no_pending_marker(tmp_path: Path):
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo, state, venv = _stale_api_repo(tmp_path)
+    _git(repo, "remote", "set-url", "origin", str(tmp_path / "missing.git"))
+
+    _tick_with_lock_held(repo, state, venv)
+
+    assert not _pending_marker(repo).exists()
+
+
+@pytest.mark.unit
+def test_a_broken_lock_tool_defers_a_due_deploy_without_a_pending_marker(tmp_path: Path):
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo, state, venv = _stale_api_repo(tmp_path)
+    broken = state / "broken-bin"
+    broken.mkdir()
+    _stub_bin(broken, "flock", "exit 2\n")
+    _write_policy_stubs(state)
+
+    result = _run_main(repo, state, venv, {"PATH": f"{broken}:{state}/bin:{os.environ['PATH']}"})
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "flock failed unexpectedly" in (repo / "logs" / "auto-deploy.log").read_text()
+    assert not _pending_marker(repo).exists()
+    assert "restart lifeos-api" not in _restarts(state)
+
+
+@pytest.mark.unit
+def test_nightly_sync_unit_with_nothing_to_deploy_leaves_no_pending_marker(tmp_path: Path):
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo, state, venv = _current_api_repo(tmp_path)
+
+    result = _run_main(repo, state, venv, _systemctl_override(state, "lifeos-sync.service", "active"))
+
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert not _pending_marker(repo).exists()
+
+
+@pytest.mark.unit
+def test_held_lock_with_main_ahead_on_origin_leaves_the_pending_marker(tmp_path: Path):
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo, state, venv = _current_api_repo(tmp_path)
+    other = tmp_path / "other"
+    subprocess.run(["git", "clone", "-q", "-b", "main", str(tmp_path / "origin.git"), str(other)], check=True)
+    _git(other, "config", "user.email", "t@t.t")
+    _git(other, "config", "user.name", "t")
+    (other / "api" / "b.py").write_text("more code\n")
+    _git(other, "add", "-A")
+    _git(other, "commit", "-qm", "advance main")
+    _git(other, "push", "-q", "origin", "HEAD:main")
+
+    _tick_with_lock_held(repo, state, venv)
+
+    assert _pending_marker(repo).exists()
+
+
+@pytest.mark.unit
+def test_held_lock_with_only_the_env_file_newer_than_a_service_leaves_the_pending_marker(tmp_path: Path):
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo, state, venv = _current_api_repo(tmp_path)
+    (state / "since_lifeos-api").write_text(str(int(time.time()) - 3600))
+    code_epoch = int(time.time()) - 7200
+    os.utime(repo / "api" / "a.py", (code_epoch, code_epoch))  # the code is older than the service
+
+    _tick_with_lock_held(repo, state, venv)
+
+    assert _pending_marker(repo).exists()
+
+
+@pytest.mark.unit
+def test_held_lock_with_only_the_code_newer_than_a_service_leaves_the_pending_marker(tmp_path: Path):
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo, state, venv = _current_api_repo(tmp_path)
+    now = int(time.time())
+    (state / "since_lifeos-api").write_text(str(now - 3600))
+    os.utime(repo / ".env", (now - 7200, now - 7200))  # the config is older than the service
+    os.utime(repo / "api" / "a.py", (now - 1800, now - 1800))
+
+    _tick_with_lock_held(repo, state, venv)
+
+    assert _pending_marker(repo).exists()
+
+
+@pytest.mark.unit
+def test_held_lock_with_only_a_busy_worker_stale_leaves_no_pending_marker(tmp_path: Path):
+    """main() defers a worker mid-session, so no deploy is waiting on the lock."""
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo, state, venv = _current_api_repo(tmp_path)
+    (state / "active_lifeos-agent-worker").touch()
+    (state / "since_lifeos-agent-worker").write_text(str(int(time.time()) - 3600))
+    code_epoch = int(time.time()) - 1800
+    os.utime(repo / "api" / "a.py", (code_epoch, code_epoch))
+    store = SessionStore(db_path=repo / "data" / "agent_sessions.db")
+    store.create(task_id="t-1", session_id="s-1", status=STATUS_CLAIMED)
+
+    _tick_with_lock_held(repo, state, venv)
+
+    assert not _pending_marker(repo).exists()

@@ -10,9 +10,13 @@ A run ends on its own after LIFEOS_VAULT_INDEX_TIME_BUDGET_SECONDS, between note
 well inside the unit's timeout. Notes over LIFEOS_VAULT_INDEX_MAX_NOTE_BYTES are
 left for the nightly reindex, which has the time for them; the job logs how many.
 
+A deploy that finds the sync lock held leaves a marker (see DEPLOY_PENDING_NAME).
+While it is fresh the job starts no run, and a run in progress ends between
+notes, so the lock is free for the deploy's next attempt.
+
 The run exits 0 without indexing when there is nothing to do, when the nightly
-vault reindex or a deploy restart holds its lock, or when the host lacks memory
-for embeddings. It never stops the LLM service to make room. A failure is left
+vault reindex or a deploy restart holds its lock, when a deploy is waiting, or
+when the host lacks memory for embeddings. It never stops the LLM service to make room. A failure is left
 in logs/vault-index.log and the unit's status, and the next tick tries again: it
 sends no alert and records no sync failure.
 
@@ -38,12 +42,28 @@ logger = logging.getLogger(__name__)
 # holds it shared, as a sync does, so a deploy does not restart services under it.
 SYNC_LOCK_PATH = Path.home() / ".lifeos" / "sync.lock"
 
+# Beside the sync lock. auto-deploy.sh touches it each time it defers because the
+# lock is held, and removes it once it holds the lock. A marker older than this
+# is ignored, so a deploy that has stopped trying (disabled, host down) does not
+# keep the job away. Three deploy intervals (lifeos-autodeploy.timer: 10 min).
+DEPLOY_PENDING_NAME = "deploy-pending"
+DEPLOY_PENDING_MAX_AGE_SECONDS = 1800
+
 # Suppresses CRITICAL alerts raised inside this process only: the API server keeps
 # its own registry and goes on alerting. Longer than the unit's TimeoutStartSec
 # allows a run.
 ALERT_SUPPRESSION_SECONDS = 3600
 
 DRY_RUN_LISTED_FILES = 20
+
+
+def _deploy_pending() -> bool:
+    """Whether a deploy has recently found the sync lock held and is waiting."""
+    try:
+        age = time.time() - SYNC_LOCK_PATH.with_name(DEPLOY_PENDING_NAME).stat().st_mtime
+    except OSError:
+        return False
+    return age < DEPLOY_PENDING_MAX_AGE_SECONDS
 
 
 def _memory_shortfall() -> str | None:
@@ -143,6 +163,10 @@ def run_job(dry_run: bool = True, max_files: int | None = None) -> dict:
     if dry_run:
         return _report_dry_run(vault_path, cap, max_deletions, max_note_bytes)
 
+    if _deploy_pending():
+        logger.info("A deploy is waiting for the sync lock; trying again next tick")
+        return {"status": "skipped", "reason": "deploy_pending"}
+
     # Held for the rest of this call. A crash releases them, since the kernel
     # drops a flock when its process exits.
     vault_lock = try_flock(VAULT_INDEX_LOCK_PATH)
@@ -186,6 +210,7 @@ def run_job(dry_run: bool = True, max_files: int | None = None) -> dict:
         max_deletions=max_deletions,
         time_budget_seconds=time_budget,
         max_file_bytes=max_note_bytes,
+        should_stop=_deploy_pending,
     )
     elapsed = time.time() - start_time
 

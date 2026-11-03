@@ -1732,3 +1732,213 @@ class TestInstallation:
         service = (REPO_ROOT / "config" / "systemd" / "lifeos-vault-index.service").read_text()
         timeout = int(re.search(r"TimeoutStartSec=(\d+)", service).group(1))
         assert timeout + 90 < Settings.model_fields["vault_index_lock_wait_seconds"].default
+
+
+def _announce_deploy(job, age_seconds: float = 0) -> Path:
+    """Leave the marker auto-deploy.sh leaves when it finds the sync lock held."""
+    marker = job.SYNC_LOCK_PATH.with_name(job.DEPLOY_PENDING_NAME)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.touch()
+    stamp = time.time() - age_seconds
+    os.utime(marker, (stamp, stamp))
+    return marker
+
+
+class TestDeployPending:
+    def test_fresh_marker_starts_no_run_and_takes_no_lock(self, job, vault, vector_store):
+        from api.services import vault_index_lock
+
+        _write_note(vault, "note.md", 1000)
+        _announce_deploy(job)
+
+        result = job.run_job(dry_run=False)
+
+        assert result == {"status": "skipped", "reason": "deploy_pending"}
+        vector_store.assert_not_called()
+        assert vault_index_lock.try_flock(job.SYNC_LOCK_PATH) is not None, "the job took the sync lock"
+        assert vault_index_lock.try_flock(vault_index_lock.VAULT_INDEX_LOCK_PATH) is not None
+
+    def test_dry_run_reports_even_while_a_deploy_is_pending(self, job, vault, vector_store):
+        _write_note(vault, "note.md", 1000)
+        _announce_deploy(job)
+
+        result = job.run_job(dry_run=True)
+
+        assert result["status"] == "dry_run"
+        assert result["changed"] == 1
+
+    def test_marker_is_honoured_until_it_is_old_and_then_ignored(self, job, vault, vector_store):
+        _write_note(vault, "note.md", 1000)
+        marker = _announce_deploy(job, age_seconds=job.DEPLOY_PENDING_MAX_AGE_SECONDS - 60)
+        assert job.run_job(dry_run=False)["reason"] == "deploy_pending"
+
+        stamp = time.time() - job.DEPLOY_PENDING_MAX_AGE_SECONDS - 60
+        os.utime(marker, (stamp, stamp))
+        result = job.run_job(dry_run=False)
+
+        assert result["status"] == "indexed"
+        assert len(_indexed_paths(vector_store)) == 1
+
+    def test_marker_stays_fresh_across_the_gap_between_deploy_ticks(self):
+        """Every deferral refreshes the marker, so it must outlast several ticks of the deploy timer."""
+        import re
+
+        sys.path.insert(0, str(REPO_ROOT / "scripts"))
+        import vault_index_job
+        sys.path.remove(str(REPO_ROOT / "scripts"))
+
+        timer = (REPO_ROOT / "config" / "systemd" / "lifeos-autodeploy.timer").read_text()
+        interval_seconds = int(re.search(r"OnUnitActiveSec=(\d+)min", timer).group(1)) * 60
+
+        assert vault_index_job.DEPLOY_PENDING_MAX_AGE_SECONDS >= 2 * interval_seconds
+
+    def test_run_ends_between_notes_when_a_deploy_announces_itself(self, job, vault, vector_store, monkeypatch):
+        from api.services.indexer import IndexerService
+
+        for i in range(6):
+            _write_note(vault, f"{i}.md", 1000 + i)
+        real_index_file = IndexerService.index_file
+        calls = []
+
+        def index_file(self, *args, **kwargs):
+            calls.append(args[0])
+            outcome = real_index_file(self, *args, **kwargs)
+            if len(calls) == 2:
+                _announce_deploy(job)
+            return outcome
+
+        monkeypatch.setattr(IndexerService, "index_file", index_file)
+
+        result = job.run_job(dry_run=False)
+
+        assert result["status"] == "indexed"
+        assert result["files_indexed"] == 2
+        assert len(calls) == 2
+        assert len([p for p in json.loads(_state_file().read_text()) if p.endswith(".md")]) == 2
+
+    def test_stopped_run_loses_no_work(self, job, vault, vector_store, monkeypatch):
+        from api.services.indexer import IndexerService
+
+        notes = {str(_write_note(vault, f"{i}.md", 1000 + i).resolve()) for i in range(6)}
+        real_index_file = IndexerService.index_file
+        seen = []
+
+        def index_file(self, *args, **kwargs):
+            outcome = real_index_file(self, *args, **kwargs)
+            seen.append(args[0])
+            if len(seen) == 3:
+                _announce_deploy(job)
+            return outcome
+
+        monkeypatch.setattr(IndexerService, "index_file", index_file)
+        job.run_job(dry_run=False)
+        assert len(_indexed_paths(vector_store)) == 3
+        job.SYNC_LOCK_PATH.with_name(job.DEPLOY_PENDING_NAME).unlink()
+        while job.run_job(dry_run=False)["status"] == "indexed":
+            pass
+
+        indexed = _indexed_paths(vector_store)
+        assert sorted(indexed) == sorted(notes)
+        assert len(indexed) == len(set(indexed)), "a note was indexed twice"
+
+    def test_indexer_stops_when_asked_and_a_later_run_finishes(self, indexer, vault, vector_store):
+        for i in range(5):
+            _write_note(vault, f"{i}.md", 1000 + i)
+        asked = []
+
+        def should_stop():
+            asked.append(1)
+            return len(asked) > 2
+
+        assert indexer.index_all(newest_first=True, light_pass=True, should_stop=should_stop) == 2
+        assert indexer.last_run["stopped_early"] is True
+        assert indexer.last_run["files_remaining"] == 3
+
+        assert indexer.index_all(newest_first=True, light_pass=True) == 3
+
+    def test_indexer_asked_to_stop_removes_no_deleted_notes_and_a_later_run_does(self, indexer, vault, vector_store):
+        notes = [_write_note(vault, f"{i}.md", 1000 + i) for i in range(3)]
+        indexer.index_all(light_pass=True)
+        for note in notes:
+            note.unlink()
+        _write_note(vault, "keep.md", 5000)
+
+        indexer.index_all(light_pass=True, should_stop=lambda: True)
+        assert indexer.last_run["files_pruned"] == 0
+        assert indexer.last_run["files_remaining"] == 4
+
+        indexer.index_all(light_pass=True)
+        assert indexer.last_run["files_pruned"] == 3
+
+    def test_a_deploy_gets_through_runs_that_follow_one_another(self, job, vault, vector_store, tmp_path, monkeypatch):
+        """The job's runs follow one another with no gap and its backlog never
+        empties. A deploy tick that finds the lock held leaves its marker; the
+        run in progress ends at its next note, the runs after it start nothing,
+        and the deploy's next tick gets the lock. The job loses nothing.
+
+        Ordered by events, not sleeps: the first note is held open until the
+        first deploy tick has seen the lock held, and the second deploy tick
+        starts only after that run has ended and the next has begun."""
+        from api.services.indexer import IndexerService
+        from tests.test_deploy_drift import _restarts, _run_main, _stale_api_repo
+
+        repo, state, venv = _stale_api_repo(tmp_path / "deploy")
+        monkeypatch.setattr(job, "SYNC_LOCK_PATH", repo / "home" / ".lifeos" / "sync.lock")
+        for i in range(30):
+            _write_note(vault, f"seed-{i:03}.md", 1000 + i)
+        real_index_file = IndexerService.index_file
+        in_first_note = threading.Event()
+        first_deploy_tick_done = threading.Event()
+        growing = {"on": True, "n": 0}
+        results: list[dict] = []
+
+        def index_file(self, *args, **kwargs):
+            if not in_first_note.is_set():
+                in_first_note.set()
+                assert first_deploy_tick_done.wait(120)
+            if growing["on"]:
+                growing["n"] += 1
+                _write_note(vault, f"new-{growing['n']:04}.md", 5000 + growing["n"])
+            return real_index_file(self, *args, **kwargs)
+
+        monkeypatch.setattr(IndexerService, "index_file", index_file)
+        keep_running = threading.Event()
+        keep_running.set()
+
+        def timer():
+            while keep_running.is_set():
+                results.append(job.run_job(dry_run=False, max_files=30))
+                if results[-1]["status"] == "skipped":  # holds no lock: spare the CPU, not the pattern
+                    time.sleep(0.005)
+
+        runner = threading.Thread(target=timer, daemon=True)
+        runner.start()
+        try:
+            assert in_first_note.wait(120), "the job never started indexing"
+            assert _run_main(repo, state, venv).returncode == 0
+            assert "restart lifeos-api" not in _restarts(state), "the deploy ran while the job held the lock"
+            assert job.SYNC_LOCK_PATH.with_name(job.DEPLOY_PENDING_NAME).exists()
+            first_deploy_tick_done.set()
+
+            deadline = time.monotonic() + 120
+            while len(results) < 2 and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert len(results) >= 2, "the run in progress never ended"
+            assert results[0]["files_indexed"] == 1, "the run did not end at its next note"
+
+            assert _run_main(repo, state, venv).returncode == 0
+            assert "restart lifeos-api" in _restarts(state), "the deploy was starved by back-to-back runs"
+        finally:
+            first_deploy_tick_done.set()
+            keep_running.clear()
+            runner.join(60)
+        assert not runner.is_alive()
+        assert not job.SYNC_LOCK_PATH.with_name(job.DEPLOY_PENDING_NAME).exists()
+        assert all(r == {"status": "skipped", "reason": "deploy_pending"} for r in results[1:2])
+
+        growing["on"] = False
+        while job.run_job(dry_run=False, max_files=30)["status"] == "indexed":
+            pass
+        indexed = _indexed_paths(vector_store)
+        assert len(indexed) == len(set(indexed)), "a note was indexed twice"
+        assert {Path(p).name for p in indexed} == {p.name for p in vault.glob("*.md")}
