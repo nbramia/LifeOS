@@ -56,6 +56,11 @@ def modified_day(date_str: Optional[str]) -> int:
         return UNDATED_DAY
 
 
+def default_fetch_count(top_k: int) -> int:
+    """Nearest chunks a search fetches before its recency re-rank."""
+    return min(top_k * 5, 100)
+
+
 def _date_where(date_from: Optional[str], date_to: Optional[str]) -> Optional[dict]:
     """Chroma ``where`` admitting chunks inside the inclusive window, plus
     undated chunks. None when no bound is given (or a bound does not parse)."""
@@ -289,6 +294,7 @@ class VectorStore:
         file_paths: Optional[list[str]] = None,
         date_from: Optional[str] = None,
         date_to: Optional[str] = None,
+        fetch_count: Optional[int] = None,
     ) -> list[dict]:
         """
         Search for similar chunks with heavy recency bias.
@@ -305,6 +311,8 @@ class VectorStore:
             date_from / date_to: Inclusive ``YYYY-MM-DD`` window, applied as a
                 ``modified_day`` clause inside the vector query; chunks
                 without a parseable date pass.
+            fetch_count: Nearest chunks to fetch before the recency re-rank
+                (default five times ``top_k``, at most 100).
 
         Returns:
             List of result dicts with content, metadata, and score
@@ -319,7 +327,8 @@ class VectorStore:
             conds.append(window)
 
         # Fetch more results to re-rank with recency bias
-        fetch_count = min(top_k * 5, 100)
+        if fetch_count is None:
+            fetch_count = default_fetch_count(top_k)
 
         # Query collection
         if file_paths is None:

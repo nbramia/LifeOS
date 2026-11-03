@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Search Pipeline
-> **Last Updated:** 2026-11-02
+> **Last Updated:** 2026-11-03
 
 How LifeOS searches across vault content using hybrid vector + keyword search.
 
@@ -11,7 +11,7 @@ How LifeOS searches across vault content using hybrid vector + keyword search.
 ## Pipeline Overview
 
 ```
-Query → Name Expansion → [Vector Search + BM25 Search] → RRF Fusion → Boosting → Dedup → Reranking → Results
+Query → Name Expansion → [Vector Search + BM25 Search] → RRF Fusion → Boosting → Dedup → Reranking → Bulk Blending → Results
 ```
 
 ---
@@ -58,6 +58,14 @@ A cross-encoder reranker (`api/services/reranker.py`) re-scores top results for 
 - **Protected indices**: For factual queries (as determined by `query_classifier.py`), high-signal results containing query keywords are protected from being displaced by reranking. Semantic queries have no protected results.
 - **Candidate pool**: Fetches `rerank_candidates` (default 50) results from the hybrid pipeline, then re-ranks and returns `top_k`
 
+### 7. Bulk Content
+
+A note under a folder in `LIFEOS_VAULT_NO_PEOPLE_PATHS` is bulk content, decided from the chunk's path at query time (`api/services/bulk_content.py`), so there is nothing to re-embed or backfill. With no folder configured, the arms are called as usual.
+
+Bulk chunks compete only among themselves, so they can't take an ordinary note's candidate slot or reach the cross-encoder. Chroma can't filter on a path prefix, so the vector arm fetches the nearest 400 chunks and splits them; if bulk chunks take most of those, the ordinary pool is smaller and the keyword arm carries more. The keyword arm runs one query for each kind, skipping the bulk one when ordinary results already hold all the terms and fill `top_k`. Corpus-wide BM25 statistics still count bulk chunks.
+
+A bulk chunk holding all of a query's terms when no ordinary note does leads the results. Other bulk chunks only fill slots ordinary results left empty. A result set holds at most 30% bulk chunks, and at least one when the query asks for one. No recency, name or facet boost applies to them. A list is reached by its exact words, a `folder` facet or the [CRM lookup](../product/crm-people.md#lists): facets that leave only bulk files rank them as usual, with no bound. `include_bulk=False` leaves them out entirely, and person briefings and meeting prep use it.
+
 ### Query Classification Impact
 
 The query classifier (`api/services/query_classifier.py`) determines whether a query is factual or semantic. This affects the pipeline:
@@ -68,7 +76,7 @@ The query classifier (`api/services/query_classifier.py`) determines whether a q
 
 ### What Gets Indexed
 
-Every `.md` file in the vault except those under `_`-prefixed folders. Bulk content (`LIFEOS_VAULT_NO_PEOPLE_PATHS`, frontmatter `people: false` or `generated:`) is indexed for search like any other note and contributes no people data; see [Data & Sync](data-and-sync.md).
+Every `.md` file in the vault except those under `_`-prefixed folders. Bulk content (`LIFEOS_VAULT_NO_PEOPLE_PATHS`, frontmatter `people: false` or `generated:`) is indexed for search like any other note and contributes no people data; see [Data & Sync](data-and-sync.md). A note under one of those folders ranks as in [Bulk Content](#7-bulk-content).
 
 ### Chunking and the embedding ceiling
 

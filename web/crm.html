@@ -2299,6 +2299,14 @@
             display: block;
         }
 
+        .list-match {
+            padding: 0.5rem 0;
+            border-top: 1px solid var(--border);
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            overflow-wrap: anywhere;
+        }
+
         /* Timeline tab */
         .timeline-filters {
             display: flex;
@@ -8375,6 +8383,15 @@
                             </div>
                         </div>
 
+                        <!-- Bulk-content lists: looked up only when asked -->
+                        <div class="source-entities-footer" id="listMatchesFooter" style="display:none">
+                            <div class="source-entities-toggle-bar">
+                                <span class="source-entities-label">Lists</span>
+                                <button class="split-btn" id="listMatchesBtn" onclick="checkListMatches()">Check lists</button>
+                            </div>
+                            <div class="source-entities-expanded-content" id="listMatchesContent"></div>
+                        </div>
+
                         <!-- Hidden elements for backwards compatibility -->
                         <div style="display:none">
                             <div id="strengthBarFill"></div>
@@ -9215,6 +9232,7 @@
                 // configured server-side; without them the photo viewer is
                 // thumbnail-only.
                 photosOriginalsEnabled = !!config.photos_originals_enabled;
+                document.getElementById('listMatchesFooter').style.display = config.list_lookup_enabled ? '' : 'none';
             } catch (error) {
                 console.warn('[Config] Failed to load CRM config:', error);
             }
@@ -10917,6 +10935,7 @@
             const sourceEntityCount = person.source_entity_count || 0;
             document.getElementById('sourceEntitiesCount').textContent = sourceEntityCount.toLocaleString();
             const listEl = document.getElementById('sourceEntitiesList');
+            if (listMatchesPersonId !== person.id) showListMatches(null, []);
 
             // If source_entities is present at all (from include_related=true),
             // render it — updateSourceEntities() itself renders "No source
@@ -19568,6 +19587,36 @@
                     updateUrl(selectedPersonId, tabName);
                 }
             }
+        }
+
+        // Lists are looked up only when the owner asks, for the person on screen.
+        let listMatchesPersonId = null;
+        const LIST_MATCH_LABELS = { email: 'Exact email', phone: 'Exact phone', name: 'Name only, weaker match' };
+
+        function showListMatches(personId, lines) {
+            listMatchesPersonId = personId;
+            document.getElementById('listMatchesFooter').classList.toggle('expanded', personId !== null);
+            document.getElementById('listMatchesContent').replaceChildren(...lines.map(text => {
+                const line = document.createElement('div');
+                line.className = 'list-match';
+                line.textContent = text;
+                return line;
+            }));
+        }
+
+        async function checkListMatches() {
+            const personId = selectedPersonId;
+            let lines;
+            showListMatches(personId, ['Checking lists...']);
+            try {
+                const data = await api(`/people/${personId}/list-matches`);
+                lines = data.matches.map(m => `${m.list_name} (${LIST_MATCH_LABELS[m.match_type]}): ${m.row}`);
+                if (!lines.length) lines = ['Not found on any list.'];
+                if (data.truncated) lines.push('Showing the first matches; there may be more.');
+            } catch (e) {
+                lines = ['Could not check lists.'];
+            }
+            if (selectedPersonId === personId) showListMatches(personId, lines);
         }
 
         // Toggle source entities

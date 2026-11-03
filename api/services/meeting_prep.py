@@ -161,7 +161,7 @@ def _find_people_notes(names: list[str], search: any) -> list[RelatedNote]:
         # Search for person's dedicated note
         query = f"{name} file:People"
         try:
-            results = search.search(query, top_k=3, use_reranker=False)
+            results = search.search(query, top_k=3, use_reranker=False, include_bulk=False)
             for result in results:
                 file_path = result.get("file_path", "")
                 file_name = result.get("file_name", "") or result.get("metadata", {}).get("file_name", "")
@@ -207,7 +207,7 @@ def _find_past_meetings(title: str, event_date: datetime, search: any) -> list[R
     # Search for past meeting notes
     query = f"{search_title} file:Meetings"
     try:
-        results = search.search(query, top_k=10, use_reranker=False)
+        results = search.search(query, top_k=10, use_reranker=False, include_bulk=False)
 
         for result in results:
             file_path = result.get("file_path", "")
@@ -291,7 +291,7 @@ def _find_topic_notes(title: str, description: Optional[str], attendee_names: li
     query = " ".join(search_terms[:6])  # Limit query length
 
     try:
-        results = search.search(query, top_k=10, use_reranker=False)
+        results = search.search(query, top_k=10, use_reranker=False, include_bulk=False)
 
         for result in results:
             file_path = result.get("file_path", "")

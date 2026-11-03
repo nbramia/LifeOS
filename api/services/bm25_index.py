@@ -20,7 +20,7 @@ import sqlite3
 import logging
 import unicodedata
 from pathlib import Path
-from typing import Collection, Optional
+from typing import Callable, Collection, Optional
 
 from config.settings import settings
 
@@ -295,13 +295,15 @@ class BM25Index:
         file_paths: Optional[Collection[str]] = None,
         date_from: Optional[str] = None,
         date_to: Optional[str] = None,
+        doc_filter: Optional[Callable[[str], bool]] = None,
     ) -> list[dict]:
         """Run one FTS5 MATCH expression and tag each row with its match mode.
 
-        ``file_paths`` and the ``date_from``/``date_to`` window (inclusive
-        ``YYYY-MM-DD``; undated chunks pass) restrict the rows before the
-        ``LIMIT`` applies, so a selective restriction still returns ``limit``
-        rows when that many exist.
+        ``file_paths``, ``doc_filter`` and the ``date_from``/``date_to`` window
+        (inclusive ``YYYY-MM-DD``; undated chunks pass) restrict the rows before
+        the ``LIMIT`` applies, so a selective restriction still returns
+        ``limit`` rows when that many exist. ``rank`` is FTS5's built-in BM25;
+        ordering by it sorts before any other column is read.
         """
         restrict = ""
         params: list = [match_expr]
@@ -313,6 +315,9 @@ class BM25Index:
                 deterministic=True,
             )
             restrict = "AND in_allowed_files(chunks_fts.doc_id)"
+        if doc_filter is not None:
+            conn.create_function("passes_doc_filter", 1, doc_filter)
+            restrict += " AND passes_doc_filter(chunks_fts.doc_id)"
         if date_from:
             restrict += " AND (COALESCE(doc_dates.modified_date, '') = '' OR substr(doc_dates.modified_date, 1, 10) >= ?)"
             params.append(date_from)
@@ -324,11 +329,11 @@ class BM25Index:
             f"""
             SELECT chunks_fts.doc_id, chunks_fts.content,
                    chunks_fts.file_name, chunks_fts.people,
-                   bm25(chunks_fts) as score, doc_dates.modified_date
+                   rank, doc_dates.modified_date
             FROM chunks_fts
             LEFT JOIN doc_dates ON doc_dates.doc_id = chunks_fts.doc_id
             WHERE chunks_fts MATCH ? {restrict}
-            ORDER BY score
+            ORDER BY rank
             LIMIT ?
             """,
             params,
@@ -391,6 +396,7 @@ class BM25Index:
         file_paths: Optional[Collection[str]] = None,
         date_from: Optional[str] = None,
         date_to: Optional[str] = None,
+        doc_filter: Optional[Callable[[str], bool]] = None,
     ) -> list[dict]:
         """
         Search the index using BM25.
@@ -409,6 +415,8 @@ class BM25Index:
             date_from: Inclusive lower bound (YYYY-MM-DD) on doc date, applied
                 before ``limit``; undated chunks pass.
             date_to: Inclusive upper bound, same rules.
+            doc_filter: When given, only chunks whose ``doc_id`` it accepts are
+                candidates, applied before ``limit``.
 
         Returns:
             List of matching documents with doc_id and BM25 score
@@ -418,7 +426,7 @@ class BM25Index:
             return []
         restrict = {
             k: v for k, v in
-            (("file_paths", file_paths), ("date_from", date_from), ("date_to", date_to))
+            (("file_paths", file_paths), ("date_from", date_from), ("date_to", date_to), ("doc_filter", doc_filter))
             if v is not None
         }
 
@@ -444,6 +452,23 @@ class BM25Index:
             return []
         finally:
             conn.close()
+
+    def chunks_with_phrases(
+        self, phrases: list[str], doc_filter: Callable[[str], bool], limit: int
+    ) -> list[dict]:
+        """Chunks whose text holds any phrase as adjacent tokens, unranked, as doc_id/content/file_name dicts."""
+        quoted = ['"' + " ".join(self._extract_terms(phrase)) + '"' for phrase in phrases]
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.create_function("passes_doc_filter", 1, doc_filter)
+            rows = conn.execute(
+                "SELECT doc_id, content, file_name FROM chunks_fts "
+                "WHERE chunks_fts MATCH ? AND passes_doc_filter(doc_id) LIMIT ?",
+                ("content : (" + " OR ".join(quoted) + ")", limit),
+            ).fetchall()
+        finally:
+            conn.close()
+        return [{"doc_id": r[0], "content": r[1], "file_name": r[2]} for r in rows]
 
     def bulk_add(self, documents: list[dict]):
         """
