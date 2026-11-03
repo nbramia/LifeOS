@@ -276,6 +276,29 @@ class TestSummaryQueue:
 
         assert _queued(summary_queue) == []
 
+    def test_bulk_note_is_not_queued_and_a_queued_one_is_dropped_without_the_llm(
+        self, indexer, vault, summary_queue, monkeypatch
+    ):
+        from api.services import summarizer
+        from config.settings import settings
+
+        monkeypatch.setattr(settings, "vault_no_people_paths_raw", "Bulk")
+        bulk = _write_note(vault, "Bulk/row.md", 1000)
+        queued_bulk = _write_note(vault, "Bulk/old-row.md", 1001)
+        plain = _write_note(vault, "plain.md", 1002)
+        for note in (queued_bulk, plain):
+            summarizer.add_summary_failure(str(note), note.name)
+        retry = MagicMock(return_value="A synthetic ordinary summary.")
+        monkeypatch.setattr(summarizer, "retry_summary", retry)
+
+        indexer.index_all(light_pass=True)
+        assert str(bulk) not in _queued(summary_queue)
+
+        stats = summarizer.drain_summary_queue(indexer.bm25_index)
+
+        assert stats["remaining"] == 0
+        assert [call.args[1] for call in retry.call_args_list] == ["plain.md"]
+
     def test_note_too_short_to_summarize_is_not_queued(self, indexer, vault, summary_queue):
         _write_note(vault, "short.md", 1000, body="Brief.")
 
@@ -291,6 +314,27 @@ class TestSummaryQueue:
         assert indexer.index_all(light_pass=True) == 1
 
         get_manager.assert_not_called()
+
+class TestReindexReplacesChunks:
+    def test_reindex_leaves_exactly_the_new_chunks_without_the_per_chunk_scan(
+        self, indexer, vault, monkeypatch
+    ):
+        note = _write_note(vault, "note.md", 1000, body="\n\n".join(f"Synthetic paragraph {i}. " * 40 for i in range(6)))
+        indexer.index_all(light_pass=True, skip_summaries=True)
+        before = indexer.bm25_index.count()
+        note.write_text("# note\n\n" + LONG_BODY + "\n")
+        os.utime(note, (2000, 2000))
+        add = MagicMock(wraps=indexer.bm25_index.add_document)
+        monkeypatch.setattr(indexer.bm25_index, "add_document", add)
+
+        indexer.index_all(light_pass=True, skip_summaries=True)
+
+        assert before > add.call_count >= 1
+        assert all(call.kwargs["replace"] is False for call in add.call_args_list)
+        assert indexer.bm25_index.count() == add.call_count
+        ids = [hit["doc_id"] for hit in indexer.bm25_index.search("Synthetic", limit=50)]
+        assert len(ids) == len(set(ids))
+
 
 class TestWithMainIndexerFeatures:
     def test_underscore_folder_is_not_listed_and_drops_out_through_deletions(self, indexer, vault, vector_store):

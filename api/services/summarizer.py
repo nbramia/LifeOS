@@ -326,13 +326,25 @@ def invalidate_queued_summary(file_path: str) -> None:
             save_summary_failures(failures)
 
 
-def queue_summary(file_path: str, file_name: str, body: str) -> None:
+def has_no_people_reason(file_path: str, frontmatter: dict) -> bool:
+    """Whether the note is bulk content (a no-people folder or marker), which gets no summary."""
+    from api.services.vault_listing import no_people_reason, vault_relative_path
+
+    rel = vault_relative_path(file_path, settings.vault_path)
+    return no_people_reason(rel, frontmatter, settings.vault_no_people_paths) is not None
+
+
+def queue_summary(file_path: str, file_name: str, body: str, frontmatter: dict) -> None:
     """Queue a note for a summary, unless it would get none anyway.
 
     Call before the note's chunks and summary leave BM25: see
     ``invalidate_queued_summary``.
     """
-    if get_summary_tier(file_path) == SummaryTier.SKIP or len(body) < MIN_SUMMARY_CONTENT_CHARS:
+    if (
+        get_summary_tier(file_path) == SummaryTier.SKIP
+        or len(body) < MIN_SUMMARY_CONTENT_CHARS
+        or has_no_people_reason(file_path, frontmatter)
+    ):
         invalidate_queued_summary(file_path)
         return
     add_summary_failure(file_path, file_name)
@@ -385,7 +397,8 @@ def _drain_order(entry: dict) -> tuple[int, float]:
 def drain_summary_queue(bm25_index) -> dict:
     """Generate queued summaries into BM25, within the configured time budget.
 
-    Holds no lock while the LLM works, so the vault index job keeps running. A
+    Drops entries for bulk no-people notes without calling the LLM. Holds no
+    lock while the LLM works, so the vault index job keeps running. A
     note rewritten meanwhile keeps its entry and gets a summary on a later pass.
     A failed attempt also keeps its entry, and the pass stops after
     ``MAX_CONSECUTIVE_SUMMARY_FAILURES`` in a row, since the LLM has probably
@@ -422,6 +435,10 @@ def drain_summary_queue(bm25_index) -> dict:
             # Gone or unreadable, so no summary can come of it. A later reindex
             # queues the note again if it comes back.
             logger.warning(f"Dropping queued summary for {file_path}: {e}")
+            finish_queued_summary(file_path, generation)
+            continue
+
+        if has_no_people_reason(file_path, frontmatter):
             finish_queued_summary(file_path, generation)
             continue
 

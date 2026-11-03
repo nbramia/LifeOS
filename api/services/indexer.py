@@ -639,7 +639,7 @@ class IndexerService:
             # Not caught: a note that was not queued must not be recorded as
             # indexed, or nothing would ever summarize it.
             from api.services.summarizer import queue_summary
-            queue_summary(file_path, path.name, body)
+            queue_summary(file_path, path.name, body, frontmatter)
         else:
             self._invalidate_queued_summary(file_path)
 
@@ -659,7 +659,8 @@ class IndexerService:
                 content=chunk.get("content", ""),
                 file_name=path.name,
                 people=all_people if all_people else None,
-                modified_date=metadata["modified_date"]
+                modified_date=metadata["modified_date"],
+                replace=False,  # delete_by_path above already cleared them
             )
 
         # Generate document summary for discovery queries (P9.4)
@@ -672,8 +673,8 @@ class IndexerService:
 
                 tier = get_summary_tier(file_path)
 
-                if tier == SummaryTier.SKIP:
-                    logger.debug(f"Skipping summary for {file_path} (tier: SKIP)")
+                if tier == SummaryTier.SKIP or self._no_people_reason(path, frontmatter):
+                    logger.debug(f"Skipping summary for {file_path}")
                 else:
                     summary, success = generate_summary(body, path.name)
                     if success and summary:
