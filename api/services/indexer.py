@@ -11,7 +11,7 @@ import logging
 import time
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Callable, Optional
 
 from api.services.chunker import chunk_document, extract_frontmatter, add_context_to_chunks, normalize_tags, tag_phrase_key
 from api.services.vectorstore import VectorStore, is_people_tag
@@ -343,6 +343,7 @@ class IndexerService:
         light_pass: bool = False,
         max_deletions: int | None = None,
         max_file_bytes: int | None = None,
+        should_stop: Callable[[], bool] | None = None,
     ) -> int:
         """
         Index markdown files in the vault.
@@ -352,8 +353,8 @@ class IndexerService:
 
         Progress is saved every 10 files, or after every file on a light pass, so crashes don't lose work.
 
-        With a time budget the run stops between files once it is spent, and
-        ends normally. A file counts as done only when the saved state says so,
+        With a time budget the run stops between files once it is spent, or as
+        soon as ``should_stop`` returns True, and ends normally. A file counts as done only when the saved state says so,
         so whatever it didn't reach, including removals of deleted files, the
         next run picks up. Stats still refresh for the people it touched, since
         their files won't come round again. ``last_run`` reports what was left.
@@ -376,14 +377,24 @@ class IndexerService:
                 they take no slot from smaller files, and they are not part of
                 ``files_remaining``; ``last_run`` reports how many in
                 ``files_skipped_large``. None or 0 sets no limit.
+            should_stop: Asked before each file and each removal; True ends the
+                run there, as a spent time budget does.
 
         Returns:
             Number of files indexed
         """
         deadline = None if time_budget_seconds is None else self._clock() + time_budget_seconds
 
+        stop_reasons: list[str] = []
+
         def out_of_time() -> bool:
-            return deadline is not None and self._clock() >= deadline
+            if deadline is not None and self._clock() >= deadline:
+                stop_reasons.append("Time budget reached")
+                return True
+            if should_stop is not None and should_stop():
+                stop_reasons.append("Asked to stop")
+                return True
+            return False
 
         # Always load existing state - even in force mode, we track progress
         # so we can resume if interrupted
@@ -496,8 +507,8 @@ class IndexerService:
             "files_skipped_large": skipped_large,
             "stopped_early": stopped_early,
         }
-        if stopped_early and deadline is not None:
-            logger.info(f"Time budget reached: {files_remaining} files remain for the next run")
+        if stopped_early and stop_reasons:
+            logger.info(f"{stop_reasons[0]}: {files_remaining} files remain for the next run")
 
         # Batch refresh all affected person stats ONCE at the end
         if all_affected_person_ids:

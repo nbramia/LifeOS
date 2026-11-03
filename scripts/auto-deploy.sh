@@ -52,6 +52,12 @@ VENV_DIR="${LIFEOS_VENV:-$HOME/.venvs/lifeos}"
 # gate would silently lock two different files, recreating the exact
 # split-brain this fixed-host-wide-path change exists to prevent.
 SYNC_LOCK_FILE="$HOME/.lifeos/sync.lock"
+# Touched whenever a deploy defers because a sync or the vault index job holds
+# the lock, removed once the deploy holds it. scripts/vault_index_job.py starts
+# no run while this is fresh (30 min) and ends a running one between notes, so a
+# job whose runs follow one another cannot keep the lock held forever. Same
+# directory as the lock, for the same host-wide reason.
+DEPLOY_PENDING_FILE="$HOME/.lifeos/deploy-pending"
 # Non-interactive git over SSH: fail fast instead of prompting for a passphrase.
 export GIT_SSH_COMMAND='ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new'
 
@@ -318,12 +324,37 @@ sync_in_progress_lock_acquire() {
     rc=$?
     case "$rc" in
         0) return 1 ;;    # acquired — proceed; fd 9 stays open+locked
-        75) return 0 ;;   # held by a sync (flock's own conflict-exit-code) — defer, expected
+        75)               # held (flock's own conflict-exit-code) — defer, expected
+            deploy_pending_announce
+            log "skip: $(lock_holder_description) — deferring deploy to avoid a mid-run restart"
+            return 0
+            ;;
         *)
             log "ERROR: flock failed unexpectedly (exit $rc) acquiring $SYNC_LOCK_FILE — deferring as a precaution"
             return 0
             ;;
     esac
+}
+
+deploy_pending_announce() {
+    mkdir -p "$(dirname "$DEPLOY_PENDING_FILE")"
+    touch "$DEPLOY_PENDING_FILE" 2>/dev/null \
+        || log "ERROR: could not write $DEPLOY_PENDING_FILE — the vault index job will not stand aside"
+}
+
+deploy_pending_clear() {
+    rm -f "$DEPLOY_PENDING_FILE" 2>/dev/null || true
+}
+
+# What to call the lock's holder in the log. The vault index job is a systemd
+# unit; anything else holding the lock is a sync launched by hand.
+lock_holder_description() {
+    case "$(systemctl show lifeos-vault-index.service -p ActiveState --value 2>/dev/null)" in
+        activating|active|deactivating|reloading)
+            echo "the vault index job is running (it stands aside for a pending deploy)"
+            return ;;
+    esac
+    echo "a sync is running"
 }
 
 sync_in_progress_lock_release() {
@@ -346,6 +377,7 @@ esac
 
 # --- Defer while the nightly sync is running ------------------------------------
 if sync_in_progress_systemd; then
+    deploy_pending_announce
     log "skip: nightly sync in progress — deferring deploy to avoid a mid-sync restart"
     exit 0
 fi
@@ -359,9 +391,9 @@ fi
 # releases it via the kernel regardless, the trap just makes that the
 # visible, enforced contract rather than an implicit one).
 if sync_in_progress_lock_acquire; then
-    log "skip: nightly sync in progress — deferring deploy to avoid a mid-sync restart"
-    exit 0
+    exit 0   # already logged, and the pending marker left, by the acquire
 fi
+deploy_pending_clear
 trap sync_in_progress_lock_release EXIT
 
 # --- Guards: only auto-deploy a clean main --------------------------------------
