@@ -2199,7 +2199,8 @@
 
         .contact-meta-row {
             display: flex;
-            gap: 1.5rem;
+            flex-wrap: wrap;
+            gap: 0.5rem 1.5rem;
             margin-top: 0.75rem;
             padding-top: 0.75rem;
             border-top: 1px solid var(--border);
@@ -11423,8 +11424,19 @@
                 `;
             }
 
-            // Meta info (First Seen, Last Seen, Category)
+            // Meta info (Past organizations, First Seen, Last Seen, Category)
             const metaItems = [];
+            const pastText = (person.past_organizations || []).filter(org => org && org.name)
+                .map(org => org.until ? `${org.name} (until ${String(org.until).slice(0, 4)})` : org.name)
+                .join(', ');
+            if (pastText) {
+                metaItems.push(`
+                    <div class="contact-meta-item">
+                        <span class="contact-meta-label">Past organizations</span>
+                        <span class="contact-meta-value">${escapeHtml(pastText)}</span>
+                    </div>
+                `);
+            }
             if (person.first_seen) {
                 metaItems.push(`
                     <div class="contact-meta-item">

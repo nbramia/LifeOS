@@ -12,6 +12,7 @@ from pydantic import BaseModel
 
 from api.services.entity_resolver import get_entity_resolver
 from api.services.person_entity import get_person_entity_store
+from api.services.person_organizations import visible_past_organizations
 from api.services.interaction_store import get_interaction_store
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,7 @@ class PersonResponse(BaseModel):
     email: Optional[str] = None
     company: Optional[str] = None
     position: Optional[str] = None
+    past_organizations: list[dict] = []  # name, source, since, until
     sources: list[str]
     meeting_count: int = 0
     email_count: int = 0
@@ -117,6 +119,7 @@ def _entity_to_response(
         email=entity.emails[0] if entity.emails else None,
         company=entity.company,
         position=entity.position,
+        past_organizations=visible_past_organizations(entity.past_organizations, entity.company),
         sources=entity.sources,
         meeting_count=entity.meeting_count,
         email_count=entity.email_count,

@@ -107,6 +107,7 @@ def fake_person(monkeypatch):
             birthday=None,
             company="Tidewater Press",
             position="Editor",
+            past_organizations=[],
             hidden=False,
         ),
         resolved=True,

@@ -34,6 +34,23 @@ Source entities are tagged with one of the following types:
 
 `meeting` marks a meeting note, one with `wispr_id` or `granola_id` in its frontmatter or filed under a `Granola` folder. Meeting source entities and interactions also carry a `provider`: `wispr`, `granola`, or null when the note names neither. Omi and Limitless notes are also transcripts but stay under `vault`. API filters accept `granola` as an alias of `meeting`.
 
+### Current and Past Organizations
+
+A person's `company` and `position` are their current organization and role, as LinkedIn and the address book state them. `past_organizations` lists the organizations they were with before. Each entry holds `name`, `source`, `since` and `until`; the dates are `YYYY`, `YYYY-MM` or `YYYY-MM-DD`, or null.
+
+| `source` | Where it comes from |
+|----------|---------------------|
+| `linkedin_profile` | A job with an end date in the `experience` list of a scraped profile in `data/linkedin_extracted.json`, matched to the person by the profile's `person_id`. |
+| `manual` | A hand edit through `PATCH /api/crm/people/{id}`, which replaces the whole list. |
+
+- Only those two sources can add an entry; message text, notes and person facts are never read.
+- The organization a person works for is never returned or shown, in any spelling (`Inc`, `&`, punctuation, "BlueLabs" for "BlueLabs Analytics"). A scraped job with no end, or an end in the future, is the current job, so a promotion is not a departure. A stint at the current company before a move away is not listed.
+- A name that is blank, a placeholder such as "self-employed", or a web address is not an organization. A person has at most 10 entries, latest first.
+- `company` and `position` are never changed by this list.
+- A merge carries both people's lists to the surviving person, and undoing a merge takes the restored person's organizations back off the survivor.
+
+`scripts/backfill_person_organizations.py` fills the list from the scraped profiles and leaves a person with a hand-entered organization alone; see [scripts](../../guides/scripts.md). The CRM person responses, the people responses, the person page, the people-index profile, the MCP profile and the model's person block show the list.
+
 ---
 
 ## Relationship Tracking

@@ -10,6 +10,7 @@ import re
 from pathlib import Path
 
 from api.services.person_entity import PersonEntity, get_person_entity_store
+from api.services.person_organizations import visible_past_organizations
 from api.services.source_entity import SourceEntity, get_source_entity_store
 from api.services.relationship import get_relationship_store
 from config.settings import settings
@@ -247,6 +248,8 @@ def search_matches(query: str, person) -> bool:
         return True
     if person.company and q_lower in person.company.lower():
         return True
+    if any(q_lower in org["name"].lower() for org in visible_past_organizations(person.past_organizations, person.company)):
+        return True
 
     return False
 
@@ -311,6 +314,7 @@ def person_to_detail_response(
         phone_numbers=person.phone_numbers,
         company=person.company,
         position=person.position,
+        past_organizations=visible_past_organizations(person.past_organizations, person.company),
         linkedin_url=person.linkedin_url,
         category=computed_category,
         vault_contexts=person.vault_contexts,

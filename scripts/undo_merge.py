@@ -6,7 +6,7 @@ Reverses the merge by:
 1. Restoring the secondary PersonEntity (unhiding)
 2. Re-pointing source_entities back to the secondary based on identifier matching
 3. Re-pointing interactions back based on source_entity reversal
-4. Removing the secondary's identifiers from the primary
+4. Removing the secondary's identifiers and past organizations from the primary
 5. Removing the merge chain entry from merged_person_ids.json
 6. Refreshing stats for both entities
 
@@ -14,6 +14,8 @@ Known limitations:
 - Relationship changes from merge are not reversed (secondary will have no relationships)
 - Notes/tags concatenated during merge are not split back
 - Aliases added to primary during merge are not removed
+- An organization both people held is removed from the primary, since the merged list does not
+  record which person it came from; the backfill restores the email-domain and profile ones
 - Facts moved to the primary during merge stay with the primary
 
 Usage:
@@ -31,6 +33,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from api.services.person_entity import get_person_entity_store
 from api.services.interaction_store import get_interaction_db_path
+from api.services.person_organizations import normalize_entries, same_org
 from api.services.source_entity import get_crm_db_path
 from scripts.merge_people import load_merged_ids, save_merged_ids
 
@@ -86,6 +89,7 @@ def undo_merge(secondary_id: str, dry_run: bool = True) -> dict:
         "interactions_moved": 0,
         "emails_removed_from_primary": 0,
         "phones_removed_from_primary": 0,
+        "past_organizations_removed_from_primary": 0,
     }
 
     crm_path = get_crm_db_path()
@@ -126,6 +130,8 @@ def undo_merge(secondary_id: str, dry_run: bool = True) -> dict:
 
     primary_emails = json.loads(primary_row["emails"]) if primary_row["emails"] else []
     primary_phones = json.loads(primary_row["phone_numbers"]) if primary_row["phone_numbers"] else []
+    secondary_past = normalize_entries(json.loads(row["past_organizations"] or "[]")) if "past_organizations" in row.keys() else []
+    primary_past = normalize_entries(json.loads(primary_row["past_organizations"] or "[]")) if "past_organizations" in primary_row.keys() else []
     logger.info(f"  Primary: '{primary_row['canonical_name']}'")
 
     # 3. Find source_entities to move back (those on primary matching secondary's identifiers)
@@ -188,6 +194,11 @@ def undo_merge(secondary_id: str, dry_run: bool = True) -> dict:
     logger.info(f"  Emails to remove from primary: {len(emails_to_remove)}")
     logger.info(f"  Phones to remove from primary: {len(phones_to_remove)}")
 
+    # The merge copied the secondary's past organizations to the primary; take them back out.
+    remaining_past = [e for e in primary_past if not any(same_org(e["name"], s["name"]) for s in secondary_past)]
+    stats["past_organizations_removed_from_primary"] = len(primary_past) - len(remaining_past)
+    logger.info(f"  Past organizations to remove from primary: {stats['past_organizations_removed_from_primary']}")
+
     if dry_run:
         logger.info("\nDRY RUN - no changes made. Use --execute to apply.")
         conn.close()
@@ -233,8 +244,8 @@ def undo_merge(secondary_id: str, dry_run: bool = True) -> dict:
         remaining_emails = [e for e in primary_emails if e.lower() not in emails_to_remove]
         remaining_phones = [p for p in primary_phones if p not in phones_to_remove]
         conn.execute(
-            "UPDATE person_entities SET emails = ?, phone_numbers = ? WHERE id = ?",
-            (json.dumps(remaining_emails), json.dumps(remaining_phones), primary_id),
+            "UPDATE person_entities SET emails = ?, phone_numbers = ?, past_organizations = ? WHERE id = ?",
+            (json.dumps(remaining_emails), json.dumps(remaining_phones), json.dumps(remaining_past), primary_id),
         )
         # Rebuild primary lookup tables
         conn.execute("DELETE FROM person_emails WHERE person_id = ?", (primary_id,))

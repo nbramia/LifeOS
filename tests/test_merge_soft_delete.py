@@ -291,6 +291,42 @@ class TestUndoMerge:
         remaining = json.loads(merged_ids_file.read_text())
         assert secondary_id not in remaining
 
+    def test_undo_takes_the_secondarys_past_organizations_back_off_the_primary(self, crm_db, tmp_path):
+        primary_id, secondary_id = "person-primary", "person-secondary"
+        _insert_person(crm_db, primary_id, "Alice Smith", emails=["alice@test.com", "alices@test.com"])
+        _insert_person(crm_db, secondary_id, "Alice S", emails=["alices@test.com"], hidden=True,
+                       hidden_at=datetime.now(timezone.utc).isoformat(), hidden_reason=f"merged_into:{primary_id}")
+        mine = {"name": "Primary Org", "source": "manual", "since": None, "until": None}
+        theirs = {"name": "Secondary Org", "source": "linkedin_profile", "since": None, "until": "2018"}
+        conn = sqlite3.connect(crm_db)
+        conn.execute("UPDATE person_entities SET past_organizations = ? WHERE id = ?", (json.dumps([mine, theirs]), primary_id))
+        conn.execute("UPDATE person_entities SET past_organizations = ? WHERE id = ?", (json.dumps([theirs]), secondary_id))
+        conn.commit()
+        conn.close()
+
+        int_path = str(tmp_path / "interactions.db")
+        int_conn = sqlite3.connect(int_path)
+        int_conn.execute("CREATE TABLE interactions (id TEXT PRIMARY KEY, person_id TEXT, source_id TEXT, source_type TEXT, title TEXT, timestamp TEXT)")
+        int_conn.commit()
+        int_conn.close()
+        merged_ids_file = tmp_path / "merged_person_ids.json"
+        merged_ids_file.write_text(json.dumps({secondary_id: primary_id}))
+
+        with patch("scripts.undo_merge.get_crm_db_path", return_value=crm_db), \
+             patch("scripts.undo_merge.get_interaction_db_path", return_value=int_path), \
+             patch("scripts.merge_people.MERGED_IDS_FILE", merged_ids_file), \
+             patch("api.services.person_stats.refresh_person_stats"):
+            from scripts.undo_merge import undo_merge
+            dry = undo_merge(secondary_id, dry_run=True)
+            stats = undo_merge(secondary_id, dry_run=False)
+
+        assert dry["past_organizations_removed_from_primary"] == 1 == stats["past_organizations_removed_from_primary"]
+        conn = sqlite3.connect(crm_db)
+        held = {pid: [e["name"] for e in json.loads(raw)] for pid, raw in conn.execute(
+            "SELECT id, past_organizations FROM person_entities WHERE id IN (?, ?)", (primary_id, secondary_id))}
+        conn.close()
+        assert held == {primary_id: ["Primary Org"], secondary_id: ["Secondary Org"]}
+
     def test_undo_dry_run_makes_no_changes(self, crm_db, tmp_path):
         """Dry run reports but doesn't modify anything."""
         primary_id = "person-primary"

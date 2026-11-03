@@ -336,6 +336,26 @@ class TestMCPProtocol:
 
 
 @pytest.mark.unit
+class TestPersonProfilePastOrganizations:
+    @staticmethod
+    def _format(past):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("mcp_server", MCP_SERVER_PATH)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        data = {"display_name": "Robin Example", "company": "Now Org", "past_organizations": past}
+        return module.LifeOSMCPServer()._format_response("lifeos_person_profile", data)
+
+    def test_names_come_with_the_year_they_ended(self):
+        out = self._format([{"name": "Old Firm", "until": "2019-04-10"}, {"name": "Undated Org", "until": None}])
+        assert "**Past organizations:** Old Firm (until 2019), Undated Org\n" in out
+
+    def test_nothing_is_printed_without_any(self):
+        assert "Past organizations" not in self._format([])
+        assert "Past organizations" not in self._format(None)
+
+
+@pytest.mark.unit
 class TestAPIOpenAPISync:
     """Test that MCP server stays in sync with API changes."""
 

@@ -619,6 +619,35 @@ class TestActiveLinkAndTabRegressions:
         expect(page.locator(".contact-meta-item", has_text="Last seen")).to_contain_text("No interactions")
         assert not [e for e in console_errors if "last_seen" in e or "Invalid" in e]
 
+    def _open_person(self, page: Page, crm_base_url, **fields):
+        _prepare(page)
+        page.goto(f"{crm_base_url}/family")
+        expect(page.locator("#familyDashboard")).to_be_visible()
+        body = {**SYNTHETIC_OTHER_PERSON, **fields}
+        person_url = f"**/api/crm/people/{SYNTHETIC_OTHER_PERSON['id']}"
+        for url in (person_url, f"{person_url}?include_related=true"):
+            page.route(url, lambda route: route.fulfill(
+                status=200, content_type="application/json", body=json.dumps(body),
+            ))
+        page.evaluate(f"selectPerson('{SYNTHETIC_OTHER_PERSON['id']}')")
+        expect(page.locator("#personContentGrid")).to_be_visible()
+
+    def test_past_organizations_show_beside_the_contact_fields_and_are_escaped(self, page: Page, crm_base_url):
+        self._open_person(page, crm_base_url, company="Now Org", past_organizations=[
+            None, {"name": "", "until": "2020"}, {"name": "Old Firm", "until": "2019-04-10"},
+            {"name": "<img src=x id=injected>", "until": None},
+        ])
+
+        value = page.locator(".contact-meta-item", has_text="Past organizations").locator(".contact-meta-value")
+        expect(value).to_have_text("Old Firm (until 2019), <img src=x id=injected>")
+        assert page.locator("#injected").count() == 0
+        expect(page.locator(".contact-meta-item", has_text="Last seen")).to_be_visible()
+
+    def test_no_past_organizations_shows_no_row(self, page: Page, crm_base_url):
+        for fields in ({"past_organizations": []}, {}):
+            self._open_person(page, crm_base_url, **fields)
+            assert page.locator(".contact-meta-item", has_text="Past organizations").count() == 0
+
     def test_family_member_with_no_interaction_has_no_invented_gap(self, page: Page, crm_base_url):
         _prepare(page)
         page.goto(f"{crm_base_url}/family")

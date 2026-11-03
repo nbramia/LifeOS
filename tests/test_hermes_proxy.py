@@ -4322,6 +4322,31 @@ class TestOffboxNamesHoldNoIdentifiers:
 
         assert "Role:" not in build_offbox_person_context("Who is Birdie?").block
 
+    def test_past_organizations_are_listed_and_scrubbed(self, person_crm):
+        from api.services.person_context import build_offbox_person_context
+
+        person = _add_person(person_crm, "Robin Alpha", aliases=["Birdie"], company="Acme", past_organizations=[
+            {"name": "Old Firm (robin@example.com)", "source": "manual", "since": None, "until": "2021-05-04"},
+            {"name": "robin.private@example.com", "source": "manual", "since": None, "until": None},
+            {"name": "Acme", "source": "manual", "since": None, "until": "2020"},
+        ])
+
+        block = build_offbox_person_context("Who is Birdie?").block
+
+        assert "Previously worked at: Old Firm (until 2021)\n" in block
+        _assert_no_contact_detail(block)
+        assert person.id
+
+    def test_the_chat_block_lists_past_organizations_as_stored_and_none_without(self, person_crm):
+        from api.services.person_context import build_person_context
+
+        _add_person(person_crm, "Robin Alpha", aliases=["Birdie"], past_organizations=[
+            {"name": "Old Firm (ops@example.com)", "source": "manual", "since": None, "until": "2021"}])
+        _add_person(person_crm, "Robin Beta", aliases=["Bee"])
+
+        assert "Previously worked at: Old Firm (ops@example.com) (until 2021)\n" in build_person_context("Who is Birdie?").block
+        assert "Previously worked at" not in build_person_context("Who is Bee?").block
+
     async def test_a_hermes_turn_carries_the_scrubbed_name(self, person_proxy, person_crm, hermes_store):
         _add_person(person_crm, _EMAIL_NAME, 80.0)
         _add_person(person_crm, _PHONE_NAME, 75.0)
