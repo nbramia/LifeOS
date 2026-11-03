@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Index changed vault notes every 15 minutes, newest first.
+Index changed vault notes every 15 minutes: ordinary notes first, each newest first.
 
 Runs from lifeos-vault-index.timer, outside the API server. It shares the
 incremental reindex and its saved state with the nightly run, up to a per-run
@@ -207,7 +207,7 @@ def run_job(dry_run: bool = True, max_files: int | None = None) -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description='Index changed vault notes, newest first')
+    parser = argparse.ArgumentParser(description='Index changed vault notes: ordinary notes first, each newest first')
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--execute', action='store_true', help='Actually index')
     mode.add_argument('--dry-run', action='store_true', help='Report what would be indexed and write nothing (default)')

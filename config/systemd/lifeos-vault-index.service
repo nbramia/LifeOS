@@ -1,5 +1,5 @@
 [Unit]
-Description=LifeOS vault index job — indexes changed notes, newest first, without LLM summaries
+Description=LifeOS vault index job — indexes changed notes, ordinary notes first and each newest first, without LLM summaries
 After=network.target lifeos-chromadb.service
 
 [Service]
