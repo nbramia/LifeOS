@@ -1758,6 +1758,15 @@ class TestDeployPending:
         assert vault_index_lock.try_flock(job.SYNC_LOCK_PATH) is not None, "the job took the sync lock"
         assert vault_index_lock.try_flock(vault_index_lock.VAULT_INDEX_LOCK_PATH) is not None
 
+    def test_dry_run_reports_even_while_a_deploy_is_pending(self, job, vault, vector_store):
+        _write_note(vault, "note.md", 1000)
+        _announce_deploy(job)
+
+        result = job.run_job(dry_run=True)
+
+        assert result["status"] == "dry_run"
+        assert result["changed"] == 1
+
     def test_marker_is_honoured_until_it_is_old_and_then_ignored(self, job, vault, vector_store):
         _write_note(vault, "note.md", 1000)
         marker = _announce_deploy(job, age_seconds=job.DEPLOY_PENDING_MAX_AGE_SECONDS - 60)
@@ -1864,7 +1873,12 @@ class TestDeployPending:
     def test_a_deploy_gets_through_runs_that_follow_one_another(self, job, vault, vector_store, tmp_path, monkeypatch):
         """The job's runs follow one another with no gap and its backlog never
         empties. A deploy tick that finds the lock held leaves its marker; the
-        next tick must get the lock, and the job loses nothing."""
+        run in progress ends at its next note, the runs after it start nothing,
+        and the deploy's next tick gets the lock. The job loses nothing.
+
+        Ordered by events, not sleeps: the first note is held open until the
+        first deploy tick has seen the lock held, and the second deploy tick
+        starts only after that run has ended and the next has begun."""
         from api.services.indexer import IndexerService
         from tests.test_deploy_drift import _restarts, _run_main, _stale_api_repo
 
@@ -1873,12 +1887,15 @@ class TestDeployPending:
         for i in range(30):
             _write_note(vault, f"seed-{i:03}.md", 1000 + i)
         real_index_file = IndexerService.index_file
-        in_run = threading.Event()
+        in_first_note = threading.Event()
+        first_deploy_tick_done = threading.Event()
         growing = {"on": True, "n": 0}
+        results: list[dict] = []
 
         def index_file(self, *args, **kwargs):
-            in_run.set()
-            time.sleep(0.02)
+            if not in_first_note.is_set():
+                in_first_note.set()
+                assert first_deploy_tick_done.wait(120)
             if growing["on"]:
                 growing["n"] += 1
                 _write_note(vault, f"new-{growing['n']:04}.md", 5000 + growing["n"])
@@ -1890,24 +1907,34 @@ class TestDeployPending:
 
         def timer():
             while keep_running.is_set():
-                job.run_job(dry_run=False, max_files=30)
+                results.append(job.run_job(dry_run=False, max_files=30))
+                if results[-1]["status"] == "skipped":  # holds no lock: spare the CPU, not the pattern
+                    time.sleep(0.005)
 
         runner = threading.Thread(target=timer, daemon=True)
         runner.start()
         try:
-            assert in_run.wait(15), "the job never started indexing"
-            attempts = 0
-            while "restart lifeos-api" not in _restarts(state):
-                attempts += 1
-                assert attempts <= 3, "the deploy was starved by back-to-back runs"
-                assert _run_main(repo, state, venv).returncode == 0
-                time.sleep(0.3)  # the gap between deploy ticks
-            assert attempts == 2
+            assert in_first_note.wait(120), "the job never started indexing"
+            assert _run_main(repo, state, venv).returncode == 0
+            assert "restart lifeos-api" not in _restarts(state), "the deploy ran while the job held the lock"
+            assert job.SYNC_LOCK_PATH.with_name(job.DEPLOY_PENDING_NAME).exists()
+            first_deploy_tick_done.set()
+
+            deadline = time.monotonic() + 120
+            while len(results) < 2 and time.monotonic() < deadline:
+                time.sleep(0.05)
+            assert len(results) >= 2, "the run in progress never ended"
+            assert results[0]["files_indexed"] == 1, "the run did not end at its next note"
+
+            assert _run_main(repo, state, venv).returncode == 0
+            assert "restart lifeos-api" in _restarts(state), "the deploy was starved by back-to-back runs"
         finally:
+            first_deploy_tick_done.set()
             keep_running.clear()
-            runner.join(30)
+            runner.join(60)
         assert not runner.is_alive()
         assert not job.SYNC_LOCK_PATH.with_name(job.DEPLOY_PENDING_NAME).exists()
+        assert all(r == {"status": "skipped", "reason": "deploy_pending"} for r in results[1:2])
 
         growing["on"] = False
         while job.run_job(dry_run=False, max_files=30)["status"] == "indexed":

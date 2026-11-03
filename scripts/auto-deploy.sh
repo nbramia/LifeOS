@@ -52,12 +52,15 @@ VENV_DIR="${LIFEOS_VENV:-$HOME/.venvs/lifeos}"
 # gate would silently lock two different files, recreating the exact
 # split-brain this fixed-host-wide-path change exists to prevent.
 SYNC_LOCK_FILE="$HOME/.lifeos/sync.lock"
-# Touched whenever a deploy defers because a sync or the vault index job holds
-# the lock, removed once the deploy holds it. scripts/vault_index_job.py starts
-# no run while this is fresh (30 min) and ends a running one between notes, so a
-# job whose runs follow one another cannot keep the lock held forever. Same
-# directory as the lock, for the same host-wide reason.
+# Touched whenever a tick that has something to deploy is deferred because a sync
+# or the vault index job holds the lock; removed once a tick holds the lock or
+# finds nothing to deploy. scripts/vault_index_job.py starts no run while this is
+# fresh (30 min) and ends a running one between notes, so a job whose runs follow
+# one another cannot keep the lock held forever. Same directory as the lock, for
+# the same host-wide reason.
 DEPLOY_PENDING_FILE="$HOME/.lifeos/deploy-pending"
+# The services a deploy restarts when they are stale.
+DEPLOY_UNITS="lifeos-api lifeos-agent-worker lifeos-mcp-http"
 # Non-interactive git over SSH: fail fast instead of prompting for a passphrase.
 export GIT_SSH_COMMAND='ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new'
 
@@ -325,7 +328,7 @@ sync_in_progress_lock_acquire() {
     case "$rc" in
         0) return 1 ;;    # acquired — proceed; fd 9 stays open+locked
         75)               # held (flock's own conflict-exit-code) — defer, expected
-            deploy_pending_announce
+            SYNC_LOCK_CONFLICT=1
             log "skip: $(lock_holder_description) — deferring deploy to avoid a mid-run restart"
             return 0
             ;;
@@ -344,6 +347,41 @@ deploy_pending_announce() {
 
 deploy_pending_clear() {
     rm -f "$DEPLOY_PENDING_FILE" 2>/dev/null || true
+}
+
+# Would a tick holding the lock deploy anything? A read-only mirror of main()'s
+# guards and drift check: on a clean main, and either origin/main is ahead or an
+# active service predates the code or .env on disk. A worker mid-session does not
+# count, since main() defers it.
+deploy_would_happen() {
+    [ "$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" = "main" ] || return 1
+    [ -z "$(git status --porcelain --untracked-files=no)" ] || return 1
+    git fetch --quiet origin main 2>>"$LOG_FILE" || return 1
+    [ "$(git rev-list --count HEAD..origin/main 2>/dev/null)" -gt 0 ] 2>/dev/null && return 0
+    CODE_MTIME=$(newest_code_mtime)
+    ENV_MTIME=$(env_file_mtime)
+    local unit active_since
+    for unit in $DEPLOY_UNITS; do
+        systemctl is-active --quiet "$unit" || continue
+        active_since=$(service_active_since_epoch "$unit") || continue
+        if { [ -n "$CODE_MTIME" ] && [ "$active_since" -lt "$CODE_MTIME" ]; } \
+            || env_stale_for_unit "$unit" "$active_since"; then
+            [ "$unit" = "lifeos-agent-worker" ] && worker_busy && continue
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Called when a held lock keeps a tick from deploying. Announces only if a deploy
+# would happen, so a held lock with nothing to deploy costs the job no runs, and
+# withdraws an earlier announcement otherwise.
+deploy_pending_update() {
+    if deploy_would_happen; then
+        deploy_pending_announce
+    else
+        deploy_pending_clear
+    fi
 }
 
 # What to call the lock's holder in the log. The vault index job is a systemd
@@ -377,7 +415,7 @@ esac
 
 # --- Defer while the nightly sync is running ------------------------------------
 if sync_in_progress_systemd; then
-    deploy_pending_announce
+    deploy_pending_update
     log "skip: nightly sync in progress — deferring deploy to avoid a mid-sync restart"
     exit 0
 fi
@@ -391,7 +429,9 @@ fi
 # releases it via the kernel regardless, the trap just makes that the
 # visible, enforced contract rather than an implicit one).
 if sync_in_progress_lock_acquire; then
-    exit 0   # already logged, and the pending marker left, by the acquire
+    # A broken lock tool is not a holder to stand aside for.
+    [ "${SYNC_LOCK_CONFLICT:-}" = 1 ] && deploy_pending_update
+    exit 0   # the acquire already logged why
 fi
 deploy_pending_clear
 trap sync_in_progress_lock_release EXIT
@@ -460,7 +500,7 @@ FAILED=()
 CODE_MTIME=$(newest_code_mtime)
 ENV_MTIME=$(env_file_mtime)
 if [ -n "$CODE_MTIME" ] || [ -n "$ENV_MTIME" ]; then
-    for unit in lifeos-api lifeos-agent-worker lifeos-mcp-http; do
+    for unit in $DEPLOY_UNITS; do
         systemctl is-active --quiet "$unit" || continue
         active_since=$(service_active_since_epoch "$unit") || {
             log "drift-check: could not read $unit's start time — skipping"
