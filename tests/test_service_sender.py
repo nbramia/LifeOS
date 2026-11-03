@@ -775,6 +775,17 @@ class TestNightlyPass:
         assert "held back" in caplog.text
         assert people[0].canonical_name not in caplog.text
 
+    def test_the_shipped_limit_stops_an_unreviewed_first_run(self, nightly):
+        """A first run over an existing CRM is the repair's job, not the nightly's."""
+        people = [
+            nightly.person(name=f"Acme Bank{i}", emails=[f"service{i}@acmewidgets.com"])
+            for i in range(ss.NIGHTLY_MAX_HIDES + 1)
+        ]
+        assert ss.NIGHTLY_MAX_HIDES <= 100
+        for person in people:
+            nightly.interaction(person)
+        assert ss.hide_service_senders(nightly.people)["held_back"] == len(people)
+
     def test_exactly_the_limit_goes_ahead(self, nightly, monkeypatch):
         monkeypatch.setattr(ss, "NIGHTLY_MAX_HIDES", 1)
         nightly.service()
