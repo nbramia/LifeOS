@@ -261,7 +261,7 @@ Example:
 | Script | Purpose |
 |--------|---------|
 | `sync_relationship_discovery.py` | Discover relationships from interactions |
-| `sync_strengths.py` | Recalculate relationship strengths |
+| `sync_strengths.py` | Hide new services and newsletters, then recalculate relationship strengths |
 | `sync_person_stats.py` | Verify/repair interaction counts |
 | `push_birthdays_to_contacts.py` | Push birthdays to Apple Contacts |
 

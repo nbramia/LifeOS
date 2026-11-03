@@ -133,7 +133,7 @@ def sample_bulk_headers(
     samples = {person_id: dict(sample) for person_id, sample in existing.items()}
     undecided = {
         d.person.id for d in decisions
-        if not d.verdict.is_service and not d.protected_by and d.received and d.person.id not in samples
+        if not d.verdict.is_service and not d.protected_by and d.person.id not in samples
     }
     messages = _recent_received_messages(interactions_db, undecided)
     by_account: dict[str, list[str]] = defaultdict(list)

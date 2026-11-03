@@ -55,7 +55,7 @@ def _service_sender_ids(store) -> set:
     from api.services.service_sender import HIDDEN_REASON_PREFIX
     return {
         p.id for p in store.get_all(include_hidden=True, include_merged=True)
-        if p.hidden and p.hidden_reason.startswith(HIDDEN_REASON_PREFIX)
+        if p.hidden_reason.startswith(HIDDEN_REASON_PREFIX)
     }
 
 

@@ -624,10 +624,48 @@ class TestDecisions:
         assert world.decision(person, {person.id: {"checked": 3, "bulk": 3}}).will_hide
         assert not world.decision(person, {person.id: {"checked": 3, "bulk": 1}}).will_hide
 
-    def test_malformed_metadata_does_not_stop_the_run(self, world):
-        person = world.service()
+    def test_malformed_metadata_does_not_cost_anyone_else_their_mail(self, world):
+        person = world.person(name="Acme", emails=[])
+        world.mail(person, address="learn@connect.acmewidgets.com")
         other = world.service(name="Northwind Bank", emails=["service@northwindtrading.com"])
         world.execute_sql("UPDATE source_entities SET metadata = '{broken' WHERE canonical_person_id = ?", other.id)
+        assert world.decision(person).addresses == {"learn@connect.acmewidgets.com": 6}
+
+    def test_a_missing_table_reads_as_empty(self, world):
+        conn = sqlite3.connect(world.crm_db)
+        assert ss._rows(conn, "SELECT * FROM no_such_table_here") == []
+        conn.close()
+
+    def test_any_other_failure_stops_the_run_rather_than_dropping_protection(self, world):
+        conn = sqlite3.connect(world.crm_db)
+        with pytest.raises(sqlite3.OperationalError):
+            ss._rows(conn, "SELECT json_extract('{broken', '$.x')")
+        conn.close()
+
+    def test_a_row_with_mail_but_no_known_address_is_not_judged(self, world):
+        person = world.person(name="Acme", emails=[])
+        world.interaction(person)
+        assert person.id not in {d.person.id for d in world.decisions()}
+
+    def test_thread_counts_reach_the_verdict(self, world):
+        person = world.person(name="Pat Lee", emails=["desk@northwindtrading.com"])
+        world.mail(person, count=50, address="desk@northwindtrading.com")
+        assert world.decision(person).will_hide
+        for i in range(6):
+            world.interaction(person, title="↔ Subject", source_id=f"t{i}:cc:desk@northwindtrading.com")
+        decision = world.decision(person)
+        assert decision.thread == 6
+        assert not decision.verdict.is_service
+
+    def test_a_sent_title_counts_whatever_the_source_id(self, world):
+        person = world.service()
+        world.interaction(person, title="→ Hello", source_id="plainid")
+        assert "wrote_to" in world.decision(person).protected_by
+
+    def test_a_company_named_after_its_domain_is_not_protected_by_notes(self, world):
+        person = world.person(name="Acme Widgets", emails=["events@mail.acmewidgets.com"])
+        world.mail(person, address="events@mail.acmewidgets.com")
+        world.interaction(person, source="vault", title="Note")
         assert world.decision(person).will_hide
 
 
@@ -923,13 +961,17 @@ class TestGmailSync:
         assert world.people.get_by_email("pat.lee@gmail.com") is None
         assert stats["service_skipped"] == 1
 
+    def test_a_sender_named_only_by_their_address_is_created_as_usual(self, world):
+        self._run(world, [_email("m1", "robin@northwindtrading.com", "robin@northwindtrading.com")])
+        assert [p.canonical_name for p in world.people.get_all()] == ["Robin"]
+
     def test_a_service_on_the_thread_creates_nothing(self, world):
         person = world.person(name="Jane Sample", emails=["jane.sample@gmail.com"])
         self._run(world, [_email(
             "m1", "jane.sample@gmail.com", "Jane Sample",
-            to="Acme <alerts@e.acmewidgets.com>", cc="Pat Lee <pat.lee@gmail.com>",
+            to="Acme <desk@e.acmewidgets.com>", cc="Pat Lee <pat.lee@gmail.com>",
         )])
-        assert world.people.get_by_email("alerts@e.acmewidgets.com") is None
+        assert world.people.get_by_email("desk@e.acmewidgets.com") is None
         pat = world.people.get_by_email("pat.lee@gmail.com")
         assert {row[0] for row in self._interactions(world)} == {person.id, pat.id}
 
@@ -1217,3 +1259,159 @@ class TestBulkSampling:
     def test_missing_samples_file_means_no_samples(self, world):
         assert repair.load_samples(world.root / "absent.json") == {}
         assert repair.load_samples(None) == {}
+
+
+class TestAddressAndNameEdges:
+    def test_regional_providers(self):
+        assert address_shape("a@hotmail.fr").personal_provider
+        assert address_shape("a@yahoo.co.uk").personal_provider
+        assert not address_shape("a@yahoo.info").personal_provider
+        assert not address_shape("a@yahoo.northwind.uk").personal_provider
+
+    def test_short_generated_tokens(self):
+        assert ss.SIGNAL_GENERATED in address_shape("a1b2c3d4e5@b.com").signals
+        assert ss.SIGNAL_GENERATED not in address_shape("abcde12345@b.com").signals
+
+    def test_organization_words_from_the_resolver(self):
+        assert ss.SIGNAL_ORG_NAME in name_signals("Northwind Team")
+
+    def test_the_alone_is_not_an_organization(self):
+        assert ss.SIGNAL_ORG_NAME not in name_signals("The")
+
+    def test_a_short_brand_as_a_word_of_the_name(self):
+        assert ss.SIGNAL_BRAND_NAME in name_signals("Abc Bank", ["abc.com"])
+        assert ss.SIGNAL_BRAND_NAME in name_signals("Monthly Northwind", ["northwind.com"])
+
+    def test_a_name_running_into_the_domain(self):
+        assert ss.SIGNAL_BRAND_NAME in name_signals("Acme Widgets Monthly", ["acmewidgets.com"])
+
+    def test_a_short_label_does_not_claim_any_name_starting_with_it(self):
+        assert ss.SIGNAL_BRAND_NAME not in name_signals("Abel Sample", ["ab.com"])
+
+    def test_a_plus_tag_is_not_the_name(self):
+        assert not ss._carries_name(address_shape("desk+jane@b.com"), "Jane Sample")
+
+    def test_a_two_letter_word_of_the_name_proves_nothing(self):
+        assert not ss._carries_name(address_shape("delivery@b.com"), "Jo Li")
+        assert ss._carries_name(address_shape("lee@b.com"), "Jo Lee")
+
+    @pytest.mark.parametrize("name,address", [
+        ("Theodora Sample", "theod@northwindtrading.com"),
+        ("Jane Sample", "jsample@northwindtrading.com"),
+        ("Acme Sales", "jane.sample@northwindtrading.com"),
+        ("Service", "someone@gmail.com"),
+    ])
+    def test_volume_does_not_outweigh_a_personal_address(self, name, address):
+        result = verdict(name, address, 40)
+        assert not result.is_service
+        assert result.reason == "personal_address"
+
+    def test_an_automated_address_is_not_personal_whatever_it_spells(self):
+        mixed = {"noreply@northwindtrading.com": 4, "desk@northwindtrading.com": 5}
+        assert verdict("Pat Reply", mixed, 9).reason != "personal_address"
+
+    def test_a_generated_address_is_not_personal_whatever_it_spells(self):
+        assert verdict("Jane Sample", "jane+a1b2c3d4e5f6@paymentsplatform.com").reason == "generated_address"
+
+    def test_a_one_word_brand_on_its_own_domain_is_not_personal(self):
+        assert verdict("Northwindco", "northwindco@northwind.com").reason == "named_after_domain"
+
+    def test_one_word_on_little_mail_is_personal(self):
+        assert verdict("Robin", "robin@northwindtrading.com", 4).reason == "personal_address"
+
+
+class TestReviewEdges:
+    def test_summary_separates_service_shaped_protection(self, world):
+        world.service(phone_numbers=["+15555550100"])
+        real = world.person(name="Jane Sample", emails=["jane.sample@gmail.com"], phone_numbers=["+15555550101"])
+        world.mail(real, address="jane.sample@gmail.com")
+        summary = repair.summarize(world.decisions(), top_strength=0.0)
+        assert summary["service_shaped_but_protected"] == 1
+        assert summary["protected_by"] == {"phone_number": 1}
+
+    def test_thinnest_protection_comes_first(self, world):
+        thick = world.service(name="Northwind Bank", emails=["service@northwindtrading.com"], phone_numbers=["+15555550100"], tags=["x"])
+        thin = world.service(phone_numbers=["+15555550101"])
+        protected, _ = repair.near_line(world.decisions())
+        assert [d.person.id for d in protected] == [thin.id, thick.id]
+
+    def test_kept_rows_with_signals_that_fell_short(self, world):
+        def kept(name, address, count=2):
+            person = world.person(name=name, emails=[address])
+            world.mail(person, count=count, address=address)
+            return person
+
+        relay = kept("Pat Lee via Platform", "desk@platformname.com", count=2)
+        unexplained = kept("Northwind Labs", "desk@elsewhere-sample.com", count=1)
+        steady = kept("Jane Sample", "jane@janes-letter.com", count=12)
+        quiet = kept("Sam Sample", "sam@janes-letter.com", count=9)
+        plain = kept("Pat Lee", "desk@northwindtrading.com", count=2)
+
+        _, short = repair.near_line(world.decisions())
+        ids = [d.person.id for d in short]
+        assert steady.id in ids and relay.id in ids and unexplained.id in ids
+        assert quiet.id not in ids
+        assert plain.id not in ids
+        assert ids[0] == steady.id, "most mail first"
+
+    def test_near_line_sections_are_capped_but_counted(self, world, monkeypatch):
+        monkeypatch.setattr(repair, "NEAR_LINE_SIZE", 1)
+        for i in range(2):
+            world.service(name=f"Acme Bank{i}", emails=[f"service{i}@acmewidgets.com"], phone_numbers=[f"+1555555010{i}"])
+            person = world.person(name=f"Jane {chr(65 + i)}lpha", emails=[f"support{i}@janes-letter.com"])
+            world.mail(person, count=2, address=f"support{i}@janes-letter.com")
+        text = repair.build_review(world.decisions(), {}, 0.0)
+        saved = next(s for s in text.split("\n## ") if s.startswith("Kept: service-shaped"))
+        short = next(s for s in text.split("\n## ") if s.startswith("Kept: signals fell short"))
+        assert saved.startswith("Kept: service-shaped, only protection saved them (2, thinnest first, showing 1)")
+        assert short.startswith("Kept: signals fell short (2, most mail first, showing 1)")
+        assert saved.count("service0@") + saved.count("service1@") == 1
+        assert short.count("support0@") + short.count("support1@") == 1
+
+    def test_merged_ids_path_is_honored(self, world, tmp_path):
+        person = world.service()
+        elsewhere = tmp_path / "elsewhere.json"
+        elsewhere.write_text(json.dumps({"merged-away": person.id}))
+        repair.main([
+            "--crm-db", str(world.crm_db), "--interactions-db", str(world.interactions_db),
+            "--merged-ids", str(elsewhere), "--report", str(world.review),
+        ])
+        assert "would_hide\": 0" in world.review.read_text()
+
+    def test_a_new_private_file_is_never_world_readable(self, world):
+        target = world.root / "private" / "new.json"
+        with patch.object(repair.os, "chmod"):
+            repair._write_private(target, "{}")
+        assert stat.S_IMODE(os.stat(target).st_mode) == 0o600
+
+    def test_sampling_reads_received_mail_only(self, world):
+        person = world.person(name="Jane Sample", emails=["jane@janes-letter.com"])
+        world.interaction(person, source_id="in-1", when="2026-01-01T00:00:00+00:00")
+        world.interaction(person, title="↔ Subject", source_id="thread-1", when="2026-02-01T00:00:00+00:00")
+        asked = []
+
+        def fetch(account, ids):
+            asked.extend(ids)
+            return {}
+
+        repair.sample_bulk_headers(world.decisions(), world.interactions_db, {}, fetch)
+        assert asked == ["in-1"]
+
+
+class TestStoreAndGmailEdges:
+    def test_unhide_unblocks_a_phone_number(self, world):
+        person = world.person(name="Pat Lee", emails=[], phone_numbers=["+15555550100"])
+        world.people.hide_person(person.id, "x")
+        assert world.people.is_blocked("+15555550100")
+        world.people.unhide_person(person.id)
+        assert not world.people.is_blocked("+15555550100")
+
+    def test_a_single_fetch_requests_the_headers_too(self):
+        service = GmailService.__new__(GmailService)
+        service.account_type = GoogleAccount.PERSONAL
+        client = MagicMock()
+        with patch.object(GmailService, "service", client), patch.object(GmailService, "_rate_limit"):
+            service.get_message("m1", include_body=False)
+        client.users().messages().get.assert_any_call(
+            userId="me", id="m1", format="metadata", metadataHeaders=METADATA_HEADERS,
+        )

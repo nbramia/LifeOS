@@ -298,9 +298,9 @@ def name_signals(name: str, domains: Iterable[str] = ()) -> list[str]:
     compact = "".join(words)
     labels = {label for domain in domains for label in _host_labels(domain)}
     normalized = {label.replace("-", "") for label in labels}
-    if compact and (compact in normalized or set(words) & labels or any(
+    if set(words) & labels or any(
         len(label) >= 4 and compact.startswith(label) for label in normalized
-    )):
+    ):
         signals.append(SIGNAL_BRAND_NAME)
     return signals
 
@@ -441,7 +441,7 @@ def is_unknown_service_sender(
     if store.is_blocked(email):
         return True
     return classify_sender(SenderEvidence(
-        name or "", {email.lower(): 1}, received=1, bulk=int(bulk), checked=1,
+        name or "", {email: 1}, received=1, bulk=int(bulk), checked=1,
     )).is_service
 
 
@@ -516,10 +516,17 @@ def _connect_read_only(path) -> sqlite3.Connection:
 
 
 def _rows(conn: sqlite3.Connection, sql: str) -> list[tuple]:
-    """A query's rows, or none on an install that hasn't created the table."""
+    """
+    A query's rows, or none on an install that hasn't created the table.
+
+    Any other failure raises. These queries find what protects a row, so reading a
+    locked database as "nothing protects anyone" would hide real people.
+    """
     try:
         return conn.execute(sql).fetchall()
-    except sqlite3.OperationalError:
+    except sqlite3.OperationalError as e:
+        if "no such table" not in str(e):
+            raise
         return []
 
 
@@ -676,15 +683,9 @@ def _domains(addresses: Iterable[str]) -> list[str]:
 def hide_service_person(store: PersonEntityStore, decision: SenderDecision) -> None:
     """Hide a service, block every address it wrote from, and clear its relationship value."""
     reason = HIDDEN_REASON_PREFIX + decision.verdict.reason
-    held_elsewhere = {
-        address for address in decision.addresses
-        if (holder := store.get_by_email(address)) is not None and holder.id != decision.person.id
-    }
-    store.hide_person(
-        decision.person.id,
-        reason,
-        extra_emails=[address for address in decision.addresses if address not in held_elsewhere],
-    )
+    # The row's own addresses are blocked with it. One someone else holds stays theirs.
+    unheld = [address for address in decision.addresses if store.get_by_email(address) is None]
+    store.hide_person(decision.person.id, reason, extra_emails=unheld)
     hidden = store.get_by_id(decision.person.id)
     hidden.relationship_strength = 0.0
     hidden.is_peripheral_contact = True

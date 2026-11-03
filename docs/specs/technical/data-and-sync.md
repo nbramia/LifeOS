@@ -332,7 +332,7 @@ Runs in this order (see [iMessage Sync Ordering](#imessage-sync-ordering) below)
 |--------|---------|-------------|
 | `sync_person_stats.py` | Full refresh of all PersonEntity counts and timestamps | `data/interactions.db` |
 | `sync_relationship_discovery.py` | Discover relationships and populate edge weights | All interactions |
-| `sync_strengths.py` | Recalculate relationship strengths | `data/crm.db` |
+| `sync_strengths.py` | Hide new services and newsletters, then recalculate relationship strengths | `data/crm.db` |
 | `push_birthdays_to_contacts.py` | Push LifeOS birthdays to Apple Contacts (macOS-only — `skipped` on Linux) | `data/crm.db` |
 
 ### Phase 4: Vector Store Indexing
