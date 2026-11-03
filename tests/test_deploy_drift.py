@@ -1451,7 +1451,7 @@ def test_held_lock_with_main_ahead_on_origin_leaves_the_pending_marker(tmp_path:
         pytest.skip("scripts/auto-deploy.sh not present")
     repo, state, venv = _current_api_repo(tmp_path)
     other = tmp_path / "other"
-    subprocess.run(["git", "clone", "-q", str(tmp_path / "origin.git"), str(other)], check=True)
+    subprocess.run(["git", "clone", "-q", "-b", "main", str(tmp_path / "origin.git"), str(other)], check=True)
     _git(other, "config", "user.email", "t@t.t")
     _git(other, "config", "user.name", "t")
     (other / "api" / "b.py").write_text("more code\n")
