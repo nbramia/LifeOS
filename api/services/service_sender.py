@@ -860,7 +860,7 @@ def restore_people_who_wrote_back(store: PersonEntityStore, interactions_db: Pat
     crm_db = Path(store.db_path)
     mail, _ = _load_evidence(crm_db, interactions_db, merged_ids)
     restored = 0
-    hidden_services = f"hidden = 1 AND hidden_reason LIKE '{HIDDEN_SERVICE_REASON_PREFIX}%'"
+    hidden_services = f"hidden_reason LIKE '{HIDDEN_SERVICE_REASON_PREFIX}%'"
     for person in _load_people(crm_db, merged_ids, where=hidden_services):
         record = mail.get(person.id) or _Mail()
         evidence = _evidence_of(person, record, _addresses_of(person, record), {})

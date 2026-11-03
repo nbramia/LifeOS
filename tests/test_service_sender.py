@@ -839,6 +839,14 @@ class TestOwnAddressProtection:
         decision = world.decision(person)
         assert (decision.received, decision.thread, decision.sent) == (received, thread, 0)
 
+    def test_a_sent_message_counts_for_the_address_it_went_to(self, world):
+        person = world.person(name="Jane Sample", emails=[OWN_ADDRESS, "events@acmewidgets.com"])
+        world.mail(person, count=2, address=OWN_ADDRESS)
+        world.interaction(person, title="→ Hello", source_id="abc:events@acmewidgets.com")
+        decision = world.decision(person)
+        assert decision.sent == 1
+        assert not decision.verdict.wrote_to_own_address
+
     def test_mail_he_sent_recorded_only_as_a_source_entity(self, world):
         person = self._one_way(world)
         world.source_entity(person, source_id=f"abc:{OWN_ADDRESS}", email=OWN_ADDRESS)
@@ -968,7 +976,7 @@ class TestDecisions:
     def test_name_signals_see_the_domain_for_a_human_link(self, world):
         address = "northwindco@northwind.com"
         person = world.person(name="Northwindco", emails=[address])
-        world.mail(person, address=address)
+        world.mail(person, count=2, address=address)
         world.source_entity(person, status="confirmed", email=address)
         assert "human_link" not in world.decision(person).protected_by
 
