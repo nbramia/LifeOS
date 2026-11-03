@@ -377,8 +377,9 @@ def main(argv=None) -> int:
         print(f"Back now: {interaction_count(args.interactions_db, [p.id for p in restored])} interactions, "
               "including mail received while hidden, plus source entities and unblocked addresses.")
         print("Rebuilt by the next nightly run: inferred relationships, strength and circle, people index.")
-        print("Not recovered: iMessage, WhatsApp, or phone contact while hidden, "
-              "which those syncs don't record for a hidden row.")
+        print("Not recovered: iMessage, WhatsApp, or phone contact while hidden, which those syncs "
+              "don't record for a hidden row, and relationship rows discovery no longer produces. "
+              "The CRM backup beside the database holds those rows.")
         return 0
 
     merged_ids_path = args.merged_ids or args.crm_db.with_name("merged_person_ids.json")

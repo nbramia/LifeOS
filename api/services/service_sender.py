@@ -386,7 +386,7 @@ def _is_own_address(shape: AddressShape, evidence: SenderEvidence, names: list[s
         if bare in set(words) - _ORGANIZATION_WORDS:
             return True
         return evidence.has_history and _carries_name(shape, name)
-    if SIGNAL_ONE_WORD in names and evidence.received >= ONE_WORD_OWN_ADDRESS_MAX_RECEIVED:
+    if SIGNAL_ONE_WORD in names and evidence.received >= ONE_WORD_OWN_ADDRESS_MAX_RECEIVED and not evidence.has_history:
         return False
     return _carries_name(shape, name)
 
@@ -412,7 +412,7 @@ def classify_sender(evidence: SenderEvidence) -> SenderVerdict:
     own = tuple(a for a, s in shapes.items() if _is_own_address(s, evidence, names))
     wrote_to_own = any(
         (address == "" and own) or _is_own_address(address_shape(address), evidence, names)
-        for address, count in evidence.sent_to.items() if count
+        for address in evidence.sent_to
     )
 
     def verdict(is_service: bool, reason: str) -> SenderVerdict:
@@ -431,9 +431,6 @@ def classify_sender(evidence: SenderEvidence) -> SenderVerdict:
         and evidence.sent <= evidence.received * ONE_WAY_MAX_SENT_SHARE
     )
     never_answered = not evidence.thread and not evidence.sent
-
-    if not has_own and share(lambda s: s.automated) >= SERVICE_ADDRESS_MIN_SHARE:
-        return verdict(True, "automated_address")
 
     # A person turns up in threads, or writes from their own mailbox as well as the
     # address their newsletter goes out on. Neither is bulk however that mail reads.
@@ -635,7 +632,7 @@ def _load_people(crm_db: Path, merged_ids: Mapping[str, str], where: str = "hidd
 def _recipient_of(source_id: Optional[str]) -> str:
     """The address in a sent message's ``<message>:<recipient>`` source id, if it has one."""
     _, _, recipient = (source_id or "").partition(":")
-    return recipient.lower()
+    return recipient
 
 
 def _load_interaction_evidence(interactions_db: Path, mail: dict, reasons: dict) -> None:
@@ -863,9 +860,8 @@ def restore_people_who_wrote_back(store: PersonEntityStore, interactions_db: Pat
     crm_db = Path(store.db_path)
     mail, _ = _load_evidence(crm_db, interactions_db, merged_ids)
     restored = 0
-    for person in _load_people(crm_db, merged_ids, where="hidden = 1"):
-        if not is_hidden_service(person):
-            continue
+    hidden_services = f"hidden = 1 AND hidden_reason LIKE '{HIDDEN_SERVICE_REASON_PREFIX}%'"
+    for person in _load_people(crm_db, merged_ids, where=hidden_services):
         record = mail.get(person.id) or _Mail()
         evidence = _evidence_of(person, record, _addresses_of(person, record), {})
         if classify_sender(evidence).wrote_to_own_address and (record.received or record.thread):

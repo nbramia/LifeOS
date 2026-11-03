@@ -129,9 +129,15 @@ class TestTheOneWayRule:
         addresses = {"jane@janes-letter.com": 289, "jane.sample@gmail.com": 2}
         assert verdict("Jane Sample", addresses, 291).reason == "one_way_volume"
 
+    def test_the_threshold_itself(self):
+        assert not verdict("Jane Sample", OWN_ADDRESS, 9).is_service
+        assert verdict("Jane Sample", OWN_ADDRESS, 10).is_service
+
     def test_an_address_with_no_name_in_it_takes_the_same_volume(self):
         assert not verdict("Pat Lee", "desk@northwindtrading.com", T - 1).is_service
-        assert verdict("Pat Lee", "desk@northwindtrading.com", T).reason == "one_way_volume"
+        result = verdict("Pat Lee", "desk@northwindtrading.com", T)
+        assert result.reason == "one_way_volume"
+        assert ss.SIGNAL_ONE_WAY in result.signals
 
     def test_a_colleague_turns_up_in_threads(self):
         assert verdict("Pat Lee", "desk@northwindtrading.com", 100, thread=10).is_service
@@ -187,14 +193,31 @@ class TestAPersonsOwnAddress:
         assert not verdict("Jane Sample", "hello@janesample.com", 3, thread=2).is_service
         assert verdict("Jane Sample", "hello@janesample.com", 3, thread=1).is_service
 
-    def test_a_companys_name_is_not_a_site(self):
-        assert verdict("Acme Bank", "hello@acmebank.com").is_service
-        assert verdict("Dana (Acme)", "hello@acme.com").is_service
+    def test_a_companys_name_is_not_a_site_even_with_replies(self):
+        for name, address in (("Acme Bank", "hello@acmebank.com"), ("Dana (Acme)", "hello@acme.com")):
+            assert verdict(name, address).is_service
+            result = verdict(name, address, 3, sent_to={address: 2})
+            assert result.is_service, name
+            assert not result.wrote_to_own_address, name
+
+    def test_their_site_by_a_hyphenated_name_or_by_surname(self):
+        assert verdict("Jane Sample", "me@jane-sample.com", 3).reason == "own_address"
+        assert verdict("Jane Sample", "founder@sample.com", 3).reason == "own_address"
+
+    def test_a_shortened_name_counts_as_theirs_when_written_to(self):
+        address = "theod@northwindtrading.com"
+        assert verdict("Theodora Sample", address, 1, sent_to={address: 1}).wrote_to_own_address
+
+    def test_a_one_word_brand_on_its_own_domain_is_not_personal(self):
+        assert verdict("Northwindco", "northwindco@northwind.com").reason == "named_after_domain"
 
     def test_one_word_name_on_its_own_address(self):
         assert verdict("Robin", "robin@northwindtrading.com", 4).reason == "own_address"
         assert verdict("Etickets", "etickets@northwindtrading.com", 40).reason == "one_way_volume"
         assert verdict("Etickets", "etickets@northwindtrading.com", 5).reason == "not_a_person_name"
+        address = "robin@northwindtrading.com"
+        talking = verdict("Robin", address, 51, thread=18, sent_to={address: 30})
+        assert talking.own_addresses == (address,) and talking.wrote_to_own_address
 
     def test_a_person_in_threads_on_their_own_domain_is_not_a_brand(self):
         assert not verdict("Jane Sample", "her@janesample.org", 0, thread=13).is_service
@@ -229,10 +252,21 @@ class TestRealHistoryOutweighsAddressShape:
 
     def test_a_company_name_on_a_sending_host_needs_no_run_of_mail(self):
         assert verdict("Acme Bank", "acme@mail.northwind.com").is_service
+        assert verdict("Acme Widgets Monthly", "acme@mail.acmewidgets.com").is_service
+        assert verdict("Acme® Card", "acme@mail.northwind.com").is_service
 
     @pytest.mark.parametrize("address", ["sarah@stmarys.org", "schurch@stmarys.org", "sarahchurch@stmarys.org"])
     def test_a_name_that_reads_as_an_organization_with_history(self, address):
         assert not verdict("Sarah Church", address, 3, thread=50).is_service
+
+    def test_a_name_that_reads_as_an_organization_on_their_first_name(self):
+        assert verdict("Sarah Church", "sarah@stmarys.org", 3).reason == "own_address"
+        assert verdict("Sarah Church", "church1@stmarys.org", 3).is_service
+
+    def test_history_only_helps_an_address_carrying_the_name(self):
+        assert verdict("Sarah Church", "desk@stmarys.org", 3, thread=50).is_service
+        replied = verdict("Sarah Church", "schurch@stmarys.org", 3, sent_to={"schurch@stmarys.org": 1})
+        assert replied.own_addresses and replied.wrote_to_own_address
 
     def test_a_name_that_reads_as_an_organization_without_history(self):
         assert verdict("Acme Labs", "hq@northwindtrading.com", 2).reason == "organization_name"
@@ -253,6 +287,10 @@ class TestJudgedPerAddress:
         result = verdict("Jane Sample", addresses, T - 1)
         assert not result.is_service
         assert result.own_addresses == ("jane.sample@gmail.com",)
+
+    def test_one_own_address_at_a_small_share_still_counts(self):
+        addresses = {"events@northwindtrading.com": 17, "jane.sample@northwindtrading.com": 3}
+        assert verdict("Jane Sample", addresses, 9).reason == "own_address"
 
     def test_a_real_address_among_others(self):
         mostly_role = {"events@northwindtrading.com": 8, "jane.sample@northwindtrading.com": 2}
@@ -380,7 +418,7 @@ class TestSignals:
         assert ss.SIGNAL_ORG_NAME in name_signals("Northwind Team")
         assert ss.SIGNAL_ORG_NAME not in name_signals("The")
         assert ss.SIGNAL_ORG_NAME not in name_signals("Jane Sample")
-        assert ss.SIGNAL_ORG_NAME in name_signals("Northwind.com Tickets")
+        assert ss.SIGNAL_ORG_NAME in name_signals("Northwind.com Sample")
         assert ss.SIGNAL_ORG_NAME not in name_signals("J.R. Sample")
         assert ss.SIGNAL_NOT_A_NAME in name_signals("Acme® Card")
         assert ss.SIGNAL_NOT_A_NAME in name_signals("")
@@ -422,6 +460,19 @@ class TestSignals:
         # A provider's address has no other shape worth reading.
         assert address_shape("support@gmail.com").signals == ()
 
+    def test_brand_rules(self):
+        assert verdict("Bank Acme", "hq@acme.com").reason == "named_after_domain"
+        assert verdict("Sam from Acme", "desk@acme.com").reason == "named_after_domain"
+        assert verdict("Acme Widgets Monthly", "desk@acmewidgets.com", 2).reason == "named_after_domain"
+        assert not verdict("Acme Widgets Monthly", "desk@acmewidgets.com", 1).is_service
+        assert not verdict("Acmewidgets", "anything@acmewidgets.com", 0, thread=3).is_service
+
+    def test_names_that_are_not_a_person(self):
+        assert verdict("Rachel & Chris", "desk@northwindtrading.com", 2).reason == "not_a_person_name"
+        assert verdict("Etickets", "desk@northwindtrading.com", 2).reason == "not_a_person_name"
+        assert not verdict("Bonnie", "desk@northwindtrading.com", 5, thread=3).is_service
+        assert not verdict("", "pat@northwindtrading.com", 3).is_service
+
     def test_automated_words(self):
         assert ss.SIGNAL_AUTOMATED in address_shape("mailer@b.com").signals
         assert ss.SIGNAL_AUTOMATED not in address_shape("jane.mailer@b.com").signals
@@ -433,6 +484,8 @@ class TestSignals:
         assert address_shape("a@yahoo.co.uk").personal_provider
         assert not address_shape("a@yahoo.info").personal_provider
         assert not address_shape("a@yahoo.northwind.uk").personal_provider
+        for provider in ("hushmail.com", "rediffmail.com", "mailbox.org"):
+            assert address_shape(f"a@{provider}").personal_provider, provider
 
     def test_name_in_the_address(self):
         assert not ss._carries_name(address_shape("desk+jane@b.com"), "Jane Sample")
@@ -772,6 +825,20 @@ class TestOwnAddressProtection:
         assert decision.verdict.wrote_to_own_address
         assert "wrote_to" in decision.protected_by
 
+    @pytest.mark.parametrize("title,source_id", [("→ Hello", f"abc:{OWN_ADDRESS}"), ("→ Hello", "plainid")])
+    def test_a_sent_message_is_not_received_mail(self, world, title, source_id):
+        person = world.person(name="Jane Sample", emails=[OWN_ADDRESS])
+        world.interaction(person, title=title, source_id=source_id)
+        decision = world.decision(person)
+        assert decision.received == 0 and decision.sent == 1
+
+    @pytest.mark.parametrize("arrow,received,thread", [("←", 1, 0), ("↔", 0, 1)])
+    def test_an_arrow_outweighs_a_colon_in_the_source_id(self, world, arrow, received, thread):
+        person = world.person(name="Jane Sample", emails=[OWN_ADDRESS])
+        world.interaction(person, title=f"{arrow} Hello", source_id="abc:def")
+        decision = world.decision(person)
+        assert (decision.received, decision.thread, decision.sent) == (received, thread, 0)
+
     def test_mail_he_sent_recorded_only_as_a_source_entity(self, world):
         person = self._one_way(world)
         world.source_entity(person, source_id=f"abc:{OWN_ADDRESS}", email=OWN_ADDRESS)
@@ -794,6 +861,7 @@ class TestOwnAddressProtection:
 
     @pytest.mark.parametrize("source,attendees,protected", [
         ("calendar", 1, True), ("calendar", 5, True), ("calendar", 6, False), ("calendar", None, False),
+        ("calendar", 0, False),
         ("meeting", None, True), ("vault", None, False),
     ])
     def test_a_real_meeting(self, world, source, attendees, protected):
@@ -898,10 +966,11 @@ class TestDecisions:
         assert not decision.verdict.is_service
 
     def test_name_signals_see_the_domain_for_a_human_link(self, world):
-        person = world.person(name="Acme Widgets", emails=["acme.w@acmewidgets.com"])
-        world.mail(person, address="acme.w@acmewidgets.com")
-        world.source_entity(person, status="confirmed", email="acme.w@acmewidgets.com")
-        assert "human_link" in world.decision(person).protected_by
+        address = "northwindco@northwind.com"
+        person = world.person(name="Northwindco", emails=[address])
+        world.mail(person, address=address)
+        world.source_entity(person, status="confirmed", email=address)
+        assert "human_link" not in world.decision(person).protected_by
 
 
 class TestHide:
@@ -1123,6 +1192,14 @@ class TestAutoRestore:
         assert not row.hidden
         assert not nightly.people.is_blocked(OWN_ADDRESS)
         assert ss.hide_service_senders(nightly.people)["hidden"] == 0
+
+    def test_a_hold_back_still_restores_and_says_so(self, nightly, monkeypatch):
+        person = nightly.newsletter()
+        ss.hide_service_senders(nightly.people)
+        nightly.interaction(person, title="→ Hello", source_id=f"abc:{OWN_ADDRESS}")
+        monkeypatch.setattr(ss, "NIGHTLY_MAX_HIDES", 0)
+        nightly.service()
+        assert ss.hide_service_senders(nightly.people) == {"hidden": 0, "held_back": 1, "restored": 1}
 
     def test_a_reply_to_a_role_mailbox_does_not(self, nightly):
         person = nightly.service()
@@ -1396,6 +1473,12 @@ class TestGmailSync:
         assert stats["marketing_skipped"] == 0
         assert world.interactions() == [(person.id, "← Subject")]
 
+    def test_a_hidden_namesake_with_a_phone_does_not_stop_it(self, world):
+        hidden = world.person(name="Jane Sample", emails=["pat@northwindtrading.com"], phone_numbers=["+15555550100"])
+        world.people.hide_person(hidden.id, "by hand")
+        stats, _ = self._run(world, [_email("m1", "events@mail.acmewidgets.com", "Jane Sample")])
+        assert stats["service_skipped"] == 1
+
     def test_a_namesake_with_no_phone_does_not_stop_it(self, world):
         world.person(name="Jane Sample", emails=["jane.sample@gmail.com"])
         stats, _ = self._run(world, [_email("m1", "events@mail.acmewidgets.com", "Jane Sample")])
@@ -1496,6 +1579,44 @@ class TestGmailSync:
         self._run(world, emails, fetched=fetched)
         assert fetched == []
 
+    def test_a_hidden_service_on_the_thread_is_kept_too(self, world):
+        person = world.service()
+        world.hide(person)
+        sender = world.person(name="Pat Lee", emails=["pat.lee@gmail.com"])
+        before = len(world.interactions())
+        self._run(world, [_email("m1", "pat.lee@gmail.com", "Pat Lee", to=f"Acme <{SERVICE_ADDRESS}>")])
+        assert sum(pid == person.id for pid, _ in world.interactions()) == 7
+        assert sum(pid == sender.id for pid, _ in world.interactions()) == 1
+        assert len(world.interactions()) == before + 2
+
+    def test_someone_hidden_by_hand_still_gets_nothing(self, world):
+        person = world.person(name="Pat Lee", emails=["pat.lee@gmail.com"])
+        world.people.hide_person(person.id, "by hand")
+        self._run(world, [_email("m1", "pat.lee@gmail.com", "Pat Lee")])
+        assert world.interactions() == []
+
+    def test_a_hidden_service_keeps_its_calendar_record(self, world):
+        from api.services.calendar import CalendarEvent
+        from scripts.sync_gmail_calendar_interactions import sync_calendar_interactions
+
+        person = world.service()
+        world.hide(person)
+        before = len(world.interactions())
+        start = datetime(2026, 6, 15, 12, 0, tzinfo=timezone.utc)
+        event = CalendarEvent(
+            event_id="ev1", title="Synthetic sync", start_time=start, end_time=start,
+            source_account="personal", attendees=[SERVICE_ADDRESS],
+        )
+        calendar = MagicMock()
+        calendar.get_events_in_range.return_value = [event]
+        module = "scripts.sync_gmail_calendar_interactions"
+        with patch(f"{module}.CalendarService", return_value=calendar), \
+             patch(f"{module}.get_interaction_db_path", return_value=str(world.interactions_db)), \
+             patch(f"{module}.get_source_entity_store", return_value=world.sources), \
+             patch(f"{module}.get_entity_resolver", return_value=EntityResolver(world.people)):
+            sync_calendar_interactions(account_type=GoogleAccount.PERSONAL, dry_run=False, days_back=30)
+        assert len(world.interactions()) == before + 1
+
     def test_mail_the_owner_sends_a_hidden_service_is_kept_too(self, world):
         me = world.person(name="Owner Sample", emails=["owner.sample@gmail.com"])
         person = world.service()
@@ -1535,6 +1656,24 @@ class TestGmailSync:
 
         self._run(world, [first, second])
         assert sum(pid == person.id for pid, _ in world.interactions()) == 2
+
+    def test_writing_to_someone_releases_their_skipped_mail_too(self, world):
+        me = world.person(name="Owner Sample", emails=["owner.sample@gmail.com"])
+        first = _email("m1", OWN_ADDRESS, "Jane Sample", bulk=True)
+        _, cache = self._run(world, [first], my_person_id=me.id)
+        assert cache.get_skipped_ids("personal") == {"m1"}
+        sent = _email("m2", "owner.sample@gmail.com", "Owner Sample", to=f"Jane Sample <{OWN_ADDRESS}>")
+        _, cache = self._run(world, [first, sent], my_person_id=me.id)
+        assert cache.get_skipped_ids("personal") == set()
+
+    def test_a_new_person_on_the_thread_releases_their_skipped_mail_too(self, world):
+        first = _email("m1", "pat.lee@gmail.com", "Pat Lee", bulk=True)
+        _, cache = self._run(world, [first])
+        assert cache.get_skipped_ids("personal") == {"m1"}
+        world.person(name="Jane Sample", emails=[OWN_ADDRESS])
+        thread = _email("m2", OWN_ADDRESS, "Jane Sample", to="Pat Lee <pat.lee@gmail.com>")
+        _, cache = self._run(world, [first, thread])
+        assert cache.get_skipped_ids("personal") == set()
 
     def test_releasing_mail_only_asks_gmail_for_that_address(self, world):
         from scripts.sync_gmail_calendar_interactions import _release_skipped_mail
@@ -1662,6 +1801,13 @@ class TestRepairScript:
         fell_short = self._section(world, "Kept: signals or one-way mail")
         assert short.canonical_name in fell_short and "organization_name" in fell_short
 
+    def test_review_of_circles_leaves_out_lower_ones(self, world):
+        high = world.service(relationship_strength=42.0, dunbar_circle=5)
+        low = world.service(name="Northwind Bank", emails=["service@northwindtrading.com"], dunbar_circle=7)
+        world.run()
+        reviewed = self._section(world, "Would hide, circles 0-5")
+        assert high.canonical_name in reviewed and low.canonical_name not in reviewed
+
     def test_review_samples_the_rest_at_random(self, world):
         for i in range(120):
             person = world.person(name=f"Acme Bank{i}", emails=[f"service{i}@acmewidgets.com"], dunbar_circle=7)
@@ -1690,6 +1836,8 @@ class TestRepairScript:
         new = world.service()
         same = world.service(name="Northwind Bank", emails=["service@northwindtrading.com"])
         kept_now = world.person(name="Jane Sample", emails=["jane.sample@gmail.com"])
+        bystander = world.person(name="Bystander Sample", emails=["bystander.sample@gmail.com"])
+        world.mail(bystander, address="bystander.sample@gmail.com")
         previous = tmp_path / "previous.json"
         previous.write_text(json.dumps([same.id, kept_now.id, "gone-now"]))
         world.mail(kept_now, address="jane.sample@gmail.com")
@@ -1698,6 +1846,7 @@ class TestRepairScript:
         assert new.canonical_name in added and same.canonical_name not in added
         removed = self._section(world, "Hidden last version, kept now (1)")
         assert kept_now.canonical_name in removed
+        assert "Bystander" not in removed
 
     def test_review_says_why_a_row_was_kept(self, world, tmp_path):
         protected = world.service(phone_numbers=["+15555550100"])
@@ -1750,6 +1899,12 @@ class TestRepairScript:
     def test_top_rank_on_a_small_crm_takes_everyone(self, world):
         world.person(name="Sample One", emails=[], relationship_strength=90.0)
         assert repair.top_rank_strength(world.crm_db) == 0.0
+
+    def test_a_kept_row_that_never_looked_like_a_service_is_not_near_the_line_for_protection(self, world):
+        real = world.person(name="Jane Sample", emails=["jane.sample@gmail.com"], phone_numbers=["+15555550100"])
+        world.mail(real, address="jane.sample@gmail.com")
+        protected, _ = repair.near_line(world.decisions())
+        assert protected == []
 
     def test_thinnest_protection_comes_first(self, world):
         thick = world.service(name="Northwind Bank", emails=["service@northwindtrading.com"], phone_numbers=["+15555550100"], tags=["x"])

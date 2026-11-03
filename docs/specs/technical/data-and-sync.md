@@ -631,8 +631,8 @@ A hidden service keeps its interactions and source entities, and Gmail and Calen
 keep adding to them, which also means its mail isn't fetched again every run.
 Its `hidden_reason` starts with `service sender: `, which consistency verification
 checks before removing interactions. Consistency verification and relationship
-discovery do remove its inferred relationships; discovery rebuilds them from the
-interactions after a restore. Gmail search reads Gmail directly, so nothing stops being
+discovery do remove its inferred relationships; discovery rebuilds what it still
+produces from the interactions after a restore. Gmail search reads Gmail directly, so nothing stops being
 searchable. `repair_service_senders.py --restore` shows the row again, unblocks its
 addresses, tags it `confirmed-person`, which keeps the nightly pass off it, and says what
 came back. iMessage, WhatsApp, and phone contact while hidden isn't recorded.
