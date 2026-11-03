@@ -1847,6 +1847,20 @@ class TestDeployPending:
 
         assert indexer.index_all(newest_first=True, light_pass=True) == 3
 
+    def test_indexer_asked_to_stop_removes_no_deleted_notes_and_a_later_run_does(self, indexer, vault, vector_store):
+        notes = [_write_note(vault, f"{i}.md", 1000 + i) for i in range(3)]
+        indexer.index_all(light_pass=True)
+        for note in notes:
+            note.unlink()
+        _write_note(vault, "keep.md", 5000)
+
+        indexer.index_all(light_pass=True, should_stop=lambda: True)
+        assert indexer.last_run["files_pruned"] == 0
+        assert indexer.last_run["files_remaining"] == 4
+
+        indexer.index_all(light_pass=True)
+        assert indexer.last_run["files_pruned"] == 3
+
     def test_a_deploy_gets_through_runs_that_follow_one_another(self, job, vault, vector_store, tmp_path, monkeypatch):
         """The job's runs follow one another with no gap and its backlog never
         empties. A deploy tick that finds the lock held leaves its marker; the
