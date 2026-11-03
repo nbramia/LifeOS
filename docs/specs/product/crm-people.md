@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** CRM
-**Last Updated:** 2026-11-02
+**Last Updated:** 2026-11-03
 
 People management: the list and detail views at `/crm`, the contact-source model behind entity splitting/merging, the relationship-strength score that drives ranking and Dunbar circles, and the multi-stage fact-extraction pipeline that surfaces memorable personal details.
 
@@ -232,6 +232,10 @@ Detail panel that slides in when a person is selected. Shows contact info (email
 Timeline, Connections, and Graph tabs are covered in their respective specs ([crm-interactions.md](crm-interactions.md), [crm-graph.md](crm-graph.md)).
 
 Beside First seen, Last seen and Category, the contact panel shows a "Past organizations" field when the person has any: each name, with the year it ended when known (`Old Firm (until 2019)`). `PATCH /api/crm/people/{id}` accepts `past_organizations` (a list of `{name, since, until}`) to replace the list by hand. See [data-model.md](data-model.md#current-and-past-organizations).
+
+### Lists
+
+With a bulk-content folder configured, the Overview tab has a **Check lists** button. It looks the person up through [`GET /api/crm/people/{id}/list-matches`](api-crm.md#get-apicrmpeopleidlist-matches) and shows each list's name and row, labelled as an exact email, an exact phone, or a name-only weaker match. Nothing is requested until the click. Being on a list doesn't affect a person's strength, circle, last-seen date or search rank.
 
 ### Tone card
 

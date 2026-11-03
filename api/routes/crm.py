@@ -17,9 +17,12 @@ import sqlite3
 import threading
 import time
 
-from fastapi import APIRouter, HTTPException, Query, UploadFile, File
+from fastapi import APIRouter, HTTPException, Query, Response, UploadFile, File
 from pydantic import BaseModel, Field
 
+from api.services.bm25_index import get_bm25_index
+from api.services.bulk_content import bulk_path_matcher
+from api.services.bulk_lookup import ListMatch, find_list_matches
 from api.services.meeting_source import fold_legacy_counts, migration_status, normalize_source_type
 from api.services.person_entity import PersonEntity, get_person_entity_store, compute_person_category
 from api.services.person_organizations import SOURCE_MANUAL, entry_error, normalize_entries, visible_past_organizations
@@ -650,6 +653,8 @@ class CRMConfigResponse(BaseModel):
     # Whether on-demand originals/previews from the Photos Mac are configured
     # (LIFEOS_PHOTOS_ORIGIN_SSH_HOST).
     photos_originals_enabled: bool = False
+    # Whether a bulk-content folder is configured, so the person page can offer a list lookup.
+    list_lookup_enabled: bool = False
 
 
 def _load_family_default_selected_ids() -> list[str]:
@@ -695,6 +700,7 @@ def get_crm_config():
         family_default_selected_ids=_load_family_default_selected_ids(),
         photos_enabled=settings.photos_enabled or settings.photos_thumbnails_available,
         photos_originals_enabled=settings.photos_originals_enabled,
+        list_lookup_enabled=bulk_path_matcher() is not None,
     )
 
 
@@ -2108,6 +2114,36 @@ def _fact_to_response(fact: PersonFact) -> PersonFactResponse:
         created_at=fact.created_at.isoformat() if fact.created_at else None,
         category_icon=FACT_CATEGORIES.get(fact.category, ""),
     )
+
+
+class ListMatchesResponse(BaseModel):
+    """Rows of bulk-content lists that match a person."""
+    matches: list[ListMatch]
+    truncated: bool
+
+
+@router.get("/people/{person_id}/list-matches", response_model=ListMatchesResponse)
+def get_person_list_matches(person_id: str, response: Response):
+    """
+    Look a person up in bulk-content lists, on request.
+
+    Finds rows by exact email or phone, then by exact full name as a weaker match. Nothing
+    is stored on the person, and rows are not logged or cached. A hidden person or a
+    merged-away id gets no matches, and an install with no bulk folder gets a 409.
+    """
+    response.headers["Cache-Control"] = "no-store"
+    is_bulk = bulk_path_matcher()
+    if is_bulk is None:
+        raise HTTPException(status_code=409, detail="No bulk-content folder is configured")
+    person_store = get_person_entity_store()
+    person = person_store.get_by_id_unresolved(person_id)
+    merged_away = person_store.get_canonical_id(person_id) != person_id
+    if not person and not merged_away:
+        raise HTTPException(status_code=404, detail=f"Person '{person_id}' not found")
+    if merged_away or person.hidden:
+        return ListMatchesResponse(matches=[], truncated=False)
+    matches, truncated = find_list_matches(person, get_bm25_index(), is_bulk)
+    return ListMatchesResponse(matches=matches, truncated=truncated)
 
 
 @router.get("/people/{person_id}/facts", response_model=PersonFactsResponse)

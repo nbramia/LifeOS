@@ -27,9 +27,11 @@ import re
 import logging
 from collections import Counter, defaultdict
 from datetime import datetime
-from typing import Optional, TYPE_CHECKING
+from typing import Callable, Optional, TYPE_CHECKING
 
 from config.settings import settings
+from api.services.bm25_index import file_path_of_doc_id
+from api.services.bulk_content import bulk_path_matcher
 from api.services.query_classifier import classify_query
 from api.services.perf_trace import trace_span
 from api.services.search_facets import SearchFacets, resolve_allowed_paths
@@ -40,6 +42,12 @@ if TYPE_CHECKING:
     from api.services.bm25_index import BM25Index
 
 logger = logging.getLogger(__name__)
+
+# Nearest chunks fetched when bulk content is in play. Chroma can't filter on a path
+# prefix, so the vector arm over-fetches and splits the result.
+BULK_VECTOR_FETCH = 400
+# Most of a result set that may be bulk chunks.
+BULK_RESULT_SHARE = 0.3
 
 
 def find_protected_indices(
@@ -355,6 +363,70 @@ def deduplicate_overlapping_chunks(results: list[dict]) -> list[dict]:
     return deduplicated
 
 
+def split_vector_candidates(
+    candidates: list[dict], is_bulk: Callable[[str], bool], top_k: int
+) -> tuple[list[dict], list[dict]]:
+    """
+    Split an over-fetched vector result into ordinary and bulk chunks.
+
+    The ordinary list is built as a plain search builds it: the same number of nearest
+    chunks, re-ranked by the same score.
+    """
+    from api.services.vectorstore import default_fetch_count
+
+    nearest = sorted(candidates, key=lambda r: r.get("semantic_score", 0.0), reverse=True)
+    ordinary = [r for r in nearest if not is_bulk(r.get("file_path", ""))][:default_fetch_count(top_k)]
+    ordinary.sort(key=lambda r: r.get("score", 0.0), reverse=True)
+    return ordinary[:top_k], [r for r in nearest if is_bulk(r.get("file_path", ""))]
+
+
+def _keyword_hit_as_result(hit: dict) -> dict:
+    path = file_path_of_doc_id(hit["doc_id"])
+    return {
+        **hit,
+        "id": hit["doc_id"],
+        "file_path": path,
+        "found_by": "bm25",
+        "metadata": {"file_name": hit["file_name"], "file_path": path, "source": path},
+    }
+
+
+def blend_bulk_results(
+    ordinary: list[dict],
+    keyword_hits: list[dict],
+    vector_hits: list[dict],
+    ordinary_has_exact_match: bool,
+    top_k: int,
+) -> list[dict]:
+    """
+    Add a bounded number of bulk chunks to ordinary results.
+
+    A chunk holding all of a query's terms when no ordinary note does leads. Other bulk
+    chunks only fill slots the ordinary results left empty. No boost applies to any of
+    them: an import date isn't recency, and a name in a list isn't about that person.
+
+    Args:
+        ordinary: Ordinary results, best first
+        keyword_hits: Bulk chunks from the keyword arm, best first
+        vector_hits: Bulk chunks from the vector arm, best first
+        ordinary_has_exact_match: Whether an ordinary note holds all of the query's terms
+        top_k: Size of the result set
+
+    Returns:
+        At most ``top_k`` results, at most ``BULK_RESULT_SHARE`` of them (at least one) bulk
+    """
+    bulk = [_keyword_hit_as_result(hit) for hit in keyword_hits] + [{**hit, "found_by": "vector"} for hit in vector_hits]
+    bulk = deduplicate_overlapping_chunks(bulk)
+    for result in bulk:
+        result["hybrid_score"] = 0.0
+    exact = [] if ordinary_has_exact_match else [r for r in bulk if r.get("match_mode") == "and"]
+    cap = max(1, int(top_k * BULK_RESULT_SHARE))
+    leading = exact[:cap]
+    kept = ordinary[:top_k - len(leading)]
+    room = min(cap - len(leading), top_k - len(leading) - len(kept))
+    return leading + kept + [r for r in bulk if r not in leading][:room]
+
+
 class HybridSearch:
     """
     Main search orchestrator combining vector and BM25 search.
@@ -413,6 +485,7 @@ class HybridSearch:
         date_from: str | None = None,
         date_to: str | None = None,
         facets: SearchFacets | None = None,
+        include_bulk: bool = True,
     ) -> list[dict]:
         """
         Perform hybrid search combining vector and BM25 with optional cross-encoder re-ranking.
@@ -440,6 +513,8 @@ class HybridSearch:
                 arms to the files that satisfy them (zero matching files
                 returns []). With ``facets.boost`` they instead multiply the
                 score of matching results by ``settings.search_facet_boost``.
+            include_bulk: False leaves bulk content out, for searches run
+                automatically about a person rather than asked for by anyone.
 
         Returns:
             List of dicts with id, content, file_path, file_name, hybrid_score
@@ -482,15 +557,32 @@ class HybridSearch:
             date_kwargs["date_to"] = date_to
         arm_kwargs.update(date_kwargs)
 
+        # Bulk chunks compete only among themselves. Facets that leave nothing but
+        # bulk files have asked for them, so those files rank as usual.
+        is_bulk = bulk_path_matcher()
+        if is_bulk and include_bulk and allowed_paths is not None and all(map(is_bulk, allowed_paths)):
+            is_bulk = None
+        bulk_vector: list[dict] = []
+        bulk_keyword: list[dict] = []
+
         # Get vector results (use expanded query for better semantic matching)
         with trace_span("search_vector", parent="tool_search_vault"):
             vector_store = self._get_vector_store()
             vector_kwargs = dict(date_kwargs)
             if allowed_paths is not None:
                 vector_kwargs["file_paths"] = sorted(allowed_paths)
-            vector_results = vector_store.search(
-                query=expanded_query, top_k=fetch_k, **vector_kwargs
-            )
+            if is_bulk:
+                vector_results, bulk_vector = split_vector_candidates(
+                    vector_store.search(
+                        query=expanded_query, top_k=BULK_VECTOR_FETCH, fetch_count=BULK_VECTOR_FETCH, **vector_kwargs
+                    ),
+                    is_bulk,
+                    fetch_k,
+                )
+            else:
+                vector_results = vector_store.search(
+                    query=expanded_query, top_k=fetch_k, **vector_kwargs
+                )
 
         # Fusion keys are normalized (vector_fusion_id) so a chunk found by
         # both vector and BM25 fuses into one RRF entry; the result dict's
@@ -511,10 +603,18 @@ class HybridSearch:
             bm25_doc_ids = []
             bm25_results_by_id = {}
             bm25_match_mode: str | dict = "none"
+            ordinary_has_exact_match = False
 
             if bm25_index:
                 try:
+                    if is_bulk:
+                        arm_kwargs["doc_filter"] = lambda doc_id: not is_bulk(doc_id)
                     bm25_results = bm25_index.search(expanded_query, limit=fetch_k, **arm_kwargs)
+                    ordinary_has_exact_match = any(r.get("match_mode") == "and" for r in bm25_results)
+                    # A bulk keyword hit could neither lead nor fill a slot here.
+                    if is_bulk and include_bulk and not (ordinary_has_exact_match and len(bm25_results) >= top_k):
+                        arm_kwargs["doc_filter"] = is_bulk
+                        bulk_keyword = bm25_index.search(expanded_query, limit=top_k, **arm_kwargs)
                     if bm25_results:
                         bm25_match_mode = dict(
                             Counter(r.get("match_mode") or "unknown" for r in bm25_results)
@@ -527,6 +627,11 @@ class HybridSearch:
                     bm25_match_mode = "error"
                     from api.services.service_health import record_degradation
                     record_degradation("bm25_index", "hybrid_search", "vector_only", "BM25 search failed")
+
+        def with_bulk(ordinary: list[dict]) -> list[dict]:
+            if not include_bulk:
+                return ordinary
+            return blend_bulk_results(ordinary, bulk_keyword, bulk_vector, ordinary_has_exact_match, top_k)
 
         # If no BM25 results, return vector results directly
         if not bm25_doc_ids:
@@ -547,6 +652,7 @@ class HybridSearch:
             vector_results = vector_results[:top_k]
             for r in vector_results:
                 r["found_by"] = "vector"
+            vector_results = with_bulk(vector_results)
             self._record_attribution(
                 query, top_k, len(vector_doc_ids), 0, bm25_match_mode, vector_results,
                 facet_names,
@@ -688,6 +794,7 @@ class HybridSearch:
             else:
                 final_results = final_results[:top_k]
 
+        final_results = with_bulk(final_results)
         self._record_attribution(
             query, top_k, len(vector_doc_ids), len(bm25_doc_ids),
             bm25_match_mode, final_results, facet_names,

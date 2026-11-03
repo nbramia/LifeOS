@@ -355,7 +355,8 @@ class BriefingsService:
         try:
             chunks = self.hybrid_search.search(
                 query=resolved,
-                top_k=15
+                top_k=15,
+                include_bulk=False,
             )
 
             for chunk in chunks:

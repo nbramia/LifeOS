@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-11-02
+**Last Updated:** 2026-11-03
 
 Every `/api/crm/*` HTTP endpoint. Split out of the main [api-reference.md](api-reference.md) because the CRM endpoint catalog is large enough to deserve its own file. For the consumer view of the CRM features these endpoints back, see the [CRM specs](crm-ui.md).
 
@@ -339,6 +339,16 @@ Dashboard stats (counts by category, source, strength distribution).
 
 ## Facts
 
+### GET /api/crm/people/{id}/list-matches
+
+Look a person up in bulk-content lists on request, through the keyword index: by exact email or phone, then by exact full name as a weaker match (`match_type` is `email`, `phone` or `name`). Nothing is stored or logged, the response is `Cache-Control: no-store`, and no chat turn or MCP tool calls it.
+
+```json
+{"matches": [{"list_name": "Example Donors 2020", "row": "Alex | Chen | alex.chen@example.com | $100", "match_type": "email"}], "truncated": false}
+```
+
+`row` is the run of filled cells around the match. At most 50 rows return, and `truncated` is true when more may exist. A hidden person or a merged-away id returns no matches. An unknown id is `404`, and an install with no bulk folder is `409`.
+
 ### GET /api/crm/people/{id}/facts
 
 Get extracted facts about a person (auto-extracted from interactions).
@@ -421,6 +431,7 @@ Summary for UI display.
 Get CRM configuration values for the frontend (owner person ID, work email domain, partner ID, family default selected IDs, `photos_enabled`). Reads from `LIFEOS_*` env vars — see [configuration.md](../../guides/configuration.md).
 
 **Response fields:**
+- `list_lookup_enabled` (bool): Whether a bulk-content folder is configured. The person page offers its list lookup only when true.
 - `photos_enabled` (bool): Whether Apple Photos is configured on this install. The frontend uses this to decide whether to request avatar/profile photos at all, gated the same as `has_profile_photo` on person list cards — see [crm-people.md](crm-people.md).
 
 ---
