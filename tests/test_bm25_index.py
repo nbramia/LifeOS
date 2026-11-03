@@ -327,3 +327,17 @@ class TestIntraWordJoiners:
     def test_leading_and_trailing_joiners_are_separators(self, bm25, query):
         assert bm25._extract_terms(query) == ["alpha"]
         assert bm25._sanitize_query(query) == '"alpha"'
+
+
+class TestAddDocumentReplace:
+    def test_default_replaces_an_existing_row(self, bm25):
+        bm25.add_document("doc1", "first version", "A.md")
+        bm25.add_document("doc1", "second version", "A.md")
+
+        assert bm25.count() == 1
+
+    def test_replace_false_skips_the_lookup_for_a_cleared_document(self, bm25):
+        bm25.add_document("doc1", "first version", "A.md")
+        bm25.add_document("doc1", "second version", "A.md", replace=False)
+
+        assert bm25.count() == 2

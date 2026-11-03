@@ -96,7 +96,8 @@ class BM25Index:
         content: str,
         file_name: str,
         people: Optional[list[str]] = None,
-        modified_date: Optional[str] = None
+        modified_date: Optional[str] = None,
+        replace: bool = True,
     ):
         """
         Add or update a document in the index.
@@ -108,16 +109,19 @@ class BM25Index:
             people: List of people mentioned
             modified_date: Document date (YYYY-MM-DD), used for recency ranking
                 and date-range filtering
+            replace: Delete any existing row with this doc_id first. That
+                lookup scans the whole table, so a caller that has just
+                cleared the document (``delete_by_path``) passes False.
         """
         people_str = " ".join(people) if people else ""
 
         conn = sqlite3.connect(self.db_path)
         try:
-            # Delete existing entry if present (for updates)
-            conn.execute(
-                "DELETE FROM chunks_fts WHERE doc_id = ?",
-                (doc_id,)
-            )
+            if replace:
+                conn.execute(
+                    "DELETE FROM chunks_fts WHERE doc_id = ?",
+                    (doc_id,)
+                )
             # Insert new entry
             conn.execute(
                 "INSERT INTO chunks_fts (doc_id, content, file_name, people) VALUES (?, ?, ?, ?)",
