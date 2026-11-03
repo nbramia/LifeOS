@@ -1,0 +1,51 @@
+# Generic descriptions of the kind "who do I know in ...". One per line; blank
+# lines and lines starting with # are ignored. Generic occupations and fields
+# only: no names, employers or places.
+fundraising
+pediatric dentist
+real estate lawyer
+who do I know in venture capital
+someone who works in education
+software engineer
+accountant
+financial advisor
+architect
+nonprofit board
+public relations
+journalist
+graphic designer
+physician
+veterinarian
+mortgage broker
+insurance agent
+recruiter
+marketing agency
+photography
+contractor for home renovation
+school principal
+university professor
+product manager
+data scientist
+cybersecurity
+healthcare administrator
+restaurant owner
+consultant
+attorney
+patent
+pharmacist
+nutritionist
+personal trainer
+youth sports coach
+church or ministry
+film production
+musician
+event planning
+logistics and shipping
+manufacturing
+energy and utilities
+government affairs
+policy research
+biotech
+travel agent
+interior design
+tax preparation

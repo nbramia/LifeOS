@@ -500,6 +500,16 @@ class VectorStore:
                     paths.add(meta["file_path"])
         return paths
 
+    def iter_documents(self, batch_size: int = 500):
+        """Yield the text of every chunk, a batch at a time."""
+        offset = 0
+        while True:
+            documents = self._collection.get(include=["documents"], limit=batch_size, offset=offset)["documents"]
+            if not documents:
+                return
+            yield from documents
+            offset += len(documents)
+
     def sample_file_paths(self, limit: int = 5) -> list[str]:
         """Return up to `limit` distinct indexed *vault* file paths, without
         scanning the whole collection. Used by the vault_search

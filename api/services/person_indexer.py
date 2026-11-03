@@ -472,6 +472,14 @@ def _descriptive_lines(document: str) -> str:
     return "\n".join(lines)
 
 
+def has_descriptive_content(document: str) -> bool:
+    """Whether a profile says something about who the person is beyond other names for them."""
+    return any(
+        line and not line.startswith("Also known as")
+        for line in _descriptive_lines(document).splitlines()
+    )
+
+
 def find_people_by_description(query: str, top_k: int = 5) -> list[DescriptionMatch]:
     """
     Find people whose profile fits a description such as "who do I know in fundraising".
