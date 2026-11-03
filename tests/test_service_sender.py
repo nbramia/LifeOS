@@ -220,6 +220,10 @@ class TestAPersonsOwnAddress:
         address = address.replace("janesample", "stevenrosson") if address.startswith("sr") else address
         assert verdict(name, address).own_addresses == (address,)
 
+    def test_a_plus_tag_does_not_hide_a_personal_local_part(self):
+        assert verdict("Jane Sample", "hello+tag@janesample.com", 3, thread=2).own_addresses
+        assert verdict("Jane Sample", "me+tag@janesample.com").own_addresses
+
     def test_history_makes_any_local_part_on_their_own_site_theirs(self):
         assert verdict("Jane Sample", "desk@janesample.com", 4, thread=16).own_addresses
         assert not verdict("Jane Sample", "desk@janesample.com", 4).own_addresses
@@ -289,6 +293,7 @@ class TestAReplyCounts:
         ("Northwind Finance", "ar@northwind.com"),
         ("Sam from Acme", "ar@acme.com"),
         ("Acme® Card", "ar@northwind.com"),
+        ("Dana (Elsewhere)", "ar@northwind.com"),
     ])
     def test_not_a_company_name_on_an_address_without_a_person(self, name, address):
         assert not verdict(name, address, 11, sent_to={address: 4}).wrote_to_own_address
@@ -315,6 +320,10 @@ class TestAListWithAStrayAddress:
     def test_a_list_host_outweighs_an_address_naming_no_one(self):
         addresses = {"progressive-exchange@googlegroups.com": 2, "discuss@progressiveexchange.org": 1}
         assert verdict("Progressive Exchange", addresses, 0, thread=3).reason == "automated_address"
+
+    def test_their_own_mailbox_keeps_them_in_play_whatever_it_spells(self):
+        addresses = {"newsletter@northwindtrading.com": 6, "someone@gmail.com": 4}
+        assert verdict("Jane Sample", addresses, 9).reason == "own_address"
 
     def test_an_address_naming_someone_keeps_them_in_play(self):
         addresses = {"newsletter@northwindtrading.com": 6, "jane@janes-letter.com": 4}
@@ -406,8 +415,9 @@ class TestJudgedPerAddress:
         addresses = {"jane.sample@gmail.com": 2, "events@acmewidgets.com": 8}
         assert not verdict("Jane Sample", addresses, 10, sent_to={"events@acmewidgets.com": 1}).wrote_to_own_address
 
-    def test_a_sent_message_with_no_recorded_address_counts_for_a_row_with_an_own_one(self):
+    def test_a_sent_message_with_no_recorded_address_goes_by_the_rows_addresses(self):
         assert verdict("Jane Sample", OWN_ADDRESS, 1, sent_to={"": 1}).wrote_to_own_address
+        assert verdict("Robert Sample", "bob@northwind.com", 20, sent_to={"": 1}).wrote_to_own_address
         assert not verdict(SERVICE_NAME, SERVICE_ADDRESS, 1, sent_to={"": 1}).wrote_to_own_address
 
 

@@ -454,9 +454,11 @@ def classify_sender(evidence: SenderEvidence) -> SenderVerdict:
     own = tuple(a for a, s in shapes.items() if _is_own_address(s, evidence, names))
     enough_checked = evidence.checked >= min(evidence.received, BULK_MIN_CHECKED) and evidence.checked
     bulk_mail = bool(enough_checked and evidence.bulk / evidence.checked >= BULK_MIN_SHARE)
+    # A sent message with no recorded recipient went to one of the row's addresses.
     wrote_to_own = any(
-        (address == "" and own) or (address and _reply_counts(address_shape(address), evidence, names, bulk_mail))
+        _reply_counts(shape, evidence, names, bulk_mail)
         for address in evidence.sent_to
+        for shape in (shapes.values() if address == "" else [address_shape(address)])
     )
 
     def verdict(is_service: bool, reason: str) -> SenderVerdict:
