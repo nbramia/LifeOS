@@ -1,5 +1,5 @@
 [Unit]
-Description=LifeOS vault index job — indexes changed notes, newest first, without LLM summaries
+Description=LifeOS vault index job — indexes changed notes, ordinary notes first and each newest first, without LLM summaries
 After=network.target lifeos-chromadb.service
 
 [Service]
@@ -11,7 +11,8 @@ Environment=LIFEOS_HEADLESS=true
 ExecStart=__VENV__/bin/python __LIFEOS_DIR__/scripts/vault_index_job.py --execute
 # Shorter than the nightly reindex's wait for the vault index lock
 # (LIFEOS_VAULT_INDEX_LOCK_WAIT_SECONDS), so a stuck run is killed, and its lock
-# released, before that wait runs out. Progress is saved as it goes.
+# released, before that wait runs out. The job ends itself after
+# LIFEOS_VAULT_INDEX_TIME_BUDGET_SECONDS, well below this. Progress is saved as it goes.
 TimeoutStartSec=1200
 # The same containment as lifeos-sync.service: a runaway embedding run dies
 # inside its own cgroup rather than freezing the host.

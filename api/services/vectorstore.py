@@ -28,6 +28,9 @@ TAG_KEY_PREFIX = "tag:"
 # A ``file_path $in`` list is split into batches of this many paths so no
 # single query carries an oversized parameter list.
 FILE_PATH_BATCH = 2000
+
+# Records per write when the client does not report the server's own limit.
+FALLBACK_WRITE_BATCH = 1000
 # ``modified_day`` value of a chunk whose ``modified_date`` cannot be parsed;
 # date windows keep such chunks, matching the undated-passes contract.
 UNDATED_DAY = -1_000_000
@@ -131,6 +134,39 @@ class VectorStore:
         parts = url.replace("http://", "").replace("https://", "").split(":")
         return int(parts[1]) if len(parts) > 1 else 8000
 
+    def _write_batch_size(self) -> int:
+        """Most records one write may carry: the server's limit, or a safe default."""
+        size = getattr(self, "_reported_write_batch", None)
+        if size is None:
+            try:
+                size = int(self._client.get_max_batch_size())
+            except Exception:
+                size = 0
+            if size <= 0:
+                size = FALLBACK_WRITE_BATCH
+            self._reported_write_batch = size
+        return size
+
+    def _add_in_batches(self, ids, embeddings, documents, metadatas, replacing: frozenset = frozenset()) -> None:
+        """Add records in batches within the server's limit.
+
+        ``replacing`` names ids already stored: each batch removes its own before
+        adding, since an upsert would merge old metadata keys into the new record.
+        """
+        size = self._write_batch_size()
+        for start in range(0, len(ids), size):
+            end = start + size
+            batch_ids = ids[start:end]
+            old = [chunk_id for chunk_id in batch_ids if chunk_id in replacing]
+            if old:
+                self._collection.delete(ids=old)
+            self._collection.add(
+                ids=batch_ids,
+                embeddings=embeddings[start:end],
+                documents=documents[start:end],
+                metadatas=metadatas[start:end],
+            )
+
     def add_document(
         self,
         chunks: list[dict],
@@ -145,7 +181,10 @@ class VectorStore:
         """
         if not chunks:
             return
+        self._add_in_batches(*self._prepare_records(chunks, metadata))
 
+    def _prepare_records(self, chunks: list[dict], metadata: dict) -> tuple[list, list, list, list]:
+        """Embed ``chunks`` and return the ``ids, embeddings, documents, metadatas`` to write."""
         ids = []
         embeddings = []
         documents = []
@@ -188,13 +227,7 @@ class VectorStore:
                     chunk_meta.setdefault(tag_key(str(tag)), True)
             metadatas.append(chunk_meta)
 
-        # Add to collection
-        self._collection.add(
-            ids=ids,
-            embeddings=embeddings,
-            documents=documents,
-            metadatas=metadatas
-        )
+        return ids, embeddings, documents, metadatas
 
     def _calculate_recency_score(self, modified_date: str, note_type: str = "") -> float:
         """
@@ -475,16 +508,30 @@ class VectorStore:
         metadata: dict
     ) -> None:
         """
-        Update a document by deleting old chunks and adding new ones.
+        Replace a document's chunks.
+
+        Embedding comes first, so a failure there leaves the document as it was.
+        The write then goes batch by batch within the server's limit, each batch
+        overwriting its own stored chunks, and stored chunks absent from the new
+        text are deleted last. A failure part-way leaves the batches already
+        written as new text, the one in flight possibly missing and the rest as
+        stored; the index state does not record the note, so a retry converges.
 
         Args:
             chunks: New chunks
             metadata: Updated metadata
         """
-        # Delete existing chunks
-        self.delete_document(metadata["file_path"])
-        # Add new chunks
-        self.add_document(chunks, metadata)
+        file_path = metadata["file_path"]
+        if not chunks:
+            self.delete_document(file_path)
+            return
+        ids, embeddings, documents, metadatas = self._prepare_records(chunks, metadata)
+        existing = self._collection.get(where={"file_path": file_path}, include=[])["ids"]
+        self._add_in_batches(ids, embeddings, documents, metadatas, replacing=frozenset(existing))
+        kept = set(ids)
+        stale = [chunk_id for chunk_id in existing if chunk_id not in kept]
+        if stale:
+            self._collection.delete(ids=stale)
 
     def get_document_count(self) -> int:
         """Get total number of chunks in the store."""

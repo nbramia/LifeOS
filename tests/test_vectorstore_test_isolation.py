@@ -132,3 +132,59 @@ def test_marker_opts_a_test_out_of_the_guard():
         # Would raise pytest.fail.Exception without the marker above.
         store = VectorStore(collection_name="lifeos_vault")
         assert store.collection_name == "lifeos_vault"
+
+
+@pytest.mark.unit
+def test_fast_unit_test_cannot_open_a_chroma_server_connection(tmp_path):
+    """A throwaway collection name still opens a real connection to the server
+    on the default port, which on the maintainer's host holds the live index."""
+    import chromadb
+
+    from api.services.vectorstore import VectorStore
+
+    with pytest.raises(pytest.fail.Exception, match="ChromaDB server connection"):
+        chromadb.HttpClient(host="localhost", port=1)
+    with pytest.raises(pytest.fail.Exception, match="ChromaDB server connection"):
+        VectorStore(collection_name="synthetic_throwaway_collection")
+
+
+@pytest.mark.unit
+def test_bare_indexer_service_cannot_connect_to_a_server(tmp_path):
+    from api.services.indexer import IndexerService
+
+    with pytest.raises(pytest.fail.Exception, match="ChromaDB server connection"):
+        IndexerService(vault_path=str(tmp_path / "vault"), db_path=str(tmp_path / "db"))
+
+
+@pytest.mark.unit
+def test_in_process_chroma_still_works_under_the_refusal():
+    import chromadb
+
+    client = chromadb.EphemeralClient()
+    assert client.get_max_batch_size() > 0
+
+
+@pytest.mark.unit
+@pytest.mark.uses_live_vectorstore
+def test_opt_out_marker_leaves_the_client_alone():
+    import chromadb
+
+    assert chromadb.HttpClient.__name__ == "HttpClient"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "marker_names, in_lane",
+    [
+        ({"unit"}, True),
+        ({"unit", "slow"}, False),
+        ({"unit", "integration"}, False),
+        ({"unit", "requires_server"}, False),
+        ({"slow"}, False),
+        (set(), False),
+    ],
+)
+def test_refusal_applies_to_the_fast_unit_lane_only(marker_names, in_lane):
+    from tests.conftest import runs_in_fast_unit_lane
+
+    assert runs_in_fast_unit_lane(marker_names) is in_lane

@@ -124,7 +124,7 @@ class IndexerService:
     # Budgets are measured on this clock.
     _clock = staticmethod(time.monotonic)
     # What the latest index_all did beyond its return value.
-    last_run: dict = {"files_pruned": 0, "files_remaining": 0, "stopped_early": False}
+    last_run: dict = {"files_pruned": 0, "files_remaining": 0, "files_skipped_large": 0, "stopped_early": False}
 
     def __init__(
         self,
@@ -231,7 +231,27 @@ class IndexerService:
 
         return sorted(files, key=lambda item: (is_bulk(item[0]), -item[1]))
 
-    def scan_changes(self, compare_tags: bool = True) -> dict:
+    @staticmethod
+    def _split_oversized(
+        files: list[tuple[str, float]], max_file_bytes: int | None
+    ) -> tuple[list[tuple[str, float]], int]:
+        """Split off files larger than ``max_file_bytes``; return the rest and how many were split off.
+
+        A file that cannot be measured is kept, so its failure surfaces when it is indexed.
+        """
+        if not max_file_bytes:
+            return files, 0
+        kept = []
+        for item in files:
+            try:
+                oversized = os.path.getsize(item[0]) > max_file_bytes
+            except OSError:
+                oversized = False
+            if not oversized:
+                kept.append(item)
+        return kept, len(files) - len(kept)
+
+    def scan_changes(self, compare_tags: bool = True, max_file_bytes: int | None = None) -> dict:
         """Report what an incremental ``index_all`` would do, changing nothing.
 
         Needs no vector store or BM25, so a caller can learn that there is no
@@ -241,19 +261,24 @@ class IndexerService:
             compare_tags: If False, ignore tag phrases and compare modification
                 times only. For a caller that has no tag store to read: treating
                 every note as untagged would report each tagged one as changed.
+            max_file_bytes: Leave out changed notes larger than this, as
+                ``index_all`` does. None or 0 leaves out none.
 
         Returns:
-            Dict with ``to_index`` (newest modification time first), ``deleted``
-            and ``file_count``.
+            Dict with ``to_index`` (newest modification time first), ``deleted``,
+            ``file_count`` and ``skipped_large`` (how many changed notes
+            ``max_file_bytes`` left out).
         """
         index_state = self._load_index_state()
         files_to_index, deleted_files, _tag_key, file_count = self._find_changes(
             index_state, force=False, compare_tags=compare_tags
         )
+        files_to_index, skipped_large = self._split_oversized(files_to_index, max_file_bytes)
         return {
             "to_index": [path for path, _ in sorted(files_to_index, key=lambda item: item[1], reverse=True)],
             "deleted": sorted(deleted_files),
             "file_count": file_count,
+            "skipped_large": skipped_large,
         }
 
     def _find_changes(self, index_state: dict, force: bool, compare_tags: bool = True) -> tuple[list, set, dict, int]:
@@ -317,6 +342,7 @@ class IndexerService:
         newest_first: bool = False,
         light_pass: bool = False,
         max_deletions: int | None = None,
+        max_file_bytes: int | None = None,
     ) -> int:
         """
         Index markdown files in the vault.
@@ -324,7 +350,7 @@ class IndexerService:
         Uses incremental indexing by default - only indexes files that have
         changed since the last index run. Use force=True to reindex everything.
 
-        Progress is saved incrementally every 50 files, so crashes don't lose work.
+        Progress is saved every 10 files, or after every file on a light pass, so crashes don't lose work.
 
         With a time budget the run stops between files once it is spent, and
         ends normally. A file counts as done only when the saved state says so,
@@ -345,6 +371,11 @@ class IndexerService:
                 a later run retries it.
             max_deletions: Remove at most this many deleted files from the index,
                 leaving the rest for a later run.
+            max_file_bytes: Leave changed files larger than this for a run that
+                sets no limit. They are dropped before ``max_files`` counts, so
+                they take no slot from smaller files, and they are not part of
+                ``files_remaining``; ``last_run`` reports how many in
+                ``files_skipped_large``. None or 0 sets no limit.
 
         Returns:
             Number of files indexed
@@ -403,6 +434,7 @@ class IndexerService:
             files_to_index = self._ordered_for_budget(files_to_index)
         elif newest_first:
             files_to_index = sorted(files_to_index, key=lambda item: item[1], reverse=True)
+        files_to_index, skipped_large = self._split_oversized(files_to_index, max_file_bytes)
         files_changed = len(files_to_index)
         if max_files is not None and files_changed > max_files:
             logger.info(f"Indexing {max_files} of {files_changed} changed files this run; the rest wait for a later run")
@@ -435,9 +467,11 @@ class IndexerService:
                     tag_keys[file_path] = current_tag_key[file_path]
                 count += 1
 
-                # Save progress and clean up memory periodically
-                if count % save_interval == 0:
+                # A light pass saves after every file, so a killed run loses only
+                # the note in progress. Cleanup stays periodic.
+                if light_pass or count % save_interval == 0:
                     self._save_index_state(index_state)
+                if count % save_interval == 0:
                     gc.collect()  # Prevent memory bloat during long indexing runs
                     try:
                         import torch
@@ -459,6 +493,7 @@ class IndexerService:
         self.last_run = {
             "files_pruned": pruned,
             "files_remaining": files_remaining,
+            "files_skipped_large": skipped_large,
             "stopped_early": stopped_early,
         }
         if stopped_early and deadline is not None:
