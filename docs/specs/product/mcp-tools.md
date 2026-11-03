@@ -507,7 +507,7 @@ Get comprehensive CRM profile for a person including all contact info, relations
 |------|------|----------|-------------|
 | person_id | string | Yes | Entity ID from lifeos_people_search |
 
-**Returns:** Full profile with emails, phones, company, relationship_strength, tags, notes, and interaction counts.
+**Returns:** Full profile with emails, phones, company, past organizations, relationship_strength, tags, notes, and interaction counts.
 
 ### lifeos_person_facts
 

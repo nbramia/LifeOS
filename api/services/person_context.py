@@ -33,6 +33,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Callable, Iterator, Optional
 
+from api.services.person_organizations import format_past_organizations, visible_past_organizations
 from config.relationship_weights import (
     CLEARLY_CLOSER_MIN_STRENGTH_LEAD,
     CLOSE_RELATIONSHIP_MIN_STRENGTH,
@@ -433,6 +434,12 @@ def format_person_profile(entity, fact_limit: int, offbox: bool = False) -> str:
     role = _offbox_role(entity) if offbox else " — ".join(filter(None, [entity.position, entity.company]))
     if role:
         parts.append(f"Role: {role}")
+    past_entries = visible_past_organizations(entity.past_organizations, entity.company)
+    if offbox:
+        past_entries = [{**e, "name": _scrub_identifiers(e["name"])} for e in past_entries]
+    past = format_past_organizations(past_entries, None)
+    if past:
+        parts.append(f"Previously worked at: {past}")
 
     # Relationship summary
     rel = get_relationship_summary(entity.id)

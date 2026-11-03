@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 
 from api.services.meeting_source import fold_legacy_counts, migration_status, normalize_source_type
 from api.services.person_entity import PersonEntity, get_person_entity_store, compute_person_category
+from api.services.person_organizations import SOURCE_MANUAL, entry_error, normalize_entries, visible_past_organizations
 from api.services.interaction_store import get_interaction_store
 from api.services.aggregate_cache import cached_aggregate
 from config.people_config import InteractionConfig
@@ -204,6 +205,8 @@ def _search_matches(query: str, person) -> bool:
         return True
     if person.company and q_lower in person.company.lower():
         return True
+    if any(q_lower in org["name"].lower() for org in visible_past_organizations(person.past_organizations, person.company)):
+        return True
 
     return False
 
@@ -250,6 +253,7 @@ class PersonDetailResponse(BaseModel):
     phone_numbers: list[str] = []
     company: Optional[str] = None
     position: Optional[str] = None
+    past_organizations: list[dict] = []  # name, source, since, until
     linkedin_url: Optional[str] = None
     category: str = "unknown"
     vault_contexts: list[str] = []
@@ -458,6 +462,7 @@ class PersonUpdateRequest(BaseModel):
     category: Optional[str] = None
     birthday: Optional[str] = None  # "MM-DD" format (month-day only), empty string to clear
     display_name: Optional[str] = None
+    past_organizations: Optional[list[dict]] = None  # name, since, until; replaces the whole list
 
 
 class PersonMergeRequest(BaseModel):
@@ -590,6 +595,7 @@ def _person_to_detail_response(
         phone_numbers=person.phone_numbers,
         company=person.company,
         position=person.position,
+        past_organizations=visible_past_organizations(person.past_organizations, person.company),
         linkedin_url=person.linkedin_url,
         category=computed_category,
         vault_contexts=person.vault_contexts,
@@ -952,6 +958,15 @@ def update_person(person_id: str, request: PersonUpdateRequest):
         if name:
             person.display_name = name
             person.canonical_name = name
+
+    if request.past_organizations is not None:
+        for index, org in enumerate(request.past_organizations):
+            if error := entry_error(org):
+                raise HTTPException(status_code=422, detail=f"past_organizations[{index}]: {error}")
+        # An edit replaces the whole list and marks every entry as entered by hand.
+        person.past_organizations = normalize_entries(
+            {**org, "source": SOURCE_MANUAL} for org in request.past_organizations
+        )
 
     if request.birthday is not None:
         if request.birthday == "":

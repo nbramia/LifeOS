@@ -1,0 +1,11 @@
+# Questions about where people work or used to work, one per line; blank lines and
+# lines starting with # are ignored. Every organization is a synthetic placeholder:
+# real ones belong in a private file outside the repo.
+who do I know at Example Co
+who used to work at Example Co
+anyone at Sample Labs
+who has worked at Sample Labs
+who do I know at Placeholder Foundation
+who used to work at Placeholder Foundation
+people at Fictional Partners
+former Fictional Partners employees

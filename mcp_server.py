@@ -2317,6 +2317,12 @@ class LifeOSMCPServer:
                 text += f"**Company:** {company}\n"
             if position := data.get("position"):
                 text += f"**Position:** {position}\n"
+            if past := [
+                f"{org['name']} (until {org['until'][:4]})" if org.get("until") else org["name"]
+                for org in data.get("past_organizations") or []
+                if org.get("name")
+            ]:
+                text += f"**Past organizations:** {', '.join(past)}\n"
             if linkedin := data.get("linkedin_url"):
                 text += f"**LinkedIn:** {linkedin}\n"
             text += f"**Relationship Strength:** {data.get('relationship_strength', 0):.0f}/100\n"

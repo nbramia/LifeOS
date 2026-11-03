@@ -481,6 +481,10 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True, resum
             stats['tags_merged'] += 1
             logger.info(f"   + Tag: {tag}")
 
+    # Merge past organizations (the upsert below writes the combined list)
+    from api.services.person_organizations import normalize_entries
+    primary.past_organizations = normalize_entries([*primary.past_organizations, *secondary.past_organizations])
+
     # Merge notes (concatenate with separator if both have content)
     stats['notes_merged'] = 0
     if secondary.notes and secondary.notes.strip():

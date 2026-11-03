@@ -175,6 +175,35 @@ class TestFactsSurviveMerge:
         assert _owned(env, PRIMARY) == {("work", "role"): ("secondary role", True)}
 
 
+class TestPastOrganizationsSurviveMerge:
+    """A real merge carries both people's lists to the primary."""
+
+    def _entry(self, name, source="linkedin_profile"):
+        return {"name": name, "source": source, "since": None, "until": None}
+
+    def _give(self, env, person_id, *entries):
+        person = env["people"].get_by_id(person_id)
+        person.past_organizations = list(entries)
+        env["people"].update(person)
+
+    def test_both_lists_end_up_on_the_primary_once(self, env):
+        self._give(env, PRIMARY, self._entry("Primary Org"), self._entry("Shared Org"))
+        self._give(env, SECONDARY, self._entry("Secondary Org", "manual"), self._entry("Shared Org"))
+        _merge()
+        merged = env["people"].get_by_id(PRIMARY).past_organizations
+        assert sorted(e["name"] for e in merged) == ["Primary Org", "Secondary Org", "Shared Org"]
+
+    def test_a_secondary_list_moves_to_a_primary_that_had_none(self, env):
+        self._give(env, SECONDARY, self._entry("Secondary Org"))
+        _merge()
+        assert [e["name"] for e in env["people"].get_by_id(PRIMARY).past_organizations] == ["Secondary Org"]
+
+    def test_a_dry_run_changes_nothing(self, env):
+        self._give(env, SECONDARY, self._entry("Secondary Org"))
+        _merge(dry_run=True)
+        assert env["people"].get_by_id(PRIMARY).past_organizations == []
+
+
 class TestCollisionRule:
     """Both people hold a fact for the same (category, key)."""
 

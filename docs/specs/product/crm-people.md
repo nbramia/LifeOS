@@ -34,7 +34,7 @@ See [crm-ui.md](crm-ui.md) for the CRM index and the sibling specs that cover in
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `q` | string | Search query (name, email, company) |
+| `q` | string | Search query (name, email, company, past organization) |
 | `category` | string | Filter by category: `work`, `personal`, `family` |
 | `source` | string | Filter by source: `gmail`, `calendar`, `linkedin`, etc. |
 | `sort` | string | Sort field: `name`, `last_seen`, `interaction_count`, `strength` |
@@ -57,6 +57,7 @@ Default sort is by `relationship_strength` descending.
       "phone_numbers": ["+15550123"],
       "company": null,
       "position": null,
+      "past_organizations": [],
       "category": "personal",
       "sources": ["phone_contacts", "gmail", "calendar", "imessage"],
       "interaction_count": 847,
@@ -92,6 +93,9 @@ Returns full PersonEntity fields including emails, phones, vault contexts, tags,
   "emails": ["alex.chen@example.com"],
   "phone_numbers": ["+15550123"],
   "company": null,
+  "past_organizations": [
+    {"name": "Old Firm", "source": "linkedin_profile", "since": "2018", "until": "2019-04"}
+  ],
   "category": "personal",
   "vault_contexts": ["Personal/Relationship/"],
   "tags": [],
@@ -226,6 +230,8 @@ Detail panel that slides in when a person is selected. Shows contact info (email
 ```
 
 Timeline, Connections, and Graph tabs are covered in their respective specs ([crm-interactions.md](crm-interactions.md), [crm-graph.md](crm-graph.md)).
+
+Beside First seen, Last seen and Category, the contact panel shows a "Past organizations" field when the person has any: each name, with the year it ended when known (`Old Firm (until 2019)`). `PATCH /api/crm/people/{id}` accepts `past_organizations` (a list of `{name, since, until}`) to replace the list by hand. See [data-model.md](data-model.md#current-and-past-organizations).
 
 ### Tone card
 

@@ -19,6 +19,7 @@ from api.services.vectorstore import VectorStore
 from api.services.person_entity import PersonEntity, get_person_entity_store
 from api.services.relationship_summary import get_relationship_summary, RelationshipSummary
 from api.services.person_facts import get_person_fact_store
+from api.services.person_organizations import format_past_organizations
 from config.relationship_weights import MIN_STRENGTH_FOR_INDEX, STRENGTH_DESCRIPTION_BANDS
 
 logger = logging.getLogger(__name__)
@@ -153,6 +154,9 @@ def generate_person_document(person: PersonEntity, summary: RelationshipSummary)
             parts.append(f"Works at {person.company} as {person.position}")
         else:
             parts.append(f"Works at {person.company}")
+    past = format_past_organizations(person.past_organizations, person.company)
+    if past:
+        parts.append(f"Previously worked at {past}")
 
     # Communication channels
     if summary.channels:
@@ -467,7 +471,7 @@ def _descriptive_lines(document: str) -> str:
     for line in document.splitlines()[1:]:
         if line.startswith("## "):
             in_facts = line.startswith("## Known Facts")
-        elif in_facts or line.startswith(("Works at", "Tags:", "Notes:", "Also known as")):
+        elif in_facts or line.startswith(("Works at", "Previously worked at", "Tags:", "Notes:", "Also known as")):
             lines.append(line)
     return "\n".join(lines)
 

@@ -82,6 +82,8 @@ class PersonEntity:
     company: Optional[str] = None
     position: Optional[str] = None
     linkedin_url: Optional[str] = None
+    # Organizations they were with before (see person_organizations.py)
+    past_organizations: list[dict] = field(default_factory=list)
 
     # Context
     category: str = "unknown"  # work, personal, family
@@ -411,6 +413,7 @@ class PersonEntity:
         data.setdefault("dunbar_circle", None)
         # Handle birthday field (default to None)
         data.setdefault("birthday", None)
+        data["past_organizations"] = list(data.get("past_organizations") or [])
         return cls(**data)
 
     @classmethod
@@ -513,6 +516,7 @@ class PersonEntityStore:
         "related_notes", "aliases", "phone_numbers", "phone_primary", "confidence_score",
         "tags", "notes", "source_entity_count", "birthday", "hidden", "hidden_at",
         "hidden_reason", "relationship_strength", "is_peripheral_contact", "dunbar_circle",
+        "past_organizations",
     )
     _PLACEHOLDERS = ", ".join(["?"] * len(_COLUMNS))
     _COLUMNS_STR = ", ".join(_COLUMNS)
@@ -626,6 +630,10 @@ class PersonEntityStore:
                 conn.execute("ALTER TABLE person_entities ADD COLUMN photo_count INTEGER NOT NULL DEFAULT 0")
             except sqlite3.OperationalError:
                 pass  # Column already exists
+            try:
+                conn.execute("ALTER TABLE person_entities ADD COLUMN past_organizations TEXT NOT NULL DEFAULT '[]'")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
             conn.commit()
         finally:
             conn.close()
@@ -705,6 +713,7 @@ class PersonEntityStore:
             entity._relationship_strength,
             1 if entity.is_peripheral_contact else 0,
             entity.dunbar_circle,
+            json.dumps(entity.past_organizations),
         )
 
     def _row_to_entity(self, row: sqlite3.Row) -> PersonEntity:
@@ -712,7 +721,7 @@ class PersonEntityStore:
         data = dict(row)
         # Parse JSON list fields
         for list_field in ('emails', 'vault_contexts', 'sources', 'related_notes',
-                           'aliases', 'phone_numbers', 'tags'):
+                           'aliases', 'phone_numbers', 'tags', 'past_organizations'):
             val = data.get(list_field)
             data[list_field] = json.loads(val) if val else []
         data['sources'] = normalize_sources(data['sources'])

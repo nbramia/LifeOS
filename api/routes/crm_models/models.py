@@ -75,6 +75,7 @@ class PersonDetailResponse(BaseModel):
     phone_numbers: list[str] = []
     company: Optional[str] = None
     position: Optional[str] = None
+    past_organizations: list[dict] = []  # name, source, since, until
     linkedin_url: Optional[str] = None
     category: str = "unknown"
     vault_contexts: list[str] = []
@@ -110,6 +111,7 @@ class PersonUpdateRequest(BaseModel):
     tags: Optional[list[str]] = None
     category: Optional[str] = None
     birthday: Optional[str] = None  # "MM-DD" format (month-day only), empty string to clear
+    past_organizations: Optional[list[dict]] = None  # name, since, until; replaces the whole list
 
 
 class PersonMergeRequest(BaseModel):

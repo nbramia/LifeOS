@@ -357,6 +357,7 @@ class TestStoreNeverWritesIt:
             emails=["updated@example.test"],
             company="Updated Co",
             position="Updated Role",
+            past_organizations=[{"name": "Updated Past Org", "source": "manual", "since": None, "until": None}],
             linkedin_url="https://example.test/updated",
             category="work",
             vault_contexts=["Work/"],
