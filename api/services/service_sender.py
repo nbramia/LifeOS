@@ -3,13 +3,20 @@ Decide whether an email sender is a service or newsletter rather than a person.
 
 classify_sender weighs a sender's address shape, name shape, and mail. It sees one
 message for a sender no one has met, or a whole history for a person in the CRM.
+The line it draws is a person's own address: a mailbox provider, their own site, or
+a local part carrying their name. A role mailbox is a service even when someone with
+a name answers it and the owner has replied, and an own address is a service only
+when it sends steadily and nothing has ever come back.
 
-protection_reasons lists everything that puts a row out of scope however it looks:
-anything two-way or from a human. A protected row is never hidden.
+Some things put a row out of scope however it looks: family, one-to-one messages or
+calls, a phone number, a human's confirmation of an own address, manual overrides and
+tags, and mail the owner wrote to an own address. Calendar invites, contact-book
+entries, and note mentions don't vouch for a service-shaped row.
 
-A hidden service keeps its interactions, its address stays blocklisted so no later
-sync brings it back as a new person, and restore_person undoes all of it. Only the
-person row and its relationship value change; mail stays searchable in Gmail.
+A hidden service keeps its interactions, including new mail, and holds its addresses
+so no later sync brings it back as a new person. It answers to no name. Only its
+service-shaped addresses are blocked. Two-way mail on an own address restores it, and
+so does restore_person.
 """
 import json
 import logging
@@ -20,12 +27,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Mapping, Optional
 
-from api.services.entity_resolver import NON_NAME_WORDS
+from api.services.entity_resolver import NON_NAME_WORDS, parse_name
 from api.services.person_entity import (
     FAMILY_PERSON_IDS,
+    HIDDEN_SERVICE_REASON_PREFIX,
     PersonEntity,
     PersonEntityStore,
     _is_family_member,
+    is_hidden_service,
 )
 from api.services.relationship import TYPE_COWORKER, TYPE_INFERRED
 from config.marketing_patterns import (
@@ -52,10 +61,6 @@ from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
-# Every row hidden here has a hidden_reason starting with this. Consistency
-# verification keeps those rows' interactions.
-HIDDEN_REASON_PREFIX = "service sender: "
-
 # Added by a restore. A tag protects its row, so the nightly pass leaves it visible.
 CONFIRMED_PERSON_TAG = "confirmed-person"
 
@@ -75,23 +80,29 @@ SIGNAL_NOT_A_NAME = "not_a_name"
 SIGNAL_ONE_WAY = "one_way_volume"
 SIGNAL_BULK_MAIL = "bulk_mail_headers"
 
-# Messages a shared mailbox has to send, with no reply ever, before a person's name
-# on it stops counting. A one-off from a named person at support@ can be personal.
-ROLE_ADDRESS_MIN_RECEIVED = 5
-# The same for a person's own-looking address on a dedicated sending host.
-SENDING_HOST_MIN_RECEIVED = 3
-# An organization's name on an ordinary address.
-ORGANIZATION_MIN_RECEIVED = 3
-# So many one-way messages from an address with no sign of a person behind it, and
-# the share of shared threads it may have. A colleague turns up in threads; a mailer doesn't.
-ONE_WAY_MIN_RECEIVED = 40
+# Messages received, with no thread and no reply ever, before any address stops
+# counting as a relationship.
+ONE_WAY_MIN_RECEIVED = 10
+# How much thread and reply traffic still reads as one-way on an address that isn't
+# someone's own. A colleague turns up in threads and gets answers; a mailer doesn't.
 ONE_WAY_MAX_THREAD_SHARE = 0.1
-# Share of the mail checked that has to carry bulk headers.
+ONE_WAY_MAX_SENT_SHARE = 0.05
+# Messages before a thin signal is enough: an own-looking address on a sending host,
+# an organization's name on an ordinary address, a multi-word name running into the
+# domain, or one word that isn't in the address.
+THIN_SIGNAL_MIN_RECEIVED = 2
+# One word copied into the local part reads like a first name until this much one-way mail.
+ONE_WORD_OWN_ADDRESS_MAX_RECEIVED = 5
+# Share of the mail checked that has to carry bulk headers, and the fewest messages
+# checked before that means anything on a sender with more mail than that.
 BULK_MIN_SHARE = 0.6
-# Share of mail from a personal-looking address that makes the sender a person.
-PERSONAL_ADDRESS_MIN_SHARE = 0.1
+BULK_MIN_CHECKED = 3
+# Share of mail from an own address that makes it count.
+OWN_ADDRESS_MIN_SHARE = 0.1
 # Share of mail the service-shaped addresses have to carry.
 SERVICE_ADDRESS_MIN_SHARE = 0.5
+# A calendar event this small is a meeting rather than an invitation to a crowd.
+REAL_MEETING_MAX_ATTENDEES = 5
 
 # The nightly pass hides new arrivals. More than this at once means the one-time
 # repair hasn't been reviewed and run, which is a human's call.
@@ -105,9 +116,10 @@ _NOT_A_NAME_CHARACTERS = re.compile(r"[\d@/\\<>|=*_#®™©&]")
 _PERSONA_PAREN = re.compile(r"\(.+\)")
 _WORD = re.compile(r"[^\W\d_]+")
 _FIRST_DOT_LAST = re.compile(r"[a-z]{3,}\.[a-z]{3,}")
-_DOMAIN_LIKE_NAME = re.compile(r"\b[^\W\d_]{2,}\.(com|org|net|io|co|ai)\b", re.IGNORECASE)
+_DOMAIN_LIKE_NAME = re.compile(r"\b[^\W\d_]{2,}\.(com|org|net|io|co|ai|me)\b", re.IGNORECASE)
 _LONG_NUMBER = re.compile(r"\d{8,}")
 _LETTERS_AND_DIGITS = re.compile(r"[a-z]+|\d+")
+_ORGANIZATION_WORDS = NON_NAME_WORDS | ORGANIZATION_NAME_WORDS
 
 
 @dataclass(frozen=True)
@@ -142,14 +154,23 @@ class AddressShape:
 
 @dataclass(frozen=True)
 class SenderEvidence:
-    """A sender's name, addresses with message counts, and how their mail arrived."""
+    """A sender's name, addresses with message counts, and how their mail moved."""
 
     name: str
     addresses: Mapping[str, int]
     received: int = 1
     thread: int = 0
+    sent_to: Mapping[str, int] = field(default_factory=dict)
     bulk: int = 0
     checked: int = 0
+
+    @property
+    def sent(self) -> int:
+        return sum(self.sent_to.values())
+
+    @property
+    def has_history(self) -> bool:
+        return bool(self.thread or self.sent)
 
 
 @dataclass(frozen=True)
@@ -159,6 +180,8 @@ class SenderVerdict:
     is_service: bool
     signals: tuple[str, ...] = ()
     reason: str = ""
+    own_addresses: tuple[str, ...] = ()
+    wrote_to_own_address: bool = False
 
 
 # ------------------------------------------------------------------- address
@@ -238,10 +261,13 @@ def address_shape(address: str) -> AddressShape:
     signals: list[str] = []
     joined = re.sub(r"[^a-z0-9]", "", local)
     words = set(re.split(r"[^a-z0-9]+", local))
-    if any(token in joined for token in AUTOMATED_LOCAL_SUBSTRINGS) or words & AUTOMATED_LOCAL_WORDS:
+    provider = _is_personal_provider(domain)
+    # "Mailer" is a surname too, so it takes more than a person's own mailbox to mean a bot.
+    automated_word = words & AUTOMATED_LOCAL_WORDS and not provider and not _FIRST_DOT_LAST.fullmatch(local)
+    if any(token in joined for token in AUTOMATED_LOCAL_SUBSTRINGS) or automated_word:
         signals.append(SIGNAL_AUTOMATED)
 
-    if _is_personal_provider(domain):
+    if provider:
         return AddressShape(local, domain, tuple(signals), personal_provider=True)
 
     if _LONG_NUMBER.search(local) or any(_looks_generated(word) for word in words):
@@ -288,7 +314,7 @@ def name_signals(name: str, domains: Iterable[str] = ()) -> list[str]:
     if is_persona:
         signals.append(SIGNAL_PERSONA)
     if (
-        set(words) & (NON_NAME_WORDS | ORGANIZATION_NAME_WORDS)
+        set(words) & _ORGANIZATION_WORDS
         or (words[:1] == ["the"] and len(words) > 1)
         or _DOMAIN_LIKE_NAME.search(stripped)
     ):
@@ -318,26 +344,49 @@ def _carries_name(shape: AddressShape, name: str) -> bool:
     )
 
 
-def _is_personal_address(shape: AddressShape, name: str, names: list[str], received: int = 0) -> bool:
-    """A mailbox provider, or an ordinary address carrying someone's own name."""
+def _on_own_site(shape: AddressShape, name: str, names: list[str]) -> bool:
+    """A person's full name, or their surname, is the domain: someone's own site."""
+    words = _name_words(name)
+    if len(words) < 2 or {SIGNAL_ORG_NAME, SIGNAL_NOT_A_NAME, SIGNAL_PERSONA} & set(names):
+        return False
+    label = _registered_labels(shape.domain)[1].replace("-", "")
+    return label in ("".join(words), words[-1])
+
+
+def _is_own_address(shape: AddressShape, evidence: SenderEvidence, names: list[str]) -> bool:
+    """A mailbox provider, the sender's own site, or a local part carrying their name."""
+    name = evidence.name
     if shape.automated or shape.generated:
         return False
     if shape.personal_provider:
         return True
-    if shape.sending or shape.role:
+    if _on_own_site(shape, name, names):
+        # A small company's name reads the same, so its role mailbox takes real history.
+        return not shape.role or bool(evidence.sent) or evidence.thread > 1
+    if shape.role:
+        return False
+    if shape.sending and _reads_as_organization(names):
         return False
     # first.last reads as a person whatever the row happens to be called, unless
     # one half is the company's own name.
     if _FIRST_DOT_LAST.fullmatch(shape.local) and not set(shape.local.split(".")) & set(shape.domain.split(".")):
         return True
+    words = _name_words(name)
+    # A company's name first on its own domain, or one word on it, is a brand. Two
+    # words where the second is the domain were caught above as someone's site.
+    if SIGNAL_BRAND_NAME in names and (len(words) == 1 or words[0] in _host_labels(shape.domain)):
+        return False
     if SIGNAL_ORG_NAME in names:
-        return False
-    # A one-word name on its own domain is a brand; two words on one is someone's site.
-    if {SIGNAL_BRAND_NAME, SIGNAL_ONE_WORD} <= set(names):
-        return False
-    # So is one word on steady one-way mail. A placeholder name copied from the
-    # address reads the same as a first name, and people don't write that way unanswered.
-    if SIGNAL_ONE_WORD in names and received >= ROLE_ADDRESS_MIN_RECEIVED:
+        # "Sarah Church" reads as an organization by one word. Her first name alone is
+        # an address, a company's word in it isn't, and the rest takes real history.
+        tokens = {token for token in re.split(r"[^a-z0-9]+", shape.local) if token}
+        if tokens & _ORGANIZATION_WORDS:
+            return False
+        bare = re.sub(r"[^a-z]", "", shape.local)
+        if bare in set(words) - _ORGANIZATION_WORDS:
+            return True
+        return evidence.has_history and _carries_name(shape, name)
+    if SIGNAL_ONE_WORD in names and evidence.received >= ONE_WORD_OWN_ADDRESS_MAX_RECEIVED:
         return False
     return _carries_name(shape, name)
 
@@ -349,80 +398,117 @@ def classify_sender(evidence: SenderEvidence) -> SenderVerdict:
     """
     Judge a sender from their addresses, name, and mail.
 
-    An automated address decides alone, and so does mail carrying bulk headers.
-    After those a personal-looking address makes the sender a person. Below that the
-    address has to be service-shaped, and the weaker its evidence, the more the name
-    and the history have to agree: a person's name on a role address takes repeated
-    one-way mail.
+    Own addresses are judged by what came back: steady mail with no thread and no
+    reply makes them a service, and so does a run of messages on a dedicated sending
+    host. Anything else about them leaves a person. Every other address is judged by
+    its shape, and a name or a reply doesn't change that.
     """
     shapes = {address: address_shape(address) for address in evidence.addresses}
     total = sum(evidence.addresses.values()) or 1
     names = name_signals(evidence.name, [shape.domain for shape in shapes.values()])
     fired = list(dict.fromkeys([s for shape in shapes.values() for s in shape.signals] + names))
+    words = _name_words(evidence.name)
+
+    own = tuple(a for a, s in shapes.items() if _is_own_address(s, evidence, names))
+    wrote_to_own = any(
+        (address == "" and own) or _is_own_address(address_shape(address), evidence, names)
+        for address, count in evidence.sent_to.items() if count
+    )
+
+    def verdict(is_service: bool, reason: str) -> SenderVerdict:
+        return SenderVerdict(is_service, tuple(fired), reason, own, wrote_to_own)
 
     if not shapes:
-        return SenderVerdict(False, tuple(fired), "no_address")
+        return verdict(False, "no_address")
 
     def share(predicate) -> float:
         return sum(evidence.addresses[a] for a, s in shapes.items() if predicate(s)) / total
 
-    def service(reason: str) -> SenderVerdict:
-        return SenderVerdict(True, tuple(fired), reason)
+    own_share = sum(evidence.addresses[a] for a in own) / total
+    has_own = own_share >= OWN_ADDRESS_MIN_SHARE
+    mostly_one_way = (
+        evidence.thread <= evidence.received * ONE_WAY_MAX_THREAD_SHARE
+        and evidence.sent <= evidence.received * ONE_WAY_MAX_SENT_SHARE
+    )
+    never_answered = not evidence.thread and not evidence.sent
 
-    def person(reason: str) -> SenderVerdict:
-        return SenderVerdict(False, tuple(fired), reason)
-
-    org_like = _reads_as_organization(names)
-    one_way = evidence.thread <= evidence.received * ONE_WAY_MAX_THREAD_SHARE
-
-    if share(lambda s: s.automated) >= SERVICE_ADDRESS_MIN_SHARE:
-        return service("automated_address")
+    if not has_own and share(lambda s: s.automated) >= SERVICE_ADDRESS_MIN_SHARE:
+        return verdict(True, "automated_address")
 
     # A person turns up in threads, or writes from their own mailbox as well as the
     # address their newsletter goes out on. Neither is bulk however that mail reads.
-    has_own_mailbox = len(shapes) > 1 and share(lambda s: s.personal_provider) >= PERSONAL_ADDRESS_MIN_SHARE
+    has_own_mailbox = len(shapes) > 1 and share(lambda s: s.personal_provider) >= OWN_ADDRESS_MIN_SHARE
+    enough_checked = evidence.checked >= min(evidence.received, BULK_MIN_CHECKED) and evidence.checked
     if (
-        evidence.checked
+        enough_checked
         and evidence.bulk / evidence.checked >= BULK_MIN_SHARE
-        and one_way
+        and evidence.thread <= evidence.received * ONE_WAY_MAX_THREAD_SHARE
         and not has_own_mailbox
     ):
         fired.append(SIGNAL_BULK_MAIL)
-        return service("bulk_mail")
+        return verdict(True, "bulk_mail")
 
-    if share(lambda s: _is_personal_address(s, evidence.name, names, evidence.received)) >= PERSONAL_ADDRESS_MIN_SHARE:
-        return person("personal_address")
+    if has_own:
+        if never_answered and evidence.received >= ONE_WAY_MIN_RECEIVED:
+            fired.append(SIGNAL_ONE_WAY)
+            return verdict(True, "one_way_volume")
+        if (
+            share(lambda s: s.sending) >= SERVICE_ADDRESS_MIN_SHARE
+            and evidence.received >= THIN_SIGNAL_MIN_RECEIVED
+            and mostly_one_way
+        ):
+            return verdict(True, "sending_host")
+        return verdict(False, "own_address")
 
-    # "Name via Platform": someone writing through a relay, whose address is shared.
-    if " via " in f" {evidence.name.casefold()} " and share(lambda s: s.sending) < SERVICE_ADDRESS_MIN_SHARE:
-        return person("person_via_relay")
+    for predicate, reason in (
+        (lambda s: s.automated, "automated_address"),
+        (lambda s: s.generated, "generated_address"),
+        (lambda s: s.infrastructure, "mail_infrastructure"),
+        (lambda s: s.sending, "sending_host"),
+        (lambda s: s.role, "role_address"),
+    ):
+        if share(predicate) >= SERVICE_ADDRESS_MIN_SHARE:
+            return verdict(True, reason)
+    if share(lambda s: s.automated or s.generated or s.infrastructure or s.sending or s.role) >= SERVICE_ADDRESS_MIN_SHARE:
+        return verdict(True, "mixed_service_addresses")
 
-    if share(lambda s: s.generated) >= SERVICE_ADDRESS_MIN_SHARE:
-        return service("generated_address")
+    if " via " in f" {evidence.name.casefold()} ":
+        return verdict(True, "relay_address")
 
-    if share(lambda s: s.infrastructure) >= SERVICE_ADDRESS_MIN_SHARE:
-        return service("mail_infrastructure")
-
-    if evidence.received >= ONE_WAY_MIN_RECEIVED and one_way:
+    if evidence.received >= ONE_WAY_MIN_RECEIVED and mostly_one_way:
         fired.append(SIGNAL_ONE_WAY)
-        return service("one_way_volume")
+        return verdict(True, "one_way_volume")
 
-    if share(lambda s: s.sending) >= SERVICE_ADDRESS_MIN_SHARE:
-        carries_name = any(_carries_name(s, evidence.name) for s in shapes.values())
-        if org_like or not carries_name or evidence.received >= SENDING_HOST_MIN_RECEIVED:
-            return service("sending_host")
-        return person("person_name_on_sending_host")
+    if SIGNAL_BRAND_NAME in names and evidence.received and (
+        {SIGNAL_ONE_WORD, SIGNAL_ORG_NAME, SIGNAL_PERSONA} & set(names)
+        or any(words[0] in _host_labels(s.domain) for s in shapes.values())
+        or evidence.received >= THIN_SIGNAL_MIN_RECEIVED
+    ):
+        return verdict(True, "named_after_domain")
+    if evidence.received >= THIN_SIGNAL_MIN_RECEIVED:
+        if SIGNAL_ORG_NAME in names:
+            return verdict(True, "organization_name")
+        if words and mostly_one_way and {SIGNAL_NOT_A_NAME, SIGNAL_ONE_WORD} & set(names):
+            return verdict(True, "not_a_person_name")
+    return verdict(False, "no_service_evidence")
 
-    if share(lambda s: s.role) >= SERVICE_ADDRESS_MIN_SHARE:
-        if org_like or evidence.received >= ROLE_ADDRESS_MIN_RECEIVED:
-            return service("role_address")
-        return person("person_name_on_role_address")
 
-    if SIGNAL_BRAND_NAME in names and evidence.received:
-        return service("named_after_domain")
-    if SIGNAL_ORG_NAME in names and evidence.received >= ORGANIZATION_MIN_RECEIVED:
-        return service("organization_name")
-    return person("no_service_evidence")
+def _known_holder(store: PersonEntityStore, email: str, name: Optional[str]) -> Optional[PersonEntity]:
+    """A row holding this address, or a visible person of this full name reachable by phone."""
+    holder = store.get_by_email(email)
+    if holder:
+        return holder
+    if name and parse_name(name).last:
+        namesake = store.get_by_name(name)
+        if namesake and not namesake.hidden and namesake.phone_numbers:
+            return namesake
+    return None
+
+
+def is_known_sender(store: PersonEntityStore, email: str, name: Optional[str] = None) -> bool:
+    """Whether this mail has a person or a hidden service to go to, whatever its address looks like."""
+    holder = _known_holder(store, email, name)
+    return bool(holder) and (not holder.hidden or is_hidden_service(holder))
 
 
 def is_unknown_service_sender(
@@ -431,12 +517,12 @@ def is_unknown_service_sender(
     """
     Whether mail from this address should create no person and count for no one.
 
-    An address someone already holds is never in question here. Its mail is theirs,
-    and the nightly pass judges the whole row. Otherwise a blocked address or one
-    message's service evidence is enough. Name matching doesn't run first, so a
-    service's mail can't land on someone who happens to share its display name.
+    An address someone holds is never in question here, nor is someone with a phone
+    number writing under their full name. Otherwise a blocked address or one message's
+    service evidence is enough. Name matching doesn't run first, so a service's mail
+    can't land on someone who happens to share its display name.
     """
-    if not email or store.get_by_email(email):
+    if not email or _known_holder(store, email, name):
         return False
     if store.is_blocked(email):
         return True
@@ -447,16 +533,18 @@ def is_unknown_service_sender(
 
 # ---------------------------------------------------------------- protection
 
-# Channels someone reaches a real person on, or a human maintains.
-CONTACT_INTERACTION_SOURCES = frozenset({"calendar", "imessage", "phone", "photos", "slack", "whatsapp"})
-CONTACT_ENTITY_SOURCES = CONTACT_INTERACTION_SOURCES | {"contacts", "linkedin", "phone_contacts"}
-# Note mentions count for a person-shaped name only. Notes mention companies too.
-MENTION_SOURCES = frozenset({"meeting", "vault"})
-AUTOMATIC_PERSON_SOURCES = CONTACT_ENTITY_SOURCES | MENTION_SOURCES | {"gmail", "granola"}
+# One-to-one channels, read from interactions so groups and bots don't count.
+CHANNEL_SOURCES = frozenset({"imessage", "phone", "photos", "slack", "whatsapp"})
+# Source entities a person's own identity produces, with no invitation or import to explain them.
+IDENTITY_ENTITY_SOURCES = frozenset({"imessage", "linkedin", "phone", "photos"})
+AUTOMATIC_PERSON_SOURCES = (
+    CHANNEL_SOURCES | IDENTITY_ENTITY_SOURCES
+    | {"calendar", "contacts", "gmail", "granola", "meeting", "phone_contacts", "vault"}
+)
 
 
 def protection_reasons(person: PersonEntity) -> list[str]:
-    """What on the row itself means a human or a two-way channel vouches for it."""
+    """What on the row itself means a human or a one-to-one channel vouches for it."""
     reasons: list[str] = []
     if person.id == settings.my_person_id:
         reasons.append("self")
@@ -503,12 +591,13 @@ class SenderDecision:
 @dataclass
 class _Mail:
     addresses: Counter = field(default_factory=Counter)
+    sent_to: Counter = field(default_factory=Counter)
     received: int = 0
-    sent: int = 0
     thread: int = 0
     bulk: int = 0
     checked: int = 0
-    mentions: set = field(default_factory=set)
+    real_meeting: bool = False
+    human_links: set = field(default_factory=set)
 
 
 def _connect_read_only(path) -> sqlite3.Connection:
@@ -530,38 +619,61 @@ def _rows(conn: sqlite3.Connection, sql: str) -> list[tuple]:
         return []
 
 
-def _load_people(crm_db: Path, merged_ids: Mapping[str, str]) -> list[PersonEntity]:
+def _load_people(crm_db: Path, merged_ids: Mapping[str, str], where: str = "hidden = 0") -> list[PersonEntity]:
     conn = _connect_read_only(crm_db)
     conn.row_factory = sqlite3.Row
     try:
         return [
             PersonEntityStore._row_to_entity(None, row)
-            for row in conn.execute("SELECT * FROM person_entities WHERE hidden = 0")
+            for row in conn.execute(f"SELECT * FROM person_entities WHERE {where}")
             if row["id"] not in merged_ids
         ]
     finally:
         conn.close()
 
 
+def _recipient_of(source_id: Optional[str]) -> str:
+    """The address in a sent message's ``<message>:<recipient>`` source id, if it has one."""
+    _, _, recipient = (source_id or "").partition(":")
+    return recipient.lower()
+
+
 def _load_interaction_evidence(interactions_db: Path, mail: dict, reasons: dict) -> None:
     conn = _connect_read_only(interactions_db)
     try:
-        for person_id, source, arrow, recipient_shaped, count in conn.execute(
-            "SELECT person_id, source_type, substr(title, 1, 1), "
-            "source_id LIKE '%:%' AND source_id NOT LIKE '%:cc:%', COUNT(*) "
-            "FROM interactions GROUP BY 1, 2, 3, 4"
+        for person_id, source, arrow, count, one_to_one, small_meeting in conn.execute(
+            "SELECT person_id, source_type, substr(title, 1, 1), COUNT(*), "
+            "  source_type NOT IN ('whatsapp', 'slack') OR (source_type = 'whatsapp' AND attendee_count IS NULL) "
+            "    OR (source_type = 'slack' AND title LIKE 'Slack DM%'), "
+            f"  source_type = 'calendar' AND attendee_count BETWEEN 1 AND {REAL_MEETING_MAX_ATTENDEES} "
+            "FROM interactions "
+            "WHERE NOT (source_type = 'gmail' AND source_id LIKE '%:%' AND source_id NOT LIKE '%:cc:%') "
+            "  AND NOT (source_type = 'gmail' AND substr(title, 1, 1) = '→') "
+            "GROUP BY 1, 2, 3, 5, 6"
         ):
             if source == "gmail":
-                if arrow == "→" or (arrow not in ("←", "↔") and recipient_shaped):
-                    mail[person_id].sent += count
-                elif arrow == "↔":
+                if arrow == "↔":
                     mail[person_id].thread += count
                 else:
                     mail[person_id].received += count
-            elif source in CONTACT_INTERACTION_SOURCES:
-                reasons[person_id].add(f"interaction:{source}")
-            elif source in MENTION_SOURCES:
-                mail[person_id].mentions.add(source)
+            elif source in CHANNEL_SOURCES:
+                if one_to_one:
+                    reasons[person_id].add(f"interaction:{source}")
+            elif source == "meeting" or small_meeting:
+                mail[person_id].real_meeting = True
+        sent: dict = defaultdict(Counter)
+        for person_id, arrow, source_id in conn.execute(
+            "SELECT person_id, substr(title, 1, 1), source_id FROM interactions WHERE source_type = 'gmail' "
+            "AND (substr(title, 1, 1) = '→' OR (source_id LIKE '%:%' AND source_id NOT LIKE '%:cc:%'))"
+        ):
+            if arrow not in ("←", "↔"):
+                sent[person_id][_recipient_of(source_id)] += 1
+            elif arrow == "↔":
+                mail[person_id].thread += 1
+            else:
+                mail[person_id].received += 1
+        for person_id, recipients in sent.items():
+            mail[person_id].sent_to.update(recipients)
     finally:
         conn.close()
 
@@ -569,21 +681,20 @@ def _load_interaction_evidence(interactions_db: Path, mail: dict, reasons: dict)
 def _load_crm_evidence(crm_db: Path, merged_ids: Mapping[str, str], mail: dict, reasons: dict) -> None:
     conn = _connect_read_only(crm_db)
     try:
-        for person_id, source, status in _rows(
-            conn,
-            "SELECT DISTINCT canonical_person_id, source_type, link_status FROM source_entities "
+        for person_id, source in _rows(
+            conn, "SELECT DISTINCT canonical_person_id, source_type FROM source_entities "
             "WHERE canonical_person_id IS NOT NULL",
         ):
-            if source in CONTACT_ENTITY_SOURCES:
+            if source in IDENTITY_ENTITY_SOURCES:
                 reasons[person_id].add(f"source_entity:{source}")
-            elif source in MENTION_SOURCES:
-                mail[person_id].mentions.add(source)
-            if status != "auto":
-                reasons[person_id].add(f"link_status:{status}")
-        for person_id, address, count, recipient, bulk, checked in _rows(
+        for person_id, address in _rows(
+            conn, "SELECT DISTINCT canonical_person_id, lower(observed_email) FROM source_entities "
+            "WHERE canonical_person_id IS NOT NULL AND link_status NOT IN ('auto', 'rejected')",
+        ):
+            mail[person_id].human_links.add(address)
+        for person_id, address, count, bulk, checked in _rows(
             conn,
             "SELECT canonical_person_id, lower(observed_email), COUNT(*), "
-            "SUM(source_id LIKE '%:%' AND source_id NOT LIKE '%:cc:%'), "
             "SUM(json_extract(metadata, '$.bulk') = 1), "
             "SUM(json_extract(metadata, '$.bulk') IS NOT NULL) "
             "FROM source_entities WHERE source_type = 'gmail' AND canonical_person_id IS NOT NULL "
@@ -594,8 +705,16 @@ def _load_crm_evidence(crm_db: Path, merged_ids: Mapping[str, str], mail: dict, 
             record.addresses[address] += count
             record.bulk += bulk or 0
             record.checked += checked or 0
-            if recipient:
-                reasons[person_id].add("wrote_to")
+        # A sent message's source entity holds its recipient even with no interaction.
+        for person_id, source_id in _rows(
+            conn,
+            "SELECT canonical_person_id, source_id FROM source_entities "
+            "WHERE source_type = 'gmail' AND canonical_person_id IS NOT NULL "
+            "AND source_id LIKE '%:%' AND source_id NOT LIKE '%:cc:%'",
+        ):
+            recipient = _recipient_of(source_id)
+            if not mail[person_id].sent_to[recipient]:
+                mail[person_id].sent_to[recipient] = 1
         for (person_id,) in _rows(conn, "SELECT person_id FROM person_facts WHERE confirmed_by_user = 1"):
             reasons[person_id].add("confirmed_fact")
         for preferred, rejected in _rows(
@@ -627,6 +746,35 @@ def load_merged_ids(path: Path) -> dict[str, str]:
         return {}
 
 
+def _addresses_of(person: PersonEntity, record: _Mail) -> dict[str, int]:
+    addresses = dict(record.addresses)
+    for email in person.emails:
+        addresses.setdefault(email.lower(), 1)
+    return addresses
+
+
+def _evidence_of(
+    person: PersonEntity, record: _Mail, addresses: Mapping[str, int], sample: Mapping[str, int]
+) -> SenderEvidence:
+    return SenderEvidence(
+        person.canonical_name or "",
+        addresses,
+        received=record.received,
+        thread=record.thread,
+        sent_to=dict(record.sent_to),
+        bulk=record.bulk + sample.get("bulk", 0),
+        checked=record.checked + sample.get("checked", 0),
+    )
+
+
+def _load_evidence(crm_db: Path, interactions_db: Path, merged_ids: Mapping[str, str]) -> tuple[dict, dict]:
+    mail: dict[str, _Mail] = defaultdict(_Mail)
+    reasons: dict[Optional[str], set] = defaultdict(set)
+    _load_interaction_evidence(interactions_db, mail, reasons)
+    _load_crm_evidence(crm_db, merged_ids, mail, reasons)
+    return mail, reasons
+
+
 def decide_senders(
     crm_db: Path,
     interactions_db: Path,
@@ -640,75 +788,68 @@ def decide_senders(
     {person_id: {"checked": n, "bulk": m}}.
     """
     merged_ids = load_merged_ids(merged_ids_path)
-    mail: dict[str, _Mail] = defaultdict(_Mail)
-    reasons: dict[Optional[str], set] = defaultdict(set)
-    _load_interaction_evidence(interactions_db, mail, reasons)
-    _load_crm_evidence(crm_db, merged_ids, mail, reasons)
+    mail, reasons = _load_evidence(crm_db, interactions_db, merged_ids)
 
     decisions = []
     for person in _load_people(crm_db, merged_ids):
         record = mail.get(person.id) or _Mail()
-        addresses = dict(record.addresses)
-        for email in person.emails:
-            addresses.setdefault(email.lower(), 1)
-        if not addresses or not (record.received or record.thread or record.addresses):
+        addresses = _addresses_of(person, record)
+        if not addresses or not (record.received or record.thread or record.sent_to or record.addresses):
             continue
-        sample = (bulk_samples or {}).get(person.id, {})
-        verdict = classify_sender(SenderEvidence(
-            person.canonical_name or "",
-            addresses,
-            received=record.received,
-            thread=record.thread,
-            bulk=record.bulk + sample.get("bulk", 0),
-            checked=record.checked + sample.get("checked", 0),
-        ))
+        evidence = _evidence_of(person, record, addresses, (bulk_samples or {}).get(person.id, {}))
+        verdict = classify_sender(evidence)
         protected_by = sorted(reasons.get(person.id, set())) + protection_reasons(person)
-        if record.sent and "wrote_to" not in protected_by:
+        if verdict.wrote_to_own_address:
             protected_by.append("wrote_to")
-        if record.mentions and not _reads_as_organization(name_signals(person.canonical_name, _domains(addresses))):
-            protected_by.append("mentioned_in_notes")
+        if verdict.own_addresses and record.real_meeting:
+            protected_by.append("real_meeting")
+        # A confirmed link says this message belongs to this row. That vouches for a
+        # person on their own address, and only for the row's name on a service's.
+        names = name_signals(evidence.name, [_split_address(a)[1] for a in addresses])
+        if any(
+            address is None or _is_own_address(address_shape(address), evidence, names)
+            for address in record.human_links
+        ):
+            protected_by.append("human_link")
         decisions.append(SenderDecision(
-            person, addresses, record.received, record.sent, record.thread, verdict, protected_by,
+            person, addresses, record.received, evidence.sent, record.thread, verdict, protected_by,
         ))
     return decisions
-
-
-def _domains(addresses: Iterable[str]) -> list[str]:
-    return [_split_address(address)[1] for address in addresses]
 
 
 # ---------------------------------------------------------------------- hide
 
 
 def hide_service_person(store: PersonEntityStore, decision: SenderDecision) -> None:
-    """Hide a service, block every address it wrote from, and clear its relationship value."""
-    reason = HIDDEN_REASON_PREFIX + decision.verdict.reason
-    # The row's own addresses are blocked with it. One someone else holds stays theirs.
-    unheld = [address for address in decision.addresses if store.get_by_email(address) is None]
-    store.hide_person(decision.person.id, reason, extra_emails=unheld)
-    hidden = store.get_by_id(decision.person.id)
+    """
+    Hide a service and clear its relationship value.
+
+    The row takes on the service-shaped addresses it wrote from, unless someone else
+    holds one, so their mail keeps finding it. Those are blocked. An own address that
+    a newsletter merged into the row is never blocked.
+    """
+    own = set(decision.verdict.own_addresses)
+    row = store.get_by_id(decision.person.id)
+    for address in decision.addresses:
+        if address not in own and store.get_by_email(address) is None:
+            row.add_email(address)
+    store.update(row)
+    store.hide_person(row.id, HIDDEN_SERVICE_REASON_PREFIX + decision.verdict.reason, keep_unblocked=own)
+    hidden = store.get_by_id(row.id)
     hidden.relationship_strength = 0.0
     hidden.is_peripheral_contact = True
     hidden.dunbar_circle = None
     store.update(hidden)
 
 
-def restore_person(store: PersonEntityStore, person_id: str, crm_db: Path) -> Optional[PersonEntity]:
+def restore_person(store: PersonEntityStore, person_id: str) -> Optional[PersonEntity]:
     """
     Undo a hide, unblock the row's addresses, and tag it so it stays visible.
 
-    The next strength run gives it back a score and a circle.
+    The next strength run gives it back a score and a circle, and the next relationship
+    discovery rebuilds its inferred relationships from the interactions it kept.
     """
-    conn = _connect_read_only(crm_db)
-    try:
-        observed = [row[0] for row in conn.execute(
-            "SELECT DISTINCT lower(observed_email) FROM source_entities "
-            "WHERE canonical_person_id = ? AND observed_email IS NOT NULL",
-            (person_id,),
-        )]
-    finally:
-        conn.close()
-    restored = store.unhide_person(person_id, extra_identifiers=observed)
+    restored = store.unhide_person(person_id)
     if restored is None:
         return None
     restored.add_tag(CONFIRMED_PERSON_TAG)
@@ -716,19 +857,39 @@ def restore_person(store: PersonEntityStore, person_id: str, crm_db: Path) -> Op
     return restored
 
 
+def restore_people_who_wrote_back(store: PersonEntityStore, interactions_db: Path) -> int:
+    """Show any hidden service again once the owner and they have mail on an own address."""
+    merged_ids = load_merged_ids(PersonEntityStore.MERGED_IDS_PATH)
+    crm_db = Path(store.db_path)
+    mail, _ = _load_evidence(crm_db, interactions_db, merged_ids)
+    restored = 0
+    for person in _load_people(crm_db, merged_ids, where="hidden = 1"):
+        if not is_hidden_service(person):
+            continue
+        record = mail.get(person.id) or _Mail()
+        evidence = _evidence_of(person, record, _addresses_of(person, record), {})
+        if classify_sender(evidence).wrote_to_own_address and (record.received or record.thread):
+            restore_person(store, person.id)
+            restored += 1
+    return restored
+
+
 def hide_service_senders(store: Optional[PersonEntityStore] = None) -> dict:
     """
-    Hide services that reached the CRM since the last run, so they earn no score or circle.
+    Keep the people list current: restore anyone who wrote back, then hide new services.
 
-    Holds back and warns when there are too many at once for a nightly pass to
-    decide unreviewed. scripts/repair_service_senders.py is the reviewed path.
+    Runs before scoring, so a new service takes no score or circle slot. Holds back and
+    warns when there are too many at once for a nightly pass to decide unreviewed.
+    scripts/repair_service_senders.py is the reviewed path.
     """
     from api.services.interaction_store import get_interaction_db_path
     from api.services.person_entity import get_person_entity_store
 
     store = store or get_person_entity_store()
+    interactions_db = Path(get_interaction_db_path())
+    restored = restore_people_who_wrote_back(store, interactions_db)
     decisions = [d for d in decide_senders(
-        Path(store.db_path), Path(get_interaction_db_path()), PersonEntityStore.MERGED_IDS_PATH,
+        Path(store.db_path), interactions_db, PersonEntityStore.MERGED_IDS_PATH,
     ) if d.will_hide]
     if len(decisions) > NIGHTLY_MAX_HIDES:
         logger.warning(
@@ -736,7 +897,7 @@ def hide_service_senders(store: Optional[PersonEntityStore] = None) -> dict:
             "Review and run scripts/repair_service_senders.py.",
             len(decisions), NIGHTLY_MAX_HIDES,
         )
-        return {"hidden": 0, "held_back": len(decisions)}
+        return {"hidden": 0, "held_back": len(decisions), "restored": restored}
     for decision in decisions:
         hide_service_person(store, decision)
-    return {"hidden": len(decisions), "held_back": 0}
+    return {"hidden": len(decisions), "held_back": 0, "restored": restored}

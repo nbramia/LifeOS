@@ -52,11 +52,8 @@ def _get_valid_person_ids():
 
 def _service_sender_ids(store) -> set:
     """Hidden services, which keep their interactions so a restore loses nothing."""
-    from api.services.service_sender import HIDDEN_REASON_PREFIX
-    return {
-        p.id for p in store.get_all(include_hidden=True, include_merged=True)
-        if p.hidden_reason.startswith(HIDDEN_REASON_PREFIX)
-    }
+    from api.services.person_entity import is_hidden_service
+    return {p.id for p in store.get_all(include_hidden=True, include_merged=True) if is_hidden_service(p)}
 
 
 def _check_person_stats(dry_run: bool) -> dict:

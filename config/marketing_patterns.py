@@ -278,7 +278,7 @@ ROLE_LOCAL_WORDS = frozenset({
     'jobs', 'learn', 'loyalty', 'mail', 'marketing', 'member', 'members', 'membership',
     'message', 'messages', 'messaging', 'news', 'offers', 'office', 'order', 'orders',
     'partnerships', 'payment', 'payments', 'press', 'product', 'promo', 'promotions',
-    'receipt', 'receipts', 'registration', 'research', 'reservations', 'rewards',
+    'receipt', 'receipts', 'registration', 'research', 'reservation', 'reservations', 'rewards',
     'sales', 'security', 'service', 'services', 'shipping', 'shop', 'solutions',
     'staff', 'statements', 'store', 'success', 'support', 'survey', 'surveys', 'team',
     'tickets', 'transactional', 'update', 'updates', 'verify', 'verification',
@@ -287,14 +287,14 @@ ROLE_LOCAL_WORDS = frozenset({
 # Role words long enough to recognize inside a compound local part.
 ROLE_LOCAL_COMPOUND_WORDS = frozenset({
     'account', 'billing', 'concierge', 'experience', 'feedback', 'giving', 'loyalty',
-    'marketing', 'member', 'rewards', 'security', 'service', 'support',
+    'marketing', 'member', 'rewards', 'security', 'service', 'services', 'support',
 })
 
 # Host labels that mark a dedicated sending host, ignoring a trailing number
 # (e1, em7, info15). Any single letter also counts.
 SENDING_HOST_LABELS = frozenset({
     'alert', 'alerts', 'app', 'bounce', 'comms', 'communication', 'communications', 'connect',
-    'em', 'eml', 'engage', 'experience', 'express', 'feedback', 'go', 'groups', 'info',
+    'em', 'eml', 'engage', 'experience', 'express', 'feedback', 'go', 'groups', 'info', 'lists',
     'marketing', 'message', 'messages', 'messaging', 'mg', 'mkt', 'mktg', 'msg', 'notice',
     'notices', 'notify', 'offers', 'post', 'promo', 'read', 'reply', 'send', 'sender',
     'service', 'services', 'transact', 'transactional', 'update', 'updates',
@@ -312,18 +312,24 @@ RESERVED_TLDS = frozenset({'example', 'invalid', 'localhost', 'test'})
 
 # Mailbox providers: the address says nothing about who is behind it.
 PERSONAL_MAIL_DOMAINS = frozenset({
-    'aol.com', 'att.net', 'bellsouth.net', 'comcast.net', 'cox.net', 'email.com',
-    'fastmail.com', 'fastmail.fm', 'gmail.com', 'gmx.com', 'gmx.de', 'gmx.net',
-    'googlemail.com', 'hey.com', 'hotmail.com', 'icloud.com', 'live.com', 'mac.com',
-    'mail.com', 'mail.ru', 'me.com', 'msn.com', 'outlook.com', 'pm.me', 'proton.me',
-    'protonmail.com', 'qq.com', 'rocketmail.com', 'sbcglobal.net', 'tutanota.com',
-    'verizon.net', 'yahoo.com', 'yandex.com', 'yandex.ru', 'ymail.com', 'zoho.com',
+    '126.com', '163.com', 'aim.com', 'aol.com', 'att.net', 'bellsouth.net',
+    'btinternet.com', 'charter.net', 'comcast.net', 'cox.net', 'duck.com',
+    'earthlink.net', 'email.com', 'fastmail.com', 'fastmail.fm', 'free.fr', 'gmail.com',
+    'gmx.com', 'gmx.de', 'gmx.net', 'googlemail.com', 'hey.com', 'hotmail.com',
+    'hushmail.com', 'icloud.com', 'inbox.com', 'laposte.net', 'libero.it', 'live.com',
+    'mac.com', 'mail.com', 'mail.de', 'mail.ru', 'mailbox.org', 'mailfence.com', 'me.com',
+    'msn.com', 'naver.com', 'netzero.net', 'optonline.net', 'orange.fr', 'outlook.com',
+    'pm.me', 'posteo.de', 'proton.me', 'protonmail.com', 'qq.com', 'rediffmail.com',
+    'rocketmail.com', 'rogers.com', 'runbox.com', 'sbcglobal.net', 'seznam.cz', 'shaw.ca',
+    'sky.com', 't-online.de', 'telus.net', 'tutanota.com', 'verizon.net',
+    'virginmedia.com', 'wanadoo.fr', 'web.de', 'yahoo.com', 'yandex.com', 'yandex.ru',
+    'ymail.com', 'zoho.com', 'zohomail.com',
 })
 
 # Words in a sender's name that describe an organization or a mail program, on top
 # of the words the entity resolver already refuses in a person's name.
 ORGANIZATION_NAME_WORDS = frozenset({
-    'academy', 'airline', 'airlines', 'alert', 'alliance', 'alumni', 'app', 'bank', 'cellars',
+    'academy', 'airline', 'airlines', 'airways', 'alert', 'alliance', 'alumni', 'app', 'bank', 'cellars',
     'center', 'church', 'club', 'community', 'cooperative', 'credit', 'developer',
     'energy', 'events', 'gallery', 'giving', 'hospital', 'hotel', 'hotels', 'insurance',
     'labs', 'lending', 'loyalty', 'mortgage', 'museum', 'network', 'payments',

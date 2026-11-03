@@ -38,8 +38,15 @@ def main():
     except Exception:
         # Scoring everyone matters more than this night's filter.
         logger.exception("Service-sender pass failed")
-        services = {"hidden": 0, "held_back": 0}
+        services = {"hidden": 0, "held_back": 0, "restored": 0}
         services_failed = 1
+    if services["held_back"]:
+        from api.services.sync_health import record_sync_error
+        record_sync_error(
+            "strengths",
+            f"Service-sender pass held back {services['held_back']} rows; review and run repair_service_senders.py",
+            error_type="service_senders_held_back",
+        )
     result = update_all_strengths()
     logger.info("\n=== Strength Update Summary ===")
     logger.info(f"Updated: {result['updated']}")
@@ -54,6 +61,7 @@ def main():
         "errors": int(result.get("failed", 0) or 0) + services_failed,
         "service_senders_hidden": services["hidden"],
         "service_senders_held_back": services["held_back"],
+        "service_senders_restored": services["restored"],
     })
 
 

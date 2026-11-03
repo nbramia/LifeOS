@@ -108,6 +108,22 @@ class GmailSkipCache:
             conn.close()
         return len(rows)
 
+    def forget(self, account: str, message_ids: Iterable[str]) -> int:
+        """Let these messages be fetched and judged again. Returns how many were cached."""
+        rows = [(account, message_id) for message_id in message_ids]
+        if not rows:
+            return 0
+        conn = sqlite3.connect(self.db_path)
+        try:
+            before = conn.total_changes
+            conn.executemany(
+                "DELETE FROM skipped_messages WHERE account = ? AND message_id = ?", rows
+            )
+            conn.commit()
+            return conn.total_changes - before
+        finally:
+            conn.close()
+
     def prune(self, retention_days: int = DEFAULT_RETENTION_DAYS) -> int:
         """
         Drop entries older than the retention window.

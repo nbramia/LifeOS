@@ -18,7 +18,7 @@ from api.services.gmail_skip_cache import GmailSkipCache
 from api.services.google_auth import GoogleAccount
 from api.services.interaction_store import InteractionStore
 from api.services.link_override import LinkOverrideStore
-from api.services.person_entity import PersonEntity, PersonEntityStore
+from api.services.person_entity import PersonEntity, PersonEntityStore, is_hidden_service
 from api.services.person_facts import PersonFactStore
 from api.services.relationship import RelationshipStore
 from api.services.relationship_metrics import compute_all_dunbar_circles
@@ -31,7 +31,9 @@ pytestmark = pytest.mark.unit
 
 SERVICE_NAME = "Acme Bank"
 SERVICE_ADDRESS = "service@acmewidgets.com"
+OWN_ADDRESS = "jane@janes-letter.com"
 NOW = "2026-06-15T00:00:00+00:00"
+T = ss.ONE_WAY_MIN_RECEIVED
 
 
 def verdict(name, address, received=1, **kwargs):
@@ -39,7 +41,7 @@ def verdict(name, address, received=1, **kwargs):
     return classify_sender(SenderEvidence(name, addresses, received=received, **kwargs))
 
 
-class TestSomeoneIsAService:
+class TestServiceAddressesGoWhateverTheName:
     @pytest.mark.parametrize("name,address,rule", [
         ("Acme", "no-reply@acmewidgets.com", "automated_address"),
         ("Jane Sample", "noreply@acmewidgets.com", "automated_address"),
@@ -57,191 +59,262 @@ class TestSomeoneIsAService:
         ("Acme", "hello@em7.acmewidgets.com", "sending_host"),
         ("Jane Sample", "events@mail.acmewidgets.com", "sending_host"),
         ("Acme", "acme@acmewidgetsmail.com", "sending_host"),
-        ("Acme", "acme@mynotifications.acmewidgets.com", "sending_host"),
+        ("Acme", "buy@mynotifications.acmewidgets.com", "sending_host"),
+        ("Sam from Acme", "sam@app.acmewidgets.com", "sending_host"),
         ("Service", "service@acmewidgets.com", "role_address"),
         (SERVICE_NAME, SERVICE_ADDRESS, "role_address"),
         ("Jane from Acme", "events@acmewidgets.com", "role_address"),
         ("Sam @ Acme", "events@acmewidgets.com", "role_address"),
         ("Acme® Card", "acmesupport@acmewidgets.com", "role_address"),
         ("Acmewidgets", "anything@acmewidgets.com", "named_after_domain"),
+        ("Acme Widgets", "acme.widgets@acme.com", "named_after_domain"),
         ("Northwind Quick", "northwind@eq.northwind.com", "role_address"),
         ("Acme", "acme@acme.shipping-sample.com", "role_address"),
         ("Acme Receipts", "acme.france@acme.com", "named_after_domain"),
         ("Acme.com", "orders2@acmewidgets.com", "role_address"),
         ("Acme Alert", "acmealert@acme.com", "named_after_domain"),
-        ("Sam from Acme", "sam@app.acmewidgets.com", "sending_host"),
         ("Acme", "acme@emessaging.acmewidgets.com", "sending_host"),
-        ("Acme Widgets", "anything@acmewidgets.com", "named_after_domain"),
+        ("Jane Sample", "support@acmewidgets.com", "role_address"),
+        ("Winona Sample (Support)", "support@acmewidgets.com", "role_address"),
+        ("Jane Sample via Platform", "pleasereply+thread-123456789@platformname.com", "generated_address"),
+        ("Jane Sample via Platform", "platform@platformname.com", "relay_address"),
+        ("Jane Sample via Platform", "desk@platformname.com", "relay_address"),
     ])
     def test_one_message_is_enough(self, name, address, rule):
         result = verdict(name, address)
         assert result.is_service, result
         assert result.reason == rule
 
-    @pytest.mark.parametrize("name,address,below,enough", [
-        ("Jane Sample", "support@acmewidgets.com", 4, 5),
-        ("Jane Sample", "jane@mail.acmewidgets.com", 2, 3),
-        ("Acme Labs", "hq@northwindtrading.com", 2, 3),
+    @pytest.mark.parametrize("address", [
+        "accounting@acmewidgets.com", "customersupport@acmewidgets.com", "core-services@acmewidgets.com",
+        "community@acmewidgets.com", "marketingoffers@acmewidgets.com",
     ])
-    def test_a_weaker_address_takes_repeated_mail(self, name, address, below, enough):
-        assert not verdict(name, address, below).is_service
-        assert verdict(name, address, enough).is_service
+    def test_replies_and_threads_do_not_save_a_role_mailbox(self, address):
+        result = verdict("Pat Lee", address, 2, thread=355, sent_to={address: 78})
+        assert result.is_service
+        assert not result.wrote_to_own_address
 
-    def test_steady_one_way_mail_with_no_person_behind_it(self):
-        assert not verdict("Pat Lee", "desk@northwindtrading.com", 39).is_service
-        result = verdict("Pat Lee", "desk@northwindtrading.com", 40)
-        assert result.is_service and ss.SIGNAL_ONE_WAY in result.signals
+    def test_a_reply_does_not_save_an_organization_address(self):
+        for name, address in (
+            ("Sms Compliance Operations", "sms_compliance_operations@northwindtrading.com"),
+            ("Ent Credit Control Inc", "credit-control-inc@northwindtrading.com"),
+        ):
+            result = verdict(name, address, 7, thread=4, sent_to={address: 4})
+            assert result.is_service, name
+            assert not result.wrote_to_own_address, name
 
-    def test_a_mailer_does_not_turn_up_in_threads(self):
+
+class TestTheOneWayRule:
+    @pytest.mark.parametrize("name,address", [
+        ("Jane Sample", "jane@janes-letter.com"),
+        ("Theodora Sample", "theod@northwindtrading.com"),
+        ("Jane Sample", "jsample@northwindtrading.com"),
+        ("Acme Sales", "jane.sample@northwindtrading.com"),
+        ("Jane Sample", "jane@jane-sample.com"),
+        ("Jane Sample", "jane.sample@gmail.com"),
+        ("Service", "someone@gmail.com"),
+    ])
+    def test_steady_mail_nobody_answered_is_a_service_on_any_own_address(self, name, address):
+        below = verdict(name, address, T - 1)
+        assert not below.is_service, below
+        result = verdict(name, address, T)
+        assert result.is_service and result.reason == "one_way_volume"
+        assert ss.SIGNAL_ONE_WAY in result.signals
+
+    @pytest.mark.parametrize("extra", [{"thread": 1}, {"sent_to": {"jane@janes-letter.com": 1}}])
+    def test_one_thread_or_one_reply_keeps_an_own_address(self, extra):
+        assert not verdict("Jane Sample", OWN_ADDRESS, 500, **extra).is_service
+
+    def test_a_second_own_mailbox_does_not_rescue_a_row_nobody_answered(self):
+        addresses = {"jane@janes-letter.com": 289, "jane.sample@gmail.com": 2}
+        assert verdict("Jane Sample", addresses, 291).reason == "one_way_volume"
+
+    def test_an_address_with_no_name_in_it_takes_the_same_volume(self):
+        assert not verdict("Pat Lee", "desk@northwindtrading.com", T - 1).is_service
+        assert verdict("Pat Lee", "desk@northwindtrading.com", T).reason == "one_way_volume"
+
+    def test_a_colleague_turns_up_in_threads(self):
         assert verdict("Pat Lee", "desk@northwindtrading.com", 100, thread=10).is_service
         assert not verdict("Pat Lee", "desk@northwindtrading.com", 100, thread=11).is_service
 
-    @pytest.mark.parametrize("bulk,checked,expected", [
-        (3, 3, True), (2, 3, True), (1, 3, False), (1, 1, True), (0, 3, False), (0, 0, False),
-    ])
-    def test_bulk_headers_outweigh_a_personal_address(self, bulk, checked, expected):
-        result = verdict("Jane Sample", "jane@janes-letter.com", 8, bulk=bulk, checked=checked)
-        assert result.is_service is expected
-        assert (ss.SIGNAL_BULK_MAIL in result.signals) is expected
-        assert verdict("Jane Sample", "jane.sample@gmail.com", 8, bulk=bulk, checked=checked).is_service is expected
+    def test_a_correspondent_gets_answers(self):
+        address = "desk@northwindtrading.com"
+        assert verdict("Pat Lee", address, 100, sent_to={address: 5}).is_service
+        assert not verdict("Pat Lee", address, 100, sent_to={address: 6}).is_service
 
 
-class TestBulkMailIsNotEnoughFor:
-    def test_someone_who_turns_up_in_threads(self):
-        kept = verdict("Jane Sample", "jane.sample@gmail.com", 1, thread=59, bulk=1, checked=1)
-        assert not kept.is_service
-        assert verdict("Jane Sample", "jane@janes-letter.com", 10, thread=1, bulk=3, checked=3).is_service
-        assert not verdict("Jane Sample", "jane@janes-letter.com", 10, thread=2, bulk=3, checked=3).is_service
-
-    def test_someone_who_also_writes_from_their_own_mailbox(self):
-        mixed = {"jane@janes-letter.com": 16, "jane.sample@gmail.com": 3}
-        assert not verdict("Jane Sample", mixed, 19, bulk=2, checked=2).is_service
-        barely = {"jane@janes-letter.com": 19, "jane.sample@gmail.com": 1}
-        assert verdict("Jane Sample", barely, 20, bulk=2, checked=2).is_service
-
-    def test_a_newsletter_sent_from_a_mailbox_alone_is_still_bulk(self):
-        assert verdict("Jane Sample", "jane.sample@gmail.com", 8, bulk=3, checked=3).is_service
-
-
-class TestSomeoneIsAPerson:
+class TestAPersonsOwnAddress:
     @pytest.mark.parametrize("name,address", [
         ("Jane Sample", "jane.sample@gmail.com"),
         ("Service", "someone@gmail.com"),
         ("Jane Sample", "janesample@yahoo.co.uk"),
         ("Jane Sample", "janesample@outlook.de"),
+        ("Jane Sample", "jane@hushmail.com"),
+        ("Jane Sample", "sample@rediffmail.com"),
+        ("Jane Sample", "anything@mailbox.org"),
         ("Jane Sample", "jane@acmewidgets.com"),
         ("Jane Sample", "jsample@acmewidgets.com"),
         ("Theodora Sample", "theod@acmewidgets.com"),
         ("Acme Sales", "jane.sample@acmewidgets.com"),
         ("Jane Sample", "jane@jane-sample.com"),
         ("Jane Sample", "jane@janesample.com"),
+        ("Jane Sample", "founder@sample.com"),
+        ("Jane Sample", "me@janesample.com"),
+        ("Jane Sample", "j@janesample.com"),
         ("Jane Sample", "jsample@mail.stateuniversity.edu"),
         ("Sample, Jane", "jane.sample@mail.agency.gov"),
         ("Sample, Jane", "jane.sample@units.ac.uk"),
         ("Robin", "robin@acmewidgets.com"),
         ("Sample, Jane", "jane.sample@northwindtrading.com"),
-        ("Jane Sample", "support@acmewidgets.com"),
         ("Jane Sample", "jane@mail.acmewidgets.com"),
-        ("Jane Sample via Platform", "pleasereply+thread-123456789@platformname.com"),
-        ("Jane Sample via Platform", "platform@platformname.com"),
         ("Pat Lee", "desk@northwindtrading.com"),
+        ("Jane Mailer", "jane.mailer@northwindtrading.com"),
+        ("Jane Mailer", "mailer@gmail.com"),
+        ("Sarah Church", "sarah@stmarys.org"),
     ])
     def test_one_message_is_not_enough(self, name, address):
         result = verdict(name, address)
         assert not result.is_service, result
+
+    def test_own_addresses_are_named_on_the_verdict(self):
+        addresses = {"jane.sample@gmail.com": 3, "events@acmewidgets.com": 3}
+        assert verdict("Jane Sample", addresses, 6).own_addresses == ("jane.sample@gmail.com",)
+
+    def test_a_role_mailbox_on_their_own_site_takes_history(self):
+        assert verdict("Jane Sample", "hello@janesample.com").is_service
+        kept = verdict("Jane Sample", "hello@janesample.com", 3, sent_to={"hello@janesample.com": 2})
+        assert not kept.is_service and kept.wrote_to_own_address
+        assert not verdict("Jane Sample", "hello@janesample.com", 3, thread=2).is_service
+        assert verdict("Jane Sample", "hello@janesample.com", 3, thread=1).is_service
+
+    def test_a_companys_name_is_not_a_site(self):
+        assert verdict("Acme Bank", "hello@acmebank.com").is_service
+        assert verdict("Dana (Acme)", "hello@acme.com").is_service
+
+    def test_one_word_name_on_its_own_address(self):
+        assert verdict("Robin", "robin@northwindtrading.com", 4).reason == "own_address"
+        assert verdict("Etickets", "etickets@northwindtrading.com", 40).reason == "one_way_volume"
+        assert verdict("Etickets", "etickets@northwindtrading.com", 5).reason == "not_a_person_name"
+
+    def test_a_person_in_threads_on_their_own_domain_is_not_a_brand(self):
+        assert not verdict("Jane Sample", "her@janesample.org", 0, thread=13).is_service
+
+    def test_first_dot_last_on_the_company_name_is_not_a_person(self):
+        assert not verdict("Jane Sample", "jane.sample@sample.com").is_service
+        assert "role_address" in address_shape("acme@acme.com").signals
+        assert "role_address" in address_shape("acme+tag@mail.acme.com").signals
+        assert "role_address" not in address_shape("jane@acme.com").signals
 
     def test_a_big_mailbox_is_not_a_provider_just_for_its_first_label(self):
         assert not address_shape("jane@email.acmewidgets.com").personal_provider
         assert not address_shape("jane@mail.acmewidgets.com").personal_provider
         assert address_shape("jane@mail.com").personal_provider
 
-    def test_a_one_word_name_on_its_own_address(self):
-        assert not verdict("Robin", "robin@northwindtrading.com", 4).is_service
-        assert verdict("Etickets", "etickets@northwindtrading.com", 40).is_service
-        assert verdict("Etickets", "etickets@northwindtrading.com", 40).reason == "one_way_volume"
-        assert not verdict("Etickets", "etickets@northwindtrading.com", 39).is_service
-        assert verdict("Etickets", "etickets@northwindtrading.com", 5, bulk=3, checked=3).is_service
 
-    def test_a_host_named_mailbox_is_not_first_dot_last(self):
-        assert not verdict("Jane Sample", "jane.sample@sample.com").is_service
-        assert "role_address" in address_shape("acme@acme.com").signals
-        assert "role_address" in address_shape("acme+tag@mail.acme.com").signals
-        assert "role_address" not in address_shape("jane@acme.com").signals
+class TestRealHistoryOutweighsAddressShape:
+    def test_a_sending_host_with_threads(self):
+        address = "jane.sample@mail.northwind.com"
+        assert not verdict("Jane Sample", address, 3, thread=200).is_service
+        assert verdict("Jane Sample", address, 3).reason == "sending_host"
 
-    def test_personal_mail_at_volume_stays_a_person(self):
-        assert not verdict("Jane Sample", "jane@acmewidgets.com", 500).is_service
+    def test_a_sending_host_with_replies(self):
+        address = "jane@mail.northwind.com"
+        kept = verdict("Jane Sample", address, 3, sent_to={address: 3})
+        assert not kept.is_service and kept.wrote_to_own_address
 
-    def test_relay_on_a_sending_host_is_still_a_service(self):
-        assert verdict("Jane Sample via Platform", "x@mail.platformname.com").is_service
+    def test_two_messages_on_a_sending_host_are_enough_and_one_is_not(self):
+        address = "jane@mail.northwind.com"
+        assert verdict("Jane Sample", address, 2).is_service
+        assert not verdict("Jane Sample", address, 1).is_service
 
-    def test_automated_relay_is_still_a_service(self):
-        assert verdict("Jane Sample via Platform", "noreply@platformname.com").is_service
+    def test_a_company_name_on_a_sending_host_needs_no_run_of_mail(self):
+        assert verdict("Acme Bank", "acme@mail.northwind.com").is_service
 
-    def test_a_person_in_threads_on_their_own_domain_is_not_a_brand(self):
-        assert not verdict("Jane Sample", "her@janesample.org", 0, thread=13).is_service
+    @pytest.mark.parametrize("address", ["sarah@stmarys.org", "schurch@stmarys.org", "sarahchurch@stmarys.org"])
+    def test_a_name_that_reads_as_an_organization_with_history(self, address):
+        assert not verdict("Sarah Church", address, 3, thread=50).is_service
 
-    def test_a_sender_with_a_real_address_among_others(self):
+    def test_a_name_that_reads_as_an_organization_without_history(self):
+        assert verdict("Acme Labs", "hq@northwindtrading.com", 2).reason == "organization_name"
+        assert not verdict("Acme Labs", "hq@northwindtrading.com", 1).is_service
+        assert verdict("Acme Club", "acmeclub@northwindtrading.com", 2).is_service
+
+    def test_an_automated_address_is_never_own_whatever_it_spells(self):
+        mixed = {"bounce@northwindtrading.com": 4, "desk@northwindtrading.com": 5}
+        assert verdict("Pat Bounce", mixed, 9).reason == "no_service_evidence"
+
+    def test_a_generated_address_is_never_own_whatever_it_spells(self):
+        assert verdict("Jane Sample", "jane+a1b2c3d4e5f6@paymentsplatform.com").reason == "generated_address"
+
+
+class TestJudgedPerAddress:
+    def test_a_newsletter_merged_into_a_persons_row_does_not_sink_them(self):
+        addresses = {"newsletter@northwindtrading.com": 6, "jane.sample@gmail.com": 4}
+        result = verdict("Jane Sample", addresses, T - 1)
+        assert not result.is_service
+        assert result.own_addresses == ("jane.sample@gmail.com",)
+
+    def test_a_real_address_among_others(self):
         mostly_role = {"events@northwindtrading.com": 8, "jane.sample@northwindtrading.com": 2}
-        assert not verdict("Jane Sample", mostly_role, 10).is_service
+        assert not verdict("Jane Sample", mostly_role, T - 1).is_service
         barely = {"events@northwindtrading.com": 19, "jane.sample@northwindtrading.com": 1}
-        assert verdict("Jane Sample", barely, 20).is_service
+        assert verdict("Jane Sample", barely, 9).is_service
 
-    def test_service_addresses_must_carry_most_of_the_mail(self):
+    def test_service_addresses_must_carry_half_the_mail(self):
         assert not verdict("Pat Lee", {"desk@northwindtrading.com": 5, "events@northwindtrading.com": 4}, 9).is_service
         assert verdict("Pat Lee", {"desk@northwindtrading.com": 4, "events@northwindtrading.com": 5}, 9).is_service
 
-    def test_automated_addresses_must_carry_half_the_mail(self):
-        mixed = {"noreply@northwindtrading.com": 4, "desk@northwindtrading.com": 5}
-        assert verdict("Pat Lee", mixed, 9).reason != "automated_address"
+    def test_mixed_kinds_of_service_address_add_up(self):
+        mixed = {"desk@northwindtrading.com": 4, "events@northwindtrading.com": 3, "noreply@acmewidgets.com": 3}
+        assert verdict("Pat Lee", mixed, 9).reason == "mixed_service_addresses"
 
     def test_no_address_is_no_verdict(self):
         assert classify_sender(SenderEvidence("Acme", {}, received=3)).reason == "no_address"
 
+    def test_a_reply_to_an_own_address_counts_even_with_a_service_address_too(self):
+        addresses = {"jane.sample@gmail.com": 2, "events@acmewidgets.com": 8}
+        result = verdict("Jane Sample", addresses, 10, sent_to={"jane.sample@gmail.com": 1})
+        assert result.wrote_to_own_address
 
-class TestSignals:
-    def test_name_signals(self):
-        assert ss.SIGNAL_ONE_WORD in name_signals("Instagramish")
-        assert ss.SIGNAL_ORG_NAME in name_signals("Northwind Bank")
-        assert ss.SIGNAL_ORG_NAME in name_signals("The Northwind")
-        assert ss.SIGNAL_ORG_NAME not in name_signals("Jane Sample")
-        assert ss.SIGNAL_ORG_NAME in name_signals("Northwind.com Tickets")
-        assert ss.SIGNAL_ORG_NAME not in name_signals("J.R. Sample")
-        assert ss.SIGNAL_NOT_A_NAME in name_signals("Acme® Card")
-        assert ss.SIGNAL_NOT_A_NAME in name_signals("")
-        assert ss.SIGNAL_NOT_A_NAME not in name_signals("Sam @ Acme")
-        assert ss.SIGNAL_PERSONA in name_signals("Dana (Acme)")
-        assert ss.SIGNAL_PERSONA in name_signals("Sam, Sales & Support")
-        assert ss.SIGNAL_PERSONA not in name_signals("Sample, Jane")
-        assert ss.SIGNAL_BRAND_NAME in name_signals("Acme Widgets", ["e.acmewidgets.com"])
-        assert ss.SIGNAL_BRAND_NAME in name_signals("Northwind Monthly", ["northwind.com"])
-        assert ss.SIGNAL_BRAND_NAME not in name_signals("Jane Sample", ["northwind.com"])
-        assert ss.SIGNAL_BRAND_NAME in name_signals("Zzzclub", ["email.zzz-club.com"])
-        assert ss.SIGNAL_BRAND_NAME in name_signals("Ledgerly", ["em1.ledgerly.northwind.com"])
+    def test_a_reply_to_the_service_address_alone_does_not(self):
+        addresses = {"jane.sample@gmail.com": 2, "events@acmewidgets.com": 8}
+        assert not verdict("Jane Sample", addresses, 10, sent_to={"events@acmewidgets.com": 1}).wrote_to_own_address
 
-    def test_address_shapes(self):
-        assert address_shape("<id@acmewidgets.com>").domain == "acmewidgets.com"
-        assert address_shape("a@b.co.uk").signals == ()
-        assert ss.SIGNAL_SENDING_HOST in address_shape("a@e.b.co.uk").signals
-        assert ss.SIGNAL_SENDING_HOST not in address_shape("a@mail.b.edu").signals
-        assert ss.SIGNAL_SENDING_HOST not in address_shape("a@mail.b.ac.uk").signals
-        assert ss.SIGNAL_SENDING_HOST not in address_shape("a@us.b.com").signals
-        assert ss.SIGNAL_ROLE in address_shape("customer_support@b.com").signals
-        assert ss.SIGNAL_ROLE in address_shape("supportdesk@b.com").signals
-        assert ss.SIGNAL_ROLE in address_shape("info15@b.com").signals
-        assert ss.SIGNAL_ROLE not in address_shape("janet@b.com").signals
-        assert ss.SIGNAL_MAIL_BRANDED in address_shape("a@email-b.com").signals
-        assert ss.SIGNAL_GENERATED not in address_shape("jane.sample1980@b.com").signals
-        assert ss.SIGNAL_GENERATED not in address_shape("jsample1980@b.com").signals
-        assert ss.SIGNAL_GENERATED in address_shape("ab1cdefghijkl@b.com").signals
-        assert ss.SIGNAL_GENERATED in address_shape("1ab23cdefghi@b.com").signals
-        assert ss.SIGNAL_GENERATED in address_shape("0123456789abcdef0123456789abcdef@b.com").signals
-        assert ss.SIGNAL_RESERVED in address_shape("a@sub.example.org").signals
-        assert ss.SIGNAL_LIST_HOST in address_shape("a@sub.groups.io").signals
-        # A provider's address has no other shape worth reading.
-        assert address_shape("support@gmail.com").signals == ()
+    def test_a_sent_message_with_no_recorded_address_counts_for_a_row_with_an_own_one(self):
+        assert verdict("Jane Sample", OWN_ADDRESS, 1, sent_to={"": 1}).wrote_to_own_address
+        assert not verdict(SERVICE_NAME, SERVICE_ADDRESS, 1, sent_to={"": 1}).wrote_to_own_address
 
 
-class TestBulkHeaders:
+class TestBulkMail:
+    @pytest.mark.parametrize("received,bulk,checked,expected", [
+        (8, 3, 3, True), (8, 2, 3, True), (8, 1, 3, False), (1, 1, 1, True), (2, 2, 2, True),
+        (8, 0, 3, False), (8, 0, 0, False),
+        # One bulk message says nothing about eight ordinary ones.
+        (9, 1, 1, False), (9, 2, 2, False), (9, 3, 9, False), (9, 6, 9, True),
+    ])
+    def test_a_share_of_the_mail_checked(self, received, bulk, checked, expected):
+        result = verdict("Jane Sample", "jane@janes-letter.com", received, bulk=bulk, checked=checked)
+        assert result.is_service is expected
+        assert (ss.SIGNAL_BULK_MAIL in result.signals) is expected
+
+    def test_one_bulk_message_does_not_outweigh_a_correspondent(self):
+        result = verdict("Jane Sample", OWN_ADDRESS, 32, sent_to={OWN_ADDRESS: 1}, bulk=1, checked=1)
+        assert not result.is_service
+
+    def test_someone_who_turns_up_in_threads(self):
+        assert not verdict("Jane Sample", "jane.sample@gmail.com", 1, thread=59, bulk=1, checked=1).is_service
+        assert verdict("Jane Sample", OWN_ADDRESS, 10, thread=1, bulk=3, checked=3).is_service
+        assert not verdict("Jane Sample", OWN_ADDRESS, 10, thread=2, bulk=3, checked=3).is_service
+
+    def test_someone_who_also_writes_from_their_own_mailbox(self):
+        mixed = {"jane@janes-letter.com": 6, "jane.sample@gmail.com": 3}
+        assert not verdict("Jane Sample", mixed, 9, bulk=3, checked=3).is_service
+        barely = {"jane@janes-letter.com": 39, "jane.sample@gmail.com": 1}
+        assert verdict("Jane Sample", barely, 9, bulk=3, checked=3).is_service
+
+    def test_a_newsletter_sent_from_a_mailbox_alone_is_still_bulk(self):
+        assert verdict("Jane Sample", "jane.sample@gmail.com", 8, bulk=3, checked=3).is_service
+
     @pytest.mark.parametrize("headers,expected", [
         ({"list-unsubscribe": "<mailto:x>"}, True),
         ({"precedence": "bulk"}, True),
@@ -289,6 +362,83 @@ class TestBulkHeaders:
             userId="me", id="m1", format="metadata", metadataHeaders=METADATA_HEADERS,
         )
 
+    def test_a_single_fetch_requests_the_headers_too(self):
+        service = self._service()
+        client = MagicMock()
+        with patch.object(GmailService, "service", client), patch.object(GmailService, "_rate_limit"):
+            service.get_message("m1", include_body=False)
+        client.users().messages().get.assert_any_call(
+            userId="me", id="m1", format="metadata", metadataHeaders=METADATA_HEADERS,
+        )
+
+
+class TestSignals:
+    def test_name_signals(self):
+        assert ss.SIGNAL_ONE_WORD in name_signals("Instagramish")
+        assert ss.SIGNAL_ORG_NAME in name_signals("Northwind Bank")
+        assert ss.SIGNAL_ORG_NAME in name_signals("The Northwind")
+        assert ss.SIGNAL_ORG_NAME in name_signals("Northwind Team")
+        assert ss.SIGNAL_ORG_NAME not in name_signals("The")
+        assert ss.SIGNAL_ORG_NAME not in name_signals("Jane Sample")
+        assert ss.SIGNAL_ORG_NAME in name_signals("Northwind.com Tickets")
+        assert ss.SIGNAL_ORG_NAME not in name_signals("J.R. Sample")
+        assert ss.SIGNAL_NOT_A_NAME in name_signals("Acme® Card")
+        assert ss.SIGNAL_NOT_A_NAME in name_signals("")
+        assert ss.SIGNAL_NOT_A_NAME not in name_signals("Sam @ Acme")
+        assert ss.SIGNAL_PERSONA in name_signals("Dana (Acme)")
+        assert ss.SIGNAL_PERSONA in name_signals("Sam, Sales & Support")
+        assert ss.SIGNAL_PERSONA not in name_signals("Sample, Jane")
+        assert ss.SIGNAL_BRAND_NAME in name_signals("Acme Widgets", ["e.acmewidgets.com"])
+        assert ss.SIGNAL_BRAND_NAME in name_signals("Northwind Monthly", ["northwind.com"])
+        assert ss.SIGNAL_BRAND_NAME not in name_signals("Jane Sample", ["northwind.com"])
+        assert ss.SIGNAL_BRAND_NAME in name_signals("Zzzclub", ["email.zzz-club.com"])
+        assert ss.SIGNAL_BRAND_NAME in name_signals("Ledgerly", ["em1.ledgerly.northwind.com"])
+        assert ss.SIGNAL_BRAND_NAME in name_signals("Abc Bank", ["abc.com"])
+        assert ss.SIGNAL_BRAND_NAME in name_signals("Monthly Northwind", ["northwind.com"])
+        assert ss.SIGNAL_BRAND_NAME in name_signals("Acme Widgets Monthly", ["acmewidgets.com"])
+        assert ss.SIGNAL_BRAND_NAME not in name_signals("Abel Sample", ["ab.com"])
+
+    def test_address_shapes(self):
+        assert address_shape("<id@acmewidgets.com>").domain == "acmewidgets.com"
+        assert address_shape("a@b.co.uk").signals == ()
+        assert ss.SIGNAL_SENDING_HOST in address_shape("a@e.b.co.uk").signals
+        assert ss.SIGNAL_SENDING_HOST not in address_shape("a@mail.b.edu").signals
+        assert ss.SIGNAL_SENDING_HOST not in address_shape("a@mail.b.ac.uk").signals
+        assert ss.SIGNAL_SENDING_HOST not in address_shape("a@us.b.com").signals
+        assert ss.SIGNAL_ROLE in address_shape("customer_support@b.com").signals
+        assert ss.SIGNAL_ROLE in address_shape("supportdesk@b.com").signals
+        assert ss.SIGNAL_ROLE in address_shape("info15@b.com").signals
+        assert ss.SIGNAL_ROLE not in address_shape("janet@b.com").signals
+        assert ss.SIGNAL_MAIL_BRANDED in address_shape("a@email-b.com").signals
+        assert ss.SIGNAL_GENERATED not in address_shape("jane.sample1980@b.com").signals
+        assert ss.SIGNAL_GENERATED not in address_shape("jsample1980@b.com").signals
+        assert ss.SIGNAL_GENERATED not in address_shape("abcde12345@b.com").signals
+        assert ss.SIGNAL_GENERATED in address_shape("ab1cdefghijkl@b.com").signals
+        assert ss.SIGNAL_GENERATED in address_shape("1ab23cdefghi@b.com").signals
+        assert ss.SIGNAL_GENERATED in address_shape("a1b2c3d4e5@b.com").signals
+        assert ss.SIGNAL_GENERATED in address_shape("0123456789abcdef0123456789abcdef@b.com").signals
+        assert ss.SIGNAL_RESERVED in address_shape("a@sub.example.org").signals
+        assert ss.SIGNAL_LIST_HOST in address_shape("a@sub.groups.io").signals
+        # A provider's address has no other shape worth reading.
+        assert address_shape("support@gmail.com").signals == ()
+
+    def test_automated_words(self):
+        assert ss.SIGNAL_AUTOMATED in address_shape("mailer@b.com").signals
+        assert ss.SIGNAL_AUTOMATED not in address_shape("jane.mailer@b.com").signals
+        assert ss.SIGNAL_AUTOMATED not in address_shape("mailer@gmail.com").signals
+        assert ss.SIGNAL_AUTOMATED in address_shape("noreply@gmail.com").signals
+
+    def test_regional_providers(self):
+        assert address_shape("a@hotmail.fr").personal_provider
+        assert address_shape("a@yahoo.co.uk").personal_provider
+        assert not address_shape("a@yahoo.info").personal_provider
+        assert not address_shape("a@yahoo.northwind.uk").personal_provider
+
+    def test_name_in_the_address(self):
+        assert not ss._carries_name(address_shape("desk+jane@b.com"), "Jane Sample")
+        assert not ss._carries_name(address_shape("delivery@b.com"), "Jo Li")
+        assert ss._carries_name(address_shape("lee@b.com"), "Jo Lee")
+
 
 class World:
     def __init__(self, tmp_path: Path):
@@ -319,12 +469,13 @@ class World:
             entity.relationship_strength = relationship_strength
         return self.people.add(entity)
 
-    def interaction(self, person, source="gmail", title="← Subject", source_id=None, account="personal", when=NOW):
+    def interaction(self, person, source="gmail", title="← Subject", source_id=None, account="personal",
+                    when=NOW, attendees=None):
         conn = sqlite3.connect(self.interactions_db)
         conn.execute(
-            "INSERT INTO interactions (id, person_id, timestamp, source_type, title, source_id, source_account) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (str(uuid.uuid4()), person.id, when, source, title, source_id or uuid.uuid4().hex, account),
+            "INSERT INTO interactions (id, person_id, timestamp, source_type, title, source_id, source_account, "
+            "attendee_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (str(uuid.uuid4()), person.id, when, source, title, source_id or uuid.uuid4().hex, account, attendees),
         )
         conn.commit()
         conn.close()
@@ -351,6 +502,11 @@ class World:
         self.mail(person)
         return person
 
+    def newsletter(self, name="Jane Sample", address=OWN_ADDRESS, count=T):
+        person = self.person(name=name, emails=[address])
+        self.mail(person, count=count, address=address)
+        return person
+
     def execute_sql(self, sql, *params, db=None):
         conn = sqlite3.connect(db or self.crm_db)
         conn.execute(sql, params)
@@ -362,6 +518,15 @@ class World:
 
     def decision(self, person, samples=None):
         return next(d for d in self.decisions(samples) if d.person.id == person.id)
+
+    def hide(self, person, store=None):
+        ss.hide_service_person(store or self.people, self.decision(person))
+
+    def interactions(self):
+        conn = sqlite3.connect(self.interactions_db)
+        rows = conn.execute("SELECT person_id, title FROM interactions").fetchall()
+        conn.close()
+        return rows
 
     def args(self, *extra):
         return [
@@ -379,7 +544,7 @@ def world(tmp_path):
     return World(tmp_path)
 
 
-class TestProtection:
+class TestStillProtected:
     def test_baseline_service_is_hidden(self, world):
         """The control for every case below: this row goes unless something saves it."""
         assert world.decision(world.service()).will_hide
@@ -392,38 +557,29 @@ class TestProtection:
         repair.execute_decisions(world.decisions(), world.crm_db)
         assert not world.people.get_by_id(person.id).hidden
 
-    @pytest.mark.parametrize("title,source_id", [
-        ("→ Hello", "abc:service@acmewidgets.com"),
-        ("Hello", "abc:service@acmewidgets.com"),
-    ])
-    def test_mail_he_sent_in_interactions(self, world, title, source_id):
-        person = world.service()
-        world.interaction(person, title=title, source_id=source_id)
-        self._assert_protected(world, person, "wrote_to")
-
-    def test_mail_he_sent_recorded_only_as_a_source_entity(self, world):
-        person = world.service()
-        world.source_entity(person, source_id="abc:service@acmewidgets.com")
-        self._assert_protected(world, person, "wrote_to")
-
-    def test_a_shared_thread_is_not_mail_he_sent(self, world):
-        person = world.service()
-        world.interaction(person, title="↔ Hello", source_id="abc:cc:service@acmewidgets.com")
-        world.source_entity(person, source_id="abc:cc:service@acmewidgets.com")
-        decision = world.decision(person)
-        assert decision.thread == 1 and decision.sent == 0
-        assert decision.will_hide
-
-    @pytest.mark.parametrize("source", ["imessage", "whatsapp", "phone", "calendar", "slack", "photos"])
-    def test_contact_interactions(self, world, source):
+    @pytest.mark.parametrize("source", ["imessage", "whatsapp", "phone", "photos"])
+    def test_one_to_one_channels(self, world, source):
         person = world.service()
         world.interaction(person, source=source, title="Hello")
         self._assert_protected(world, person, f"interaction:{source}")
 
-    @pytest.mark.parametrize("source", [
-        "imessage", "whatsapp", "phone", "calendar", "slack", "photos", "contacts", "phone_contacts", "linkedin",
-    ])
-    def test_contact_source_entities(self, world, source):
+    def test_a_slack_dm(self, world):
+        person = world.service()
+        world.interaction(person, source="slack", title="Slack DM with Sam")
+        self._assert_protected(world, person, "interaction:slack")
+
+    def test_a_slack_channel_is_not_one_to_one(self, world):
+        person = world.service()
+        world.interaction(person, source="slack", title="Message in a channel")
+        assert world.decision(person).will_hide
+
+    def test_a_whatsapp_group_is_not_one_to_one(self, world):
+        person = world.service()
+        world.interaction(person, source="whatsapp", title="WhatsApp group", attendees=30)
+        assert world.decision(person).will_hide
+
+    @pytest.mark.parametrize("source", ["imessage", "phone", "photos", "linkedin"])
+    def test_identity_source_entities(self, world, source):
         person = world.service()
         world.source_entity(person, source=source, email=None)
         self._assert_protected(world, person, f"source_entity:{source}")
@@ -446,14 +602,8 @@ class TestProtection:
         self._assert_protected(world, person, reason)
 
     def test_automatic_sources_protect_nothing(self, world):
-        person = world.service(sources=["gmail", "vault", "meeting", "granola"])
+        person = world.service(sources=["gmail", "vault", "meeting", "granola", "calendar", "contacts"])
         assert world.decision(person).will_hide
-
-    @pytest.mark.parametrize("status", ["confirmed", "rejected", "manual"])
-    def test_a_human_touched_link(self, world, status):
-        person = world.service()
-        world.source_entity(person, status=status)
-        self._assert_protected(world, person, f"link_status:{status}")
 
     @pytest.mark.parametrize("column", ["preferred_person_id", "rejected_person_id"])
     def test_link_overrides(self, world, column):
@@ -559,25 +709,110 @@ class TestProtection:
         world.merged.write_text(json.dumps({person.id: "survivor"}))
         assert person.id not in {d.person.id for d in world.decisions()}
 
-    @pytest.mark.parametrize("source", ["vault", "meeting"])
-    def test_notes_mentioning_a_person_shaped_name(self, world, source):
-        person = world.person(name="Jane Sample", emails=["events@mail.acmewidgets.com"])
-        world.mail(person, address="events@mail.acmewidgets.com")
-        world.interaction(person, source=source, title="Note")
-        self._assert_protected(world, person, "mentioned_in_notes")
 
-    def test_notes_mentioning_a_person_shaped_name_by_source_entity(self, world):
-        person = world.person(name="Jane Sample", emails=["events@mail.acmewidgets.com"])
-        world.mail(person, address="events@mail.acmewidgets.com")
-        world.source_entity(person, source="vault", email=None)
-        self._assert_protected(world, person, "mentioned_in_notes")
+class TestWhatNoLongerVouches:
+    def test_writing_to_a_role_mailbox(self, world):
+        person = world.service()
+        world.interaction(person, title="→ Hello", source_id=f"abc:{SERVICE_ADDRESS}")
+        world.source_entity(person, source_id=f"abd:{SERVICE_ADDRESS}")
+        decision = world.decision(person)
+        assert decision.sent == 1
+        assert decision.will_hide
 
-    def test_notes_mentioning_a_company_do_not_protect_it(self, world):
-        person = world.person(name="Acme", emails=[])
-        world.mail(person, address="learn@connect.acmewidgets.com")
-        world.interaction(person, source="vault", title="Note")
-        world.source_entity(person, source="meeting", email=None)
+    def test_writing_to_a_role_mailbox_is_counted_from_either_record(self, world):
+        person = world.service()
+        world.source_entity(person, source_id=f"abd:{SERVICE_ADDRESS}")
+        assert world.decision(person).sent == 1
+
+    @pytest.mark.parametrize("source", ["calendar", "contacts", "phone_contacts", "vault", "meeting", "whatsapp", "slack"])
+    def test_thin_source_entities(self, world, source):
+        person = world.service()
+        world.source_entity(person, source=source, email=None)
         assert world.decision(person).will_hide
+
+    @pytest.mark.parametrize("source,attendees", [("calendar", 3), ("calendar", 40), ("meeting", None), ("vault", None)])
+    def test_invites_and_mentions_on_a_service_address(self, world, source, attendees):
+        person = world.service()
+        world.interaction(person, source=source, title="Event", attendees=attendees)
+        assert world.decision(person).will_hide
+
+    def test_a_confirmed_link_on_a_service_address(self, world):
+        person = world.service()
+        world.source_entity(person, status="confirmed")
+        assert world.decision(person).will_hide
+
+    def test_a_rejected_link(self, world):
+        person = world.service()
+        world.source_entity(person, status="rejected")
+        assert world.decision(person).will_hide
+
+    def test_notes_on_a_person_shaped_name_at_a_marketing_address(self, world):
+        person = world.person(name="Jane Sample", emails=["events@mail.acmewidgets.com"])
+        world.mail(person, address="events@mail.acmewidgets.com")
+        world.interaction(person, source="vault", title="Note")
+        world.source_entity(person, source="vault", email=None)
+        assert world.decision(person).will_hide
+
+
+class TestOwnAddressProtection:
+    def _one_way(self, world):
+        person = world.newsletter()
+        assert world.decision(person).will_hide
+        return person
+
+    @pytest.mark.parametrize("title,source_id", [
+        ("→ Hello", f"abc:{OWN_ADDRESS}"),
+        ("→ Hello", "plainid"),
+        ("Hello", f"abc:{OWN_ADDRESS}"),
+    ])
+    def test_mail_he_sent(self, world, title, source_id):
+        person = self._one_way(world)
+        world.interaction(person, title=title, source_id=source_id)
+        decision = world.decision(person)
+        assert decision.verdict.wrote_to_own_address
+        assert "wrote_to" in decision.protected_by
+
+    def test_mail_he_sent_recorded_only_as_a_source_entity(self, world):
+        person = self._one_way(world)
+        world.source_entity(person, source_id=f"abc:{OWN_ADDRESS}", email=OWN_ADDRESS)
+        assert "wrote_to" in world.decision(person).protected_by
+
+    def test_wrote_to_saves_a_bulk_row(self, world):
+        person = self._one_way(world)
+        world.interaction(person, title="→ Hello", source_id=f"abc:{OWN_ADDRESS}")
+        decision = world.decision(person, {person.id: {"checked": 3, "bulk": 3}})
+        assert decision.verdict.is_service and "wrote_to" in decision.protected_by
+        assert not decision.will_hide
+
+    def test_a_shared_thread_is_not_mail_he_sent(self, world):
+        person = self._one_way(world)
+        world.interaction(person, title="↔ Hello", source_id=f"abc:cc:{OWN_ADDRESS}")
+        world.source_entity(person, source_id=f"abc:cc:{OWN_ADDRESS}", email=OWN_ADDRESS)
+        decision = world.decision(person)
+        assert decision.thread == 1 and decision.sent == 0
+        assert not decision.verdict.is_service
+
+    @pytest.mark.parametrize("source,attendees,protected", [
+        ("calendar", 1, True), ("calendar", 5, True), ("calendar", 6, False), ("calendar", None, False),
+        ("meeting", None, True), ("vault", None, False),
+    ])
+    def test_a_real_meeting(self, world, source, attendees, protected):
+        person = self._one_way(world)
+        world.interaction(person, source=source, title="Event", attendees=attendees)
+        decision = world.decision(person)
+        assert ("real_meeting" in decision.protected_by) is protected
+        assert decision.will_hide is not protected
+
+    @pytest.mark.parametrize("status,email,protected", [
+        ("confirmed", OWN_ADDRESS, True), ("manual", OWN_ADDRESS, True), ("rejected", OWN_ADDRESS, False),
+        ("confirmed", None, True),
+    ])
+    def test_a_human_link_on_their_own_address(self, world, status, email, protected):
+        person = self._one_way(world)
+        world.source_entity(person, status=status, email=email)
+        decision = world.decision(person)
+        assert ("human_link" in decision.protected_by) is protected
+        assert decision.will_hide is not protected
 
 
 class TestDecisions:
@@ -597,29 +832,39 @@ class TestDecisions:
         person = world.person()
         assert person.id not in {d.person.id for d in world.decisions()}
 
+    def test_a_row_with_mail_but_no_known_address_is_not_judged(self, world):
+        person = world.person(name="Acme", emails=[])
+        world.interaction(person)
+        assert person.id not in {d.person.id for d in world.decisions()}
+
+    def test_a_row_only_written_to_is_judged(self, world):
+        person = world.person()
+        world.interaction(person, title="→ Hello", source_id=f"abc:{SERVICE_ADDRESS}")
+        assert world.decision(person).will_hide
+
     def test_a_hidden_row_is_not_judged(self, world):
         person = world.service()
         world.people.hide_person(person.id, "by hand")
         assert person.id not in {d.person.id for d in world.decisions()}
 
     def test_counts_and_stored_bulk_flags(self, world):
-        person = world.person(name="Jane Sample", emails=["jane@janes-letter.com"])
-        world.mail(person, count=3, address="jane@janes-letter.com", metadata={"bulk": True})
-        world.mail(person, count=1, address="jane@janes-letter.com", metadata={"bulk": False})
-        world.mail(person, count=2, address="jane@janes-letter.com")
+        person = world.person(name="Jane Sample", emails=[OWN_ADDRESS])
+        world.mail(person, count=3, address=OWN_ADDRESS, metadata={"bulk": True})
+        world.mail(person, count=1, address=OWN_ADDRESS, metadata={"bulk": False})
+        world.mail(person, count=2, address=OWN_ADDRESS)
         decision = world.decision(person)
         assert decision.received == 6
         assert decision.verdict.reason == "bulk_mail"
 
     def test_too_little_stored_bulk_keeps_a_person(self, world):
-        person = world.person(name="Jane Sample", emails=["jane@janes-letter.com"])
-        world.mail(person, count=1, address="jane@janes-letter.com", metadata={"bulk": True})
-        world.mail(person, count=2, address="jane@janes-letter.com", metadata={"bulk": False})
+        person = world.person(name="Jane Sample", emails=[OWN_ADDRESS])
+        world.mail(person, count=1, address=OWN_ADDRESS, metadata={"bulk": True})
+        world.mail(person, count=2, address=OWN_ADDRESS, metadata={"bulk": False})
         assert not world.decision(person).verdict.is_service
 
     def test_sampled_bulk_counts(self, world):
-        person = world.person(name="Jane Sample", emails=["jane@janes-letter.com"])
-        world.mail(person, address="jane@janes-letter.com")
+        person = world.person(name="Jane Sample", emails=[OWN_ADDRESS])
+        world.mail(person, address=OWN_ADDRESS)
         assert not world.decision(person).will_hide
         assert world.decision(person, {person.id: {"checked": 3, "bulk": 3}}).will_hide
         assert not world.decision(person, {person.id: {"checked": 3, "bulk": 1}}).will_hide
@@ -642,11 +887,6 @@ class TestDecisions:
             ss._rows(conn, "SELECT json_extract('{broken', '$.x')")
         conn.close()
 
-    def test_a_row_with_mail_but_no_known_address_is_not_judged(self, world):
-        person = world.person(name="Acme", emails=[])
-        world.interaction(person)
-        assert person.id not in {d.person.id for d in world.decisions()}
-
     def test_thread_counts_reach_the_verdict(self, world):
         person = world.person(name="Pat Lee", emails=["desk@northwindtrading.com"])
         world.mail(person, count=50, address="desk@northwindtrading.com")
@@ -657,32 +897,26 @@ class TestDecisions:
         assert decision.thread == 6
         assert not decision.verdict.is_service
 
-    def test_a_sent_title_counts_whatever_the_source_id(self, world):
-        person = world.service()
-        world.interaction(person, title="→ Hello", source_id="plainid")
-        assert "wrote_to" in world.decision(person).protected_by
-
-    def test_a_company_named_after_its_domain_is_not_protected_by_notes(self, world):
-        person = world.person(name="Acme Widgets", emails=["events@mail.acmewidgets.com"])
-        world.mail(person, address="events@mail.acmewidgets.com")
-        world.interaction(person, source="vault", title="Note")
-        assert world.decision(person).will_hide
+    def test_name_signals_see_the_domain_for_a_human_link(self, world):
+        person = world.person(name="Acme Widgets", emails=["acme.w@acmewidgets.com"])
+        world.mail(person, address="acme.w@acmewidgets.com")
+        world.source_entity(person, status="confirmed", email="acme.w@acmewidgets.com")
+        assert "human_link" in world.decision(person).protected_by
 
 
 class TestHide:
     def test_hiding_clears_only_the_row_and_its_value(self, world):
         person = world.service(relationship_strength=42.0, dunbar_circle=5)
-        ss.hide_service_person(world.people, world.decision(person))
+        world.hide(person)
 
         row = world.people.get_by_id(person.id)
         assert row.hidden and row.hidden_at is not None
         assert row.hidden_reason == "service sender: role_address"
+        assert is_hidden_service(row)
         assert row.relationship_strength == 0.0
         assert row.dunbar_circle is None
         assert row.is_peripheral_contact
-        conn = sqlite3.connect(world.interactions_db)
-        assert conn.execute("SELECT COUNT(*) FROM interactions").fetchone()[0] == 6
-        conn.close()
+        assert len(world.interactions()) == 6
         conn = sqlite3.connect(world.crm_db)
         linked = conn.execute(
             "SELECT COUNT(*) FROM source_entities WHERE canonical_person_id = ?", (person.id,)
@@ -690,21 +924,41 @@ class TestHide:
         conn.close()
         assert linked == 6
 
-    def test_every_address_it_wrote_from_is_blocked(self, world):
+    def test_every_service_address_it_wrote_from_comes_with_it(self, world):
         person = world.person(name="Acme", emails=[])
         world.mail(person, address="learn@connect.acmewidgets.com")
-        ss.hide_service_person(world.people, world.decision(person))
+        world.hide(person)
         assert world.people.is_blocked("learn@connect.acmewidgets.com")
         assert PersonEntityStore(str(world.crm_db)).is_blocked("learn@connect.acmewidgets.com")
+        assert world.people.get_by_email("learn@connect.acmewidgets.com").id == person.id
 
     def test_an_address_someone_else_holds_stays_theirs(self, world):
         real = world.person(name="Pat Lee", emails=["shared@northwindtrading.com"], phone_numbers=["+15555550100"])
         person = world.person(name="Acme", emails=[])
         world.mail(person, count=9, address="learn@connect.acmewidgets.com")
         world.mail(person, count=1, address="shared@northwindtrading.com")
-        ss.hide_service_person(world.people, world.decision(person))
+        world.hide(person)
         assert not world.people.is_blocked("shared@northwindtrading.com")
         assert world.people.get_by_email("shared@northwindtrading.com").id == real.id
+
+    def test_a_persons_own_address_is_not_blocked_by_a_newsletter_on_their_row(self, world):
+        gmail = "jane.sample@gmail.com"
+        person = world.person(name="Jane Sample", emails=["newsletter@northwindtrading.com", gmail])
+        world.mail(person, count=12, address="newsletter@northwindtrading.com")
+        world.mail(person, count=8, address=gmail)
+        decision = world.decision(person)
+        assert decision.verdict.reason == "one_way_volume"
+        assert gmail in decision.verdict.own_addresses
+        world.hide(person)
+        assert world.people.is_blocked("newsletter@northwindtrading.com")
+        assert not world.people.is_blocked(gmail)
+
+    def test_an_own_address_only_seen_on_mail_stays_free(self, world):
+        person = world.person(name="Jane Sample", emails=["newsletter@northwindtrading.com"])
+        world.mail(person, count=12, address="newsletter@northwindtrading.com")
+        world.mail(person, count=8, address="jane.sample@gmail.com")
+        world.hide(person)
+        assert world.people.get_by_email("jane.sample@gmail.com") is None
 
     def test_a_hidden_service_takes_no_circle_slot(self, world):
         service = world.service(relationship_strength=99.0, is_peripheral_contact=False)
@@ -716,25 +970,81 @@ class TestHide:
         assert world.people.get_by_id(service.id).dunbar_circle == 1
         assert world.people.get_by_id(people[4].id).dunbar_circle == 2
 
-        ss.hide_service_person(world.people, world.decision(service))
+        world.hide(service)
         compute_all_dunbar_circles(world.people)
 
         assert world.people.get_by_id(service.id).dunbar_circle is None
         assert world.people.get_by_id(people[4].id).dunbar_circle == 1
 
     def test_a_blocked_address_cannot_become_a_new_person(self, world):
-        person = world.service()
-        ss.hide_service_person(world.people, world.decision(person))
-        assert world.people.add(PersonEntity(canonical_name="Acme Again", emails=[SERVICE_ADDRESS])) is None
+        person = world.person(name=SERVICE_NAME, emails=[])
+        world.mail(person)
+        world.hide(person)
+        world.execute_sql("DELETE FROM person_emails")
+        store = PersonEntityStore(str(world.crm_db))
+        assert store.add(PersonEntity(canonical_name="Acme Again", emails=[SERVICE_ADDRESS])) is None
+
+
+class TestAHiddenNamesake:
+    def _hidden_namesake(self, world):
+        person = world.person(name="Jane Sample", emails=["events@mail.acmewidgets.com"])
+        world.mail(person, address="events@mail.acmewidgets.com")
+        world.hide(person)
+        return person
+
+    def test_a_hidden_service_does_not_answer_to_its_name(self, world):
+        hidden = self._hidden_namesake(world)
+        assert world.people.get_by_name("Jane Sample") is None
+        resolver = EntityResolver(world.people)
+        assert resolver.resolve(name="Jane Sample") is None or resolver.resolve(name="Jane Sample").entity.id != hidden.id
+
+    def test_it_does_not_absorb_a_different_address(self, world):
+        hidden = self._hidden_namesake(world)
+        result = EntityResolver(world.people).resolve(
+            name="Jane Sample", email="jane.sample@gmail.com", create_if_missing=True,
+        )
+        assert result.entity.id != hidden.id
+        assert not result.entity.hidden
+        assert result.entity.has_email("jane.sample@gmail.com")
+
+    def test_a_stale_name_entry_still_does_not_win(self, world):
+        hidden = self._hidden_namesake(world)
+        world.execute_sql("INSERT INTO person_names (name, person_id) VALUES ('jane sample', ?)", hidden.id)
+        result = EntityResolver(world.people).match_name("Jane Sample")
+        assert result.result is None or result.result.entity.id != hidden.id
+
+    def test_hiding_does_not_take_the_name_from_a_visible_twin(self, world):
+        twin = world.person(name="Jane Sample", emails=["jane.sample@gmail.com"])
+        service = world.person(name="Jane Sample", emails=["events@mail.acmewidgets.com"])
+        assert world.people.get_by_name("Jane Sample").id == service.id, "the later row holds the name"
+        world.mail(service, address="events@mail.acmewidgets.com")
+        world.hide(service)
+        assert world.people.get_by_name("Jane Sample").id == twin.id
+
+    def test_its_own_address_still_finds_it(self, world):
+        hidden = self._hidden_namesake(world)
+        result = EntityResolver(world.people).resolve(name="Jane Sample", email="events@mail.acmewidgets.com")
+        assert result.entity.id == hidden.id
+
+    def test_restore_gives_the_name_back(self, world):
+        hidden = self._hidden_namesake(world)
+        ss.restore_person(world.people, hidden.id)
+        assert world.people.get_by_name("Jane Sample").id == hidden.id
+
+    def test_other_hidden_rows_keep_their_full_names(self, world):
+        person = world.person(name="Pat Lee", emails=["pat@northwindtrading.com"])
+        world.people.hide_person(person.id, "fake marketing persona")
+        assert world.people.get_by_name("Pat Lee").id == person.id
+        assert EntityResolver(world.people).match_name("Pat Lee").result.entity.id == person.id
 
 
 class TestRestore:
     def test_restore_undoes_the_hide_and_keeps_it(self, world):
         person = world.person(name="Acme", emails=[SERVICE_ADDRESS], relationship_strength=42.0)
         world.mail(person, address="learn@connect.acmewidgets.com")
-        ss.hide_service_person(world.people, world.decision(person))
+        world.hide(person)
 
-        restored = ss.restore_person(world.people, person.id, world.crm_db)
+        restored = ss.restore_person(world.people, person.id)
 
         row = world.people.get_by_id(person.id)
         assert restored.id == person.id
@@ -747,13 +1057,107 @@ class TestRestore:
         assert not world.decision(person).will_hide
 
     def test_restore_of_an_unknown_id(self, world):
-        assert ss.restore_person(world.people, "no-such-person", world.crm_db) is None
+        assert ss.restore_person(world.people, "no-such-person") is None
+
+    def test_unhide_unblocks_a_phone_number(self, world):
+        person = world.person(name="Pat Lee", emails=[], phone_numbers=["+15555550100"])
+        world.people.hide_person(person.id, "x")
+        assert world.people.is_blocked("+15555550100")
+        world.people.unhide_person(person.id)
+        assert not world.people.is_blocked("+15555550100")
+
+    def test_inferred_relationships_come_back_from_the_kept_interactions(self, world, monkeypatch):
+        """The whole round trip: hide, verify, restore, discover."""
+        from api.services import relationship_discovery as discovery
+
+        person = world.newsletter()
+        conn = sqlite3.connect(world.interactions_db)
+        conn.execute("UPDATE interactions SET title = '← Same subject ' || (rowid % 2)")
+        conn.commit()
+        conn.close()
+        relationships = RelationshipStore(str(world.crm_db))
+        monkeypatch.setattr("config.settings.settings.my_person_id", "owner", raising=False)
+        monkeypatch.setattr(discovery, "get_relationship_store", lambda: relationships)
+        monkeypatch.setattr(discovery, "get_interaction_db_path", lambda: str(world.interactions_db))
+
+        def rows():
+            conn = sqlite3.connect(world.crm_db)
+            found = conn.execute(
+                "SELECT shared_threads_count FROM relationships WHERE person_a_id = ? OR person_b_id = ?",
+                (person.id, person.id),
+            ).fetchall()
+            conn.close()
+            return found
+
+        discovery.discover_from_email_threads()
+        before = rows()
+        assert before, "discovery should find the owner's threads with this row"
+
+        world.hide(person)
+        with patch("config.settings.settings.chroma_path", world.root / "chromadb"):
+            consistency._check_relationship_hygiene({person.id}, {person.id, "a", "b", "c"}, dry_run=False)
+        assert rows() == []
+        assert len(world.interactions()) == T
+
+        ss.restore_person(world.people, person.id)
+        discovery.discover_from_email_threads()
+        assert rows() == before
+
+
+class TestAutoRestore:
+    @pytest.fixture
+    def nightly(self, world, monkeypatch):
+        monkeypatch.setattr(PersonEntityStore, "MERGED_IDS_PATH", world.merged)
+        with patch("api.services.interaction_store.get_interaction_db_path", return_value=str(world.interactions_db)):
+            yield world
+
+    def test_two_way_mail_on_an_own_address_brings_a_row_back(self, nightly):
+        person = nightly.newsletter()
+        assert ss.hide_service_senders(nightly.people)["hidden"] == 1
+        nightly.interaction(person, title="→ Hello", source_id=f"abc:{OWN_ADDRESS}")
+
+        result = ss.hide_service_senders(nightly.people)
+
+        assert result == {"hidden": 0, "held_back": 0, "restored": 1}
+        row = nightly.people.get_by_id(person.id)
+        assert not row.hidden
+        assert not nightly.people.is_blocked(OWN_ADDRESS)
+        assert ss.hide_service_senders(nightly.people)["hidden"] == 0
+
+    def test_a_reply_to_a_role_mailbox_does_not(self, nightly):
+        person = nightly.service()
+        ss.hide_service_senders(nightly.people)
+        nightly.interaction(person, title="→ Hello", source_id=f"abc:{SERVICE_ADDRESS}")
+        assert ss.hide_service_senders(nightly.people)["restored"] == 0
+        assert nightly.people.get_by_id(person.id).hidden
+
+    def test_a_sent_message_with_nothing_back_is_not_two_way(self, nightly):
+        person = nightly.person(name="Jane Sample", emails=[OWN_ADDRESS])
+        person.hidden = True
+        person.hidden_reason = "service sender: one_way_volume"
+        nightly.people.update(person)
+        nightly.interaction(person, title="→ Hello", source_id=f"abc:{OWN_ADDRESS}")
+        assert ss.hide_service_senders(nightly.people)["restored"] == 0
+
+    def test_a_row_hidden_for_another_reason_is_left_alone(self, nightly):
+        person = nightly.newsletter()
+        nightly.people.hide_person(person.id, "by hand")
+        nightly.interaction(person, title="→ Hello", source_id=f"abc:{OWN_ADDRESS}")
+        assert ss.hide_service_senders(nightly.people)["restored"] == 0
+        assert nightly.people.get_by_id(person.id).hidden
+
+    def test_a_merged_away_row_is_left_alone(self, nightly):
+        person = nightly.newsletter()
+        ss.hide_service_senders(nightly.people)
+        nightly.interaction(person, title="→ Hello", source_id=f"abc:{OWN_ADDRESS}")
+        nightly.merged.write_text(json.dumps({person.id: "survivor"}))
+        assert ss.hide_service_senders(nightly.people)["restored"] == 0
 
 
 class TestConsistencyVerification:
     def test_hidden_services_keep_interactions_and_others_lose_them(self, world):
         service = world.service()
-        ss.hide_service_person(world.people, world.decision(service))
+        world.hide(service)
         other = world.person(name="Spam Persona", emails=["spam@northwindtrading.com"])
         world.interaction(other)
         world.people.hide_person(other.id, "fake marketing persona")
@@ -794,7 +1198,7 @@ class TestNightlyPass:
         real = nightly.person(name="Jane Sample", emails=["jane.sample@gmail.com"])
         nightly.mail(real, address="jane.sample@gmail.com")
 
-        assert ss.hide_service_senders(nightly.people) == {"hidden": 1, "held_back": 0}
+        assert ss.hide_service_senders(nightly.people) == {"hidden": 1, "held_back": 0, "restored": 0}
         assert nightly.people.get_by_id(person.id).hidden
         assert not nightly.people.get_by_id(real.id).hidden
 
@@ -807,7 +1211,7 @@ class TestNightlyPass:
             nightly.mail(person, address=f"service{i}@acmewidgets.com")
 
         with caplog.at_level("WARNING"):
-            assert ss.hide_service_senders(nightly.people) == {"hidden": 0, "held_back": 3}
+            assert ss.hide_service_senders(nightly.people) == {"hidden": 0, "held_back": 3, "restored": 0}
 
         assert not any(nightly.people.get_by_id(p.id).hidden for p in people)
         assert "held back" in caplog.text
@@ -827,20 +1231,20 @@ class TestNightlyPass:
     def test_exactly_the_limit_goes_ahead(self, nightly, monkeypatch):
         monkeypatch.setattr(ss, "NIGHTLY_MAX_HIDES", 1)
         nightly.service()
-        assert ss.hide_service_senders(nightly.people) == {"hidden": 1, "held_back": 0}
+        assert ss.hide_service_senders(nightly.people)["hidden"] == 1
 
     def test_a_restored_row_stays_visible(self, nightly):
         person = nightly.service()
         ss.hide_service_senders(nightly.people)
-        ss.restore_person(nightly.people, person.id, nightly.crm_db)
-        assert ss.hide_service_senders(nightly.people) == {"hidden": 0, "held_back": 0}
+        ss.restore_person(nightly.people, person.id)
+        assert ss.hide_service_senders(nightly.people)["hidden"] == 0
         assert not nightly.people.get_by_id(person.id).hidden
 
     def test_the_strength_step_hides_before_it_scores(self, capsys):
         from scripts import sync_strengths
 
         order = []
-        with patch.object(sync_strengths, "hide_service_senders", side_effect=lambda: order.append("hide") or {"hidden": 2, "held_back": 0}), \
+        with patch.object(sync_strengths, "hide_service_senders", side_effect=lambda: order.append("hide") or {"hidden": 2, "held_back": 0, "restored": 1}), \
              patch.object(sync_strengths, "update_all_strengths", side_effect=lambda: order.append("score") or {"updated": 1, "failed": 0, "total": 1}), \
              patch("sys.argv", ["sync_strengths.py", "--execute"]):
             sync_strengths.main()
@@ -849,6 +1253,7 @@ class TestNightlyPass:
         stats = json.loads(capsys.readouterr().out.split("SYNC_STATS:")[1].splitlines()[0])
         assert stats["service_senders_hidden"] == 2
         assert stats["service_senders_held_back"] == 0
+        assert stats["service_senders_restored"] == 1
 
     def test_a_failed_pass_still_scores_and_reports_it(self, capsys):
         from scripts import sync_strengths
@@ -861,6 +1266,44 @@ class TestNightlyPass:
         score.assert_called_once_with()
         stats = json.loads(capsys.readouterr().out.split("SYNC_STATS:")[1].splitlines()[0])
         assert stats["errors"] == 1
+        assert stats["service_senders_restored"] == 0
+
+    def test_a_hold_back_is_recorded_and_reaches_the_summary(self, capsys):
+        from scripts import sync_strengths
+        from scripts.run_all_syncs import _parse_sync_output, send_sync_summary_telegram
+
+        with patch.object(sync_strengths, "hide_service_senders", return_value={"hidden": 0, "held_back": 900, "restored": 0}), \
+             patch.object(sync_strengths, "update_all_strengths", return_value={"updated": 1, "failed": 0, "total": 1}), \
+             patch("api.services.sync_health.record_sync_error") as recorded, \
+             patch("sys.argv", ["sync_strengths.py", "--execute"]):
+            sync_strengths.main()
+
+        recorded.assert_called_once()
+        assert recorded.call_args.kwargs["error_type"] == "service_senders_held_back"
+        output = capsys.readouterr().out
+        assert _parse_sync_output(output)["service_senders_held_back"] == 900
+        assert _parse_sync_output(output)["errors"] == 0
+
+        result = {
+            "failed": 0, "succeeded": 1, "sources_run": 1, "failed_sources": [], "duration_seconds": 1,
+            "results": {"strengths": {"success": True, "service_senders_held_back": 900}},
+        }
+        with patch("api.services.telegram.send_message", return_value=True) as send:
+            send_sync_summary_telegram(result, trigger="test")
+        message = send.call_args[0][0]
+        assert "Service filter held back" in message and "900" in message
+        assert "✅" not in message
+
+    def test_a_quiet_night_says_nothing_in_the_summary(self):
+        from scripts.run_all_syncs import send_sync_summary_telegram
+
+        result = {
+            "failed": 0, "succeeded": 1, "sources_run": 1, "failed_sources": [], "duration_seconds": 1,
+            "results": {"strengths": {"success": True, "service_senders_held_back": 0}},
+        }
+        with patch("api.services.telegram.send_message", return_value=True) as send:
+            send_sync_summary_telegram(result, trigger="test")
+        assert "Service filter held back" not in send.call_args[0][0]
 
     def test_the_strength_dry_run_does_neither(self):
         from scripts import sync_strengths
@@ -883,13 +1326,19 @@ def _email(message_id, sender, name, to=None, cc=None, bulk=False):
 
 
 class TestGmailSync:
-    def _run(self, world, emails, my_person_id=""):
+    def _run(self, world, emails, my_person_id="", fetched=None):
         from scripts.sync_gmail_calendar_interactions import sync_gmail_interactions
 
         gmail = MagicMock()
         by_id = {email.message_id: email for email in emails}
         gmail.service.users().messages().list().execute.return_value = {"messages": [{"id": i} for i in by_id]}
-        gmail.get_messages_batch.side_effect = lambda ids, **kw: {i: by_id[i] for i in ids}
+
+        def batch(ids, **kw):
+            if fetched is not None:
+                fetched.extend(ids)
+            return {i: by_id[i] for i in ids}
+
+        gmail.get_messages_batch.side_effect = batch
         cache = GmailSkipCache(db_path=str(world.root / "skip.db"))
         module = "scripts.sync_gmail_calendar_interactions"
         with patch(f"{module}.GmailService", return_value=gmail), \
@@ -902,12 +1351,6 @@ class TestGmailSync:
             stats = sync_gmail_interactions(account_type=GoogleAccount.PERSONAL, dry_run=False, days_back=30)
         return stats, cache
 
-    def _interactions(self, world):
-        conn = sqlite3.connect(world.interactions_db)
-        rows = conn.execute("SELECT person_id, title FROM interactions").fetchall()
-        conn.close()
-        return rows
-
     def _source_entities(self, world):
         conn = sqlite3.connect(world.crm_db)
         rows = conn.execute("SELECT observed_email, metadata FROM source_entities").fetchall()
@@ -917,53 +1360,75 @@ class TestGmailSync:
     def test_an_unknown_service_creates_nothing(self, world):
         stats, cache = self._run(world, [_email("m1", "events@mail.acmewidgets.com", "Acme")])
         assert world.people.get_all() == []
-        assert self._interactions(world) == []
+        assert world.interactions() == []
         assert self._source_entities(world) == []
         assert stats["service_skipped"] == 1
         assert cache.get_skipped_ids("personal") == {"m1"}
 
     def test_a_new_sender_of_bulk_mail_creates_nothing(self, world):
-        stats, _ = self._run(world, [_email("m1", "jane@janes-letter.com", "Jane Sample", bulk=True)])
+        stats, _ = self._run(world, [_email("m1", OWN_ADDRESS, "Jane Sample", bulk=True)])
         assert world.people.get_all() == []
         assert stats["service_skipped"] == 1
 
     def test_a_new_person_is_created_as_usual(self, world):
-        stats, cache = self._run(world, [_email("m1", "jane@janes-letter.com", "Jane Sample")])
+        stats, cache = self._run(world, [_email("m1", OWN_ADDRESS, "Jane Sample")])
         assert [p.canonical_name for p in world.people.get_all()] == ["Jane Sample"]
-        assert len(self._interactions(world)) == 1
+        assert len(world.interactions()) == 1
         assert json.loads(self._source_entities(world)[0][1])["bulk"] is False
         assert stats["service_skipped"] == 0
         assert cache.get_skipped_ids("personal") == set()
 
+    @pytest.mark.parametrize("address", ["founder@sample.com", "me@janesample.com", "j@janesample.com"])
+    def test_a_person_on_their_own_domain_gets_a_row_from_one_message(self, world, address):
+        self._run(world, [_email("m1", address, "Jane Sample")])
+        assert world.people.get_by_email(address) is not None
+        assert len(world.interactions()) == 1
+
+    def test_a_phone_number_stops_the_drop(self, world):
+        person = world.person(name="Jane Sample", emails=[], phone_numbers=["+15555550100"])
+        stats, _ = self._run(world, [_email("m1", "events@mail.acmewidgets.com", "Jane Sample")])
+        assert stats["service_skipped"] == 0
+        assert world.interactions() == [(person.id, "← Subject")]
+
+    def test_a_phone_number_also_stops_the_marketing_drop(self, world):
+        person = world.person(name="Jane Sample", emails=[], phone_numbers=["+15555550100"])
+        stats, _ = self._run(world, [_email("m1", "hello@janes-letter.com", "Jane Sample")])
+        assert stats["marketing_skipped"] == 0
+        assert world.interactions() == [(person.id, "← Subject")]
+
+    def test_a_namesake_with_no_phone_does_not_stop_it(self, world):
+        world.person(name="Jane Sample", emails=["jane.sample@gmail.com"])
+        stats, _ = self._run(world, [_email("m1", "events@mail.acmewidgets.com", "Jane Sample")])
+        assert stats["service_skipped"] == 1
+        assert world.interactions() == []
+
+    def test_a_one_word_namesake_with_a_phone_does_not_stop_it(self, world):
+        world.person(name="Acme", emails=[], phone_numbers=["+15555550100"])
+        stats, _ = self._run(world, [_email("m1", "events@mail.acmewidgets.com", "Acme")])
+        assert stats["service_skipped"] == 1
+
     def test_bulk_mail_from_a_known_person_counts_and_is_recorded(self, world):
-        person = world.person(name="Jane Sample", emails=["jane@janes-letter.com"])
-        stats, _ = self._run(world, [_email("m1", "jane@janes-letter.com", "Jane Sample", bulk=True)])
-        assert self._interactions(world) == [(person.id, "← Subject")]
+        person = world.person(name="Jane Sample", emails=[OWN_ADDRESS])
+        stats, _ = self._run(world, [_email("m1", OWN_ADDRESS, "Jane Sample", bulk=True)])
+        assert world.interactions() == [(person.id, "← Subject")]
         assert json.loads(self._source_entities(world)[0][1])["bulk"] is True
         assert stats["service_skipped"] == 0
 
     def test_a_service_cannot_land_on_someone_sharing_its_name(self, world):
         acme = world.person(name="Acme Sample", emails=["acme.sample@gmail.com"])
         self._run(world, [_email("m1", "events@e.acmewidgets.com", "Acme Sample")])
-        assert self._interactions(world) == []
+        assert world.interactions() == []
         assert world.people.get_by_id(acme.id).emails == ["acme.sample@gmail.com"]
 
     def test_a_blocked_address_with_no_row_produces_nothing(self, world):
         world.people.hide_person(world.person(name="Gone", emails=["gone@northwindtrading.com"]).id, "x")
-        conn = sqlite3.connect(world.crm_db)
-        conn.execute("DELETE FROM person_emails WHERE email = 'gone@northwindtrading.com'")
-        conn.commit()
-        conn.close()
+        world.execute_sql("DELETE FROM person_emails WHERE email = 'gone@northwindtrading.com'")
         stats, _ = self._run(world, [_email(
             "m1", "gone@northwindtrading.com", "Gone Sample", to="Pat Lee <pat.lee@gmail.com>",
         )])
-        assert self._interactions(world) == []
+        assert world.interactions() == []
         assert world.people.get_by_email("pat.lee@gmail.com") is None
         assert stats["service_skipped"] == 1
-
-    def test_a_sender_named_only_by_their_address_is_created_as_usual(self, world):
-        self._run(world, [_email("m1", "robin@northwindtrading.com", "robin@northwindtrading.com")])
-        assert [p.canonical_name for p in world.people.get_all()] == ["Robin"]
 
     def test_a_service_on_the_thread_creates_nothing(self, world):
         person = world.person(name="Jane Sample", emails=["jane.sample@gmail.com"])
@@ -973,9 +1438,116 @@ class TestGmailSync:
         )])
         assert world.people.get_by_email("desk@e.acmewidgets.com") is None
         pat = world.people.get_by_email("pat.lee@gmail.com")
-        assert {row[0] for row in self._interactions(world)} == {person.id, pat.id}
+        assert {row[0] for row in world.interactions()} == {person.id, pat.id}
 
-    def test_someone_he_writes_to_is_kept_however_they_look(self, world):
+    def test_a_sender_named_only_by_their_address_is_created_as_usual(self, world):
+        self._run(world, [_email("m1", "robin@northwindtrading.com", "robin@northwindtrading.com")])
+        assert [p.canonical_name for p in world.people.get_all()] == ["Robin"]
+
+    @pytest.mark.parametrize("address,name", [
+        ("hello@janesample.com", "Jane Sample"), ("info@janesample.com", "Jane Sample"),
+        ("team@janesample.com", "Jane Sample"), ("support@janesample.com", "Jane Sample"),
+    ])
+    def test_replies_to_a_role_mailbox_are_counted_truthfully(self, world, address, name):
+        me = world.person(name="Owner Sample", emails=["owner.sample@gmail.com"])
+        self._run(
+            world, [_email("m1", "owner.sample@gmail.com", "Owner Sample", to=f"{name} <{address}>")],
+            my_person_id=me.id,
+        )
+        recipient = world.people.get_by_email(address)
+        assert recipient is not None
+        decision = world.decision(recipient)
+        assert decision.sent == 1
+        assert "wrote_to" in decision.protected_by, "her own site, so a reply counts"
+
+    def test_a_reply_to_a_companys_role_mailbox_is_counted_and_does_not_protect(self, world):
+        me = world.person(name="Owner Sample", emails=["owner.sample@gmail.com"])
+        self._run(
+            world, [_email("m1", "owner.sample@gmail.com", "Owner Sample", to="Acme Help <support@acmewidgets.com>")],
+            my_person_id=me.id,
+        )
+        decision = world.decision(world.people.get_by_email("support@acmewidgets.com"))
+        assert decision.sent == 1
+        assert decision.will_hide
+
+    def test_her_answer_from_a_role_address_counts_once_the_address_is_known(self, world):
+        person = world.person(name="Jane Sample", emails=["hello@janesample.com"])
+        stats, _ = self._run(world, [_email("m1", "hello@janesample.com", "Jane Sample")])
+        assert stats["marketing_skipped"] == 0
+        assert world.interactions() == [(person.id, "← Subject")]
+
+    def test_mail_from_a_stranger_at_a_marketing_prefix_is_still_dropped(self, world):
+        stats, _ = self._run(world, [_email("m1", "deals@mailchimp.com", "Jane Sample")])
+        assert stats["marketing_skipped"] == 1
+        assert world.interactions() == []
+
+    def test_a_hidden_services_mail_is_kept_and_not_fetched_again(self, world):
+        person = world.service()
+        world.hide(person)
+        before = len(world.interactions())
+        fetched = []
+        emails = [_email("m1", SERVICE_ADDRESS, SERVICE_NAME)]
+        stats, cache = self._run(world, emails, fetched=fetched)
+        assert len(world.interactions()) == before + 1
+        assert stats["service_skipped"] == 0
+        assert world.people.get_by_email(SERVICE_ADDRESS).hidden
+
+        fetched.clear()
+        self._run(world, emails, fetched=fetched)
+        assert fetched == []
+
+    def test_mail_the_owner_sends_a_hidden_service_is_kept_too(self, world):
+        me = world.person(name="Owner Sample", emails=["owner.sample@gmail.com"])
+        person = world.service()
+        world.hide(person)
+        before = len(world.interactions())
+        self._run(
+            world, [_email("m1", "owner.sample@gmail.com", "Owner Sample", to=f"Acme <{SERVICE_ADDRESS}>")],
+            my_person_id=me.id,
+        )
+        assert len(world.interactions()) == before + 1
+
+    def test_a_namesakes_mail_stays_with_the_namesake(self, world):
+        person = world.person(name="Jane Sample", emails=["events@mail.acmewidgets.com"])
+        world.mail(person, address="events@mail.acmewidgets.com")
+        world.hide(person)
+        count = len(world.interactions())
+        me = world.person(name="Owner Sample", emails=["owner.sample@gmail.com"])
+        self._run(world, [
+            _email("m1", "jane.sample@gmail.com", "Jane Sample"),
+            _email("m2", "owner.sample@gmail.com", "Owner Sample", to="Jane Sample <jane.sample@gmail.com>"),
+        ], my_person_id=me.id)
+        real = world.people.get_by_email("jane.sample@gmail.com")
+        assert real is not None and real.id != person.id and not real.hidden
+        assert sum(pid == real.id for pid, _ in world.interactions()) == 2
+        assert len(world.interactions()) == count + 2
+
+    def test_mail_skipped_before_someone_had_a_row_comes_back(self, world):
+        first = _email("m1", OWN_ADDRESS, "Jane Sample", bulk=True)
+        _, cache = self._run(world, [first])
+        assert cache.get_skipped_ids("personal") == {"m1"}
+
+        second = _email("m2", OWN_ADDRESS, "Jane Sample")
+        _, cache = self._run(world, [first, second])
+        assert cache.get_skipped_ids("personal") == set(), "a new person releases their skipped mail"
+        person = world.people.get_by_email(OWN_ADDRESS)
+        assert len(world.interactions()) == 1
+
+        self._run(world, [first, second])
+        assert sum(pid == person.id for pid, _ in world.interactions()) == 2
+
+    def test_releasing_mail_only_asks_gmail_for_that_address(self, world):
+        from scripts.sync_gmail_calendar_interactions import _release_skipped_mail
+
+        gmail = MagicMock()
+        gmail.service.users().messages().list().execute.return_value = {"messages": [{"id": "m1"}]}
+        cache = MagicMock()
+        cache.forget.return_value = 1
+        _release_skipped_mail(gmail, cache, "personal", {OWN_ADDRESS}, datetime(2026, 6, 1, tzinfo=timezone.utc))
+        assert gmail.service.users().messages().list.call_args.kwargs["q"] == f"from:{OWN_ADDRESS} after:2026/06/01"
+        cache.forget.assert_called_once_with("personal", ["m1"])
+
+    def test_someone_he_writes_to_is_recorded_however_they_look(self, world):
         me = world.person(name="Owner Sample", emails=["owner.sample@gmail.com"])
         self._run(
             world,
@@ -984,17 +1556,18 @@ class TestGmailSync:
         )
         recipient = world.people.get_by_email("desk@e.acmewidgets.com")
         assert recipient is not None
-        decision = world.decision(recipient)
-        assert decision.verdict.is_service and "wrote_to" in decision.protected_by
+        assert world.decision(recipient).sent == 1
 
-    def test_a_hidden_service_keeps_its_source_entities_flowing(self, world):
-        person = world.service()
-        ss.hide_service_person(world.people, world.decision(person))
-        before = len(self._interactions(world))
-        stats, _ = self._run(world, [_email("m1", SERVICE_ADDRESS, SERVICE_NAME)])
-        assert len(self._interactions(world)) == before
-        assert stats["service_skipped"] == 0
-        assert world.people.get_by_email(SERVICE_ADDRESS).hidden
+
+class TestSkipCacheForget:
+    def test_forget_clears_only_what_it_names(self, world):
+        cache = GmailSkipCache(db_path=str(world.root / "skip.db"))
+        cache.record_skipped("personal", ["m1", "m2"])
+        cache.record_skipped("work", ["m1"])
+        assert cache.forget("personal", ["m1", "other"]) == 1
+        assert cache.get_skipped_ids("personal") == {"m2"}
+        assert cache.get_skipped_ids("work") == {"m1"}
+        assert cache.forget("personal", []) == 0
 
 
 class TestIsUnknownServiceSender:
@@ -1007,15 +1580,23 @@ class TestIsUnknownServiceSender:
 
     def test_a_blocked_address(self, world):
         world.people.hide_person(world.person(name="Pat Lee", emails=["pat@northwindtrading.com"]).id, "x")
-        conn = sqlite3.connect(world.crm_db)
-        conn.execute("DELETE FROM person_emails")
-        conn.commit()
-        conn.close()
+        world.execute_sql("DELETE FROM person_emails")
         assert ss.is_unknown_service_sender(world.people, "PAT@northwindtrading.com", "Pat Lee")
 
     def test_case_and_missing_name(self, world):
         assert ss.is_unknown_service_sender(world.people, "NoReply@AcmeWidgets.com")
         assert not ss.is_unknown_service_sender(world.people, "jane.sample@gmail.com")
+
+    def test_is_known_sender(self, world):
+        world.person(name="Jane Sample", emails=["jane@janes-letter.com"])
+        hidden_other = world.person(name="Pat Lee", emails=["pat@northwindtrading.com"])
+        world.people.hide_person(hidden_other.id, "by hand")
+        hidden_service = world.service()
+        world.hide(hidden_service)
+        assert ss.is_known_sender(world.people, "jane@janes-letter.com")
+        assert ss.is_known_sender(world.people, SERVICE_ADDRESS)
+        assert not ss.is_known_sender(world.people, "pat@northwindtrading.com")
+        assert not ss.is_known_sender(world.people, "stranger@northwindtrading.com", "Sam Sample")
 
 
 class TestRepairScript:
@@ -1056,30 +1637,79 @@ class TestRepairScript:
         with pytest.raises(SystemExit):
             repair._write_private(repair.REPO_ROOT / "tests" / "samples.json", "{}")
 
+    def test_a_new_private_file_is_never_world_readable(self, world):
+        target = world.root / "private" / "new.json"
+        with patch.object(repair.os, "chmod"):
+            repair._write_private(target, "{}")
+        assert stat.S_IMODE(os.stat(target).st_mode) == 0o600
+
+    def _sections(self, world):
+        return {section.split("\n")[0]: section for section in world.review.read_text().split("\n## ")}
+
+    def _section(self, world, start):
+        return next(v for k, v in self._sections(world).items() if k.startswith(start))
+
     def test_review_shows_both_error_directions(self, world):
         hidden = world.service(relationship_strength=42.0, dunbar_circle=5)
         protected = world.service(name="Northwind Bank", emails=["service@northwindtrading.com"], phone_numbers=["+15555550100"])
-        short = world.person(name="Jane Sample", emails=["support@janes-letter.com"])
-        world.mail(short, count=2, address="support@janes-letter.com")
+        short = world.person(name="Northwind Labs", emails=["hq@elsewhere-sample.com"])
+        world.mail(short, count=1, address="hq@elsewhere-sample.com")
         world.run()
-        text = world.review.read_text()
-        sections = text.split("\n## ")
-        by_title = {section.split("\n")[0]: section for section in sections}
-        reviewed = next(v for k, v in by_title.items() if k.startswith("Would hide, circles 0-5"))
+        reviewed = self._section(world, "Would hide, circles 0-5")
         assert hidden.canonical_name in reviewed and "role_address" in reviewed and hidden.id in reviewed
-        saved = next(v for k, v in by_title.items() if k.startswith("Kept: service-shaped"))
+        saved = self._section(world, "Kept: service-shaped")
         assert protected.canonical_name in saved and "phone_number" in saved
-        fell_short = next(v for k, v in by_title.items() if k.startswith("Kept: signals fell short"))
-        assert short.canonical_name in fell_short and "person_name_on_role_address" in fell_short
+        fell_short = self._section(world, "Kept: signals or one-way mail")
+        assert short.canonical_name in fell_short and "organization_name" in fell_short
 
     def test_review_samples_the_rest_at_random(self, world):
         for i in range(120):
             person = world.person(name=f"Acme Bank{i}", emails=[f"service{i}@acmewidgets.com"], dunbar_circle=7)
             world.mail(person, count=1, address=f"service{i}@acmewidgets.com")
         world.run()
-        section = next(s for s in world.review.read_text().split("\n## ") if s.startswith("Would hide, random"))
+        section = self._section(world, "Would hide, random")
         assert section.startswith("Would hide, random 100 of the other 120")
         assert section.count("\n| 7 |") == 100
+
+    def test_review_shows_hidden_rows_with_the_most_two_way_mail(self, world):
+        quiet = world.service()
+        busy = world.person(name="Northwind Help", emails=["help@northwindtrading.com"])
+        world.mail(busy, count=1, address="help@northwindtrading.com")
+        for i in range(3):
+            world.interaction(busy, title="↔ Subject", source_id=f"t{i}:cc:help@northwindtrading.com")
+        world.interaction(busy, title="→ Subject", source_id="s1:help@northwindtrading.com")
+        busier = world.person(name="Acme Help", emails=["help@acmewidgets.com"])
+        for i in range(6):
+            world.interaction(busier, title="→ Subject", source_id=f"s{i}:help@acmewidgets.com")
+        world.run()
+        section = self._section(world, "Hidden rows with the most two-way mail")
+        assert section.index("Acme Help") < section.index("Northwind Help")
+        assert quiet.canonical_name not in section
+
+    def test_review_compares_with_the_last_version(self, world, tmp_path):
+        new = world.service()
+        same = world.service(name="Northwind Bank", emails=["service@northwindtrading.com"])
+        kept_now = world.person(name="Jane Sample", emails=["jane.sample@gmail.com"])
+        previous = tmp_path / "previous.json"
+        previous.write_text(json.dumps([same.id, kept_now.id, "gone-now"]))
+        world.mail(kept_now, address="jane.sample@gmail.com")
+        world.run("--previous", str(previous))
+        added = self._section(world, "Newly hidden compared with the last version (1)")
+        assert new.canonical_name in added and same.canonical_name not in added
+        removed = self._section(world, "Hidden last version, kept now (1)")
+        assert kept_now.canonical_name in removed
+
+    def test_review_says_why_a_row_was_kept(self, world, tmp_path):
+        protected = world.service(phone_numbers=["+15555550100"])
+        previous = tmp_path / "previous.json"
+        previous.write_text(json.dumps([protected.id]))
+        world.run("--previous", str(previous))
+        assert "phone_number" in self._section(world, "Hidden last version, kept now")
+
+    def test_no_comparison_without_a_previous_version(self, world):
+        world.service()
+        world.run()
+        assert not any(k.startswith("Newly hidden") for k in self._sections(world))
 
     def test_summary_counts_by_circle_and_rank(self, world):
         for i, circle in enumerate([4, 5, 5, 7, None]):
@@ -1097,6 +1727,16 @@ class TestRepairScript:
         assert summary["people_with_email"] == 6
         assert summary["by_rule"] == {"role_address": 5}
 
+    def test_summary_counts_what_each_protection_saves(self, world):
+        world.service(phone_numbers=["+15555550100"])
+        world.service(name="Northwind Bank", emails=["service@northwindtrading.com"], phone_numbers=["+15555550101"], company="Sample Co")
+        real = world.person(name="Jane Sample", emails=["jane.sample@gmail.com"], phone_numbers=["+15555550102"])
+        world.mail(real, address="jane.sample@gmail.com")
+        summary = repair.summarize(world.decisions(), top_strength=0.0)
+        assert summary["service_shaped_but_protected"] == 2
+        assert summary["protected_by"] == {"phone_number": 2, "company": 1}
+        assert summary["protected_by_only_this"] == {"phone_number": 1}
+
     def test_top_rank_counts_everyone_visible_with_or_without_email(self, world, monkeypatch):
         monkeypatch.setattr(repair, "TOP_RANK", 2)
         world.person(name="Sample One", emails=[], phone_numbers=["+15555550100"], relationship_strength=90.0)
@@ -1110,6 +1750,64 @@ class TestRepairScript:
     def test_top_rank_on_a_small_crm_takes_everyone(self, world):
         world.person(name="Sample One", emails=[], relationship_strength=90.0)
         assert repair.top_rank_strength(world.crm_db) == 0.0
+
+    def test_thinnest_protection_comes_first(self, world):
+        thick = world.service(name="Northwind Bank", emails=["service@northwindtrading.com"], phone_numbers=["+15555550100"], tags=["x"])
+        thin = world.service(phone_numbers=["+15555550101"])
+        protected, _ = repair.near_line(world.decisions())
+        assert [d.person.id for d in protected] == [thin.id, thick.id]
+
+    def test_kept_rows_near_the_line(self, world):
+        def kept(name, address, count=2):
+            person = world.person(name=name, emails=[address])
+            world.mail(person, count=count, address=address)
+            return person
+
+        signal = kept("Northwind Labs", "hq@elsewhere-sample.com", count=1)
+        near = kept("Jane Sample", OWN_ADDRESS, count=T - 1)
+        far = kept("Sam Sample", "sam@janes-letter.com", count=repair.NEAR_ONE_WAY_RECEIVED - 1)
+        plain = kept("Pat Lee", "desk@northwindtrading.com", count=2)
+        talkative = kept("Dana Sample", "dana@janes-letter.com", count=T - 1)
+        world.interaction(talkative, title="↔ Subject", source_id="t:cc:dana@janes-letter.com")
+
+        _, short = repair.near_line(world.decisions())
+        ids = [d.person.id for d in short]
+        assert near.id in ids and signal.id in ids
+        assert far.id not in ids and plain.id not in ids and talkative.id not in ids
+        assert ids[0] == near.id, "most mail first"
+
+    def test_near_line_sections_are_capped_but_counted(self, world, monkeypatch):
+        monkeypatch.setattr(repair, "NEAR_LINE_SIZE", 1)
+        for i in range(2):
+            world.service(name=f"Acme Bank{i}", emails=[f"service{i}@acmewidgets.com"], phone_numbers=[f"+1555555010{i}"])
+            person = world.person(name=f"Northwind Labs {'Alpha' if i else 'Beta'}", emails=[f"hq{chr(97 + i)}@elsewhere-sample.com"])
+            world.mail(person, count=1, address=f"hq{chr(97 + i)}@elsewhere-sample.com")
+        text = repair.build_review(world.decisions(), {}, 0.0)
+        saved = next(s for s in text.split("\n## ") if s.startswith("Kept: service-shaped"))
+        short = next(s for s in text.split("\n## ") if s.startswith("Kept: signals or one-way mail"))
+        assert saved.startswith("Kept: service-shaped, only protection saved them (2, thinnest first, showing 1)")
+        assert short.startswith("Kept: signals or one-way mail short of a rule (2, most mail first, showing 1)")
+        assert saved.count("service0@") + saved.count("service1@") == 1
+        assert short.count("hqa@") + short.count("hqb@") == 1
+
+    def test_two_way_section_is_capped(self, world, monkeypatch):
+        monkeypatch.setattr(repair, "TWO_WAY_SIZE", 1)
+        for i in range(2):
+            person = world.person(name=f"Acme Help{chr(97 + i)}", emails=[f"help{i}@acmewidgets.com"])
+            world.interaction(person, title="→ Subject", source_id=f"s{i}:help{i}@acmewidgets.com")
+        text = repair.build_review(world.decisions(), {}, 0.0)
+        section = next(s for s in text.split("\n## ") if s.startswith("Hidden rows with the most"))
+        assert section.count("help0@") + section.count("help1@") == 1
+
+    def test_merged_ids_path_is_honored(self, world, tmp_path):
+        person = world.service()
+        elsewhere = tmp_path / "elsewhere.json"
+        elsewhere.write_text(json.dumps({"merged-away": person.id}))
+        repair.main([
+            "--crm-db", str(world.crm_db), "--interactions-db", str(world.interactions_db),
+            "--merged-ids", str(elsewhere), "--report", str(world.review),
+        ])
+        assert "would_hide\": 0" in world.review.read_text()
 
     def test_execute_backs_up_hides_and_is_idempotent(self, world, capsys):
         person = world.service(relationship_strength=42.0, dunbar_circle=5)
@@ -1126,7 +1824,7 @@ class TestRepairScript:
         assert conn.execute("SELECT hidden FROM person_entities WHERE id = ?", (person.id,)).fetchone() == (0,)
         conn.close()
         assert store.get_by_id(person.id).hidden
-        assert store.get_by_id(person.id).hidden_reason.startswith(ss.HIDDEN_REASON_PREFIX)
+        assert is_hidden_service(store.get_by_id(person.id))
         assert store.is_blocked(SERVICE_ADDRESS)
         assert not store.get_by_id(real.id).hidden
         assert self._hash(world.interactions_db) == interactions_before
@@ -1142,7 +1840,7 @@ class TestRepairScript:
         store = world.run("--execute")
         assert not store.get_by_id(person.id).hidden
 
-    def test_restore_flag(self, world, capsys):
+    def test_restore_flag_says_what_came_back_and_what_did_not(self, world, capsys):
         person = world.service()
         world.run("--execute")
         capsys.readouterr()
@@ -1152,7 +1850,12 @@ class TestRepairScript:
         row = store.get_by_id(person.id)
         assert not row.hidden and ss.CONFIRMED_PERSON_TAG in row.tags
         assert not store.is_blocked(SERVICE_ADDRESS)
-        assert "Restored 1 of 2" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "Restored 1 of 2" in out
+        assert "6 interactions" in out
+        assert "inferred relationships" in out
+        assert "Not recovered" in out
+        assert person.canonical_name not in out
 
     def test_rerun_after_restore_leaves_it_visible(self, world):
         person = world.service()
@@ -1170,7 +1873,7 @@ class TestBulkSampling:
         return person
 
     def test_only_undecided_unprotected_rows_with_received_mail(self, world):
-        undecided = self._person(world, "Jane Sample", "jane@janes-letter.com", [NOW])
+        undecided = self._person(world, "Jane Sample", OWN_ADDRESS, [NOW])
         decided = self._person(world, "Acme", "noreply@acmewidgets.com", [NOW])
         protected = self._person(world, "Pat Lee", "pat@northwindtrading.com", [NOW])
         world.execute_sql("UPDATE person_entities SET phone_numbers = '[\"+15555550100\"]' WHERE id = ?", protected.id)
@@ -1189,7 +1892,7 @@ class TestBulkSampling:
         assert decided.id not in samples
 
     def test_latest_messages_per_account(self, world):
-        person = self._person(world, "Jane Sample", "jane@janes-letter.com", [
+        person = self._person(world, "Jane Sample", OWN_ADDRESS, [
             "2026-01-01T00:00:00+00:00", "2026-02-01T00:00:00+00:00",
             "2026-03-01T00:00:00+00:00", "2026-04-01T00:00:00+00:00",
         ])
@@ -1204,8 +1907,21 @@ class TestBulkSampling:
         assert asked == {"personal": ["Jane Sample-2", "Jane Sample-3"], "work": ["work-new"]}
         assert samples[person.id] == {"checked": 3, "bulk": 3}
 
+    def test_sampling_reads_received_mail_only(self, world):
+        person = world.person(name="Jane Sample", emails=[OWN_ADDRESS])
+        world.interaction(person, source_id="in-1", when="2026-01-01T00:00:00+00:00")
+        world.interaction(person, title="↔ Subject", source_id="thread-1", when="2026-02-01T00:00:00+00:00")
+        asked = []
+
+        def fetch(account, ids):
+            asked.extend(ids)
+            return {}
+
+        repair.sample_bulk_headers(world.decisions(), world.interactions_db, {}, fetch)
+        assert asked == ["in-1"]
+
     def test_a_failed_account_leaves_its_rows_unsampled(self, world):
-        person = self._person(world, "Jane Sample", "jane@janes-letter.com", [NOW])
+        person = self._person(world, "Jane Sample", OWN_ADDRESS, [NOW])
         other = self._person(world, "Pat Lee", "pat@northwindtrading.com", [NOW])
         conn = sqlite3.connect(world.interactions_db)
         conn.execute("UPDATE interactions SET source_account = 'work' WHERE person_id = ?", (other.id,))
@@ -1221,7 +1937,7 @@ class TestBulkSampling:
         assert samples == {person.id: {"checked": 1, "bulk": 0}}
 
     def test_existing_samples_are_reused_not_fetched_again(self, world):
-        person = self._person(world, "Jane Sample", "jane@janes-letter.com", [NOW])
+        person = self._person(world, "Jane Sample", OWN_ADDRESS, [NOW])
         fetch = MagicMock(return_value={})
         existing = {person.id: {"checked": 3, "bulk": 0}}
         samples = repair.sample_bulk_headers(world.decisions(existing), world.interactions_db, existing, fetch)
@@ -1229,7 +1945,7 @@ class TestBulkSampling:
         assert samples == existing
 
     def test_a_message_gmail_no_longer_has_is_not_counted(self, world):
-        person = self._person(world, "Jane Sample", "jane@janes-letter.com", [
+        person = self._person(world, "Jane Sample", OWN_ADDRESS, [
             "2026-01-01T00:00:00+00:00", "2026-02-01T00:00:00+00:00",
         ])
         samples = repair.sample_bulk_headers(
@@ -1238,7 +1954,7 @@ class TestBulkSampling:
         assert samples == {person.id: {"checked": 1, "bulk": 1}}
 
     def test_the_flag_samples_saves_and_a_later_run_reuses(self, world, capsys):
-        person = self._person(world, "Jane Sample", "jane@janes-letter.com", [NOW])
+        person = self._person(world, "Jane Sample", OWN_ADDRESS, [NOW])
         samples_path = world.root / "private" / "samples.json"
         client = MagicMock()
         client.get_messages_batch.return_value = {"Jane Sample-0": MagicMock(bulk=True)}
@@ -1260,159 +1976,3 @@ class TestBulkSampling:
     def test_missing_samples_file_means_no_samples(self, world):
         assert repair.load_samples(world.root / "absent.json") == {}
         assert repair.load_samples(None) == {}
-
-
-class TestAddressAndNameEdges:
-    def test_regional_providers(self):
-        assert address_shape("a@hotmail.fr").personal_provider
-        assert address_shape("a@yahoo.co.uk").personal_provider
-        assert not address_shape("a@yahoo.info").personal_provider
-        assert not address_shape("a@yahoo.northwind.uk").personal_provider
-
-    def test_short_generated_tokens(self):
-        assert ss.SIGNAL_GENERATED in address_shape("a1b2c3d4e5@b.com").signals
-        assert ss.SIGNAL_GENERATED not in address_shape("abcde12345@b.com").signals
-
-    def test_organization_words_from_the_resolver(self):
-        assert ss.SIGNAL_ORG_NAME in name_signals("Northwind Team")
-
-    def test_the_alone_is_not_an_organization(self):
-        assert ss.SIGNAL_ORG_NAME not in name_signals("The")
-
-    def test_a_short_brand_as_a_word_of_the_name(self):
-        assert ss.SIGNAL_BRAND_NAME in name_signals("Abc Bank", ["abc.com"])
-        assert ss.SIGNAL_BRAND_NAME in name_signals("Monthly Northwind", ["northwind.com"])
-
-    def test_a_name_running_into_the_domain(self):
-        assert ss.SIGNAL_BRAND_NAME in name_signals("Acme Widgets Monthly", ["acmewidgets.com"])
-
-    def test_a_short_label_does_not_claim_any_name_starting_with_it(self):
-        assert ss.SIGNAL_BRAND_NAME not in name_signals("Abel Sample", ["ab.com"])
-
-    def test_a_plus_tag_is_not_the_name(self):
-        assert not ss._carries_name(address_shape("desk+jane@b.com"), "Jane Sample")
-
-    def test_a_two_letter_word_of_the_name_proves_nothing(self):
-        assert not ss._carries_name(address_shape("delivery@b.com"), "Jo Li")
-        assert ss._carries_name(address_shape("lee@b.com"), "Jo Lee")
-
-    @pytest.mark.parametrize("name,address", [
-        ("Theodora Sample", "theod@northwindtrading.com"),
-        ("Jane Sample", "jsample@northwindtrading.com"),
-        ("Acme Sales", "jane.sample@northwindtrading.com"),
-        ("Service", "someone@gmail.com"),
-    ])
-    def test_volume_does_not_outweigh_a_personal_address(self, name, address):
-        result = verdict(name, address, 40)
-        assert not result.is_service
-        assert result.reason == "personal_address"
-
-    def test_an_automated_address_is_not_personal_whatever_it_spells(self):
-        mixed = {"bounce@northwindtrading.com": 4, "desk@northwindtrading.com": 5}
-        assert verdict("Pat Bounce", mixed, 9).reason == "no_service_evidence"
-
-    def test_a_generated_address_is_not_personal_whatever_it_spells(self):
-        assert verdict("Jane Sample", "jane+a1b2c3d4e5f6@paymentsplatform.com").reason == "generated_address"
-
-    def test_a_one_word_brand_on_its_own_domain_is_not_personal(self):
-        assert verdict("Northwindco", "northwindco@northwind.com").reason == "named_after_domain"
-
-    def test_one_word_on_little_mail_is_personal(self):
-        assert verdict("Robin", "robin@northwindtrading.com", 4).reason == "personal_address"
-
-
-class TestReviewEdges:
-    def test_summary_separates_service_shaped_protection(self, world):
-        world.service(phone_numbers=["+15555550100"])
-        real = world.person(name="Jane Sample", emails=["jane.sample@gmail.com"], phone_numbers=["+15555550101"])
-        world.mail(real, address="jane.sample@gmail.com")
-        summary = repair.summarize(world.decisions(), top_strength=0.0)
-        assert summary["service_shaped_but_protected"] == 1
-        assert summary["protected_by"] == {"phone_number": 1}
-
-    def test_thinnest_protection_comes_first(self, world):
-        thick = world.service(name="Northwind Bank", emails=["service@northwindtrading.com"], phone_numbers=["+15555550100"], tags=["x"])
-        thin = world.service(phone_numbers=["+15555550101"])
-        protected, _ = repair.near_line(world.decisions())
-        assert [d.person.id for d in protected] == [thin.id, thick.id]
-
-    def test_kept_rows_with_signals_that_fell_short(self, world):
-        def kept(name, address, count=2):
-            person = world.person(name=name, emails=[address])
-            world.mail(person, count=count, address=address)
-            return person
-
-        relay = kept("Pat Lee via Platform", "desk@platformname.com", count=2)
-        unexplained = kept("Northwind Labs", "desk@elsewhere-sample.com", count=1)
-        steady = kept("Jane Sample", "jane@janes-letter.com", count=12)
-        quiet = kept("Sam Sample", "sam@janes-letter.com", count=9)
-        plain = kept("Pat Lee", "desk@northwindtrading.com", count=2)
-
-        _, short = repair.near_line(world.decisions())
-        ids = [d.person.id for d in short]
-        assert steady.id in ids and relay.id in ids and unexplained.id in ids
-        assert quiet.id not in ids
-        assert plain.id not in ids
-        assert ids[0] == steady.id, "most mail first"
-
-    def test_near_line_sections_are_capped_but_counted(self, world, monkeypatch):
-        monkeypatch.setattr(repair, "NEAR_LINE_SIZE", 1)
-        for i in range(2):
-            world.service(name=f"Acme Bank{i}", emails=[f"service{i}@acmewidgets.com"], phone_numbers=[f"+1555555010{i}"])
-            person = world.person(name=f"Jane {chr(65 + i)}lpha", emails=[f"support{i}@janes-letter.com"])
-            world.mail(person, count=2, address=f"support{i}@janes-letter.com")
-        text = repair.build_review(world.decisions(), {}, 0.0)
-        saved = next(s for s in text.split("\n## ") if s.startswith("Kept: service-shaped"))
-        short = next(s for s in text.split("\n## ") if s.startswith("Kept: signals fell short"))
-        assert saved.startswith("Kept: service-shaped, only protection saved them (2, thinnest first, showing 1)")
-        assert short.startswith("Kept: signals fell short (2, most mail first, showing 1)")
-        assert saved.count("service0@") + saved.count("service1@") == 1
-        assert short.count("support0@") + short.count("support1@") == 1
-
-    def test_merged_ids_path_is_honored(self, world, tmp_path):
-        person = world.service()
-        elsewhere = tmp_path / "elsewhere.json"
-        elsewhere.write_text(json.dumps({"merged-away": person.id}))
-        repair.main([
-            "--crm-db", str(world.crm_db), "--interactions-db", str(world.interactions_db),
-            "--merged-ids", str(elsewhere), "--report", str(world.review),
-        ])
-        assert "would_hide\": 0" in world.review.read_text()
-
-    def test_a_new_private_file_is_never_world_readable(self, world):
-        target = world.root / "private" / "new.json"
-        with patch.object(repair.os, "chmod"):
-            repair._write_private(target, "{}")
-        assert stat.S_IMODE(os.stat(target).st_mode) == 0o600
-
-    def test_sampling_reads_received_mail_only(self, world):
-        person = world.person(name="Jane Sample", emails=["jane@janes-letter.com"])
-        world.interaction(person, source_id="in-1", when="2026-01-01T00:00:00+00:00")
-        world.interaction(person, title="↔ Subject", source_id="thread-1", when="2026-02-01T00:00:00+00:00")
-        asked = []
-
-        def fetch(account, ids):
-            asked.extend(ids)
-            return {}
-
-        repair.sample_bulk_headers(world.decisions(), world.interactions_db, {}, fetch)
-        assert asked == ["in-1"]
-
-
-class TestStoreAndGmailEdges:
-    def test_unhide_unblocks_a_phone_number(self, world):
-        person = world.person(name="Pat Lee", emails=[], phone_numbers=["+15555550100"])
-        world.people.hide_person(person.id, "x")
-        assert world.people.is_blocked("+15555550100")
-        world.people.unhide_person(person.id)
-        assert not world.people.is_blocked("+15555550100")
-
-    def test_a_single_fetch_requests_the_headers_too(self):
-        service = GmailService.__new__(GmailService)
-        service.account_type = GoogleAccount.PERSONAL
-        client = MagicMock()
-        with patch.object(GmailService, "service", client), patch.object(GmailService, "_rate_limit"):
-            service.get_message("m1", include_body=False)
-        client.users().messages().get.assert_any_call(
-            userId="me", id="m1", format="metadata", metadataHeaders=METADATA_HEADERS,
-        )

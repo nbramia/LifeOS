@@ -15,13 +15,19 @@ and addresses go only to the private review file.
 which stored data lacks for older mail, and saves the answers to --bulk-samples.
 Later runs given that file reuse them, so --execute applies what was reviewed.
 
---restore PERSON_ID undoes a hide and tags the row so it stays visible.
+--restore PERSON_ID undoes a hide and tags the row so it stays visible. It says what
+came back and what the next nightly run rebuilds. --previous takes a JSON list of the
+person ids an earlier run would hide, so the review can show what changed.
 
 Usage:
     python3 scripts/repair_service_senders.py --crm-db data/crm.db --interactions-db data/interactions.db
     python3 scripts/repair_service_senders.py ... --sample-gmail --bulk-samples ~/.lifeos-private/service-filter/bulk-samples.json
     python3 scripts/repair_service_senders.py ... --bulk-samples FILE --execute
     python3 scripts/repair_service_senders.py ... --restore PERSON_ID [PERSON_ID ...]
+
+Hiding holds on to interactions, source entities, and new mail, and consistency
+verification leaves them. It removes a hidden row's inferred relationships, which
+relationship discovery rebuilds from those interactions after a restore.
 
 Afterwards rebuild derived data: scripts/sync_strengths.py --execute, then
 scripts/sync_crm_to_vectorstore.py --execute.
@@ -45,6 +51,7 @@ from api.services.gmail import GmailService  # noqa: E402
 from api.services.google_auth import GoogleAccount  # noqa: E402
 from api.services.person_entity import PersonEntityStore  # noqa: E402
 from api.services.service_sender import (  # noqa: E402
+    ONE_WAY_MIN_RECEIVED,
     SenderDecision,
     decide_senders,
     hide_service_person,
@@ -57,12 +64,12 @@ DEFAULT_REPORT_DIR = Path.home() / ".lifeos-private" / "service-filter"
 REVIEWED_CIRCLES = range(0, 6)
 RANDOM_REST_SIZE = 100
 SAMPLE_SEED = 20261103
-NEAR_LINE_SIZE = 100
+NEAR_LINE_SIZE = 500
+TWO_WAY_SIZE = 100
 TOP_RANK = 500
 MESSAGES_PER_ROW = 3
-
-# Kept rows whose evidence fell just short, as opposed to rows with none.
-BORDERLINE_REASONS = frozenset({"person_name_on_role_address", "person_name_on_sending_host", "person_via_relay"})
+# One-way mail this close to the rule counts as near the line, signals or not.
+NEAR_ONE_WAY_RECEIVED = ONE_WAY_MIN_RECEIVED // 2
 
 
 def _strength(decision: SenderDecision) -> float:
@@ -82,6 +89,17 @@ def backup_crm(crm_db: Path) -> Path:
         source.close()
     os.chmod(target, 0o600)
     return target
+
+
+def interaction_count(interactions_db: Path, person_ids: list[str]) -> int:
+    conn = sqlite3.connect(f"file:{interactions_db.resolve()}?mode=ro", uri=True, timeout=60.0)
+    try:
+        return sum(
+            conn.execute("SELECT COUNT(*) FROM interactions WHERE person_id = ?", (person_id,)).fetchone()[0]
+            for person_id in person_ids
+        )
+    finally:
+        conn.close()
 
 
 def execute_decisions(decisions: Iterable[SenderDecision], crm_db: Path) -> int:
@@ -191,24 +209,23 @@ def top_rank_strength(crm_db: Path) -> float:
 def summarize(decisions: list[SenderDecision], top_strength: float) -> dict:
     """Aggregate counts, safe to print."""
     hides = [d for d in decisions if d.will_hide]
+    protected = [d for d in decisions if d.verdict.is_service and d.protected_by]
     return {
         "people_with_email": len(decisions),
         "would_hide": len(hides),
         "by_circle": dict(sorted(Counter(d.person.dunbar_circle for d in hides).items(), key=lambda kv: (kv[0] is None, kv[0]))),
         "in_top_500_by_strength": sum(_strength(d) >= top_strength for d in hides),
         "by_rule": dict(Counter(d.verdict.reason for d in hides).most_common()),
-        "service_shaped_but_protected": sum(d.verdict.is_service and bool(d.protected_by) for d in decisions),
-        "protected_by": dict(Counter(
-            reason.split(":")[0]
-            for d in decisions if d.verdict.is_service for reason in d.protected_by
-        ).most_common()),
+        "service_shaped_but_protected": len(protected),
+        "protected_by": dict(Counter(reason for d in protected for reason in d.protected_by).most_common()),
+        "protected_by_only_this": dict(Counter(d.protected_by[0] for d in protected if len(d.protected_by) == 1).most_common()),
     }
 
 
 def near_line(decisions: list[SenderDecision]) -> tuple[list[SenderDecision], list[SenderDecision]]:
     """
     Kept rows closest to being hidden: service-shaped rows only protection saved, the
-    thinnest protection first, then undecided rows with signals that fell short.
+    thinnest protection first, then rows with a signal or one-way mail short of a rule.
     """
     protected = sorted(
         (d for d in decisions if d.verdict.is_service and d.protected_by),
@@ -218,9 +235,7 @@ def near_line(decisions: list[SenderDecision]) -> tuple[list[SenderDecision], li
         (
             d for d in decisions
             if not d.verdict.is_service and not d.protected_by and (
-                d.verdict.reason in BORDERLINE_REASONS
-                or (d.verdict.reason == "no_service_evidence" and d.verdict.signals)
-                or (d.verdict.reason == "personal_address" and d.received >= 10 and not d.thread and not d.sent)
+                d.verdict.signals or (d.received >= NEAR_ONE_WAY_RECEIVED and not d.thread and not d.sent)
             )
         ),
         key=lambda d: -d.received,
@@ -261,7 +276,10 @@ def _short_because(decision: SenderDecision) -> str:
 
 
 def build_review(
-    decisions: list[SenderDecision], samples: Mapping[str, Mapping[str, int]], top_strength: float
+    decisions: list[SenderDecision],
+    samples: Mapping[str, Mapping[str, int]],
+    top_strength: float,
+    previous_hides: Optional[set[str]] = None,
 ) -> str:
     """The private review: both error directions, with the signals that fired."""
     summary = summarize(decisions, top_strength)
@@ -270,6 +288,26 @@ def build_review(
     rest = [d for d in hides if d.person.dunbar_circle not in REVIEWED_CIRCLES]
     picked = random.Random(SAMPLE_SEED).sample(rest, min(RANDOM_REST_SIZE, len(rest)))
     protected, short = near_line(decisions)
+    most_two_way = sorted(
+        (d for d in hides if d.sent or d.thread), key=lambda d: (-(d.sent + d.thread), -d.received),
+    )[:TWO_WAY_SIZE]
+
+    changes: list[str] = []
+    if previous_hides is not None:
+        new = [d for d in hides if d.person.id not in previous_hides]
+        kept_now = [d for d in decisions if not d.will_hide and d.person.id in previous_hides]
+        changes = [
+            f"## Newly hidden compared with the last version ({len(new)})",
+            "",
+            _HEADER.format("Signals").rstrip(),
+            *[_row(d, _signals) for d in new],
+            "",
+            f"## Hidden last version, kept now ({len(kept_now)})",
+            "",
+            _HEADER.format("Why").rstrip(),
+            *[_row(d, _kept_because if d.protected_by else _short_because) for d in kept_now],
+            "",
+        ]
 
     lines = [
         "# Service and newsletter filter: review",
@@ -279,6 +317,12 @@ def build_review(
         "```json",
         json.dumps(summary, indent=2, default=str),
         "```",
+        "",
+        *changes,
+        f"## Hidden rows with the most two-way mail, where a real person would be at risk (showing {len(most_two_way)})",
+        "",
+        _HEADER.format("Signals").rstrip(),
+        *[_row(d, _signals) for d in most_two_way],
         "",
         f"## Would hide, circles 0-5 ({len(reviewed)})",
         "",
@@ -295,7 +339,7 @@ def build_review(
         _HEADER.format("Kept because").rstrip(),
         *[_row(d, _kept_because) for d in protected[:NEAR_LINE_SIZE]],
         "",
-        f"## Kept: signals fell short ({len(short)}, most mail first, showing {min(NEAR_LINE_SIZE, len(short))})",
+        f"## Kept: signals or one-way mail short of a rule ({len(short)}, most mail first, showing {min(NEAR_LINE_SIZE, len(short))})",
         "",
         _HEADER.format("Rule and signals").rstrip(),
         *[_row(d, _short_because) for d in short[:NEAR_LINE_SIZE]],
@@ -317,6 +361,7 @@ def main(argv=None) -> int:
     parser.add_argument("--sample-gmail", action="store_true", help="Check recent mail of undecided rows")
     parser.add_argument("--execute", action="store_true", help="Back up, then apply")
     parser.add_argument("--restore", nargs="+", metavar="PERSON_ID", help="Undo the hide on these rows and stop")
+    parser.add_argument("--previous", type=Path, help="JSON list of the person ids an earlier run would hide")
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
@@ -324,8 +369,16 @@ def main(argv=None) -> int:
     if args.restore:
         backup_crm(args.crm_db)
         store = PersonEntityStore(str(args.crm_db))
-        restored = sum(restore_person(store, person_id, args.crm_db) is not None for person_id in args.restore)
-        print(f"Restored {restored} of {len(args.restore)} rows")
+        restored = [
+            person for person_id in args.restore
+            if (person := restore_person(store, person_id)) is not None
+        ]
+        print(f"Restored {len(restored)} of {len(args.restore)} rows.")
+        print(f"Back now: {interaction_count(args.interactions_db, [p.id for p in restored])} interactions, "
+              "including mail received while hidden, plus source entities and unblocked addresses.")
+        print("Rebuilt by the next nightly run: inferred relationships, strength and circle, people index.")
+        print("Not recovered: iMessage, WhatsApp, or phone contact while hidden, "
+              "which those syncs don't record for a hidden row.")
         return 0
 
     merged_ids_path = args.merged_ids or args.crm_db.with_name("merged_person_ids.json")
@@ -340,7 +393,8 @@ def main(argv=None) -> int:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     report_path = args.report or DEFAULT_REPORT_DIR / f"review-{stamp}.md"
     top_strength = top_rank_strength(args.crm_db)
-    _write_private(report_path, build_review(decisions, samples, top_strength))
+    previous = set(json.loads(args.previous.read_text())) if args.previous else None
+    _write_private(report_path, build_review(decisions, samples, top_strength, previous))
 
     print("EXECUTE" if args.execute else "DRY RUN (use --execute to apply)")
     print(json.dumps(summarize(decisions, top_strength), indent=2, default=str))
