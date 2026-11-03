@@ -30,6 +30,7 @@ from api.services.calendar import CalendarService
 from api.services.google_auth import GoogleAccount
 from api.services.entity_resolver import get_entity_resolver
 from api.services.person_entity import get_person_entity_store
+from api.services.service_sender import is_unknown_service_sender
 from api.services.interaction_store import get_interaction_db_path
 from config.people_config import InteractionConfig
 from api.services.gmail_skip_cache import get_gmail_skip_cache
@@ -130,6 +131,7 @@ def sync_gmail_interactions(
         'errors': 0,
         'source_entities_created': 0,
         'marketing_skipped': 0,
+        'service_skipped': 0,
     }
 
     # Track affected person_ids for stats refresh
@@ -286,9 +288,16 @@ def sync_gmail_interactions(
                     newly_skipped.append(message_id)
                     continue
 
+                # An unknown service sender creates no person. The mail stays in Gmail.
+                sender_label = email.sender_name if email.sender_name != email.sender else None
+                if is_unknown_service_sender(resolver.store, email.sender, sender_label, email.bulk):
+                    stats['service_skipped'] += 1
+                    newly_skipped.append(message_id)
+                    continue
+
                 # Resolve the sender
                 sender_result = resolver.resolve(
-                    name=email.sender_name if email.sender_name != email.sender else None,
+                    name=sender_label,
                     email=email.sender,
                     create_if_missing=True,
                 )
@@ -334,7 +343,7 @@ def sync_gmail_interactions(
                                 sender_email=email.sender,
                                 sender_name=email.sender_name if email.sender_name != email.sender else None,
                                 observed_at=email.date,
-                                metadata={"subject": subject[:100] if subject else None},
+                                metadata={"subject": subject[:100] if subject else None, "bulk": email.bulk},
                             )
                             source_entity.canonical_person_id = sender_person_id
                             source_entity.link_confidence = sender_result.confidence if sender_result else 1.0
@@ -355,6 +364,8 @@ def sync_gmail_interactions(
                     for participant_name, participant_email in other_participants:
                         # Skip marketing/automated addresses
                         if is_marketing_email(participant_email, participant_name):
+                            continue
+                        if is_unknown_service_sender(resolver.store, participant_email, participant_name):
                             continue
 
                         # Use source_id format: message_id:cc:email for CC participants

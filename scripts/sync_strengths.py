@@ -13,6 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from api.services.relationship_metrics import update_all_strengths
+from api.services.service_sender import hide_service_senders
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
@@ -30,6 +31,15 @@ def main():
         logger.info("Would update relationship strengths for all people")
         return
 
+    # Before scoring and ranking, so a new service takes no score or circle slot.
+    services_failed = 0
+    try:
+        services = hide_service_senders()
+    except Exception:
+        # Scoring everyone matters more than this night's filter.
+        logger.exception("Service-sender pass failed")
+        services = {"hidden": 0, "held_back": 0}
+        services_failed = 1
     result = update_all_strengths()
     logger.info("\n=== Strength Update Summary ===")
     logger.info(f"Updated: {result['updated']}")
@@ -41,7 +51,9 @@ def main():
     emit_sync_stats({
         "people_updated": int(result.get("updated", 0) or 0),
         "processed": int(result.get("total", 0) or 0),
-        "errors": int(result.get("failed", 0) or 0),
+        "errors": int(result.get("failed", 0) or 0) + services_failed,
+        "service_senders_hidden": services["hidden"],
+        "service_senders_held_back": services["held_back"],
     })
 
 

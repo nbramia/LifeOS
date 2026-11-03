@@ -50,6 +50,15 @@ def _get_valid_person_ids():
     return valid_ids, hidden_ids, store
 
 
+def _service_sender_ids(store) -> set:
+    """Hidden services, which keep their interactions so a restore loses nothing."""
+    from api.services.service_sender import HIDDEN_REASON_PREFIX
+    return {
+        p.id for p in store.get_all(include_hidden=True, include_merged=True)
+        if p.hidden and p.hidden_reason.startswith(HIDDEN_REASON_PREFIX)
+    }
+
+
 def _check_person_stats(dry_run: bool) -> dict:
     """Check 1: Verify cached PersonEntity counts match computed counts."""
     from api.services.person_stats import verify_person_stats
@@ -106,6 +115,7 @@ def _check_hidden_interactions(hidden_ids: set, valid_ids: set, dry_run: bool) -
 
     These interactions drive unnecessary relationship discovery work and serve
     no purpose since the person is hidden.  Always cleaned up (no threshold).
+    Callers leave hidden services out of hidden_ids; see _service_sender_ids.
     """
     if not hidden_ids:
         return {"count": 0, "fixed": 0}
@@ -595,7 +605,7 @@ def verify_consistency(dry_run: bool = True, fix_threshold: int = AUTO_FIX_THRES
 
     # Interaction-modifying checks first (deletions change counts)
     orphaned_interactions = _check_orphaned_interactions(valid_ids, dry_run, fix_threshold)
-    hidden_interactions = _check_hidden_interactions(hidden_ids, valid_ids, dry_run)
+    hidden_interactions = _check_hidden_interactions(hidden_ids - _service_sender_ids(store), valid_ids, dry_run)
     stale_merged_ids = _check_stale_merged_ids(valid_ids, store, dry_run, fix_threshold)
     # Re-point stale merged IDs in relationships BEFORE checking for orphans
     stale_merged_rels = _check_stale_merged_relationships(valid_ids, store, dry_run)

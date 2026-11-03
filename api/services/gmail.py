@@ -24,6 +24,9 @@ from api.services.google_auth import get_google_auth, GoogleAccount  # noqa: E40
 
 logger = logging.getLogger(__name__)
 
+# Headers to request in metadata format, including what tells mass mail apart.
+METADATA_HEADERS = ["Subject", "From", "To", "Cc", "Date", "List-Unsubscribe", "List-Post", "Precedence"]
+
 
 @dataclass
 class EmailMessage:
@@ -40,6 +43,7 @@ class EmailMessage:
     to: Optional[str] = None
     cc: Optional[str] = None
     labels: list[str] = field(default_factory=list)
+    bulk: bool = False
 
     def to_dict(self) -> dict:
         """Convert to dict for API response."""
@@ -141,6 +145,18 @@ def build_gmail_query(
         parts.append("is:read")
 
     return " ".join(parts)
+
+
+def is_bulk_mail(headers: dict[str, str]) -> bool:
+    """
+    Whether lower-cased message headers mark mass mail rather than a person's message.
+
+    A discussion list carries unsubscribe headers too, but its List-Post address
+    means members write to it, so a post there is still that member's own message.
+    """
+    if "list-post" in headers:
+        return False
+    return "list-unsubscribe" in headers or headers.get("precedence", "").strip().lower() in ("bulk", "junk")
 
 
 def parse_sender(from_header: str) -> tuple[str, str]:
@@ -305,7 +321,7 @@ class GmailService:
                     userId="me",
                     id=message_id,
                     format=format_type,
-                    metadataHeaders=["Subject", "From", "To", "Cc", "Date"] if not include_body else None,
+                    metadataHeaders=METADATA_HEADERS if not include_body else None,
                 ).execute()
                 logger.debug(f"API call completed for message {message_id[:8]}")
 
@@ -384,9 +400,7 @@ class GmailService:
             Callers must not assume every requested id is present.
         """
         format_type = "full" if include_body else "metadata"
-        metadata_headers = (
-            ["Subject", "From", "To", "Cc", "Date"] if not include_body else None
-        )
+        metadata_headers = METADATA_HEADERS if not include_body else None
         chunk_interval = batch_size * seconds_per_message
 
         results: dict[str, EmailMessage] = {}
@@ -502,6 +516,7 @@ class GmailService:
             date_str = ""
 
             cc_header = ""
+            lowered_headers = {h.get("name", "").lower(): h.get("value", "") for h in headers}
             for header in headers:
                 name = header.get("name", "").lower()
                 value = header.get("value", "")
@@ -542,6 +557,7 @@ class GmailService:
                 to=to_header,
                 cc=cc_header if cc_header else None,
                 labels=labels,
+                bulk=is_bulk_mail(lowered_headers),
                 source_account=self.account_type.value,
             )
 

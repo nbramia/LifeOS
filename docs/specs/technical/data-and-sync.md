@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Data Pipeline
-> **Last Updated:** 2026-11-02
+> **Last Updated:** 2026-11-03
 
 How LifeOS ingests and stores data from multiple sources.
 
@@ -581,6 +581,49 @@ resolved to the surviving person, whose `hidden` flag decides and whose id the
 iMessage rows carry; the other sources receive survivors from the entity
 resolver. Sync counters (`interactions_created`, `source_entities_created`)
 count rows and entities actually created.
+
+#### Services and newsletters
+
+`api/services/service_sender.py` decides whether an email sender is a service or
+newsletter rather than a person, from generic signals and no list of brands:
+
+- **Address shape:** automated local parts (`no-reply`), generated tokens, mailing
+  list hosts, sending hosts (`e.`, `mail.`, `service.` below the registered name,
+  never on `.edu`, `.gov`, `.mil`), and role mailboxes (`support@`).
+- **Name shape:** an organization's words, a name matching the domain, a brand
+  persona ("Name at Brand"), or something no person's name holds.
+- **Mail:** one-way volume, and bulk headers. `GmailService` reads `List-Unsubscribe`,
+  `List-Post`, and `Precedence` into `EmailMessage.bulk`, and a sender's source
+  entities record it as `metadata.bulk`. A `List-Post` address marks a discussion
+  list, whose posts stay their authors' own messages.
+
+A mailbox-provider address, or an ordinary address carrying the sender's own name,
+makes the sender a person unless their mail is bulk. A person's name on a role
+address or sending host needs repeated one-way mail before it stops counting, and
+"Name via Platform" on a shared relay address stays a person.
+
+A row is out of scope, however it looks, with any of these: mail the owner sent
+(a `→` title or a `<message>:<recipient>` source id); a phone number; iMessage,
+WhatsApp, phone, calendar, Slack, or photo contact; a contacts or LinkedIn source; a
+confirmed or rejected link; a link override; a confirmed fact; a strength, circle, or
+tag override; tags, notes, a birthday, or profile fields; the owner or family; a
+non-inferred relationship; a review marked kept; a merge target; or note mentions on a
+person-shaped name.
+
+| Where | What happens |
+|-------|--------------|
+| Gmail sync | An unknown address with service evidence or on the blocklist creates no person, interaction, or source entity, and joins the skip cache. This runs before name matching, so a service can't land on someone sharing its display name. A recipient of the owner's sent mail is never gated |
+| `sync_strengths.py` | `hide_service_senders()` runs before scoring and ranking, so a new service takes no score or circle slot. Past `NIGHTLY_MAX_HIDES` rows it hides nothing and logs a warning, and the run reports `service_senders_held_back` |
+| `repair_service_senders.py` | The reviewed path for existing rows. See [scripts](../../guides/scripts.md#utility-scripts) |
+
+Hiding keeps the row's interactions and source entities, clears its strength and
+circle, and blocklists every address it wrote from unless someone else holds it.
+Its `hidden_reason` starts with `service sender: `, which consistency verification
+checks before removing interactions. Gmail keeps the mail, and Gmail search reads
+Gmail directly, so nothing stops being searchable. `repair_service_senders.py
+--restore` shows the row again, unblocks its addresses, and tags it
+`confirmed-person`, which keeps the nightly pass off it. New mail from a hidden
+sender adds no interaction while it stays hidden.
 
 ### Slack Sync
 

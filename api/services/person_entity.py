@@ -782,7 +782,9 @@ class PersonEntityStore:
         self._bump_get_all_cache_generation()
         self._blocklist.add(identifier)
 
-    def hide_person(self, entity_id: str, reason: str = "") -> Optional[PersonEntity]:
+    def hide_person(
+        self, entity_id: str, reason: str = "", extra_emails: Iterable[str] = ()
+    ) -> Optional[PersonEntity]:
         """
         Hide a person (soft delete) and blocklist their identifiers.
 
@@ -792,6 +794,8 @@ class PersonEntityStore:
         Args:
             entity_id: ID of the person to hide
             reason: Optional reason for hiding (e.g., "fake marketing persona")
+            extra_emails: Addresses seen on the person's mail but not on the row,
+                blocklisted the same way
 
         Returns:
             The hidden PersonEntity, or None if not found
@@ -810,12 +814,44 @@ class PersonEntityStore:
             self._add_to_blocklist(email, "email", entity.canonical_name, reason)
         for phone in entity.phone_numbers:
             self._add_to_blocklist(phone, "phone", entity.canonical_name, reason)
+        for email in extra_emails:
+            self._add_to_blocklist(email, "email", entity.canonical_name, reason)
 
         # Update in database
         self.update(entity)
 
         logger.info(f"Hidden person '{entity.canonical_name}' (ID: {entity_id[:8]}), "
                     f"blocklisted {len(entity.emails)} emails, {len(entity.phone_numbers)} phones")
+        return entity
+
+    def unhide_person(self, entity_id: str, extra_identifiers: Iterable[str] = ()) -> Optional[PersonEntity]:
+        """
+        Reverse hide_person: show the person and unblock their identifiers.
+
+        Args:
+            entity_id: ID of the person to show
+            extra_identifiers: Other identifiers the hide blocklisted
+
+        Returns:
+            The visible PersonEntity, or None if not found
+        """
+        entity = self.get_by_id(entity_id)
+        if not entity:
+            return None
+
+        identifiers = {i.lower() for i in (*entity.emails, *entity.phone_numbers, *extra_identifiers)}
+        conn = self._get_connection()
+        try:
+            conn.executemany("DELETE FROM person_blocklist WHERE identifier = ?", [(i,) for i in identifiers])
+            conn.commit()
+        finally:
+            conn.close()
+        self._blocklist -= identifiers
+
+        entity.hidden = False
+        entity.hidden_at = None
+        entity.hidden_reason = ""
+        self.update(entity)
         return entity
 
     def purge_hidden(self, older_than_days: int = 90) -> int:
