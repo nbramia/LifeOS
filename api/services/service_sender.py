@@ -37,6 +37,7 @@ from api.services.person_entity import (
     is_hidden_service,
 )
 from api.services.relationship import TYPE_COWORKER, TYPE_INFERRED
+from api.services.sqlite_connect import connect_closing
 from config.marketing_patterns import (
     AUTOMATED_LOCAL_SUBSTRINGS,
     AUTOMATED_LOCAL_WORDS,
@@ -644,8 +645,9 @@ class _Mail:
     human_links: set = field(default_factory=set)
 
 
-def _connect_read_only(path) -> sqlite3.Connection:
-    return sqlite3.connect(f"file:{Path(path).resolve()}?mode=ro", uri=True, timeout=60.0)
+def _connect_read_only(path):
+    """Context manager for a read-only connection that closes on the way out."""
+    return connect_closing(f"file:{Path(path).resolve()}?mode=ro", uri=True, timeout=60.0)
 
 
 def _rows(conn: sqlite3.Connection, sql: str) -> list[tuple]:
@@ -664,16 +666,13 @@ def _rows(conn: sqlite3.Connection, sql: str) -> list[tuple]:
 
 
 def _load_people(crm_db: Path, merged_ids: Mapping[str, str], where: str = "hidden = 0") -> list[PersonEntity]:
-    conn = _connect_read_only(crm_db)
-    conn.row_factory = sqlite3.Row
-    try:
+    with _connect_read_only(crm_db) as conn:
+        conn.row_factory = sqlite3.Row
         return [
             PersonEntityStore._row_to_entity(None, row)
             for row in conn.execute(f"SELECT * FROM person_entities WHERE {where}")
             if row["id"] not in merged_ids
         ]
-    finally:
-        conn.close()
 
 
 def _recipient_of(source_id: Optional[str]) -> str:
@@ -683,8 +682,7 @@ def _recipient_of(source_id: Optional[str]) -> str:
 
 
 def _load_interaction_evidence(interactions_db: Path, mail: dict, reasons: dict) -> None:
-    conn = _connect_read_only(interactions_db)
-    try:
+    with _connect_read_only(interactions_db) as conn:
         for person_id, source, arrow, count, one_to_one, small_meeting in conn.execute(
             "SELECT person_id, source_type, substr(title, 1, 1), COUNT(*), "
             "  source_type NOT IN ('whatsapp', 'slack') OR (source_type = 'whatsapp' AND attendee_count IS NULL) "
@@ -718,13 +716,10 @@ def _load_interaction_evidence(interactions_db: Path, mail: dict, reasons: dict)
                 mail[person_id].received += 1
         for person_id, recipients in sent.items():
             mail[person_id].sent_to.update(recipients)
-    finally:
-        conn.close()
 
 
 def _load_crm_evidence(crm_db: Path, merged_ids: Mapping[str, str], mail: dict, reasons: dict) -> None:
-    conn = _connect_read_only(crm_db)
-    try:
+    with _connect_read_only(crm_db) as conn:
         for person_id, source in _rows(
             conn, "SELECT DISTINCT canonical_person_id, source_type FROM source_entities "
             "WHERE canonical_person_id IS NOT NULL",
@@ -777,8 +772,6 @@ def _load_crm_evidence(crm_db: Path, merged_ids: Mapping[str, str], mail: dict, 
         ):
             reasons[person_a].add("review_kept")
             reasons[person_b].add("review_kept")
-    finally:
-        conn.close()
     for primary in set(merged_ids.values()):
         reasons[primary].add("merge_target")
 
