@@ -995,6 +995,41 @@ def _guard_live_vectorstore_collections(request, monkeypatch):
     monkeypatch.setattr(vectorstore_mod.VectorStore, "__init__", _guarded_init)
 
 
+def runs_in_fast_unit_lane(marker_names: set[str]) -> bool:
+    """Whether a test with these markers is in the ``fast-unit`` lane."""
+    from scripts.test_lane_registry import classify
+
+    return classify(marker_names) == "fast-unit"
+
+
+@pytest.fixture(autouse=True)
+def _fast_unit_tests_never_reach_a_chroma_server(request, monkeypatch):
+    """A ``fast-unit`` test cannot open a connection to a ChromaDB server.
+
+    ``_guard_live_vectorstore_collections`` refuses production collection
+    names, but a throwaway name still opens a real connection, and on the
+    maintainer's host the server on the default port holds the live index. The
+    lane runs on hosts with no server at all. Both reasons end the same way:
+    the test builds its stores in process (``chromadb.EphemeralClient``) or
+    mocks ``chromadb.HttpClient`` itself, which replaces this refusal for the
+    test's duration. ``@pytest.mark.uses_live_vectorstore`` opts out.
+    """
+    marker_names = {mark.name for mark in request.node.iter_markers()}
+    if "uses_live_vectorstore" in marker_names or not runs_in_fast_unit_lane(marker_names):
+        return
+
+    import chromadb
+
+    def _refuse_server_connection(*args, **kwargs):
+        pytest.fail(
+            f"{request.node.nodeid} is a fast-unit test but opened a ChromaDB server "
+            "connection. Use chromadb.EphemeralClient or mock chromadb.HttpClient; "
+            "the server on the default port holds the live index."
+        )
+
+    monkeypatch.setattr(chromadb, "HttpClient", _refuse_server_connection)
+
+
 @pytest.fixture(autouse=True)
 def _reset_vectorstore_singletons(monkeypatch):
     """Clear every process-wide singleton that can hold a live

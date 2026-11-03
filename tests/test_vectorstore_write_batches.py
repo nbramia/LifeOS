@@ -295,9 +295,10 @@ class TestThroughTheIndexer:
         monkeypatch.setattr("api.services.summarizer.queue_summary", MagicMock())
         indexer = IndexerService(
             vault_path=str(vault), tag_store=MagicMock(get=MagicMock(return_value=None)), interaction_store=MagicMock(),
-            source_entity_store=MagicMock(), entity_resolver=MagicMock(),
+            source_entity_store=MagicMock(), entity_resolver=MagicMock(), connect_stores=False,
         )
         indexer.vector_store = _bare_store(client, collection)
+        indexer.bm25_index = indexer_mod.BM25Index()
 
         indexer.index_file(str(note), light_pass=True)
 
