@@ -71,7 +71,7 @@ class TestStoppingEarly:
 
         assert count == 2
         assert len(harness.indexed) == 2
-        assert indexer.last_run == {"files_pruned": 0, "files_remaining": 3, "stopped_early": True}
+        assert indexer.last_run == {"files_pruned": 0, "files_remaining": 3, "files_skipped_large": 0, "stopped_early": True}
         saved = [k for k in harness.state() if k.endswith(".md")]
         assert len(saved) == 2
         assert {Path(k).name for k in saved} == set(harness.indexed)
@@ -141,7 +141,7 @@ class TestPruningUnderABudget:
         indexer.index_all(time_budget_seconds=2.0)
 
         assert len(harness.deleted) == 2
-        assert indexer.last_run == {"files_pruned": 2, "files_remaining": 3, "stopped_early": True}
+        assert indexer.last_run == {"files_pruned": 2, "files_remaining": 3, "files_skipped_large": 0, "stopped_early": True}
         assert len(harness.state()) - ("__tag_phrase_keys__" in harness.state()) == 3
 
         harness.now = 0.0
@@ -224,7 +224,7 @@ class TestUnbudgeted:
         indexer = harness.make()
 
         assert indexer.index_all() == 5
-        assert indexer.last_run == {"files_pruned": 0, "files_remaining": 0, "stopped_early": False}
+        assert indexer.last_run == {"files_pruned": 0, "files_remaining": 0, "files_skipped_large": 0, "stopped_early": False}
 
     def test_force_is_unbudgeted_by_default_however_slow(self, harness):
         harness.notes(5)

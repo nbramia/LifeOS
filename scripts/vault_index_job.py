@@ -6,6 +6,10 @@ Runs from lifeos-vault-index.timer, outside the API server. It shares the
 incremental reindex and its saved state with the nightly run, up to a per-run
 cap (LIFEOS_VAULT_INDEX_MAX_FILES). LLM summaries are queued for the nightly run.
 
+A run ends on its own after LIFEOS_VAULT_INDEX_TIME_BUDGET_SECONDS, between notes,
+well inside the unit's timeout. Notes over LIFEOS_VAULT_INDEX_MAX_NOTE_BYTES are
+left for the nightly reindex, which has the time for them; the job logs how many.
+
 The run exits 0 without indexing when there is nothing to do, when the nightly
 vault reindex or a deploy restart holds its lock, or when the host lacks memory
 for embeddings. It never stops the LLM service to make room. A failure is left
@@ -64,7 +68,12 @@ def _memory_shortfall() -> str | None:
     return None
 
 
-def _report_dry_run(vault_path: Path, cap: int, max_deletions: int) -> dict:
+def _log_skipped_large(count: int, max_note_bytes: int) -> None:
+    if count:
+        logger.info(f"Left {count} changed notes over {max_note_bytes} bytes for the nightly reindex")
+
+
+def _report_dry_run(vault_path: Path, cap: int, max_deletions: int, max_note_bytes: int) -> dict:
     from api.services.indexer import IndexerService
     from api.services.vault_tag_store import VaultTagStore, get_vault_tags_db_path
 
@@ -82,13 +91,14 @@ def _report_dry_run(vault_path: Path, cap: int, max_deletions: int) -> dict:
         logger.warning(f"Tag store unreadable at {tag_db_path} ({e}); counting by modification time only, so notes whose tags changed are missed")
 
     scanner = IndexerService(vault_path=vault_path, connect_stores=False, tag_store=tag_store)
-    changes = scanner.scan_changes(compare_tags=tag_store is not None)
+    changes = scanner.scan_changes(compare_tags=tag_store is not None, max_file_bytes=max_note_bytes)
     to_index = changes["to_index"]
     logger.info(
         f"DRY RUN - {changes['file_count']} notes in vault, {len(to_index)} changed, "
         f"{len(changes['deleted'])} deleted; a run would index {min(cap, len(to_index))} (cap {cap}) "
         f"and remove {min(max_deletions, len(changes['deleted']))} (cap {max_deletions})"
     )
+    _log_skipped_large(changes["skipped_large"], max_note_bytes)
     for file_path in to_index[:min(cap, DRY_RUN_LISTED_FILES)]:
         logger.info(f"  would index: {file_path}")
     for file_path in changes["deleted"][:DRY_RUN_LISTED_FILES]:
@@ -101,6 +111,7 @@ def _report_dry_run(vault_path: Path, cap: int, max_deletions: int) -> dict:
         "changed": len(to_index),
         "deleted": len(changes["deleted"]),
         "would_index": min(cap, len(to_index)),
+        "skipped_large": changes["skipped_large"],
     }
 
 
@@ -126,9 +137,11 @@ def run_job(dry_run: bool = True, max_files: int | None = None) -> dict:
         return {"status": "error", "reason": "vault_not_found"}
 
     max_deletions = settings.vault_index_max_deletions
+    max_note_bytes = settings.vault_index_max_note_bytes
+    time_budget = settings.vault_index_time_budget_seconds or None
 
     if dry_run:
-        return _report_dry_run(vault_path, cap, max_deletions)
+        return _report_dry_run(vault_path, cap, max_deletions, max_note_bytes)
 
     # Held for the rest of this call. A crash releases them, since the kernel
     # drops a flock when its process exits.
@@ -142,12 +155,13 @@ def run_job(dry_run: bool = True, max_files: int | None = None) -> dict:
         return {"status": "skipped", "reason": "deploy_running"}
 
     # Decided before the indexer exists, so an idle tick stays this cheap.
-    changes = IndexerService(vault_path=vault_path, connect_stores=False).scan_changes()
-    to_index, deleted = changes["to_index"], changes["deleted"]
+    changes = IndexerService(vault_path=vault_path, connect_stores=False).scan_changes(max_file_bytes=max_note_bytes)
+    to_index, deleted, skipped_large = changes["to_index"], changes["deleted"], changes["skipped_large"]
+    _log_skipped_large(skipped_large, max_note_bytes)
 
     if not to_index and not deleted:
         logger.info("Nothing to index")
-        return {"status": "nothing_to_do", "files_indexed": 0}
+        return {"status": "nothing_to_do", "files_indexed": 0, "skipped_large": skipped_large}
 
     if changes["file_count"] == 0:
         # An unmounted or emptied vault looks like every note was deleted.
@@ -166,7 +180,12 @@ def run_job(dry_run: bool = True, max_files: int | None = None) -> dict:
     start_time = time.time()
     indexer = IndexerService(vault_path=vault_path)
     files_indexed = indexer.index_all(
-        max_files=cap, newest_first=True, light_pass=True, max_deletions=max_deletions
+        max_files=cap,
+        newest_first=True,
+        light_pass=True,
+        max_deletions=max_deletions,
+        time_budget_seconds=time_budget,
+        max_file_bytes=max_note_bytes,
     )
     elapsed = time.time() - start_time
 
@@ -181,6 +200,7 @@ def run_job(dry_run: bool = True, max_files: int | None = None) -> dict:
         "status": "indexed",
         "files_indexed": files_indexed,
         "changed": len(to_index),
+        "skipped_large": skipped_large,
         "deleted": len(deleted),
         "elapsed_seconds": round(elapsed, 1),
     }

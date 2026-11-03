@@ -741,6 +741,305 @@ class TestJobGates:
         vector_store.assert_not_called()
 
 
+BIG_BODY = "Synthetic archive filler sentence. " * 200
+SIZE_LIMIT = 2000
+
+
+def _service_timeout() -> int:
+    import re
+
+    service = (REPO_ROOT / "config" / "systemd" / "lifeos-vault-index.service").read_text()
+    return int(re.search(r"TimeoutStartSec=(\d+)", service).group(1))
+
+
+@pytest.fixture
+def size_limit(monkeypatch):
+    from config.settings import settings
+
+    monkeypatch.setattr(settings, "vault_index_max_note_bytes", SIZE_LIMIT)
+    return SIZE_LIMIT
+
+
+@pytest.fixture
+def index_all_calls(monkeypatch) -> list[dict]:
+    """Every ``index_all`` call's keyword arguments; the call itself still runs."""
+    from api.services.indexer import IndexerService
+
+    calls: list[dict] = []
+    real = IndexerService.index_all
+
+    def spy(self, *args, **kwargs):
+        calls.append(kwargs)
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(IndexerService, "index_all", spy)
+    return calls
+
+
+class TestTimeBudget:
+    def test_default_budget_leaves_a_margin_below_the_unit_timeout(self):
+        from config.settings import Settings
+
+        budget = Settings.model_fields["vault_index_time_budget_seconds"].default
+
+        assert 0 < budget <= _service_timeout() - 300
+
+    def test_job_passes_the_budget_to_the_indexer(self, job, vault, index_all_calls, monkeypatch):
+        from config.settings import settings
+
+        _write_note(vault, "note.md", 1000)
+        monkeypatch.setattr(settings, "vault_index_time_budget_seconds", 321)
+
+        job.run_job(dry_run=False)
+
+        assert index_all_calls[0]["time_budget_seconds"] == 321
+
+    def test_default_run_hands_the_indexer_a_budget_below_the_unit_timeout(self, job, vault, index_all_calls):
+        _write_note(vault, "note.md", 1000)
+
+        job.run_job(dry_run=False)
+
+        assert 0 < index_all_calls[0]["time_budget_seconds"] < _service_timeout()
+
+    def test_zero_turns_the_budget_off(self, job, vault, index_all_calls, monkeypatch):
+        from config.settings import settings
+
+        _write_note(vault, "note.md", 1000)
+        monkeypatch.setattr(settings, "vault_index_time_budget_seconds", 0)
+
+        job.run_job(dry_run=False)
+
+        assert index_all_calls[0]["time_budget_seconds"] is None
+
+    def test_spent_budget_ends_the_run_normally_between_notes(self, job, vault, vector_store, monkeypatch):
+        from api.services.indexer import IndexerService
+        from config.settings import settings
+
+        for i in range(5):
+            _write_note(vault, f"{i}.md", 1000 + i)
+        monkeypatch.setattr(settings, "vault_index_time_budget_seconds", 150)
+        clock = {"now": 0.0}
+        monkeypatch.setattr(IndexerService, "_clock", staticmethod(lambda: clock["now"]))
+        real_index_file = IndexerService.index_file
+
+        def slow_index_file(self, *args, **kwargs):
+            clock["now"] += 100
+            return real_index_file(self, *args, **kwargs)
+
+        monkeypatch.setattr(IndexerService, "index_file", slow_index_file)
+
+        result = job.run_job(dry_run=False)
+
+        assert result["status"] == "indexed"
+        assert result["files_indexed"] == 2
+        assert len(_indexed_paths(vector_store)) == 2
+
+
+class TestLargeNotes:
+    def test_default_limit_keeps_the_note_in_progress_inside_the_margin(self):
+        """Measured on the host: 1.5 to 5 KB of note per chunk, 2 to 4 chunks per second."""
+        from config.settings import Settings
+
+        fields = Settings.model_fields
+        smallest_bytes_per_chunk, slowest_chunks_per_second = 1500, 2
+        worst_seconds = fields["vault_index_max_note_bytes"].default / smallest_bytes_per_chunk / slowest_chunks_per_second
+
+        assert worst_seconds <= _service_timeout() - fields["vault_index_time_budget_seconds"].default
+
+    def test_job_skips_a_large_note_and_the_nightly_path_indexes_it(self, job, vault, vector_store, size_limit):
+        small = _write_note(vault, "small.md", 1000)
+        large = _write_note(vault, "Archive/large.md", 2000, body=BIG_BODY)
+        assert large.stat().st_size > size_limit
+
+        result = job.run_job(dry_run=False)
+
+        assert result["files_indexed"] == 1
+        assert _indexed_paths(vector_store) == [str(small.resolve())]
+        assert str(large) not in json.loads(_state_file().read_text())
+
+        from api.services.indexer import IndexerService
+
+        vector_store.return_value.update_document.reset_mock()
+        nightly_indexer = IndexerService(vault_path=str(vault), tag_store=MagicMock(get=MagicMock(return_value=None)))
+        assert nightly_indexer.index_all(skip_summaries=True, time_budget_seconds=1800) == 1
+        assert _indexed_paths(vector_store) == [str(large.resolve())]
+        assert str(large) in json.loads(_state_file().read_text())
+
+    def test_large_notes_take_no_slot_from_smaller_ones_behind_them(self, job, vault, vector_store, size_limit, monkeypatch):
+        from config.settings import settings
+
+        monkeypatch.setattr(settings, "vault_index_max_files", 2)
+        _write_note(vault, "large-newest.md", 4000, body=BIG_BODY)
+        _write_note(vault, "large-newer.md", 3000, body=BIG_BODY)
+        first = _write_note(vault, "first.md", 2000)
+        second = _write_note(vault, "second.md", 1000)
+
+        result = job.run_job(dry_run=False)
+
+        assert result["files_indexed"] == 2
+        assert result["changed"] == 2
+        assert sorted(_indexed_paths(vector_store)) == sorted([str(first.resolve()), str(second.resolve())])
+
+    def test_run_with_only_large_notes_exits_cleanly_without_loading_anything(
+        self, job, vault, vector_store, size_limit, monkeypatch
+    ):
+        import api.services.indexer as indexer_mod
+
+        _write_note(vault, "a.md", 1000, body=BIG_BODY)
+        _write_note(vault, "b.md", 2000, body=BIG_BODY)
+        bm25 = MagicMock()
+        monkeypatch.setattr(indexer_mod, "BM25Index", bm25)
+        embedding_service = MagicMock()
+        monkeypatch.setattr("api.services.embeddings.get_embedding_service", embedding_service)
+
+        result = job.run_job(dry_run=False)
+
+        assert result["status"] == "nothing_to_do"
+        assert result["skipped_large"] == 2
+        vector_store.assert_not_called()
+        bm25.assert_not_called()
+        embedding_service.assert_not_called()
+
+    def test_only_large_notes_do_not_trip_the_memory_check(self, job, vault, size_limit, monkeypatch):
+        from api.services import gpu_memory
+
+        _write_note(vault, "a.md", 1000, body=BIG_BODY)
+        monkeypatch.setattr(gpu_memory, "get_available_gpu_memory_mb", lambda: 1)
+
+        assert job.run_job(dry_run=False)["status"] == "nothing_to_do"
+
+    def test_skip_count_is_logged_with_the_limit(self, job, vault, size_limit, caplog):
+        _write_note(vault, "small.md", 500)
+        _write_note(vault, "a.md", 1000, body=BIG_BODY)
+        _write_note(vault, "b.md", 2000, body=BIG_BODY)
+
+        with caplog.at_level(logging.INFO):
+            result = job.run_job(dry_run=False)
+
+        assert result["skipped_large"] == 2
+        assert f"Left 2 changed notes over {SIZE_LIMIT} bytes for the nightly reindex" in caplog.text
+
+    def test_nothing_logged_when_no_note_is_large(self, job, vault, caplog):
+        _write_note(vault, "small.md", 500)
+
+        with caplog.at_level(logging.INFO):
+            job.run_job(dry_run=False)
+
+        assert "for the nightly reindex" not in caplog.text
+
+    def test_dry_run_reports_the_skipped_notes(self, job, vault, size_limit, caplog):
+        _write_note(vault, "small.md", 500)
+        _write_note(vault, "a.md", 1000, body=BIG_BODY)
+
+        with caplog.at_level(logging.INFO):
+            result = job.run_job(dry_run=True)
+
+        assert result["changed"] == 1
+        assert result["skipped_large"] == 1
+        assert "Left 1 changed notes" in caplog.text
+
+    def test_zero_turns_the_limit_off(self, job, vault, vector_store, size_limit, monkeypatch):
+        from config.settings import settings
+
+        monkeypatch.setattr(settings, "vault_index_max_note_bytes", 0)
+        _write_note(vault, "large.md", 1000, body=BIG_BODY)
+
+        assert job.run_job(dry_run=False)["files_indexed"] == 1
+
+    def test_indexer_reports_what_it_left_apart_from_the_remaining_count(self, indexer, vault):
+        _write_note(vault, "large.md", 2000, body=BIG_BODY)
+        _write_note(vault, "small.md", 1000)
+
+        indexer.index_all(light_pass=True, max_file_bytes=SIZE_LIMIT)
+
+        assert indexer.last_run["files_skipped_large"] == 1
+        assert indexer.last_run["files_remaining"] == 0
+        assert indexer.last_run["stopped_early"] is False
+
+    def test_unmeasurable_note_is_not_treated_as_large(self, indexer, vault, monkeypatch):
+        _write_note(vault, "note.md", 1000)
+        monkeypatch.setattr(os.path, "getsize", MagicMock(side_effect=OSError))
+
+        assert indexer.scan_changes(max_file_bytes=SIZE_LIMIT)["skipped_large"] == 0
+
+    def test_nightly_sets_no_size_limit(self, vault, monkeypatch):
+        sys.path.insert(0, str(REPO_ROOT / "scripts"))
+        import sync_vault_reindex
+        sys.path.remove(str(REPO_ROOT / "scripts"))
+        import api.services.indexer as indexer_mod
+        from config.settings import settings
+
+        indexer_class = MagicMock(name="IndexerService")
+        indexer_class.return_value.index_all.return_value = 0
+        indexer_class.return_value.last_run = {"files_pruned": 0, "files_remaining": 0, "stopped_early": False}
+        monkeypatch.setattr(indexer_mod, "IndexerService", indexer_class)
+        monkeypatch.setattr("api.services.vault_index_pages.write_index_pages", MagicMock(side_effect=RuntimeError))
+        monkeypatch.setattr(settings, "vault_path", vault)
+
+        sync_vault_reindex.sync_vault_reindex(dry_run=False, budget_minutes=30)
+
+        kwargs = indexer_class.return_value.index_all.call_args.kwargs
+        assert kwargs["time_budget_seconds"] == 1800
+        assert not kwargs.get("max_file_bytes")
+
+    def test_nightly_budget_does_not_starve_a_large_note_that_starts_inside_it(self, indexer, vault, vector_store, monkeypatch):
+        from api.services.indexer import IndexerService
+
+        large = _write_note(vault, "large.md", 2000, body=BIG_BODY)
+        later = _write_note(vault, "later.md", 1000)
+        clock = {"now": 0.0}
+        monkeypatch.setattr(IndexerService, "_clock", staticmethod(lambda: clock["now"]))
+        real_index_file = IndexerService.index_file
+
+        def hour_long_index_file(self, *args, **kwargs):
+            clock["now"] += 3600
+            return real_index_file(self, *args, **kwargs)
+
+        monkeypatch.setattr(IndexerService, "index_file", hour_long_index_file)
+
+        assert indexer.index_all(skip_summaries=True, time_budget_seconds=1800) == 1
+
+        assert _indexed_paths(vector_store) == [str(large.resolve())]
+        assert str(large) in json.loads(_state_file().read_text())
+        assert str(later) not in json.loads(_state_file().read_text())
+        assert indexer.last_run["files_remaining"] == 1
+
+
+class TestLightPassSaves:
+    def _kill_on_third_note(self, indexer, monkeypatch):
+        real_index_file = indexer.index_file
+        started = []
+
+        def index_file(path, **kwargs):
+            if len(started) == 2:
+                raise KeyboardInterrupt  # not an Exception: skips every handler, as a kill does
+            started.append(path)
+            return real_index_file(path, **kwargs)
+
+        monkeypatch.setattr(indexer, "index_file", index_file)
+
+    def test_light_pass_records_each_note_before_the_next_starts(self, indexer, vault, monkeypatch):
+        for i in range(3):
+            _write_note(vault, f"{i}.md", 1000 + i)
+        self._kill_on_third_note(indexer, monkeypatch)
+
+        with pytest.raises(KeyboardInterrupt):
+            indexer.index_all(newest_first=True, light_pass=True)
+
+        saved = json.loads(_state_file().read_text())
+        assert sorted(Path(p).name for p in saved if p.endswith(".md")) == ["1.md", "2.md"]
+
+    def test_full_pass_keeps_its_ten_file_interval(self, indexer, vault, monkeypatch):
+        for i in range(3):
+            _write_note(vault, f"{i}.md", 1000 + i)
+        self._kill_on_third_note(indexer, monkeypatch)
+
+        with pytest.raises(KeyboardInterrupt):
+            indexer.index_all(newest_first=True, skip_summaries=True)
+
+        assert not _state_file().exists() or not any(p.endswith(".md") for p in json.loads(_state_file().read_text()))
+
+
 class TestNightlyWaits:
     def test_nightly_waits_for_the_job_then_runs(self, nightly):
         from api.services import vault_index_lock

@@ -1420,6 +1420,11 @@ class Settings(BaseSettings):
     vault_index_max_files: int = Field(default=200, alias="LIFEOS_VAULT_INDEX_MAX_FILES")
     vault_index_max_deletions: int = Field(default=300, alias="LIFEOS_VAULT_INDEX_MAX_DELETIONS")
     vault_index_lock_wait_seconds: int = Field(default=1800, alias="LIFEOS_VAULT_INDEX_LOCK_WAIT_SECONDS")
+    # Together these keep a run inside the unit's TimeoutStartSec: the budget stops
+    # the run between notes, and the size limit keeps the note in progress short
+    # enough to finish in the margin the budget leaves.
+    vault_index_time_budget_seconds: int = Field(default=900, alias="LIFEOS_VAULT_INDEX_TIME_BUDGET_SECONDS")
+    vault_index_max_note_bytes: int = Field(default=500_000, alias="LIFEOS_VAULT_INDEX_MAX_NOTE_BYTES")
     summary_retry_budget_seconds: int = Field(default=3600, alias="LIFEOS_SUMMARY_RETRY_BUDGET_SECONDS")
 
     # Cross-encoder re-ranking (P9.2)
