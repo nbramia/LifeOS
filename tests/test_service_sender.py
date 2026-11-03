@@ -186,12 +186,43 @@ class TestAPersonsOwnAddress:
         addresses = {"jane.sample@gmail.com": 3, "events@acmewidgets.com": 3}
         assert verdict("Jane Sample", addresses, 6).own_addresses == ("jane.sample@gmail.com",)
 
-    def test_a_role_mailbox_on_their_own_site_takes_history(self):
-        assert verdict("Jane Sample", "hello@janesample.com").is_service
-        kept = verdict("Jane Sample", "hello@janesample.com", 3, sent_to={"hello@janesample.com": 2})
+    def test_a_greeting_mailbox_on_their_own_site_takes_history(self):
+        address = "hello@janesample.com"
+        assert verdict("Jane Sample", address).is_service
+        assert verdict("Jane Sample", address, 3, sent_to={address: 1}).is_service
+        kept = verdict("Jane Sample", address, 3, sent_to={address: 2})
         assert not kept.is_service and kept.wrote_to_own_address
-        assert not verdict("Jane Sample", "hello@janesample.com", 3, thread=2).is_service
-        assert verdict("Jane Sample", "hello@janesample.com", 3, thread=1).is_service
+        assert not verdict("Jane Sample", address, 3, thread=2).is_service
+        assert verdict("Jane Sample", address, 3, thread=1).is_service
+
+    @pytest.mark.parametrize("address", ["support@blueapron.com", "team@blueapron.com", "info@blueapron.com"])
+    def test_a_role_mailbox_on_a_company_named_like_a_person_never_counts(self, address):
+        result = verdict("Blue Apron", address, 5, sent_to={address: 9}, thread=9)
+        assert result.is_service
+        assert not result.wrote_to_own_address
+
+    @pytest.mark.parametrize("name,address", [
+        ("Seavey Vineyard", "wine@seaveyvineyard.com"),
+        ("Netroots Nation", "panels@netrootsnation.org"),
+        ("Seen by Indeed", "talent@beseen.indeed.com"),
+        ("Travis Ci", "builds@travis-ci.com"),
+        ("Colorado Coffee Merchants", "stephanie@coloradocoffeemerchants.com"),
+        ("Graining Fork Nature Preserve", "mngr@grainingfork.org"),
+    ])
+    def test_a_descriptive_local_part_on_a_name_matching_domain_is_a_company(self, name, address):
+        result = verdict(name, address)
+        assert result.is_service, result
+        assert not result.own_addresses
+
+    @pytest.mark.parametrize("address", ["sr@janesample.com", "j@janesample.com", "me@janesample.com", "founder@sample.com"])
+    def test_a_personal_local_part_on_their_own_site(self, address):
+        name = "Steven Rosson" if address.startswith("sr") else "Jane Sample"
+        address = address.replace("janesample", "stevenrosson") if address.startswith("sr") else address
+        assert verdict(name, address).own_addresses == (address,)
+
+    def test_history_makes_any_local_part_on_their_own_site_theirs(self):
+        assert verdict("Jane Sample", "desk@janesample.com", 4, thread=16).own_addresses
+        assert not verdict("Jane Sample", "desk@janesample.com", 4).own_addresses
 
     def test_a_companys_name_is_not_a_site_even_with_replies(self):
         for name, address in (("Acme Bank", "hello@acmebank.com"), ("Dana (Acme)", "hello@acme.com")):
@@ -234,6 +265,62 @@ class TestAPersonsOwnAddress:
         assert address_shape("jane@mail.com").personal_provider
 
 
+class TestAReplyCounts:
+    @pytest.mark.parametrize("name,address,received,replies", [
+        ("Robert Sample", "bob@northwind.com", 20, 1),
+        ("Pat Lee", "cq@northwind.com", 40, 2),
+    ])
+    def test_an_address_without_their_name(self, name, address, received, replies):
+        result = verdict(name, address, received, sent_to={address: replies})
+        assert result.wrote_to_own_address
+
+    @pytest.mark.parametrize("address", ["support@northwind.com", "noreply@northwind.com", "a1b2c3d4e5f6@northwind.com"])
+    def test_not_a_role_automated_or_generated_address(self, address):
+        assert not verdict("Pat Lee", address, 40, sent_to={address: 5}).wrote_to_own_address
+
+    def test_not_one_reply_lost_in_a_mailing(self):
+        address = "schooltalk@northwind.com"
+        assert verdict("Pat Lee", address, 100, sent_to={address: 1}).wrote_to_own_address
+        assert not verdict("Pat Lee", address, 101, sent_to={address: 1}).wrote_to_own_address
+
+    @pytest.mark.parametrize("name,address", [
+        ("Acme Bank", "ar@northwind.com"),
+        ("Pat (Support)", "ar@northwind.com"),
+        ("Northwind Finance", "ar@northwind.com"),
+        ("Sam from Acme", "ar@acme.com"),
+        ("Acme® Card", "ar@northwind.com"),
+    ])
+    def test_not_a_company_name_on_an_address_without_a_person(self, name, address):
+        assert not verdict(name, address, 11, sent_to={address: 4}).wrote_to_own_address
+
+    def test_sustained_replies_beat_a_sending_host(self):
+        address = "bm@mail.eastwind.com"
+        assert verdict("Pat Lee", address, 30, sent_to={address: 30}).wrote_to_own_address
+        assert verdict("Pat Lee", address, 30, sent_to={address: 3}).wrote_to_own_address
+        assert not verdict("Pat Lee", address, 30, sent_to={address: 2}).wrote_to_own_address
+
+    def test_not_a_true_sending_host(self):
+        address = "bm@mail.eastwind.com"
+        assert not verdict("Pat Lee", address, 30, sent_to={address: 30}, bulk=3, checked=3).wrote_to_own_address
+        own = "pat@mail.eastwind.com"
+        assert not verdict("Pat Lee", own, 30, sent_to={own: 30}, bulk=3, checked=3).wrote_to_own_address
+        generated = "a1b2c3d4e5f6@mail.eastwind.com"
+        assert not verdict("Pat Lee", generated, 30, sent_to={generated: 30}).wrote_to_own_address
+
+    def test_bulk_mail_does_not_undo_a_reply_to_an_ordinary_address(self):
+        assert verdict("Jane Sample", OWN_ADDRESS, 30, sent_to={OWN_ADDRESS: 1}, bulk=3, checked=3).wrote_to_own_address
+
+
+class TestAListWithAStrayAddress:
+    def test_a_list_host_outweighs_an_address_naming_no_one(self):
+        addresses = {"progressive-exchange@googlegroups.com": 2, "discuss@progressiveexchange.org": 1}
+        assert verdict("Progressive Exchange", addresses, 0, thread=3).reason == "automated_address"
+
+    def test_an_address_naming_someone_keeps_them_in_play(self):
+        addresses = {"newsletter@northwindtrading.com": 6, "jane@janes-letter.com": 4}
+        assert verdict("Jane Sample", addresses, 9).reason == "own_address"
+
+
 class TestRealHistoryOutweighsAddressShape:
     def test_a_sending_host_with_threads(self):
         address = "jane.sample@mail.northwind.com"
@@ -260,8 +347,9 @@ class TestRealHistoryOutweighsAddressShape:
         assert not verdict("Sarah Church", address, 3, thread=50).is_service
 
     def test_a_name_that_reads_as_an_organization_on_their_first_name(self):
-        assert verdict("Sarah Church", "sarah@stmarys.org", 3).reason == "own_address"
-        assert verdict("Sarah Church", "church1@stmarys.org", 3).is_service
+        assert verdict("Sarah Church", "sarah@stmarys.org", 3).is_service
+        assert not verdict("Sarah Church", "sarah@stmarys.org", 1).is_service
+        assert verdict("Stoko Support", "stoko@elsewhere-sample.com", 2).is_service
 
     def test_history_only_helps_an_address_carrying_the_name(self):
         assert verdict("Sarah Church", "desk@stmarys.org", 3, thread=50).is_service
@@ -463,8 +551,7 @@ class TestSignals:
     def test_brand_rules(self):
         assert verdict("Bank Acme", "hq@acme.com").reason == "named_after_domain"
         assert verdict("Sam from Acme", "desk@acme.com").reason == "named_after_domain"
-        assert verdict("Acme Widgets Monthly", "desk@acmewidgets.com", 2).reason == "named_after_domain"
-        assert not verdict("Acme Widgets Monthly", "desk@acmewidgets.com", 1).is_service
+        assert verdict("Acme Widgets Monthly", "desk@acmewidgets.com").reason == "named_after_domain"
         assert not verdict("Acmewidgets", "anything@acmewidgets.com", 0, thread=3).is_service
 
     def test_names_that_are_not_a_person(self):
@@ -1209,6 +1296,28 @@ class TestAutoRestore:
         nightly.service()
         assert ss.hide_service_senders(nightly.people) == {"hidden": 0, "held_back": 1, "restored": 1}
 
+    @pytest.mark.parametrize("name,address", [("Robert Sample", "bob@northwind.com"), ("Pat Lee", "cq@northwind.com")])
+    def test_a_reply_to_an_address_without_their_name(self, nightly, name, address):
+        person = nightly.person(name=name, emails=[address])
+        nightly.mail(person, count=20, address=address)
+        assert ss.hide_service_senders(nightly.people)["hidden"] == 1
+        assert nightly.people.is_blocked(address)
+
+        nightly.interaction(person, title="→ Hello", source_id=f"abc:{address}")
+
+        assert ss.hide_service_senders(nightly.people)["restored"] == 1
+        assert not nightly.people.get_by_id(person.id).hidden
+        assert not nightly.people.is_blocked(address)
+
+    def test_a_reply_to_a_companys_support_mailbox_does_not(self, nightly):
+        address = "support@blueapron.com"
+        person = nightly.person(name="Blue Apron", emails=[address])
+        nightly.mail(person, address=address)
+        ss.hide_service_senders(nightly.people)
+        nightly.interaction(person, title="→ Hello", source_id=f"abc:{address}")
+        assert ss.hide_service_senders(nightly.people)["restored"] == 0
+        assert nightly.people.get_by_id(person.id).hidden
+
     def test_a_reply_to_a_role_mailbox_does_not(self, nightly):
         person = nightly.service()
         ss.hide_service_senders(nightly.people)
@@ -1547,9 +1656,7 @@ class TestGmailSync:
         )
         recipient = world.people.get_by_email(address)
         assert recipient is not None
-        decision = world.decision(recipient)
-        assert decision.sent == 1
-        assert "wrote_to" in decision.protected_by, "her own site, so a reply counts"
+        assert world.decision(recipient).sent == 1
 
     def test_a_reply_to_a_companys_role_mailbox_is_counted_and_does_not_protect(self, world):
         me = world.person(name="Owner Sample", emails=["owner.sample@gmail.com"])

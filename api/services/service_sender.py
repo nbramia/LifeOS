@@ -10,13 +10,13 @@ when it sends steadily and nothing has ever come back.
 
 Some things put a row out of scope however it looks: family, one-to-one messages or
 calls, a phone number, a human's confirmation of an own address, manual overrides and
-tags, and mail the owner wrote to an own address. Calendar invites, contact-book
-entries, and note mentions don't vouch for a service-shaped row.
+tags, and a reply to anything but a role, automated, or generated address. Calendar
+invites, contact-book entries, and note mentions don't vouch for a service-shaped row.
 
 A hidden service keeps its interactions, including new mail, and holds its addresses
 so no later sync brings it back as a new person. It answers to no name. Only its
-service-shaped addresses are blocked. Two-way mail on an own address restores it, and
-so does restore_person.
+service-shaped addresses are blocked. A reply that counts restores it, and so does
+restore_person.
 """
 import json
 import logging
@@ -44,6 +44,7 @@ from config.marketing_patterns import (
     ORGANIZATION_NAME_WORDS,
     PERSONA_NAME_MARKERS,
     PERSONAL_MAIL_DOMAINS,
+    PERSONAL_SITE_LOCALS,
     RESERVED_DOMAINS,
     RESERVED_TLDS,
     ROLE_LOCAL_COMPOUND_WORDS,
@@ -93,6 +94,13 @@ ONE_WAY_MAX_SENT_SHARE = 0.05
 THIN_SIGNAL_MIN_RECEIVED = 2
 # One word copied into the local part reads like a first name until this much one-way mail.
 ONE_WORD_OWN_ADDRESS_MAX_RECEIVED = 5
+# A reply has to be this much of what came in to say anything about an address with no
+# name in it: one answer to a thousand-message list doesn't make it a correspondent.
+REPLY_MIN_SHARE = 0.01
+# Replies it takes to a dedicated sending host, with no name in the address.
+SENDING_HOST_MIN_REPLIES = 3
+# Replies or threads that make a greeting mailbox on someone's own site theirs.
+OWN_SITE_MIN_HISTORY = 2
 # Share of the mail checked that has to carry bulk headers, and the fewest messages
 # checked before that means anything on a sender with more mail than that.
 BULK_MIN_SHARE = 0.6
@@ -353,6 +361,21 @@ def _on_own_site(shape: AddressShape, name: str, names: list[str]) -> bool:
     return label in ("".join(words), words[-1])
 
 
+def _is_personal_on_own_site(shape: AddressShape, evidence: SenderEvidence, name: str) -> bool:
+    """A local part on someone's own site: a greeting with real history, or anything personal."""
+    local = shape.local.split("+", 1)[0]
+    if shape.role:
+        history = max(evidence.sent, evidence.thread)
+        return local in PERSONAL_SITE_LOCALS and history >= OWN_SITE_MIN_HISTORY
+    initials = "".join(word[0] for word in _name_words(name))
+    return (
+        evidence.has_history
+        or local in PERSONAL_SITE_LOCALS
+        or local in (initials, initials[0])
+        or _carries_name(shape, name)
+    )
+
+
 def _is_own_address(shape: AddressShape, evidence: SenderEvidence, names: list[str]) -> bool:
     """A mailbox provider, the sender's own site, or a local part carrying their name."""
     name = evidence.name
@@ -361,8 +384,9 @@ def _is_own_address(shape: AddressShape, evidence: SenderEvidence, names: list[s
     if shape.personal_provider:
         return True
     if _on_own_site(shape, name, names):
-        # A small company's name reads the same, so its role mailbox takes real history.
-        return not shape.role or bool(evidence.sent) or evidence.thread > 1
+        # "Blue Apron" reads the same as "Jane Sample", so the local part has to look
+        # personal too. A company's support@ never does, however often it's answered.
+        return _is_personal_on_own_site(shape, evidence, name)
     if shape.role:
         return False
     if shape.sending and _reads_as_organization(names):
@@ -377,18 +401,36 @@ def _is_own_address(shape: AddressShape, evidence: SenderEvidence, names: list[s
     if SIGNAL_BRAND_NAME in names and (len(words) == 1 or words[0] in _host_labels(shape.domain)):
         return False
     if SIGNAL_ORG_NAME in names:
-        # "Sarah Church" reads as an organization by one word. Her first name alone is
-        # an address, a company's word in it isn't, and the rest takes real history.
+        # "Sarah Church" reads as an organization by one word. A company's word in the
+        # address settles it, and otherwise it takes real history to count as hers.
         tokens = {token for token in re.split(r"[^a-z0-9]+", shape.local) if token}
         if tokens & _ORGANIZATION_WORDS:
             return False
-        bare = re.sub(r"[^a-z]", "", shape.local)
-        if bare in set(words) - _ORGANIZATION_WORDS:
-            return True
         return evidence.has_history and _carries_name(shape, name)
     if SIGNAL_ONE_WORD in names and evidence.received >= ONE_WORD_OWN_ADDRESS_MAX_RECEIVED and not evidence.has_history:
         return False
     return _carries_name(shape, name)
+
+
+def _reply_counts(shape: AddressShape, evidence: SenderEvidence, names: list[str], bulk_mail: bool) -> bool:
+    """
+    Whether writing to this address says there's someone behind it.
+
+    An own address counts unless its mail is bulk from a sending host. So does any
+    other address a person's name sits on, unless it's a role, automated, or generated
+    one, or the replies are lost in what comes in. A sending host takes sustained replies.
+    """
+    if _is_own_address(shape, evidence, names):
+        return not (shape.sending and bulk_mail)
+    if shape.automated or shape.generated or shape.role:
+        return False
+    if {SIGNAL_ORG_NAME, SIGNAL_BRAND_NAME, SIGNAL_NOT_A_NAME, SIGNAL_PERSONA} & set(names):
+        return False
+    if evidence.sent < evidence.received * REPLY_MIN_SHARE:
+        return False
+    if shape.sending:
+        return not bulk_mail and evidence.sent >= SENDING_HOST_MIN_REPLIES
+    return True
 
 
 # ------------------------------------------------------------------- verdict
@@ -410,8 +452,10 @@ def classify_sender(evidence: SenderEvidence) -> SenderVerdict:
     words = _name_words(evidence.name)
 
     own = tuple(a for a, s in shapes.items() if _is_own_address(s, evidence, names))
+    enough_checked = evidence.checked >= min(evidence.received, BULK_MIN_CHECKED) and evidence.checked
+    bulk_mail = bool(enough_checked and evidence.bulk / evidence.checked >= BULK_MIN_SHARE)
     wrote_to_own = any(
-        (address == "" and own) or _is_own_address(address_shape(address), evidence, names)
+        (address == "" and own) or (address and _reply_counts(address_shape(address), evidence, names, bulk_mail))
         for address in evidence.sent_to
     )
 
@@ -435,10 +479,8 @@ def classify_sender(evidence: SenderEvidence) -> SenderVerdict:
     # A person turns up in threads, or writes from their own mailbox as well as the
     # address their newsletter goes out on. Neither is bulk however that mail reads.
     has_own_mailbox = len(shapes) > 1 and share(lambda s: s.personal_provider) >= OWN_ADDRESS_MIN_SHARE
-    enough_checked = evidence.checked >= min(evidence.received, BULK_MIN_CHECKED) and evidence.checked
     if (
-        enough_checked
-        and evidence.bulk / evidence.checked >= BULK_MIN_SHARE
+        bulk_mail
         and evidence.thread <= evidence.received * ONE_WAY_MAX_THREAD_SHARE
         and not has_own_mailbox
     ):
@@ -446,6 +488,13 @@ def classify_sender(evidence: SenderEvidence) -> SenderVerdict:
         return verdict(True, "bulk_mail")
 
     if has_own:
+        # A list with one stray address on the side is still a list. An address that names
+        # someone keeps them in play, however much of their row is a newsletter.
+        names_someone = any(
+            shapes[a].personal_provider or _carries_name(shapes[a], evidence.name) for a in own
+        )
+        if share(lambda s: s.automated) >= SERVICE_ADDRESS_MIN_SHARE and not names_someone:
+            return verdict(True, "automated_address")
         if never_answered and evidence.received >= ONE_WAY_MIN_RECEIVED:
             fired.append(SIGNAL_ONE_WAY)
             return verdict(True, "one_way_volume")
@@ -476,11 +525,7 @@ def classify_sender(evidence: SenderEvidence) -> SenderVerdict:
         fired.append(SIGNAL_ONE_WAY)
         return verdict(True, "one_way_volume")
 
-    if SIGNAL_BRAND_NAME in names and evidence.received and (
-        {SIGNAL_ONE_WORD, SIGNAL_ORG_NAME, SIGNAL_PERSONA} & set(names)
-        or any(words[0] in _host_labels(s.domain) for s in shapes.values())
-        or evidence.received >= THIN_SIGNAL_MIN_RECEIVED
-    ):
+    if SIGNAL_BRAND_NAME in names and evidence.received:
         return verdict(True, "named_after_domain")
     if evidence.received >= THIN_SIGNAL_MIN_RECEIVED:
         if SIGNAL_ORG_NAME in names:
@@ -855,7 +900,7 @@ def restore_person(store: PersonEntityStore, person_id: str) -> Optional[PersonE
 
 
 def restore_people_who_wrote_back(store: PersonEntityStore, interactions_db: Path) -> int:
-    """Show any hidden service again once the owner and they have mail on an own address."""
+    """Show any hidden service again once the owner has replied to it in a way that counts."""
     merged_ids = load_merged_ids(PersonEntityStore.MERGED_IDS_PATH)
     crm_db = Path(store.db_path)
     mail, _ = _load_evidence(crm_db, interactions_db, merged_ids)

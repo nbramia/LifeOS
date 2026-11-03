@@ -597,16 +597,21 @@ carrying their name.
   and replies.
 - **An own address is judged by what came back.** With no thread and no sent mail, at
   least `ONE_WAY_MIN_RECEIVED` messages make it a service. So does repeated one-way
-  mail on a sending host. Anything else leaves a person. A role mailbox on someone's
-  own site counts as theirs only with replies or threads.
+  mail on a sending host. Anything else leaves a person. On a domain matching the
+  sender's name, the local part has to look personal too: their name or initials, a
+  greeting such as `hello@` with repeated replies or threads, or real history. A role
+  mailbox like `support@` never does.
+- **A reply counts on anything but a role, automated, or generated address**, under a
+  person's name and at no less than 1% of what came in. A sending host takes three
+  replies and no bulk mail.
 - **Bulk headers count as a share.** `GmailService` reads `List-Unsubscribe`,
   `List-Post`, and `Precedence` into `EmailMessage.bulk`, and a sender's source
   entities record it as `metadata.bulk`. A `List-Post` address marks a discussion
   list, whose posts stay their authors' own messages. At least three messages have to
   be checked, or all of them if there are fewer.
 
-A row is out of scope, however it looks, with any of these: mail the owner sent to an
-own address (a `→` title or a `<message>:<recipient>` source id); a phone number;
+A row is out of scope, however it looks, with any of these: a reply that counts (a `→`
+title or a `<message>:<recipient>` source id); a phone number;
 one-to-one iMessage, WhatsApp, phone, or Slack contact, or photos; an iMessage, phone,
 photo, or LinkedIn source; a human's link on an own address; a link override; a
 confirmed fact; a strength, circle, or tag override; tags, notes, a birthday, or profile
@@ -619,7 +624,7 @@ contact-book entries, and note mentions vouch for nobody.
 | Where | What happens |
 |-------|--------------|
 | Gmail sync | Mail the owner sends is always recorded. An unknown address with service evidence or on the blocklist creates no person, interaction, or source entity, and joins the skip cache, unless someone of that full name with a phone number is known. This runs before name matching. When an address gains a person, its skipped mail is released and judged again on the next run |
-| `sync_strengths.py` | `hide_service_senders()` first restores any hidden service with mail from the owner on an own address, then hides new services before scoring and ranking. Past `NIGHTLY_MAX_HIDES` rows it hides nothing, records a sync error, and the sync summary says so |
+| `sync_strengths.py` | `hide_service_senders()` first restores any hidden service with a reply that counts, then hides new services before scoring and ranking. Past `NIGHTLY_MAX_HIDES` rows it hides nothing, records a sync error, and the sync summary says so |
 | `repair_service_senders.py` | The reviewed path for existing rows. See [scripts](../../guides/scripts.md#utility-scripts) |
 
 Hiding clears the row's strength and circle and takes it out of name lookups, so a

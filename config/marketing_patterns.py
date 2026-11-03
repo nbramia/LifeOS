@@ -338,5 +338,8 @@ ORGANIZATION_NAME_WORDS = frozenset({
     'tracking', 'travel',
 })
 
+# Local parts someone uses on a site named after them.
+PERSONAL_SITE_LOCALS = frozenset({'contact', 'founder', 'hello', 'hey', 'hi', 'mail', 'me'})
+
 # How a sender's name presents a brand behind a first name.
 PERSONA_NAME_MARKERS = frozenset({'via', 'at', 'from', '@', 'c/o'})
