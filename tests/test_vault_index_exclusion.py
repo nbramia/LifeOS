@@ -6,8 +6,8 @@ import pytest
 from api.services.bm25_index import BM25Index
 from api.services.hybrid_search import HybridSearch
 from api.services.index_exclusion import index_exclude_matcher, matches_exclude_globs
-from api.services.indexer import IndexerService
-from config.settings import settings
+from api.services.indexer import TAG_STATE_KEY, IndexerService
+from config.settings import Settings, settings
 
 pytestmark = pytest.mark.unit
 
@@ -66,7 +66,16 @@ def search(vault, tmp_path):
     return HybridSearch(vector_store=vectors, bm25_index=bm25)
 
 
+class FakeTagStore:
+    def get(self, key):
+        return None
+
+
 class TestGlobs:
+    def test_shipped_default_is_the_personas_globs(self):
+        default = Settings.model_fields["vault_index_exclude_globs_raw"].default
+        assert [g.strip() for g in default.split(",")] == DEFAULT_GLOBS
+
     @pytest.mark.parametrize("rel,expected", [
         ("Work/ML/Personas/a.md", True),
         ("Work/ML/Personas/deep/er/a.md", True),
@@ -136,6 +145,34 @@ class TestIndexRun:
         assert sorted(result["deleted"]) == sorted(
             str(vault / rel) for rel in NOTES if "Meetings" not in rel
         )
+
+    def test_index_run_removes_prior_chunks_from_both_stores(self, vault, tmp_path, monkeypatch):
+        monkeypatch.setattr(IndexerService, "_invalidate_queued_summary", staticmethod(lambda path: None))
+        indexer = IndexerService(
+            vault_path=str(vault), db_path=str(tmp_path / "db"), tag_store=FakeTagStore(), connect_stores=False
+        )
+        state_file = tmp_path / "index_state.json"
+        indexer.INDEX_STATE_FILE = str(state_file)
+        indexer.bm25_index = BM25Index(db_path=str(tmp_path / "bm25.db"))
+        removed = []
+        indexer.vector_store = type("Vectors", (), {"delete_document": lambda self, path: removed.append(path)})()
+        # Indexed before the exclusion existed: every note has chunks and a current state entry.
+        state = {}
+        for rel, marker in NOTES.items():
+            path = vault / rel
+            indexer.bm25_index.add_document(f"{path.resolve()}_0", f"Planted {marker} text.", path.name)
+            state[str(path)] = path.stat().st_mtime
+        state_file.write_text(json.dumps(state))
+
+        assert indexer.index_all(skip_summaries=True) == 0
+
+        excluded_paths = sorted(str((vault / rel).resolve()) for rel in NOTES if "Meetings" not in rel)
+        assert sorted(removed) == excluded_paths
+        for marker in EXCLUDED:
+            assert indexer.bm25_index.search(marker) == []
+        assert indexer.bm25_index.search("zzmarkerordinary")
+        saved = json.loads(state_file.read_text())
+        assert [k for k in saved if k != TAG_STATE_KEY] == [str(vault / "Work/ML/Meetings/Standup.md")]
 
     def test_fresh_run_indexes_only_ordinary_notes(self, vault, tmp_path):
         indexer = IndexerService(vault_path=str(vault), db_path=str(tmp_path / "db"), connect_stores=False)
