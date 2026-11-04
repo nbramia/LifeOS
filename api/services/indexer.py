@@ -18,6 +18,7 @@ from api.services.vectorstore import VectorStore, is_people_tag
 from api.services.bm25_index import BM25Index
 from api.services.meeting_source import MEETING_SOURCE_TYPE, meeting_provider
 from api.services.people import people_in_note
+from api.services.index_exclusion import matches_exclude_globs
 from api.services.vault_listing import in_underscore_dir, no_people_reason
 
 # V2 People System integration
@@ -293,7 +294,7 @@ class IndexerService:
         # the deleted-file path below.
         all_md_files = [
             f for f in self.vault_path.rglob("*.md")
-            if not in_underscore_dir(f.relative_to(self.vault_path))
+            if not self._is_excluded_from_index(f)
         ]
         current_files = {str(f): f.stat().st_mtime for f in all_md_files}
 
@@ -761,11 +762,14 @@ class IndexerService:
         return no_people_reason(self._rel_path(path), frontmatter, settings.vault_no_people_paths)
 
     def _is_excluded_from_index(self, path: Path) -> bool:
-        """Whether a file sits under a _-prefixed folder of the vault."""
+        """Whether a file sits under a _-prefixed folder or a LIFEOS_VAULT_INDEX_EXCLUDE_GLOBS glob."""
+        from config.settings import settings
+
         try:
-            return in_underscore_dir(path.relative_to(self.vault_path))
+            rel = path.relative_to(self.vault_path)
         except ValueError:
             return False
+        return in_underscore_dir(rel) or matches_exclude_globs(rel.as_posix(), settings.vault_index_exclude_globs)
 
     def _get_mention_resolver(self, resolver, interaction_store) -> "MentionResolver | None":
         """A resolver over the current people, rebuilt once it has aged out.
