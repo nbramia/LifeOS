@@ -9,6 +9,7 @@ import time
 from typing import Optional
 from datetime import datetime, timezone
 
+import httpx
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
@@ -158,7 +159,6 @@ _NOT_VISIBLE_ERRORS = frozenset({
     "not_in_channel",
     "thread_not_found",
     "access_denied",
-    "is_archived",
 })
 
 
@@ -559,7 +559,7 @@ async def get_my_messages_for_day(
 
 
 @router.get("/thread", response_model=SlackThreadResponse)
-async def get_thread(
+def get_thread(
     channel: str = Query(..., description="Slack conversation ID"),
     ts: str = Query(..., description="The thread parent's ts (thread_ts)"),
 ):
@@ -567,7 +567,8 @@ async def get_thread(
     **Every message in a Slack thread**, parent first, oldest to newest.
 
     Live `conversations.replies` with the operator's user token, paged to the
-    end. Messages from any author are returned, including bots and people
+    end. A plain ``def`` so FastAPI runs it in the threadpool: rate-limit
+    retries sleep without blocking the event loop. Messages from any author are returned, including bots and people
     LifeOS doesn't know. `user` is the Slack user id, or the `bot_id` for a
     bot message. Channel join/leave/topic noise is dropped.
 
@@ -581,6 +582,8 @@ async def get_thread(
         messages, truncated = client.get_thread_messages(channel, ts)
     except SlackAPIError as e:
         raise _context_http_error(e)
+    except (httpx.HTTPError, ValueError):
+        raise HTTPException(status_code=502, detail="Slack request failed")
 
     return SlackThreadResponse(
         channel=channel,
@@ -592,7 +595,7 @@ async def get_thread(
 
 
 @router.get("/context", response_model=SlackContextResponse)
-async def get_channel_context(
+def get_channel_context(
     channel: str = Query(..., description="Slack conversation ID"),
     ts: str = Query(..., description="Return messages strictly before this ts"),
     before: int = Query(10, ge=1, le=50, description="Max messages to return"),
@@ -615,6 +618,8 @@ async def get_channel_context(
         messages = client.get_messages_before(channel, ts, before)
     except SlackAPIError as e:
         raise _context_http_error(e)
+    except (httpx.HTTPError, ValueError):
+        raise HTTPException(status_code=502, detail="Slack request failed")
 
     return SlackContextResponse(
         channel=channel,

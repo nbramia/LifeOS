@@ -124,6 +124,24 @@ class TestSlackThread:
         assert msg["thread_ts"] == THREAD_TS
         assert msg["text"].startswith("Synthetic question")
 
+    def test_truncated_at_the_cap_keeps_the_oldest(self):
+        slack = RecordedSlack()
+        messages, truncated = slack.client().get_thread_messages(CHANNEL, THREAD_TS, max_messages=3)
+        assert truncated is True
+        assert [m["ts"] for m in messages] == [THREAD_TS, "1767225660.000200", "1767225720.000300"]
+
+    def test_out_of_order_replies_come_back_oldest_first(self, api):
+        slack = RecordedSlack()
+        for page in slack.recorded["conversations.replies"].values():
+            page["messages"].reverse()
+        slack.recorded["conversations.replies"]["page2"], slack.recorded["conversations.replies"][""] = (
+            slack.recorded["conversations.replies"][""], slack.recorded["conversations.replies"]["page2"])
+        slack.recorded["conversations.replies"][""]["response_metadata"] = {"next_cursor": "page2"}
+        slack.recorded["conversations.replies"]["page2"]["response_metadata"] = {"next_cursor": ""}
+        response, _ = _run(api, "/api/slack/thread", slack, channel=CHANNEL, ts=THREAD_TS)
+        ts_list = [m["ts"] for m in response.json()["messages"]]
+        assert ts_list == sorted(ts_list, key=float) and len(ts_list) == 5
+
     def test_drops_channel_noise(self, api):
         response, _ = _run(api, "/api/slack/thread", RecordedSlack(), channel=CHANNEL, ts=THREAD_TS)
 
@@ -209,7 +227,7 @@ ENDPOINTS = [
 class TestSlackThreadContextErrors:
 
     @pytest.mark.parametrize("url,method,extra", ENDPOINTS)
-    @pytest.mark.parametrize("error", ["channel_not_found", "not_in_channel", "thread_not_found"])
+    @pytest.mark.parametrize("error", ["channel_not_found", "not_in_channel", "thread_not_found", "access_denied"])
     def test_not_visible_is_404_without_slack_text(self, api, url, method, extra, error):
         slack = RecordedSlack(failures={
             method: [httpx.Response(200, json={"ok": False, "error": error})],
@@ -261,6 +279,27 @@ class TestSlackThreadContextErrors:
 
         assert response.status_code == 400
         assert slack.calls == []
+
+    @pytest.mark.parametrize("url,method,extra", ENDPOINTS)
+    def test_other_slack_errors_are_502_with_the_code_only(self, api, url, method, extra):
+        slack = RecordedSlack(failures={
+            method: [httpx.Response(200, json={"ok": False, "error": "fatal_error"})],
+        })
+        response, _ = _run(api, url, slack, channel=CHANNEL, ts=THREAD_TS, **extra)
+        assert response.status_code == 502
+        assert response.json() == {"detail": "Slack API error: fatal_error"}
+
+    @pytest.mark.parametrize("url,method,extra", ENDPOINTS)
+    def test_a_non_json_slack_body_is_502(self, api, url, method, extra):
+        slack = RecordedSlack(failures={method: [httpx.Response(500, text="<html>Synthetic outage</html>")]})
+        response, _ = _run(api, url, slack, channel=CHANNEL, ts=THREAD_TS, **extra)
+        assert response.status_code == 502 and "Synthetic" not in response.text
+
+    @pytest.mark.parametrize("url,_method,extra", ENDPOINTS)
+    @pytest.mark.parametrize("channel", ["D0TESTDM01", "G0TESTGRP1"])
+    def test_dm_and_private_ids_are_accepted(self, api, url, _method, extra, channel):
+        response, _ = _run(api, url, RecordedSlack(), channel=channel, ts=THREAD_TS, **extra)
+        assert response.status_code == 200
 
     @pytest.mark.parametrize("url,_method,extra", ENDPOINTS)
     def test_disabled_is_503(self, api, url, _method, extra):

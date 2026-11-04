@@ -786,8 +786,8 @@ class SlackClient:
         oldest first.
 
         Uses ``conversations.history`` with ``latest=ts, inclusive=false``.
-        Channel membership/metadata noise is dropped, and up to ``max_pages``
-        pages are read so noise doesn't crowd out real messages.
+        Channel membership/metadata noise is dropped; pages of at least 100
+        are read, up to ``max_pages``, so noise doesn't crowd out real messages.
         """
         cutoff = float(ts)
         collected: list[dict] = []
@@ -798,7 +798,7 @@ class SlackClient:
                 "channel": channel_id,
                 "latest": ts,
                 "inclusive": False,
-                "limit": before,
+                "limit": max(before, 100),
             }
             if cursor:
                 params["cursor"] = cursor
