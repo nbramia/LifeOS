@@ -472,6 +472,38 @@ Every message the user sent on a given day — DMs, group DMs, public/private ch
 
 `truncated: true` means the day exceeded the pagination cap (1,000 messages); `total_available` is Slack's full match count.
 
+### GET /api/slack/thread
+
+Every message in one thread, parent first, oldest to newest. Live `conversations.replies` with the operator's user token, paged server-side to the end (cap 5,000; `truncated: true` past it). Messages from any author are returned, including bots and people LifeOS doesn't know. Read-only.
+
+**Query parameters:** `channel` (required, Slack conversation ID), `ts` (required, the parent's `thread_ts`).
+
+**Response:**
+```json
+{
+  "channel": "C0TESTCHAN",
+  "ts": "1767225600.000100",
+  "total": 2,
+  "truncated": false,
+  "messages": [
+    {"ts": "1767225600.000100", "user": "U0TESTAAA1", "bot_id": null, "text": "does the widget ship Friday?", "thread_ts": "1767225600.000100", "subtype": null},
+    {"ts": "1767225720.000300", "user": "B0TESTBOT1", "bot_id": "B0TESTBOT1", "text": "build passed", "thread_ts": "1767225600.000100", "subtype": "bot_message"}
+  ]
+}
+```
+
+`user` is the Slack user ID, or the `bot_id` for a bot message; `bot_id` is set only for bots. `text` is Slack's raw text (mentions stay as `<@U…>`). Channel membership and metadata messages (join, leave, topic, purpose, rename, archive) are dropped.
+
+### GET /api/slack/context
+
+Up to `before` top-level messages in a channel strictly before `ts`, oldest first, in the `/thread` message shape. Live `conversations.history` (`latest=ts`, `inclusive=false`). Join/leave/topic noise is dropped and doesn't count toward `before`. Read-only.
+
+**Query parameters:** `channel` (required), `ts` (required), `before` (default 10, 1–50; outside that range is 400).
+
+**Response:** `{"channel", "ts", "before", "total", "messages": [...]}`.
+
+**Errors (both endpoints):** 400 for a malformed `channel` or `ts`; 404 `Channel or thread not visible to this token` when Slack reports the channel or thread missing or inaccessible (no Slack content is returned); 403 when the token lacks a `*:history` scope; 503 when Slack still rate-limits after retries (each 429 is retried after its `Retry-After`); 502 for any other Slack failure, naming the Slack error code only.
+
 ### GET /api/slack/conversations
 
 List DMs and channels.
