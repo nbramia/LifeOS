@@ -204,7 +204,9 @@ def test_folder_matches_on_a_directory_boundary(env):
     assert allowed == {_abs("Work/Meetings/hiring-sync.md"), _abs("Work/Meetings/budget-sync.md")}
 
 
-def test_no_facets_leaves_both_arms_untouched(env):
+def test_no_facets_leaves_both_arms_untouched(env, monkeypatch):
+    from config.settings import settings
+    monkeypatch.setattr(settings, "vault_index_exclude_globs_raw", "")
     hs, vec, bm25, _ = env
     seen = _spy_bm25(bm25)
     baseline = hs.search("budget hiring", top_k=10, use_reranker=False)

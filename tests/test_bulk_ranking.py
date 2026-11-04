@@ -115,6 +115,7 @@ class TestRule:
 
     def test_arms_are_called_as_usual_with_no_rule(self, corpus, monkeypatch):
         monkeypatch.setattr(settings, "vault_no_people_paths_raw", "")
+        monkeypatch.setattr(settings, "vault_index_exclude_globs_raw", "")
         list_path = corpus.list_rows("Givers", 30, "harvest pledge row")
         spy = MagicMock(wraps=corpus.bm25.search)
         corpus.bm25.search = spy
