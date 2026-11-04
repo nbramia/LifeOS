@@ -77,6 +77,7 @@ class TestGlobs:
         ("Work/ML/Meetings/a.md", False),
         ("Work/ML/PersonasNotes/a.md", False),
         ("Personal/Relationship/Personas.md", False),
+        ("Work/ML/Personas Archive/a.md", False),
     ])
     def test_default_globs(self, rel, expected):
         assert matches_exclude_globs(rel, DEFAULT_GLOBS) is expected
@@ -90,6 +91,31 @@ class TestGlobs:
     def test_empty_config_excludes_nothing(self, vault, monkeypatch):
         monkeypatch.setattr(settings, "vault_index_exclude_globs_raw", "")
         assert index_exclude_matcher() is None
+
+    def test_glob_without_wildcard_is_not_a_prefix_match(self, vault, monkeypatch):
+        monkeypatch.setattr(settings, "vault_index_exclude_globs_raw", "Work/ML/Personas.md")
+        excluded = index_exclude_matcher()
+        assert excluded(str((vault / "Work/ML/Personas.md").resolve()) + "_2")
+        assert not excluded(str((vault / "Work/ML/Personas.md.bak").resolve()))
+
+    def test_chat_vault_fetch_drops_excluded(self, vault, monkeypatch):
+        import asyncio
+        from api.routes import chat
+
+        class Stub:
+            def __init__(self, *a, **k): pass
+            def search(self, **k):
+                return [{"file_path": str((vault / "Work/ML/Personas/Jordan Profile.md").resolve()), "id": "x::0"},
+                        {"file_path": str((vault / "Work/ML/Meetings/Standup.md").resolve()), "id": "y::0"}]
+        monkeypatch.setattr(chat, "HybridSearch", Stub)
+        out = asyncio.run(chat._fetch_vault("q", 5))
+        assert [c["id"] for c in out] == ["y::0"]
+
+    def test_tagger_skips_excluded(self, vault):
+        import sys
+        sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent / "scripts"))
+        import sync_vault_tag
+        assert [p.name for p in sync_vault_tag.list_vault_notes(vault)] == ["Standup.md"]
 
     def test_matcher_accepts_chunk_ids(self, vault):
         excluded = index_exclude_matcher()

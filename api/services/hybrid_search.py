@@ -582,7 +582,12 @@ class HybridSearch:
             vector_search = vector_store.search
             if is_excluded:
                 def vector_search(**kw):
-                    return [r for r in vector_store.search(**kw) if not _result_excluded(r, is_excluded)]
+                    # Over-fetch so chunks dropped here don't leave the arm short before the next index run.
+                    kw = {**kw, "top_k": kw["top_k"] * 3}
+                    if kw.get("fetch_count"):
+                        kw["fetch_count"] *= 3
+                    kept = [r for r in vector_store.search(**kw) if not _result_excluded(r, is_excluded)]
+                    return kept[: kw["top_k"] // 3]
             if is_bulk:
                 vector_results, bulk_vector = split_vector_candidates(
                     vector_search(

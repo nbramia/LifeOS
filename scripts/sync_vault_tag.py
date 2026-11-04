@@ -35,6 +35,11 @@ def _excluded(rel: Path) -> bool:
     from api.services.vault_listing import in_underscore_dir
 
     rel_s = rel.as_posix()
+    from api.services.index_exclusion import matches_exclude_globs
+    from config.settings import settings
+
+    if matches_exclude_globs(rel_s, settings.vault_index_exclude_globs):
+        return True
     return in_underscore_dir(rel) or any(rel_s == d or rel_s.startswith(d + "/") for d in EXCLUDED_DIRS)
 
 

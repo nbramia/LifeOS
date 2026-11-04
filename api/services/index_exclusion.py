@@ -15,7 +15,9 @@ from config.settings import settings
 
 
 def _glob_to_regex(glob: str) -> re.Pattern:
-    glob = glob.strip().replace("\\", "/").lstrip("/")
+    glob = glob.strip().replace("\\", "/")
+    while glob.startswith(("./", "/")):
+        glob = glob[2:] if glob.startswith("./") else glob[1:]
     out = []
     i = 0
     while i < len(glob):
@@ -46,7 +48,7 @@ def matches_exclude_globs(rel_path: str, globs: Iterable[str]) -> bool:
     """Whether a vault-relative POSIX path (or chunk id tail) matches any glob."""
     patterns = _compile(tuple(globs))
     rel = str(rel_path).replace("\\", "/")
-    return any(p.match(rel) for p in patterns)
+    return any(p.fullmatch(rel) for p in patterns)
 
 
 def index_exclude_matcher() -> Optional[Callable[[str], bool]]:
@@ -65,6 +67,10 @@ def index_exclude_matcher() -> Optional[Callable[[str], bool]]:
         rel = vault_relative_path(path, root)
         if rel is None:
             rel = vault_relative_path(path, Path(settings.vault_path))
-        return rel is not None and matches_exclude_globs(rel, globs)
+        if rel is None:
+            return False
+        # Chunk ids (``{path}_{n}``, ``{path}::{n}``, ``{path}::summary``) match as their file.
+        base = re.sub(r"(?:::(?:\d+|summary)|_\d+)$", "", rel)
+        return matches_exclude_globs(rel, globs) or matches_exclude_globs(base, globs)
 
     return excluded
