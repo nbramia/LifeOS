@@ -9,7 +9,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated
 
-import frontmatter
 from dotenv import dotenv_values
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from pydantic import Field, field_validator
@@ -127,6 +126,8 @@ def _parse_persona(text: str, name: str = "") -> "tuple[str, tuple[str, ...], st
     persona may contain literal ``{...}`` examples. ``voice``/``model`` are parsed
     for the orchestrator to consume later; they are inert here.
     """
+    import frontmatter  # lazy: the MCP bridge venv imports this module without python-frontmatter
+
     try:
         post = frontmatter.loads(text)
     except Exception as e:  # noqa: BLE001 — a malformed persona file must not take down
