@@ -151,6 +151,10 @@ def scan_notes(root: Path, folder: Path, glob: str = DEFAULT_GLOB) -> list[dict]
     outside the vault (symlink escapes) are dropped. Ties on mtime break on
     relative path so the order is stable.
     """
+    from api.services.index_exclusion import matches_exclude_globs
+    from config.settings import settings
+
+    exclude_globs = settings.vault_index_exclude_globs
     found = []
     try:
         matches = list(folder.glob(glob))
@@ -164,7 +168,7 @@ def scan_notes(root: Path, folder: Path, glob: str = DEFAULT_GLOB) -> list[dict]
                 continue
             p.resolve().relative_to(root)
             rel = p.relative_to(root)
-            if is_hidden(rel.parts):
+            if is_hidden(rel.parts) or matches_exclude_globs(rel.as_posix(), exclude_globs):
                 continue
             mtime = p.stat().st_mtime
         except (OSError, ValueError):

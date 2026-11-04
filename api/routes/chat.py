@@ -138,6 +138,13 @@ async def _fetch_vault(query: str, top_k: int, date_filter: str | None = None) -
                 chunks = hybrid_search.search(query=query, top_k=top_k)
         else:
             chunks = hybrid_search.search(query=query, top_k=top_k)
+        from api.services.index_exclusion import index_exclude_matcher
+        is_excluded = index_exclude_matcher()
+        if is_excluded:
+            chunks = [
+                c for c in chunks
+                if not is_excluded(c.get("file_path") or (c.get("metadata") or {}).get("file_path") or c.get("id") or "")
+            ]
         return chunks
     except Exception as e:
         logger.warning(f"Vault search error: {e}")

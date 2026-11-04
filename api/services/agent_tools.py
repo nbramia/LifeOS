@@ -3929,7 +3929,12 @@ def _tool_read_vault_file(inp: dict) -> str:
         target = target[:-3]  # name without extension
 
     # Try exact match first, then case-insensitive, then substring
-    candidates = list(vault.rglob("*.md"))
+    from api.services.index_exclusion import matches_exclude_globs
+    exclude_globs = settings.vault_index_exclude_globs
+    candidates = [
+        f for f in vault.rglob("*.md")
+        if not matches_exclude_globs(f.relative_to(vault).as_posix(), exclude_globs)
+    ]
     match = None
     for f in candidates:
         if f.name == target_md:

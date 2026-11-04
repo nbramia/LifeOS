@@ -31,6 +31,7 @@ from typing import Callable, Optional, TYPE_CHECKING
 
 from config.settings import settings
 from api.services.bm25_index import file_path_of_doc_id
+from api.services.index_exclusion import index_exclude_matcher
 from api.services.bulk_content import bulk_path_matcher
 from api.services.query_classifier import classify_query
 from api.services.perf_trace import trace_span
@@ -262,6 +263,11 @@ def calculate_recency_boost(date_str: Optional[str], max_boost: float = 0.5) -> 
 
     except (ValueError, TypeError):
         return 0.0
+
+
+def _result_excluded(result: dict, is_excluded) -> bool:
+    path = result.get("file_path") or (result.get("metadata") or {}).get("file_path") or result.get("id") or ""
+    return bool(path) and is_excluded(path)
 
 
 def _result_date(result: dict) -> Optional[str]:
@@ -560,6 +566,8 @@ class HybridSearch:
         # Bulk chunks compete only among themselves. Facets that leave nothing but
         # bulk files have asked for them, so those files rank as usual.
         is_bulk = bulk_path_matcher()
+        # Excluded paths never surface, even when an earlier index run left chunks behind.
+        is_excluded = index_exclude_matcher()
         if is_bulk and include_bulk and allowed_paths is not None and all(map(is_bulk, allowed_paths)):
             is_bulk = None
         bulk_vector: list[dict] = []
@@ -571,16 +579,20 @@ class HybridSearch:
             vector_kwargs = dict(date_kwargs)
             if allowed_paths is not None:
                 vector_kwargs["file_paths"] = sorted(allowed_paths)
+            vector_search = vector_store.search
+            if is_excluded:
+                def vector_search(**kw):
+                    return [r for r in vector_store.search(**kw) if not _result_excluded(r, is_excluded)]
             if is_bulk:
                 vector_results, bulk_vector = split_vector_candidates(
-                    vector_store.search(
+                    vector_search(
                         query=expanded_query, top_k=BULK_VECTOR_FETCH, fetch_count=BULK_VECTOR_FETCH, **vector_kwargs
                     ),
                     is_bulk,
                     fetch_k,
                 )
             else:
-                vector_results = vector_store.search(
+                vector_results = vector_search(
                     query=expanded_query, top_k=fetch_k, **vector_kwargs
                 )
 
@@ -608,12 +620,16 @@ class HybridSearch:
             if bm25_index:
                 try:
                     if is_bulk:
-                        arm_kwargs["doc_filter"] = lambda doc_id: not is_bulk(doc_id)
+                        arm_kwargs["doc_filter"] = lambda doc_id: not is_bulk(doc_id) and not (is_excluded and is_excluded(doc_id))
+                    elif is_excluded:
+                        arm_kwargs["doc_filter"] = lambda doc_id: not is_excluded(doc_id)
                     bm25_results = bm25_index.search(expanded_query, limit=fetch_k, **arm_kwargs)
                     ordinary_has_exact_match = any(r.get("match_mode") == "and" for r in bm25_results)
                     # A bulk keyword hit could neither lead nor fill a slot here.
                     if is_bulk and include_bulk and not (ordinary_has_exact_match and len(bm25_results) >= top_k):
-                        arm_kwargs["doc_filter"] = is_bulk
+                        arm_kwargs["doc_filter"] = (
+                            (lambda doc_id: is_bulk(doc_id) and not is_excluded(doc_id)) if is_excluded else is_bulk
+                        )
                         bulk_keyword = bm25_index.search(expanded_query, limit=top_k, **arm_kwargs)
                     if bm25_results:
                         bm25_match_mode = dict(

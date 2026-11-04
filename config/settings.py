@@ -1605,6 +1605,11 @@ class Settings(BaseSettings):
         """Bulk-content folders from LIFEOS_VAULT_NO_PEOPLE_PATHS."""
         return [p.strip() for p in (self.vault_no_people_paths_raw or "").split(",") if p.strip()]
 
+    @property
+    def vault_index_exclude_globs(self) -> list[str]:
+        """Globs from LIFEOS_VAULT_INDEX_EXCLUDE_GLOBS."""
+        return [p.strip() for p in (self.vault_index_exclude_globs_raw or "").split(",") if p.strip()]
+
     def is_sync_enabled(self, account: str, service: str) -> bool:
         """Check if sync is enabled for account+service (gmail/calendar)."""
         if account == "work":
@@ -1682,6 +1687,13 @@ class Settings(BaseSettings):
         alias="LIFEOS_VAULT_NO_PEOPLE_PATHS",
         description="Comma-separated vault-relative folders of bulk content. Notes under them stay "
                     "searchable but create no people, links, interactions, or source entities.",
+    )
+
+    vault_index_exclude_globs_raw: str = Field(
+        default="Work/ML/Personas/**,Personal/Personas/**,**/_system/**",
+        alias="LIFEOS_VAULT_INDEX_EXCLUDE_GLOBS",
+        description="Comma-separated vault-relative globs kept out of the index and out of vault search. "
+                    "Files already indexed under them are removed at the next index run.",
     )
 
     # Fitness
