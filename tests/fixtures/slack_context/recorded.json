@@ -1,0 +1,47 @@
+{
+  "_comment": "Synthetic Slack Web API responses in the recorded shape, keyed by method then cursor ('' = first page). No real people, channels or text.",
+  "conversations.replies": {
+    "": {
+      "ok": true,
+      "messages": [
+        {"type": "message", "ts": "1767225600.000100", "thread_ts": "1767225600.000100", "user": "U0TESTAAA1", "text": "Synthetic question: does the widget ship Friday?", "reply_count": 4},
+        {"type": "message", "ts": "1767225660.000200", "thread_ts": "1767225600.000100", "user": "U0OUTSIDER", "text": "Synthetic reply from someone outside any roster"},
+        {"type": "message", "subtype": "bot_message", "ts": "1767225720.000300", "thread_ts": "1767225600.000100", "bot_id": "B0TESTBOT1", "text": "Synthetic bot notice"}
+      ],
+      "has_more": true,
+      "response_metadata": {"next_cursor": "page2"}
+    },
+    "page2": {
+      "ok": true,
+      "messages": [
+        {"type": "message", "subtype": "channel_join", "ts": "1767225750.000350", "user": "U0TESTJOIN", "text": "<@U0TESTJOIN> has joined the channel"},
+        {"type": "message", "ts": "1767225780.000400", "thread_ts": "1767225600.000100", "user": "U0TESTSUBJ", "text": "Synthetic answer: yes, Friday."},
+        {"type": "message", "subtype": "thread_broadcast", "ts": "1767225840.000500", "thread_ts": "1767225600.000100", "user": "U0TESTAAA1", "text": "Synthetic broadcast reply"}
+      ],
+      "has_more": false,
+      "response_metadata": {"next_cursor": ""}
+    }
+  },
+  "conversations.history": {
+    "": {
+      "ok": true,
+      "messages": [
+        {"type": "message", "ts": "1767225500.000900", "user": "U0TESTAAA1", "text": "Synthetic message five"},
+        {"type": "message", "subtype": "channel_join", "ts": "1767225400.000800", "user": "U0TESTJOIN", "text": "<@U0TESTJOIN> has joined the channel"},
+        {"type": "message", "subtype": "bot_message", "ts": "1767225300.000700", "bot_id": "B0TESTBOT1", "text": "Synthetic message four (bot)"},
+        {"type": "message", "ts": "1767225200.000600", "user": "U0OUTSIDER", "text": "Synthetic message three"}
+      ],
+      "has_more": true,
+      "response_metadata": {"next_cursor": "hist2"}
+    },
+    "hist2": {
+      "ok": true,
+      "messages": [
+        {"type": "message", "ts": "1767225100.000500", "user": "U0TESTSUBJ", "text": "Synthetic message two"},
+        {"type": "message", "ts": "1767225000.000400", "user": "U0TESTAAA1", "text": "Synthetic message one"}
+      ],
+      "has_more": false,
+      "response_metadata": {"next_cursor": ""}
+    }
+  }
+}

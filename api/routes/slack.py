@@ -117,7 +117,84 @@ class SlackMyMessagesResponse(BaseModel):
     messages: list[SlackDayMessage]
 
 
+class SlackContextMessage(BaseModel):
+    """One message from the thread or channel-context endpoint."""
+    ts: str
+    user: str  # Slack user id, or the bot_id for a bot message
+    bot_id: Optional[str] = None
+    text: str
+    thread_ts: Optional[str] = None
+    subtype: Optional[str] = None
+
+
+class SlackThreadResponse(BaseModel):
+    """Response for GET /api/slack/thread."""
+    channel: str
+    ts: str
+    total: int
+    truncated: bool = False
+    messages: list[SlackContextMessage]
+
+
+class SlackContextResponse(BaseModel):
+    """Response for GET /api/slack/context."""
+    channel: str
+    ts: str
+    before: int
+    total: int
+    messages: list[SlackContextMessage]
+
+
 # Helper Functions
+
+
+_CHANNEL_ID_RE = re.compile(r"[CDG][A-Z0-9]{2,}")
+_TS_RE = re.compile(r"\d{1,12}\.\d{1,8}")
+
+# Slack errors meaning the token can't see the channel or thread. They map
+# to 404 with a fixed message so no Slack content reaches the caller.
+_NOT_VISIBLE_ERRORS = frozenset({
+    "channel_not_found",
+    "not_in_channel",
+    "thread_not_found",
+    "access_denied",
+    "is_archived",
+})
+
+
+def _validate_channel_and_ts(channel: str, ts: str) -> None:
+    """400 unless channel is a Slack conversation id and ts a message ts."""
+    if not _CHANNEL_ID_RE.fullmatch(channel):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid channel — expected a Slack conversation ID",
+        )
+    if not _TS_RE.fullmatch(ts):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid ts — expected a Slack message timestamp",
+        )
+
+
+def _context_http_error(e: SlackAPIError) -> HTTPException:
+    """Map a Slack error from the thread/context endpoints to an HTTP error."""
+    error = str(e)
+    if error in _NOT_VISIBLE_ERRORS:
+        return HTTPException(
+            status_code=404,
+            detail="Channel or thread not visible to this token",
+        )
+    if error in ("missing_scope", "not_allowed_token_type"):
+        return HTTPException(
+            status_code=403,
+            detail=(
+                "Slack token lacks a history scope (channels:history, "
+                "groups:history, im:history or mpim:history)"
+            ),
+        )
+    if error == "Rate limit exceeded after retries":
+        return HTTPException(status_code=503, detail="Slack rate limit exceeded")
+    return HTTPException(status_code=502, detail=f"Slack API error: {error}")
 
 
 def _require_slack_enabled():
@@ -478,6 +555,73 @@ async def get_my_messages_for_day(
         truncated=result["truncated"],
         total_available=result["total_available"],
         messages=messages,
+    )
+
+
+@router.get("/thread", response_model=SlackThreadResponse)
+async def get_thread(
+    channel: str = Query(..., description="Slack conversation ID"),
+    ts: str = Query(..., description="The thread parent's ts (thread_ts)"),
+):
+    """
+    **Every message in a Slack thread**, parent first, oldest to newest.
+
+    Live `conversations.replies` with the operator's user token, paged to the
+    end. Messages from any author are returned, including bots and people
+    LifeOS doesn't know. `user` is the Slack user id, or the `bot_id` for a
+    bot message. Channel join/leave/topic noise is dropped.
+
+    404 when the token can't see the channel or thread.
+    """
+    _require_slack_enabled()
+    _validate_channel_and_ts(channel, ts)
+
+    client = get_slack_client()
+    try:
+        messages, truncated = client.get_thread_messages(channel, ts)
+    except SlackAPIError as e:
+        raise _context_http_error(e)
+
+    return SlackThreadResponse(
+        channel=channel,
+        ts=ts,
+        total=len(messages),
+        truncated=truncated,
+        messages=[SlackContextMessage(**m) for m in messages],
+    )
+
+
+@router.get("/context", response_model=SlackContextResponse)
+async def get_channel_context(
+    channel: str = Query(..., description="Slack conversation ID"),
+    ts: str = Query(..., description="Return messages strictly before this ts"),
+    before: int = Query(10, ge=1, le=50, description="Max messages to return"),
+):
+    """
+    **Up to `before` top-level channel messages strictly before `ts`**,
+    oldest first.
+
+    Live `conversations.history` (`latest=ts`, `inclusive=false`) with the
+    operator's user token. Same message shape as `/thread`. Channel
+    join/leave/topic noise is dropped and doesn't count toward `before`.
+
+    404 when the token can't see the channel.
+    """
+    _require_slack_enabled()
+    _validate_channel_and_ts(channel, ts)
+
+    client = get_slack_client()
+    try:
+        messages = client.get_messages_before(channel, ts, before)
+    except SlackAPIError as e:
+        raise _context_http_error(e)
+
+    return SlackContextResponse(
+        channel=channel,
+        ts=ts,
+        before=before,
+        total=len(messages),
+        messages=[SlackContextMessage(**m) for m in messages],
     )
 
 

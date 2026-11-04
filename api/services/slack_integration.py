@@ -350,7 +350,10 @@ class SlackClient:
                 headers={"Authorization": f"Bearer {token}"},
                 json=kwargs if kwargs else None,
             )
-            data = response.json()
+            if response.status_code == 429:
+                data = {"ok": False, "error": "ratelimited"}
+            else:
+                data = response.json()
 
             if data.get("ok"):
                 return data
@@ -704,6 +707,120 @@ class SlackClient:
                 break
 
         return replies
+
+    @staticmethod
+    def _context_fields(msg: dict) -> dict:
+        """The fields the thread and context endpoints return for one message.
+
+        ``user`` falls back to ``bot_id`` so every message carries an author
+        id; ``bot_id`` is kept so a consumer can tell a bot from a person.
+        """
+        return {
+            "ts": msg.get("ts", ""),
+            "user": msg.get("user") or msg.get("bot_id") or "",
+            "bot_id": msg.get("bot_id"),
+            "text": msg.get("text", ""),
+            "thread_ts": msg.get("thread_ts"),
+            "subtype": msg.get("subtype"),
+        }
+
+    def get_thread_messages(
+        self,
+        channel_id: str,
+        thread_ts: str,
+        workspace_id: str = "default",
+        max_messages: int = 5000,
+    ) -> tuple[list[dict], bool]:
+        """
+        Every message in a thread, parent included, oldest first.
+
+        Pages ``conversations.replies`` to the end. Bot messages and messages
+        from any author are kept; only channel membership/metadata noise
+        (``NOISE_MESSAGE_SUBTYPES``) is dropped.
+
+        Returns:
+            (messages, truncated) where truncated means ``max_messages`` was
+            reached before the last page.
+        """
+        messages: list[dict] = []
+        cursor = None
+        truncated = False
+
+        while True:
+            params = {"channel": channel_id, "ts": thread_ts, "limit": 200}
+            if cursor:
+                params["cursor"] = cursor
+            data = self._api_call(
+                "conversations.replies", workspace_id, max_retries=5, **params
+            )
+            for msg in data.get("messages", []):
+                if msg.get("type") != "message":
+                    continue
+                if msg.get("subtype") in NOISE_MESSAGE_SUBTYPES:
+                    continue
+                messages.append(self._context_fields(msg))
+
+            cursor = data.get("response_metadata", {}).get("next_cursor")
+            if not cursor:
+                break
+            if len(messages) >= max_messages:
+                truncated = True
+                break
+
+        messages.sort(key=lambda m: float(m["ts"]))
+        if len(messages) > max_messages:
+            messages = messages[:max_messages]
+            truncated = True
+        return messages, truncated
+
+    def get_messages_before(
+        self,
+        channel_id: str,
+        ts: str,
+        before: int,
+        workspace_id: str = "default",
+        max_pages: int = 3,
+    ) -> list[dict]:
+        """
+        Up to ``before`` top-level channel messages strictly before ``ts``,
+        oldest first.
+
+        Uses ``conversations.history`` with ``latest=ts, inclusive=false``.
+        Channel membership/metadata noise is dropped, and up to ``max_pages``
+        pages are read so noise doesn't crowd out real messages.
+        """
+        cutoff = float(ts)
+        collected: list[dict] = []
+        cursor = None
+
+        for _ in range(max_pages):
+            params = {
+                "channel": channel_id,
+                "latest": ts,
+                "inclusive": False,
+                "limit": before,
+            }
+            if cursor:
+                params["cursor"] = cursor
+            data = self._api_call("conversations.history", workspace_id, **params)
+            for msg in data.get("messages", []):
+                if msg.get("type") != "message":
+                    continue
+                if msg.get("subtype") in NOISE_MESSAGE_SUBTYPES:
+                    continue
+                try:
+                    if float(msg.get("ts", "")) >= cutoff:
+                        continue
+                except ValueError:
+                    continue
+                collected.append(self._context_fields(msg))
+
+            cursor = data.get("response_metadata", {}).get("next_cursor")
+            if len(collected) >= before or not cursor:
+                break
+
+        collected.sort(key=lambda m: float(m["ts"]))
+        return collected[-before:]
 
     def auth_test(self, workspace_id: str = "default") -> dict:
         """
