@@ -365,6 +365,25 @@ def sync_calendar_to_v2(
     return stats
 
 
+def _norm_linkedin_url(url: str) -> str:
+    return url.split("?")[0].rstrip("/").lower()
+
+
+def _urls_scraped_after_export(csv_file) -> set[str]:
+    """Normalized URLs of scraped profiles (linkedin_extracted.json beside the
+    export) whose scraped_at is newer than the export file's modification time."""
+    exported = datetime.fromtimestamp(csv_file.stat().st_mtime, timezone.utc)
+    try:
+        profiles = json.loads(csv_file.with_name("linkedin_extracted.json").read_text())["profiles"]
+        return {
+            _norm_linkedin_url(p["linkedin_url"])
+            for p in profiles
+            if _make_aware(datetime.fromisoformat(p["scraped_at"].replace("Z", "+00:00"))) > exported
+        }
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return set()
+
+
 def sync_linkedin_to_v2(
     csv_path: str,
     entity_resolver: EntityResolver = None,
@@ -403,6 +422,7 @@ def sync_linkedin_to_v2(
 
     try:
         connections = load_linkedin_connections(csv_path)
+        newer_profiles = _urls_scraped_after_export(csv_file)
         logger.info(f"LinkedIn v2 sync: found {len(connections)} connections to process")
 
         for conn in connections:
@@ -415,13 +435,14 @@ def sync_linkedin_to_v2(
                 stats["connections_skipped"] += 1
                 continue
 
-            # Use resolve_from_linkedin for proper entity resolution
+            # A profile scraped after the export holds newer job data than the export row.
+            keep_stored_job = _norm_linkedin_url(conn.get("linkedin_url") or "") in newer_profiles
             result = resolver.resolve_from_linkedin(
                 first_name=first_name,
                 last_name=last_name,
                 email=conn.get("email") or None,
-                company=conn.get("company") or None,
-                position=conn.get("position") or None,
+                company=None if keep_stored_job else conn.get("company") or None,
+                position=None if keep_stored_job else conn.get("position") or None,
                 linkedin_url=conn.get("linkedin_url") or None,
             )
 
