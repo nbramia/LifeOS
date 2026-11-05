@@ -1,17 +1,18 @@
 """
 Tests for ChromaDB vector store integration.
 
-Requires ChromaDB server running on localhost:8001.
-Uses a separate test collection to avoid polluting production data.
+Runs against an in-process ChromaDB client, so no server is involved. The real
+embedding model is used, so search relevance is exercised for real.
 
 NOTE: Imports are deferred to avoid loading heavy dependencies (ChromaDB,
 sentence-transformers) during pytest collection, which would slow down unit tests.
 """
+import uuid
 from datetime import datetime
 
 import pytest
 
-# These tests require ChromaDB server (slow)
+# These tests load the real embedding model (slow)
 pytestmark = pytest.mark.slow
 
 
@@ -20,26 +21,23 @@ class TestVectorStore:
 
     @pytest.fixture
     def vector_store(self):
-        """Create vector store instance with test collection."""
+        """Create a vector store backed by an in-process client with a throwaway collection."""
+        import chromadb
+
+        from api.services.embeddings import get_embedding_service
         from api.services.vectorstore import VectorStore
 
-        # Use a test collection name to avoid polluting production data
-        store = VectorStore(collection_name="lifeos_vault_test")
-        # Clear any existing test data
-        try:
-            store._client.delete_collection("lifeos_vault_test")
-            store._collection = store._client.get_or_create_collection(
-                name="lifeos_vault_test",
-                metadata={"hnsw:space": "cosine"}
-            )
-        except Exception:
-            pass
+        name = f"synthetic-vectorstore-{uuid.uuid4().hex}"
+        client = chromadb.EphemeralClient()
+        store = VectorStore.__new__(VectorStore)
+        store.collection_name = name
+        store._client = client
+        store._collection = client.get_or_create_collection(
+            name=name, metadata={"hnsw:space": "cosine"}
+        )
+        store._embedding_service = get_embedding_service()
         yield store
-        # Cleanup: delete test collection
-        try:
-            store._client.delete_collection("lifeos_vault_test")
-        except Exception:
-            pass
+        client.delete_collection(name)
 
     def test_add_document_chunks(self, vector_store):
         """Should add document chunks to the store."""
