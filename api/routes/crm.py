@@ -293,6 +293,7 @@ class TimelineItem(BaseModel):
     snippet: Optional[str] = None
     source_link: str = ""
     source_badge: str = ""
+    source_id: Optional[str] = None
 
 
 class TimelineResponse(BaseModel):
@@ -1788,6 +1789,7 @@ def get_person_timeline(
                 snippet=i.snippet,
                 source_link=i.source_link or "",  # Handle None values
                 source_badge=i.source_badge or "",  # Handle None values
+                source_id=i.source_id,
             )
             for i in interactions
         ],
@@ -3508,6 +3510,7 @@ def get_me_timeline(
                 snippet=i.snippet,
                 source_link=i.source_link or "",  # Handle None values
                 source_badge=i.source_badge or "",  # Handle None values
+                source_id=i.source_id,
             )
             for i in interactions
         ],

@@ -11535,6 +11535,15 @@
             return Math.max(1, Math.min(10, yearsNeeded));
         }
 
+        // Timeline tag text. Google Messages rows are stored as 'imessage' so the
+        // message pipelines include them; their source_id prefix tells them apart.
+        function timelineSourceLabel(item) {
+            if (item.source_type === 'imessage' && (item.source_id || '').startsWith('gmessages_')) {
+                return 'Google Messages';
+            }
+            return item.source_type || 'Unknown';
+        }
+
         // Source type badges mapping
         const SOURCE_BADGES = {
             'imessage': { badge: String.fromCodePoint(0x1F4AC), label: 'iMessages' },
@@ -16773,7 +16782,7 @@
                         ${snippet && !isDuplicate ? `<div class="timeline-snippet">${escapeHtml(snippet)}</div>` : ''}
                         <div class="timeline-meta">
                             ${formatDate(item.timestamp)}
-                            <span class="timeline-source-badge">${escapeHtml(item.source_type || 'Unknown')}</span>
+                            <span class="timeline-source-badge">${escapeHtml(timelineSourceLabel(item))}</span>
                         </div>
                     </div>
                 </div>
