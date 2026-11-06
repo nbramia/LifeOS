@@ -162,6 +162,15 @@ _NOT_VISIBLE_ERRORS = frozenset({
 })
 
 
+# Slack errors that mean the request itself was bad, not that Slack is down.
+_BAD_REQUEST_ERRORS = frozenset({
+    "invalid_arguments",
+    "invalid_cursor",
+    "invalid_ts_latest",
+    "invalid_ts_oldest",
+})
+
+
 def _validate_channel_and_ts(channel: str, ts: str) -> None:
     """400 unless channel is a Slack conversation id and ts a message ts."""
     if not _CHANNEL_ID_RE.fullmatch(channel):
@@ -192,6 +201,8 @@ def _context_http_error(e: SlackAPIError) -> HTTPException:
                 "groups:history, im:history or mpim:history)"
             ),
         )
+    if error in _BAD_REQUEST_ERRORS:
+        return HTTPException(status_code=400, detail=f"Slack rejected the request: {error}")
     if error == "Rate limit exceeded after retries":
         return HTTPException(status_code=503, detail="Slack rate limit exceeded")
     return HTTPException(status_code=502, detail=f"Slack API error: {error}")
