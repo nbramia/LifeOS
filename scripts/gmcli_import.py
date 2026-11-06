@@ -315,8 +315,12 @@ def import_gmcli(store_dir: Path, dry_run: bool = True, min_messages: int = 1,
 
         confidence = 1.0 if method in ("phone_exact", "created") else 0.9
         if valid_name(name):
+            # observed_at is the number's latest message time, not import time:
+            # person last_seen takes the newest of these, so import time would
+            # make every imported contact look seen today.
             contact, _ = source_store.add_or_update(create_contacts_source_entity(
                 contact_id=f"gmcli_{e164}", name=name, phone=e164,
+                observed_at=last_seen.get(e164),
                 metadata={"origin": "google_messages"},
             ))
             source_store.link_to_person(
