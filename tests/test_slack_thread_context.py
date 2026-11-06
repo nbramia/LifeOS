@@ -8,6 +8,7 @@ no live Slack calls.
 """
 import json
 from pathlib import Path
+from urllib.parse import parse_qsl
 from unittest.mock import patch
 
 import httpx
@@ -32,7 +33,13 @@ class RecordedSlack:
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         method = request.url.path.rsplit("/", 1)[-1]
-        params = json.loads(request.content or b"{}")
+        # Like real Slack, conversations.replies rejects a JSON body.
+        if request.headers.get("content-type", "").startswith("application/json"):
+            if method == "conversations.replies":
+                return httpx.Response(200, json={"ok": False, "error": "invalid_arguments"})
+            params = json.loads(request.content or b"{}")
+        else:
+            params = dict(parse_qsl(request.content.decode()))
         self.calls.append((method, params))
         queued = self.failures.get(method)
         if queued:
@@ -48,13 +55,13 @@ class RecordedSlack:
         recorded = self.recorded["conversations.history"]
         msgs = [m for page in recorded.values() for m in page["messages"]]
         latest = float(params["latest"])
-        inclusive = params.get("inclusive", False)
+        inclusive = params.get("inclusive") == "true"
         msgs = [
             m for m in msgs
             if float(m["ts"]) < latest or (inclusive and float(m["ts"]) == latest)
         ]
         offset = int(params.get("cursor", "0"))
-        limit = params.get("limit", 100)
+        limit = int(params.get("limit", 100))
         page = msgs[offset: offset + limit]
         more = offset + limit < len(msgs)
         return {
@@ -171,7 +178,7 @@ class TestSlackContext:
         assert data["total"] == 4
         params = [p for m, p in slack.calls if m == "conversations.history"][0]
         assert params["latest"] == ts
-        assert params["inclusive"] is False
+        assert params["inclusive"] == "false"  # form-encoded on the wire
 
     def test_at_most_before_messages_keeps_the_latest(self, api):
         response, _ = _run(
@@ -265,6 +272,33 @@ class TestSlackThreadContextErrors:
         })
         response, _ = _run(api, url, slack, channel=CHANNEL, ts=THREAD_TS, **extra)
         assert response.status_code == 403
+
+    @pytest.mark.parametrize("url,method,extra", ENDPOINTS)
+    @pytest.mark.parametrize("error", ["invalid_arguments", "invalid_cursor"])
+    def test_slack_client_errors_are_400(self, api, url, method, extra, error):
+        slack = RecordedSlack(failures={
+            method: [httpx.Response(200, json={"ok": False, "error": error})],
+        })
+        response, _ = _run(api, url, slack, channel=CHANNEL, ts=THREAD_TS, **extra)
+        assert response.status_code == 400
+        assert response.json() == {"detail": f"Slack rejected the request: {error}"}
+
+    @pytest.mark.parametrize("url,method,extra", ENDPOINTS)
+    def test_arguments_are_sent_form_encoded(self, api, url, method, extra):
+        slack = RecordedSlack()
+        seen = []
+        handler = slack.handler
+
+        def spy(request):
+            seen.append(request.headers.get("content-type", ""))
+            return handler(request)
+
+        slack.handler = spy
+        response, _ = _run(api, url, slack, channel=CHANNEL, ts=THREAD_TS, **extra)
+        assert response.status_code == 200
+        assert seen and all(
+            ct.startswith("application/x-www-form-urlencoded") for ct in seen
+        )
 
     @pytest.mark.parametrize("url,_method,extra", ENDPOINTS)
     @pytest.mark.parametrize("channel,ts", [

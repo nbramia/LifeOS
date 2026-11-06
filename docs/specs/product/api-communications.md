@@ -502,7 +502,7 @@ Up to `before` top-level messages in a channel strictly before `ts`, oldest firs
 
 **Response:** `{"channel", "ts", "before", "total", "messages": [...]}`.
 
-**Errors (both endpoints):** 400 for a malformed `channel` or `ts`; 404 `Channel or thread not visible to this token` when Slack reports the channel or thread missing or inaccessible (no Slack content is returned); 403 when the token lacks a `*:history` scope; 503 when Slack still rate-limits after retries (each 429 is retried after its `Retry-After`); 502 for any other Slack failure, naming the Slack error code only.
+**Errors (both endpoints):** 400 for a malformed `channel` or `ts`, or when Slack rejects the request itself (`invalid_arguments`, `invalid_cursor`, `invalid_ts_latest`, `invalid_ts_oldest`; detail `Slack rejected the request: <code>`); 404 `Channel or thread not visible to this token` when Slack reports the channel or thread missing or inaccessible (no Slack content is returned); 403 when the token lacks a `*:history` scope; 503 when Slack still rate-limits after retries (each 429 is retried after its `Retry-After`); 502 for any other Slack failure, naming the Slack error code only.
 
 ### GET /api/slack/conversations
 

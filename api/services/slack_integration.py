@@ -344,11 +344,19 @@ class SlackClient:
 
         retry_delay = 2  # Start with 2 seconds
 
+        # Form-encode the arguments. Slack's read methods don't all accept a
+        # JSON body: conversations.replies answers ``invalid_arguments`` to
+        # one, so JSON only worked by luck for conversations.history.
+        form = {
+            key: ("true" if value else "false") if isinstance(value, bool) else str(value)
+            for key, value in kwargs.items()
+        }
+
         for attempt in range(max_retries + 1):
             response = self.http_client.post(
                 f"{self.BASE_URL}/{method}",
                 headers={"Authorization": f"Bearer {token}"},
-                json=kwargs if kwargs else None,
+                data=form or None,
             )
             if response.status_code == 429:
                 data = {"ok": False, "error": "ratelimited"}
