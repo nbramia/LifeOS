@@ -661,17 +661,21 @@ class GSheetSyncService:
     def _sync_dailies_db(self, fetch_rows=None) -> dict:
         """Sync the Dailies database source into journal notes.
 
-        A note is rewritten only when its row's `updated_at` changed since
-        the last sync (tracked in `synced_rows` by a hash of date and update
-        time). A missing credential, an unreachable database or a table
-        holding more than one member's entries skips the source and logs a
-        fixed category, leaving every note untouched.
+        Only rows written in Home are synced (`dailies_db.is_home_authored`);
+        imported, unedited rows leave the existing note as it is. A row's
+        note is left alone when its hash of date and `updated_at` is both
+        recorded in `synced_rows` and present in the note on disk, and is
+        rewritten otherwise, so a sheet rewrite of the same date is replaced.
+        A missing credential, an unreachable database or a table holding
+        more than one member's entries skips the source and logs a fixed
+        category, leaving every note untouched. Failed note writes are
+        counted in `failed`.
         """
         from api.services import dailies_db
 
         def skipped(reason: str) -> dict:
             logger.warning(f"Dailies database source skipped: {reason}")
-            return {"status": "skipped", "reason": reason, "new_rows": 0, "skipped_rows": 0}
+            return {"status": "skipped", "reason": reason, "new_rows": 0, "skipped_rows": 0, "failed": 0}
 
         dsn = settings.dailies_database_url
         if not dsn:
@@ -684,21 +688,35 @@ class GSheetSyncService:
             return skipped("dailies_db_multiple_members")
 
         config = dailies_db.SHEET_CONFIG
-        written = unchanged = 0
+        written = unchanged = failed = 0
         for row in rows:
-            entry = dailies_db.row_to_entry(row)
-            if entry is None or self._is_row_synced(config.sheet_id, entry.row_hash):
+            entry = dailies_db.row_to_entry(row) if dailies_db.is_home_authored(row) else None
+            if entry is None:
+                unchanged += 1
+                continue
+            path = Path(self.vault_path) / dailies_db.JOURNAL_FOLDER / f"{entry.date_str}.md"
+            try:
+                on_disk = path.exists() and f"row_hash: {entry.row_hash}" in path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                on_disk = False
+            if on_disk and self._is_row_synced(config.sheet_id, entry.row_hash):
                 unchanged += 1
                 continue
             try:
                 self._create_journal_note(entry, config)
             except Exception:
                 logger.error("Dailies database source: journal note write failed")
+                failed += 1
                 continue
             self._mark_row_synced(config.sheet_id, entry)
             written += 1
-        logger.info(f"Dailies database source: {written} notes written, {unchanged} unchanged")
-        return {"status": "success", "new_rows": written, "skipped_rows": unchanged}
+        logger.info(
+            f"Dailies database source: {written} notes written, {unchanged} unchanged, {failed} failed"
+        )
+        return {
+            "status": "failed" if failed else "success",
+            "new_rows": written, "skipped_rows": unchanged, "failed": failed,
+        }
 
     def sync_all(self) -> dict:
         """
@@ -771,8 +789,14 @@ class GSheetSyncService:
             result = self._sync_dailies_db()
             stats["synced"] += result["new_rows"]
             stats["skipped"] += result["skipped_rows"]
+            stats["failed"] += result["failed"]
             stats["dailies_db"] = {k: v for k, v in result.items() if k in ("status", "reason")}
-            if result["status"] == "skipped" and not self.configs:
+            if result["failed"]:
+                # A note that could not be written is a failed run, so a
+                # "clean nightly run" means every note landed.
+                stats["status"] = "error"
+                stats["reason"] = "dailies_db_note_write_failed"
+            elif result["status"] == "skipped" and not self.configs:
                 stats["status"] = "skipped"
                 stats["reason"] = result["reason"]
 

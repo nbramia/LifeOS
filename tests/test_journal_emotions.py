@@ -311,7 +311,7 @@ class TestIterJournalChains:
         svc = GSheetSyncService(vault_path=vault, db_path=str(tmp_path / "state.db"))
 
         def row(day, status, feelings):
-            return {"subject": "synthetic", "entry_date": date(2026, 6, day),
+            return {"subject": "synthetic", "source": "home", "revision": 1, "entry_date": date(2026, 6, day),
                     "updated_at": datetime(2026, 6, day, 12, tzinfo=timezone.utc),
                     "mood": 5, "feeling_status": status, "feelings": feelings}
 

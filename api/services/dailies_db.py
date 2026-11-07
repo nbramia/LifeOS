@@ -19,11 +19,12 @@ from api.services.gsheet_sync import JournalEntry, SheetConfig
 SOURCE_ID = "home_dailies"
 JOURNAL_FOLDER = "Personal/Journal"
 
-# Never selects the internal id, revision, imported raw rows or sheet-mirror
-# state, so none of them can reach a note. `subject` is read only to confirm
-# the table holds a single member's entries; it is never mapped to a field.
+# Never selects the internal id, imported raw rows or sheet-mirror state, so
+# none of them can reach a note. `subject` (to confirm the table holds a
+# single member's entries), `source` and `revision` (see `is_home_authored`)
+# are read for those checks only and never mapped to a field.
 SELECT_SQL = """
-SELECT subject, entry_date, updated_at, connection_taylor, connection_malea,
+SELECT subject, source, revision, entry_date, updated_at, connection_taylor, connection_malea,
        resonant, word, sleep_hours, alcohol, caffeine, food, exercise,
        mood, stress, body, feelings, feeling_status
 FROM home_dailies
@@ -104,6 +105,16 @@ def fetch_rows(dsn: str) -> list[dict]:
     with psycopg.connect(dsn, connect_timeout=15, row_factory=dict_row) as conn:
         conn.read_only = True
         return conn.execute(SELECT_SQL).fetchall()
+
+
+def is_home_authored(row: dict) -> bool:
+    """Whether a row's content was written in Home: saved there (`source`
+    `home`), or imported from the Form and edited in Home since (every save
+    bumps `revision` past its initial 1). An unedited imported row is a
+    lossy reconstruction of a sheet row whose note already exists, so the
+    source leaves that note alone."""
+    revision = row.get("revision")
+    return row.get("source") == "home" or (isinstance(revision, int) and revision > 1)
 
 
 def _valid_paths(feelings) -> list[list[str]]:

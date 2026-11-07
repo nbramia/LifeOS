@@ -150,8 +150,64 @@ class TestFieldMapping:
 
     def test_select_never_reads_internal_columns(self):
         sql = dailies_db.SELECT_SQL.lower()
-        for column in ("id,", " raw", "mirror_", "revision", "logged_at"):
+        for column in ("id,", " raw", "mirror_", "logged_at"):
             assert column not in sql
+
+
+class TestImportedHistory:
+    """Imported Form rows are a lossy reconstruction; only rows written or
+    edited in Home may replace an existing note."""
+
+    def _sheet_note(self, service) -> bytes:
+        path = note_path(service)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("---\ndate: 2030-01-02\nrow_hash: sheetrow\nfeeling: Bad\nbored_feelings: Not sure\n---\n",
+                        encoding="utf-8")
+        return path.read_bytes()
+
+    @pytest.mark.parametrize("source", ["form", "form-old"])
+    def test_unedited_imported_row_leaves_the_note_byte_for_byte(self, service, source):
+        before = self._sheet_note(service)
+        result = sync(service, [make_row(source=source, revision=1)])
+        assert note_path(service).read_bytes() == before
+        assert result["new_rows"] == 0
+
+    def test_unedited_imported_row_writes_no_note_for_a_missing_date(self, service):
+        sync(service, [make_row(source="form", revision=1)])
+        assert not note_path(service).exists()
+
+    def test_imported_row_edited_in_home_is_written(self, service):
+        self._sheet_note(service)
+        result = sync(service, [make_row(source="form", revision=2)])
+        assert result["new_rows"] == 1
+        assert read_fm(service)["feelings"] == ["Bad > Tired > Sleepy"]
+
+    def test_native_home_row_is_written_at_its_first_revision(self, service):
+        result = sync(service, [make_row(source="home", revision=1)])
+        assert result["new_rows"] == 1
+
+
+class TestWriteFailures:
+    def _failing_writer(self, service, monkeypatch):
+        def boom(entry, config):
+            raise OSError("synthetic disk failure")
+
+        monkeypatch.setattr(service, "_create_journal_note", boom)
+
+    def test_failed_write_is_counted_and_marks_the_source_failed(self, service, monkeypatch):
+        self._failing_writer(service, monkeypatch)
+        result = sync(service, [make_row()])
+        assert result["status"] == "failed"
+        assert result["failed"] == 1
+        assert result["new_rows"] == 0
+
+    def test_failed_write_fails_the_run(self, service, monkeypatch):
+        self._failing_writer(service, monkeypatch)
+        monkeypatch.setattr(dailies_db, "fetch_rows", lambda dsn: [make_row()])
+        stats = service.sync_all()
+        assert stats["failed"] == 1
+        assert stats["status"] == "error"
+        assert stats["reason"] == "dailies_db_note_write_failed"
 
 
 class TestFeelings:
@@ -236,13 +292,39 @@ class TestDates:
 
 class TestChangeDetection:
     def test_unchanged_row_does_not_touch_the_file(self, service):
+        import os
+
         rows = [make_row()]
         assert sync(service, rows)["new_rows"] == 1
         path = note_path(service)
-        path.write_text("sentinel", encoding="utf-8")
+        before = path.read_bytes()
+        os.utime(path, (1_000_000_000, 1_000_000_000))
         result = sync(service, rows)
-        assert result == {"status": "success", "new_rows": 0, "skipped_rows": 1}
-        assert path.read_text(encoding="utf-8") == "sentinel"
+        assert result == {"status": "success", "new_rows": 0, "skipped_rows": 1, "failed": 0}
+        assert path.read_bytes() == before
+        assert path.stat().st_mtime == 1_000_000_000
+
+    def test_db_version_replaces_a_sheet_rewrite_of_the_same_date(self, service):
+        # Overlap night: the sheet source rewrites a date the database source
+        # already synced; the next database pass must put its version back.
+        rows = [make_row(feelings=[["Happy", "Proud"], ["Sad"]])]
+        sync(service, rows)
+        sheet_fields = {"Feelings": "Happy", "Happy feelings": "Proud"}
+        sheet_config = SheetConfig(
+            sheet_id="synthetic-sheet", name="Daily Journal", account="personal", range="R",
+            timestamp_column="Timestamp",
+            outputs={"journal_notes": {"enabled": True, "folder": "Personal/Journal"}},
+            field_mappings={"Feelings": "feeling"},
+        )
+        service._create_journal_note(
+            JournalEntry(row_hash="sheet0001", timestamp=datetime(2030, 1, 2), date_str="2030-01-02",
+                         fields=sheet_fields, raw_row=sheet_fields),
+            sheet_config,
+        )
+        assert "feelings" not in read_fm(service)
+        result = sync(service, rows)
+        assert result["new_rows"] == 1
+        assert read_fm(service)["feelings"] == ["Happy > Proud", "Sad"]
 
     def test_sync_state_feeds_trend_taxonomy_with_wheel_branches_only(self, service):
         from api.routes.journal_trends import _derive_taxonomy_labels
