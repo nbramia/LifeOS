@@ -154,7 +154,7 @@ The 7-phase structure ensures correct data flow:
 
 **Note:** Apple data (contacts, phone calls, iMessage, photos, WhatsApp) is exported from an Apple Data Agent (any spare Mac with FDA granted) via `scripts/apple_data_agent.sh` at 2:50 AM, before the main pipeline, and imported on Linux by the `apple_import` source. The export runs on that Mac (which has FDA access) and syncs to the Linux server via rsync. Three sources are macOS-only and report `skipped` (not a failure) when the nightly sync runs on the Linux host: `contacts`, `photos`, `push_birthdays`.
 
-**Unconfigured-source clean skip:** a source with no way to authenticate or nothing set up reports `skipped`, not `failed`, so one missing integration never fails the whole run and never repeats as a nightly error. This covers the macOS-only sources above on a Linux host, plus config-gated sources checked at run time: `gmail_personal`/`calendar_personal` when `config/credentials-personal.json` is absent, `monarch_money` when there's no cached session and `MONARCH_EMAIL`/`MONARCH_PASSWORD` are unset, and `google_sheets` when `config/gsheet_sync.yaml` doesn't exist (the gsheet-journal pipeline was never set up). A source that *is* configured but genuinely fails (bad credentials, network, expired session with no fallback) still records `failed` exactly as before — this only short-circuits the "never configured at all" case.
+**Unconfigured-source clean skip:** a source with no way to authenticate or nothing set up reports `skipped`, not `failed`, so one missing integration never fails the whole run and never repeats as a nightly error. This covers the macOS-only sources above on a Linux host, plus config-gated sources checked at run time: `gmail_personal`/`calendar_personal` when `config/credentials-personal.json` is absent, `monarch_money` when there's no cached session and `MONARCH_EMAIL`/`MONARCH_PASSWORD` are unset, and `google_sheets` when `config/gsheet_sync.yaml` doesn't exist (the gsheet-journal pipeline was never set up) or when its only enabled source, the Dailies database (`dailies_db`), has no `LIFEOS_DAILIES_DATABASE_URL`, can't be reached, or holds more than one Home member's entries (see [journal-analytics.md](../product/journal-analytics.md#data-source)). A source that *is* configured but genuinely fails (bad credentials, network, expired session with no fallback) still records `failed` exactly as before — this only short-circuits the "never configured at all" case.
 
 ### Process Summary
 
@@ -364,7 +364,7 @@ Runs in this order (see [iMessage Sync Ordering](#imessage-sync-ordering) below)
 | Script | Purpose | Data Source |
 |--------|---------|-------------|
 | `sync_google_docs.py` | Sync Google Docs to vault | Google Docs API |
-| `sync_google_sheets.py` | Sync Google Sheets to vault | Google Sheets API |
+| `sync_google_sheets.py` | Sync Google Sheets and the Dailies database to vault | Google Sheets API, Postgres (read-only) |
 | `sync_monarch_money.py` | Sync Monarch Money financial data (monthly, runs on 1st) | Monarch Money API |
 
 ### Phase 6: Post-Sync Cleanup

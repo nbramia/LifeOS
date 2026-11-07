@@ -7,6 +7,16 @@
 
 sync_enabled: true
 
+# Dailies database source: reads check-ins from Home's Postgres (table
+# home_dailies) as the read-only role home_dailies_reader and writes one
+# Personal/Journal/YYYY-MM-DD.md note per entry, in the same frontmatter shape
+# the Daily Journal sheet produces plus a `feelings` list. The connection
+# string is the secret LIFEOS_DAILIES_DATABASE_URL in .env (never committed);
+# without it the source is skipped. Runs after the sheets below, so it can be
+# enabled alongside the Daily Journal sheet before that sheet is removed.
+dailies_db:
+  enabled: false
+
 sheets:
   - sheet_id: "YOUR_GOOGLE_SHEET_ID"
     name: "Daily Journal"

@@ -1767,6 +1767,17 @@ class Settings(BaseSettings):
                     "warning if the key is absent)."
     )
 
+    # Dailies (Home) journal source
+    dailies_database_url: str = Field(
+        default="",
+        alias="LIFEOS_DAILIES_DATABASE_URL",
+        description="Postgres connection string for Home's read-only "
+                    "home_dailies_reader role, read by the Dailies database "
+                    "journal source (config/gsheet_sync.yaml `dailies_db`). "
+                    "A secret: set it in .env, never commit it. Empty skips "
+                    "the source."
+    )
+
     # Monarch Money
     monarch_email: str = Field(
         default="",

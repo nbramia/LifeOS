@@ -22,7 +22,7 @@ Two irregularities in the real data drove the parsing approach:
 
 Privacy and correctness considerations:
 - Frontmatter values are free text as far as the parser is concerned — the
-  fixed Google Form is today's only source, but a hand-edited entry could
+  sync sources write fixed form vocabulary, but a hand-edited entry could
   put a full sentence in `feeling:` and it would otherwise become public
   API/display text. `_display_value` applies a conservative shape policy
   (short, few words, no line breaks) instead of allowlisting today's known
