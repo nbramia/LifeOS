@@ -1636,3 +1636,41 @@ class TestScheduleSnooze:
         got = store.get(entry.id)
         assert got.snoozed_until == until
         assert got.next_trigger_at == _utc(2026, 3, 4, 9, 0).isoformat()
+
+    def test_sub_second_wake_time_never_selects_a_slot_before_it(self, clock):
+        entry = ScheduleEntry(
+            id="t", name="T", schedule_type="cron", schedule_value="0 10 * * *",
+            timezone="UTC", snoozed_until="2026-03-04T10:00:00.500000+00:00",
+        )
+        # 10:00:00 on the wake day is inside the snooze; the next day's slot is next.
+        assert compute_next_trigger(entry) == _utc(2026, 3, 5, 10, 0).isoformat()
+
+    def test_unsnoozing_a_once_after_its_wake_time_but_before_a_tick_still_fires(self, store, clock):
+        entry = store.create(
+            name="One-off", schedule_type="once", schedule_value=_utc(2026, 3, 2, 12, 0).isoformat(),
+            timezone="UTC", action="notify", message_type="static", message_content="x",
+        )
+        store.set_snooze(entry.id, _utc(2026, 3, 3, 8, 0).isoformat())
+        clock.now = _utc(2026, 3, 3, 8, 0, 30)  # wake time passed, no tick yet
+        store.set_snooze(entry.id, None)
+        assert [e.id for e in store.get_due_reminders()] == [entry.id]
+
+    @pytest.mark.asyncio
+    async def test_entry_snoozed_while_an_earlier_fire_is_in_flight_is_skipped(self, store, clock):
+        first = self._daily(store)
+        second = self._daily(store)
+        for e in (first, second):
+            store.get(e.id).next_trigger_at = _utc(2026, 3, 2, 7, 0).isoformat()
+        scheduler = SchedulerScheduler(store)
+        fired = []
+
+        async def fake_fire(entry, **_kwargs):
+            fired.append(entry.id)
+            other = second.id if entry.id == first.id else first.id
+            store.set_snooze(other, _utc(2026, 3, 9, 8, 0).isoformat())
+            scheduler._stop_event.set()
+
+        with patch.object(scheduler, "_read_control_file", return_value=True), \
+             patch.object(scheduler, "_fire_entry", side_effect=fake_fire):
+            await scheduler._schedule_loop()
+        assert len(fired) == 1

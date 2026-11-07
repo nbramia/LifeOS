@@ -170,6 +170,10 @@ def compute_next_n_triggers(
             if not_before is not None and not_before > now_utc:
                 # croniter's get_next is exclusive of its start; backing off
                 # one second makes a slot exactly at not_before eligible.
+                # A sub-second not_before is rounded up first, so a slot
+                # strictly before it is never chosen.
+                if not_before.microsecond:
+                    not_before = not_before.replace(microsecond=0) + timedelta(seconds=1)
                 start = (not_before - timedelta(seconds=1)).astimezone(tz)
             cron = croniter(schedule_value, start)
             triggers = []
@@ -841,15 +845,19 @@ class SchedulerStore:
 
         Only ``snoozed_until`` and the derived ``next_trigger_at`` change —
         the definition (trigger, timezone, enabled checkbox) is untouched.
-        Unsnoozing a ``once`` schedule whose fire time already passed during
-        the snooze ends the snooze now instead of dropping it, so the
-        one-off fires on the next tick rather than being lost.
+        Unsnoozing a not-yet-fired ``once`` schedule whose fire time already
+        passed ends the snooze now instead of dropping it — whether or not
+        the wake time itself has passed yet — so the one-off fires on the
+        next tick rather than being lost.
         """
         with self._lock:
             entry = self._entries.get(entry_id)
             if not entry:
                 return None
-            if snoozed_until is None and entry.schedule_type == "once" and is_entry_snoozed(entry):
+            if (
+                snoozed_until is None and entry.schedule_type == "once" and entry.enabled
+                and parse_snoozed_until(entry.snoozed_until) is not None
+            ):
                 now = datetime.now(timezone.utc)
                 at_utc = _once_trigger_utc(
                     entry.schedule_value, entry.timezone or settings.timezone, label=entry.id,
@@ -1280,6 +1288,11 @@ class SchedulerScheduler:
             try:
                 if self._read_control_file():
                     for entry in self.store.get_due_reminders():
+                        # An earlier fire in this batch may have awaited long
+                        # enough for the operator to snooze this entry.
+                        current = self.store.get(entry.id)
+                        if current is None or is_entry_snoozed(current):
+                            continue
                         await self._fire_entry(entry)
                 else:
                     logger.debug("Scheduler paused via control file")
