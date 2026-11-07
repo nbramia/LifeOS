@@ -4,30 +4,22 @@
 // configured specialized bot. The selection scopes the conversation sidebar
 // (`?persona_id=`), rides along on /api/ask/stream as `persona_id`, and gates
 // the claude_intent handoff on the persona's advertised `capabilities`. The
-// choice persists across refresh in sessionStorage. Implements the persona
+// choice persists across refresh and across the tab closing
+// (readPersisted/writePersisted in session.js). Implements the persona
 // contract in docs/specs/technical/client-surfaces.md.
 
-import { config, elements, endpoints } from './session.js';
+import { config, elements, endpoints, readPersisted, writePersisted } from './session.js';
 import { newChat } from './conversations.js';
 
 const PERSONA_STORAGE_KEY = 'lifeos:chat:persona_id';
 const DEFAULT_PERSONA_ID = 'primary';
 
 function readStoredPersonaId() {
-  try {
-    return window.sessionStorage.getItem(PERSONA_STORAGE_KEY) || DEFAULT_PERSONA_ID;
-  } catch (e) {
-    // sessionStorage unavailable (private mode / disabled)
-    return DEFAULT_PERSONA_ID;
-  }
+  return readPersisted(PERSONA_STORAGE_KEY) || DEFAULT_PERSONA_ID;
 }
 
 function storePersonaId(id) {
-  try {
-    window.sessionStorage.setItem(PERSONA_STORAGE_KEY, id);
-  } catch (e) {
-    // sessionStorage unavailable — the selection just won't survive a refresh
-  }
+  writePersisted(PERSONA_STORAGE_KEY, id);
 }
 
 export async function loadPersonas() {

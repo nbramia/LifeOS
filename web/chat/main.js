@@ -27,6 +27,7 @@ import {
 } from './voice.js';
 import { initBackend } from './backend.js';
 import { initModel, onModelChange } from './model.js';
+import { initTurnRecovery, findPendingNewConversation } from './turn-recovery.js';
 
 // Boot the chat surface. The shell passes in the explicit DOM element map (so
 // the modules never getElementById), the API endpoints, and integration hooks
@@ -83,7 +84,10 @@ export function initChat({ elements: els, endpoints: eps, hooks: hks } = {}) {
   // param leaves every existing boot path (including the plain `?mode=`/
   // `?record=` deep links voice.js reads) byte-identical, and this never
   // touches the SSE contract those params gate.
-  window.lifeChat.backendReady.then(() => { maybeOpenDeepLinkedConversation(); });
+  window.lifeChat.backendReady.then(() => { restoreConversationOnLoad(); });
+  // Catch up on replies that finished, or are still running server-side,
+  // while the page was hidden or closed.
+  initTurnRecovery();
   initModel();  // restore the per-turn model picker (Auto/Sonnet/Opus/Gemma)
   initVoice();  // restore Voice|Text mode + wire the hold-to-talk dock
   setStatus('', 'Ready');
@@ -97,10 +101,22 @@ function maybeOpenDeepLinkedConversation() {
   try {
     id = new URLSearchParams(window.location.search).get('conversation');
   } catch (e) {
-    return;  // no URLSearchParams / blocked — same guard voice.js uses
+    return false;  // no URLSearchParams / blocked — same guard voice.js uses
   }
-  if (!id) return;
+  if (!id) return false;
   loadConversation(id);
+  return true;
+}
+
+// Reopen the thread the user was in: a deep link wins; then a first turn of a
+// new conversation whose id never reached the page before it closed; then the
+// stored conversation for this backend and persona. Loading it also resumes
+// waiting on a turn still running or queued for it (loadConversation()).
+async function restoreConversationOnLoad() {
+  if (maybeOpenDeepLinkedConversation()) return;
+  if (await findPendingNewConversation()) return;
+  const id = state.currentConversationId;
+  if (id && config.backend !== 'agent') loadConversation(id, { refreshList: false });
 }
 
 // --- Bridge for the classic shell script + inline handlers ---

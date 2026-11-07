@@ -7,10 +7,10 @@
 // `lifeos_context` envelope) — the latter two proxied with a
 // server-side bearer at /api/agent/ask/stream and /api/hermes/ask/stream
 // respectively. Neither proxied backend has handoff wired through. The
-// selection persists in sessionStorage, and
+// selection persists (readPersisted/writePersisted in session.js), and
 // each backend keeps its own conversation id (lifeos and hermes are further
-// scoped per persona) so switching back and forth — and refreshing — continues
-// the right thread.
+// scoped per persona) so switching back and forth, refreshing, or reopening
+// a closed tab continues the right thread.
 //
 // With no stored preference, the default is conditional: hermes if it's
 // configured server-side, else lifeos — so a machine with no Hermes URL set
@@ -18,7 +18,9 @@
 // that default (an async availability check) before the composer accepts a
 // turn, via the same state.isLoading gate sendMessage() already respects.
 
-import { state, config, elements, endpoints } from './session.js';
+import {
+  state, config, elements, endpoints, readPersisted, writePersisted, removePersisted,
+} from './session.js';
 import { newChat, loadConversation, loadConversations } from './conversations.js';
 import { updateOrchestratesBadge } from './persona.js';
 
@@ -45,12 +47,8 @@ export function getBackendMode() {
 // backend by hand (setBackendMode()), so the conditional default below never
 // gets confused with an explicit preference.
 function getStoredBackendMode() {
-  try {
-    const v = window.sessionStorage.getItem(BACKEND_MODE_KEY);
-    return BACKEND_MODES.includes(v) ? v : null;
-  } catch (e) {
-    return null;
-  }
+  const v = readPersisted(BACKEND_MODE_KEY);
+  return BACKEND_MODES.includes(v) ? v : null;
 }
 
 // Conversation id is stored per backend; lifeos and hermes are also scoped per
@@ -63,12 +61,34 @@ function convKey() {
 }
 
 export function getStoredConversationId() {
-  try { return window.sessionStorage.getItem(convKey()) || null; } catch (e) { return null; }
+  return readPersisted(convKey());
 }
 
 export function setStoredConversationId(id) {
   if (!id) return;
-  try { window.sessionStorage.setItem(convKey(), id); } catch (e) { /* storage blocked */ }
+  writePersisted(convKey(), id);
+}
+
+// A turn sent on a brand-new conversation, recorded until its
+// `conversation_id` frame arrives. If the page closes before then, the next
+// load finds the conversation the server created for it (see
+// findPendingNewConversation() in turn-recovery.js).
+function pendingKey() {
+  return `${convKey()}:pending`;
+}
+
+export function getPendingNewTurn() {
+  const raw = readPersisted(pendingKey());
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch (e) { return null; }
+}
+
+export function setPendingNewTurn(question) {
+  writePersisted(pendingKey(), JSON.stringify({ question, at: Date.now() }));
+}
+
+export function clearPendingNewTurn() {
+  removePersisted(pendingKey());
 }
 
 function applyBackendUi() {
@@ -94,7 +114,7 @@ function setBackendMode(mode) {
   // config.backend drives ask/stream routing + voice turns; null = lifeos
   // default (omitted from the request body).
   config.backend = next === 'lifeos' ? null : next;
-  try { window.sessionStorage.setItem(BACKEND_MODE_KEY, next); } catch (e) { /* blocked */ }
+  writePersisted(BACKEND_MODE_KEY, next);
   applyBackendUi();
   restoreBackendConversation();
 }

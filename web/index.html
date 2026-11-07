@@ -394,6 +394,19 @@
             border: 1px solid var(--border);
         }
 
+        /* A message sent while an earlier turn is still running: it waits in
+           the server-side queue until that turn finishes. */
+        .message.user.queued {
+            opacity: 0.75;
+        }
+
+        .queued-marker {
+            margin-top: 0.25rem;
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            text-align: right;
+        }
+
         .message.assistant {
             align-self: flex-start;
             background: var(--assistant-bubble);
@@ -1368,9 +1381,9 @@
             transform: none;
         }
 
-        /* Stop button: swapped in for send-btn while a turn is in
-           flight. Shares send-btn's box so the composer layout doesn't
-           shift; a distinct color signals it's a different action. */
+        /* Stop button: shown beside send-btn while a turn is running or
+           queued (Send stays usable to queue another message). Same box
+           as send-btn; a distinct color signals it's a different action. */
         .stop-btn {
             width: 48px;
             height: 48px;
@@ -3052,9 +3065,10 @@
                     ></textarea>
                 </div>
                 <button class="send-btn" id="sendBtn" onclick="sendMessage()" title="Send message">➤</button>
-                <!-- Stop: shown in place of Send while a turn is in flight.
-                     Cancels the turn server-side rather than just walking away from
-                     the stream -- the turn otherwise keeps running to completion. -->
+                <!-- Stop: shown beside Send while a turn is running or queued.
+                     Cancels the turn and its queue server-side rather than just
+                     walking away from the stream -- the turn otherwise keeps
+                     running to completion. -->
                 <button class="stop-btn" id="stopBtn" onclick="stopTurn()" title="Stop">⏹</button>
             </div>
             <!-- Voice dock: tap-to-talk + dock toggles; shown in voice mode -->

@@ -13,6 +13,13 @@ and `conversation_id -> turn_id`) that makes a turn cancellable by
 conversation id from `POST /api/conversations/{id}/cancel`, bounds a
 detached turn's lifetime, and lets `api/main.py`'s shutdown drain every
 turn still running before the process exits.
+
+It also holds a per-conversation FIFO of queued turns (`enqueue()`): a turn
+a client asked to queue behind a busy conversation (`if_busy: "queue"`) is
+created, and its task started, immediately, but the task waits in
+`wait_to_start()` until every turn ahead of it has finished. `pop()` of the
+running turn promotes the next queued one, so the queue drains server-side
+with no client attached.
 """
 
 import asyncio
@@ -80,6 +87,12 @@ class ChatTurn:
         # not change cancellation behavior on its own.
         self.modality = modality
         self.started_at = time.time()
+        # True for a turn created by `TurnRegistry.enqueue()`. `_started` is
+        # set once the turn may run: immediately for an ordinary turn, on
+        # promotion for a queued one.
+        self.queued = False
+        self._started = asyncio.Event()
+        self._started.set()
         self.detached_at: Optional[float] = None
         self.reader_attached = True
         self.finalized = False
@@ -192,6 +205,8 @@ class TurnRegistry:
         self._by_turn_id: dict[str, ChatTurn] = {}
         self._by_conversation_id: dict[str, str] = {}
         self._by_client_turn_id: dict[str, str] = {}
+        # conversation_id -> turns waiting behind the running one, oldest first.
+        self._queued: dict[str, list[ChatTurn]] = {}
 
     def create(
         self,
@@ -215,6 +230,57 @@ class TurnRegistry:
             # most recently claimed it, never one further back.
             self._by_client_turn_id[client_turn_id] = turn.turn_id
         return turn
+
+    def is_busy(self, conversation_id: str) -> bool:
+        """True when this conversation has a turn registered as running or
+        any turn queued. A registered turn counts even in the brief window
+        after its task finished and before its `finally` pops it: `pop()`
+        promotes the queue, so a turn enqueued in that window still runs."""
+        return self.get_by_conversation(conversation_id) is not None or bool(self._queued.get(conversation_id))
+
+    def queued_count(self, conversation_id: str) -> int:
+        return len(self._queued.get(conversation_id) or ())
+
+    def enqueue(
+        self,
+        conversation_id: str,
+        modality: str = "text",
+        client_turn_id: Optional[str] = None,
+    ) -> ChatTurn:
+        """Create a turn that waits behind every turn already running or
+        queued for `conversation_id`. It is reachable by `turn_id` and
+        `client_turn_id` at once, and by `conversation_id` only once it is
+        promoted to running."""
+        turn = ChatTurn(str(uuid.uuid4()), conversation_id, modality, client_turn_id)
+        turn.queued = True
+        turn._started.clear()
+        self._by_turn_id[turn.turn_id] = turn
+        if client_turn_id:
+            self._by_client_turn_id[client_turn_id] = turn.turn_id
+        self._queued.setdefault(conversation_id, []).append(turn)
+        return turn
+
+    def queue_position(self, turn: ChatTurn) -> int:
+        """1-based position among the turns waiting for this conversation;
+        0 once the turn is running (or no longer queued)."""
+        waiting = self._queued.get(turn.conversation_id or "") or []
+        return waiting.index(turn) + 1 if turn in waiting else 0
+
+    async def wait_to_start(self, turn: ChatTurn) -> None:
+        """Return once `turn` may run. Immediate for an ordinary turn."""
+        await turn._started.wait()
+
+    def _promote_next(self, conversation_id: str) -> None:
+        waiting = self._queued.get(conversation_id)
+        if not waiting:
+            self._queued.pop(conversation_id, None)
+            return
+        nxt = waiting.pop(0)
+        if not waiting:
+            self._queued.pop(conversation_id, None)
+        self._by_conversation_id[conversation_id] = nxt.turn_id
+        nxt.started_at = time.time()
+        nxt._started.set()
 
     def bind(self, turn: ChatTurn, conversation_id: str) -> None:
         """(Re)point the conversation_id -> turn_id mapping once a turn's
@@ -245,8 +311,16 @@ class TurnRegistry:
         replaced either with a newer turn's id, and this must not clobber
         that (the same guard, applied to both keys)."""
         self._by_turn_id.pop(turn.turn_id, None)
-        if turn.conversation_id and self._by_conversation_id.get(turn.conversation_id) == turn.turn_id:
+        waiting = self._queued.get(turn.conversation_id or "")
+        if waiting and turn in waiting:
+            # Never started (cancelled while queued): leave the queue order
+            # and the running turn untouched.
+            waiting.remove(turn)
+            if not waiting:
+                self._queued.pop(turn.conversation_id, None)
+        elif turn.conversation_id and self._by_conversation_id.get(turn.conversation_id) == turn.turn_id:
             self._by_conversation_id.pop(turn.conversation_id, None)
+            self._promote_next(turn.conversation_id)
         if turn.client_turn_id and self._by_client_turn_id.get(turn.client_turn_id) == turn.turn_id:
             self._by_client_turn_id.pop(turn.client_turn_id, None)
         deadline_task = turn._deadline_task
@@ -254,14 +328,19 @@ class TurnRegistry:
             deadline_task.cancel()
 
     def cancel_conversation(self, conversation_id: str, reason: str = "cancelled") -> bool:
-        """Cancel whatever turn is in flight for this conversation, if any.
-        Used both by the explicit `POST /{id}/cancel` endpoint and by
-        supersede (a new turn on a conversation that already has one running
-        cancels it first — asking again IS a stop gesture)."""
+        """Cancel whatever turn is in flight for this conversation, if any,
+        and every turn queued behind it. Used both by the explicit
+        `POST /{id}/cancel` endpoint and by supersede (a new turn on a
+        conversation that already has one running cancels it first — asking
+        again IS a stop gesture). The queue is emptied before the running
+        turn is cancelled, so its `pop()` has nothing left to promote."""
+        cancelled = False
+        for queued in self._queued.pop(conversation_id, []):
+            cancelled = queued.request_cancel(reason) or cancelled
         turn = self.get_by_conversation(conversation_id)
-        if turn is None:
-            return False
-        return turn.request_cancel(reason)
+        if turn is not None:
+            cancelled = turn.request_cancel(reason) or cancelled
+        return cancelled
 
     def cancel_by_client_turn_id(self, client_turn_id: str, reason: str = "cancelled") -> bool:
         """Cancel whatever turn is in flight under this client-supplied key.
@@ -285,6 +364,10 @@ class TurnRegistry:
 
         async def _watch():
             try:
+                # A queued turn's clock starts when it starts running, not
+                # while it waits behind the turns ahead of it (each of which
+                # is bounded by its own deadline).
+                await turn._started.wait()
                 await asyncio.sleep(timeout)
             except asyncio.CancelledError:
                 return
@@ -298,6 +381,7 @@ class TurnRegistry:
         from `api/main.py`'s lifespan shutdown so a mid-turn auto-redeploy
         stores an honest partial instead of silently losing the turn."""
         turns = list(self._by_turn_id.values())
+        self._queued.clear()
         tasks = []
         for turn in turns:
             if turn.task is not None and not turn.task.done():
