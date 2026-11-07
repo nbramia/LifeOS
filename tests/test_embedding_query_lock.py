@@ -24,7 +24,7 @@ pytestmark = pytest.mark.unit
 # Long enough that a blocked event loop is unmistakable, short enough to keep
 # the tests quick.
 _QUERY_WAIT = 1.5
-# A request that runs while the embedding waits must finish well inside the wait.
+# The event loop never goes this long without running another coroutine.
 _PROMPT = 0.5
 
 
@@ -187,19 +187,26 @@ class _EmbeddingSearch:
         return []
 
 
-async def _time_concurrent(slow, quick):
-    """Start ``slow``, then time ``quick`` while ``slow`` is still running."""
+async def _longest_stall(slow, beat):
+    """Run ``slow`` while repeating ``beat``; return (longest beat cycle, slow's result).
+
+    A cycle is measured end to end, so if ``slow`` blocks the event loop the
+    cycle that spans the block is as long as the block.
+    """
     slow_task = asyncio.create_task(slow)
-    await asyncio.sleep(0.2)  # let the slow call reach the lock wait
-    start = time.monotonic()
-    await quick
-    quick_elapsed = time.monotonic() - start
-    slow_result = await slow_task
-    return quick_elapsed, slow_result
+    longest = 0.0
+    last = time.monotonic()
+    while not slow_task.done():
+        await beat()
+        await asyncio.sleep(0.02)
+        now = time.monotonic()
+        longest = max(longest, now - last)
+        last = now
+    return longest, await slow_task
 
 
 class TestEventLoopStaysFree:
-    async def test_health_answers_while_a_search_request_waits_for_the_lock(self, service, held_lock):
+    async def test_health_answers_while_a_search_request_waits_for_the_lock(self, service, models, held_lock):
         from api.routes import search as search_route
 
         app = FastAPI()
@@ -212,15 +219,19 @@ class TestEventLoopStaysFree:
         with patch.object(search_route, "get_hybrid_search", return_value=_EmbeddingSearch()):
             transport = httpx.ASGITransport(app=app)
             async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-                health_elapsed, search_response = await _time_concurrent(
+                async def check_health():
+                    assert (await client.get("/health")).status_code == 200
+
+                stall, search_response = await _longest_stall(
                     client.post("/api/search", json={"query": "synthetic query"}),
-                    client.get("/health"),
+                    check_health,
                 )
 
         assert search_response.status_code == 200
-        assert health_elapsed < _PROMPT
+        assert models[1].encode.call_count == 1  # the query did wait out the lock
+        assert stall < _PROMPT
 
-    async def test_chat_turn_memory_lookup_leaves_the_loop_free(self, service, held_lock):
+    async def test_chat_turn_memory_lookup_leaves_the_loop_free(self, service, models, held_lock):
         """A chat turn embeds the question for its memory lookup before the
         first model call; other coroutines keep running while it waits."""
         from api.services import agent_loop
@@ -243,7 +254,8 @@ class TestEventLoopStaysFree:
 
         with patch.object(agent_loop, "_select_client", return_value=_Client()), \
                 patch("api.services.memory_store.get_memory_store", return_value=_MemoryStore()):
-            tick_elapsed, events = await _time_concurrent(turn(), asyncio.sleep(0.01))
+            stall, events = await _longest_stall(turn(), lambda: asyncio.sleep(0))
 
         assert any(e["type"] == "text" for e in events)
-        assert tick_elapsed < _PROMPT
+        assert models[1].encode.call_count == 1  # the lookup did wait out the lock
+        assert stall < _PROMPT
