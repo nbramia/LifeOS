@@ -12,6 +12,7 @@ model is loaded.
 import asyncio
 import fcntl
 import os
+import threading
 import time
 from unittest.mock import MagicMock, patch
 
@@ -175,6 +176,126 @@ class TestCpuCopyLifetime:
 
         assert service._cpu_model is None
         assert models[0].encode.call_count == 1
+
+
+class _ConcurrentEntry(Exception):
+    pass
+
+
+def _single_entry_encode(hold=0.05):
+    """An encode that fails if two threads are inside it at once."""
+    guard = threading.Lock()
+
+    def encode(data, **kwargs):
+        if not guard.acquire(blocking=False):
+            raise _ConcurrentEntry("model entered by two threads at once")
+        try:
+            time.sleep(hold)
+            return _fake_encode(data, **kwargs)
+        finally:
+            guard.release()
+
+    return encode
+
+
+def _run_in_threads(target, count):
+    """Run ``target(i)`` on ``count`` threads at once; return (results, errors)."""
+    barrier = threading.Barrier(count)
+    results, errors = [], []
+
+    def run(i):
+        barrier.wait()
+        try:
+            results.append(target(i))
+        except BaseException as e:  # noqa: BLE001 -- reported by the test
+            errors.append(e)
+
+    threads = [threading.Thread(target=run, args=(i,)) for i in range(count)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+    return results, errors
+
+
+class TestConcurrentCalls:
+    """Embedding calls arrive from many worker threads at once."""
+
+    def test_concurrent_queries_during_a_held_lock_take_turns_on_the_cpu_copy(
+        self, service, models, held_lock, monkeypatch
+    ):
+        from api.services import embeddings
+        from config.settings import settings
+
+        gpu, cpu, _ = models
+        cpu.encode.side_effect = _single_entry_encode()
+        monkeypatch.setattr(settings, "embedding_query_gpu_lock_timeout_seconds", 0.2)
+        # Every call tries to free the copy, so frees race the encodes too.
+        monkeypatch.setattr(embeddings, "_CPU_COPY_IDLE_RELEASE_SECONDS", 0.0)
+
+        results, errors = _run_in_threads(lambda i: service.embed_text(f"synthetic query {i}"), 8)
+
+        assert errors == []
+        assert results == [[0.1, 0.2]] * 8
+        assert cpu.encode.call_count == 8
+
+    def test_a_timed_out_query_never_reaches_the_gpu_model(
+        self, service, models, held_lock, monkeypatch
+    ):
+        from api.services import embeddings
+        from config.settings import settings
+
+        gpu, cpu, _ = models
+        gpu.encode.side_effect = AssertionError("GPU model used without the GPU lock")
+        cpu.encode.side_effect = _single_entry_encode(hold=0.01)
+        monkeypatch.setattr(settings, "embedding_query_gpu_lock_timeout_seconds", 0.1)
+        monkeypatch.setattr(embeddings, "_CPU_COPY_IDLE_RELEASE_SECONDS", 0.0)
+
+        results, errors = _run_in_threads(lambda i: service.embed_text(f"synthetic query {i}"), 6)
+
+        assert errors == []
+        assert len(results) == 6
+        assert gpu.encode.call_count == 0
+
+    def test_concurrent_calls_after_the_move_to_cpu_take_turns_on_the_model(
+        self, service, models, held_lock, monkeypatch
+    ):
+        from config.settings import settings
+
+        gpu, cpu, _ = models
+        cpu.encode.side_effect = _single_entry_encode()
+        monkeypatch.setattr(settings, "embedding_gpu_lock_timeout_seconds", 0.1)
+
+        results, errors = _run_in_threads(
+            lambda i: service.embed_texts([f"synthetic chunk {i}"]), 6
+        )
+
+        assert errors == []
+        assert len(results) == 6
+        assert service.using_cpu_fallback is True
+        assert gpu.encode.call_count == 0
+
+    def test_a_query_waiting_on_the_cpu_path_is_not_held_up_by_a_waiting_batch_call(
+        self, service, models, held_lock, monkeypatch
+    ):
+        """A batch call waiting minutes for the GPU lock holds no in-process
+        lock, so a query that times out still encodes on the CPU copy."""
+        from config.settings import settings
+
+        _, cpu, _ = models
+        monkeypatch.setattr(settings, "embedding_gpu_lock_timeout_seconds", 5.0)
+        monkeypatch.setattr(settings, "embedding_query_gpu_lock_timeout_seconds", 0.1)
+
+        batch = threading.Thread(target=service.embed_texts, args=(["synthetic chunk"],))
+        batch.start()
+        time.sleep(0.1)  # the batch call is now waiting for the GPU lock
+        start = time.monotonic()
+        service.embed_text("synthetic query")
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 1.0
+        assert cpu.encode.call_count == 1
+        batch.join(timeout=10)
 
 
 class _EmbeddingSearch:
