@@ -12,6 +12,7 @@ import base64
 from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
+import re
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -4139,9 +4140,14 @@ _EMAIL_NAME = "Robin Alpha (robin.private@example.com)"
 _PHONE_NAME = "Robin Beta +1 (555) 010-0199"
 
 
+_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
 def _assert_no_contact_detail(block):
-    assert "@example.com" not in block
-    assert "555" not in block
+    # Entity ids are random UUIDs, so they are removed before the digit check.
+    text = _UUID.sub("<id>", block)
+    assert "@example.com" not in text
+    assert "555" not in text
 
 
 class TestOffboxNamesHoldNoIdentifiers:
