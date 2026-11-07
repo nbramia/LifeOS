@@ -160,8 +160,6 @@ def sync_vault_reindex(
     logger.info(f"  Files indexed: {files_indexed}")
     logger.info(f"  Files pruned: {run['files_pruned']}")
     logger.info(f"  Files remaining: {run['files_remaining']}")
-    if run["files_failed"]:
-        logger.error(f"  Files failed: {run['files_failed']} (retried next run); first {len(run['failed_paths'])}: {run['failed_paths']}")
     logger.info(f"  Search keys backfilled: {search_keys_backfilled}")
     logger.info(f"  Time elapsed: {elapsed:.1f}s ({elapsed/60:.1f} min)")
 
