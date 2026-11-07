@@ -1624,6 +1624,11 @@ def compute_person_category(person: PersonEntity, source_entities: list = None) 
     if "slack" in person.sources:
         return "work"
 
+    # Check company against the configured work companies (LIFEOS_WORK_COMPANIES)
+    company = (person.company or "").lower()
+    if company and any(name in company for name in settings.work_companies):
+        return "work"
+
     # If no source entities provided, fetch them
     if source_entities is None:
         source_store = get_source_entity_store()

@@ -1382,6 +1382,13 @@ class Settings(BaseSettings):
                     "categorizing work contacts (e.g., 'thirdcompany.com,"
                     "fourthcompany.com')."
     )
+    work_companies_extra: str = Field(
+        default="",
+        alias="LIFEOS_WORK_COMPANIES",
+        description="Comma-separated company names (part of a name is enough, "
+                    "case-insensitive) whose contacts are categorized as work, "
+                    "e.g. 'Acme Corp'."
+    )
     gmail_draft_send_cooldown_seconds: int = Field(
         default=300,
         alias="LIFEOS_GMAIL_DRAFT_SEND_COOLDOWN_SECONDS",
@@ -1485,6 +1492,11 @@ class Settings(BaseSettings):
             d.strip() for d in (self.work_email_domains_extra or "").split(",") if d.strip()
         )
         return domains
+
+    @property
+    def work_companies(self) -> list[str]:
+        """Company names (lowercased) whose contacts count as work."""
+        return [c.strip().lower() for c in (self.work_companies_extra or "").split(",") if c.strip()]
 
     def is_sync_enabled(self, account: str, service: str) -> bool:
         """Check if sync is enabled for account+service (gmail/calendar)."""
