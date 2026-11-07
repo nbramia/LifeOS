@@ -15,6 +15,7 @@ import json
 import threading
 import time
 import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -38,6 +39,14 @@ class FakeChatApi:
         self.conversation_id_delay = 0.0
         # Frames to send before the HTTP stream is cut; the turn itself is unaffected.
         self.drop_after_frames = None
+        # Frames to send before the stream ends cleanly with no terminal event.
+        self.eof_after_frames = None
+        # Seconds after which a new-conversation POST answers 500 (None: never).
+        self.fail_new_conversation_after = None
+        self.fail_queued_posts = False
+        self.list_delay = 0.0
+        self.cancelled: set[str] = set()
+        self.cancel_calls: list[str] = []
 
     def reset(self):
         with self.lock:
@@ -45,9 +54,35 @@ class FakeChatApi:
             self.running.clear()
             self.queues.clear()
             self.requests.clear()
+            self.cancelled.clear()
+            self.cancel_calls.clear()
             self.turn_seconds = 1.5
             self.conversation_id_delay = 0.0
             self.drop_after_frames = None
+            self.eof_after_frames = None
+            self.fail_new_conversation_after = None
+            self.fail_queued_posts = False
+            self.list_delay = 0.0
+
+    def seed_conversation(self, question: str, answer: str, created: datetime) -> str:
+        conv_id = str(uuid.uuid4())
+        with self.lock:
+            self.conversations[conv_id] = {
+                "title": question[:40], "created": created.isoformat(timespec="seconds"),
+                "messages": [{"role": "user", "content": question},
+                             {"role": "assistant", "content": answer}],
+            }
+        return conv_id
+
+    def cancel(self, conv_id: str):
+        """Like POST /api/conversations/{id}/cancel: drop the queue, stop
+        the running turn."""
+        with self.lock:
+            self.cancel_calls.append(conv_id)
+            self.cancelled.update(self.queues.pop(conv_id, []))
+            if conv_id in self.running:
+                self.cancelled.add(self.running[conv_id])
+            self.lock.notify_all()
 
     def start_turn(self, body: dict):
         """Returns (frames, done_event): a list the turn thread appends SSE
@@ -78,18 +113,32 @@ class FakeChatApi:
                 time.sleep(self.conversation_id_delay)
             with self.lock:
                 if queued:
-                    while self.running.get(conv_id) != turn_id:
+                    while self.running.get(conv_id) != turn_id and turn_id not in self.cancelled:
                         self.lock.wait()
+                    if turn_id in self.cancelled:
+                        finished.set()  # cancelled while queued: no further frames
+                        return
                 if not conv_id:
                     conv_id = str(uuid.uuid4())
-                    self.conversations[conv_id] = {"title": question[:40], "messages": []}
+                    self.conversations[conv_id] = {
+                        "title": question[:40], "messages": [],
+                        "created": datetime.now().isoformat(timespec="seconds"),
+                    }
                     self.running[conv_id] = turn_id
                 conv = self.conversations[conv_id]
                 frames.append(json.dumps({"type": "conversation_id", "conversation_id": conv_id}))
                 history = [m["content"] for m in conv["messages"]]
                 conv["messages"].append({"role": "user", "content": question})
                 self.lock.notify_all()
-            time.sleep(self.turn_seconds)
+            deadline = time.time() + self.turn_seconds
+            while time.time() < deadline:
+                time.sleep(0.05)
+                with self.lock:
+                    if turn_id in self.cancelled:
+                        self.running.pop(conv_id, None)
+                        self.lock.notify_all()
+                        finished.set()  # cut off: the stream ends with no `done`
+                        return
             answer = f"Answer to {question} (after {len(history) // 2} earlier)"
             with self.lock:
                 frames.append(json.dumps({"type": "content", "content": answer}))
@@ -112,7 +161,7 @@ class FakeChatApi:
             if conv is None:
                 return None
             return {
-                "id": conv_id, "title": conv["title"], "created_at": "", "updated_at": "",
+                "id": conv_id, "title": conv["title"], "created_at": conv["created"], "updated_at": "",
                 "messages": list(conv["messages"]),
                 "active_turn": {"turn_id": self.running[conv_id], "conversation_id": conv_id,
                                 "started_at": ""} if conv_id in self.running else None,
@@ -121,7 +170,7 @@ class FakeChatApi:
 
     def listing(self):
         with self.lock:
-            return [{"id": cid, "title": c["title"], "created_at": "", "updated_at": "",
+            return [{"id": cid, "title": c["title"], "created_at": c["created"], "updated_at": "",
                      "message_count": len(c["messages"]), "persona_id": "primary",
                      "backend": "lifeos"}
                     for cid, c in reversed(list(self.conversations.items()))]
@@ -150,7 +199,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             data = API.conversation(path[len("/api/conversations/"):])
             return self._json(200 if data else 404, data or {"detail": "not found"})
         if path == "/api/conversations":
+            time.sleep(API.list_delay)
             return self._json(200, {"conversations": API.listing()})
+        if path == "/api/personas":
+            return self._json(200, {"personas": [
+                {"id": "primary", "label": "Primary"}, {"id": "fitness", "label": "Fitness"},
+            ]})
         if path.startswith("/api/"):
             return self._json(200, {})
         if path in ("/chat", "/"):
@@ -174,8 +228,18 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         length = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(length) or b"{}")
+        if path.startswith("/api/conversations/") and path.endswith("/cancel"):
+            API.cancel(path[len("/api/conversations/"):-len("/cancel")])
+            return self._json(200, {"ok": True, "cancelled": True})
         if path != "/api/ask/stream":
             return self._json(200, {})
+        if API.fail_queued_posts and body.get("if_busy") == "queue":
+            API.requests.append(body)
+            return self._json(500, {"detail": "boom"})
+        if API.fail_new_conversation_after is not None and not body.get("conversation_id"):
+            API.requests.append(body)
+            time.sleep(API.fail_new_conversation_after)
+            return self._json(500, {"detail": "boom"})
         frames, finished = API.start_turn(body)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -195,6 +259,11 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                         # A network drop mid-turn: chunked encoding never
                         # terminated, so the browser sees a failed read.
                         self.connection.shutdown(2)
+                        return
+                    if API.eof_after_frames is not None and sent >= API.eof_after_frames:
+                        # The stream ends cleanly but with no terminal event.
+                        self.wfile.write(b"0\r\n\r\n")
+                        self.close_connection = True
                         return
                 if finished.is_set() and sent >= len(frames):
                     self.wfile.write(b"0\r\n\r\n")
@@ -341,3 +410,102 @@ def test_dropped_stream_mid_turn_recovers_without_an_error(page: Page, chat_base
     expect(page.locator(".message.assistant", has_text="Answer to flaky network question")).to_be_visible(timeout=10000)
     expect(page.locator("text=something went wrong")).to_have_count(0)
     expect(page.locator("#statusText")).to_have_text("Ready")
+
+
+def _requests_settle(api, page, count, wait_ms=1500):
+    """Give stray sends time to (wrongly) post, then return the request count."""
+    page.wait_for_timeout(wait_ms)
+    return len(api.requests)
+
+
+def test_queued_send_is_never_posted_without_a_conversation_id(page: Page, chat_base_url, api):
+    # The first send of a new conversation fails without ever learning its id.
+    api.fail_new_conversation_after = 1.0
+    _open_chat(page, chat_base_url)
+    _send(page, "first question")
+    _send(page, "second question")
+    second_reply = page.locator(".message.assistant").nth(1)
+    expect(second_reply).to_contain_text("Not sent", timeout=10000)
+    assert _requests_settle(api, page, 1) == 1  # the queued send never started a new conversation
+    assert api.conversations == {}
+
+
+def test_stop_cancels_sends_still_waiting_and_a_first_turn_without_an_id(page: Page, chat_base_url, api):
+    api.conversation_id_delay = 1.5
+    api.turn_seconds = 5.0
+    _open_chat(page, chat_base_url)
+    _send(page, "first question")
+    _send(page, "second question")  # waits in the page for the conversation id
+    expect(page.locator("#stopBtn")).to_have_class("stop-btn visible")
+    page.locator("#stopBtn").click()
+
+    replies = page.locator(".message.assistant")
+    expect(replies.nth(1)).to_have_text("Cancelled.", timeout=10000)
+    # The first turn is cancelled as soon as its conversation id arrives.
+    expect(replies.nth(0)).to_have_text("Cancelled.", timeout=10000)
+    assert len(api.cancel_calls) == 1
+    assert _requests_settle(api, page, 1) == 1  # the waiting send was never posted
+    assert [r["question"] for r in api.requests] == ["first question"]
+
+
+def test_stream_ending_without_a_terminal_event_recovers(page: Page, chat_base_url, api):
+    api.turn_seconds = 1.5
+    api.eof_after_frames = 1  # the stream ends cleanly after `conversation_id`
+    _open_chat(page, chat_base_url)
+    _send(page, "cut short question")
+    expect(page.locator(".message.assistant", has_text="Answer to cut short question")).to_be_visible(timeout=10000)
+    expect(page.locator(".typing")).to_have_count(0)
+
+
+def test_pending_search_does_not_open_an_older_conversation_with_the_same_question(
+    page: Page, chat_base_url, api,
+):
+    api.seed_conversation("same opener", "old answer", datetime.now() - timedelta(hours=1))
+    pending = json.dumps({"question": "same opener", "at": int(time.time() * 1000), "knownIds": []})
+    page.add_init_script(
+        f"window.localStorage.setItem('lifeos:chat:conv:lifeos:primary:pending', {json.dumps(pending)});"
+    )
+    _open_chat(page, chat_base_url)
+    page.wait_for_timeout(1500)  # the search and a retry have run
+    assert page.evaluate("window.lifeChat.state.currentConversationId") is None
+    expect(page.locator(".message.assistant", has_text="old answer")).to_have_count(0)
+
+
+def test_pending_search_bails_out_when_the_persona_changes(page: Page, chat_base_url, api):
+    conv_id = api.seed_conversation("pending opener", "its answer", datetime.now())
+    api.list_delay = 1.5
+    pending = json.dumps({"question": "pending opener", "at": int(time.time() * 1000) - 1000, "knownIds": []})
+    page.add_init_script(
+        f"window.localStorage.setItem('lifeos:chat:conv:lifeos:primary:pending', {json.dumps(pending)});"
+    )
+    page.add_init_script("window.__LIFEOS_TEST_RECOVERY_POLL_MS__ = 200;")
+    page.goto(f"{chat_base_url}/chat")
+    page.wait_for_selector("#personaPicker option[value='fitness']", state="attached")
+    page.select_option("#personaPicker", "fitness")  # while the search waits on the list
+    page.wait_for_timeout(6000)  # both delayed list calls and the search have finished
+    assert page.evaluate("window.lifeChat.config.personaId") == "fitness"
+    assert page.evaluate("window.lifeChat.state.currentConversationId") is None
+    assert page.evaluate("window.localStorage.getItem('lifeos:chat:conv:lifeos:fitness')") is None
+    expect(page.locator(".message.assistant", has_text="its answer")).to_have_count(0)
+    assert conv_id in api.conversations
+
+
+def test_a_failed_send_during_recovery_hands_back_to_the_watcher(page: Page, chat_base_url, api):
+    api.turn_seconds = 4.0
+    _open_chat(page, chat_base_url)
+    _send(page, "long question")
+    page.wait_for_function("window.lifeChat.state.currentConversationId !== null")
+    page.reload()
+    page.wait_for_selector("#backendLifeos", state="attached")
+    expect(page.locator("#turn-recovery-indicator")).to_be_visible()
+
+    api.fail_queued_posts = True
+    _send(page, "follow-up")
+    expect(page.locator(".message.assistant", has_text="something went wrong")).to_be_visible(timeout=5000)
+    # The failure stays in view while the watcher takes over again.
+    page.wait_for_timeout(500)
+    expect(page.locator(".message.assistant", has_text="something went wrong")).to_be_visible()
+    expect(page.locator("#turn-recovery-indicator")).to_be_visible()
+    expect(page.locator("#inputField")).to_have_value("follow-up")  # handed back for a retry
+    # Recovery resumes and still picks up the first reply.
+    expect(page.locator(".message.assistant", has_text="Answer to long question")).to_be_visible(timeout=10000)

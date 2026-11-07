@@ -135,6 +135,7 @@ export function watchConversation(id, { until = null, indicator = true, maxMs = 
   const startedAt = Date.now();
   (async () => {
     let last = null;
+    let lastCount = null;
     let satisfied = false;
     while (true) {
       await sleep(pollInterval(Date.now() - startedAt));
@@ -145,7 +146,13 @@ export function watchConversation(id, { until = null, indicator = true, maxMs = 
       if (data) {
         last = data;
         satisfied = !isBusy(data) && (!until || until(data));
-        if (!until && (data.messages || []).length !== renderedMessageCount()) {
+        // Re-render when the stored thread gains messages, or on the first
+        // poll if the page shows fewer than are stored. A local bubble the
+        // store doesn't have (a send that failed) stays until then.
+        const count = (data.messages || []).length;
+        const grew = lastCount === null ? count > renderedMessageCount() : count !== lastCount;
+        lastCount = count;
+        if (!until && grew) {
           renderConversation(data);
           if (indicator && !satisfied) showIndicator();
         }
@@ -235,6 +242,10 @@ function retryPendingSearch() {
   }, pollInterval(0));
 }
 
+// Server timestamps are naive server-local times, read here as browser-local;
+// this allowance absorbs clock skew between the two.
+const PENDING_CLOCK_SKEW_MS = 2 * 60 * 1000;
+
 async function searchPendingNewConversation() {
   const pending = getPendingNewTurn();
   if (!pending) return false;
@@ -243,10 +254,19 @@ async function searchPendingNewConversation() {
     return false;
   }
   if (hasLocalTurns()) return false;  // the stream that will deliver the id is still open
+  // The record belongs to this persona/backend and to whatever the page was
+  // showing when the search began. If the user moves on while it runs, drop
+  // it rather than open (or store an id under) a different selection.
+  const personaId = config.personaId || 'primary';
+  const backend = config.backend || 'lifeos';
+  const startConversationId = state.currentConversationId;
+  const unchanged = () => (config.personaId || 'primary') === personaId
+    && (config.backend || 'lifeos') === backend
+    && state.currentConversationId === startConversationId
+    && !hasLocalTurns();
+  const known = new Set(pending.knownIds || []);
   let list = [];
   try {
-    const personaId = config.personaId || 'primary';
-    const backend = config.backend || 'lifeos';
     const resp = await fetch(
       `${endpoints.conversations}?persona_id=${encodeURIComponent(personaId)}&backend=${encodeURIComponent(backend)}`,
     );
@@ -254,8 +274,17 @@ async function searchPendingNewConversation() {
   } catch (e) {
     return false;
   }
-  for (const conv of list.slice(0, 3)) {
+  if (!unchanged()) return false;
+  // Only a conversation created after the turn was sent can be its own: an
+  // older one may open with the same question.
+  const candidates = list.filter((conv) => {
+    if (known.has(conv.id)) return false;
+    const created = Date.parse(conv.created_at);
+    return Number.isFinite(created) && created >= (pending.at || 0) - PENDING_CLOCK_SKEW_MS;
+  });
+  for (const conv of candidates.slice(0, 3)) {
     const data = await fetchConversation(conv.id);
+    if (!unchanged()) return false;
     const first = data && (data.messages || [])[0];
     if (first && first.role === 'user' && first.content === pending.question) {
       clearPendingNewTurn();

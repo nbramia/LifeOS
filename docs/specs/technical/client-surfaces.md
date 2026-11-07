@@ -256,7 +256,11 @@ server finished it:
   `visibilitychange` to visible and `pageshow` from the back/forward cache
   (`checkCurrentConversation()`), and when a text stream fails after the
   server accepted the request. A dropped stream for a turn still running
-  shows no error bubble; it hands over to the watcher. A stream still open
+  shows no error bubble; it hands over to the watcher. A stream that ends
+  without a terminal `done` or `error` event counts as dropped too (the
+  turn was cut off, or is still running), queued turns included. The
+  watcher re-renders when the stored thread gains messages, so a local
+  failure notice stays in view until then. A stream still open
   while the server reports nothing running died silently while the page
   was hidden, so after a short grace it is aborted and the stored thread
   shown.
@@ -267,19 +271,31 @@ server finished it:
   stored the moment its `conversation_id` frame arrives.
 - **A new conversation whose id never arrived.** Until that frame arrives,
   the first message of a new conversation is recorded under the backend
-  and persona's key. If the page closes first, the next load looks among
-  that persona and backend's three most recent conversations for the one
-  whose first message is that question (retrying for a minute, since the
-  request may still have been on its way) and opens it. This needs no API
+  and persona's key, with the send time and the ids the sidebar already
+  listed. If the page closes first, the next load looks among that persona
+  and backend's three most recent conversations created at or after the
+  send time (less a two-minute clock-skew allowance; `created_at` is
+  server-local time read as browser-local) and not already listed, for the
+  one whose first message is that question, retrying for a minute since
+  the request may still have been on its way, and opens it. The search
+  gives up if the persona, backend, or open conversation changes while it
+  runs. This needs no API
   addition: the server creates the conversation as soon as it receives the
   request.
 - **Sending while busy.** The composer stays open during a turn. A message
   sent while this page streams a turn on the same conversation, or watches
   one, renders at once with a "Queued" marker and is posted with `if_busy:
-  "queue"` (it waits for the first turn's `conversation_id` frame if the
-  conversation is new); the marker clears when its first non-`queued`
-  frame arrives, and its reply streams on its own request. Stop cancels the
-  running turn and the queue. The Agent backend has no server-side queue,
+  "queue"`. Sends are posted in the order they were made, each after the
+  previous request has been answered, and a send on a new conversation
+  waits for that conversation's id: it is never posted without one, and if
+  the earlier send ends without an id the queued bubble says it was not
+  sent. The marker clears when its first non-`queued` frame arrives, and
+  its reply streams on its own request. Stop cancels the running turn and
+  the server-side queue, aborts sends still waiting in the page (they are
+  never posted, and show as cancelled), and cancels a first turn whose
+  conversation id hasn't arrived yet as soon as it does. A send that fails
+  before reaching the server is handed back to the composer, and if it had
+  taken over from the watcher, the watcher resumes. The Agent backend has no server-side queue,
   so it still takes one turn at a time. Voice turns keep their own
   lifecycle: a voice turn and a text turn don't start while the other is in
   flight, because the voice gateway supersedes rather than queues.

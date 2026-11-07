@@ -83,8 +83,12 @@ export function getPendingNewTurn() {
   try { return JSON.parse(raw); } catch (e) { return null; }
 }
 
-export function setPendingNewTurn(question) {
-  writePersisted(pendingKey(), JSON.stringify({ question, at: Date.now() }));
+// `knownIds`: the conversations this persona/backend already had when the
+// turn was sent — none of them can be the one it creates.
+export function setPendingNewTurn(question, knownIds = []) {
+  writePersisted(pendingKey(), JSON.stringify({
+    question, at: Date.now(), knownIds: knownIds.slice(0, 50),
+  }));
 }
 
 export function clearPendingNewTurn() {
