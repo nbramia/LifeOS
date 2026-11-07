@@ -1352,6 +1352,7 @@ def _schedule_card(entry) -> dict[str, Any]:
         "working_dir": entry.working_dir,
         "budget_dollars": entry.budget_dollars,
         "wall_seconds": entry.wall_seconds,
+        "snoozed_until": entry.snoozed_until,
     }
 
 
@@ -1406,9 +1407,10 @@ def _build_board() -> dict[str, Any]:
         ))
 
     for entry in scheduler_store.list_all():
-        bucket = "scheduled" if agent_board.is_schedule_active(
+        bucket = agent_board.schedule_lane(
             entry.enabled, entry.next_trigger_at, entry.schedule_type,
-        ) else "done"
+            entry.snoozed_until, now,
+        )
         lanes[bucket].append(_schedule_card(entry))
 
     return {"lanes": lanes, "generated_at": int(time.time()), "api_host": api_host_name()}
@@ -1640,22 +1642,59 @@ async def update_board_card_tags(card_id: str, body: BoardTagsRequest) -> dict[s
     return {"id": task.id, "lane": lane, "status": task.status, "tags": list(task.tags)}
 
 
+def _set_schedule_snooze(card_id: str, until: str | None) -> dict[str, Any]:
+    """Snooze (``until``) or unsnooze (``None``) the scheduler entry
+    ``card_id`` for the board's snooze endpoints. 404 when no entry has
+    that id; a snooze on a disabled entry is refused, since it never fires
+    anyway. An unsnooze of an entry with no wake-up time is a no-op."""
+    from api.services import agent_board
+    from api.services.scheduler_store import get_scheduler_store
+
+    store = get_scheduler_store()
+    entry = store.get(card_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="card not found")
+    if until is not None and not entry.enabled:
+        raise HTTPException(
+            status_code=agent_board.SNOOZE_INELIGIBLE_ERROR[0],
+            detail=agent_board.SNOOZE_INELIGIBLE_ERROR[1],
+        )
+    if until is not None or entry.snoozed_until:
+        entry = store.set_snooze(card_id, until)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="card not found")
+        _invalidate_board_cache()
+    lane = agent_board.schedule_lane(
+        entry.enabled, entry.next_trigger_at, entry.schedule_type, entry.snoozed_until, _now(),
+    )
+    return {
+        "id": entry.id, "kind": "schedule", "lane": lane,
+        "snoozed_until": entry.snoozed_until if lane == "snoozed" else None,
+        "next_fire_at": entry.next_trigger_at,
+    }
+
+
 @router.put("/board/cards/{card_id}/snooze")
 async def snooze_board_card(card_id: str, body: SnoozeRequest) -> dict[str, Any]:
     """Set a card's wake-up time, deriving it into the Snoozed lane.
 
-    Eligible on any card whose status/tags alone (ignoring any snooze
-    already in effect) derive to Unassigned, Assigned, Human queue, or
-    Review — a card that derives to In progress or Done is refused, and so
-    is a scheduler entry (`card_id` never resolves through `TaskManager`).
-    `until` must be an ISO-8601 timestamp with a UTC offset, in the future
-    — anything else is refused without touching the task (see
-    `agent_board.parse_snoozed_until`). Persisted as `parsed.isoformat()`
-    (UTC, canonical `+00:00` form) rather than verbatim — `until` may
-    arrive as a compact form, with a space separator, or with a `Z` suffix,
-    all of which `datetime.fromisoformat` accepts but a browser's `Date`
-    constructor does not uniformly parse back. Only `snoozed_until`
-    changes: status, tags, and notes are left exactly as they were.
+    A task card is eligible when `agent_board.is_snooze_eligible` holds for
+    its status/tags alone (ignoring any snooze already in effect):
+    Unassigned, Assigned, Human queue, Review, or an In progress card that
+    is the operator's own or unassigned, unclaimed, not waiting on a
+    machine, and has no live session. Done, and In progress under an agent,
+    are refused. A scheduler entry (`card_id` that resolves through the
+    scheduler store, not `TaskManager`) is eligible while enabled; its
+    scheduler skips every fire until the wake-up time (see
+    `SchedulerStore.set_snooze`). `until` must be an ISO-8601 timestamp
+    with a UTC offset, in the future — anything else is refused without a
+    write (see `agent_board.parse_snoozed_until`). Persisted as
+    `parsed.isoformat()` (UTC, canonical `+00:00` form) rather than
+    verbatim — `until` may arrive as a compact form, with a space
+    separator, or with a `Z` suffix, all of which `datetime.fromisoformat`
+    accepts but a browser's `Date` constructor does not uniformly parse
+    back. Only the wake-up time changes: a task's status, tags, and notes,
+    and a schedule's definition, are left exactly as they were.
     """
     from api.services import agent_board
     from api.services.task_manager import get_task_manager, TaskConflictError
@@ -1671,12 +1710,18 @@ async def snooze_board_card(card_id: str, body: SnoozeRequest) -> dict[str, Any]
     task_manager = get_task_manager()
     task = task_manager.get(card_id)
     if task is None:
-        raise HTTPException(status_code=404, detail="card not found")
+        return _set_schedule_snooze(card_id, normalized_until)
 
     def ineligible(status: str, tags) -> bool:
-        return agent_board.natural_lane(status, tags) not in agent_board.SNOOZABLE_LANES
+        return not agent_board.is_snooze_eligible(status, tags)
 
-    if ineligible(task.status, task.tags):
+    # An In progress card also needs no live session behind it at all —
+    # looked up without status/tags, which would short-circuit the query
+    # for a card no agent is assigned to.
+    if ineligible(task.status, task.tags) or (
+        agent_board.natural_lane(task.status, task.tags) == "in_progress"
+        and _get_session_store().has_live_session(card_id)
+    ):
         raise HTTPException(
             status_code=agent_board.SNOOZE_INELIGIBLE_ERROR[0],
             detail=agent_board.SNOOZE_INELIGIBLE_ERROR[1],
@@ -1715,6 +1760,8 @@ async def snooze_board_card(card_id: str, body: SnoozeRequest) -> dict[str, Any]
 async def unsnooze_board_card(card_id: str) -> dict[str, Any]:
     """Clear a card's wake-up time, restoring its status/tag-derived lane.
 
+    Works on a task card or a scheduler entry; an unsnoozed schedule is
+    back in Scheduled at once, with its next fire recomputed from now.
     A no-op success (no write) on a card that isn't currently snoozed.
     """
     from api.services import agent_board
@@ -1723,7 +1770,7 @@ async def unsnooze_board_card(card_id: str) -> dict[str, Any]:
     task_manager = get_task_manager()
     task = task_manager.get(card_id)
     if task is None:
-        raise HTTPException(status_code=404, detail="card not found")
+        return _set_schedule_snooze(card_id, None)
 
     if agent_board.SNOOZED_UNTIL_FIELD not in task.fields:
         lane = agent_board.derive_lane(task.status, task.tags, task.fields)

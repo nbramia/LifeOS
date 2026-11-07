@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Scheduler
-> **Last Updated:** 2026-09-08
+> **Last Updated:** 2026-11-07
 > **Audience:** Operators
 
 The Scheduler runs work on a timer. A **schedule** binds a **trigger**
@@ -37,6 +37,7 @@ source of truth; `data/scheduler_index.json` is a rebuildable cache.
 - **`[action:: …]`** — what fires (see below).
 - **`#executor` tag** — for `action:: agent`, the executor: `#local`, `#cloud`, `#cloud-haiku`, or `#cloud-sonnet`.
 - **`[bot:: <name>]`** — which Telegram bot delivers the notification (see below); omitted means the primary bot.
+- **`[snoozed_until:: <ISO datetime with offset>]`** — holds off every fire until then (see [Snoozing a schedule](#snoozing-a-schedule)); omitted means not snoozed.
 
 `endpoint` schedules carry the call itself in the line, so it is fully defined
 by the vault: `[endpoint:: <METHOD> <path>]` (e.g.
@@ -199,7 +200,33 @@ the type and the new value together to convert a schedule.
 - **Update:** `PUT /api/scheduler/{id}`, or edit the line in Obsidian
 - **Delete:** `DELETE /api/scheduler/{id}`, or "delete the … schedule"
 - **Trigger now:** `POST /api/scheduler/{id}/trigger` (also `lifeos_schedule_trigger` and `manage_schedules` action='trigger') — fires immediately; for a `once` schedule this consumes it (disables it and clears its next fire), the same as if it had fired on its own. A `manual` schedule stays enabled and can be triggered again.
+- **Snooze:** the `/agents` board's **Snooze** / **Unsnooze** on a Scheduled card, or `PUT` / `DELETE /api/agents/board/cards/{id}/snooze` — see below
 - **Pause all:** set `enabled: false` in `LifeOS/Scheduler/Scheduler.md`
+
+### Snoozing a schedule
+
+A snooze sets a wake-up time on one enabled schedule, stored in its line as
+`[snoozed_until:: …]`. Until then the scheduler doesn't fire it at all, and
+the card sits in the board's Snoozed lane. The schedule's definition — trigger,
+timezone, and enabled checkbox — is untouched, and a rebuilt index cache keeps
+the snooze because it lives in the vault line.
+
+- **Recurring:** fires that fall inside the snooze are skipped, not caught up.
+  The next fire is the first slot at or after the snooze's end: a daily 9am
+  schedule snoozed for two days fires at 9am on day three, then carries on as
+  before.
+- **One-off:** if its time falls inside the snooze, it fires once when the
+  snooze ends (also after a restart, under the run-once catch-up below), then
+  disables as usual. A time after the snooze's end is unaffected.
+- **Manual:** has no fires to skip; the snooze only parks the card in Snoozed.
+  Trigger now still fires it.
+- **Unsnooze** brings the schedule back at once: its next fire is recomputed
+  from now. A one-off whose time already passed during the snooze fires on the
+  next tick.
+- Trigger now during a recurring schedule's snooze fires once and keeps the
+  snooze, so the next scheduled fire still waits for the snooze's end.
+- A snooze that has passed is ignored, and the field is dropped the next time
+  the schedule fires. Deleting the field in Obsidian unsnoozes it.
 
 ## Obsidian Dashboard
 

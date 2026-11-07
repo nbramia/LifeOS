@@ -937,8 +937,8 @@ class TestClaimAgentEndpointSnoozeExclusion:
 class TestUpdateTaskEndpointClearsStaleSnooze:
     """The generic `PUT /api/tasks/{id}` (the MCP `lifeos_task_update`/
     complete shape) calls `TaskManager.update`, which must never leave a
-    stale future `snoozed_until` on a task whose own write lands it in
-    In progress or Done — that write path is one of the central choke
+    stale future `snoozed_until` on a task whose own write makes it
+    snooze-ineligible (Done, or agent-owned In progress) — that write path is one of the central choke
     points `TaskManager._clear_stale_snooze` guards, not a board-specific
     concern."""
 

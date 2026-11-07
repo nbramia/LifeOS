@@ -133,7 +133,7 @@ class SnoozeNotifier:
 
             delivery_key = (task.id, raw_until)
 
-            if agent_board.natural_lane(task.status, task.tags) not in agent_board.SNOOZABLE_LANES:
+            if not agent_board.is_snooze_eligible(task.status, task.tags):
                 # Never eligible for a wake-up message. Clear the expired
                 # value now rather than leaving it — otherwise a later,
                 # unrelated edit that returns the card to an eligible lane

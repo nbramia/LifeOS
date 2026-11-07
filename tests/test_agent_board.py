@@ -163,16 +163,43 @@ class TestDeriveLaneSnooze:
         assert agent_board.derive_lane("todo", [], fields, before) == "snoozed"
         assert agent_board.derive_lane("todo", [], fields, after) == "unassigned"
 
-    def test_in_progress_and_done_ignore_a_future_snooze_field(self):
-        # A snooze can never hide a running or finished card — the override
-        # only ever applies when the natural (status/tag-only) lane is
-        # itself snooze-eligible (SNOOZABLE_LANES). A future `snoozed_until`
-        # on an in_progress or done task is simply ignored.
+    def test_agent_in_progress_and_done_ignore_a_future_snooze_field(self):
+        # A snooze can never hide live agent work or a finished card. A
+        # future `snoozed_until` on a done task, or on an In progress task
+        # an agent owns, the worker claimed, or a machine wait holds, is
+        # simply ignored.
         fields = {"snoozed_until": self.FUTURE}
-        assert agent_board.derive_lane("in_progress", [], fields) == "in_progress"
         assert agent_board.derive_lane("done", [], fields) == "done"
         assert agent_board.derive_lane("cancelled", [], fields) == "done"
         assert agent_board.derive_lane("todo", ["agent-running"], fields) == "in_progress"
+        assert agent_board.derive_lane("in_progress", ["me", "agent-running"], fields) == "in_progress"
+        assert agent_board.derive_lane("in_progress", ["claude"], fields) == "in_progress"
+        assert agent_board.derive_lane("in_progress", ["muse"], fields) == "in_progress"
+        assert agent_board.derive_lane("in_progress", ["agent-wait-dependency"], fields) == "in_progress"
+
+    @pytest.mark.parametrize("tags", [["me"], []])
+    def test_operator_or_unassigned_in_progress_card_can_be_snoozed(self, tags):
+        fields = {"snoozed_until": self.FUTURE}
+        assert agent_board.derive_lane("in_progress", tags, fields) == "snoozed"
+        assert agent_board.derive_lane("in_progress", tags, {"snoozed_until": self.PAST}) == "in_progress"
+
+    @pytest.mark.parametrize("status,tags,eligible", [
+        ("todo", [], True),
+        ("todo", ["codex"], True),
+        ("blocked", [], True),
+        ("done", ["agent-completed"], True),
+        ("in_progress", ["me"], True),
+        ("in_progress", [], True),
+        ("in_progress", ["codex"], False),
+        ("in_progress", ["duet"], False),
+        ("todo", ["agent-running"], False),
+        ("in_progress", ["me", "agent-running"], False),
+        ("in_progress", ["agent-wait-provider"], False),
+        ("done", [], False),
+        ("cancelled", [], False),
+    ])
+    def test_is_snooze_eligible(self, status, tags, eligible):
+        assert agent_board.is_snooze_eligible(status, tags) is eligible
 
     def test_natural_lane_matches_derive_lane_with_no_fields(self):
         cases = [
@@ -184,7 +211,9 @@ class TestDeriveLaneSnooze:
             assert agent_board.natural_lane(status, tags) == agent_board.derive_lane(status, tags), (status, tags)
 
     def test_snoozable_lanes_matches_the_eligible_set(self):
-        assert agent_board.SNOOZABLE_LANES == {"unassigned", "assigned", "human_queue", "review"}
+        assert agent_board.SNOOZABLE_LANES == {
+            "unassigned", "assigned", "in_progress", "human_queue", "review",
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -680,6 +709,32 @@ class TestIsScheduleActive:
 
     def test_enabled_with_no_next_trigger_is_not_active(self):
         assert agent_board.is_schedule_active(True, None) is False
+
+
+class TestScheduleLane:
+    FUTURE = "2099-01-01T00:00:00+00:00"
+    NEXT = "2099-02-01T09:00:00+00:00"
+
+    def test_enabled_entry_with_a_future_snooze_is_snoozed(self):
+        assert agent_board.schedule_lane(True, self.NEXT, "cron", self.FUTURE) == "snoozed"
+        assert agent_board.schedule_lane(True, None, "manual", self.FUTURE) == "snoozed"
+
+    def test_disabled_entry_stays_in_done_whatever_its_snooze(self):
+        assert agent_board.schedule_lane(False, None, "cron", self.FUTURE) == "done"
+
+    @pytest.mark.parametrize("snoozed_until", [None, "2000-01-01T00:00:00+00:00", "not-a-date"])
+    def test_past_or_missing_snooze_falls_back_to_scheduled_or_done(self, snoozed_until):
+        assert agent_board.schedule_lane(True, self.NEXT, "cron", snoozed_until) == "scheduled"
+        assert agent_board.schedule_lane(True, None, "once", snoozed_until) == "done"
+
+    def test_now_is_injectable(self):
+        wake = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+        assert agent_board.schedule_lane(
+            True, self.NEXT, "cron", wake.isoformat(), wake - timedelta(seconds=1),
+        ) == "snoozed"
+        assert agent_board.schedule_lane(
+            True, self.NEXT, "cron", wake.isoformat(), wake + timedelta(seconds=1),
+        ) == "scheduled"
 
 
 # ---------------------------------------------------------------------------

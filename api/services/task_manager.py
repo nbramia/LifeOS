@@ -33,10 +33,9 @@ from typing import Callable, Optional
 
 from config.settings import settings
 from api.services.agent_board import (
-    SNOOZABLE_LANES as _SNOOZABLE_LANES,
     SNOOZED_UNTIL_FIELD as _SNOOZED_UNTIL_FIELD,
+    is_snooze_eligible as _is_snooze_eligible,
     is_snoozed as _is_snoozed,
-    natural_lane as _natural_lane,
 )
 from api.services.atomic_write import atomic_write_text, atomic_write_lines
 from api.services.operation_lock import exclusive_operation_lock
@@ -183,27 +182,28 @@ class Task:
 
 
 def _clear_stale_snooze(t: Task) -> None:
-    """Central choke point: if this task's own status/tags now land it in
-    a natural lane a snooze can never override (In progress or Done — see
-    `agent_board.SNOOZABLE_LANES`), drop `snoozed_until` when present.
+    """Central choke point: if this task's own status/tags now make it
+    snooze-ineligible (Done, or In progress under an agent or a worker
+    claim — see `agent_board.is_snooze_eligible`), drop `snoozed_until`
+    when present.
 
     Called at the tail of every write path that can change a task's
     status or tags (`update`, `swap_tag`) right before the task is
     persisted, so a snoozed Human-queue card resumed via `/swap-tag`
     (`agent-blocked` -> `agent-running`), a status write to
-    `in_progress`/`done`/`cancelled`, or any other tag change that lands
-    the card in In progress or Done can never leave a stale future
-    wake-up time behind — one that would otherwise silently re-apply and
-    hide the card again the next time it lands in a snooze-eligible lane
-    (e.g. a resumed card reaching Review before its wake-up time).
-    Mutates `t.fields` in place; a no-op when the field is absent or the
-    natural lane is still snooze-eligible — which is why a `#human` card
-    the human-queue resolve path marks `done` keeps its snooze: the
-    `human` tag alone still puts its natural lane in Human queue.
+    `done`/`cancelled`, or any other status/tag change that makes the card
+    ineligible can never leave a stale future wake-up time behind — one
+    that would otherwise silently re-apply and hide the card again the
+    next time it becomes eligible (e.g. a resumed card reaching Review
+    before its wake-up time). Mutates `t.fields` in place; a no-op when
+    the field is absent or the card is still snooze-eligible — which is
+    why a `#human` card the human-queue resolve path marks `done` keeps
+    its snooze: the `human` tag alone still puts its natural lane in
+    Human queue.
     """
     if _SNOOZED_UNTIL_FIELD not in t.fields:
         return
-    if _natural_lane(t.status, t.tags) in _SNOOZABLE_LANES:
+    if _is_snooze_eligible(t.status, t.tags):
         return
     t.fields = {k: v for k, v in t.fields.items() if k != _SNOOZED_UNTIL_FIELD}
 

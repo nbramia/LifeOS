@@ -254,34 +254,59 @@ export async function moveCardToLane(card, lane, onChanged, findCard) {
 // computed by the caller's picker UI (session_actions.js's
 // `renderActionRow` snooze branch) — this function only performs the
 // write and reports the result.
-export async function snoozeCard(card, until, onChanged) {
+//
+// With `undoable`, the confirmation toast offers Undo, which puts back the
+// card's wake-up time from before the click: the earlier snooze if it is
+// still in the future, otherwise none. A schedule card carries its wake-up
+// time as `snoozed_until`, a task card as `fields.snoozed_until`.
+export async function snoozeCard(card, until, onChanged, { undoable = false } = {}) {
+  const priorUntil = wakeTimeOf(card);
   try {
-    const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(card.id)}/snooze`, {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ until }),
-    });
-    if (!r.ok) {
-      const text = await r.text();
-      let msg = text;
-      try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
-      throw new Error(msg || `HTTP ${r.status}`);
-    }
-    showToast('Snoozed.', false);
+    await writeSnooze(card.id, until);
+    if (undoable) showUndoableToast('Snoozed.', () => restoreSnooze(card.id, priorUntil, onChanged));
+    else showToast('Snoozed.', false);
     if (onChanged) await onChanged();
   } catch (err) { showToast(`Snooze failed: ${err.message}`, true); }
 }
 
-export async function unsnoozeCard(card, onChanged) {
+export async function unsnoozeCard(card, onChanged, { undoable = false } = {}) {
+  const priorUntil = wakeTimeOf(card);
   try {
-    const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(card.id)}/snooze`, { method: 'DELETE' });
-    if (!r.ok) {
-      const text = await r.text();
-      let msg = text;
-      try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
-      throw new Error(msg || `HTTP ${r.status}`);
-    }
-    showToast('Unsnoozed.', false);
+    await writeSnooze(card.id, null);
+    if (undoable) showUndoableToast('Unsnoozed.', () => restoreSnooze(card.id, priorUntil, onChanged));
+    else showToast('Unsnoozed.', false);
     if (onChanged) await onChanged();
   } catch (err) { showToast(`Unsnooze failed: ${err.message}`, true); }
+}
+
+function wakeTimeOf(card) {
+  if (!card || card.lane !== 'snoozed') return null;
+  return card.kind === 'schedule' ? card.snoozed_until : (card.fields && card.fields.snoozed_until);
+}
+
+// PUT a wake-up time, or DELETE it when `until` is null. Throws the
+// server's own detail on a refusal.
+async function writeSnooze(cardId, until) {
+  const url = `/api/agents/board/cards/${encodeURIComponent(cardId)}/snooze`;
+  const r = until
+    ? await fetch(url, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ until }) })
+    : await fetch(url, { method: 'DELETE' });
+  if (!r.ok) {
+    const text = await r.text();
+    let msg = text;
+    try { const j = JSON.parse(text); msg = j.detail || msg; } catch (_) {}
+    throw new Error(msg || `HTTP ${r.status}`);
+  }
+}
+
+function restoreSnooze(cardId, priorUntil, onChanged) {
+  const stillFuture = priorUntil && new Date(priorUntil).getTime() > Date.now();
+  return writeSnooze(cardId, stillFuture ? priorUntil : null)
+    .then(async () => { if (onChanged) await onChanged(); })
+    .catch((err) => {
+      showToast(`Couldn't undo: ${err.message}`, true);
+      throw err;
+    });
 }
 
 export async function cancelCard(card, onChanged) {
@@ -477,8 +502,8 @@ export function cardActionHandlers(card, {
     }),
     start: () => moveCardToLane(card, 'in_progress', changed, findCard),
     resolve: () => moveCardToLane(card, 'done', changed, findCard),
-    snooze: (until) => snoozeCard(card, until, changed),
-    unsnooze: () => unsnoozeCard(card, changed),
+    snooze: (until) => snoozeCard(card, until, changed, { undoable: true }),
+    unsnooze: () => unsnoozeCard(card, changed, { undoable: true }),
     cancel: () => cancelCard(card, changed),
     delete: () => openDeleteCardModal(card, {
       findCard, onDeleted: changed, onMutationOpened, onMutationCancelled,

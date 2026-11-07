@@ -627,10 +627,10 @@ export function initBoard() {
   // server's own `snoozed` lane can never be set directly (plan_lane_move
   // refuses it the same way review/scheduled are refused). Deliberately
   // omits the machine-wait-tag branch production's natural_lane has: a
-  // card this function is ever called on was successfully snoozed, which
-  // the drawer only ever offers from Unassigned, Assigned, Human queue, or
-  // Review (session_actions.js's SNOOZE_ELIGIBLE_LANES), so its natural
-  // lane can never actually be the machine-wait flavor of In progress.
+  // card this function is ever called on was successfully snoozed, and
+  // the drawer never offers Snooze on a machine-waiting In progress card
+  // (session_actions.js's `canSnooze`), so its natural lane can never
+  // actually be the machine-wait flavor of In progress.
   function naturalLaneFor(card) {
     const tags = new Set((card.tags || []).map(t => String(t).replace(/^#+/, '').toLowerCase()));
     const status = (card.status || 'todo').toLowerCase();
@@ -1053,9 +1053,11 @@ export function initBoard() {
     const isManual = card.schedule_type === 'manual';
     const nextFire = card.next_fire_at ? new Date(card.next_fire_at).toLocaleString() : '—';
     const actionChip = scheduleActionChipText(card);
+    const wake = card.lane === 'snoozed' && card.snoozed_until ? formatWakeTime(card.snoozed_until) : null;
     div.innerHTML = `
       <div class="board-card-title">${escapeHtml(card.name || '(schedule)')}</div>
       <div class="board-card-chips">
+        ${wake ? `<span class="board-chip board-chip-snoozed" title="wakes ${escapeAttr(wake.exact)}">⏰ ${escapeHtml(wake.label)}</span>` : ''}
         <span class="board-chip" title="${escapeHtml(actionChip.title)}">${escapeHtml(actionChip.text)}</span>
         ${isManual
           ? '<span class="board-chip">Manual — trigger only</span>'

@@ -152,11 +152,28 @@ export function showUndoableToast(message, undo) {
 // Reject, Reassign, Start, Mark Done, Snooze, Unsnooze, Cancel, Delete.
 // ---------------------------------------------------------------------
 
-// Lanes a card can be snoozed FROM — mirrors agent_board.py's
-// `derive_lane`/the `PUT .../snooze` route's eligibility check (anything
-// that isn't In progress, Done, or a scheduler entry). A card already in
-// `snoozed` isn't in this set — it offers Unsnooze instead, below.
-const SNOOZE_ELIGIBLE_LANES = new Set(['unassigned', 'assigned', 'human_queue', 'review']);
+// Lanes a task card can be snoozed FROM — mirrors agent_board.py's
+// `SNOOZABLE_LANES`. In progress is in the set, but `canSnooze` below
+// narrows it to the operator's own unclaimed work, as
+// `is_snooze_eligible` does. A card already in `snoozed` isn't in this set
+// — it offers Unsnooze instead.
+const SNOOZE_ELIGIBLE_LANES = new Set(['unassigned', 'assigned', 'in_progress', 'human_queue', 'review']);
+const WORKER_OWNED_TAGS = new Set(['agent-running', 'agent-blocked', 'agent-wait-provider', 'agent-wait-dependency']);
+
+// Mirrors the `PUT .../snooze` route's eligibility: a schedule card while
+// it sits in Scheduled (enabled), and a task card in a snooze-eligible
+// lane — for In progress, only when it is the operator's own or
+// unassigned, carries no worker-claim or machine-wait tag, and has no
+// live session, so live agent work is never hidden.
+function canSnooze(s, c) {
+  if (c.kind === 'schedule') return c.lane === 'scheduled';
+  if (!SNOOZE_ELIGIBLE_LANES.has(c.lane)) return false;
+  if (c.lane !== 'in_progress') return true;
+  if (c.assignee && c.assignee !== 'me') return false;
+  const tags = (c.tags || []).map(t => String(t).replace(/^#+/, '').toLowerCase());
+  if (tags.some(t => WORKER_OWNED_TAGS.has(t))) return false;
+  return !(s && !TERMINAL.has(s.status));
+}
 
 // Lanes Start (-> In progress) and Mark Done (-> Done) are offered from.
 const START_FROM_LANES = new Set(['unassigned', 'assigned', 'human_queue']);
@@ -283,11 +300,11 @@ export function decideActions(session, card) {
   }
 
   // Snooze / Unsnooze — deferring a card until later, or waking it early.
-  // Snooze is offered on any card that isn't actively running or finished
-  // (agent_board.py's SNOOZE_INELIGIBLE_ERROR refuses everything else —
-  // In progress, Done, and scheduler entries — server-side too); Unsnooze
-  // only on a card that's currently dormant. Both card-only.
-  if (c && SNOOZE_ELIGIBLE_LANES.has(c.lane)) {
+  // Snooze is offered on a task card that isn't finished or live agent
+  // work, and on a scheduled entry (see `canSnooze`; agent_board.py's
+  // SNOOZE_INELIGIBLE_ERROR refuses everything else server-side too);
+  // Unsnooze only on a card that's currently dormant. Both card-only.
+  if (c && canSnooze(s, c)) {
     out.push({ id: 'snooze', label: 'Snooze', enabled: true, reason: null, danger: false });
   }
   if (c && c.lane === 'snoozed') {
