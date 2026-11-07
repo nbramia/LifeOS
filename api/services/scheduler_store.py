@@ -32,10 +32,14 @@ round-trip through the line as ``[endpoint:: <METHOD> <path>]`` and
 computed ``next_trigger_at`` (plus run history) has no markdown representation
 and lives only in a rebuildable index cache (``data/scheduler_index.json``),
 merged back by ID when markdown is reindexed. The cache is never the source of
-truth — it can be deleted and rebuilt from the vault.
+truth — it can be deleted and rebuilt from the vault. Store mutations other
+than ``create`` edit only the tokens they change in the entry's current
+on-disk block (see ``SchedulerStore._edit_entry``).
 """
 import asyncio
 import base64
+import copy
+import dataclasses
 import json
 import logging
 import re
@@ -580,6 +584,135 @@ def _find_block_span(lines: list[str], entry_id: str) -> Optional[tuple[int, int
     return None
 
 
+# A run of name text in a line whose fields, tags and id are masked with NULs.
+_NAME_PIECE_RE = re.compile(r"[^\0\s](?:[^\0]*[^\0\s])?")
+
+# Attributes that determine a schedule's next fire.
+_TRIGGER_ATTRS = ("schedule_type", "schedule_value", "enabled", "timezone", "snoozed_until")
+
+# ScheduleEntry attribute → the inline-field keys that carry it on the line.
+# `enabled` (checkbox), `name` (leading text), `executor` (tag) and
+# `message_content` (body) are edited by their own helpers; attributes absent
+# from both (run history, next_trigger_at) have no markdown representation.
+_ATTR_FIELD_KEYS = {
+    "schedule_type": ("cron", "at"),
+    "schedule_value": ("cron", "at"),
+    "timezone": ("tz",),
+    "action": ("action", "endpoint", "params"),
+    "message_type": ("mtype",),
+    "endpoint_config": ("endpoint", "params"),
+    "bot": ("bot",),
+    "created_at": ("created",),
+    "last_triggered_at": ("last",),
+    "operation_key": ("operation_key",),
+    "budget_dollars": ("budget",),
+    "wall_seconds": ("wall",),
+    "snoozed_until": (SNOOZED_UNTIL_FIELD,),
+    **{key: (key,) for key in ("persona_id", "model_id", "effort", "host", "working_dir")},
+}
+
+
+def _cut_token(line: str, start: int, end: int) -> str:
+    """Remove ``line[start:end]`` plus one adjoining space."""
+    if start > 0 and line[start - 1] == " ":
+        start -= 1
+    elif end < len(line) and line[end] == " ":
+        end += 1
+    return line[:start] + line[end:]
+
+
+def _insert_before_id(line: str, token: str) -> str:
+    """Insert ``token`` just before the line's ``<!-- id:… -->`` comment."""
+    pos = _ID_RE.search(line).start()
+    return line[:pos] + token + " " + line[pos:]
+
+
+def _set_inline_field(line: str, key: str, token: Optional[str]) -> str:
+    """Set inline field ``key`` to the full ``[key:: value]`` ``token``, or
+    remove it when ``token`` is None.
+
+    Setting replaces the last occurrence in place (the one the parser reads)
+    or, when the key is absent, inserts the token before the id comment.
+    Removing drops every occurrence. The rest of the line is untouched.
+    """
+    matches = [m for m in _INLINE_FIELD_RE.finditer(line) if m.group(1) == key]
+    if token is None:
+        for m in reversed(matches):
+            line = _cut_token(line, m.start(), m.end())
+        return line
+    if not matches:
+        return _insert_before_id(line, token)
+    last = matches[-1]
+    return line[:last.start()] + token + line[last.end():]
+
+
+def _executor_tag_span(line: str) -> Optional[tuple[int, int]]:
+    """Span of the tag the parser reads as the executor: the first ``#tag``
+    outside inline fields and the id comment."""
+    masked = line
+    for regex in (_INLINE_FIELD_RE, _ID_RE):
+        masked = regex.sub(lambda m: " " * len(m.group(0)), masked)
+    m = _TAG_RE.search(masked)
+    return (m.start(), m.end()) if m else None
+
+
+def _set_name(line: str, name: str) -> str:
+    """Replace the name text: the first run of text outside the checkbox,
+    inline fields, tags and the id comment becomes ``name``, and any later
+    runs (which the parser joins into the name) are removed."""
+    rest_start = _CHECKBOX_RE.match(line).start(2)
+    masked = line
+    for regex in (_INLINE_FIELD_RE, _ID_RE, _TAG_RE):
+        masked = regex.sub(lambda m: "\0" * len(m.group(0)), masked)
+    pieces = [m.span() for m in _NAME_PIECE_RE.finditer(masked, rest_start)]
+    if not pieces:
+        return line[:rest_start] + name + " " + line[rest_start:]
+    for start, end in reversed(pieces[1:]):
+        line = _cut_token(line, start, end)
+    start, end = pieces[0]
+    return line[:start] + name + line[end:]
+
+
+def _edit_block_lines(block: list[str], target: ScheduleEntry, attrs: list[str]) -> list[str]:
+    """Apply ``target``'s values for ``attrs`` to an on-disk ``block``.
+
+    Only the tokens those attributes own change; every other field (known
+    or not), field order, and the body stay byte-for-byte. Values are
+    serialized by ``_format_entry_line`` so an edited line parses exactly
+    like a freshly formatted one.
+    """
+    line = block[0]
+    body = block[1:]
+    formatted = {m.group(1): m.group(0) for m in _INLINE_FIELD_RE.finditer(_format_entry_line(target))}
+    for attr in attrs:
+        if attr == "enabled":
+            symbol = line[3]
+            if target.enabled and symbol != " ":
+                line = line[:3] + " " + line[4:]
+            elif not target.enabled and symbol == " ":
+                line = line[:3] + "x" + line[4:]
+        elif attr == "name":
+            line = _set_name(line, target.name)
+        elif attr == "executor":
+            span = _executor_tag_span(line)
+            if span and target.executor:
+                line = line[:span[0]] + f"#{target.executor}" + line[span[1]:]
+            elif span:
+                line = _cut_token(line, *span)
+            elif target.executor:
+                line = _insert_before_id(line, f"#{target.executor}")
+        elif attr == "message_content":
+            body = _format_entry_block(target)[1:]
+        for key in _ATTR_FIELD_KEYS.get(attr, ()):
+            current = {m.group(1): m.group(2).strip() for m in _INLINE_FIELD_RE.finditer(line)}
+            token = formatted.get(key)
+            if token is None and key in current:
+                line = _set_inline_field(line, key, None)
+            elif token is not None and current.get(key) != _INLINE_FIELD_RE.match(token).group(2).strip():
+                line = _set_inline_field(line, key, token)
+    return [line] + body
+
+
 class SchedulerStore:
     """
     CRUD store for schedules backed by ``LifeOS/Scheduler/Inbox.md``.
@@ -693,16 +826,50 @@ class SchedulerStore:
             lines = lines[:first_idx] + block + lines[first_idx:]
         self._write_inbox_lines(lines)
 
-    def _rewrite_block(self, entry: ScheduleEntry):
-        """Replace the markdown block for ``entry`` (by ID); insert if absent."""
-        block = _format_entry_block(entry)
+    def _edit_entry(self, cached: ScheduleEntry, changes_for) -> Optional[ScheduleEntry]:
+        """Apply targeted edits to ``cached``'s block in Inbox.md and return
+        the entry as it reads on disk afterwards. Must be called with the lock held.
+
+        The block is re-read from the file at write time, so a hand edit made
+        since the last reindex is both kept and picked up. ``changes_for`` is
+        called with that current entry (disk fields, plus cached payload and
+        history merged forward) and returns ``{attribute: new value}``; only
+        the tokens owned by attributes whose value differs from disk change.
+        The returned entry is the edited block re-parsed, with the changed
+        entry's non-markdown fields merged forward; ``next_trigger_at`` is the
+        caller's to set.
+
+        When several blocks share the id, the last one is edited, matching
+        the block a reindex keeps. When no block carries the id (deleted or
+        re-id'd by hand), nothing is written: the entry is dropped from the
+        cache and None is returned, so callers treat it as an unknown id.
+        """
         lines = self._read_inbox_lines()
-        span = _find_block_span(lines, entry.id)
-        if span is None:
-            self._insert_block_at_top(block)
-            return
-        start, end = span
-        self._write_inbox_lines(lines[:start] + block + lines[end:])
+        found = None
+        for start, end, entry in _iter_entry_blocks(lines):
+            if entry.id == cached.id:
+                found = (start, end, entry)
+        if found is None:
+            logger.info("Schedule block missing from the inbox; dropping it from the cache")
+            self._entries = {k: v for k, v in self._entries.items() if k != cached.id}
+            return None
+        start, end, disk = found
+        current = copy.copy(disk)
+        self._merge_prior(current, cached)
+        changes = changes_for(current)
+        target = dataclasses.replace(current, **changes)
+        attrs = [attr for attr in changes if getattr(disk, attr) != getattr(target, attr)]
+        block = _edit_block_lines(lines[start:end], target, attrs)
+        if block != lines[start:end]:
+            self._write_inbox_lines(lines[:start] + block + lines[end:])
+        _s, _e, refreshed = next(_iter_entry_blocks(block))
+        self._merge_prior(refreshed, target)
+        return refreshed
+
+    def _commit(self, entry: ScheduleEntry):
+        """Swap ``entry`` into the cache and persist it. Lock held."""
+        self._entries = {**self._entries, entry.id: entry}
+        self._save()
 
     def _remove_block(self, entry_id: str):
         lines = self._read_inbox_lines()
@@ -789,16 +956,24 @@ class SchedulerStore:
 
     def update(self, entry_id: str, **kwargs) -> Optional[ScheduleEntry]:
         with self._lock:
-            entry = self._entries.get(entry_id)
-            if not entry:
+            cached = self._entries.get(entry_id)
+            if not cached:
                 return None
-            for key, value in kwargs.items():
-                if hasattr(entry, key) and value is not None:
-                    setattr(entry, key, value)
-            if any(k in kwargs for k in ("schedule_type", "schedule_value", "enabled", "timezone")):
+            changes = {
+                key: value for key, value in kwargs.items()
+                if key in ScheduleEntry.__dataclass_fields__ and value is not None
+            }
+            entry = self._edit_entry(cached, lambda _current: changes)
+            if entry is None:
+                self._save()
+                return None
+            if any(k in changes for k in _TRIGGER_ATTRS) or any(
+                getattr(entry, k) != getattr(cached, k) for k in _TRIGGER_ATTRS
+            ):
                 entry.next_trigger_at = compute_next_trigger(entry) if entry.enabled else None
-            self._rewrite_block(entry)
-            self._save()
+            else:
+                entry.next_trigger_at = cached.next_trigger_at
+            self._commit(entry)
             return entry
 
     def delete(self, entry_id: str) -> bool:
@@ -810,7 +985,7 @@ class SchedulerStore:
                 return True
             return False
 
-    def mark_triggered(self, entry_id: str):
+    def mark_triggered(self, entry_id: str) -> Optional[ScheduleEntry]:
         """Mark a schedule as triggered and advance/disable it.
 
         A ``once`` schedule is consumed (disabled, no next fire). ``cron``
@@ -822,21 +997,30 @@ class SchedulerStore:
         ended, drops its ``snoozed_until``; a manual trigger during a cron
         schedule's snooze keeps it, so the next scheduled fire still waits
         for the snooze's end.
+
+        Returns the updated entry, or None when the schedule is unknown or
+        its block is gone from the inbox.
         """
         with self._lock:
-            entry = self._entries.get(entry_id)
-            if not entry:
-                return
-            entry.last_triggered_at = datetime.now(timezone.utc).isoformat()
-            if entry.schedule_type == "once" or not is_entry_snoozed(entry):
-                entry.snoozed_until = None
-            if entry.schedule_type == "once":
-                entry.enabled = False
-                entry.next_trigger_at = None
-            else:
-                entry.next_trigger_at = compute_next_trigger(entry)
-            self._rewrite_block(entry)
-            self._save()
+            cached = self._entries.get(entry_id)
+            if not cached:
+                return None
+
+            def fire_changes(current: ScheduleEntry) -> dict:
+                changes: dict = {"last_triggered_at": datetime.now(timezone.utc).isoformat()}
+                if current.schedule_type == "once" or not is_entry_snoozed(current):
+                    changes["snoozed_until"] = None
+                if current.schedule_type == "once":
+                    changes["enabled"] = False
+                return changes
+
+            entry = self._edit_entry(cached, fire_changes)
+            if entry is None:
+                self._save()
+                return None
+            entry.next_trigger_at = None if entry.schedule_type == "once" else compute_next_trigger(entry)
+            self._commit(entry)
+            return entry
 
     def set_snooze(self, entry_id: str, snoozed_until: Optional[str]) -> Optional[ScheduleEntry]:
         """Snooze a schedule until ``snoozed_until`` (an ISO-8601 string with
@@ -851,23 +1035,30 @@ class SchedulerStore:
         next tick rather than being lost.
         """
         with self._lock:
-            entry = self._entries.get(entry_id)
-            if not entry:
+            cached = self._entries.get(entry_id)
+            if not cached:
                 return None
-            if (
-                snoozed_until is None and entry.schedule_type == "once" and entry.enabled
-                and parse_snoozed_until(entry.snoozed_until) is not None
-            ):
-                now = datetime.now(timezone.utc)
-                at_utc = _once_trigger_utc(
-                    entry.schedule_value, entry.timezone or settings.timezone, label=entry.id,
-                )
-                if at_utc is not None and at_utc <= now:
-                    snoozed_until = now.isoformat()
-            entry.snoozed_until = snoozed_until
+
+            def snooze_changes(current: ScheduleEntry) -> dict:
+                if (
+                    snoozed_until is None and current.schedule_type == "once" and current.enabled
+                    and parse_snoozed_until(current.snoozed_until) is not None
+                ):
+                    now = datetime.now(timezone.utc)
+                    at_utc = _once_trigger_utc(
+                        current.schedule_value, current.timezone or settings.timezone,
+                        label=current.id,
+                    )
+                    if at_utc is not None and at_utc <= now:
+                        return {"snoozed_until": now.isoformat()}
+                return {"snoozed_until": snoozed_until}
+
+            entry = self._edit_entry(cached, snooze_changes)
+            if entry is None:
+                self._save()
+                return None
             entry.next_trigger_at = compute_next_trigger(entry) if entry.enabled else None
-            self._rewrite_block(entry)
-            self._save()
+            self._commit(entry)
             return entry
 
     def record_run(self, entry_id: str, status: str, result: str = ""):
@@ -978,7 +1169,8 @@ class SchedulerStore:
             # supplied endpoint_config above. Persist it into the vault line
             # now; the next parse finds it directly, so this runs at most once.
             if entry.action == "endpoint" and not had_endpoint_field and entry.endpoint_config:
-                self._rewrite_block(entry)
+                config = entry.endpoint_config
+                self._edit_entry(entry, lambda _current: {"endpoint_config": config})
         return entries
 
     @staticmethod
@@ -1408,7 +1600,9 @@ class SchedulerScheduler:
 
         # Non-agent actions retain the historical advance-before-delivery
         # behavior; occurrence idempotency is specifically for task handoff.
-        self.store.mark_triggered(entry.id)
+        # A schedule whose block is gone from the inbox is not delivered.
+        if self.store.mark_triggered(entry.id) is None:
+            return
 
         if entry.action == "prompt" and self._should_skip_pre_meeting(entry):
             self.store.record_run(entry.id, "skipped", "no upcoming meeting")

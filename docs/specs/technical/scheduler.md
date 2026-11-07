@@ -43,10 +43,20 @@ representation and lives only in the cache), are **merged back by ID** on
 every reindex via `_merge_prior` (`scheduler_store.py:553`). This is why
 editing a line in Obsidian never wipes a schedule's prompt text or history.
 
-CRUD writes both sides: `create`/`update`/`mark_triggered`
-(`:387`, `:415`, `:438`) edit the markdown line by ID and re-save the cache;
-`record_run` (`:453`) updates history in the cache only (it is not part of the
-markdown definition).
+CRUD writes both sides. `create` formats a whole new block.
+`update`/`mark_triggered`/`set_snooze` go through `_edit_entry`, which, under
+the store lock, re-reads the entry's current block from Inbox.md by ID, edits
+only the tokens the changed attributes own (`_edit_block_lines`: the checkbox,
+the leading name text, the executor tag, the `>` body, or the inline fields in
+`_ATTR_FIELD_KEYS`, serialized by `_format_entry_line`), then re-parses the
+edited block into the cache. Unknown fields, field order, and the body survive,
+and a hand edit made since the last reindex is picked up. With duplicate ids
+the last block is edited, the same block a reindex keeps. A block missing on
+disk is never written back: `_edit_entry` drops the entry from the cache and
+returns None, so `update`/`set_snooze` callers answer 404 and a fire skips
+delivery.
+`record_run` updates history in the cache only (it is not part of the markdown
+definition).
 
 ## Reindex on edit
 
