@@ -34,6 +34,7 @@ class _FakeEmbeddingService:
         self._default = default          # vector for unknown text
         self.model_name = model_name
         self.embedded_texts = []         # every text passed to embed_text/embed_texts
+        self.query_flags = []            # the query flag of each embed_texts call
 
     def _lookup(self, text):
         return list(self._vectors.get(text, self._default))
@@ -42,8 +43,9 @@ class _FakeEmbeddingService:
         self.embedded_texts.append(text)
         return self._lookup(text)
 
-    def embed_texts(self, texts):
+    def embed_texts(self, texts, query=False):
         self.embedded_texts.extend(texts)
+        self.query_flags.append(query)
         return [self._lookup(t) for t in texts]
 
 
@@ -748,6 +750,17 @@ class TestMemoryStoreHybridSearch:
         entry = cache["vectors"][memory.id]
         assert entry["vector"] == [1.0, 0.0, 0.0]
         assert len(entry["hash"]) == 64  # sha256 hex digest
+
+    def test_memories_embedded_during_a_search_use_the_query_lock_wait(self, store, monkeypatch):
+        """A search embeds uncached memories on the request path, so the call
+        takes the short GPU-lock wait of a query, not the batch wait."""
+        store.create_memory("synthetic memory to embed")
+        fake = _FakeEmbeddingService(vectors={}, default=[1.0, 0.0, 0.0])
+        self._use(monkeypatch, fake)
+
+        store.search_memories("any query")
+
+        assert fake.query_flags == [True]
 
     def test_cache_recomputes_only_on_content_change(self, store, monkeypatch):
         """A memory is re-embedded when its content changes, not on every search."""

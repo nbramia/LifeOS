@@ -3,6 +3,7 @@ Vector Search API endpoint.
 
 POST /api/search - Search the indexed vault for relevant content.
 """
+import asyncio
 import logging
 import time
 from typing import Optional
@@ -141,7 +142,8 @@ async def search(request: SearchRequest) -> SearchResponse:
     # Search using hybrid search (vector + BM25 keyword)
     try:
         hybrid_search = get_hybrid_search()
-        raw_results = hybrid_search.search(
+        raw_results = await asyncio.to_thread(
+            hybrid_search.search,
             query=request.query,
             top_k=request.top_k,
             date_from=date_from,

@@ -117,6 +117,10 @@ The uvicorn access log itself has its query string stripped before it ever reach
 
 Both signals alert via Telegram and log to `logs/gpu-watchdog.log`. See `api/services/embeddings.py`'s cross-process `flock` (settings `embedding_gpu_lock_*`) for the mitigation that serializes GPU embedding across processes to prevent SDMA exhaustion in the first place.
 
+### GPU embedding lock
+
+Every LifeOS process takes a cross-process `flock` on `data/gpu_embed.lock` (`api/services/embeddings.py`) around each GPU embedding call, so only one process uses the GPU queues at a time. Indexing and batch jobs (the nightly sync, `scripts/sync_vault_reindex.py`) wait up to `LIFEOS_EMBEDDING_GPU_LOCK_TIMEOUT` (300 s), then embed on CPU for the rest of that run. A search query's embedding waits only `LIFEOS_EMBEDDING_QUERY_GPU_LOCK_TIMEOUT` (5 s), then embeds that one query on CPU, so chat and search keep working while a reindex holds the lock. Every async request path runs searches in a worker thread, so a wait never blocks the API's event loop. `Encoding this query on CPU because the GPU embedding lock was not acquired in time` in `logs/server.log` means a batch job held the lock during a query; it is expected during the nightly sync and reindexes.
+
 ## Host routes and dependencies
 
 Other devices reach this host through tailnet routes and depend on a few host processes. LifeOS declares them, applies them, verifies them, and repairs them, so a reboot cannot silently drop one.

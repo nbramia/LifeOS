@@ -3,6 +3,7 @@ Calendar API endpoints for LifeOS.
 
 Provides access to Google Calendar events.
 """
+import asyncio
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -15,7 +16,7 @@ from api.services.calendar import (
     format_event_time,
 )
 from api.services.google_auth import resolve_account
-from api.services.meeting_prep import get_meeting_prep, MeetingPrep, RelatedNote
+from api.services.meeting_prep import get_meeting_prep
 
 router = APIRouter(prefix="/api/calendar", tags=["calendar"])
 
@@ -353,7 +354,8 @@ async def get_meeting_prep_endpoint(
         date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     try:
-        result = get_meeting_prep(
+        result = await asyncio.to_thread(
+            get_meeting_prep,
             date=date,
             include_all_day=include_all_day,
             max_related_notes=max_related_notes,

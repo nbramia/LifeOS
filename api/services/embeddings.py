@@ -24,6 +24,14 @@ logger = logging.getLogger(__name__)
 # GPU error keywords — shared between load-time and encode-time fallback
 _GPU_ERROR_KEYWORDS = ("hip", "cuda", "out of memory", "invalid device", "gpu hang")
 
+# How long the CPU copy used by query embeddings may sit unused before a query
+# that gets the GPU lock releases it.
+_CPU_COPY_IDLE_RELEASE_SECONDS = 600.0
+
+# Serializes model loads across every EmbeddingService in the process; a load
+# may swap os.environ (see _load_with_offline_retry).
+_LOAD_LOCK = threading.Lock()
+
 # Outcomes of _acquire_gpu_lock(). See its docstring.
 _LOCK_ACQUIRED = "acquired"
 _LOCK_DISABLED = "disabled"
@@ -93,15 +101,22 @@ class EmbeddingService:
         self.cache_dir = cache_dir or getattr(settings, 'embedding_cache_dir', None) or None
         self._model: Any = None
         self._force_cpu: bool = False
+        # A CPU copy that query embeddings use while another process holds the
+        # GPU lock; the GPU model stays the primary (see _encode_query_on_cpu).
+        self._cpu_model: Any = None
+        self._cpu_model_last_used: float = 0.0
         self._ceiling: int | None = None
         self._length_tokenizer: Any = None
-        # Serialize lazy loads. Searches run through execute_tool_parallel →
-        # asyncio.to_thread, so concurrent first-use from multiple tool threads
-        # would otherwise race the (meta-device) model init and leave params on
-        # the meta device — surfacing as "Cannot copy out of meta tensor" when
-        # SentenceTransformer.__init__ calls self.to(device). Loading once under
-        # a lock removes the race.
-        self._load_lock = threading.Lock()
+        # Guards the primary model: its load, every encode on it, and the
+        # switch to CPU. Embedding calls arrive from many worker threads, so
+        # this keeps them from racing the (meta-device) model init ("Cannot
+        # copy out of meta tensor"), sharing the model's tokenizer ("Already
+        # borrowed"), or publishing a GPU model after the switch to CPU.
+        # Reentrant because an encode under it loads the model through
+        # ``self.model``.
+        self._model_lock = threading.RLock()
+        # Guards the CPU copy the same way (see _encode_query_on_cpu).
+        self._cpu_copy_lock = threading.Lock()
 
     @property
     def using_cpu_fallback(self) -> bool:
@@ -112,13 +127,13 @@ class EmbeddingService:
     def model(self) -> "SentenceTransformer":
         """Lazy-load the model, falling back to CPU if GPU fails."""
         if self._model is None:
-            with self._load_lock:
+            with self._model_lock:
                 if self._model is None:
                     self._load_model()
         return self._model
 
     def _load_model(self) -> None:
-        """Construct the SentenceTransformer (caller holds ``self._load_lock``)."""
+        """Construct the SentenceTransformer (caller holds ``self._model_lock``)."""
         from sentence_transformers import SentenceTransformer
 
         try:
@@ -204,8 +219,10 @@ class EmbeddingService:
             return None
 
     def _warn_if_truncated(self, data) -> None:
-        """Log (counts only, never text) when ``data`` exceeds the ceiling."""
-        _ = self.model  # a first call loads the model, which sets the ceiling
+        """Log (counts only, never text) when ``data`` exceeds the ceiling.
+
+        Called once the encoding model is loaded, since loading sets the ceiling.
+        """
         if self._ceiling is None or self._length_tokenizer is None:
             return
         try:
@@ -237,10 +254,15 @@ class EmbeddingService:
         behaviour is to skip the network probe entirely.
 
         Thread safety: mutates ``os.environ`` for the duration of the retry.
-        This runs inside ``EmbeddingService._load_lock`` (the ``model`` property
-        serializes lazy loads), so the env swap can't race a concurrent load,
-        and the try/finally restores it before the lock is released.
+        Every load runs under the module-wide ``_LOAD_LOCK``, so the env swap
+        can't race a concurrent load, and the try/finally restores it before
+        the lock is released.
         """
+        with _LOAD_LOCK:
+            return self._load_with_offline_retry_locked(st_cls, load_kwargs)
+
+    def _load_with_offline_retry_locked(self, st_cls, load_kwargs: dict):
+        """``_load_with_offline_retry`` body; the caller holds ``_LOAD_LOCK``."""
         try:
             return st_cls(**load_kwargs)
         except Exception as exc:
@@ -277,7 +299,7 @@ class EmbeddingService:
             return model
 
     @contextmanager
-    def _acquire_gpu_lock(self):
+    def _acquire_gpu_lock(self, timeout: float | None = None):
         """Cross-process lock serializing GPU embedding across all LifeOS
         processes (API server, agent worker, nightly sync, ad-hoc scripts).
 
@@ -300,13 +322,16 @@ class EmbeddingService:
             just a file, which fits a single-host coordination problem.
           - It works across independent processes (unlike ``threading.Lock``,
             which only serializes within one process, not across processes:
-            ``self._load_lock`` already handles the in-process case).
+            ``self._model_lock`` and ``self._cpu_copy_lock`` handle the
+            in-process case).
 
-        Bounded wait: gives up after
-        ``settings.embedding_gpu_lock_timeout_seconds`` and yields
+        Bounded wait: gives up after ``timeout`` seconds (default
+        ``settings.embedding_gpu_lock_timeout_seconds``) and yields
         ``_LOCK_TIMEOUT`` rather than waiting forever behind a stuck or
         long-running holder. The caller treats a timeout as "someone else is
         actively using the GPU" and falls back to CPU instead of piling on.
+        Query embeddings pass the short
+        ``settings.embedding_query_gpu_lock_timeout_seconds``.
 
         Defensive: any error opening or locking the file (permissions, missing
         parent dir, disk full, an fcntl-less platform) logs a warning and
@@ -349,7 +374,8 @@ class EmbeddingService:
 
         acquired = False
         try:
-            timeout = settings.embedding_gpu_lock_timeout_seconds
+            if timeout is None:
+                timeout = settings.embedding_gpu_lock_timeout_seconds
             deadline = time.monotonic() + timeout
             outcome = _LOCK_ERROR
             while True:
@@ -369,9 +395,8 @@ class EmbeddingService:
                     if time.monotonic() >= deadline:
                         logger.warning(
                             f"Timed out after {timeout}s waiting for the GPU "
-                            f"embedding lock ({lock_path}) — another process is "
-                            "likely embedding on the GPU right now; falling back "
-                            "to CPU for this process."
+                            f"embedding lock ({lock_path}); another process is "
+                            "likely embedding on the GPU right now"
                         )
                         outcome = _LOCK_TIMEOUT
                         break
@@ -388,50 +413,26 @@ class EmbeddingService:
             except OSError:
                 pass
 
-    def _encode(self, data, **kwargs):
-        """``model.encode`` after reporting any input the ceiling will trim."""
-        self._warn_if_truncated(data)
-        return self.model.encode(data, **kwargs)
+    def _encode(self, model, data, **kwargs):
+        """``model.encode`` after reporting any input the ceiling will trim.
 
-    def _encode_with_fallback(self, data, **kwargs):
-        """Encode with GPU→CPU fallback on RuntimeError, serialized against
-        other processes' GPU embedding via a cross-process lock.
-
-        If the model was loaded on GPU and encode() raises a GPU error,
-        the model is reloaded on CPU and the encode is retried.
+        The caller holds the lock that guards ``model``.
         """
-        # Bound the batch so a large document's chunks are encoded in small
-        # groups instead of one giant allocation. An unbounded batch of a
-        # multi-MB note's chunks spiked ~10GB of VRAM in a single call, which
-        # exhausted the gfx1151 iGPU's SDMA queues and froze the host.
-        # This is semantically neutral: batching changes only peak memory, not
-        # the resulting vectors. Callers may still override batch_size.
-        kwargs.setdefault("batch_size", settings.embedding_batch_size)
+        self._warn_if_truncated(data)
+        return model.encode(data, **kwargs)
 
-        if self._force_cpu:
-            # Already on CPU — nothing to serialize (the lock only protects
-            # concurrent GPU access), so skip the flock overhead entirely.
-            return self._encode(data, **kwargs)
+    def _encode_on_primary(self, data, **kwargs):
+        """Encode on the primary model, falling back to CPU on a GPU error.
 
-        with self._acquire_gpu_lock() as outcome:
-            if outcome == _LOCK_TIMEOUT:
-                # Another process is very likely on the GPU right now. Rather
-                # than encode on top of it — the exact concurrent-access
-                # pattern that exhausts the iGPU's SDMA queues — give up on
-                # GPU for the rest of this process's lifetime, same as a real
-                # GPU error would (see the RuntimeError branch below).
-                logger.warning(
-                    "Falling back to CPU embeddings for this process because "
-                    "the GPU embedding lock was not acquired in time"
-                )
-                self._model = None
-                self._force_cpu = True
-                return self._encode(data, **kwargs)
-
-            # ACQUIRED, DISABLED, or ERROR all proceed on GPU as before — the
-            # existing GPU->CPU RuntimeError fallback still applies.
+        Holds ``self._model_lock`` for the whole call, so one encode at a time
+        uses the primary model and its tokenizer, and a switch to CPU cannot
+        interleave with a load or an encode. Callers that may run on the GPU
+        hold the cross-process GPU lock already; the model lock is never held
+        while waiting for it.
+        """
+        with self._model_lock:
             try:
-                return self._encode(data, **kwargs)
+                return self._encode(self.model, data, **kwargs)
             except RuntimeError as e:
                 error_msg = str(e).lower()
                 if self._force_cpu or not any(kw in error_msg for kw in _GPU_ERROR_KEYWORDS):
@@ -445,11 +446,130 @@ class EmbeddingService:
                 )
                 self._model = None
                 self._force_cpu = True
-                return self._encode(data, **kwargs)
+                return self._encode(self.model, data, **kwargs)
+
+    def _move_to_cpu_and_encode(self, data, **kwargs):
+        """Switch the whole process to CPU, then encode on it."""
+        with self._model_lock:
+            if not self._force_cpu:
+                logger.warning(
+                    "Falling back to CPU embeddings for this process because "
+                    "the GPU embedding lock was not acquired in time"
+                )
+                self._model = None
+                self._force_cpu = True
+            return self._encode(self.model, data, **kwargs)
+
+    def _encode_query_on_cpu(self, data, **kwargs):
+        """Encode one query on the CPU copy, leaving the GPU model in place.
+
+        A query is small, so it costs little on the CPU, and the service keeps
+        using the GPU for every call that gets the lock. That is why a query
+        timeout does not move the whole process to CPU: in the long-lived API
+        process that would last until the next restart.
+
+        ``self._cpu_copy_lock`` covers the load, the encode, and the idle
+        release, so concurrent queries take turns on the copy and its
+        tokenizer, the copy loads once, and it is never freed while in use.
+        """
+        if self._force_cpu:
+            return self._encode_on_primary(data, **kwargs)
+        with self._cpu_copy_lock:
+            if self._cpu_model is None:
+                from sentence_transformers import SentenceTransformer
+
+                model = self._load_with_offline_retry(SentenceTransformer, dict(
+                    model_name_or_path=self.model_name,
+                    cache_folder=self.cache_dir,
+                    device="cpu",
+                    local_files_only=True,
+                ))
+                self._apply_sequence_ceiling(model)
+                self._cpu_model = model
+            self._cpu_model_last_used = time.monotonic()
+            return self._encode(self._cpu_model, data, **kwargs)
+
+    def _release_idle_cpu_model(self) -> None:
+        """Drop the CPU copy once it has gone unused for a while.
+
+        Runs at the start of every embedding call. The copy is a second full
+        model in RAM, so it is kept only while the GPU lock is contended; the
+        idle window stops a run of alternating lock outcomes during a long
+        batch job from reloading it on every other query. A copy in use holds
+        ``self._cpu_copy_lock``, so it is skipped rather than waited for.
+        """
+        if self._cpu_model is None:
+            return
+        if not self._cpu_copy_lock.acquire(blocking=False):
+            return
+        try:
+            if (
+                self._cpu_model is not None
+                and time.monotonic() - self._cpu_model_last_used >= _CPU_COPY_IDLE_RELEASE_SECONDS
+            ):
+                self._cpu_model = None
+        finally:
+            self._cpu_copy_lock.release()
+
+    def _encode_with_fallback(self, data, query: bool = False, **kwargs):
+        """Encode with GPU→CPU fallback on RuntimeError, serialized against
+        other processes' GPU embedding via a cross-process lock.
+
+        If the model was loaded on GPU and encode() raises a GPU error,
+        the model is reloaded on CPU and the encode is retried.
+
+        ``query`` marks a request-path embedding (a search query). It waits
+        only ``settings.embedding_query_gpu_lock_timeout_seconds`` for the GPU
+        lock and, on timeout, encodes this one call on a CPU copy of the model.
+        Other calls (indexing, batch jobs) wait
+        ``settings.embedding_gpu_lock_timeout_seconds`` and, on timeout, move
+        the whole process to CPU.
+
+        The GPU lock wait holds no in-process lock, so a batch call waiting
+        minutes for it never delays a query's CPU path.
+        """
+        # Bound the batch so a large document's chunks are encoded in small
+        # groups instead of one giant allocation. An unbounded batch of a
+        # multi-MB note's chunks spiked ~10GB of VRAM in a single call, which
+        # exhausted the gfx1151 iGPU's SDMA queues and froze the host.
+        # This is semantically neutral: batching changes only peak memory, not
+        # the resulting vectors. Callers may still override batch_size.
+        kwargs.setdefault("batch_size", settings.embedding_batch_size)
+        self._release_idle_cpu_model()
+
+        if self._force_cpu:
+            # Already on CPU: nothing to serialize across processes (the lock
+            # only protects concurrent GPU access), so skip the flock.
+            return self._encode_on_primary(data, **kwargs)
+
+        lock_timeout = settings.embedding_query_gpu_lock_timeout_seconds if query else None
+        with self._acquire_gpu_lock(lock_timeout) as outcome:
+            if outcome == _LOCK_TIMEOUT and query:
+                logger.warning(
+                    "Encoding this query on CPU because the GPU embedding lock "
+                    "was not acquired in time"
+                )
+                return self._encode_query_on_cpu(data, **kwargs)
+
+            if outcome == _LOCK_TIMEOUT:
+                # Another process is very likely on the GPU right now. Rather
+                # than encode on top of it (the concurrent-access pattern that
+                # exhausts the iGPU's SDMA queues), give up on GPU for the rest
+                # of this process's lifetime, as a real GPU error does.
+                return self._move_to_cpu_and_encode(data, **kwargs)
+
+            # ACQUIRED, DISABLED, or ERROR all proceed on GPU; a GPU error
+            # still falls back to CPU.
+            return self._encode_on_primary(data, **kwargs)
 
     def embed_text(self, text: str) -> list[float]:
         """
-        Generate embedding for a single text.
+        Generate the embedding for a single search query.
+
+        This is the request-path embedding: it waits only briefly for the GPU
+        lock and encodes on CPU for this call when the lock is busy (see
+        ``_encode_with_fallback``). It is synchronous, so async callers run it
+        (or the search that calls it) in a worker thread.
 
         Args:
             text: Text to embed
@@ -457,20 +577,22 @@ class EmbeddingService:
         Returns:
             List of floats representing the embedding vector
         """
-        embedding = self._encode_with_fallback(text, convert_to_numpy=True)
+        embedding = self._encode_with_fallback(text, query=True, convert_to_numpy=True)
         return embedding.tolist()
 
-    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+    def embed_texts(self, texts: list[str], query: bool = False) -> list[list[float]]:
         """
         Generate embeddings for multiple texts.
 
         Args:
             texts: List of texts to embed
+            query: True for a small request-path batch, which gets the query
+                lock behaviour of ``embed_text``; indexing leaves it False.
 
         Returns:
             List of embedding vectors
         """
-        embeddings = self._encode_with_fallback(texts, convert_to_numpy=True)
+        embeddings = self._encode_with_fallback(texts, query=query, convert_to_numpy=True)
         return [emb.tolist() for emb in embeddings]
 
     @property

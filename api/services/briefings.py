@@ -8,6 +8,7 @@ Generates stakeholder briefings by aggregating:
 - Calendar meetings with the person
 - Interaction history
 """
+import asyncio
 import logging
 from datetime import datetime
 from typing import Optional
@@ -497,8 +498,9 @@ class BriefingsService:
             Dict with briefing content and metadata
         """
         # Gather context
-        context = self.gather_context(
-            person_name, email=email, interaction_days=interaction_days
+        # Off the event loop: gathering runs a vault search, which embeds.
+        context = await asyncio.to_thread(
+            self.gather_context, person_name, email=email, interaction_days=interaction_days
         )
 
         if not context:
