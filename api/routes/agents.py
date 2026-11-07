@@ -2192,9 +2192,13 @@ async def cancel_board_card(card_id: str) -> dict[str, Any]:
 
     # Strip the tags that would otherwise keep the card out of Done —
     # `derive_lane` ranks Human queue and In progress above Done, so a
-    # lingering `agent-running`/`agent-blocked`/`human` tag would hide the
-    # cancellation instead of landing the card where the operator expects it.
-    strip = {agent_board.RUNNING_TAG, agent_board.BLOCKED_TAG, agent_board.HUMAN_TAG}
+    # lingering `agent-running`/`agent-blocked`/`human` tag or a provider/
+    # dependency wait tag would hide the cancellation instead of landing the
+    # card where the operator expects it.
+    strip = {
+        agent_board.RUNNING_TAG, agent_board.BLOCKED_TAG, agent_board.HUMAN_TAG,
+        *agent_board.MACHINE_WAIT_TAGS,
+    }
     new_tags = [t for t in task.tags if t.lstrip("#").lower() not in strip]
 
     def cancel_still_allowed(current) -> None:

@@ -4,8 +4,8 @@
 // task store via GET/PUT /api/agents/board*, with a card drawer that reuses
 // the shared SessionPanel (./panel.js) for the linked session's transcript,
 // exactly like the Graph tab's side panel does. The drawer's own action
-// row (Open, Go To, Resume, Kill, Answer, Accept, Reject, Reassign, Mark
-// Done, Snooze, Unsnooze, Cancel, Delete)
+// row (Open, Go To, Resume, Kill, Answer, Accept, Reject, Reassign, Start,
+// Mark Done, Snooze, Unsnooze, Cancel, Delete)
 // is rendered by session_actions.js's `renderActionRow` — the same
 // function the Graph tab's side panel uses for its own header — so the
 // embedded SessionPanel here is constructed with `showActions: false`
@@ -30,6 +30,7 @@ import { LANES, laneColor } from './lanes.js';
 import { routingFilterValue } from './graph_encoding.js';
 import { POINTER_SLOP, pointerCanDrag, pointerIsActive, shouldCancelPointerGesture } from './board_gesture.js';
 import { assignChipHues } from './chip_colors.js';
+import { suggestTags } from './tag_suggestions.js';
 import {
   compareSortValues, loadSortSelection as readSortSelection,
   saveSortSelection as writeSortSelection, sortCards,
@@ -119,6 +120,10 @@ const DEFAULT_VISIBLE_LANE_IDS = LANES.filter(l => l.id !== 'done' && l.id !== '
 // through the drawer's Snooze picker.
 const DIRECT_LANE_IDS = new Set(LANES.filter(l => l.id !== 'review' && l.id !== 'scheduled' && l.id !== 'snoozed').map(l => l.id));
 const SCHEDULED_LANE_ID = 'scheduled';
+// The drawer's lane picker offers exactly these. Human queue is filled by
+// agents only, so the operator never picks it; Review, Scheduled, and
+// Snoozed are derived and can't be set directly.
+const DRAWER_PICKER_LANE_IDS = ['unassigned', 'assigned', 'in_progress', 'done'];
 
 function loadSortSelection() {
   return readSortSelection(localStorage, SORT_STORAGE_KEY, SORT_OPTIONS, DEFAULT_SORT);
@@ -417,7 +422,9 @@ export function initBoard() {
       // the row even while the drawer has focus, rather than leaving a
       // stale button behind until focus leaves.
       renderDrawerActions(fresh);
+      renderDrawerLanePicker(fresh);
     }
+    if (tagPickerHandle && tagPickerHandle.refreshSuggestionLock) tagPickerHandle.refreshSuggestionLock();
 
     // Beyond the editable fields, also watch pending_question and the
     // linked session's status — neither drives an input, but both drive
@@ -1520,11 +1527,10 @@ export function initBoard() {
         return r.json();
       })
       .then((data) => {
-        // The server-landed lane can differ from what was requested for the
-        // tags-only assigned/unassigned moves (e.g. a Human-queue card
-        // assigned to someone stays in Human queue) — surface that instead
-        // of leaving the operator to notice the card "snapped back" on its
-        // own.
+        // The server-landed lane can differ from what was requested (e.g. a
+        // pending Review card dropped on Assigned stays in Review) — surface
+        // that instead of leaving the operator to notice the card "snapped
+        // back" on its own.
         if (data && data.lane && data.lane !== targetLane) {
           showToast(`Card landed in ${laneLabel(data.lane)}, not ${laneLabel(targetLane)}.`, false);
         }
@@ -2320,6 +2326,25 @@ export function initBoard() {
     return normalized;
   }
 
+  // A suggestion is any editable tag except the ones that change who runs
+  // the card or which lane it derives to: the worker's provider/dependency
+  // wait markers (they hold a card In progress), `human` (Human queue is
+  // filled by agents), and `agent` (the worker's pickup marker). They can
+  // still be typed into the picker deliberately.
+  const NEVER_SUGGESTED_TAGS = new Set(['agent-wait-provider', 'agent-wait-dependency', 'human', 'agent']);
+  function normalizeSuggestedTag(raw) {
+    const tag = normalizeEditableTag(raw);
+    return tag && !NEVER_SUGGESTED_TAGS.has(tag) ? tag : null;
+  }
+
+  // The refusal that locks a task card's Tags field (the same `assignee`
+  // policy entry that disables its search box), or null while editable.
+  function tagsLockReason(card) {
+    const entry = card && card.policy && card.policy.assignee;
+    if (!entry || entry.allowed !== false) return null;
+    return entry.reason || "This card's tags can't be changed right now.";
+  }
+
   function uniqueEditableTags(tags) {
     const seen = new Set();
     const result = [];
@@ -2356,9 +2381,14 @@ export function initBoard() {
   // `putBoardTags`); omitting it (the composer) puts the picker in
   // local-only mode — it just tracks the chosen tags in memory for the
   // caller to read back via `handle.getTags()` at submit time, with no
-  // network call and no board re-fetch.
+  // network call and no board re-fetch. `config.suggest(selectedTags)`, when
+  // given, returns tags to offer as faded one-click suggestion chips after
+  // the chosen ones; picking one goes through the same `addTag` path as
+  // picking it from the search list.
   function mountTagPicker(container, initialTags, config) {
     const persist = config && config.persist;
+    const suggest = config && config.suggest;
+    const suggestLock = config && config.suggestLock;
     const picker = container.querySelector('[data-field="tags-picker"]');
     const search = picker && picker.querySelector('[data-field="tags"]');
     const chips = picker && picker.querySelector('[data-field="tag-chips"]');
@@ -2418,6 +2448,27 @@ export function initBoard() {
       chips.querySelectorAll('[data-remove-tag]').forEach(button => {
         button.addEventListener('click', () => removeTag(button.dataset.removeTag));
       });
+      if (!suggest || (suggestLock && suggestLock())) return;
+      const suggestions = suggest(selected.slice()).filter(tag => !selected.includes(tag));
+      chips.insertAdjacentHTML('beforeend', suggestions.map(tag => `
+        <button type="button" class="drawer-tag-suggestion" data-suggest-tag="${escapeHtml(tag)}"
+                aria-label="Add tag ${escapeHtml(tag)}" title="Suggested tag">+#${escapeHtml(tag)}</button>
+      `).join(''));
+      chips.querySelectorAll('[data-suggest-tag]').forEach(button => {
+        button.addEventListener('click', () => {
+          const reason = suggestLock && suggestLock();
+          if (reason) {
+            showToast(reason, true);
+            removeSuggestions();
+            return;
+          }
+          addTag(button.dataset.suggestTag);
+        });
+      });
+    }
+
+    function removeSuggestions() {
+      chips.querySelectorAll('[data-suggest-tag]').forEach(button => button.remove());
     }
 
     function renderOptions() {
@@ -2648,6 +2699,12 @@ export function initBoard() {
       // first (idempotent — a no-op if there's nothing pending, or if
       // blur already committed it).
       commitPendingText: () => saveLegacyText(),
+      // Drops the suggestion chips once `config.suggestLock` reports the
+      // Tags field locked — called on every live-board tick, which skips
+      // the full drawer rebuild while focus sits in the drawer.
+      refreshSuggestionLock: () => {
+        if (suggestLock && suggestLock()) removeSuggestions();
+      },
     };
     if (persist) tagPickerHandle = handle;
     return handle;
@@ -2958,6 +3015,7 @@ export function initBoard() {
         <textarea class="drawer-title" data-field="title" rows="1">${escapeHtml(titleValue)}</textarea>
       </div>
       ${isTask ? `
+      ${card.is_project ? '' : '<div class="drawer-lane-picker" data-field="lane-picker"></div>'}
       <div class="drawer-section drawer-meta" data-field="meta">${cardMetaHtml(card)}</div>
       ${projectDetailsHtml(card)}
       ${cardOutcomeHtml(card)}
@@ -3083,7 +3141,19 @@ export function initBoard() {
     notesEl.addEventListener('input', () => autosizeNotesTextarea(notesEl));
     autosizeNotesTextarea(notesEl);  // size to existing content on open/re-render
 
-    mountTagPicker(drawerEl, editableTags, { persist: (tags) => putBoardTags(card.id, tags) });
+    // Suggestions are offered only while the Tags field itself is editable
+    // (the same policy that disables its search box). `suggestLock` reads
+    // that policy off the live card, so a claim that lands while the drawer
+    // keeps focus (and so isn't rebuilt) still locks them.
+    mountTagPicker(drawerEl, editableTags, {
+      persist: (tags) => putBoardTags(card.id, tags),
+      suggest: assigneeDisabled ? null : (selected) => suggestTags(
+        { id: card.id, title: card.title, notes: card.notes, tags: selected },
+        allCards().filter(c => c.kind === 'task'),
+        { normalizeTag: normalizeSuggestedTag },
+      ),
+      suggestLock: () => tagsLockReason(findCard(card.id) || card),
+    });
 
     const assigneeEl = drawerEl.querySelector('.drawer-assignee[data-field="assignee"]');
     assigneeEl.addEventListener('change', async () => {
@@ -3172,8 +3242,54 @@ export function initBoard() {
     }
 
     renderProjectDrawerFields(card);
+    renderDrawerLanePicker(card);
     renderDrawerActions(card);
     renderDrawerSession(card);
+  }
+
+  // The drawer's lane picker: Unassigned / Assigned / In progress / Done,
+  // the current one pressed. Picking one is exactly a drop onto that lane
+  // (`onCardDropped`), so the Assigned default assignee, the Review -> Done
+  // accept path, Undo, and error toasts all match a drag. A lane the
+  // server policy refuses renders disabled with the refusal as its title.
+  // A card in a lane the picker doesn't offer (Human queue, Review,
+  // Snoozed) shows that lane as read-only text ahead of the options.
+  // Rebuilt only when what it shows changes, so a live-board tick never
+  // steals focus from one of its buttons.
+  function renderDrawerLanePicker(card) {
+    const el = drawerEl && drawerEl.querySelector('[data-field="lane-picker"]');
+    if (!el) return;
+    const refused = (card.policy && card.policy.lanes) || {};
+    const options = DRAWER_PICKER_LANE_IDS.map((laneId) => {
+      const entry = refused[laneId];
+      const reason = entry && entry.allowed === false
+        ? (entry.reason || `Can't move card to ${laneLabel(laneId)}.`)
+        : null;
+      return { laneId, current: card.lane === laneId, reason };
+    });
+    const sig = JSON.stringify([card.id, card.lane, options]);
+    if (el.dataset.sig === sig) return;
+    el.dataset.sig = sig;
+    const derived = DRAWER_PICKER_LANE_IDS.includes(card.lane)
+      ? ''
+      : `<span class="drawer-lane-current" data-field="lane-current">${escapeHtml(laneLabel(card.lane))}</span>`;
+    el.innerHTML = `
+      <span class="drawer-label">Lane</span>
+      ${derived}
+      <div class="drawer-lane-options" role="group" aria-label="Move card to lane">
+        ${options.map(o => `
+          <button type="button" class="drawer-lane-option${o.current ? ' current' : ''}"
+                  data-lane="${o.laneId}" aria-pressed="${o.current}"
+                  ${o.reason ? `disabled title="${escapeHtml(o.reason)}"` : ''}>${escapeHtml(laneLabel(o.laneId))}</button>
+        `).join('')}
+      </div>
+    `;
+    el.querySelectorAll('[data-lane]').forEach((button) => {
+      button.addEventListener('click', () => {
+        if (button.getAttribute('aria-pressed') === 'true') return;
+        onCardDropped(card.id, button.dataset.lane);
+      });
+    });
   }
 
   function openProjectPrompt(title, label, onSubmit) {
@@ -3926,7 +4042,7 @@ export function initBoard() {
   }
 
   // The drawer's action row — Open, Go To, Resume, Kill, Answer, Accept, Reject,
-  // Reassign, Mark Done, Snooze, Unsnooze, Cancel, Delete.
+  // Reassign, Start, Mark Done, Snooze, Unsnooze, Cancel, Delete.
   // Which of these apply and whether each is
   // enabled or disabled-with-a-reason is decided once, by
   // session_actions.js's `decideActions`, and rendered by its
@@ -3936,11 +4052,11 @@ export function initBoard() {
   // built into `renderActionRow` itself (it owns Kill's cascade-preview
   // modal, Resume's host select, Go To's "Locating…" state, and Snooze's
   // preset/duration/date-time picker); Open, Accept, Reject, Reassign,
-  // Mark Done, Snooze's write, Unsnooze, and Delete come from
-  // ./card_actions.js, shared with a
-  // card-linked Graph tab side panel — Cancel and Delete are overridden
-  // below with the extra drawer-specific bookkeeping (closing/rebuilding
-  // this drawer) that a bare handoff to `fetchBoard` doesn't cover.
+  // Snooze's write, Unsnooze, and Delete come from ./card_actions.js,
+  // shared with a card-linked Graph tab side panel — Cancel and Delete are
+  // overridden below with the extra drawer-specific bookkeeping
+  // (closing/rebuilding this drawer) that a bare handoff to `fetchBoard`
+  // doesn't cover, and Start / Mark Done with the board's own drop path.
   function renderDrawerActions(card) {
     const actionsEl = drawerEl.querySelector('[data-field="actions"]');
     if (!actionsEl) return;
@@ -3973,6 +4089,10 @@ export function initBoard() {
         // row a working button for it too.
         rename: () => { if (panel) panel.startRename(); },
         ...guardedCardHandlers,
+        // Start and Mark Done are drops onto In progress / Done, through
+        // the same path as a drag (and the lane picker above).
+        start: () => onCardDropped(card.id, 'in_progress'),
+        resolve: () => onCardDropped(card.id, 'done'),
         cancel: () => runCardAction(() => cancelCard(card, async () => {
           // Tear the session panel down through its own cleanup path right
           // here, rather than leaving it to whichever render call below

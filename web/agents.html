@@ -1702,6 +1702,53 @@
   }
   .drawer-tag-chip-remove:hover,
   .drawer-tag-chip-remove:focus { color: var(--text-primary); background: var(--border); }
+  /* Suggested tags: faded ghost chips after the assigned ones; one click
+     adds the tag. */
+  .drawer-tag-suggestion {
+    display: inline-flex;
+    align-items: center;
+    background: transparent;
+    border: 1px dashed var(--border);
+    border-radius: 999px;
+    padding: 0.1rem 0.5rem;
+    color: var(--text-secondary);
+    font-size: 0.75rem;
+    opacity: 0.7;
+    cursor: pointer;
+  }
+  .drawer-tag-suggestion:hover,
+  .drawer-tag-suggestion:focus-visible { opacity: 1; border-color: var(--accent); color: var(--text-primary); }
+  /* Compact segmented lane picker at the top of a task card's drawer. */
+  .drawer-lane-picker {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.5rem 0 0;
+  }
+  .drawer-lane-picker .drawer-label { margin: 0; }
+  .drawer-lane-current {
+    font-size: 0.75rem;
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.2rem 0.5rem;
+  }
+  .drawer-lane-options { display: inline-flex; flex-wrap: wrap; }
+  .drawer-lane-option {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    padding: 0.2rem 0.55rem;
+    font-size: 0.72rem;
+    cursor: pointer;
+    margin-left: -1px;
+  }
+  .drawer-lane-option:first-child { border-radius: 6px 0 0 6px; margin-left: 0; }
+  .drawer-lane-option:last-child { border-radius: 0 6px 6px 0; }
+  .drawer-lane-option:hover:not(:disabled) { color: var(--text-primary); border-color: var(--accent); }
+  .drawer-lane-option.current { color: var(--text-primary); background: var(--bg-elev); border-color: var(--accent); font-weight: 600; cursor: default; }
+  .drawer-lane-option:disabled { opacity: 0.45; cursor: not-allowed; }
   .drawer-tag-options {
     position: absolute;
     z-index: 4;

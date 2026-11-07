@@ -125,6 +125,21 @@ class TestGetBoard:
         assert card["title"] == "Ping the vendor"
         assert card["assignee"] == "me"
 
+    def test_machine_wait_card_refuses_assigned_and_unassigned_in_policy_and_on_write(self, client, stores):
+        task_manager, *_ = stores
+        task = task_manager.create("Waiting on an example provider", tags=["me", "agent-wait-provider"])
+        r = client.get("/api/agents/board")
+        card = next(c for c in r.json()["lanes"]["in_progress"] if c["id"] == task.id)
+        for lane in ("assigned", "unassigned"):
+            assert card["policy"]["lanes"][lane]["allowed"] is False
+            assert "waiting on a provider" in card["policy"]["lanes"][lane]["reason"]
+        r = client.put(
+            f"/api/agents/board/cards/{task.id}/lane", json={"lane": "assigned", "assignee": "codex"},
+        )
+        assert r.status_code == 409
+        fresh = task_manager.get(task.id)
+        assert "me" in fresh.tags and "codex" not in fresh.tags
+
     def test_agent_owned_card_policy_block_reflects_the_shared_decision_function(self, client, stores):
         """The card's `policy` block comes from the same
         `evaluate_card_action` the write paths enforce — the drawer and
@@ -768,6 +783,22 @@ class TestReviewActions:
                 "SELECT processed, timed_out FROM pending_questions WHERE sent_message_id = 91",
             ).fetchone()
         assert tuple(row) == (1, 1)
+
+    def test_accept_strips_machine_wait_tags_and_undo_returns_to_review(self, client, stores):
+        task_manager, *_ = stores
+        task = task_manager.create(
+            "Synthetic finished run", tags=["codex", "agent-completed", "agent-wait-dependency"], status="done",
+        )
+        accepted = client.post(f"/api/agents/board/cards/{task.id}/accept")
+        assert accepted.status_code == 200, accepted.text
+        assert accepted.json()["lane"] == "done"
+        assert "agent-wait-dependency" not in task_manager.get(task.id).tags
+        undo = client.post(
+            f"/api/agents/board/cards/{task.id}/undo-accept",
+            json={"token": accepted.json()["undo_token"]},
+        )
+        assert undo.status_code == 200, undo.text
+        assert undo.json()["lane"] == "review"
 
     def test_accept_undo_rejects_stale_transition_token(self, client, stores):
         task_manager, _sched, _session_store, _transcript = stores
@@ -1416,6 +1447,14 @@ class TestCancelBoardCard:
         updated = task_manager.get(task.id)
         assert updated.status == "cancelled"
         assert "agent-running" not in updated.tags
+
+    def test_cancel_strips_machine_wait_tags_so_the_card_lands_in_done(self, client, stores):
+        task_manager, *_ = stores
+        task = task_manager.create("Waiting on an example provider", tags=["codex", "agent-wait-provider"])
+        r = client.post(f"/api/agents/board/cards/{task.id}/cancel")
+        assert r.status_code == 200, r.text
+        assert r.json()["lane"] == "done"
+        assert "agent-wait-provider" not in task_manager.get(task.id).tags
 
     def test_cancel_review_card_is_409(self, client, stores):
         task_manager, *_ = stores

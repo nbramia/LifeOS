@@ -703,16 +703,23 @@ Four **409** cases, no write in any of them:
   worker yet (and isn't a pending review) and `lane` is `human_queue` or
   `done` — agent-owned cards are managed by the agent; reassign, unassign,
   or cancel (see below) instead of dragging it there.
+- The card carries `agent-wait-provider` or `agent-wait-dependency` and
+  isn't a pending review — the wait keeps it In progress until the worker
+  clears it, so any move is refused.
 - The card is a pending review (`agent-completed` tag without `accepted`)
   and `lane` is `in_progress` or `human_queue` — accept or reject the
   review first. `lane: "done"` on a pending review still succeeds and acts
   as accept (adds `accepted`), same as `POST .../accept`.
 
+`lane: "assigned"`/`"unassigned"` rewrite the assignee tag and, for a
+card whose status is `in_progress`, `blocked`, `done`, or `cancelled`,
+also set status `todo`; either target strips `#human`. A pending review
+only has its assignee rewritten and stays in Review.
+
 On success, the response's `lane` is the card's actual landed lane, which
-for `lane: "assigned"`/`"unassigned"` (tags-only writes) can differ from
-the requested lane if a higher-priority signal still applies — e.g. a
-Human-queue card assigned to someone stays in Human queue. The web board
-toasts when this happens.
+can differ from the requested lane if a higher-priority signal still
+applies — e.g. a pending review dropped on Assigned stays in Review. The
+web board toasts when this happens.
 
 Every task card in `GET /api/agents/board`'s response also carries a
 server-computed `policy` block (`{claimed, agent_owned, cancel, assignee,

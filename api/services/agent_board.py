@@ -264,6 +264,11 @@ SNOOZE_INELIGIBLE_ERROR: tuple[int, str] = (
     409,
     "only Unassigned, Assigned, Human queue, and Review cards can be snoozed",
 )
+MACHINE_WAIT_ERROR: tuple[int, str] = (
+    409,
+    "this card is waiting on a provider or dependency — the worker owns it "
+    "until the wait clears",
+)
 SNOOZE_UNTIL_INVALID_ERROR: tuple[int, str] = (
     400,
     "until must be an ISO-8601 timestamp with a UTC offset, in the future",
@@ -435,6 +440,11 @@ def evaluate_card_action(
             if target_lane in ("in_progress", "human_queue"):
                 return REVIEW_ERROR
             return None
+        # A provider/dependency wait keeps the card In progress whatever its
+        # status or assignee (see `natural_lane`), so any move would leave
+        # it there; the worker clears the wait tag itself.
+        if _norm_tags(current_tags) & MACHINE_WAIT_TAGS:
+            return MACHINE_WAIT_ERROR
         if agent_owned:
             if target_lane == "in_progress":
                 # Only the worker claims agent-assigned tasks (adds
@@ -639,6 +649,11 @@ def plan_review_action(
     return ReviewActionPlan(status="todo", tags=cleaned)
 
 
+# Statuses that outrank Unassigned/Assigned in `natural_lane`; a move to
+# either of those lanes resets them to `todo`.
+_REOPEN_STATUSES: frozenset[str] = frozenset({"in_progress", "blocked", "done", "cancelled"})
+
+
 def plan_lane_move(
     current_status: str,
     current_tags: Iterable[str],
@@ -681,10 +696,23 @@ def plan_lane_move(
     tset_lower = {t.lstrip("#").lower() for t in tags_list}
     is_review = is_review_pending(tags_list)
 
+    def _reopen(new_tags: list[str]) -> LaneMovePlan:
+        # Unassigned and Assigned rank below Human queue, In progress, and
+        # Done in `natural_lane`, so a card arriving from one of those lanes
+        # goes back to `todo` and loses `human`, or derive_lane would pull
+        # it straight back. A pending Review card keeps its status and tags
+        # apart from the assignee: it stays in Review until accepted or
+        # rejected.
+        if is_review:
+            return _plan(tags=new_tags)
+        status_norm = (current_status or "todo").lower()
+        status = "todo" if status_norm in _REOPEN_STATUSES else None
+        new_tags = [t for t in new_tags if t.lstrip("#").lower() != HUMAN_TAG]
+        return _plan(status=status, tags=new_tags)
+
     if target_lane == "unassigned":
         # Dropping into Unassigned clears the assignee tag.
-        new_tags = [t for t in tags_list if t.lstrip("#").lower() not in ASSIGNEE_TAGS]
-        return _plan(tags=new_tags)
+        return _reopen([t for t in tags_list if t.lstrip("#").lower() not in ASSIGNEE_TAGS])
 
     if target_lane == "assigned":
         assignee_norm = (assignee or "").lstrip("#").lower()
@@ -695,7 +723,7 @@ def plan_lane_move(
             ))
         new_tags = [t for t in tags_list if t.lstrip("#").lower() not in ASSIGNEE_TAGS]
         new_tags.append(assignee_norm)
-        return _plan(tags=new_tags)
+        return _reopen(new_tags)
 
     if target_lane == "in_progress":
         # A card can arrive here from Human queue (#human) — strip it so it

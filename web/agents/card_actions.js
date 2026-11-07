@@ -2,7 +2,7 @@
 //
 // The network call, toast, and (for Delete) the kill-then-delete
 // confirmation modal behind each card-only action in the shared action row
-// (Open, Accept, Reject, Reassign, Mark Done, Snooze, Unsnooze, Cancel,
+// (Open, Accept, Reject, Reassign, Start, Mark Done, Snooze, Unsnooze, Cancel,
 // Delete — see ./session_actions.js's `decideActions`) — the part that's
 // identical wherever a card-aware panel
 // offers them: the Board drawer (web/agents/board.js) and a card-linked
@@ -193,34 +193,31 @@ async function putTask(taskId, patch) {
   return r.json();
 }
 
-// Mark Done is a drop onto Done under the hood. This action only ever
-// fires from Human queue (session_actions.js's `decideActions` offers
-// `resolve` exclusively when `c.lane === 'human_queue'`), so Undo always
-// restores INTO Human queue — replaying the lane endpoint with
-// `{lane: 'human_queue'}` is not safe there: plan_lane_move's human_queue
-// branch only ever forces `status="blocked"` and never touches tags, so it
-// can't bring back a `#human` tag Done's own move just stripped, or a
-// status other than "blocked" the card had before. Restore the
-// exact pre-move status/tags instead, through the general task-update
-// endpoint the drawer's own edits use — its assignee/claim-tag guard
-// refuses the write (leaving the card as the server currently has it)
-// rather than clobbering a reassignment or claim made while it sat in Done.
+// Start and Mark Done are drops onto In progress / Done under the hood.
+// Undo restores the exact pre-move status/tags through the general
+// task-update endpoint the drawer's own edits use, rather than replaying
+// the lane endpoint toward the prior lane: plan_lane_move's lane branches
+// write a fixed status for their target, so they can't bring back a
+// `#human` tag the move just stripped or the exact status the card had
+// before. That endpoint's assignee/claim-tag guard refuses the write
+// (leaving the card as the server currently has it) rather than
+// clobbering a reassignment or claim made in the meantime.
 //
 // `findCard`, when given, resolves the card's live board state at the
 // moment this is actually invoked — `card` itself is whatever
-// `cardActionHandlers(card, ...)` closed over when the drawer's action row
-// was last (re)built, which the drawer skips redoing while focus sits
-// inside it (e.g. right after picking a tag in the Tags search box), so a
-// tag added there is not yet reflected in `card` by the time Mark Done is
-// clicked. Snapshotting from the stale closure would restore the card
-// without that tag on Undo; snapshotting from `findCard`'s live read does not.
-export async function resolveCard(card, onChanged, findCard) {
+// `cardActionHandlers(card, ...)` closed over when the action row was last
+// (re)built, which the drawer skips redoing while focus sits inside it
+// (e.g. right after picking a tag in the Tags search box), so a tag added
+// there is not yet reflected in `card` by the time the button is clicked.
+// Snapshotting from the stale closure would restore the card without that
+// tag on Undo; snapshotting from `findCard`'s live read does not.
+export async function moveCardToLane(card, lane, onChanged, findCard) {
   const current = (findCard && findCard(card.id)) || card;
   const priorStatus = current.status;
   const priorTags = (current.tags || []).slice();
   try {
     const r = await fetch(`/api/agents/board/cards/${encodeURIComponent(card.id)}/lane`, {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lane: 'done' }),
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ lane }),
     });
     if (!r.ok) {
       const text = await r.text();
@@ -229,14 +226,16 @@ export async function resolveCard(card, onChanged, findCard) {
       throw new Error(msg || `HTTP ${r.status}`);
     }
     const data = await r.json();
-    // The server-landed lane can differ from what was requested (e.g. a
-    // Human-queue card assigned to someone stays in Human queue) — surface
+    // The server-landed lane can differ from what was requested — surface
     // that instead of leaving the operator to notice the card "snapped
     // back" on its own.
-    if (data && data.lane && data.lane !== 'done') {
-      showToast(`Card landed in ${laneLabelFor(data.lane)}, not Done.`, false);
+    if (data && data.lane && data.lane !== lane) {
+      showToast(`Card landed in ${laneLabelFor(data.lane)}, not ${laneLabelFor(lane)}.`, false);
     } else {
-      showUndoableToast(`Marked "${card.title || card.id}" done.`, () => (
+      const message = lane === 'done'
+        ? `Marked "${card.title || card.id}" done.`
+        : `Moved "${card.title || card.id}" to ${laneLabelFor(lane)}.`;
+      showUndoableToast(message, () => (
         putTask(card.id, { status: priorStatus, tags: priorTags })
           .then(async (undoData) => {
             if (onChanged) await onChanged(undoData);
@@ -248,7 +247,7 @@ export async function resolveCard(card, onChanged, findCard) {
       ));
     }
     if (onChanged) await onChanged(data);
-  } catch (err) { showToast(`Couldn't resolve card: ${err.message}`, true); }
+  } catch (err) { showToast(`Couldn't move card: ${err.message}`, true); }
 }
 
 // `until` is an absolute ISO-8601 string with a UTC offset, already
@@ -476,7 +475,8 @@ export function cardActionHandlers(card, {
       onMutationOpened, onMutationCancelled,
       onMutationConfirmed, onMutationFailed,
     }),
-    resolve: () => resolveCard(card, changed, findCard),
+    start: () => moveCardToLane(card, 'in_progress', changed, findCard),
+    resolve: () => moveCardToLane(card, 'done', changed, findCard),
     snooze: (until) => snoozeCard(card, until, changed),
     unsnooze: () => unsnoozeCard(card, changed),
     cancel: () => cancelCard(card, changed),

@@ -359,11 +359,9 @@ class TestPlanLaneMove:
 #   * the card is a pending review (agent-completed, not yet accepted) and
 #     the target is In progress or Human queue — Done still doubles as the
 #     accept path
-# Assigned/unassigned are tags-only by design (an assignee change must not
-# pull a card out of Human queue — the lane table says Human queue beats
-# Assigned), so for those two targets this only checks the assignee-tag
-# outcome and that `status` is left untouched, never landed-lane == target
-# — except when the worker owns the card, where they're refused outright.
+# A pending review dropped on Assigned/Unassigned only has its assignee
+# rewritten and stays in Review until accepted or rejected; every other
+# allowed move lands in the target lane.
 # ---------------------------------------------------------------------------
 
 class TestPlanLaneMoveLandsInTargetLane:
@@ -444,12 +442,14 @@ class TestPlanLaneMoveLandsInTargetLane:
         assert plan.error is None, (start_name, target_lane, plan.error)
 
         if target_lane in ("assigned", "unassigned"):
-            assert plan.status is None, (start_name, target_lane, plan.status)
             landed_tags = plan.tags if plan.tags is not None else list(current_tags)
             new_assignee = agent_board.derive_assignee(landed_tags)
             expected_assignee = "me" if target_lane == "assigned" else None
             assert new_assignee == expected_assignee, (start_name, target_lane, landed_tags)
-            return
+            if agent_board.is_review_pending(current_tags):
+                assert plan.status is None, (start_name, target_lane, plan.status)
+                assert agent_board.derive_lane(current_status, landed_tags) == "review"
+                return
 
         final_status = plan.status if plan.status is not None else current_status
         final_tags = plan.tags if plan.tags is not None else list(current_tags)
@@ -504,6 +504,67 @@ class TestPlanLaneMoveLandsInTargetLane:
         )
         assert plan.status is None
         assert plan.tags is None
+
+    def test_in_progress_card_dropped_on_assigned_reopens(self):
+        plan = agent_board.plan_lane_move("in_progress", ["me"], "assigned", "me")
+        assert plan.error is None
+        assert plan.status == "todo"
+        assert agent_board.derive_lane(plan.status, plan.tags) == "assigned"
+
+    def test_in_progress_card_dropped_on_unassigned_reopens(self):
+        plan = agent_board.plan_lane_move("in_progress", ["me", "docs"], "unassigned", None)
+        assert plan.error is None
+        assert plan.status == "todo"
+        assert plan.tags == ["docs"]
+        assert agent_board.derive_lane(plan.status, plan.tags) == "unassigned"
+
+    def test_done_card_dropped_on_assigned_reopens(self):
+        plan = agent_board.plan_lane_move("done", ["me", "docs"], "assigned", "me")
+        assert plan.error is None
+        assert plan.status == "todo"
+        assert agent_board.derive_lane(plan.status, plan.tags) == "assigned"
+
+    def test_blocked_human_card_dropped_on_unassigned_reopens(self):
+        plan = agent_board.plan_lane_move("blocked", ["human", "docs"], "unassigned", None)
+        assert plan.error is None
+        assert plan.status == "todo"
+        assert plan.tags == ["docs"]
+        assert agent_board.derive_lane(plan.status, plan.tags) == "unassigned"
+
+    def test_open_card_dropped_on_assigned_keeps_status(self):
+        plan = agent_board.plan_lane_move("urgent", ["docs"], "assigned", "me")
+        assert plan.error is None
+        assert plan.status is None
+        assert plan.tags == ["docs", "me"]
+
+    def test_review_card_dropped_on_assigned_stays_in_review(self):
+        plan = agent_board.plan_lane_move("done", ["codex", "agent-completed"], "assigned", "me")
+        assert plan.error is None
+        assert plan.status is None
+        assert set(plan.tags) == {"me", "agent-completed"}
+
+    @pytest.mark.parametrize("target_lane,assignee", [("assigned", "me"), ("unassigned", None)])
+    def test_claimed_card_still_refused_on_assigned_and_unassigned(self, target_lane, assignee):
+        plan = agent_board.plan_lane_move(
+            "in_progress", ["codex", "agent-running"], target_lane, assignee,
+        )
+        assert plan.error == (
+            409,
+            "the worker owns this task while it is running or waiting on an "
+            "answer — answer or kill the session first",
+        )
+        assert plan.status is None and plan.tags is None
+
+    @pytest.mark.parametrize("wait_tag", sorted(agent_board.MACHINE_WAIT_TAGS))
+    @pytest.mark.parametrize("target_lane,assignee", [
+        ("assigned", "me"), ("unassigned", None), ("done", None),
+    ])
+    def test_machine_wait_card_refuses_lane_moves(self, wait_tag, target_lane, assignee):
+        # The wait tag keeps the card In progress regardless of status, so a
+        # move would write status/tags and still leave it there.
+        plan = agent_board.plan_lane_move("todo", ["me", wait_tag], target_lane, assignee)
+        assert plan.error == agent_board.MACHINE_WAIT_ERROR
+        assert plan.status is None and plan.tags is None
 
     def test_has_live_session_forwards_to_the_claim_check(self):
         # An agent-owned card whose status is "in_progress" with no claim

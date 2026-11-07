@@ -492,6 +492,23 @@ def _stub_routes(page: Page, board_state: dict, lane_calls: list, task_puts: lis
                             others = [t for t in card.get("tags", []) if t.lower() not in _ASSIGNEE_TAGS]
                             card["assignee"] = assignee or None
                             card["tags"] = ([assignee] if assignee else []) + others
+                # Mirrors plan_lane_move's assigned/unassigned branches: a
+                # card that isn't a pending review goes back to `todo` from
+                # a status that outranks those lanes, and loses `#human`.
+                if body.get("lane") in ("assigned", "unassigned"):
+                    for cards in board_state["lanes"].values():
+                        for card in cards:
+                            if card["id"] != lane_match.group(1):
+                                continue
+                            tset = {str(t).lstrip("#").lower() for t in card.get("tags", [])}
+                            if "agent-completed" in tset and "accepted" not in tset:
+                                continue
+                            card["tags"] = [
+                                t for t in card.get("tags", [])
+                                if str(t).lstrip("#").lower() != "human"
+                            ]
+                            if (card.get("status") or "todo") in ("in_progress", "blocked", "done", "cancelled"):
+                                card["status"] = "todo"
                 # Mirrors plan_lane_move's target=="done" branch: `#human` is
                 # stripped (Human queue outranks Done in derive_lane, so
                 # leaving it would immediately pull the card back), status
@@ -7442,3 +7459,207 @@ class TestDrawerFieldHooks:
         page.locator("#board-drawer .drawer-assignee").select_option("hermes")
         _wait_for(lambda: bool(lane_calls), page)
         assert lane_calls[0] == {"lane": "assigned", "assignee": "hermes"}, lane_calls
+
+
+class TestDrawerLanePicker:
+    """The drawer's lane picker moves a card through the same path as a drag."""
+
+    def test_picker_lists_the_four_movable_lanes_and_never_human_queue(
+        self, page: Page, agents_base_url,
+    ):
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t1"]').click()
+        options = page.locator('#board-drawer [data-field="lane-picker"] [data-lane]')
+        expect(options).to_have_count(4)
+        assert options.evaluate_all("els => els.map(e => e.dataset.lane)") == [
+            "unassigned", "assigned", "in_progress", "done",
+        ]
+        expect(page.locator('#board-drawer [data-field="lane-picker"] [data-lane="human_queue"]')).to_have_count(0)
+        expect(page.locator('#board-drawer [data-lane="unassigned"]')).to_have_attribute("aria-pressed", "true")
+        expect(page.locator('#board-drawer [data-lane="done"]')).to_have_attribute("aria-pressed", "false")
+
+    def test_refused_lane_is_disabled_with_the_refusal_as_its_title(
+        self, page: Page, agents_base_url,
+    ):
+        board_state = _board_fixture()
+        board_state["lanes"]["unassigned"][0]["policy"] = {
+            "lanes": {"done": {"allowed": False, "reason": "example refusal reason"}},
+        }
+        lane_calls = []
+        _open_board(page, agents_base_url, board_state=board_state, lane_calls=lane_calls)
+        page.locator('[data-card-id="t1"]').click()
+        done = page.locator('#board-drawer [data-field="lane-picker"] [data-lane="done"]')
+        expect(done).to_be_disabled()
+        expect(done).to_have_attribute("title", "example refusal reason")
+        expect(page.locator('#board-drawer [data-lane="in_progress"]')).to_be_enabled()
+        assert lane_calls == []
+
+    def test_selecting_a_lane_calls_the_lane_endpoint_with_undo(
+        self, page: Page, agents_base_url,
+    ):
+        lane_calls = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls)
+        page.locator('[data-card-id="t1"]').click()
+        page.locator('#board-drawer [data-field="lane-picker"] [data-lane="in_progress"]').click()
+        _wait_for(lambda: bool(lane_calls), page)
+        assert lane_calls == [{"lane": "in_progress"}], lane_calls
+        toast = page.locator(".toast").filter(has_text="In progress")
+        expect(toast.locator(".toast-action")).to_have_text("Undo")
+        expect(page.locator('#board-drawer [data-lane="in_progress"]')).to_have_attribute(
+            "aria-pressed", "true", timeout=5000,
+        )
+
+    def test_assigned_uses_the_drag_default_assignee(self, page: Page, agents_base_url):
+        lane_calls = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls)
+        page.locator('[data-card-id="t1"]').click()
+        page.locator('#board-drawer [data-field="lane-picker"] [data-lane="assigned"]').click()
+        _wait_for(lambda: bool(lane_calls), page)
+        assert lane_calls == [{"lane": "assigned", "assignee": "me"}], lane_calls
+
+    def test_card_in_a_derived_lane_shows_it_read_only(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        page.locator('[data-card-id="t4"]').click()
+        expect(page.locator('#board-drawer [data-field="lane-current"]')).to_have_text("Human queue")
+        pressed = page.locator('#board-drawer [data-field="lane-picker"] [aria-pressed="true"]')
+        expect(pressed).to_have_count(0)
+
+
+class TestDrawerQuickActions:
+    """Start and Mark Done are drops onto In progress / Done."""
+
+    def test_start_routes_through_the_lane_endpoint(self, page: Page, agents_base_url):
+        lane_calls = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls)
+        page.locator('[data-card-id="t1"]').click()
+        page.locator('#board-drawer .drawer-actions [data-action="start"]').click()
+        _wait_for(lambda: bool(lane_calls), page)
+        assert lane_calls == [{"lane": "in_progress"}], lane_calls
+
+    def test_mark_done_is_offered_once_and_routes_through_the_lane_endpoint(
+        self, page: Page, agents_base_url,
+    ):
+        lane_calls = []
+        _open_board(page, agents_base_url, lane_calls=lane_calls)
+        page.locator('[data-card-id="t2"]').click()
+        expect(page.locator('#board-drawer [data-action="resolve"]')).to_have_count(1)
+        expect(page.locator('#board-drawer [data-action="resolve"]')).to_have_text("Mark Done")
+        page.locator('#board-drawer [data-action="resolve"]').click()
+        _wait_for(lambda: bool(lane_calls), page)
+        assert lane_calls == [{"lane": "done"}], lane_calls
+
+
+def _suggestion_board():
+    board_state = _board_fixture()
+    board_state["lanes"]["unassigned"].append({
+        "kind": "task", "id": "t-sim", "title": "Investigate outage alerts",
+        "notes": "", "status": "todo", "tags": ["example-oncall", "claude"], "assignee": None,
+        "fields": {}, "context": "Inbox", "updated_at": "2026-01-01T00:00:00+00:00",
+        "session": None, "pending_question": None,
+    })
+    return board_state
+
+
+class TestDrawerTagSuggestions:
+    """Faded suggestion chips add a tag through the tag picker's own path."""
+
+    def test_clicking_a_suggestion_adds_the_tag(self, page: Page, agents_base_url):
+        task_puts = []
+        _open_board(page, agents_base_url, board_state=_suggestion_board(), task_puts=task_puts)
+        page.locator('[data-card-id="t1"]').click()
+        suggestion = page.get_by_role("button", name="Add tag example-oncall")
+        expect(suggestion).to_be_visible()
+        # An assignee tag on the similar card is never suggested.
+        expect(page.get_by_role("button", name="Add tag claude")).to_have_count(0)
+        suggestion.click()
+        _wait_for(lambda: any("example-oncall" in (p.get("tags") or []) for p in task_puts), page=page)
+        expect(page.locator('#board-drawer .drawer-tag-chip[data-tag="example-oncall"]')).to_be_visible()
+        expect(page.get_by_role("button", name="Add tag example-oncall")).to_have_count(0)
+
+    def test_lane_changing_tags_are_never_suggested(self, page: Page, agents_base_url):
+        board_state = _suggestion_board()
+        sim = next(c for c in board_state["lanes"]["unassigned"] if c["id"] == "t-sim")
+        sim["tags"] = ["example-oncall", "agent-wait-provider", "agent-wait-dependency", "human", "agent"]
+        _open_board(page, agents_base_url, board_state=board_state)
+        page.locator('[data-card-id="t1"]').click()
+        expect(page.get_by_role("button", name="Add tag example-oncall")).to_be_visible()
+        for tag in ("agent-wait-provider", "agent-wait-dependency", "human", "agent"):
+            expect(page.get_by_role("button", name=f"Add tag {tag}", exact=True)).to_have_count(0)
+
+    def test_a_card_carrying_a_wait_tag_keeps_it_on_tag_save(self, page: Page, agents_base_url):
+        task_puts = []
+        board_state = _suggestion_board()
+        board_state["lanes"]["unassigned"][0]["tags"] = ["agent-wait-provider"]
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
+        page.locator('[data-card-id="t1"]').click()
+        expect(page.locator('#board-drawer .drawer-tag-chip[data-tag="agent-wait-provider"]')).to_be_visible()
+        page.get_by_role("button", name="Add tag example-oncall").click()
+        _wait_for(lambda: any("example-oncall" in (p.get("tags") or []) for p in task_puts), page=page)
+        saved = next(p for p in task_puts if "example-oncall" in (p.get("tags") or []))
+        assert "agent-wait-provider" in saved["tags"], saved
+
+    def test_suggestions_drop_when_a_claim_lands_while_the_drawer_has_focus(
+        self, page: Page, agents_base_url,
+    ):
+        stream_gate = threading.Event()
+        task_puts = []
+        board_state = _suggestion_board()
+        board_stream_frames: list[str] = []
+        _open_board(
+            page, agents_base_url, board_state=board_state, task_puts=task_puts,
+            board_stream_frames=board_stream_frames, stream_gate=stream_gate,
+        )
+        page.locator('[data-card-id="t1"]').click()
+        expect(page.get_by_role("button", name="Add tag example-oncall")).to_be_visible()
+        # Focus inside the drawer withholds the full rebuild.
+        page.locator('#board-drawer [data-field="notes"]').focus()
+
+        claimed = copy.deepcopy(board_state)
+        claimed["lanes"]["unassigned"][0]["policy"] = {
+            "assignee": {"allowed": False, "reason": "example claim lock"}, "lanes": {},
+        }
+        claimed["lanes"]["unassigned"][1]["title"] = "Investigate outage alerts (seen)"
+        board_stream_frames.append(f"event: board\ndata: {json.dumps(claimed)}\n\n")
+        stream_gate.set()
+
+        expect(page.locator('[data-card-id="t-sim"]')).to_contain_text("(seen)", timeout=8000)
+        expect(page.get_by_role("button", name="Add tag example-oncall")).to_have_count(0)
+        assert not any("example-oncall" in (p.get("tags") or []) for p in task_puts), task_puts
+
+    def test_suggestions_hidden_when_tags_are_locked(self, page: Page, agents_base_url):
+        board_state = _suggestion_board()
+        board_state["lanes"]["unassigned"][0]["policy"] = {
+            "assignee": {"allowed": False, "reason": "example lock"}, "lanes": {},
+        }
+        _open_board(page, agents_base_url, board_state=board_state)
+        page.locator('[data-card-id="t1"]').click()
+        expect(page.locator('#board-drawer [data-field="tags-reason"]')).to_be_visible()
+        expect(page.locator("#board-drawer .drawer-tag-suggestion")).to_have_count(0)
+
+    def test_scoring_ranks_by_name_match_and_title_similarity(self, page: Page, agents_base_url):
+        _open_board(page, agents_base_url)
+        result = page.evaluate(
+            """async () => {
+                const { suggestTags } = await import('/static/agents/tag_suggestions.js');
+                const normalizeTag = (t) => (['me', 'claude'].includes(t) ? null : t);
+                const cards = [
+                    { id: 'a', title: 'Repaint the garden fence', tags: ['garden', 'weekend'] },
+                    { id: 'b', title: 'Garden fence posts', tags: ['garden', 'claude'] },
+                    { id: 'c', title: 'Write quarterly report', tags: ['work'] },
+                    { id: 'd', title: 'Unrelated errand', tags: ['docs'] },
+                ];
+                const card = { id: 'x', title: 'Fix garden fence gate', notes: 'see the docs', tags: [] };
+                const owned = { id: 'x', title: 'Fix garden fence gate', notes: '', tags: ['garden'] };
+                return {
+                    ranked: suggestTags(card, cards, { normalizeTag }),
+                    owned: suggestTags(owned, cards, { normalizeTag }),
+                    limited: suggestTags(card, cards, { normalizeTag, limit: 1 }),
+                };
+            }"""
+        )
+        # garden: name match plus similarity to both fence cards; docs: a
+        # name match from the notes only; weekend: similarity only; work
+        # scores zero and claude is excluded by normalizeTag.
+        assert result["ranked"] == ["garden", "docs", "weekend"], result
+        assert result["owned"] == ["weekend"], result
+        assert result["limited"] == ["garden"], result
