@@ -778,6 +778,17 @@ class TestTriggerRoute:
             resp = client.post("/api/scheduler/ghost/trigger")
         assert resp.status_code == 404
 
+    def test_update_of_block_deleted_by_hand_returns_404(self, client, store):
+        entry = store.create(
+            name="Deleted by hand", schedule_type="cron", schedule_value="0 9 * * *",
+            action="notify", message_type="static", message_content="hi",
+        )
+        store.inbox_path.write_text("# Scheduler Inbox\n", encoding="utf-8")
+        with patch("api.routes.scheduler.get_scheduler_store", return_value=store):
+            resp = client.put(f"/api/scheduler/{entry.id}", json={"enabled": False})
+        assert resp.status_code == 404
+        assert store.inbox_path.read_text(encoding="utf-8") == "# Scheduler Inbox\n"
+
 
 class TestListBots:
     @pytest.fixture

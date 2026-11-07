@@ -826,7 +826,7 @@ class SchedulerStore:
             lines = lines[:first_idx] + block + lines[first_idx:]
         self._write_inbox_lines(lines)
 
-    def _edit_entry(self, cached: ScheduleEntry, changes_for) -> ScheduleEntry:
+    def _edit_entry(self, cached: ScheduleEntry, changes_for) -> Optional[ScheduleEntry]:
         """Apply targeted edits to ``cached``'s block in Inbox.md and return
         the entry as it reads on disk afterwards. Must be called with the lock held.
 
@@ -839,20 +839,20 @@ class SchedulerStore:
         entry's non-markdown fields merged forward; ``next_trigger_at`` is the
         caller's to set.
 
-        A block missing from disk (deleted by hand) is written at the top of
-        the inbox, fully formatted from the cached entry plus the changes.
+        When several blocks share the id, the last one is edited, matching
+        the block a reindex keeps. When no block carries the id (deleted or
+        re-id'd by hand), nothing is written: the entry is dropped from the
+        cache and None is returned, so callers treat it as an unknown id.
         """
         lines = self._read_inbox_lines()
-        found = next(
-            ((start, end, entry) for start, end, entry in _iter_entry_blocks(lines)
-             if entry.id == cached.id),
-            None,
-        )
+        found = None
+        for start, end, entry in _iter_entry_blocks(lines):
+            if entry.id == cached.id:
+                found = (start, end, entry)
         if found is None:
-            changes = changes_for(cached)
-            target = dataclasses.replace(cached, **changes)
-            self._insert_block_at_top(_format_entry_block(target))
-            return target
+            logger.info("Schedule block missing from the inbox; dropping it from the cache")
+            self._entries = {k: v for k, v in self._entries.items() if k != cached.id}
+            return None
         start, end, disk = found
         current = copy.copy(disk)
         self._merge_prior(current, cached)
@@ -964,6 +964,9 @@ class SchedulerStore:
                 if key in ScheduleEntry.__dataclass_fields__ and value is not None
             }
             entry = self._edit_entry(cached, lambda _current: changes)
+            if entry is None:
+                self._save()
+                return None
             if any(k in changes for k in _TRIGGER_ATTRS) or any(
                 getattr(entry, k) != getattr(cached, k) for k in _TRIGGER_ATTRS
             ):
@@ -982,7 +985,7 @@ class SchedulerStore:
                 return True
             return False
 
-    def mark_triggered(self, entry_id: str):
+    def mark_triggered(self, entry_id: str) -> Optional[ScheduleEntry]:
         """Mark a schedule as triggered and advance/disable it.
 
         A ``once`` schedule is consumed (disabled, no next fire). ``cron``
@@ -994,11 +997,14 @@ class SchedulerStore:
         ended, drops its ``snoozed_until``; a manual trigger during a cron
         schedule's snooze keeps it, so the next scheduled fire still waits
         for the snooze's end.
+
+        Returns the updated entry, or None when the schedule is unknown or
+        its block is gone from the inbox.
         """
         with self._lock:
             cached = self._entries.get(entry_id)
             if not cached:
-                return
+                return None
 
             def fire_changes(current: ScheduleEntry) -> dict:
                 changes: dict = {"last_triggered_at": datetime.now(timezone.utc).isoformat()}
@@ -1009,8 +1015,12 @@ class SchedulerStore:
                 return changes
 
             entry = self._edit_entry(cached, fire_changes)
+            if entry is None:
+                self._save()
+                return None
             entry.next_trigger_at = None if entry.schedule_type == "once" else compute_next_trigger(entry)
             self._commit(entry)
+            return entry
 
     def set_snooze(self, entry_id: str, snoozed_until: Optional[str]) -> Optional[ScheduleEntry]:
         """Snooze a schedule until ``snoozed_until`` (an ISO-8601 string with
@@ -1044,6 +1054,9 @@ class SchedulerStore:
                 return {"snoozed_until": snoozed_until}
 
             entry = self._edit_entry(cached, snooze_changes)
+            if entry is None:
+                self._save()
+                return None
             entry.next_trigger_at = compute_next_trigger(entry) if entry.enabled else None
             self._commit(entry)
             return entry
@@ -1587,7 +1600,9 @@ class SchedulerScheduler:
 
         # Non-agent actions retain the historical advance-before-delivery
         # behavior; occurrence idempotency is specifically for task handoff.
-        self.store.mark_triggered(entry.id)
+        # A schedule whose block is gone from the inbox is not delivered.
+        if self.store.mark_triggered(entry.id) is None:
+            return
 
         if entry.action == "prompt" and self._should_skip_pre_meeting(entry):
             self.store.record_run(entry.id, "skipped", "no upcoming meeting")

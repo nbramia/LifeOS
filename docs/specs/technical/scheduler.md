@@ -50,9 +50,11 @@ only the tokens the changed attributes own (`_edit_block_lines`: the checkbox,
 the leading name text, the executor tag, the `>` body, or the inline fields in
 `_ATTR_FIELD_KEYS`, serialized by `_format_entry_line`), then re-parses the
 edited block into the cache. Unknown fields, field order, and the body survive,
-and a hand edit made since the last reindex is picked up. A block missing on
-disk is written, fully formatted from the cache plus the edit, at the top of
-the inbox.
+and a hand edit made since the last reindex is picked up. With duplicate ids
+the last block is edited, the same block a reindex keeps. A block missing on
+disk is never written back: `_edit_entry` drops the entry from the cache and
+returns None, so `update`/`set_snooze` callers answer 404 and a fire skips
+delivery.
 `record_run` updates history in the cache only (it is not part of the markdown
 definition).
 

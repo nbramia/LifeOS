@@ -75,8 +75,11 @@ its checkbox, a snooze only its `[snoozed_until:: …]` field, a fire only its
 `[last:: …]` field, and so on. Fields LifeOS doesn't know, field order, and the
 instruction body stay exactly as you wrote them, and a hand edit saved just
 before a board change is kept rather than overwritten. If you delete a
-schedule's line by hand and a board change reaches it before the watcher
-reindexes, that board change writes the full schedule line at the top of the inbox.
+schedule's line by hand and a board change or a fire reaches it before the
+watcher reindexes, nothing is written: the schedule is dropped, the board
+change answers "not found", and the fire is not delivered. When two lines
+share an id, the last one is the schedule, and it is the one a board change
+edits.
 
 ## Triggers
 

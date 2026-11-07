@@ -513,19 +513,47 @@ class TestTargetedEdits:
         store.update(entry.id, name="Daily digest", enabled=True, message_content="Send the synthetic digest")
         assert self._text(store) == before
 
-    def test_block_deleted_by_hand_is_written_from_the_cache(self, store):
-        """A mutation on an entry whose block is gone writes the full block at the top."""
+    def _delete_block_by_hand(self, store, entry_id):
+        lines = self._text(store).splitlines()
+        start = next(i for i, ln in enumerate(lines) if f"id:{entry_id}" in ln)
+        store.inbox_path.write_text("\n".join(lines[:start] + lines[start + 2:]) + "\n", encoding="utf-8")
+        return self._text(store)
+
+    @pytest.mark.parametrize("mutate", [
+        lambda store, entry_id: store.update(entry_id, enabled=False),
+        lambda store, entry_id: store.set_snooze(entry_id, SNOOZE_UNTIL),
+        lambda store, entry_id: store.mark_triggered(entry_id),
+    ])
+    def test_block_deleted_by_hand_is_not_written_back(self, store, mutate):
+        """A mutation on an entry whose block is gone writes nothing and
+        drops the entry from the cache."""
         keep = self._create(store, name="Keeper")
         gone = self._create(store, name="Removed by hand")
-        lines = self._text(store).splitlines()
-        start = next(i for i, ln in enumerate(lines) if f"id:{gone.id}" in ln)
-        store.inbox_path.write_text("\n".join(lines[:start] + lines[start + 2:]) + "\n", encoding="utf-8")
+        before = self._delete_block_by_hand(store, gone.id)
 
-        store.update(gone.id, enabled=False)
-        line = self._line(store, gone.id)
-        assert line == _format_entry_line(store.get(gone.id))
-        assert line.startswith("- [x] Removed by hand")
-        assert self._line(store, keep.id)
+        assert mutate(store, gone.id) is None
+        assert self._text(store) == before
+        assert store.get(gone.id) is None
+        assert store.get(keep.id) is not None
+        assert gone.id not in store.index_path.read_text(encoding="utf-8")
+
+    def test_duplicate_ids_edit_the_block_reindex_keeps(self, store):
+        """With two blocks sharing an id, the last one is the entry (as on
+        reindex) and is the one a mutation edits."""
+        entry = self._create(store)
+        line = self._line(store, entry.id)
+        copy_line = line.replace("Daily digest", "Copied digest", 1)
+        store.inbox_path.write_text(
+            self._text(store) + "\n" + copy_line + "\n    > Copied body\n", encoding="utf-8",
+        )
+        store.reindex_file(str(store.inbox_path))
+        assert store.get(entry.id).name == "Copied digest"
+        before = self._text(store)
+
+        store.update(entry.id, enabled=False)
+        assert self._text(store) == before.replace(copy_line, copy_line.replace("- [ ]", "- [x]", 1))
+        got = store.get(entry.id)
+        assert (got.name, got.enabled, got.message_content) == ("Copied digest", False, "Copied body")
 
 
 class TestEndpointConfigVaultRoundTrip:
@@ -1387,6 +1415,20 @@ class TestActionDispatch:
         mock_send.assert_called_once()
         assert "hydrate the ferns" in mock_send.call_args[0][0]
         assert scheduler.store.get(entry.id).last_status == "sent"
+
+    @pytest.mark.asyncio
+    async def test_notify_with_block_deleted_by_hand_is_not_sent(self, scheduler):
+        entry = scheduler.store.create(
+            name="Water plants", schedule_type="cron", schedule_value="0 18 * * *",
+            action="notify", message_type="static", message_content="hydrate the ferns",
+        )
+        scheduler.store.inbox_path.write_text("# Scheduler Inbox\n", encoding="utf-8")
+        with patch("api.services.telegram.send_message_async",
+                   new_callable=AsyncMock, return_value=True) as mock_send:
+            await scheduler._fire_entry(entry)
+        mock_send.assert_not_called()
+        assert scheduler.store.get(entry.id) is None
+        assert scheduler.store.inbox_path.read_text(encoding="utf-8") == "# Scheduler Inbox\n"
 
     @pytest.mark.asyncio
     async def test_external_operation_firing_logs_and_history_omit_content(
