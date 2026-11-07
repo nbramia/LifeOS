@@ -495,6 +495,18 @@ class TestTargetedEdits:
             "endpoint": "/api/synthetic", "method": "GET", "params": {"q": "a b"},
         }
 
+    def test_rename_replaces_name_text_split_around_fields(self, store):
+        entry = self._create(store)
+        self._hand_edit(store, "[tz:: UTC]", "[tz:: UTC] extra words")
+        store.reindex_file(str(store.inbox_path))
+        assert store.get(entry.id).name.endswith("extra words")
+        before = self._text(store)
+        store.update(entry.id, name="Renamed digest")
+        assert self._text(store) == before.replace("Daily digest", "Renamed digest", 1).replace(
+            " extra words", "", 1,
+        )
+        assert store.get(entry.id).name == "Renamed digest"
+
     def test_update_with_unchanged_values_leaves_the_file_byte_identical(self, store):
         entry = self._create(store)
         before = self._with_unknown_field(store, entry)

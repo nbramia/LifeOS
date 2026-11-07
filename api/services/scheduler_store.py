@@ -584,6 +584,9 @@ def _find_block_span(lines: list[str], entry_id: str) -> Optional[tuple[int, int
     return None
 
 
+# A run of name text in a line whose fields, tags and id are masked with NULs.
+_NAME_PIECE_RE = re.compile(r"[^\0\s](?:[^\0]*[^\0\s])?")
+
 # Attributes that determine a schedule's next fire.
 _TRIGGER_ATTRS = ("schedule_type", "schedule_value", "enabled", "timezone", "snoozed_until")
 
@@ -654,15 +657,20 @@ def _executor_tag_span(line: str) -> Optional[tuple[int, int]]:
 
 
 def _set_name(line: str, name: str) -> str:
-    """Replace the leading name text (everything after the checkbox up to the
-    first inline field, tag or id comment), keeping the whitespace after it."""
+    """Replace the name text: the first run of text outside the checkbox,
+    inline fields, tags and the id comment becomes ``name``, and any later
+    runs (which the parser joins into the name) are removed."""
     rest_start = _CHECKBOX_RE.match(line).start(2)
-    rest = line[rest_start:]
-    stops = [m.start() for regex in (_INLINE_FIELD_RE, _TAG_RE, _ID_RE)
-             for m in [regex.search(rest)] if m]
-    segment = rest[:min(stops)] if stops else rest
-    trailing = segment[len(segment.rstrip()):] or (" " if stops else "")
-    return line[:rest_start] + name + trailing + rest[len(segment):]
+    masked = line
+    for regex in (_INLINE_FIELD_RE, _ID_RE, _TAG_RE):
+        masked = regex.sub(lambda m: "\0" * len(m.group(0)), masked)
+    pieces = [m.span() for m in _NAME_PIECE_RE.finditer(masked, rest_start)]
+    if not pieces:
+        return line[:rest_start] + name + " " + line[rest_start:]
+    for start, end in reversed(pieces[1:]):
+        line = _cut_token(line, start, end)
+    start, end = pieces[0]
+    return line[:start] + name + line[end:]
 
 
 def _edit_block_lines(block: list[str], target: ScheduleEntry, attrs: list[str]) -> list[str]:
