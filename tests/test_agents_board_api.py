@@ -1180,6 +1180,8 @@ class TestSnoozeBoardCard:
         ("todo", ["codex"]),               # assigned
         ("blocked", []),                   # human_queue
         ("done", ["agent-completed"]),     # review
+        ("in_progress", ["me"]),           # the operator's own In progress card
+        ("in_progress", []),               # unassigned In progress card
     ])
     def test_eligible_card_persists_the_wake_up_time(self, client, stores, status, tags):
         task_manager, *_ = stores
@@ -1225,12 +1227,15 @@ class TestSnoozeBoardCard:
         assert f"[snoozed_until:: {expected}]" in content
 
     @pytest.mark.parametrize("status,tags", [
-        ("in_progress", []),
-        ("todo", ["agent", "agent-running"]),
+        ("in_progress", ["claude"]),                      # agent-owned
+        ("in_progress", ["duet"]),                        # external agent's card
+        ("todo", ["agent", "agent-running"]),             # claimed by the worker
+        ("in_progress", ["me", "agent-running"]),         # claimed, even under `me`
+        ("in_progress", ["agent-wait-provider"]),         # machine wait
         ("done", []),
         ("cancelled", []),
     ])
-    def test_in_progress_or_done_card_is_refused_and_unmodified(
+    def test_agent_in_progress_or_done_card_is_refused_and_unmodified(
         self, client, stores, status, tags,
     ):
         task_manager, *_ = stores
@@ -1264,16 +1269,62 @@ class TestSnoozeBoardCard:
         assert 400 <= r.status_code < 500, r.text
         assert "snoozed_until" not in task_manager.get(task.id).fields
 
-    def test_scheduler_entry_is_refused(self, client, stores):
+    def test_in_progress_me_card_with_a_live_session_is_refused(self, client, stores):
+        task_manager, _scheduler_store, session_store, _ = stores
+        task = task_manager.create("Operator card with a session", status="in_progress", tags=["me"])
+        session_store.create(task_id=task.id, status=STATUS_RUNNING)
+        r = client.put(
+            f"/api/agents/board/cards/{task.id}/snooze", json={"until": self.FUTURE},
+        )
+        assert r.status_code == 409, r.text
+        assert "snoozed_until" not in task_manager.get(task.id).fields
+
+    @pytest.mark.parametrize("schedule_type,schedule_value", [
+        ("cron", "0 9 * * *"),
+        ("once", "2098-06-01T09:00:00+00:00"),
+        ("manual", ""),
+    ])
+    def test_scheduler_entry_is_snoozed_and_its_definition_untouched(
+        self, client, stores, schedule_type, schedule_value,
+    ):
         _task_manager, scheduler_store, *_ = stores
         entry = scheduler_store.create(
-            name="Nightly digest", schedule_type="cron", schedule_value="0 9 * * *",
-            message_type="static", message_content="digest",
+            name="Nightly digest", schedule_type=schedule_type, schedule_value=schedule_value,
+            timezone="UTC", message_type="static", message_content="digest",
         )
         r = client.put(
             f"/api/agents/board/cards/{entry.id}/snooze", json={"until": self.FUTURE},
         )
-        assert 400 <= r.status_code < 500
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["lane"] == "snoozed"
+        assert body["snoozed_until"] == self.FUTURE
+
+        after = scheduler_store.get(entry.id)
+        assert after.snoozed_until == self.FUTURE
+        assert (after.schedule_type, after.schedule_value, after.timezone, after.enabled) == (
+            schedule_type, schedule_value, "UTC", True,
+        )
+        if schedule_type != "manual":
+            assert datetime.fromisoformat(after.next_trigger_at) >= datetime.fromisoformat(self.FUTURE)
+
+        board = client.get("/api/agents/board").json()
+        snoozed = [c for c in board["lanes"]["snoozed"] if c["id"] == entry.id]
+        assert snoozed and snoozed[0]["kind"] == "schedule"
+        assert snoozed[0]["snoozed_until"] == self.FUTURE
+        assert entry.id not in [c["id"] for c in board["lanes"]["scheduled"]]
+
+    def test_disabled_scheduler_entry_is_refused(self, client, stores):
+        _task_manager, scheduler_store, *_ = stores
+        entry = scheduler_store.create(
+            name="Paused digest", schedule_type="cron", schedule_value="0 9 * * *",
+            message_type="static", message_content="digest", enabled=False,
+        )
+        r = client.put(
+            f"/api/agents/board/cards/{entry.id}/snooze", json={"until": self.FUTURE},
+        )
+        assert r.status_code == 409, r.text
+        assert scheduler_store.get(entry.id).snoozed_until is None
 
 
 @pytest.mark.unit
@@ -1298,6 +1349,27 @@ class TestUnsnoozeBoardCard:
         board = client.get("/api/agents/board").json()
         assert task.id in [c["id"] for c in board["lanes"]["assigned"]]
         assert task.id not in [c["id"] for c in board["lanes"]["snoozed"]]
+
+    def test_unsnoozes_a_scheduler_entry_back_into_scheduled(self, client, stores):
+        _task_manager, scheduler_store, *_ = stores
+        entry = scheduler_store.create(
+            name="Morning digest", schedule_type="cron", schedule_value="0 9 * * *",
+            timezone="UTC", message_type="static", message_content="digest",
+        )
+        scheduler_store.set_snooze(entry.id, "2099-01-01T00:00:00+00:00")
+
+        r = client.delete(f"/api/agents/board/cards/{entry.id}/snooze")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["lane"] == "scheduled"
+        assert body["snoozed_until"] is None
+        after = scheduler_store.get(entry.id)
+        assert after.snoozed_until is None
+        assert datetime.fromisoformat(after.next_trigger_at) < datetime.now(timezone.utc) + timedelta(days=2)
+
+        board = client.get("/api/agents/board").json()
+        assert entry.id in [c["id"] for c in board["lanes"]["scheduled"]]
+        assert entry.id not in [c["id"] for c in board["lanes"]["snoozed"]]
 
     def test_non_snoozed_card_is_a_no_op_success(self, client, stores):
         task_manager, *_ = stores

@@ -82,13 +82,16 @@ TASK_LANES: tuple[str, ...] = tuple(lane for lane in LANES if lane != "scheduled
 SNOOZED_UNTIL_FIELD = "snoozed_until"
 
 # The natural lanes (status/tags alone, ignoring any snooze) a snooze is
-# ever allowed to override. A card whose natural lane is In progress or
-# Done is never shown as Snoozed, no matter what `snoozed_until` says —
-# the operator's intent is "set aside a dormant card", not "hide a
-# running or finished one". `snooze_board_card`'s eligibility check and
-# `TaskManager`'s write-time clearing (see task_manager.py) both key off
-# this same set so the three stay in lockstep.
-SNOOZABLE_LANES: frozenset[str] = frozenset({"unassigned", "assigned", "human_queue", "review"})
+# ever allowed to override. Done is never shown as Snoozed, no matter what
+# `snoozed_until` says, and In progress only for the operator's own work
+# (see `is_snooze_eligible`) — the operator's intent is "set aside a card
+# I'm not working on right now", never "hide live agent work or a
+# finished card". `snooze_board_card`'s eligibility check, the snooze
+# notifier, and `TaskManager`'s write-time clearing (see task_manager.py)
+# all go through `is_snooze_eligible` so they stay in lockstep.
+SNOOZABLE_LANES: frozenset[str] = frozenset(
+    {"unassigned", "assigned", "in_progress", "human_queue", "review"}
+)
 
 
 def parse_snoozed_until(value: Optional[str]) -> Optional[datetime]:
@@ -201,6 +204,27 @@ def natural_lane(status: str, tags: Iterable[str]) -> str:
     return "unassigned"
 
 
+def is_snooze_eligible(status: str, tags: Iterable[str]) -> bool:
+    """True when a snooze may override this task's natural lane.
+
+    The natural lane must be in `SNOOZABLE_LANES`. An In progress card is
+    eligible only while it is the operator's own or nobody's: assignee
+    `me` or none, no worker claim (`agent-running`/`agent-blocked`), and
+    no machine-wait tag. Such a card can never be claimed through a live
+    session either (`is_claimed` requires an agent assignee for that), so
+    live agent work is never hidden behind a snooze.
+    """
+    lane = natural_lane(status, tags)
+    if lane not in SNOOZABLE_LANES:
+        return False
+    if lane != "in_progress":
+        return True
+    tset = _norm_tags(tags)
+    if tset & {RUNNING_TAG, BLOCKED_TAG} or tset & MACHINE_WAIT_TAGS:
+        return False
+    return derive_assignee(tset) in (None, "me")
+
+
 def derive_lane(
     status: str,
     tags: Iterable[str],
@@ -211,15 +235,16 @@ def derive_lane(
 
     Never stored — recomputed on every read from the task's current
     status/tags/fields. Computes the `natural_lane` (see above) first, then
-    overrides it with `snoozed` only when that natural lane is itself
-    snooze-eligible (`SNOOZABLE_LANES` — Unassigned, Assigned, Human queue,
-    or Review) AND the wake-up time is still in the future. A card whose
-    natural lane is In progress or Done is never shown as Snoozed, even
-    with a future `snoozed_until` still on it — a running or finished card
-    must never be hidden. In practice a stale future value shouldn't
-    survive onto such a card anyway: `TaskManager`'s write path clears it
-    the moment a write's own status/tags land the task in an unsnoozable
-    natural lane (see task_manager.py), and every board write path that
+    overrides it with `snoozed` only when the card is snooze-eligible
+    (`is_snooze_eligible` — Unassigned, Assigned, Human queue, Review, or
+    the operator's own unclaimed In progress card) AND the wake-up time is
+    still in the future. A Done card, or an In progress card an agent owns
+    or runs, is never shown as Snoozed, even with a future `snoozed_until`
+    still on it — live agent work or a finished card must never be hidden.
+    In practice a stale future value shouldn't survive onto such a card
+    anyway: `TaskManager`'s write path clears it the moment a write's own
+    status/tags make the task snooze-ineligible (see task_manager.py), and
+    every board write path that
     transitions a card out of a snooze-eligible lane (lane move, Accept,
     Cancel, Reject, Reassign) clears it too. This override rule is what
     keeps derivation correct even if some future write path forgets to.
@@ -227,7 +252,7 @@ def derive_lane(
     the natural lane.
     """
     lane = natural_lane(status, tags)
-    if lane in SNOOZABLE_LANES and is_snoozed(fields, now):
+    if is_snoozed(fields, now) and is_snooze_eligible(status, tags):
         return "snoozed"
     return lane
 
@@ -262,7 +287,8 @@ PROJECT_CANCELLATION_PENDING_ERROR: tuple[int, str] = (409, "project cancellatio
 PROJECT_HIERARCHY_INVALID_ERROR: tuple[int, str] = (409, "task hierarchy is invalid; repair the parent link first")
 SNOOZE_INELIGIBLE_ERROR: tuple[int, str] = (
     409,
-    "only Unassigned, Assigned, Human queue, and Review cards can be snoozed",
+    "only Unassigned, Assigned, Human queue, Review, your own In progress "
+    "cards, and scheduled entries can be snoozed",
 )
 MACHINE_WAIT_ERROR: tuple[int, str] = (
     409,
@@ -761,6 +787,25 @@ def plan_lane_move(
     # dragging a card there. Unreachable given evaluate_card_action's checks
     # above; kept as a defensive fallback.
     return LaneMovePlan(error=(400, f"lane '{target_lane}' cannot be set directly"))
+
+
+def schedule_lane(
+    enabled: bool,
+    next_trigger_at: Optional[str],
+    schedule_type: str = "",
+    snoozed_until: Optional[str] = None,
+    now: Optional[datetime] = None,
+) -> str:
+    """Board lane for a scheduler entry: `snoozed`, `scheduled`, or `done`.
+
+    An enabled entry whose `snoozed_until` is still in the future is
+    Snoozed — the scheduler does not fire it until then. A disabled entry
+    never fires at all, so it stays in Done whatever its snooze says.
+    Otherwise `is_schedule_active` decides Scheduled vs Done.
+    """
+    if enabled and is_snoozed({SNOOZED_UNTIL_FIELD: snoozed_until}, now):
+        return "snoozed"
+    return "scheduled" if is_schedule_active(enabled, next_trigger_at, schedule_type) else "done"
 
 
 def is_schedule_active(enabled: bool, next_trigger_at: Optional[str], schedule_type: str = "") -> bool:

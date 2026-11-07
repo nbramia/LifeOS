@@ -1447,3 +1447,192 @@ class TestMissedFire:
         assert datetime.fromisoformat(refreshed.next_trigger_at) > datetime.now(timezone.utc)
         # No duplicate catch-up: not due again (advanced + within cooldown).
         assert store.get_due_reminders() == []
+
+
+class _Clock:
+    """Settable stand-in for ``datetime`` in the scheduler store and the
+    board helpers it uses for snooze checks, so a test can walk a schedule
+    across days without sleeping."""
+
+    def __init__(self, start: datetime):
+        self.now = start
+        clock = self
+
+        class _ClockDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return clock.now.astimezone(tz) if tz else clock.now.replace(tzinfo=None)
+
+        self.datetime = _ClockDatetime
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    import api.services.agent_board as agent_board_module
+    import api.services.scheduler_store as scheduler_store_module
+
+    c = _Clock(datetime(2026, 3, 2, 8, 0, tzinfo=timezone.utc))  # a Monday
+    monkeypatch.setattr(scheduler_store_module, "datetime", c.datetime)
+    monkeypatch.setattr(agent_board_module, "datetime", c.datetime)
+    return c
+
+
+def _utc(*args) -> datetime:
+    return datetime(*args, tzinfo=timezone.utc)
+
+
+class TestScheduleSnooze:
+    """Snoozing a schedule skips every fire inside the snooze, without
+    catch-up, and leaves the definition untouched."""
+
+    def _daily(self, store):
+        return store.create(
+            name="Daily digest", schedule_type="cron", schedule_value="0 9 * * *",
+            timezone="UTC", action="notify", message_type="static", message_content="digest",
+        )
+
+    def test_snooze_round_trips_through_markdown_and_an_index_rebuild(self, store, clock, tmp_path):
+        entry = self._daily(store)
+        until = _utc(2026, 3, 4, 8, 0).isoformat()
+        store.set_snooze(entry.id, until)
+
+        line = next(
+            ln for ln in store.inbox_path.read_text(encoding="utf-8").splitlines()
+            if f"id:{entry.id}" in ln
+        )
+        assert f"[snoozed_until:: {until}]" in line
+        assert _parse_entry_line(line).snoozed_until == until
+        assert _format_entry_line(_parse_entry_line(line)) == line
+
+        # Drop the cache entirely: a rebuild from the vault alone keeps it.
+        store.index_path.unlink()
+        rebuilt = SchedulerStore(vault_path=tmp_path / "vault", index_path=store.index_path)
+        got = rebuilt.get(entry.id)
+        assert got.snoozed_until == until
+        assert got.next_trigger_at == _utc(2026, 3, 4, 9, 0).isoformat()
+
+    def test_snooze_leaves_the_definition_untouched(self, store, clock):
+        entry = self._daily(store)
+        before = store.inbox_path.read_text(encoding="utf-8")
+        store.set_snooze(entry.id, _utc(2026, 3, 4, 8, 0).isoformat())
+        got = store.get(entry.id)
+        assert (got.schedule_type, got.schedule_value, got.timezone, got.enabled) == (
+            "cron", "0 9 * * *", "UTC", True,
+        )
+        after = store.inbox_path.read_text(encoding="utf-8")
+        assert after.replace(f" [snoozed_until:: {got.snoozed_until}]", "") == before
+
+    def test_daily_entry_skips_the_window_then_fires_on_schedule(self, store, clock):
+        entry = self._daily(store)
+        assert store.get(entry.id).next_trigger_at == _utc(2026, 3, 2, 9, 0).isoformat()
+
+        store.set_snooze(entry.id, _utc(2026, 3, 4, 8, 0).isoformat())  # two days
+        assert store.get(entry.id).next_trigger_at == _utc(2026, 3, 4, 9, 0).isoformat()
+
+        for day in (2, 3):  # Monday and Tuesday 09:00 fall inside the snooze
+            clock.now = _utc(2026, 3, day, 9, 0, 30)
+            assert store.get_due_reminders() == []
+
+        clock.now = _utc(2026, 3, 4, 9, 0, 30)  # day three, normal time
+        assert [e.id for e in store.get_due_reminders()] == [entry.id]
+        store.mark_triggered(entry.id)
+        got = store.get(entry.id)
+        assert got.next_trigger_at == _utc(2026, 3, 5, 9, 0).isoformat()
+        assert got.snoozed_until is None
+        assert "snoozed_until" not in store.inbox_path.read_text(encoding="utf-8")
+
+    def test_snoozed_entry_is_not_due_even_with_a_past_next_trigger(self, store, clock):
+        entry = self._daily(store)
+        store.set_snooze(entry.id, _utc(2026, 3, 4, 8, 0).isoformat())
+        store.get(entry.id).next_trigger_at = _utc(2026, 3, 2, 7, 0).isoformat()
+        assert store.get_due_reminders() == []
+
+    def test_next_trigger_after_snooze_includes_a_slot_at_the_snooze_end(self, clock):
+        entry = ScheduleEntry(
+            id="t", name="T", schedule_type="cron", schedule_value="0 9 * * *",
+            timezone="UTC", snoozed_until=_utc(2026, 3, 4, 9, 0).isoformat(),
+        )
+        assert compute_next_trigger(entry) == _utc(2026, 3, 4, 9, 0).isoformat()
+
+    def test_next_trigger_respects_the_schedule_timezone_after_snooze(self, clock):
+        entry = ScheduleEntry(
+            id="t", name="T", schedule_type="cron", schedule_value="0 9 * * *",
+            timezone="America/New_York", snoozed_until=_utc(2026, 3, 4, 8, 0).isoformat(),
+        )
+        # 09:00 EST on the day the snooze ends is 14:00 UTC.
+        assert compute_next_trigger(entry) == _utc(2026, 3, 4, 14, 0).isoformat()
+
+    def test_past_snooze_is_ignored(self, clock):
+        entry = ScheduleEntry(
+            id="t", name="T", schedule_type="cron", schedule_value="0 9 * * *",
+            timezone="UTC", snoozed_until=_utc(2026, 3, 1, 8, 0).isoformat(),
+        )
+        assert compute_next_trigger(entry) == _utc(2026, 3, 2, 9, 0).isoformat()
+
+    def test_unsnooze_recomputes_from_now(self, store, clock):
+        entry = self._daily(store)
+        store.set_snooze(entry.id, _utc(2026, 3, 9, 8, 0).isoformat())
+        clock.now = _utc(2026, 3, 3, 7, 0)
+        store.set_snooze(entry.id, None)
+        got = store.get(entry.id)
+        assert got.snoozed_until is None
+        assert got.next_trigger_at == _utc(2026, 3, 3, 9, 0).isoformat()
+
+    def test_once_inside_the_snooze_fires_once_at_the_snooze_end(self, store, clock):
+        entry = store.create(
+            name="One-off", schedule_type="once", schedule_value=_utc(2026, 3, 2, 12, 0).isoformat(),
+            timezone="UTC", action="notify", message_type="static", message_content="x",
+        )
+        store.set_snooze(entry.id, _utc(2026, 3, 3, 8, 0).isoformat())
+        assert store.get(entry.id).next_trigger_at == _utc(2026, 3, 3, 8, 0).isoformat()
+
+        clock.now = _utc(2026, 3, 2, 12, 0, 30)  # its own time, inside the snooze
+        assert store.get_due_reminders() == []
+
+        clock.now = _utc(2026, 3, 3, 8, 0, 30)
+        assert [e.id for e in store.get_due_reminders()] == [entry.id]
+        store.mark_triggered(entry.id)
+        got = store.get(entry.id)
+        assert got.enabled is False and got.next_trigger_at is None
+        assert got.snoozed_until is None
+
+    def test_once_inside_a_snooze_that_ended_while_down_still_fires_after_rebuild(
+        self, store, clock, tmp_path,
+    ):
+        entry = store.create(
+            name="One-off", schedule_type="once", schedule_value=_utc(2026, 3, 2, 12, 0).isoformat(),
+            timezone="UTC", action="notify", message_type="static", message_content="x",
+        )
+        store.set_snooze(entry.id, _utc(2026, 3, 3, 8, 0).isoformat())
+        clock.now = _utc(2026, 3, 3, 10, 0)
+        store.index_path.unlink()
+        rebuilt = SchedulerStore(vault_path=tmp_path / "vault", index_path=store.index_path)
+        assert [e.id for e in rebuilt.get_due_reminders()] == [entry.id]
+
+    def test_once_after_the_snooze_keeps_its_own_time(self, store, clock):
+        at = _utc(2026, 3, 5, 12, 0).isoformat()
+        entry = store.create(
+            name="Later one-off", schedule_type="once", schedule_value=at,
+            timezone="UTC", action="notify", message_type="static", message_content="x",
+        )
+        store.set_snooze(entry.id, _utc(2026, 3, 3, 8, 0).isoformat())
+        assert store.get(entry.id).next_trigger_at == at
+
+    def test_unsnoozing_a_once_whose_time_passed_fires_it_now(self, store, clock):
+        entry = store.create(
+            name="One-off", schedule_type="once", schedule_value=_utc(2026, 3, 2, 12, 0).isoformat(),
+            timezone="UTC", action="notify", message_type="static", message_content="x",
+        )
+        store.set_snooze(entry.id, _utc(2026, 3, 4, 8, 0).isoformat())
+        clock.now = _utc(2026, 3, 2, 13, 0)
+        store.set_snooze(entry.id, None)
+        assert [e.id for e in store.get_due_reminders()] == [entry.id]
+
+    def test_manual_trigger_during_snooze_keeps_the_snooze(self, store, clock):
+        entry = self._daily(store)
+        until = _utc(2026, 3, 4, 8, 0).isoformat()
+        store.set_snooze(entry.id, until)
+        store.mark_triggered(entry.id)
+        got = store.get(entry.id)
+        assert got.snoozed_until == until
+        assert got.next_trigger_at == _utc(2026, 3, 4, 9, 0).isoformat()

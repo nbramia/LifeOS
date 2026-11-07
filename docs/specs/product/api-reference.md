@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-11-01
+**Last Updated:** 2026-11-07
 
 Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Four adjacent catalogs split out for size:
 
@@ -734,19 +734,29 @@ rules, so they can't disagree with what a write actually does.
 Set a card's wake-up time, deriving it into the Snoozed lane. Body:
 `{until}` — an ISO-8601 timestamp with a UTC offset, in the future.
 Missing, unparseable, offset-less, or non-future `until` returns **400**
-without touching the task. Eligible on any card whose status/tags alone
+without a write. A task card is eligible when its status/tags alone
 (ignoring any snooze already in effect) derive to Unassigned, Assigned,
-Human queue, or Review; a card that derives to In progress or Done returns
-**409**, and a scheduler entry (never resolves through the task store)
-returns **404**. Only the `snoozed_until` field changes — status, tags,
-and notes are left exactly as they were. Response: `{id, lane, status,
-tags, snoozed_until}`.
+Human queue, or Review, or to In progress with assignee `me` or none, no
+worker claim or machine-wait tag, and no live session; a Done card or an
+agent's In progress card returns **409**. Only the `snoozed_until` field
+changes — status, tags, and notes are left exactly as they were.
+Response: `{id, lane, status, tags, snoozed_until}`.
+
+`{id}` may also be a scheduler entry's id. An enabled entry is snoozed —
+the scheduler skips every fire until `until` (see [Scheduler § Snoozing a
+schedule](../../guides/scheduler.md#snoozing-a-schedule)) and the
+definition is untouched; a disabled entry returns **409**. Response:
+`{id, kind: "schedule", lane, snoozed_until, next_fire_at}`. An id that
+matches neither a task nor a schedule returns **404**.
 
 ### DELETE /api/agents/board/cards/{id}/snooze
 
 Clear a card's wake-up time, restoring its status/tag-derived lane. A
 no-op success (no write) on a card that isn't currently snoozed. Response:
-`{id, lane, status, tags, snoozed_until: null}`.
+`{id, lane, status, tags, snoozed_until: null}`. On a scheduler entry the
+schedule is back in Scheduled at once, with its next fire recomputed from
+now; response `{id, kind: "schedule", lane, snoozed_until: null,
+next_fire_at}`.
 
 ### POST /api/agents/board/cards/{id}/accept
 

@@ -102,6 +102,7 @@ def test_natural_lane_no_longer_snoozable_does_not_notify(manager):
     task = manager.create(
         "Ship synthetic release",
         status="in_progress",
+        tags=["codex"],
         fields={"snoozed_until": (now - timedelta(minutes=1)).isoformat()},
     )
     messages = []
@@ -120,6 +121,7 @@ def test_ineligible_at_expiry_does_not_replay_after_becoming_eligible_later(mana
     task = manager.create(
         "Resume synthetic deployment",
         status="in_progress",
+        tags=["codex"],
         fields={"snoozed_until": (now - timedelta(minutes=1)).isoformat()},
     )
     messages = []

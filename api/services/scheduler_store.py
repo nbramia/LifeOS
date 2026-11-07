@@ -18,7 +18,9 @@ checkbox lines with stable ``<!-- id:xxxx -->`` IDs and Dataview-style
 and edited in Obsidian and a watcher reindexes on change.
 
 The markdown line carries the user-editable *definition* (enabled checkbox,
-name, trigger, timezone, action, message type, executor tag). The
+name, trigger, timezone, action, message type, executor tag), plus an
+optional ``[snoozed_until:: …]`` wake-up time that holds off every fire
+until it passes without touching the definition. The
 human-editable instruction text (``message_content``) is written beneath the
 line as an indented ``> `` blockquote body, so it can be read and edited in
 Obsidian and round-trips back through reindexing. Indented blockquote lines
@@ -41,7 +43,7 @@ import threading
 import time as _time_mod
 import uuid
 from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -52,6 +54,7 @@ from croniter import croniter
 from zoneinfo import ZoneInfo
 
 from config.settings import settings
+from api.services.agent_board import SNOOZED_UNTIL_FIELD, is_snoozed, parse_snoozed_until
 from api.services.atomic_write import atomic_write_text
 from api.services.operation_lock import exclusive_operation_lock
 
@@ -105,6 +108,13 @@ class ScheduleEntry:
     # override — the task falls back to the worker's own defaults.
     budget_dollars: Optional[float] = None
     wall_seconds: Optional[int] = None
+    # Optional wake-up time (ISO-8601 with a UTC offset). While it is in the
+    # future the scheduler does not fire the entry: fires that fall inside
+    # the snooze are skipped, and the next trigger is computed from the
+    # snooze's end (see `compute_next_trigger`). Round-trips through
+    # Markdown as `[snoozed_until:: …]`; the definition fields above are
+    # untouched by a snooze.
+    snoozed_until: Optional[str] = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -114,8 +124,22 @@ class ScheduleEntry:
         return cls(**{k: data[k] for k in cls.__dataclass_fields__ if k in data})
 
 
+def _once_trigger_utc(schedule_value: str, tz_name: str, *, label: str = "") -> Optional[datetime]:
+    """A ``once`` schedule's fire time in UTC (a naive value is read in
+    ``tz_name``), or None when it doesn't parse."""
+    try:
+        trigger_time = datetime.fromisoformat(schedule_value)
+        if trigger_time.tzinfo is None:
+            trigger_time = trigger_time.replace(tzinfo=ZoneInfo(tz_name))
+        return trigger_time.astimezone(timezone.utc)
+    except (ValueError, TypeError) as e:
+        logger.warning(f"Invalid datetime for schedule {label}: {e}")
+        return None
+
+
 def compute_next_n_triggers(
     schedule_type: str, schedule_value: str, tz_name: str, count: int = 1, *, label: str = "",
+    not_before: Optional[datetime] = None,
 ) -> list[str]:
     """
     Compute up to ``count`` upcoming UTC trigger times for a schedule_type/
@@ -127,27 +151,27 @@ def compute_next_n_triggers(
     when it's still in the future, else an empty list. ``label`` names the
     schedule in log output only (e.g. its id); an entry with none yet (a
     preview request that hasn't been saved) passes an empty string.
+    ``not_before`` (an aware datetime later than now, e.g. a snooze's end)
+    moves the cron search start there, inclusive: a slot exactly at
+    ``not_before`` is returned.
     """
     now_utc = datetime.now(timezone.utc)
 
     if schedule_type == "once":
-        try:
-            trigger_time = datetime.fromisoformat(schedule_value)
-            if trigger_time.tzinfo is None:
-                tz = ZoneInfo(tz_name)
-                trigger_time = trigger_time.replace(tzinfo=tz)
-            trigger_time_utc = trigger_time.astimezone(timezone.utc)
-            if trigger_time_utc > now_utc:
-                return [trigger_time_utc.isoformat()]
-            return []  # past one-time schedule
-        except (ValueError, TypeError) as e:
-            logger.warning(f"Invalid datetime for schedule {label}: {e}")
-            return []
+        trigger_time_utc = _once_trigger_utc(schedule_value, tz_name, label=label)
+        if trigger_time_utc is not None and trigger_time_utc > now_utc:
+            return [trigger_time_utc.isoformat()]
+        return []  # past or unparseable one-time schedule
 
     elif schedule_type == "cron":
         try:
             tz = ZoneInfo(tz_name)
-            cron = croniter(schedule_value, datetime.now(tz))
+            start = datetime.now(tz)
+            if not_before is not None and not_before > now_utc:
+                # croniter's get_next is exclusive of its start; backing off
+                # one second makes a slot exactly at not_before eligible.
+                start = (not_before - timedelta(seconds=1)).astimezone(tz)
+            cron = croniter(schedule_value, start)
             triggers = []
             for _ in range(max(count, 0)):
                 next_time_local = cron.get_next(datetime)
@@ -165,6 +189,12 @@ def compute_next_n_triggers(
     return []
 
 
+def is_entry_snoozed(entry: ScheduleEntry, now: Optional[datetime] = None) -> bool:
+    """True while the entry's ``snoozed_until`` is in the future. A past,
+    missing, unparseable, or offset-less value is ignored."""
+    return is_snoozed({SNOOZED_UNTIL_FIELD: entry.snoozed_until}, now)
+
+
 def compute_next_trigger(entry: ScheduleEntry) -> Optional[str]:
     """
     Compute the next trigger time for a schedule.
@@ -172,10 +202,24 @@ def compute_next_trigger(entry: ScheduleEntry) -> Optional[str]:
     For cron expressions, times are interpreted in the schedule's timezone
     (defaults to settings.timezone) and converted to UTC for storage, so
     "daily at 6pm" means 6pm local, not 6pm UTC.
+
+    Snooze: a cron schedule computes from the snooze's end while the snooze
+    is in the future, so every slot inside the snooze is skipped and the
+    first slot at or after its end is next. A ``once`` schedule whose fire
+    time falls at or before the snooze's end fires once at the snooze's end
+    instead — and still does when the snooze ended while the server was
+    down, following the run-once catch-up policy in `get_due_reminders`. A
+    snooze never changes a ``manual`` schedule's (absent) next fire.
     """
+    tz_name = entry.timezone or settings.timezone
+    snooze_end = parse_snoozed_until(entry.snoozed_until)
+    if entry.schedule_type == "once" and snooze_end is not None:
+        at_utc = _once_trigger_utc(entry.schedule_value, tz_name, label=entry.id)
+        if at_utc is not None and at_utc <= snooze_end:
+            return snooze_end.isoformat()
     triggers = compute_next_n_triggers(
-        entry.schedule_type, entry.schedule_value, entry.timezone or settings.timezone,
-        count=1, label=entry.id,
+        entry.schedule_type, entry.schedule_value, tz_name,
+        count=1, label=entry.id, not_before=snooze_end,
     )
     return triggers[0] if triggers else None
 
@@ -381,6 +425,8 @@ def _format_entry_line(entry: ScheduleEntry) -> str:
         parts.append(f"[budget:: {_format_budget_dollars(entry.budget_dollars)}]")
     if entry.wall_seconds is not None:
         parts.append(f"[wall:: {_format_wall_seconds(entry.wall_seconds)}]")
+    if entry.snoozed_until:
+        parts.append(f"[{SNOOZED_UNTIL_FIELD}:: {entry.snoozed_until}]")
     for key in ("persona_id", "model_id", "effort", "host", "working_dir"):
         value = getattr(entry, key, "")
         if value:
@@ -471,6 +517,7 @@ def _parse_entry_line(line: str) -> Optional[ScheduleEntry]:
         operation_key=fields.get("operation_key", ""),
         budget_dollars=budget_dollars,
         wall_seconds=wall_seconds,
+        snoozed_until=fields.get(SNOOZED_UNTIL_FIELD) or None,
         persona_id=fields.get("persona_id", ""),
         model_id=fields.get("model_id", ""),
         effort=fields.get("effort", ""),
@@ -766,12 +813,19 @@ class SchedulerStore:
         advances to its next slot. ``manual`` has no trigger of its own —
         ``compute_next_trigger`` returns ``None`` for it — so it stays
         enabled with no next fire and is re-triggerable indefinitely.
+
+        A consumed ``once`` schedule, or any schedule whose snooze has
+        ended, drops its ``snoozed_until``; a manual trigger during a cron
+        schedule's snooze keeps it, so the next scheduled fire still waits
+        for the snooze's end.
         """
         with self._lock:
             entry = self._entries.get(entry_id)
             if not entry:
                 return
             entry.last_triggered_at = datetime.now(timezone.utc).isoformat()
+            if entry.schedule_type == "once" or not is_entry_snoozed(entry):
+                entry.snoozed_until = None
             if entry.schedule_type == "once":
                 entry.enabled = False
                 entry.next_trigger_at = None
@@ -779,6 +833,34 @@ class SchedulerStore:
                 entry.next_trigger_at = compute_next_trigger(entry)
             self._rewrite_block(entry)
             self._save()
+
+    def set_snooze(self, entry_id: str, snoozed_until: Optional[str]) -> Optional[ScheduleEntry]:
+        """Snooze a schedule until ``snoozed_until`` (an ISO-8601 string with
+        a UTC offset), or unsnooze it with ``None``. Returns the updated
+        entry, or None when ``entry_id`` doesn't exist.
+
+        Only ``snoozed_until`` and the derived ``next_trigger_at`` change —
+        the definition (trigger, timezone, enabled checkbox) is untouched.
+        Unsnoozing a ``once`` schedule whose fire time already passed during
+        the snooze ends the snooze now instead of dropping it, so the
+        one-off fires on the next tick rather than being lost.
+        """
+        with self._lock:
+            entry = self._entries.get(entry_id)
+            if not entry:
+                return None
+            if snoozed_until is None and entry.schedule_type == "once" and is_entry_snoozed(entry):
+                now = datetime.now(timezone.utc)
+                at_utc = _once_trigger_utc(
+                    entry.schedule_value, entry.timezone or settings.timezone, label=entry.id,
+                )
+                if at_utc is not None and at_utc <= now:
+                    snoozed_until = now.isoformat()
+            entry.snoozed_until = snoozed_until
+            entry.next_trigger_at = compute_next_trigger(entry) if entry.enabled else None
+            self._rewrite_block(entry)
+            self._save()
+            return entry
 
     def record_run(self, entry_id: str, status: str, result: str = ""):
         """Record the outcome of the most recent fire for the dashboard.
@@ -804,11 +886,16 @@ class SchedulerStore:
         missed one-off fires once and disables. We deliberately do not replay
         every window missed during an outage — at most one catch-up per
         schedule.
+
+        A snoozed schedule (``snoozed_until`` in the future) is never due;
+        its ``next_trigger_at`` already sits at or after the snooze's end.
         """
         now = datetime.now(timezone.utc)
         due = []
         for entry in self._entries.values():
             if not entry.enabled or not entry.next_trigger_at:
+                continue
+            if is_entry_snoozed(entry, now):
                 continue
             try:
                 next_time = datetime.fromisoformat(entry.next_trigger_at)
