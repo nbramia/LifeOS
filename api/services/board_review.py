@@ -69,14 +69,21 @@ def accept_review(manager: "TaskManager", card_id: str, *, reviewer: str) -> Rev
 
     needs_tag = not already_accepted
     needs_status = task.status != "done"
-    if needs_tag or needs_status:
+    # A finished card isn't waiting on anything; a lingering provider or
+    # dependency wait tag would keep it In progress (see `natural_lane`).
+    needs_strip = bool(tags_norm & agent_board.MACHINE_WAIT_TAGS)
+    if needs_tag or needs_status or needs_strip:
         def add_accepted(tags: list[str]) -> list[str]:
             normalized_latest = {str(tag).lstrip("#").lower() for tag in tags}
+            kept = [
+                tag for tag in tags
+                if str(tag).lstrip("#").lower() not in agent_board.MACHINE_WAIT_TAGS
+            ]
             if agent_board.ACCEPTED_TAG in normalized_latest:
-                return list(tags)
+                return kept
             if not agent_board.is_review_pending(tags):
                 raise TaskConflictError("card changed; refresh before accepting")
-            return [*tags, agent_board.ACCEPTED_TAG]
+            return [*kept, agent_board.ACCEPTED_TAG]
 
         try:
             task = manager.update(
