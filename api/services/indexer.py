@@ -104,8 +104,10 @@ _TAG_LOOKUP_FAILED = object()
 # frontmatter. A note whose frontmatter runs longer sorts as ordinary.
 BUDGET_ORDER_HEAD_CHARS = 8192
 
+# Failed note paths kept in last_run.
+MAX_REPORTED_FAILURES = 20
+
 # How long one built MentionResolver stands in for the people store.
-MAX_REPORTED_FAILURES = 20  # failed note paths kept in last_run
 MENTION_RESOLVER_MAX_AGE_SECONDS = 600
 
 
