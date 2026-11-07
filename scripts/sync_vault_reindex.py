@@ -169,6 +169,8 @@ def sync_vault_reindex(
         "files_pruned": run["files_pruned"],
         "files_remaining": run["files_remaining"],
         "stopped_early": run["stopped_early"],
+        "files_failed": run["files_failed"],
+        "failed_paths": run["failed_paths"],
         "index_pages": index_pages,
         "search_keys_backfilled": search_keys_backfilled,
         "elapsed_seconds": round(elapsed, 1),
@@ -189,6 +191,7 @@ def sync_stats(result: dict) -> dict:
     return {
         "processed": int(result.get("files_indexed", 0) or 0) + int(result.get("files_pruned", 0) or 0),
         "files_remaining": int(result.get("files_remaining", 0) or 0),
+        "errors": int(result.get("files_failed", 0) or 0),
         "search_keys_backfilled": int(result.get("search_keys_backfilled", 0) or 0),
     }
 
