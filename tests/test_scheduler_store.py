@@ -350,6 +350,172 @@ class TestMarkdownSourceOfTruth:
         assert "Persist" in names
 
 
+SNOOZE_UNTIL = "2030-01-02T08:00:00+00:00"
+# An inline field the formatter doesn't know, with spaces, colons and `::` in its value.
+UNKNOWN_FIELD = "[synthetic_note:: keep me: a::b c]"
+
+
+class TestTargetedEdits:
+    """Store mutations edit only the tokens they own in the current on-disk
+    block; everything else in Inbox.md stays byte-for-byte."""
+
+    def _create(self, store, **overrides):
+        kwargs = dict(
+            name="Daily digest", schedule_type="cron", schedule_value="0 9 * * *",
+            timezone="UTC", action="notify", message_type="static",
+            message_content="Send the synthetic digest",
+        )
+        kwargs.update(overrides)
+        return store.create(**kwargs)
+
+    def _text(self, store):
+        return store.inbox_path.read_text(encoding="utf-8")
+
+    def _line(self, store, entry_id):
+        return next(ln for ln in self._text(store).splitlines() if f"id:{entry_id}" in ln)
+
+    def _hand_edit(self, store, old, new):
+        text = self._text(store)
+        assert old in text
+        store.inbox_path.write_text(text.replace(old, new, 1), encoding="utf-8")
+
+    def _with_unknown_field(self, store, entry):
+        """Hand-insert UNKNOWN_FIELD mid-line (after the trigger) and re-indent
+        the body with a tab, without reindexing."""
+        self._hand_edit(store, "[cron:: 0 9 * * *]", f"[cron:: 0 9 * * *] {UNKNOWN_FIELD}")
+        self._hand_edit(store, f"    > {entry.message_content}", f"\t> {entry.message_content}")
+        return self._text(store)
+
+    def test_unreindexed_hand_edit_survives_update_and_snooze(self, store):
+        entry = self._create(store)
+        self._hand_edit(store, f" <!-- id:{entry.id} -->", f" {UNKNOWN_FIELD} <!-- id:{entry.id} -->")
+        self._hand_edit(store, "> Send the synthetic digest", "> Hand-edited synthetic body")
+
+        store.update(entry.id, enabled=False)
+        store.set_snooze(entry.id, SNOOZE_UNTIL)
+
+        text = self._text(store)
+        line = self._line(store, entry.id)
+        assert UNKNOWN_FIELD in line
+        assert line.startswith("- [x] Daily digest")
+        assert f"[snoozed_until:: {SNOOZE_UNTIL}]" in line
+        assert "    > Hand-edited synthetic body" in text
+        assert "Send the synthetic digest" not in text
+        got = store.get(entry.id)
+        assert got.message_content == "Hand-edited synthetic body"
+        assert got.enabled is False
+        assert got.snoozed_until == SNOOZE_UNTIL
+
+    @pytest.mark.parametrize("updates, old, new", [
+        ({"enabled": False}, "- [ ] Daily digest", "- [x] Daily digest"),
+        ({"name": "Evening: digest :: v2"}, "- [ ] Daily digest ", "- [ ] Evening: digest :: v2 "),
+        ({"schedule_value": "30 18 * * *"}, "[cron:: 0 9 * * *]", "[cron:: 30 18 * * *]"),
+        ({"timezone": "America/New_York"}, "[tz:: UTC]", "[tz:: America/New_York]"),
+        ({"schedule_type": "cron", "schedule_value": "0 9 * * *", "timezone": "UTC"}, "", ""),
+    ])
+    def test_each_update_changes_only_its_own_token(self, store, updates, old, new):
+        entry = self._create(store)
+        before = self._with_unknown_field(store, entry)
+        store.update(entry.id, **updates)
+        assert self._text(store) == before.replace(old, new, 1)
+        got = store.get(entry.id)
+        for key, value in updates.items():
+            assert getattr(got, key) == value
+
+    def test_snooze_adds_only_its_field_and_unsnooze_removes_only_it(self, store):
+        entry = self._create(store)
+        before = self._with_unknown_field(store, entry)
+        store.set_snooze(entry.id, SNOOZE_UNTIL)
+        snoozed = before.replace(
+            f" <!-- id:{entry.id} -->", f" [snoozed_until:: {SNOOZE_UNTIL}] <!-- id:{entry.id} -->", 1,
+        )
+        assert self._text(store) == snoozed
+
+        # A snooze field placed mid-line by hand is removed from where it sits.
+        self._hand_edit(store, f" [snoozed_until:: {SNOOZE_UNTIL}]", "")
+        self._hand_edit(store, "[tz:: UTC]", f"[tz:: UTC] [snoozed_until:: {SNOOZE_UNTIL}]")
+        store.reindex_file(str(store.inbox_path))
+        store.set_snooze(entry.id, None)
+        assert self._text(store) == before
+        assert store.get(entry.id).snoozed_until is None
+
+    def test_fire_bookkeeping_changes_only_the_last_field(self, store):
+        entry = self._create(store)
+        before = self._with_unknown_field(store, entry)
+        store.mark_triggered(entry.id)
+        last = store.get(entry.id).last_triggered_at
+        assert self._text(store) == before.replace(
+            f" <!-- id:{entry.id} -->", f" [last:: {last}] <!-- id:{entry.id} -->", 1,
+        )
+
+    def test_neighboring_entries_are_untouched(self, store):
+        first = self._create(
+            store, name="First synthetic", schedule_value="0 7 * * *", message_content="First body",
+        )
+        target = self._create(store)
+        self._create(
+            store, name="Last synthetic", schedule_value="0 8 * * *",
+            message_content="Line one\n\nLine three",
+        )
+        # Hand-edit both neighbors (unknown field, odd spacing) without reindexing.
+        self._hand_edit(store, f"<!-- id:{first.id} -->", f"{UNKNOWN_FIELD}  <!-- id:{first.id} -->")
+        self._hand_edit(store, "    > Line three", "\t>   Line three")
+        self._with_unknown_field(store, target)
+        before = self._text(store)
+
+        store.update(target.id, enabled=False)
+        store.set_snooze(target.id, SNOOZE_UNTIL)
+        store.mark_triggered(target.id)
+
+        after_lines = self._text(store).splitlines()
+        before_lines = before.splitlines()
+        changed = [i for i, (a, b) in enumerate(zip(before_lines, after_lines)) if a != b]
+        assert len(after_lines) == len(before_lines)
+        assert [before_lines[i] for i in changed] == [self._line_from(before, target.id)]
+        assert store.get(first.id).name == "First synthetic"
+
+    @staticmethod
+    def _line_from(text, entry_id):
+        return next(ln for ln in text.splitlines() if f"id:{entry_id}" in ln)
+
+    def test_edited_line_parses_like_a_formatted_one(self, store):
+        entry = self._create(store, executor="local")
+        store.update(
+            entry.id, name="Renamed", schedule_type="once", schedule_value="2030-01-01T09:00:00",
+            executor="cloud", bot="synthetic-bot", action="endpoint",
+            endpoint_config={"endpoint": "/api/synthetic", "method": "get", "params": {"q": "a b"}},
+        )
+        store.set_snooze(entry.id, SNOOZE_UNTIL)
+        line = self._line(store, entry.id)
+        assert "[cron::" not in line and line.count("#") == 1
+        parsed = _parse_entry_line(line)
+        reformatted = _parse_entry_line(_format_entry_line(store.get(entry.id)))
+        assert parsed.to_dict() == reformatted.to_dict()
+        assert parsed.endpoint_config == {
+            "endpoint": "/api/synthetic", "method": "GET", "params": {"q": "a b"},
+        }
+
+    def test_update_with_unchanged_values_leaves_the_file_byte_identical(self, store):
+        entry = self._create(store)
+        before = self._with_unknown_field(store, entry)
+        store.update(entry.id, name="Daily digest", enabled=True, message_content="Send the synthetic digest")
+        assert self._text(store) == before
+
+    def test_block_deleted_by_hand_is_written_from_the_cache(self, store):
+        """A mutation on an entry whose block is gone writes the full block at the top."""
+        keep = self._create(store, name="Keeper")
+        gone = self._create(store, name="Removed by hand")
+        lines = self._text(store).splitlines()
+        start = next(i for i, ln in enumerate(lines) if f"id:{gone.id}" in ln)
+        store.inbox_path.write_text("\n".join(lines[:start] + lines[start + 2:]) + "\n", encoding="utf-8")
+
+        store.update(gone.id, enabled=False)
+        line = self._line(store, gone.id)
+        assert line == _format_entry_line(store.get(gone.id))
+        assert line.startswith("- [x] Removed by hand")
+        assert self._line(store, keep.id)
+
+
 class TestEndpointConfigVaultRoundTrip:
     """The endpoint route, method, and params round-trip through the vault line."""
 

@@ -70,6 +70,14 @@ up within ~2s by the file watcher. Markdown edits are **not** validated — a
 `[bot:: <name>]` typed here is accepted as-is, and the fire-time routing warning
 below is the only safety net.
 
+Board and API changes edit the line in place: toggling a schedule changes only
+its checkbox, a snooze only its `[snoozed_until:: …]` field, a fire only its
+`[last:: …]` field, and so on. Fields LifeOS doesn't know, field order, and the
+instruction body stay exactly as you wrote them, and a hand edit saved just
+before a board change is kept rather than overwritten. If you delete a
+schedule's line by hand and a board change reaches it before the watcher
+reindexes, that board change writes the full schedule line at the top of the inbox.
+
 ## Triggers
 
 | Type | Field | Example | Fires |
