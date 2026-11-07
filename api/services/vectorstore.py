@@ -31,6 +31,9 @@ FILE_PATH_BATCH = 2000
 
 # Records per write when the client does not report the server's own limit.
 FALLBACK_WRITE_BATCH = 1000
+# Most records in any one write, whatever the server allows, so a request with
+# full-size embeddings stays under the server's payload limit.
+WRITE_BATCH_CAP = 500
 # ``modified_day`` value of a chunk whose ``modified_date`` cannot be parsed;
 # date windows keep such chunks, matching the undated-passes contract.
 UNDATED_DAY = -1_000_000
@@ -140,7 +143,7 @@ class VectorStore:
         return int(parts[1]) if len(parts) > 1 else 8000
 
     def _write_batch_size(self) -> int:
-        """Most records one write may carry: the server's limit, or a safe default."""
+        """Most records one write may carry: the server's limit or a safe default, capped."""
         size = getattr(self, "_reported_write_batch", None)
         if size is None:
             try:
@@ -149,6 +152,7 @@ class VectorStore:
                 size = 0
             if size <= 0:
                 size = FALLBACK_WRITE_BATCH
+            size = min(size, WRITE_BATCH_CAP)
             self._reported_write_batch = size
         return size
 
