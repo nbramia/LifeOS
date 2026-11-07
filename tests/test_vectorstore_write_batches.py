@@ -233,40 +233,86 @@ class TestBatchSize:
         assert recorder.writes == [("add", 4), ("add", 4), ("add", 2)]
 
     def test_client_without_the_method_falls_back_to_a_safe_size(self):
-        from api.services.vectorstore import FALLBACK_WRITE_BATCH
+        from api.services.vectorstore import WRITE_BATCH_CAP
 
         recorder = self._Recorder()
 
-        _bare_store(object(), recorder).add_document(_chunks(FALLBACK_WRITE_BATCH + 1), _metadata())
+        _bare_store(object(), recorder).add_document(_chunks(WRITE_BATCH_CAP + 1), _metadata())
 
-        assert recorder.writes == [("add", FALLBACK_WRITE_BATCH), ("add", 1)]
+        assert recorder.writes == [("add", WRITE_BATCH_CAP), ("add", 1)]
 
     def test_client_whose_method_fails_falls_back_to_a_safe_size(self):
-        from api.services.vectorstore import FALLBACK_WRITE_BATCH
+        from api.services.vectorstore import WRITE_BATCH_CAP
 
         client = MagicMock()
         client.get_max_batch_size.side_effect = ConnectionError
         recorder = self._Recorder()
 
-        _bare_store(client, recorder).add_document(_chunks(FALLBACK_WRITE_BATCH + 1), _metadata())
+        _bare_store(client, recorder).add_document(_chunks(WRITE_BATCH_CAP + 1), _metadata())
 
-        assert recorder.writes == [("add", FALLBACK_WRITE_BATCH), ("add", 1)]
+        assert recorder.writes == [("add", WRITE_BATCH_CAP), ("add", 1)]
 
     def test_client_reporting_no_usable_size_falls_back_to_a_safe_size(self):
-        from api.services.vectorstore import FALLBACK_WRITE_BATCH
+        from api.services.vectorstore import WRITE_BATCH_CAP
 
         client = MagicMock()
         client.get_max_batch_size.return_value = 0
         recorder = self._Recorder()
 
-        _bare_store(client, recorder).add_document(_chunks(FALLBACK_WRITE_BATCH + 1), _metadata())
+        _bare_store(client, recorder).add_document(_chunks(WRITE_BATCH_CAP + 1), _metadata())
 
-        assert recorder.writes == [("add", FALLBACK_WRITE_BATCH), ("add", 1)]
+        assert recorder.writes == [("add", WRITE_BATCH_CAP), ("add", 1)]
 
     def test_fallback_stays_below_the_known_server_limit(self):
         from api.services.vectorstore import FALLBACK_WRITE_BATCH
 
         assert 0 < FALLBACK_WRITE_BATCH < 5461
+
+    def test_large_note_is_split_into_capped_batches_in_order(self):
+        client = MagicMock()
+        client.get_max_batch_size.return_value = 5461
+        calls = []
+        collection = MagicMock()
+        collection.add.side_effect = lambda **kw: calls.append(list(kw["ids"]))
+        records = 3700
+        ids = [f"id-{i}" for i in range(records)]
+
+        _bare_store(client, collection)._add_in_batches(
+            ids, [[0.1]] * records, ["d"] * records, [{}] * records
+        )
+
+        from api.services.vectorstore import WRITE_BATCH_CAP
+
+        assert len(calls) == 8
+        assert all(len(c) <= WRITE_BATCH_CAP for c in calls)
+        assert [i for c in calls for i in c] == ids
+
+    def test_server_limit_below_the_cap_is_respected(self):
+        client = MagicMock()
+        client.get_max_batch_size.return_value = 200
+        recorder = self._Recorder()
+
+        _bare_store(client, recorder).add_document(_chunks(450), _metadata())
+
+        assert recorder.writes == [("add", 200), ("add", 200), ("add", 50)]
+
+    def test_replacing_deletes_each_batchs_old_ids_before_its_add(self):
+        client = MagicMock()
+        client.get_max_batch_size.return_value = 5461
+        events = []
+        collection = MagicMock()
+        collection.delete.side_effect = lambda **kw: events.append(("delete", list(kw["ids"])))
+        collection.add.side_effect = lambda **kw: events.append(("add", list(kw["ids"])))
+        ids = [f"id-{i}" for i in range(1200)]
+
+        _bare_store(client, collection)._add_in_batches(
+            ids, [[0.1]] * 1200, ["d"] * 1200, [{}] * 1200, replacing=frozenset(ids)
+        )
+
+        assert [e[0] for e in events] == ["delete", "add"] * 3
+        for delete, add in zip(events[0::2], events[1::2]):
+            assert delete[1] == add[1]
+        assert [i for e in events[1::2] for i in e[1]] == ids
 
     def test_size_is_asked_for_once(self):
         client = MagicMock()
