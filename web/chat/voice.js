@@ -10,6 +10,7 @@ import { loadConversations } from './conversations.js';
 import { setStoredConversationId } from './backend.js';
 import { personaOrchestrates } from './persona.js';
 import { startPendingQuestionPolling } from './pending-question.js';
+import { watchConversation } from './turn-recovery.js';
 
 const VOICE_MODE_KEY = 'lifeos:chat:voice_mode';
 const DOCK_SETTINGS_KEY = 'lifeos:chat:dock_settings';
@@ -2488,6 +2489,8 @@ async function backoffBeforeRetry(attempt, signal) {
 // user-initiated action, same as any other terminal failure.
 const MIDSTREAM_POLL_ATTEMPTS = 3;
 const MIDSTREAM_POLL_INTERVAL_MS = 1500;
+// How long a dropped voice turn's conversation is watched for its reply.
+const VOICE_RECOVERY_MAX_MS = 5 * 60 * 1000;
 
 // Rejects like waitForRetry() does if `signal` fires first -- same shape,
 // separate function because this poll's interval is fixed (never jittered),
@@ -2533,6 +2536,46 @@ async function pollForCompletedAudio(turnId, signal) {
   return false;
 }
 
+// After a mid-stream drop, wait for the reply to land in the conversation the
+// server persisted it to (the native path writes it as the turn runs; the
+// proxy's Hermes tee writes it once the gateway's `done` arrives, even with
+// no browser attached), then show the thread as stored. `transcript` is the
+// user's words as this page rendered them; the reply is the assistant
+// message right after them. Without a transcript, any new assistant message
+// counts. `audioUrls` keeps tap-to-replay on the recovered reply.
+function recoverVoiceReplyText(conversationId, transcript, baselineCount, audioUrls) {
+  if (!conversationId) return;
+  const hasReply = (data) => {
+    const msgs = (data && data.messages) || [];
+    if (transcript) {
+      for (let i = msgs.length - 2; i >= 0; i -= 1) {
+        if (msgs[i].role === 'user' && msgs[i].content === transcript) {
+          return msgs[i + 1].role === 'assistant';
+        }
+      }
+      return false;
+    }
+    return baselineCount !== null && msgs.length > baselineCount
+      && msgs[msgs.length - 1].role === 'assistant';
+  };
+  watchConversation(conversationId, {
+    until: hasReply,
+    indicator: false,
+    maxMs: VOICE_RECOVERY_MAX_MS,
+    onSettled: (data, satisfied) => {
+      if (!satisfied) return;
+      heldRecording = null;  // the turn completed server-side; nothing to retry
+      removeVoiceTurnStatus();
+      setStatus('', 'Ready');
+      if (audioUrls && audioUrls.length && elements.messagesEl) {
+        const replies = elements.messagesEl.querySelectorAll('.message.assistant');
+        const last = replies[replies.length - 1];
+        if (last) attachReplay(last, audioUrls);
+      }
+    },
+  });
+}
+
 function recoverCompletedTurn(turnId) {
   heldRecording = null; // confirmed complete server-side -- nothing left to retry
   turnDone = true;
@@ -2567,17 +2610,29 @@ function handleTerminalFailure(message) {
 // immediately rather than after its full ~3s budget.
 async function handleMidStreamDrop(err, ownTurn) {
   const turnId = activeTurnId;
+  const conversationId = state.currentConversationId;
+  const transcript = turnTranscriptEl
+    ? (turnTranscriptEl.querySelector('.message-content')?.textContent || '').trim()
+    : '';
+  const baselineCount = elements.messagesEl
+    ? elements.messagesEl.querySelectorAll('.message.user, .message.assistant').length
+    : null;
   if (turnId) {
     setStatus('loading', 'Reconnecting…');
     const completed = await pollForCompletedAudio(turnId, ownTurn.abort.signal);
     if (!isOwnTurn(ownTurn)) return;
     if (completed) {
       recoverCompletedTurn(turnId);
+      recoverVoiceReplyText(conversationId, transcript, baselineCount,
+        [`${endpoints.voice}/audio/${encodeURIComponent(turnId)}`]);
       return;
     }
   }
   setStatus('error', 'Error');
   handleTerminalFailure(err?.message || 'Voice turn failed');
+  // The turn may still finish server-side; if its reply lands, show it in
+  // place of the failure.
+  recoverVoiceReplyText(conversationId, transcript, baselineCount, null);
 }
 
 // Exported so the headless test harness can drive a turn without a real mic

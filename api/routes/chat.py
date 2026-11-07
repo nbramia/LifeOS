@@ -457,6 +457,22 @@ class AskStreamRequest(BaseModel):
     # not required to be a UUID) before sending; the server never generates
     # or returns one. Optional and additive: omitting it changes nothing.
     client_turn_id: Optional[str] = None
+    # What to do when `conversation_id` already has a turn running or
+    # queued. "supersede" (or omitted) cancels it and runs this turn now;
+    # "queue" leaves it running and runs this turn after every turn ahead
+    # of it has finished (per-conversation FIFO, server-side, independent of
+    # any client staying connected). A queued turn's stream starts with a
+    # `queued` event, then carries the ordinary frames once it starts.
+    if_busy: Optional[str] = None
+
+    @field_validator("if_busy")
+    @classmethod
+    def validate_if_busy(cls, v):
+        if v is None:
+            return v
+        if v not in ("queue", "supersede"):
+            raise ValueError("if_busy must be 'queue' or 'supersede'")
+        return v
 
     @field_validator("client_turn_id")
     @classmethod
@@ -804,15 +820,31 @@ async def ask_stream(request: AskStreamRequest):
     # newer question. Checking client_turn_id too closes the same gap the
     # explicit cancel endpoint closes: a reused/duplicate key
     # supersedes rather than silently colliding with an unrelated turn.
-    if request.conversation_id:
-        get_turn_registry().cancel_conversation(request.conversation_id)
+    #
+    # `if_busy: "queue"` opts out of the conversation half of supersede: a
+    # conversation with a turn running or queued gets this turn appended to
+    # its FIFO instead. With nothing in flight it runs at once, like any turn.
+    registry = get_turn_registry()
     if request.client_turn_id:
-        get_turn_registry().cancel_by_client_turn_id(request.client_turn_id)
-    turn = get_turn_registry().create(
-        conversation_id=request.conversation_id,
-        modality=_modality,
-        client_turn_id=request.client_turn_id,
-    )
+        registry.cancel_by_client_turn_id(request.client_turn_id)
+    if (
+        request.if_busy == "queue"
+        and request.conversation_id
+        and registry.is_busy(request.conversation_id)
+    ):
+        turn = registry.enqueue(
+            request.conversation_id,
+            modality=_modality,
+            client_turn_id=request.client_turn_id,
+        )
+    else:
+        if request.conversation_id:
+            registry.cancel_conversation(request.conversation_id)
+        turn = registry.create(
+            conversation_id=request.conversation_id,
+            modality=_modality,
+            client_turn_id=request.client_turn_id,
+        )
 
     async def _content(text: str) -> None:
         """Emit a `content` SSE frame AND accumulate it into `partial_text`
@@ -846,6 +878,21 @@ async def ask_stream(request: AskStreamRequest):
         # branch that would otherwise set it for a brand-new conversation.
         conversation_id = turn.conversation_id
         try:
+            if turn.queued:
+                # Wait behind the turns ahead of this one. Nothing about this
+                # turn — not even its user message — is persisted until it
+                # starts, so the stored thread stays in Q/A order and the
+                # history loaded below already holds every earlier answer.
+                queued_event = {
+                    "type": "queued",
+                    "conversation_id": conversation_id,
+                    "position": get_turn_registry().queue_position(turn),
+                }
+                if request.client_turn_id:
+                    queued_event["client_turn_id"] = request.client_turn_id
+                await turn.emit(f"data: {json.dumps(queued_event)}\n\n")
+                await get_turn_registry().wait_to_start(turn)
+
             # Get or create conversation
             store = get_store()
 

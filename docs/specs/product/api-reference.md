@@ -195,7 +195,8 @@ Get conversation with messages. Access by id is **not** persona-scoped — any v
     }
   ],
   "pending_question": null,
-  "active_turn": null
+  "active_turn": null,
+  "queued_turns": 0
 }
 ```
 
@@ -205,16 +206,18 @@ Get conversation with messages. Access by id is **not** persona-scoped — any v
 
 `active_turn` is present only while a chat turn is running server-side for this conversation — native or Hermes-relayed alike — and `null` otherwise: `{ "turn_id": "...", "conversation_id": "...", "started_at": "2026-08-21T09:14:22" }`. Lets a client that reconnects mid-turn show "still working..." and reach the cancel affordance below. A completed turn's message carries no marker on it in the normal case; an *interrupted* one (cancelled, timed out, caught in a server shutdown, or a genuine stream error) has its content suffixed with a visible cut-off marker and `routing: {"truncated": true, "truncation_reason": "cancelled" | "deadline" | "shutdown" | "stream_error"}` — see [client-surfaces.md § Turn lifetime and cancellation](../technical/client-surfaces.md#turn-lifetime-and-cancellation).
 
+`queued_turns` is the number of turns waiting behind `active_turn`, sent with `if_busy: "queue"` on [`POST /api/ask/stream`](api-communications.md#post-apiaskstream) (or the Hermes proxy). A queued turn's user message is not in `messages` until it starts. A client returning to the conversation keeps waiting until `active_turn` is `null` and `queued_turns` is `0`.
+
 ### POST /api/conversations/{id}/cancel
 
-Stop a chat turn in flight for this conversation — native or Hermes-relayed. Since a disconnect does not stop a turn on its own, this is the explicit way to do it (also used internally when a new turn on the same conversation supersedes an old one still running).
+Stop a chat turn in flight for this conversation — native or Hermes-relayed — and drop every turn queued behind it. Since a disconnect does not stop a turn on its own, this is the explicit way to do it (also used internally when a new turn on the same conversation supersedes an old one still running).
 
 **Response:**
 ```json
 { "ok": true, "cancelled": true }
 ```
 
-`cancelled` is `false` when nothing was in flight (already finished, or never started) — not an error. **Errors:** `404` no such conversation.
+`cancelled` is `false` when nothing was running or queued (already finished, or never started) — not an error. **Errors:** `404` no such conversation.
 
 ### POST /api/conversations/{id}/answer
 

@@ -5,6 +5,9 @@
 import { state, config, elements, endpoints } from './session.js';
 import { addMessage, escapeHtml } from './thread.js';
 import { startPendingQuestionPolling, stopPendingQuestionPolling } from './pending-question.js';
+import {
+  watchConversation, stopWatching, isBusy, hasLocalTurns,
+} from './turn-recovery.js';
 
 export function toggleSidebar() {
   elements.sidebar.classList.toggle('open');
@@ -185,12 +188,25 @@ function renderConversations(conversations, isPartial = false) {
             `).join('');
 }
 
-export async function loadConversation(id) {
+// Render a conversation as GET /api/conversations/{id} returned it.
+export function renderConversation(data) {
+  elements.chatTitle.textContent = data.title || 'Conversation';
+  elements.messagesEl.innerHTML = '';
+  if (data.messages && data.messages.length > 0) {
+    data.messages.forEach(msg => {
+      // Sources are stored directly on the message, not in metadata
+      addMessage(msg.content, msg.role, msg.sources || []);
+    });
+  }
+}
+
+export async function loadConversation(id, { refreshList = true } = {}) {
   state.currentConversationId = id;
   closeSidebar();
   // Drop any answer affordance/poll from the conversation that was open; if
   // this one has an outstanding question, polling restarts below.
   stopPendingQuestionPolling();
+  stopWatching();
 
   try {
     // encodeURIComponent — `id` can arrive from the
@@ -198,18 +214,12 @@ export async function loadConversation(id) {
     // an unencoded URL query param, same as every other conversation-id
     // fetch site (ask-stream.js, pending-question.js).
     const response = await fetch(`${endpoints.conversations}/${encodeURIComponent(id)}`);
+    // Another conversation was opened while this one was loading.
+    if (state.currentConversationId !== id) return null;
     if (response.ok) {
       const data = await response.json();
-      elements.chatTitle.textContent = data.title || 'Conversation';
-
-      // Clear and render messages
-      elements.messagesEl.innerHTML = '';
-      if (data.messages && data.messages.length > 0) {
-        data.messages.forEach(msg => {
-          // Sources are stored directly on the message, not in metadata
-          addMessage(msg.content, msg.role, msg.sources || []);
-        });
-      }
+      if (state.currentConversationId !== id) return null;
+      renderConversation(data);
 
       // If this conversation spawned an orchestrating-persona session that is
       // awaiting an answer, re-show the affordance and resume polling.
@@ -217,11 +227,19 @@ export async function loadConversation(id) {
         startPendingQuestionPolling(id);
       }
 
-      loadConversations(); // Refresh list to show active
+      // A turn is still running (or queued) server-side and this page isn't
+      // streaming it: show it thinking and pick up the reply when it lands.
+      if (isBusy(data) && !hasLocalTurns(id)) {
+        watchConversation(id);
+      }
+
+      if (refreshList) loadConversations(); // Refresh list to show active
+      return data;
     }
   } catch (e) {
     console.error('Error loading conversation:', e);
   }
+  return null;
 }
 
 export async function deleteConversation(id) {
@@ -242,6 +260,7 @@ export function newChat() {
   state.currentConversationId = null;
   state.currentAgentThread = null; // leave agent-thread mode
   stopPendingQuestionPolling();   // no active conversation → no answer affordance
+  stopWatching();
   elements.inputField.placeholder = 'Ask a question...';
   elements.chatTitle.textContent = 'New conversation';
   elements.messagesEl.innerHTML = `

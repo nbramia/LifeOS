@@ -91,6 +91,10 @@ class ConversationDetailResponse(BaseModel):
     # conversation (native or Hermes-relayed) — absent/None otherwise,
     # including for an ordinary completed turn.
     active_turn: Optional[ActiveTurnResponse] = None
+    # Turns waiting behind `active_turn` (sent with `if_busy: "queue"`).
+    # A returning client keeps waiting until `active_turn` is null and this
+    # is 0. Queued turns' user messages are not in `messages` until they start.
+    queued_turns: int = 0
 
 
 class ConversationListResponse(BaseModel):
@@ -222,6 +226,7 @@ async def get_conversation(conversation_id: str):
         pending_question=pending_question,
         agent_session_active=agent_session_active,
         active_turn=_active_turn_response(conversation_id),
+        queued_turns=get_turn_registry().queued_count(conversation_id),
     )
 
 
@@ -244,7 +249,8 @@ def _active_turn_response(conversation_id: str) -> Optional[ActiveTurnResponse]:
 @router.post("/{conversation_id}/cancel")
 async def cancel_conversation_turn(conversation_id: str):
     """Stop a chat turn in flight for this conversation, if any (native
-    or Hermes-relayed — both register in the same turn registry).
+    or Hermes-relayed — both register in the same turn registry), and
+    drop every turn queued behind it.
 
     404 if the conversation itself doesn't exist; otherwise 200 with
     `cancelled: false` when nothing was in flight (already finished, or

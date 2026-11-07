@@ -3,8 +3,9 @@
 // Extracted from the index.html SPA's single inline <script>. These objects are
 // the one source of truth for chat state; the feature modules import them
 // directly, and the classic shell script reaches the same objects through the
-// `window.lifeChat` bridge installed in main.js. Persona selection persists in
-// sessionStorage; backend × conversation persistence is a separate concern.
+// `window.lifeChat` bridge installed in main.js. Persona, backend, and
+// per-backend conversation ids persist through readPersisted()/writePersisted()
+// below.
 
 // In-memory chat state. `attachments` and `allConversations` are reassigned in
 // place (e.g. `state.attachments = state.attachments.filter(...)`), so they live
@@ -54,3 +55,32 @@ export const endpoints = {};
 // Integration hooks the shell provides via initChat() — e.g. onAgentThreadReply
 // (the agent-thread reply path, which the shell handles directly).
 export const hooks = {};
+
+// Selections that should survive the tab closing (backend, persona, and each
+// backend's current conversation id). Read from this tab's sessionStorage
+// first, so two open tabs keep their own place, then from localStorage, so a
+// fresh load (e.g. a mobile browser that discarded the tab) reopens where the
+// user left off. Written to both.
+const PERSISTED_STORES = ['sessionStorage', 'localStorage'];
+
+export function readPersisted(key) {
+  for (const name of PERSISTED_STORES) {
+    try {
+      const v = window[name].getItem(key);
+      if (v) return v;
+    } catch (e) { /* storage blocked */ }
+  }
+  return null;
+}
+
+export function writePersisted(key, value) {
+  for (const name of PERSISTED_STORES) {
+    try { window[name].setItem(key, value); } catch (e) { /* storage blocked */ }
+  }
+}
+
+export function removePersisted(key) {
+  for (const name of PERSISTED_STORES) {
+    try { window[name].removeItem(key); } catch (e) { /* storage blocked */ }
+  }
+}

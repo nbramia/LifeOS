@@ -8,19 +8,41 @@ import { addMessage, updateMessage, setStatus, buildSourcesHtml } from './thread
 import { clearAttachments } from './attachments.js';
 import { loadConversations } from './conversations.js';
 import { personaSupportsHandoff, personaOrchestrates } from './persona.js';
-import { setStoredConversationId } from './backend.js';
+import {
+  setStoredConversationId, setPendingNewTurn, clearPendingNewTurn,
+} from './backend.js';
 import { startPendingQuestionPolling } from './pending-question.js';
+import {
+  localTurns, hasLocalTurns, isWatching, stopWatching, watchConversation,
+  findPendingNewConversation,
+} from './turn-recovery.js';
+import { loadConversation } from './conversations.js';
 
 // Low-level SSE transport. Builds the request body, opens the stream, and calls
 // `on(data)` for each parsed `data:` event. If `on` returns `true`, processing
 // stops immediately (used for the server-`error` path). `personaId`/`backend`
 // are reserved for follow-ons and omitted from the body when unset, so today's
-// request is byte-identical.
-export async function askStream({ question, conversationId, attachments, personaId, backend, model, on }) {
+// request is byte-identical. `ifBusy: 'queue'` asks the server to run this
+// turn after whatever is already running or queued on the conversation
+// instead of superseding it; `clientTurnId` is the opaque key the server
+// echoes on the `queued` event. `signal` aborts the read.
+//
+// Resolves with `{ responded: true }` once the stream ends with a terminal
+// `done` or `error` event; throws otherwise, with `err.responded` telling a
+// drop mid-stream (the turn exists server-side) apart from a request that
+// never got a response. A stream that just ends with no terminal event is a
+// drop too (`err.noTerminal`): the turn was cut off, cancelled, or is still
+// running server-side.
+export async function askStream({
+  question, conversationId, attachments, personaId, backend, model, on,
+  ifBusy, clientTurnId, signal, onResponse,
+}) {
   const body = { question };
   if (conversationId) {
     body.conversation_id = conversationId;
   }
+  if (ifBusy) body.if_busy = ifBusy;
+  if (clientTurnId) body.client_turn_id = clientTurnId;
 
   // Include attachments if any
   if (attachments && attachments.length > 0) {
@@ -52,34 +74,64 @@ export async function askStream({ question, conversationId, attachments, persona
   const response = await fetch(isLifeos ? endpoints.ask : proxiedAskEndpoint[backend], {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
+    body: JSON.stringify(body),
+    signal,
   });
+  // The server has registered (or queued) the turn by the time headers arrive.
+  if (onResponse) onResponse();
 
   if (!response.ok) {
-    throw new Error('Request failed');
+    // An HTTP error status is a definite answer: the server did not start
+    // this turn. A fetch that rejects instead (network loss, the page
+    // unloading) says nothing about whether the turn exists.
+    const err = new Error('Request failed');
+    err.httpStatus = response.status;
+    throw err;
   }
 
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
+  let sawTerminal = false;
+  const handleLine = (line) => {
+    if (!line.startsWith('data: ')) return false;
+    try {
+      const data = JSON.parse(line.slice(6));
+      if (data.type === 'done' || data.type === 'error') sawTerminal = true;
+      return on(data) === true;  // handler asked to stop processing
+    } catch (e) {
+      return false;  // Skip malformed JSON
+    }
+  };
+  try {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    // A network read is not an SSE frame: keep a trailing partial line for
+    // the next read.
+    let buffer = '';
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
 
-    const chunk = decoder.decode(value);
-    const lines = chunk.split('\n');
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
 
-    for (const line of lines) {
-      if (line.startsWith('data: ')) {
-        try {
-          const data = JSON.parse(line.slice(6));
-          if (on(data) === true) return;  // handler asked to stop processing
-        } catch (e) {
-          // Skip malformed JSON
-        }
+      for (const line of lines) {
+        if (handleLine(line)) return { responded: true };
       }
     }
+    buffer += decoder.decode();
+    if (buffer && handleLine(buffer)) return { responded: true };
+  } catch (err) {
+    err.responded = true;
+    throw err;
   }
+  if (!sawTerminal) {
+    const err = new Error('Stream ended without a terminal event');
+    err.responded = true;
+    err.noTerminal = true;
+    throw err;
+  }
+  return { responded: true };
 }
 
 // Stop the turn in flight for the current conversation. A turn
@@ -87,9 +139,23 @@ export async function askStream({ question, conversationId, attachments, persona
 // explicit cancel is the only way to actually stop it — closing the tab or
 // navigating away does not. Best-effort: on failure there's nothing
 // useful to show the user; the turn just keeps running.
+//
+// The cancel endpoint also drops every turn queued behind the running one;
+// their streams then end with nothing after `queued`. Sends still waiting in
+// this page to be posted are aborted, so they never reach the server. A
+// first turn whose conversation id hasn't arrived yet is cancelled the moment
+// its `conversation_id` frame does.
 export async function stopTurn() {
+  for (const t of localTurns) {
+    t.stopRequested = true;
+    if (!t.posted) t.controller.abort();
+  }
   const conversationId = state.currentConversationId;
   if (!conversationId) return;
+  await cancelConversation(conversationId);
+}
+
+async function cancelConversation(conversationId) {
   try {
     await fetch(`${endpoints.conversations}/${encodeURIComponent(conversationId)}/cancel`, {
       method: 'POST',
@@ -99,9 +165,57 @@ export async function stopTurn() {
   }
 }
 
+// Text turns can be sent while earlier ones are still running: each later
+// send is rendered at once with a "Queued" marker and POSTed with
+// `if_busy: 'queue'`, so the server runs them in order, each with the
+// previous answers in its history. Stop cancels the running turn and the
+// queue (stopTurn()).
+function syncTurnUi() {
+  const busy = localTurns.size > 0;
+  state.isLoading = busy;
+  elements.sendBtn.disabled = false;
+  elements.stopBtn.classList.toggle('visible', busy || isWatching());
+}
+
+function markQueued(userMsg, queued) {
+  if (!userMsg) return;
+  userMsg.classList.toggle('queued', queued);
+  const existing = userMsg.querySelector('.queued-marker');
+  if (queued && !existing) {
+    userMsg.insertAdjacentHTML('beforeend', '<div class="queued-marker">Queued</div>');
+  } else if (!queued && existing) {
+    existing.remove();
+  }
+}
+
+// Resolve with `promise`, or reject with an AbortError once `signal` fires
+// (Stop, or the watcher taking over).
+function untilAborted(promise, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) { reject(new DOMException('Aborted', 'AbortError')); return; }
+    const onAbort = () => reject(new DOMException('Aborted', 'AbortError'));
+    signal.addEventListener('abort', onAbort, { once: true });
+    promise.then((v) => { signal.removeEventListener('abort', onAbort); resolve(v); });
+  });
+}
+
+let placeholderSeq = 0;
+// The most recent send: `posted` settles once its request has been answered
+// (the server has registered or queued that turn) or has failed;
+// `conversationId` resolves with its conversation id as soon as it is known,
+// or null if its request ended without one.
+let lastSend = { posted: Promise.resolve(), conversationId: Promise.resolve(null) };
+
+function newClientTurnId() {
+  try {
+    if (window.crypto && window.crypto.randomUUID) return window.crypto.randomUUID();
+  } catch (e) { /* fall through */ }
+  return 'turn-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+}
+
 export async function sendMessage() {
   const question = elements.inputField.value.trim();
-  if (!question || state.isLoading) return;
+  if (!question) return;
 
   // In agent-thread mode the composer continues that thread instead
   // of starting a normal chat query.
@@ -110,13 +224,24 @@ export async function sendMessage() {
     return;
   }
 
-  state.isLoading = true;
+  // Something other than a text turn holds the composer: the backend
+  // default still resolving, or a voice turn.
+  if (state.isLoading && localTurns.size === 0) return;
+
+  // Queue behind a turn this page is streaming, or one it is watching after
+  // a reload. The Agent backend has no server-side queue.
+  const queued = hasLocalTurns(state.currentConversationId) || isWatching(state.currentConversationId || undefined);
+  if (queued && config.backend === 'agent') return;
+  const turn = { controller: new AbortController(), conversationId: state.currentConversationId, posted: false };
+  localTurns.add(turn);
+  // A queued send takes over from the watcher; the thread is reloaded once
+  // the last local turn finishes, so the watched reply shows up in order.
+  if (isWatching(state.currentConversationId || undefined)) {
+    stopWatching();
+    turn.reloadWhenDone = true;
+  }
+  syncTurnUi();
   setStatus('loading', 'Thinking...');
-  elements.sendBtn.disabled = true;
-  // Swap Send for Stop — hidden again once this turn settles, in the
-  // same place sendBtn is re-enabled below.
-  elements.sendBtn.style.display = 'none';
-  elements.stopBtn.classList.add('visible');
 
   // Capture attachments before clearing
   const messageAttachments = [...state.attachments];
@@ -127,7 +252,8 @@ export async function sendMessage() {
   if (attachmentCount > 0) {
     userMsgContent += `\n<span class="attachment-indicator">📎 ${attachmentCount} attachment${attachmentCount > 1 ? 's' : ''}</span>`;
   }
-  addMessage(userMsgContent, 'user');
+  const userMsg = addMessage(userMsgContent, 'user');
+  markQueued(userMsg, queued);
   elements.inputField.value = '';
   elements.inputField.style.height = 'auto';
 
@@ -140,7 +266,7 @@ export async function sendMessage() {
   }
 
   // Add placeholder for assistant response
-  const msgId = 'msg-' + Date.now();
+  const msgId = 'msg-' + Date.now() + '-' + (++placeholderSeq);  // unique across back-to-back sends
   const msg = addMessage('', 'assistant', [], msgId);
 
   // Add typing indicator
@@ -153,16 +279,77 @@ export async function sendMessage() {
   // A server `error` event marks the turn failed while the shared cleanup
   // below still releases the composer for a retry.
   let serverError = false;
+  let sawDone = false;
+  let sawRunningFrame = false;
+
+  // Queued sends reach the server in the order they were made: each waits
+  // until the previous send's request has been answered before posting its
+  // own, and a queued send on a new conversation waits for that
+  // conversation's id. It is never posted without one: that would start a
+  // second conversation.
+  const previous = lastSend;
+  let markPosted;
+  let resolveConversationId;
+  lastSend = {
+    posted: new Promise((resolve) => { markPosted = resolve; }),
+    conversationId: new Promise((resolve) => { resolveConversationId = resolve; }),
+  };
+  if (turn.conversationId) resolveConversationId(turn.conversationId);
+  let startConversationId = turn.conversationId;
+  const clearOwnPending = () => {
+    if (!turn.ownsPending) return;
+    turn.ownsPending = false;
+    clearPendingNewTurn();
+  };
 
   try {
+    if (queued) {
+      await untilAborted(previous.posted, turn.controller.signal);
+      if (!turn.conversationId) {
+        turn.conversationId = state.currentConversationId
+          || await untilAborted(previous.conversationId, turn.controller.signal);
+        if (!turn.conversationId) {
+          // The earlier send ended without ever learning its conversation.
+          const err = new Error('The conversation could not be started.');
+          err.noConversation = true;
+          throw err;
+        }
+        resolveConversationId(turn.conversationId);
+        startConversationId = turn.conversationId;
+      }
+    }
+    // Until the `conversation_id` frame arrives, remember this turn so a load
+    // after the page closed can find the conversation the server created.
+    // The record is cleared only once the id arrives or the server has
+    // definitely not started the turn: a request cut off by the page closing
+    // must leave it for the next load.
+    if (!turn.conversationId) {
+      setPendingNewTurn(question, (state.allConversations || []).map((c) => c.id));
+      turn.ownsPending = true;
+    }
+
+    turn.posted = true;
     await askStream({
       question,
-      conversationId: state.currentConversationId,
+      conversationId: turn.conversationId,
       attachments: messageAttachments,
       personaId: config.personaId,
       backend: config.backend,
       model: config.model,
+      ifBusy: queued && turn.conversationId ? 'queue' : undefined,
+      // Echoed on the `queued` event; an ordinary turn's body stays unchanged.
+      clientTurnId: queued && turn.conversationId ? newClientTurnId() : undefined,
+      signal: turn.controller.signal,
+      onResponse: markPosted,
       on: (data) => {
+        if (data.type === 'queued') {
+          markQueued(userMsg, true);
+          return;
+        }
+        if (!sawRunningFrame) {
+          sawRunningFrame = true;
+          markQueued(userMsg, false);
+        }
         if (data.type === 'routing') {
           // Capture which sources are being used
           routingSources = data.sources || [];
@@ -176,8 +363,17 @@ export async function sendMessage() {
         } else if (data.type === 'sources') {
           sources = data.sources;
         } else if (data.type === 'conversation_id') {
-          state.currentConversationId = data.conversation_id;
-          setStoredConversationId(data.conversation_id);  // per-backend persistence
+          turn.conversationId = data.conversation_id;
+          resolveConversationId(data.conversation_id);
+          clearOwnPending();
+          // A Stop that arrived ahead of this id cancels the conversation here.
+          if (turn.stopRequested) cancelConversation(data.conversation_id);
+          // Only adopt it if the user is still on the conversation this
+          // turn was sent from (or on the new one it is creating).
+          if (state.currentConversationId === startConversationId || !state.currentConversationId) {
+            state.currentConversationId = data.conversation_id;
+            setStoredConversationId(data.conversation_id);  // per-backend persistence
+          }
         } else if (data.type === 'usage') {
           // A backend that can't price a turn sends no `cost_usd`
           // rather than inventing a zero. `data.cost_usd || 0` treated an
@@ -250,6 +446,7 @@ export async function sendMessage() {
             });
           }
         } else if (data.type === 'done') {
+          sawDone = true;
           // Add sources and meta to message
           const msgEl = document.getElementById(msgId);
           if (msgEl) {
@@ -339,19 +536,74 @@ export async function sendMessage() {
       },
     });
 
-    if (!serverError) setStatus('', 'Ready');
+    if (!serverError && localTurns.size <= 1) setStatus('', 'Ready');
+    if (serverError && !turn.conversationId) clearOwnPending();
 
   } catch (error) {
-    console.error('Error:', error);
-    updateMessage(msgId, 'Sorry, something went wrong. Please try again.');
-    setStatus('error', 'Error');
+    if (turn.handedOff) {
+      // Aborted so the conversation watcher could take over this thread.
+    } else if (turn.stopRequested) {
+      // Stopped: a send that never ran says so; a reply cut off mid-stream
+      // keeps what had arrived (the server stores it marked as cut off).
+      markQueued(userMsg, false);
+      if (!fullContent) updateMessage(msgId, 'Cancelled.');
+      if (!turn.posted) clearOwnPending();
+      if (localTurns.size <= 1) setStatus('', 'Ready');
+    } else if (error && error.noConversation) {
+      markQueued(userMsg, false);
+      updateMessage(msgId, 'Not sent: the conversation could not be started. Please try again.');
+      setStatus('error', 'Error');
+      findPendingNewConversation();
+    } else if (error && error.responded) {
+      // The stream dropped after the server accepted the turn (network
+      // switch, the phone sleeping). The turn keeps running server-side, so
+      // this is not an error: catch up on the persisted thread instead.
+      console.warn('Stream dropped; recovering from the server:', error);
+      const conversationId = turn.conversationId;
+      localTurns.delete(turn);
+      if (conversationId && state.currentConversationId === conversationId) {
+        for (const other of localTurns) {
+          if (other.conversationId === conversationId) {
+            other.handedOff = true;
+            other.controller.abort();
+          }
+        }
+        watchConversation(conversationId);
+      } else if (!conversationId) {
+        findPendingNewConversation();
+      }
+    } else {
+      console.error('Error:', error);
+      markQueued(userMsg, false);
+      updateMessage(msgId, 'Sorry, something went wrong. Please try again.');
+      // Hand the message back for a retry.
+      if (!elements.inputField.value) elements.inputField.value = question;
+      setStatus('error', 'Error');
+      if (error && error.httpStatus) clearOwnPending();
+      // This send took over from the conversation watcher but never reached
+      // the server: hand the conversation straight back to the watcher.
+      if (turn.reloadWhenDone && turn.conversationId
+          && state.currentConversationId === turn.conversationId
+          && ![...localTurns].some((t) => t !== turn && t.conversationId === turn.conversationId)) {
+        turn.reloadWhenDone = false;
+        watchConversation(turn.conversationId);
+      }
+    }
   }
 
-  state.isLoading = false;
-  elements.sendBtn.disabled = false;
-  elements.sendBtn.style.display = '';
-  elements.stopBtn.classList.remove('visible');
-  elements.inputField.focus();
+  markPosted();
+  resolveConversationId(turn.conversationId || null);
+  localTurns.delete(turn);
+  syncTurnUi();
+  if (turn.reloadWhenDone) {
+    if (localTurns.size > 0) {
+      // Hand the reload to whichever local turn finishes last.
+      for (const other of localTurns) other.reloadWhenDone = true;
+    } else if (turn.conversationId && state.currentConversationId === turn.conversationId) {
+      loadConversation(turn.conversationId);
+    }
+  }
+  if (localTurns.size === 0) elements.inputField.focus();
 }
 
 export function askQuestion(question) {

@@ -132,6 +132,21 @@ def _sniff_client_turn_id(raw_body: bytes) -> Optional[str]:
     return client_turn_id if isinstance(client_turn_id, str) and client_turn_id else None
 
 
+def _sniff_queue_conversation_id(raw_body: bytes) -> Optional[str]:
+    """The request's `conversation_id` when it also carries
+    `if_busy: "queue"`, else `None` — read off the raw body like
+    `_sniff_client_turn_id`. Only such a request may wait behind a busy
+    conversation instead of running at once."""
+    try:
+        data = json.loads(raw_body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(data, dict) or data.get("if_busy") != "queue":
+        return None
+    conversation_id = data.get("conversation_id")
+    return conversation_id if isinstance(conversation_id, str) and conversation_id else None
+
+
 def make_backend_router(
     *, prefix, tag, backend_label, url_attr, token_attr, client_factory,
     transform_body: Optional[Callable[[bytes], bytes]] = None,
@@ -382,6 +397,81 @@ def make_backend_router(
                     await turn.close()
 
             turn.task = asyncio.create_task(_pump_guaranteed())
+            return StreamingResponse(
+                turn.reader(), status_code=200, media_type="text/event-stream",
+            )
+
+        queue_conversation_id = (
+            _sniff_queue_conversation_id(raw_body) if observer is not None else None
+        )
+        if queue_conversation_id and get_turn_registry().is_busy(queue_conversation_id):
+            # `if_busy: "queue"` on a conversation with a turn running or
+            # queued: the backend is not contacted until every turn ahead
+            # of this one has finished, so the backend's own history for
+            # this turn already holds their answers. The turn is
+            # registry-owned from here, exactly like the observer branch
+            # below, so it runs whether or not a client stays attached.
+            client_turn_id = _sniff_client_turn_id(raw_body)
+            if client_turn_id:
+                get_turn_registry().cancel_by_client_turn_id(client_turn_id)
+            turn = get_turn_registry().enqueue(
+                queue_conversation_id,
+                modality=_sniff_modality(raw_body),
+                client_turn_id=client_turn_id,
+            )
+            if hasattr(observer, "bind_turn"):
+                observer.bind_turn(turn)
+
+            async def _pump_queued():
+                try:
+                    queued_event = {
+                        "type": "queued",
+                        "conversation_id": queue_conversation_id,
+                        "position": get_turn_registry().queue_position(turn),
+                    }
+                    if client_turn_id:
+                        queued_event["client_turn_id"] = client_turn_id
+                    await turn.emit("data: " + json.dumps(queued_event) + "\n\n")
+                    await get_turn_registry().wait_to_start(turn)
+                    try:
+                        upstream = await client.send(
+                            client.build_request("POST", url, headers=headers, content=body),
+                            stream=True,
+                        )
+                    except (httpx.RequestError, httpx.InvalidURL) as exc:
+                        logger.warning("%s backend request failed: %s", backend_label, exc)
+                        await turn.emit(
+                            "data: " + json.dumps({
+                                "type": "error",
+                                "message": f"{backend_label} backend unreachable",
+                            }) + "\n\n"
+                        )
+                        return
+                    try:
+                        if upstream.status_code >= 400:
+                            logger.warning(
+                                "%s backend returned HTTP %s for a queued turn",
+                                backend_label, upstream.status_code,
+                            )
+                            await turn.emit(
+                                "data: " + json.dumps({
+                                    "type": "error",
+                                    "message": f"{backend_label} backend returned HTTP {upstream.status_code}",
+                                }) + "\n\n"
+                            )
+                            return
+                        async for chunk in upstream.aiter_raw():
+                            observer.observe(chunk)
+                            await turn.emit(chunk)
+                    finally:
+                        await upstream.aclose()
+                finally:
+                    observer.finalize()
+                    await client.aclose()
+                    get_turn_registry().pop(turn)
+                    await turn.close()
+
+            turn.task = asyncio.create_task(_pump_queued())
             return StreamingResponse(
                 turn.reader(), status_code=200, media_type="text/event-stream",
             )

@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Platform
-> **Last Updated:** 2026-11-02
+> **Last Updated:** 2026-11-07
 
 LifeOS exposes the orchestrator to **HTTP consumers** — thin clients that submit text and consume SSE without importing LifeOS Python modules. Endpoint and event **shapes** are defined in [api-reference.md](../product/api-reference.md); this doc covers **who consumes them**, **whisper-relay integration**, and **breaking-change policy**.
 
@@ -95,7 +95,7 @@ On the `lifeos` backend, an orchestrating persona keeps its spawn path rather th
 
 So the two paths are an intentional, permanent fork, not a transitional state: `hermes` is the recommended way to run an orchestrating persona whenever it's configured and available (the existing default-backend-selection logic in `web/chat/backend.js` already prefers `hermes` for exactly this reason — see "Default backend selection" below), and `lifeos`'s fire-and-forget spawn remains the fallback that works everywhere, including a fresh clone with nothing else configured.
 
-Web chat implements this contract in `web/chat/persona.js`: a top-of-chat toolbar `<select>` populated from `/api/personas`, the selection persisted across refresh in `sessionStorage` (`lifeos:chat:persona_id`), capability-gated `claude_intent` handoff, and a persona-scoped sidebar. Switching persona starts a fresh, persona-scoped conversation.
+Web chat implements this contract in `web/chat/persona.js`: a top-of-chat toolbar `<select>` populated from `/api/personas`, the selection persisted (`lifeos:chat:persona_id`, in both `sessionStorage` and `localStorage`; see "Web client recovery" below), capability-gated `claude_intent` handoff, and a persona-scoped sidebar. Switching persona starts a fresh, persona-scoped conversation.
 
 **Model picker.** The same toolbar carries a per-turn model picker (`web/chat/model.js`): `Auto` (Haiku + escalation) / `Sonnet` / `Opus` / `Gemma (local)` / `Remote` / `Claude Code`. An explicit `Sonnet`/`Opus` pick is the operator asking for an API model, which is why it dispatches without a prompt — `Auto`'s own escalation only climbs to non-API engines. The choice persists in `sessionStorage` (`lifeos:chat:model`) and rides along on `/api/ask/stream` as `model_override` (omitted for `auto`, so the default request is unchanged). For the inline model picks the server pins the turn to that model — cloud picks reuse the per-turn escalation client; `gemma` builds a per-turn `LocalLLMClient`. Context is preserved the same way every turn is: the full `conversation_history` is replayed into the chosen client. `Claude Code` is not an inline model: selecting it short-circuits the turn into the same engine handoff the orchestrator emits for an inferred "use claude code" directive (a `claude_intent` SSE event → `/api/chat/handoff` → `spawn_claude_code_session`), so the message runs in a background Claude Code worker rather than answering inline, on any backend. The frontend treats an explicit `claude_code` pick as its own handoff opt-in, bypassing the persona capability gate that filters inferred handoffs. The **voice** surface carries the same model selection, lifeos-backend only: `web/chat/voice.js` forwards `model_override` on `/api/voice/turn/stream` exactly when the selected backend is `lifeos` — deliberately not extended to hermes, where model selection is the harness's call, not LifeOS's; whisper-relay relays it to `/api/ask/stream`. The picker is shown in voice mode as well as text — hidden on the Agent and Hermes backends (the persona picker stays visible on Hermes, unlike Agent).
 
@@ -127,7 +127,7 @@ LifeOS `/chat` is the unified text+voice client. Voice *transport* stays in whis
 
 **Topology:** browser → LifeOS `/chat` → (proxy) → gateway → for the `lifeos` backend, the gateway calls back into LifeOS `/api/ask/stream` (the consumer-into-LifeOS direction above); for the `hermes` backend, the gateway's Hermes adapter (`voice_gateway/adapters/hermes_backend.py`) calls the Hermes harness directly — not LifeOS's own Hermes proxy, `POST /api/hermes/ask/stream`. A Hermes-backend voice turn therefore gets none of that proxy seam's persona resolution or `lifeos_context` envelope, unlike the text path. It still reaches the configured LifeOS MCP server, whose task schemas and server-side guards carry task-hierarchy action semantics. Conversation/persona listing is owned by LifeOS, not the gateway; the Persistence tee below covers conversation persistence for this direct route.
 
-**Persistence tee ([ADR-021](../../adr/021-voice-turn-persistence-tee.md)):** because a Hermes-backend voice turn does not reach `/api/hermes/ask/stream`'s own persister (above), `api/routes/voice.py`'s `_VoiceTurnPersister` tees `POST turn/stream`'s relayed SSE response directly, independent of whichever internal call path the gateway used. Trigger: the terminal `done` event's authoritative `data` — a turn that errors, is cancelled, or disconnects before `done` persists nothing (this is also what keeps a bare-transcribe/wake-check call, `POST /api/voice/transcribe` above, from creating a conversation). Guard: writes only when the turn's `backend` form field was exactly `"hermes"` — a `lifeos`-backend turn is already persisted by the native orchestrator (its `done` arrives only after the gateway's internal `/api/ask/stream` call, and that call's persistence, already completed), and an `agent`-backend turn is never persisted, matching that backend's section below. Writes go through the exact same `ConversationStore` calls `_HermesTurnPersister` uses, so grouping (one conversation per voice session) matches the text path. Extracting `backend` requires buffering `turn/stream`'s multipart body — the one path on this proxy that isn't a pure unbuffered stream; every other `/api/voice/*` path is unchanged.
+**Persistence tee ([ADR-021](../../adr/021-voice-turn-persistence-tee.md)):** because a Hermes-backend voice turn does not reach `/api/hermes/ask/stream`'s own persister (above), `api/routes/voice.py`'s `_VoiceTurnPersister` tees `POST turn/stream`'s relayed SSE response directly, independent of whichever internal call path the gateway used. Trigger: the terminal `done` event's authoritative `data` — a turn that errors or is cancelled before `done` persists nothing (this is also what keeps a bare-transcribe/wake-check call, `POST /api/voice/transcribe` above, from creating a conversation). Guard: writes only when the turn's `backend` form field was exactly `"hermes"` — a `lifeos`-backend turn is already persisted by the native orchestrator (its `done` arrives only after the gateway's internal `/api/ask/stream` call, and that call's persistence, already completed), and an `agent`-backend turn is never persisted, matching that backend's section below. Writes go through the exact same `ConversationStore` calls `_HermesTurnPersister` uses, so grouping (one conversation per voice session) matches the text path. Extracting `backend` requires buffering `turn/stream`'s multipart body — the one path on this proxy that isn't a pure unbuffered stream; every other `/api/voice/*` path is unchanged. **The tee outlives the browser:** `turn/stream`'s upstream drain is a server-owned task registered in the shared turn registry (`api/services/chat_turns.py`, so it is bounded by the detached-turn deadline and the shutdown drain), and the browser reads a queue, the same pattern as a native chat turn. Once the gateway has sent `started` (which carries the turn id the browser cancels by), a browser disconnect detaches: the gateway turn runs on and the tee still sees `done`. A disconnect before `started` stops the drain and closes the upstream connection, since the browser had no turn id to cancel by yet. The proxy forwards `GET`, `HEAD`, and `POST`.
 
 **Orchestrating personas have no voice-specific divert.** An orchestrating persona reaches the Hermes proxy on both text and voice turns identically — Hermes drives the persona itself (`lifeos_agent_spawn`) rather than rejecting it. `web/chat/voice.js` still only starts pending-question polling (`startPendingQuestionPolling()`) after a `lifeos`-backend turn, never `hermes` or `agent` — not because Hermes rejects the turn, but because only a `lifeos`-backend spawn ever creates a LifeOS-linked session for this client to poll.
 
@@ -137,7 +137,7 @@ Web chat implements voice mode in `web/chat/voice.js` — tap-to-talk turn lifec
 
 **Network resilience on the initial submission is entirely client-side — no server contract change.** `web/chat/voice.js`'s `postTurnStart()` retries the `POST turn/stream` call itself (never a mid-stream failure — see below) up to 3 times with jittered backoff (~1s/3s/9s), but only on failures proven to mean "the request never reached a response": a raw `fetch()` rejection (offline/DNS/connection-reset), or this repo's own `502` from `voice_proxy()` in `api/routes/voice.py` — read that file: it raises `502` from exactly one place, `except (httpx.RequestError, httpx.InvalidURL)` around the call to the gateway, so a `502` here can never mean a turn actually started server-side. Any `4xx`, and any *other* `5xx` (not proven side-effect-free the way this proxy's `502` is — `voice_turn_stream` always answers `200` and reports its own internal failures as an in-stream `error` event, never an HTTP-level 5xx), is terminal on the first attempt. The recorded blob is held client-side (`heldRecording`) until the turn *definitively* completes — success, an explicit cancel, or an explicit dismiss — never merely because a submission attempt failed; a terminal failure renders a Retry affordance that resubmits the same blob into the same bubble.
 
-**A failure AFTER the initial POST answered `ok` (a mid-stream drop) is never auto-retried.** By then the turn may genuinely be running server-side, and a blind resubmit risks double-executing it. whisper-relay's `voice_gateway/` exposes no turn-status endpoint by `turn_id` (`cancel.py`'s `TurnRegistry` only supports firing a cancel; `storage.py`'s `read_meta()` has no HTTP route) — the one thing that IS reachable and answers "did it finish" is `GET /api/voice/audio/{turn_id}` (`routes/voice.py`'s `_serve_clip()`), which 404s until the final TTS clip is written, right before `done`. `handleMidStreamDrop()` polls that endpoint (`HEAD`, briefly) on a drop: found → the turn completed, offered back via the existing tap-to-replay affordance (there is no way to recover the transcript/response text for redisplay, since `GET /api/voice/audio/{turn_id}` answers only "did it finish", not with the text itself); not found within the window → explicit-Retry-only, identical to any other terminal failure, never auto-retried.
+**A failure AFTER the initial POST answered `ok` (a mid-stream drop) is never auto-retried.** By then the turn may genuinely be running server-side, and a blind resubmit risks double-executing it. whisper-relay's `voice_gateway/` exposes no turn-status endpoint by `turn_id` (`cancel.py`'s `TurnRegistry` only supports firing a cancel; `storage.py`'s `read_meta()` has no HTTP route) — the one thing that IS reachable and answers "did it finish" is `GET /api/voice/audio/{turn_id}` (`routes/voice.py`'s `_serve_clip()`), which 404s until the final TTS clip is written, right before `done`. `handleMidStreamDrop()` polls that endpoint (`HEAD`, briefly) on a drop: found → the turn completed, offered back via the existing tap-to-replay affordance; not found within the window → explicit-Retry-only, identical to any other terminal failure, never auto-retried. Either way it then watches the conversation (`watchConversation()` in `web/chat/turn-recovery.js`, without the thinking bubble) for up to five minutes for the reply to land in the store — the native path writes it as the turn runs, the proxy's Hermes tee once `done` arrives even with no browser attached — and the reply is the assistant message right after the user's transcript. When it lands, the thread is re-rendered from the store, the failure/Retry affordance and held recording are dropped, and tap-to-replay is attached to the recovered reply when its audio is known.
 
 ## Turn lifetime and cancellation
 
@@ -165,7 +165,28 @@ proxy; the Agent backend is unaffected (below).
   finished, or never started); `404` if the conversation itself doesn't
   exist. A new `POST /api/ask/stream` (or the Hermes equivalent) naming a
   conversation that already has a turn in flight cancels the old one first
-  (supersede) — asking again is itself a stop gesture.
+  (supersede) — asking again is itself a stop gesture. The cancel endpoint
+  and supersede both also drop every turn queued on the conversation
+  (below).
+- **Queued turns (`if_busy: "queue"`).** A client that wants a second
+  message answered after the first, not instead of it, sends `if_busy:
+  "queue"`. On a conversation with a turn running or queued, the registry
+  (`TurnRegistry.enqueue()`) creates the turn and starts its task at once,
+  but the task waits until every turn ahead of it has finished; popping the
+  running turn promotes the next. So the queue drains server-side with no
+  client attached, each turn bounded like any other (its detached-lifetime
+  clock starts when it starts running, and the shutdown drain cancels
+  queued turns too). The native path stores a queued turn's user message
+  and loads its history only once it starts, so the thread stays in
+  question/answer order and its history holds every earlier answer; the
+  Hermes proxy contacts Hermes only once the queued turn starts, for the
+  same reason. The stream of a waiting turn opens with a `queued` event
+  (`conversation_id`, `position`, `client_turn_id` when sent), then carries
+  the ordinary frames once it starts; a queued turn cancelled before it
+  starts ends its stream with no further frames. With nothing in flight, a
+  queue request runs at once. Only the web chat sends `"queue"`;
+  Telegram, whisper-relay, and Hermes keep supersede, which voice barge-in
+  depends on.
 - **`client_turn_id` and `POST /api/chat/cancel` (closes the
   first-turn barge-in gap).** `conversation_id` alone can't cancel a turn
   before its first SSE frame arrives: a brand-new conversation's id doesn't
@@ -195,10 +216,12 @@ proxy; the Agent backend is unaffected (below).
   disconnect that follows afterward is a no-op — not a second finalize.
   Cancelling an already-finished (or already-cancelled) turn is `200` +
   `cancelled: false`, never a 4xx — a gateway treats that as success.
-- **`GET /api/conversations/{id}`** gains an additive `active_turn` field:
+- **`GET /api/conversations/{id}`** carries `active_turn` —
   `{turn_id, conversation_id, started_at}` while a turn is in flight for
-  that conversation, `null` otherwise. Lets a reconnecting client show
-  "still working..." and reach the cancel affordance even after a reload.
+  that conversation, `null` otherwise — and `queued_turns`, the number of
+  turns waiting behind it. A reconnecting client shows "still working..."
+  and reaches the cancel affordance until `active_turn` is `null` and
+  `queued_turns` is `0`.
 - **A cut-off turn is always marked, never presented as whole.** Whatever
   text a turn produced before being cancelled, hitting its
   `LIFEOS_DETACHED_TURN_TIMEOUT_SECONDS` deadline (default 300s, clock
@@ -212,10 +235,70 @@ proxy; the Agent backend is unaffected (below).
   Neither field is new SSE wire protocol — they only ever appear on the
   persisted message read back via `GET /api/conversations/{id}`, not on any
   `data:` event.
-- **Byte identity for a connected client is unchanged.** No new SSE event
-  type and no new header exist — cancellation is keyed on
-  `conversation_id`, which every client already receives as the first SSE
-  event on both the native and Hermes paths.
+- **Byte identity for a connected client is unchanged.** Cancellation adds
+  no SSE event type and no header — it is keyed on `conversation_id`, which
+  every client already receives as the first SSE event on both the native
+  and Hermes paths. The one additive event, `queued`, is sent only to a
+  request that opted in with `if_busy: "queue"`.
+
+### Web client recovery
+
+`web/chat/turn-recovery.js` lets `/chat` pick a reply up wherever the
+server finished it:
+
+- **What it waits on.** `watchConversation()` shows a thinking bubble and
+  polls `GET /api/conversations/{id}` (every 2.5 s, 5 s after the first
+  minute, capped at 20 minutes) until `active_turn` is `null` and
+  `queued_turns` is `0`, re-rendering the stored thread as messages land,
+  then renders the final stored thread.
+- **When.** On page load (the restored conversation is rendered, and
+  watched if busy — any `loadConversation()` does this), on
+  `visibilitychange` to visible and `pageshow` from the back/forward cache
+  (`checkCurrentConversation()`), and when a text stream fails after the
+  server accepted the request. A dropped stream for a turn still running
+  shows no error bubble; it hands over to the watcher. A stream that ends
+  without a terminal `done` or `error` event counts as dropped too (the
+  turn was cut off, or is still running), queued turns included. The
+  watcher re-renders when the stored thread gains messages, so a local
+  failure notice stays in view until then. A stream still open
+  while the server reports nothing running died silently while the page
+  was hidden, so after a short grace it is aborted and the stored thread
+  shown.
+- **Where the page reopens.** The backend, the persona, and each backend's
+  conversation id are written to both `sessionStorage` and `localStorage`
+  and read from `sessionStorage` first, so open tabs keep their own place
+  and a fresh load reopens the last conversation. A conversation id is
+  stored the moment its `conversation_id` frame arrives.
+- **A new conversation whose id never arrived.** Until that frame arrives,
+  the first message of a new conversation is recorded under the backend
+  and persona's key, with the send time and the ids the sidebar already
+  listed. If the page closes first, the next load looks among that persona
+  and backend's three most recent conversations created at or after the
+  send time (less a two-minute clock-skew allowance; `created_at` is
+  server-local time read as browser-local) and not already listed, for the
+  one whose first message is that question, retrying for a minute since
+  the request may still have been on its way, and opens it. The search
+  gives up if the persona, backend, or open conversation changes while it
+  runs. This needs no API
+  addition: the server creates the conversation as soon as it receives the
+  request.
+- **Sending while busy.** The composer stays open during a turn. A message
+  sent while this page streams a turn on the same conversation, or watches
+  one, renders at once with a "Queued" marker and is posted with `if_busy:
+  "queue"`. Sends are posted in the order they were made, each after the
+  previous request has been answered, and a send on a new conversation
+  waits for that conversation's id: it is never posted without one, and if
+  the earlier send ends without an id the queued bubble says it was not
+  sent. The marker clears when its first non-`queued` frame arrives, and
+  its reply streams on its own request. Stop cancels the running turn and
+  the server-side queue, aborts sends still waiting in the page (they are
+  never posted, and show as cancelled), and cancels a first turn whose
+  conversation id hasn't arrived yet as soon as it does. A send that fails
+  before reaching the server is handed back to the composer, and if it had
+  taken over from the watcher, the watcher resumes. The Agent backend has no server-side queue,
+  so it still takes one turn at a time. Voice turns keep their own
+  lifecycle: a voice turn and a text turn don't start while the other is in
+  flight, because the voice gateway supersedes rather than queues.
 
 ## Text Backends
 

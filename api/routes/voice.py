@@ -15,11 +15,15 @@ with the rest of the API's localhost/Tailscale trust model.
 The ONE exception, per ADR-021: ``POST turn/stream`` is additionally
 tee'd into the same conversation store the Hermes text route uses, since a
 Hermes-backend voice turn otherwise never touches a LifeOS persister at all —
-see ``_VoiceTurnPersister`` below for why and its double-write guard. Every
-other path (cancel, audio clips, anything the gateway adds later) is the
-unmodified pass-through this module always was.
+see ``_VoiceTurnPersister`` below for why and its double-write guard. Its
+upstream drain is a server-owned task registered in the shared turn registry
+(``api/services/chat_turns.py``), so once the gateway has sent ``started``
+a browser disconnect detaches from the turn instead of ending it, and the
+tee still sees ``done``. Every other path (cancel, audio clips, anything the
+gateway adds later) is the unmodified pass-through.
 """
 
+import asyncio
 import json
 import logging
 from typing import Optional
@@ -32,6 +36,7 @@ from fastapi.responses import StreamingResponse
 from config.settings import settings
 
 from api.routes._proxy import TIMEOUT, filter_headers as _filter_headers
+from api.services.chat_turns import get_turn_registry
 from api.services.conversation_store import get_store
 from api.services.conversation_titler import schedule_retitle
 
@@ -92,10 +97,10 @@ class _VoiceTurnPersister:
 
     ``observe()`` does no I/O — in-memory SSE frame reassembly only,
     mirroring ``_HermesTurnPersister`` in hermes_proxy.py. ``finalize()`` —
-    the only place a store call happens — runs once the relay has ended
-    (normal completion or an early disconnect alike), after every byte
-    already reached the browser, so persistence can never delay a chunk in
-    flight. Every store call is wrapped so a persistence failure is logged
+    the only place a store call happens — runs once the server-owned pump
+    has drained the gateway's stream to its end (whether or not a browser
+    is still reading it), after the last chunk was relayed, so persistence
+    can never delay a chunk in flight. Every store call is wrapped so a persistence failure is logged
     and swallowed, never surfacing as a broken turn.
     """
 
@@ -106,6 +111,9 @@ class _VoiceTurnPersister:
         self._persona_id = persona_id
         self._buf = b""
         self._done_data: Optional[dict] = None
+        # Set once the gateway's `started` event (which carries the turn id
+        # the browser cancels by) has been relayed.
+        self.started_seen = False
 
     def observe(self, chunk: bytes) -> None:
         """Non-blocking, in-memory-only frame reassembly."""
@@ -131,6 +139,9 @@ class _VoiceTurnPersister:
             try:
                 event = json.loads(line[len(b"data:"):].strip())
             except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if isinstance(event, dict) and event.get("type") == "started":
+                self.started_seen = True
                 continue
             if not isinstance(event, dict) or event.get("type") != "done":
                 continue
@@ -217,7 +228,58 @@ async def _build_persister(request: Request) -> "_VoiceTurnPersister":
     return _VoiceTurnPersister(backend=backend, persona_id=persona_id)
 
 
-@router.api_route("/{path:path}", methods=["GET", "POST"])
+def _detachable_turn_response(
+    persister: "_VoiceTurnPersister", upstream: httpx.Response, client: httpx.AsyncClient,
+) -> StreamingResponse:
+    """Relay a ``turn/stream`` response through a server-owned pump.
+
+    The pump (registered in the shared turn registry, so it is bounded by
+    the detached-turn deadline and the shutdown drain) reads the gateway's
+    stream to its end and tees it into the persister; the browser only reads
+    a `ChatTurn` queue. A browser disconnect after the gateway's `started`
+    event detaches: the gateway turn keeps running and the tee still sees
+    `done`. The browser cancels a started turn explicitly, by its turn id
+    (`POST turn/{id}/cancel`). A disconnect before `started` — the browser
+    has no turn id to cancel by yet — stops the pump, which closes the
+    upstream connection.
+    """
+    turn = get_turn_registry().create(conversation_id=None, modality="voice")
+
+    async def _pump():
+        try:
+            async for chunk in upstream.aiter_raw():
+                persister.observe(chunk)
+                await turn.emit(chunk)
+        finally:
+            try:
+                persister.finalize()
+            finally:
+                await upstream.aclose()
+                await client.aclose()
+                get_turn_registry().pop(turn)
+                await turn.close()
+
+    turn.task = asyncio.create_task(_pump())
+
+    async def relay():
+        inner = turn.reader()
+        try:
+            async for chunk in inner:
+                yield chunk
+        finally:
+            await inner.aclose()
+            if not persister.started_seen and not turn.finalized:
+                turn.request_cancel("cancelled")
+
+    return StreamingResponse(
+        relay(),
+        status_code=upstream.status_code,
+        headers=_filter_headers(upstream.headers),
+        media_type=upstream.headers.get("content-type"),
+    )
+
+
+@router.api_route("/{path:path}", methods=["GET", "HEAD", "POST"])
 async def voice_proxy(path: str, request: Request):
     """Forward any ``/api/voice/<path>`` request to the voice gateway, streaming."""
     # Basic guard against an obviously crafted path. The gateway routes by its
@@ -266,6 +328,9 @@ async def voice_proxy(path: str, request: Request):
         await client.aclose()
         logger.warning("voice gateway request failed (%s %s): %s", request.method, path, exc)
         raise HTTPException(status_code=502, detail=f"voice gateway unreachable: {exc}")
+
+    if persister is not None and upstream.status_code < 400:
+        return _detachable_turn_response(persister, upstream, client)
 
     async def relay():
         try:
