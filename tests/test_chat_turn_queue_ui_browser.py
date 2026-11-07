@@ -36,7 +36,7 @@ class FakeChatApi:
         self.requests: list[dict] = []
         self.turn_seconds = 1.5
         self.conversation_id_delay = 0.0
-        # Cut the HTTP stream after this many frames (the turn keeps running).
+        # Frames to send before the HTTP stream is cut; the turn itself is unaffected.
         self.drop_after_frames = None
 
     def reset(self):

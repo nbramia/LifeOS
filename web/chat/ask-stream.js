@@ -32,7 +32,7 @@ import { loadConversation } from './conversations.js';
 // server-side) apart from a request that never got a response.
 export async function askStream({
   question, conversationId, attachments, personaId, backend, model, on,
-  ifBusy, clientTurnId, signal,
+  ifBusy, clientTurnId, signal, onResponse,
 }) {
   const body = { question };
   if (conversationId) {
@@ -74,6 +74,8 @@ export async function askStream({
     body: JSON.stringify(body),
     signal,
   });
+  // The server has registered (or queued) the turn by the time headers arrive.
+  if (onResponse) onResponse();
 
   if (!response.ok) {
     throw new Error('Request failed');
@@ -168,6 +170,8 @@ async function waitForConversationId(self, timeoutMs = 15000) {
 }
 
 let placeholderSeq = 0;
+// Settles once the most recent send's request has been answered (or failed).
+let lastPosted = Promise.resolve();
 
 function newClientTurnId() {
   try {
@@ -245,6 +249,14 @@ export async function sendMessage() {
   let sawDone = false;
   let sawRunningFrame = false;
 
+  // Queued sends reach the server in the order they were made: each waits
+  // until the previous send's request has been answered (the server has
+  // registered or queued that turn) before posting its own.
+  const previousPosted = lastPosted;
+  let markPosted;
+  const posted = new Promise((resolve) => { markPosted = resolve; });
+  lastPosted = posted;
+  if (queued) await previousPosted;
   if (queued && !turn.conversationId) {
     turn.conversationId = await waitForConversationId(turn);
   }
@@ -262,8 +274,10 @@ export async function sendMessage() {
       backend: config.backend,
       model: config.model,
       ifBusy: queued && turn.conversationId ? 'queue' : undefined,
-      clientTurnId: newClientTurnId(),
+      // Echoed on the `queued` event; an ordinary turn's body stays unchanged.
+      clientTurnId: queued && turn.conversationId ? newClientTurnId() : undefined,
       signal: turn.controller.signal,
+      onResponse: markPosted,
       on: (data) => {
         if (data.type === 'queued') {
           markQueued(userMsg, true);
@@ -494,6 +508,7 @@ export async function sendMessage() {
     }
   }
 
+  markPosted();
   localTurns.delete(turn);
   syncTurnUi();
   if (turn.reloadWhenDone) {

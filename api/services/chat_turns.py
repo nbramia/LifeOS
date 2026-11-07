@@ -262,7 +262,7 @@ class TurnRegistry:
 
     def queue_position(self, turn: ChatTurn) -> int:
         """1-based position among the turns waiting for this conversation;
-        0 once the turn is running (or no longer queued)."""
+        0 for a turn that isn't waiting (running, finished, or cancelled)."""
         waiting = self._queued.get(turn.conversation_id or "") or []
         return waiting.index(turn) + 1 if turn in waiting else 0
 
