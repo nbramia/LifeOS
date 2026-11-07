@@ -9,6 +9,7 @@ Provides:
 import asyncio
 import functools
 import logging
+import sys
 from typing import Callable, TypeVar, Optional, Any
 from dataclasses import dataclass
 
@@ -264,25 +265,27 @@ def is_retryable_status(status_code: int) -> bool:
 
 
 def is_retryable_api_error(exc: Exception) -> bool:
-    """Check if an exception is a transient LLM API error worth retrying."""
-    # Handle httpx errors (used by OpenAI-compatible local LLM client)
-    try:
-        import httpx
+    """Check if an exception is a transient LLM API error worth retrying.
+
+    Callers run this on the event loop, so it never imports a client
+    library: an exception raised by httpx or the Anthropic SDK means that
+    library is already loaded, and when one is absent from ``sys.modules``
+    the exception cannot be one of its types. Importing the Anthropic SDK
+    cold takes long enough to stall every other request.
+    """
+    # httpx errors (the OpenAI-compatible local and remote LLM client)
+    httpx = sys.modules.get("httpx")
+    if httpx is not None:
         if isinstance(exc, httpx.HTTPStatusError):
             return is_retryable_status(exc.response.status_code)
         if isinstance(exc, (httpx.ConnectError, httpx.TimeoutException)):
             return True
-    except ImportError:
-        pass
-    # Handle Anthropic errors if library is available (fallback)
-    try:
-        import anthropic
+    anthropic = sys.modules.get("anthropic")
+    if anthropic is not None:
         if isinstance(exc, anthropic.APIStatusError):
             return is_retryable_status(exc.status_code)
         if isinstance(exc, anthropic.APIConnectionError):
             return True
-    except ImportError:
-        pass
     return isinstance(exc, (ConnectionError, TimeoutError))
 
 
