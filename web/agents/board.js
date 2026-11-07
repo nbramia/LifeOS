@@ -424,6 +424,7 @@ export function initBoard() {
       renderDrawerActions(fresh);
       renderDrawerLanePicker(fresh);
     }
+    if (tagPickerHandle && tagPickerHandle.refreshSuggestionLock) tagPickerHandle.refreshSuggestionLock();
 
     // Beyond the editable fields, also watch pending_question and the
     // linked session's status — neither drives an input, but both drive
@@ -2325,6 +2326,25 @@ export function initBoard() {
     return normalized;
   }
 
+  // A suggestion is any editable tag except the ones that change who runs
+  // the card or which lane it derives to: the worker's provider/dependency
+  // wait markers (they hold a card In progress), `human` (Human queue is
+  // filled by agents), and `agent` (the worker's pickup marker). They can
+  // still be typed into the picker deliberately.
+  const NEVER_SUGGESTED_TAGS = new Set(['agent-wait-provider', 'agent-wait-dependency', 'human', 'agent']);
+  function normalizeSuggestedTag(raw) {
+    const tag = normalizeEditableTag(raw);
+    return tag && !NEVER_SUGGESTED_TAGS.has(tag) ? tag : null;
+  }
+
+  // The refusal that locks a task card's Tags field (the same `assignee`
+  // policy entry that disables its search box), or null while editable.
+  function tagsLockReason(card) {
+    const entry = card && card.policy && card.policy.assignee;
+    if (!entry || entry.allowed !== false) return null;
+    return entry.reason || "This card's tags can't be changed right now.";
+  }
+
   function uniqueEditableTags(tags) {
     const seen = new Set();
     const result = [];
@@ -2368,6 +2388,7 @@ export function initBoard() {
   function mountTagPicker(container, initialTags, config) {
     const persist = config && config.persist;
     const suggest = config && config.suggest;
+    const suggestLock = config && config.suggestLock;
     const picker = container.querySelector('[data-field="tags-picker"]');
     const search = picker && picker.querySelector('[data-field="tags"]');
     const chips = picker && picker.querySelector('[data-field="tag-chips"]');
@@ -2427,15 +2448,27 @@ export function initBoard() {
       chips.querySelectorAll('[data-remove-tag]').forEach(button => {
         button.addEventListener('click', () => removeTag(button.dataset.removeTag));
       });
-      if (!suggest) return;
+      if (!suggest || (suggestLock && suggestLock())) return;
       const suggestions = suggest(selected.slice()).filter(tag => !selected.includes(tag));
       chips.insertAdjacentHTML('beforeend', suggestions.map(tag => `
         <button type="button" class="drawer-tag-suggestion" data-suggest-tag="${escapeHtml(tag)}"
                 aria-label="Add tag ${escapeHtml(tag)}" title="Suggested tag">+#${escapeHtml(tag)}</button>
       `).join(''));
       chips.querySelectorAll('[data-suggest-tag]').forEach(button => {
-        button.addEventListener('click', () => addTag(button.dataset.suggestTag));
+        button.addEventListener('click', () => {
+          const reason = suggestLock && suggestLock();
+          if (reason) {
+            showToast(reason, true);
+            removeSuggestions();
+            return;
+          }
+          addTag(button.dataset.suggestTag);
+        });
       });
+    }
+
+    function removeSuggestions() {
+      chips.querySelectorAll('[data-suggest-tag]').forEach(button => button.remove());
     }
 
     function renderOptions() {
@@ -2666,6 +2699,12 @@ export function initBoard() {
       // first (idempotent — a no-op if there's nothing pending, or if
       // blur already committed it).
       commitPendingText: () => saveLegacyText(),
+      // Drops the suggestion chips once `config.suggestLock` reports the
+      // Tags field locked — called on every live-board tick, which skips
+      // the full drawer rebuild while focus sits in the drawer.
+      refreshSuggestionLock: () => {
+        if (suggestLock && suggestLock()) removeSuggestions();
+      },
     };
     if (persist) tagPickerHandle = handle;
     return handle;
@@ -3103,14 +3142,17 @@ export function initBoard() {
     autosizeNotesTextarea(notesEl);  // size to existing content on open/re-render
 
     // Suggestions are offered only while the Tags field itself is editable
-    // (the same policy that disables its search box).
+    // (the same policy that disables its search box). `suggestLock` reads
+    // that policy off the live card, so a claim that lands while the drawer
+    // keeps focus (and so isn't rebuilt) still locks them.
     mountTagPicker(drawerEl, editableTags, {
       persist: (tags) => putBoardTags(card.id, tags),
       suggest: assigneeDisabled ? null : (selected) => suggestTags(
         { id: card.id, title: card.title, notes: card.notes, tags: selected },
         allCards().filter(c => c.kind === 'task'),
-        { normalizeTag: normalizeEditableTag },
+        { normalizeTag: normalizeSuggestedTag },
       ),
+      suggestLock: () => tagsLockReason(findCard(card.id) || card),
     });
 
     const assigneeEl = drawerEl.querySelector('.drawer-assignee[data-field="assignee"]');

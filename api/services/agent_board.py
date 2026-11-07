@@ -264,6 +264,11 @@ SNOOZE_INELIGIBLE_ERROR: tuple[int, str] = (
     409,
     "only Unassigned, Assigned, Human queue, and Review cards can be snoozed",
 )
+MACHINE_WAIT_ERROR: tuple[int, str] = (
+    409,
+    "this card is waiting on a provider or dependency — the worker owns it "
+    "until the wait clears",
+)
 SNOOZE_UNTIL_INVALID_ERROR: tuple[int, str] = (
     400,
     "until must be an ISO-8601 timestamp with a UTC offset, in the future",
@@ -435,6 +440,11 @@ def evaluate_card_action(
             if target_lane in ("in_progress", "human_queue"):
                 return REVIEW_ERROR
             return None
+        # A provider/dependency wait keeps the card In progress whatever its
+        # status or assignee (see `natural_lane`), so any move would leave
+        # it there; the worker clears the wait tag itself.
+        if _norm_tags(current_tags) & MACHINE_WAIT_TAGS:
+            return MACHINE_WAIT_ERROR
         if agent_owned:
             if target_lane == "in_progress":
                 # Only the worker claims agent-assigned tasks (adds

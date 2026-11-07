@@ -703,6 +703,9 @@ Four **409** cases, no write in any of them:
   worker yet (and isn't a pending review) and `lane` is `human_queue` or
   `done` — agent-owned cards are managed by the agent; reassign, unassign,
   or cancel (see below) instead of dragging it there.
+- The card carries `agent-wait-provider` or `agent-wait-dependency` and
+  isn't a pending review — the wait keeps it In progress until the worker
+  clears it, so any move is refused.
 - The card is a pending review (`agent-completed` tag without `accepted`)
   and `lane` is `in_progress` or `human_queue` — accept or reject the
   review first. `lane: "done"` on a pending review still succeeds and acts

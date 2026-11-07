@@ -555,6 +555,17 @@ class TestPlanLaneMoveLandsInTargetLane:
         )
         assert plan.status is None and plan.tags is None
 
+    @pytest.mark.parametrize("wait_tag", sorted(agent_board.MACHINE_WAIT_TAGS))
+    @pytest.mark.parametrize("target_lane,assignee", [
+        ("assigned", "me"), ("unassigned", None), ("done", None),
+    ])
+    def test_machine_wait_card_refuses_lane_moves(self, wait_tag, target_lane, assignee):
+        # The wait tag keeps the card In progress regardless of status, so a
+        # move would write status/tags and still leave it there.
+        plan = agent_board.plan_lane_move("todo", ["me", wait_tag], target_lane, assignee)
+        assert plan.error == agent_board.MACHINE_WAIT_ERROR
+        assert plan.status is None and plan.tags is None
+
     def test_has_live_session_forwards_to_the_claim_check(self):
         # An agent-owned card whose status is "in_progress" with no claim
         # tag: refused when the caller reports a live session behind it,

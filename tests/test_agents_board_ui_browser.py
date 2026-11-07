@@ -7576,6 +7576,56 @@ class TestDrawerTagSuggestions:
         expect(page.locator('#board-drawer .drawer-tag-chip[data-tag="example-oncall"]')).to_be_visible()
         expect(page.get_by_role("button", name="Add tag example-oncall")).to_have_count(0)
 
+    def test_lane_changing_tags_are_never_suggested(self, page: Page, agents_base_url):
+        board_state = _suggestion_board()
+        sim = next(c for c in board_state["lanes"]["unassigned"] if c["id"] == "t-sim")
+        sim["tags"] = ["example-oncall", "agent-wait-provider", "agent-wait-dependency", "human", "agent"]
+        _open_board(page, agents_base_url, board_state=board_state)
+        page.locator('[data-card-id="t1"]').click()
+        expect(page.get_by_role("button", name="Add tag example-oncall")).to_be_visible()
+        for tag in ("agent-wait-provider", "agent-wait-dependency", "human", "agent"):
+            expect(page.get_by_role("button", name=f"Add tag {tag}", exact=True)).to_have_count(0)
+
+    def test_a_card_carrying_a_wait_tag_keeps_it_on_tag_save(self, page: Page, agents_base_url):
+        task_puts = []
+        board_state = _suggestion_board()
+        board_state["lanes"]["unassigned"][0]["tags"] = ["agent-wait-provider"]
+        _open_board(page, agents_base_url, board_state=board_state, task_puts=task_puts)
+        page.locator('[data-card-id="t1"]').click()
+        expect(page.locator('#board-drawer .drawer-tag-chip[data-tag="agent-wait-provider"]')).to_be_visible()
+        page.get_by_role("button", name="Add tag example-oncall").click()
+        _wait_for(lambda: any("example-oncall" in (p.get("tags") or []) for p in task_puts), page=page)
+        saved = next(p for p in task_puts if "example-oncall" in (p.get("tags") or []))
+        assert "agent-wait-provider" in saved["tags"], saved
+
+    def test_suggestions_drop_when_a_claim_lands_while_the_drawer_has_focus(
+        self, page: Page, agents_base_url,
+    ):
+        stream_gate = threading.Event()
+        task_puts = []
+        board_state = _suggestion_board()
+        board_stream_frames: list[str] = []
+        _open_board(
+            page, agents_base_url, board_state=board_state, task_puts=task_puts,
+            board_stream_frames=board_stream_frames, stream_gate=stream_gate,
+        )
+        page.locator('[data-card-id="t1"]').click()
+        expect(page.get_by_role("button", name="Add tag example-oncall")).to_be_visible()
+        # Focus inside the drawer withholds the full rebuild.
+        page.locator('#board-drawer [data-field="notes"]').focus()
+
+        claimed = copy.deepcopy(board_state)
+        claimed["lanes"]["unassigned"][0]["policy"] = {
+            "assignee": {"allowed": False, "reason": "example claim lock"}, "lanes": {},
+        }
+        claimed["lanes"]["unassigned"][1]["title"] = "Investigate outage alerts (seen)"
+        board_stream_frames.append(f"event: board\ndata: {json.dumps(claimed)}\n\n")
+        stream_gate.set()
+
+        expect(page.locator('[data-card-id="t-sim"]')).to_contain_text("(seen)", timeout=8000)
+        expect(page.get_by_role("button", name="Add tag example-oncall")).to_have_count(0)
+        assert not any("example-oncall" in (p.get("tags") or []) for p in task_puts), task_puts
+
     def test_suggestions_hidden_when_tags_are_locked(self, page: Page, agents_base_url):
         board_state = _suggestion_board()
         board_state["lanes"]["unassigned"][0]["policy"] = {
