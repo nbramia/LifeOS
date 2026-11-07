@@ -170,7 +170,13 @@ class TestDecideActions:
     def test_card_assigned_lane_offers_open_before_focus(self, page: Page, web_base_url):
         _load_actions_module(page, web_base_url)
         session = dict(_BARE_SESSION, session_id="cc:parity-open")
-        card = {"kind": "task", "lane": "assigned", "assignee": "claude", "pending_question": None}
+        # The server refuses In progress and Done for an agent-assigned
+        # card, so neither Start nor Mark Done is offered.
+        refused = {"allowed": False, "reason": "agent-owned"}
+        card = {
+            "kind": "task", "lane": "assigned", "assignee": "claude", "pending_question": None,
+            "policy": {"lanes": {"in_progress": refused, "done": refused}},
+        }
         out = _decide(page, session, card)
         # Assigned is snooze-eligible, so Snooze rides along before Delete.
         assert _ids(out) == ["open", "rename", "focus", "resume", "kill", "snooze", "delete"], out
@@ -235,6 +241,37 @@ class TestDecideActions:
         }
         out = _decide(page, None, card)
         assert "resolve" not in _ids(out), out
+
+    @pytest.mark.parametrize("lane,expected", [
+        ("unassigned", ["start", "resolve"]),
+        ("assigned", ["start", "resolve"]),
+        ("in_progress", ["resolve"]),
+        ("human_queue", ["start", "resolve"]),
+        ("done", []),
+        ("review", []),
+        ("snoozed", []),
+    ])
+    def test_start_and_mark_done_offered_from_lanes_the_card_can_leave(
+        self, page: Page, web_base_url, lane, expected,
+    ):
+        _load_actions_module(page, web_base_url)
+        card = {
+            "kind": "task", "lane": lane, "assignee": "me", "pending_question": None,
+            "policy": {"lanes": {}},
+        }
+        out = _ids(_decide(page, None, card))
+        assert [i for i in out if i in ("start", "resolve")] == expected, out
+        assert out.count("resolve") <= 1, out
+
+    def test_start_and_mark_done_omitted_when_policy_refuses_them(self, page: Page, web_base_url):
+        _load_actions_module(page, web_base_url)
+        refused = {"allowed": False, "reason": "example refusal"}
+        card = {
+            "kind": "task", "lane": "assigned", "assignee": "codex", "pending_question": None,
+            "policy": {"lanes": {"in_progress": refused, "done": refused}},
+        }
+        out = _ids(_decide(page, None, card))
+        assert "start" not in out and "resolve" not in out, out
 
     def test_card_human_queue_with_pending_question_omits_resolve(self, page: Page, web_base_url):
         _load_actions_module(page, web_base_url)

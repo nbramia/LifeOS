@@ -16,7 +16,7 @@
 // drawer or panel. `card` may be omitted/undefined: a session with no
 // linked board card (the Graph tab's panel before the linked card is
 // known, or a session the board never tracked at all) skips any decision
-// that needs `card` (Open, Accept, Reject, Reassign, Mark Done, Snooze,
+// that needs `card` (Open, Accept, Reject, Reassign, Start, Mark Done, Snooze,
 // Unsnooze, Cancel, Delete) rather than inventing one; Answer reads a
 // pending question off `card` when present, off the session directly
 // otherwise (both carry the identical `_pending_question_view` shape from
@@ -32,7 +32,7 @@
 // `handlers.snooze`, same as every other card-only action, since only the
 // picker UI (which preset/duration/date-time was chosen) is generic across
 // surfaces — the write itself needs a task manager id. The remaining
-// card-only actions (Open, Accept, Reject, Reassign, Mark Done, Unsnooze,
+// card-only actions (Open, Accept, Reject, Reassign, Start, Mark Done, Unsnooze,
 // Cancel, Delete) have no generic cross-card behaviour at all (they need a
 // task manager id and, for Delete, a confirmation modal) so the caller
 // supplies a handler per id via `handlers` — both the Board drawer
@@ -149,7 +149,7 @@ export function showUndoableToast(message, undo) {
 // ---------------------------------------------------------------------
 // Decision — the ordered, canonical action set. Both surfaces render
 // exactly this order: Open, Rename, Go To, Resume, Kill, Answer, Accept,
-// Reject, Reassign, Mark Done, Snooze, Unsnooze, Cancel, Delete.
+// Reject, Reassign, Start, Mark Done, Snooze, Unsnooze, Cancel, Delete.
 // ---------------------------------------------------------------------
 
 // Lanes a card can be snoozed FROM — mirrors agent_board.py's
@@ -157,6 +157,10 @@ export function showUndoableToast(message, undo) {
 // that isn't In progress, Done, or a scheduler entry). A card already in
 // `snoozed` isn't in this set — it offers Unsnooze instead, below.
 const SNOOZE_ELIGIBLE_LANES = new Set(['unassigned', 'assigned', 'human_queue', 'review']);
+
+// Lanes Start (-> In progress) and Mark Done (-> Done) are offered from.
+const START_FROM_LANES = new Set(['unassigned', 'assigned', 'human_queue']);
+const MARK_DONE_FROM_LANES = new Set(['unassigned', 'assigned', 'in_progress', 'human_queue']);
 
 export function decideActions(session, card) {
   const s = session || null;
@@ -258,14 +262,22 @@ export function decideActions(session, card) {
     out.push({ id: 'reassign', label: 'Reassign', enabled: true, reason: null, danger: false });
   }
 
-  // Mark Done — a manually-filed Human queue card with no pending question
-  // behind it, and only when the equivalent drop-onto-Done move is itself
-  // allowed. `policy.lanes` lists ONLY refused lanes — an absent `.done`
-  // entry means allowed. Card-only.
-  if (c) {
-    const doneEntry = c.policy && c.policy.lanes && c.policy.lanes.done;
-    const doneAllowed = !doneEntry || doneEntry.allowed !== false;
-    if (c.lane === 'human_queue' && !pendingQuestion && doneAllowed) {
+  // Start / Mark Done — one-click equivalents of dropping the card on In
+  // progress / Done, offered on a card with no pending question behind it,
+  // only from a lane the card can actually leave that way, and only when
+  // the equivalent drop is itself allowed. `policy.lanes` lists ONLY
+  // refused lanes — an absent entry means allowed. A Review card offers
+  // Accept instead of Mark Done, and a Snoozed card offers Unsnooze.
+  // Card-only.
+  if (c && !pendingQuestion) {
+    const laneAllowed = (lane) => {
+      const entry = c.policy && c.policy.lanes && c.policy.lanes[lane];
+      return !entry || entry.allowed !== false;
+    };
+    if (START_FROM_LANES.has(c.lane) && laneAllowed('in_progress')) {
+      out.push({ id: 'start', label: 'Start', enabled: true, reason: null, danger: false });
+    }
+    if (MARK_DONE_FROM_LANES.has(c.lane) && laneAllowed('done')) {
       out.push({ id: 'resolve', label: 'Mark Done', enabled: true, reason: null, danger: false });
     }
   }
