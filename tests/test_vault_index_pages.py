@@ -193,7 +193,7 @@ def test_nightly_script_generates_and_indexes_changed_pages(vault, monkeypatch):
 
     class FakeIndexer:
         INDEX_STATE_FILE = "unused"
-        last_run = {"files_pruned": 0, "files_remaining": 0, "stopped_early": False}
+        last_run = {"files_pruned": 0, "files_remaining": 0, "stopped_early": False, "files_failed": 0, "failed_paths": []}
 
         def __init__(self, vault_path=None):
             pass

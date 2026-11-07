@@ -563,6 +563,31 @@ class TestJobGates:
         assert result["files_indexed"] == 1
         assert _indexed_paths(vector_store) == [str(note.resolve())]
 
+    def test_reports_a_note_that_fails_to_index(self, job, vault, vector_store, monkeypatch, caplog):
+        from api.services.indexer import IndexerService
+
+        good = _write_note(vault, "good.md", 1000)
+        bad = _write_note(vault, "Lists/example-list.md", 1001)
+        real_index_file = IndexerService.index_file
+
+        def index_file(self, path, *args, **kwargs):
+            if Path(path).name == "example-list.md":
+                raise RuntimeError("Payload too large")
+            return real_index_file(self, path, *args, **kwargs)
+
+        monkeypatch.setattr(IndexerService, "index_file", index_file)
+
+        with caplog.at_level(logging.ERROR):
+            result = job.run_job(dry_run=False)
+
+        assert result["files_indexed"] == 1
+        assert result["files_failed"] == 1
+        assert [Path(p).name for p in result["failed_paths"]] == ["example-list.md"]
+        assert _indexed_paths(vector_store) == [str(good.resolve())]
+        assert str(bad) not in json.loads(_state_file().read_text())
+        assert "Payload too large" in caplog.text
+        assert "notes failed to index" in caplog.text
+
     def test_applies_the_configured_cap(self, job, vault, vector_store, monkeypatch):
         from config.settings import settings
 
@@ -1015,7 +1040,7 @@ class TestLargeNotes:
 
         indexer_class = MagicMock(name="IndexerService")
         indexer_class.return_value.index_all.return_value = 0
-        indexer_class.return_value.last_run = {"files_pruned": 0, "files_remaining": 0, "stopped_early": False}
+        indexer_class.return_value.last_run = {"files_pruned": 0, "files_remaining": 0, "stopped_early": False, "files_failed": 0, "failed_paths": []}
         monkeypatch.setattr(indexer_mod, "IndexerService", indexer_class)
         monkeypatch.setattr("api.services.vault_index_pages.write_index_pages", MagicMock(side_effect=RuntimeError))
         monkeypatch.setattr(settings, "vault_path", vault)
