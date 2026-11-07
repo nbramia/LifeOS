@@ -81,7 +81,12 @@ export async function askStream({
   if (onResponse) onResponse();
 
   if (!response.ok) {
-    throw new Error('Request failed');
+    // An HTTP error status is a definite answer: the server did not start
+    // this turn. A fetch that rejects instead (network loss, the page
+    // unloading) says nothing about whether the turn exists.
+    const err = new Error('Request failed');
+    err.httpStatus = response.status;
+    throw err;
   }
 
   let sawTerminal = false;
@@ -291,6 +296,11 @@ export async function sendMessage() {
   };
   if (turn.conversationId) resolveConversationId(turn.conversationId);
   let startConversationId = turn.conversationId;
+  const clearOwnPending = () => {
+    if (!turn.ownsPending) return;
+    turn.ownsPending = false;
+    clearPendingNewTurn();
+  };
 
   try {
     if (queued) {
@@ -310,8 +320,12 @@ export async function sendMessage() {
     }
     // Until the `conversation_id` frame arrives, remember this turn so a load
     // after the page closed can find the conversation the server created.
+    // The record is cleared only once the id arrives or the server has
+    // definitely not started the turn: a request cut off by the page closing
+    // must leave it for the next load.
     if (!turn.conversationId) {
       setPendingNewTurn(question, (state.allConversations || []).map((c) => c.id));
+      turn.ownsPending = true;
     }
 
     turn.posted = true;
@@ -351,7 +365,7 @@ export async function sendMessage() {
         } else if (data.type === 'conversation_id') {
           turn.conversationId = data.conversation_id;
           resolveConversationId(data.conversation_id);
-          clearPendingNewTurn();
+          clearOwnPending();
           // A Stop that arrived ahead of this id cancels the conversation here.
           if (turn.stopRequested) cancelConversation(data.conversation_id);
           // Only adopt it if the user is still on the conversation this
@@ -523,7 +537,7 @@ export async function sendMessage() {
     });
 
     if (!serverError && localTurns.size <= 1) setStatus('', 'Ready');
-    if (serverError && !sawDone && !turn.conversationId) clearPendingNewTurn();
+    if (serverError && !turn.conversationId) clearOwnPending();
 
   } catch (error) {
     if (turn.handedOff) {
@@ -533,7 +547,7 @@ export async function sendMessage() {
       // keeps what had arrived (the server stores it marked as cut off).
       markQueued(userMsg, false);
       if (!fullContent) updateMessage(msgId, 'Cancelled.');
-      if (!turn.posted && !turn.conversationId) clearPendingNewTurn();
+      if (!turn.posted) clearOwnPending();
       if (localTurns.size <= 1) setStatus('', 'Ready');
     } else if (error && error.noConversation) {
       markQueued(userMsg, false);
@@ -562,10 +576,10 @@ export async function sendMessage() {
       console.error('Error:', error);
       markQueued(userMsg, false);
       updateMessage(msgId, 'Sorry, something went wrong. Please try again.');
-      // The message never reached the server: hand it back for a retry.
+      // Hand the message back for a retry.
       if (!elements.inputField.value) elements.inputField.value = question;
       setStatus('error', 'Error');
-      if (!turn.conversationId) clearPendingNewTurn();
+      if (error && error.httpStatus) clearOwnPending();
       // This send took over from the conversation watcher but never reached
       // the server: hand the conversation straight back to the watcher.
       if (turn.reloadWhenDone && turn.conversationId

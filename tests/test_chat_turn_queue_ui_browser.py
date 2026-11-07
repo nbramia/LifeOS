@@ -45,6 +45,9 @@ class FakeChatApi:
         self.fail_new_conversation_after = None
         self.fail_queued_posts = False
         self.list_delay = 0.0
+        # Seconds the turn's response headers are held back after the turn
+        # has started server-side.
+        self.header_delay = 0.0
         self.cancelled: set[str] = set()
         self.cancel_calls: list[str] = []
 
@@ -63,6 +66,7 @@ class FakeChatApi:
             self.fail_new_conversation_after = None
             self.fail_queued_posts = False
             self.list_delay = 0.0
+            self.header_delay = 0.0
 
     def seed_conversation(self, question: str, answer: str, created: datetime) -> str:
         conv_id = str(uuid.uuid4())
@@ -241,6 +245,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             time.sleep(API.fail_new_conversation_after)
             return self._json(500, {"detail": "boom"})
         frames, finished = API.start_turn(body)
+        time.sleep(API.header_delay)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -400,6 +405,28 @@ def test_page_closed_before_the_conversation_id_arrived_finds_the_new_conversati
     expect(page.locator(".message.user", has_text="brand new thread")).to_be_visible(timeout=10000)
     expect(page.locator(".message.assistant", has_text="Answer to brand new thread")).to_be_visible(timeout=10000)
     assert page.evaluate("window.lifeChat.state.currentConversationId") is not None
+
+
+def test_page_closed_before_the_response_arrived_finds_the_new_conversation(
+    page: Page, chat_base_url, api,
+):
+    """The page closes after the server started the turn but before the
+    response reached the browser: the aborted request says nothing about
+    whether the turn exists, so the record that lets the next load find the
+    conversation must survive it."""
+    api.header_delay = 1.5
+    api.turn_seconds = 0.5
+    _open_chat(page, chat_base_url)
+    _send(page, "closed early thread")
+    deadline = time.time() + 5
+    while not api.requests and time.time() < deadline:
+        page.wait_for_timeout(50)
+    assert api.requests  # the server has the turn; the browser has no response yet
+
+    page.reload()
+    page.wait_for_selector("#backendLifeos", state="attached")
+    expect(page.locator(".message.user", has_text="closed early thread")).to_be_visible(timeout=10000)
+    expect(page.locator(".message.assistant", has_text="Answer to closed early thread")).to_be_visible(timeout=10000)
 
 
 def test_dropped_stream_mid_turn_recovers_without_an_error(page: Page, chat_base_url, api):
