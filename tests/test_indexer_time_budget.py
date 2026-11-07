@@ -71,7 +71,7 @@ class TestStoppingEarly:
 
         assert count == 2
         assert len(harness.indexed) == 2
-        assert indexer.last_run == {"files_pruned": 0, "files_remaining": 3, "files_skipped_large": 0, "stopped_early": True}
+        assert indexer.last_run == {"files_pruned": 0, "files_remaining": 3, "files_skipped_large": 0, "stopped_early": True, "files_failed": 0, "failed_paths": []}
         saved = [k for k in harness.state() if k.endswith(".md")]
         assert len(saved) == 2
         assert {Path(k).name for k in saved} == set(harness.indexed)
@@ -112,6 +112,39 @@ class TestStoppingEarly:
         harness.fail_on = set()
         assert harness.make().index_all(time_budget_seconds=100.0) == 2
 
+    def test_a_failed_note_is_reported_apart_from_indexed_and_remaining(self, harness, caplog):
+        harness.notes(3)
+        harness.fail_on = {"note1.md"}
+        indexer = harness.make()
+
+        with caplog.at_level("ERROR"):
+            count = indexer.index_all(time_budget_seconds=100.0)
+
+        assert count == 2
+        run = indexer.last_run
+        assert run["files_failed"] == 1
+        assert [Path(p).name for p in run["failed_paths"]] == ["note1.md"]
+        assert run["files_remaining"] == 0
+        assert {Path(k).name for k in harness.state() if k.endswith(".md")} == {"note0.md", "note2.md"}
+        assert any("note1.md" in r.getMessage() and "synthetic failure" in r.getMessage() for r in caplog.records)
+
+    def test_failed_paths_are_bounded_but_the_count_is_not(self, harness):
+        harness.notes(25)
+        harness.fail_on = {f"note{i}.md" for i in range(25)}
+        indexer = harness.make()
+
+        indexer.index_all(time_budget_seconds=100.0)
+
+        assert indexer.last_run["files_failed"] == 25
+        assert len(indexer.last_run["failed_paths"]) == 20
+
+    def test_a_clean_run_reports_no_failures(self, harness):
+        harness.notes(2)
+        indexer = harness.make()
+        indexer.index_all(time_budget_seconds=100.0)
+        assert indexer.last_run["files_failed"] == 0
+        assert indexer.last_run["failed_paths"] == []
+
     def test_stats_refresh_for_people_touched_before_the_stop(self, harness):
         harness.notes(4)
         harness.affected = {f"note{i}.md": {f"person{i}"} for i in range(4)}
@@ -141,7 +174,7 @@ class TestPruningUnderABudget:
         indexer.index_all(time_budget_seconds=2.0)
 
         assert len(harness.deleted) == 2
-        assert indexer.last_run == {"files_pruned": 2, "files_remaining": 3, "files_skipped_large": 0, "stopped_early": True}
+        assert indexer.last_run == {"files_pruned": 2, "files_remaining": 3, "files_skipped_large": 0, "stopped_early": True, "files_failed": 0, "failed_paths": []}
         assert len(harness.state()) - ("__tag_phrase_keys__" in harness.state()) == 3
 
         harness.now = 0.0
@@ -224,7 +257,7 @@ class TestUnbudgeted:
         indexer = harness.make()
 
         assert indexer.index_all() == 5
-        assert indexer.last_run == {"files_pruned": 0, "files_remaining": 0, "files_skipped_large": 0, "stopped_early": False}
+        assert indexer.last_run == {"files_pruned": 0, "files_remaining": 0, "files_skipped_large": 0, "stopped_early": False, "files_failed": 0, "failed_paths": []}
 
     def test_force_is_unbudgeted_by_default_however_slow(self, harness):
         harness.notes(5)
@@ -256,7 +289,7 @@ class TestScriptAndOrchestrator:
         vault.mkdir(exist_ok=True)
         indexer = MagicMock()
         indexer.index_all.return_value = 4
-        indexer.last_run = {"files_pruned": 1, "files_remaining": 9, "stopped_early": True}
+        indexer.last_run = {"files_pruned": 1, "files_remaining": 9, "stopped_early": True, "files_failed": 0, "failed_paths": []}
         monkeypatch.setattr("config.settings.settings.vault_path", str(vault))
         with (
             patch("api.services.indexer.IndexerService", return_value=indexer),
@@ -284,6 +317,10 @@ class TestScriptAndOrchestrator:
         stats = reindex_script.sync_stats({"files_indexed": 4, "files_pruned": 1, "files_remaining": 9})
         assert stats["processed"] == 5
         assert stats["files_remaining"] == 9
+
+    def test_stats_carry_failed_notes_as_errors(self):
+        assert reindex_script.sync_stats({"files_indexed": 4, "files_failed": 2})["errors"] == 2
+        assert reindex_script.sync_stats({"files_indexed": 4})["errors"] == 0
 
     def test_a_run_that_only_pruned_is_not_a_zero_yield_run(self):
         from scripts.run_all_syncs import _detect_yield_collapse, _run_yield

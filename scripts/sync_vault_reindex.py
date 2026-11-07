@@ -160,6 +160,8 @@ def sync_vault_reindex(
     logger.info(f"  Files indexed: {files_indexed}")
     logger.info(f"  Files pruned: {run['files_pruned']}")
     logger.info(f"  Files remaining: {run['files_remaining']}")
+    if run["files_failed"]:
+        logger.error(f"  Files failed: {run['files_failed']} (retried next run); first {len(run['failed_paths'])}: {run['failed_paths']}")
     logger.info(f"  Search keys backfilled: {search_keys_backfilled}")
     logger.info(f"  Time elapsed: {elapsed:.1f}s ({elapsed/60:.1f} min)")
 
@@ -169,6 +171,8 @@ def sync_vault_reindex(
         "files_pruned": run["files_pruned"],
         "files_remaining": run["files_remaining"],
         "stopped_early": run["stopped_early"],
+        "files_failed": run["files_failed"],
+        "failed_paths": run["failed_paths"],
         "index_pages": index_pages,
         "search_keys_backfilled": search_keys_backfilled,
         "elapsed_seconds": round(elapsed, 1),
@@ -189,6 +193,7 @@ def sync_stats(result: dict) -> dict:
     return {
         "processed": int(result.get("files_indexed", 0) or 0) + int(result.get("files_pruned", 0) or 0),
         "files_remaining": int(result.get("files_remaining", 0) or 0),
+        "errors": int(result.get("files_failed", 0) or 0),
         "search_keys_backfilled": int(result.get("search_keys_backfilled", 0) or 0),
     }
 

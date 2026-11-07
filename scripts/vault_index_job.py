@@ -218,6 +218,9 @@ def run_job(dry_run: bool = True, max_files: int | None = None) -> dict:
         f"Indexed {files_indexed} of {len(to_index)} changed notes and removed "
         f"{indexer.last_run['files_pruned']} of {len(deleted)} deleted, in {elapsed:.1f}s"
     )
+    run = indexer.last_run
+    if run["files_failed"]:
+        logger.error(f"{run['files_failed']} notes failed to index and are retried next tick: {run['failed_paths']}")
     from api.services.embeddings import get_embedding_service
     if get_embedding_service().using_cpu_fallback:
         logger.warning(f"This run embedded on the CPU, not the GPU: {files_indexed} notes in {elapsed:.1f}s")
@@ -227,6 +230,8 @@ def run_job(dry_run: bool = True, max_files: int | None = None) -> dict:
         "changed": len(to_index),
         "skipped_large": skipped_large,
         "deleted": len(deleted),
+        "files_failed": run["files_failed"],
+        "failed_paths": run["failed_paths"],
         "elapsed_seconds": round(elapsed, 1),
     }
 

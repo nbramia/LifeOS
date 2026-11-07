@@ -105,6 +105,7 @@ _TAG_LOOKUP_FAILED = object()
 BUDGET_ORDER_HEAD_CHARS = 8192
 
 # How long one built MentionResolver stands in for the people store.
+MAX_REPORTED_FAILURES = 20  # failed note paths kept in last_run
 MENTION_RESOLVER_MAX_AGE_SECONDS = 600
 
 
@@ -125,7 +126,9 @@ class IndexerService:
     # Budgets are measured on this clock.
     _clock = staticmethod(time.monotonic)
     # What the latest index_all did beyond its return value.
-    last_run: dict = {"files_pruned": 0, "files_remaining": 0, "files_skipped_large": 0, "stopped_early": False}
+    last_run: dict = {"files_pruned": 0, "files_remaining": 0, "files_skipped_large": 0, "stopped_early": False,
+        "files_failed": 0, "failed_paths": [],
+    }
 
     def __init__(
         self,
@@ -455,6 +458,8 @@ class IndexerService:
         # Index changed files, saving progress incrementally
         count = 0
         attempted = 0
+        failed_paths: list[str] = []
+        files_failed = 0
         all_affected_person_ids: set[str] = set()
 
         for file_path, mtime in files_to_index:
@@ -495,11 +500,15 @@ class IndexerService:
 
             except Exception as e:
                 logger.error(f"Failed to index {file_path}: {e}")
+                files_failed += 1
+                if len(failed_paths) < MAX_REPORTED_FAILURES:
+                    failed_paths.append(str(file_path))
 
         # Final save
         self._save_index_state(index_state)
         logger.info(f"Indexed {count} files (final save)")
 
+        # A failed note is not in the index state, so the next run retries it.
         files_remaining = (files_changed - attempted) + (len(deleted_files) - prunes_attempted)
         stopped_early = files_remaining > 0
         self.last_run = {
@@ -507,6 +516,8 @@ class IndexerService:
             "files_remaining": files_remaining,
             "files_skipped_large": skipped_large,
             "stopped_early": stopped_early,
+            "files_failed": files_failed,
+            "failed_paths": failed_paths,
         }
         if stopped_early and stop_reasons:
             logger.info(f"{stop_reasons[0]}: {files_remaining} files remain for the next run")

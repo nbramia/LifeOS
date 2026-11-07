@@ -817,6 +817,39 @@ class TestTimeoutBytesDecoding:
         assert "timed out" in stats["error"].lower()
 
 
+class TestSuccessfulRunErrorLines:
+    """A script that exits 0 but reports errors keeps its ERROR lines in the run log."""
+
+    def _run(self, tmp_path, stats_line, caplog):
+        from scripts.run_all_syncs import _execute_sync_once
+
+        script = tmp_path / "fake_sync.py"
+        script.write_text(
+            "import sys\n"
+            "print('INFO: working')\n"
+            "print('ERROR: Failed to index Notes/Lists/example-list.md: Payload too large', file=sys.stderr)\n"
+            f"print('{stats_line}')\n"
+        )
+        with caplog.at_level("INFO"):
+            return _execute_sync_once("vault_reindex", str(script), [], script)
+
+    def test_failed_note_lines_reach_the_log_when_errors_reported(self, tmp_path, caplog):
+        result = self._run(tmp_path, 'SYNC_STATS:{"processed": 3, "errors": 1}', caplog)
+
+        assert result["success"] is True
+        assert result["stats"]["errors"] == 1
+        assert any(
+            "example-list.md" in r.getMessage() and "Payload too large" in r.getMessage() and r.levelname == "ERROR"
+            for r in caplog.records
+        )
+
+    def test_clean_run_logs_no_error_lines(self, tmp_path, caplog):
+        result = self._run(tmp_path, 'SYNC_STATS:{"processed": 3, "errors": 0}', caplog)
+
+        assert result["success"] is True
+        assert not any("Payload too large" in r.getMessage() for r in caplog.records)
+
+
 class TestParseSyncOutput:
     """Tests for _parse_sync_output, the bridge between sync scripts and sync_runs."""
 

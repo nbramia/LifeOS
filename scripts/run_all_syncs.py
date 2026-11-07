@@ -1602,6 +1602,11 @@ def _execute_sync_once(source: str, script_path: str, args: list, full_path: Pat
             }
 
         logger.info(f"Sync completed for {source}: {stats}")
+        if stats.get("errors", 0) > 0:
+            # A clean exit hides the script's own failure lines; keep them.
+            error_lines = [ln for ln in combined_output.splitlines() if "ERROR" in ln]
+            if error_lines:
+                logger.error(f"{source} reported {stats['errors']} errors:\n" + "\n".join(error_lines[-50:]))
         return {"success": True, "stats": stats}
 
     except subprocess.TimeoutExpired as e:
