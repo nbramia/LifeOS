@@ -3,6 +3,7 @@ RAG Synthesis (Ask) API endpoint.
 
 POST /api/ask - Ask questions and get synthesized answers from the vault.
 """
+import asyncio
 import time
 import logging
 from typing import Optional
@@ -105,7 +106,8 @@ async def ask(request: AskRequest) -> AskResponse:
 
     try:
         hybrid_search = get_hybrid_search()
-        chunks = hybrid_search.search(
+        chunks = await asyncio.to_thread(
+            hybrid_search.search,
             query=request.question,
             top_k=10,  # Get top 10 chunks for context
             date_from=date_from,

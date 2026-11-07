@@ -328,7 +328,7 @@ async def ask_in_conversation(conversation_id: str, request: AskRequest):
             chunks = []
             if "vault" in routing_result.sources or not routing_result.sources:
                 hybrid_search = HybridSearch()
-                chunks = hybrid_search.search(query=request.question, top_k=10)
+                chunks = await asyncio.to_thread(hybrid_search.search, query=request.question, top_k=10)
 
             # Send sources
             sources = []

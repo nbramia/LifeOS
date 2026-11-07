@@ -584,7 +584,10 @@ async def run_agent_loop(
         try:
             from api.services.memory_store import get_memory_store, format_memories_for_prompt
             memory_store = get_memory_store()
-            relevant_memories = memory_store.get_relevant_memories(question, limit=5)
+            # Off the event loop: the memory search embeds the query.
+            relevant_memories = await asyncio.to_thread(
+                memory_store.get_relevant_memories, question, limit=5
+            )
             if relevant_memories:
                 # Apply token budget: ~400 words ≈ 500 tokens
                 budgeted = []

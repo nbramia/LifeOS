@@ -6,6 +6,7 @@ Provides:
 - System status
 - Configuration info
 """
+import asyncio
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -50,7 +51,7 @@ async def get_status() -> IndexStatus:
     try:
         vs = VectorStore()
         # Get approximate count from ChromaDB
-        count = len(vs.search("", top_k=10000))  # Workaround for count
+        count = len(await asyncio.to_thread(vs.search, "", top_k=10000))  # Workaround for count
     except Exception as e:
         logger.error(f"Error getting document count: {e}")
         count = 0

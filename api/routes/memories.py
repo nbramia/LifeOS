@@ -4,6 +4,7 @@ Memories API routes for LifeOS (P6.3).
 Provides endpoints for creating, reading, updating, and deleting persistent memories.
 Memories are stored in ~/.lifeos/memories.json and included in future conversation context.
 """
+import asyncio
 import logging
 from typing import Optional
 
@@ -197,7 +198,7 @@ async def search_memories(query: str, limit: int = 10):
     or to retrieve specific remembered facts/preferences.
     """
     store = get_memory_store()
-    memories = store.search_memories(query, limit=limit)
+    memories = await asyncio.to_thread(store.search_memories, query, limit=limit)
 
     return MemoryListResponse(
         memories=[MemoryResponse.from_memory(m) for m in memories],

@@ -459,11 +459,21 @@ class Settings(BaseSettings):
     embedding_gpu_lock_timeout_seconds: float = Field(
         default=300.0,
         alias="LIFEOS_EMBEDDING_GPU_LOCK_TIMEOUT",
-        description="Max seconds to wait for the cross-process GPU embedding "
-                    "lock before giving up and falling back to CPU for the rest "
-                    "of this process's lifetime, rather than deadlocking or "
-                    "piling onto whichever process is already using the GPU "
-                    "(#521)."
+        description="Max seconds an indexing or batch embedding call waits for "
+                    "the cross-process GPU embedding lock before giving up and "
+                    "falling back to CPU for the rest of this process's "
+                    "lifetime, rather than deadlocking or piling onto whichever "
+                    "process is already using the GPU."
+    )
+    embedding_query_gpu_lock_timeout_seconds: float = Field(
+        default=5.0,
+        ge=0,
+        alias="LIFEOS_EMBEDDING_QUERY_GPU_LOCK_TIMEOUT",
+        description="Max seconds a search query's embedding waits for the "
+                    "cross-process GPU embedding lock. On timeout that one query "
+                    "is encoded on a CPU copy of the model and the process keeps "
+                    "using the GPU, so a batch job holding the lock delays a "
+                    "search by seconds rather than minutes."
     )
 
     # Chunking

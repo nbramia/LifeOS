@@ -458,7 +458,7 @@ class _FakeEmbeddingService:
     def embed_text(self, text):
         return self._lookup(text)
 
-    def embed_texts(self, texts):
+    def embed_texts(self, texts, query=False):
         return [self._lookup(t) for t in texts]
 
 

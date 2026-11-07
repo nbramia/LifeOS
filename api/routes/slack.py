@@ -4,6 +4,7 @@ Slack API endpoints for LifeOS.
 Provides search and conversation access to Slack data.
 Supports both vector search (semantic) and metadata filtering.
 """
+import asyncio
 import re
 import time
 from typing import Optional
@@ -276,7 +277,8 @@ async def search_slack(request: SlackSearchRequest):
     indexer = get_slack_indexer()
 
     # Perform search
-    raw_results = indexer.search(
+    raw_results = await asyncio.to_thread(
+        indexer.search,
         query=request.query,
         top_k=request.top_k,
         channel_id=request.channel_id,

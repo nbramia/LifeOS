@@ -452,7 +452,7 @@ class MemoryStore:
                 if vectors.get(m.id, {}).get("hash") != self._content_hash(m.content)
             ]
             if pending:
-                fresh = service.embed_texts([m.content for m in pending])
+                fresh = service.embed_texts([m.content for m in pending], query=True)
                 if len(fresh) != len(pending):
                     # Defensive: a well-behaved service returns one vector per
                     # input. If it doesn't, score what we got rather than letting

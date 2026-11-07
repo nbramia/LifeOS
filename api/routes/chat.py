@@ -121,7 +121,7 @@ async def _fetch_slack(query: str, top_k: int = 10) -> list:
 
         if is_slack_enabled():
             slack_indexer = get_slack_indexer()
-            return slack_indexer.search(query=query, top_k=top_k)
+            return await asyncio.to_thread(slack_indexer.search, query=query, top_k=top_k)
     except Exception as e:
         logger.warning(f"Slack search error: {e}")
     return []
@@ -133,11 +133,13 @@ async def _fetch_vault(query: str, top_k: int, date_filter: str | None = None) -
         hybrid_search = HybridSearch()
         if date_filter:
             vector_store = VectorStore()
-            chunks = vector_store.search(query=query, top_k=top_k, filters={"modified_date": date_filter})
+            chunks = await asyncio.to_thread(
+                vector_store.search, query=query, top_k=top_k, filters={"modified_date": date_filter}
+            )
             if not chunks:
-                chunks = hybrid_search.search(query=query, top_k=top_k)
+                chunks = await asyncio.to_thread(hybrid_search.search, query=query, top_k=top_k)
         else:
-            chunks = hybrid_search.search(query=query, top_k=top_k)
+            chunks = await asyncio.to_thread(hybrid_search.search, query=query, top_k=top_k)
         from api.services.index_exclusion import index_exclude_matcher
         is_excluded = index_exclude_matcher()
         if is_excluded:
