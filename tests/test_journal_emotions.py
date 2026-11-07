@@ -293,6 +293,42 @@ class TestIterJournalChains:
         chains = list(iter_journal_chains(vault, "all-time", today=date(2026, 6, 30)))
         assert chains == []
 
+    def test_database_sourced_notes_read_like_sheet_sourced_ones(self, tmp_path, monkeypatch):
+        # Notes written by the Dailies database source, from synthetic rows,
+        # feed the wheel the same chains a sheet-sourced note does: the
+        # singular Bad/Tired keys, a multi-word secondary, a later extra
+        # path that stays out of the chain, and a "Not sure" root.
+        from datetime import datetime, timezone
+
+        from api.services.gsheet_sync import GSheetSyncService
+
+        vault = tmp_path / "vault"
+        vault.mkdir()
+        config_path = tmp_path / "gsheet_sync.yaml"
+        config_path.write_text("dailies_db:\n  enabled: true\n")
+        monkeypatch.setattr("api.services.gsheet_sync.CONFIG_PATH", config_path)
+        monkeypatch.setattr("config.settings.settings.dailies_database_url", "postgresql://synthetic@db.invalid/x")
+        svc = GSheetSyncService(vault_path=vault, db_path=str(tmp_path / "state.db"))
+
+        def row(day, status, feelings):
+            return {"subject": "synthetic", "source": "home", "revision": 1, "entry_date": date(2026, 6, day),
+                    "updated_at": datetime(2026, 6, day, 12, tzinfo=timezone.utc),
+                    "mood": 5, "feeling_status": status, "feelings": feelings}
+
+        rows = [
+            row(1, "chosen", [["Bad", "Tired", "Sleepy"]]),
+            row(2, "chosen", [["Angry", "Let down", "Resentful"], ["Happy", "Proud"]]),
+            row(3, "not_sure", []),
+            row(4, None, []),
+        ]
+        svc._sync_dailies_db(fetch_rows=lambda dsn: rows)
+
+        chains = list(iter_journal_chains(vault, "all-time", today=date(2026, 6, 30)))
+        assert chains == [["Bad", "Tired", "Sleepy"], ["Angry", "Let down", "Resentful"], ["Not sure"]]
+        _, total, with_emotion = collect_window(vault, "all-time", today=date(2026, 6, 30))
+        assert total == 4
+        assert with_emotion == 3
+
     def test_falls_back_to_filename_when_date_field_missing(self, tmp_path):
         vault = tmp_path / "vault"
         _write_entry(vault, "2026-06-30", {"feeling": "Happy"})  # no `date:` field

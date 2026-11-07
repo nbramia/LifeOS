@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** Journal
-**Last Updated:** 2026-08-12
+**Last Updated:** 2026-11-07
 
 A set of views over the daily journal, in two generations:
 
@@ -38,6 +38,11 @@ This is unrelated to the CRM's two-tier `SourceEntity`/`PersonEntity` model (see
 ## Data Source
 
 Daily journal entries live at `<vault_path>/Personal/Journal/YYYY-MM-DD.md`, one file per day the entry was made (not every calendar day has one). Each entry has YAML frontmatter with a `date:` field and a `feeling:` field, plus other logged fields (`mood`, `stress`, `sleep`, `body`, `alcohol`, `eating`, `caffeine`, `exercise`, `one_word`) that this feature does not use — its scope is the emotion wheel, not a general journal dashboard.
+
+The nightly `google_sheets` sync writes these notes from two optional sources configured in `config/gsheet_sync.yaml`, which share one note writer and one sync state (`data/gsheet_sync.db`):
+
+- **Dailies database** (`dailies_db: {enabled: true}`) — reads Home's `home_dailies` Postgres table through the read-only role `home_dailies_reader`, using the connection string in `LIFEOS_DAILIES_DATABASE_URL` (a secret in `.env`, never committed). It issues one SELECT in a read-only transaction and never selects the table's internal id, imported raw rows or sheet-mirror state. Only entries written in Home are synced: rows saved there, and rows imported from the Form that were edited in Home afterwards (`revision` above 1). An imported, unedited row is a lossy reconstruction of a sheet row, so its existing note is left byte-for-byte as it is. The note date is the entry's `entry_date` (the America/New_York day the entry is for). Enum values are written as the Dailies Google Form's option strings (`Ate healthily`, `Mid`, `1-2 drinks`, `1 cup`/`1-2 cups`, …), from one table in `api/services/dailies_db.py`; both caffeine vocabularies keep their own values. A note is rewritten when its row's `updated_at` changed, or when the note on disk does not carry that row's `row_hash` (for example after the sheet source rewrote the date). A note that fails to write fails the sync run. Feeling paths map to `feeling` plus the `<name>_feelings` chain (singular `bad_feeling` and `tired_feeling`, matching existing notes), and an additional `feelings` list carries every chosen path in order as `Core > Secondary > Tertiary`. With no credential, an unreachable database, or rows from more than one Home member, the source is skipped with a fixed log category and no note is touched.
+- **Google Sheet** (`sheets:` with `outputs.journal_notes` enabled) — rows of the Dailies Google Form's response sheet. When both are enabled, the database source runs second, so its version of a date wins.
 
 ## The Emotion Chain
 
@@ -320,4 +325,6 @@ The Google Form question backing the `Bad` branch is titled **"Bad feelings"** (
 - [api/routes/journal_trends.py](../../../api/routes/journal_trends.py) — The strip, the unexplored wheel, and the scalar stack
 - [web/journal-trends.html](../../../web/journal-trends.html) — Trend views frontend page
 - [tests/test_journal_trends.py](../../../tests/test_journal_trends.py) — Trend views unit coverage (synthetic fixtures only — never `data/`)
-- [api/services/gsheet_sync.py](../../../api/services/gsheet_sync.py) — `data/gsheet_sync.db` schema (`synced_rows.raw_data`) read by view B
+- [api/services/gsheet_sync.py](../../../api/services/gsheet_sync.py) — `data/gsheet_sync.db` schema (`synced_rows.raw_data`) read by view B; journal note writer
+- [api/services/dailies_db.py](../../../api/services/dailies_db.py) — Dailies database source: the SELECT and the column → Form-string mapping table
+- [tests/test_dailies_db.py](../../../tests/test_dailies_db.py) — Dailies database source coverage (fake row source, synthetic data)

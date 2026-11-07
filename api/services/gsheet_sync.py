@@ -30,10 +30,17 @@ def get_gsheet_sync_db_path() -> str:
     return str(db_dir / "gsheet_sync.db")
 
 
+def _dailies_db_enabled(config: dict) -> bool:
+    """Whether `config/gsheet_sync.yaml` enables the Dailies database source
+    (`dailies_db: {enabled: true}`), which writes `Personal/Journal/` notes."""
+    return bool((config.get("dailies_db") or {}).get("enabled", False))
+
+
 def journal_notes_configured() -> bool:
     """Whether any sheet in `config/gsheet_sync.yaml` has a `journal_notes`
-    output enabled — i.e. this install actually generates files under
-    `Personal/Journal/` via this pipeline.
+    output enabled, or the Dailies database source is enabled — i.e. this
+    install actually generates files under `Personal/Journal/` via this
+    pipeline.
 
     `api/routes/vault.py` uses this alongside the journal persona's
     Telegram-bot signal to decide whether to reserve that subtree: the two
@@ -51,7 +58,7 @@ def journal_notes_configured() -> bool:
         config = yaml.safe_load(CONFIG_PATH.read_text())
         if not config or not config.get("sync_enabled", True):
             return False
-        return any(
+        return _dailies_db_enabled(config) or any(
             sheet.get("outputs", {}).get("journal_notes", {}).get("enabled", False)
             for sheet in config.get("sheets", [])
         )
@@ -67,6 +74,17 @@ def journal_notes_configured() -> bool:
         # this returns True; a false "configured" here can at most reject a
         # write that would otherwise have been allowed.
         return True
+
+
+_YAML_SPECIAL_CHARS = (':', '#', '{', '}', '[', ']', ',', '&', '*', '!', '|', '>', "'", '"', '%', '@', '`', '\n', '\r')
+
+
+def _yaml_string(value: str) -> str:
+    """A YAML scalar for `value`: plain when safe, else a double-quoted
+    string with quotes, backslashes and line breaks escaped."""
+    if any(c in value for c in _YAML_SPECIAL_CHARS):
+        return json.dumps(value, ensure_ascii=False)
+    return value
 
 
 @dataclass
@@ -129,6 +147,7 @@ class GSheetSyncService:
         # broken indentation must not be reported as "not configured" while
         # the file sits right there.)
         self.config_load_error: Optional[str] = None
+        self.dailies_db_enabled = False
         self._load_config()
         self._init_db()
 
@@ -150,6 +169,7 @@ class GSheetSyncService:
                 logger.info("GSheet sync is disabled in config")
                 return
 
+            self.dailies_db_enabled = _dailies_db_enabled(config)
             for sheet in config.get("sheets", []):
                 if not sheet.get("sheet_id"):
                     logger.warning(f"Skipping sheet without sheet_id: {sheet}")
@@ -518,13 +538,9 @@ class GSheetSyncService:
             elif isinstance(value, list):
                 lines.append(f"{key}:")
                 for item in value:
-                    lines.append(f"  - {item}")
+                    lines.append(f"  - {_yaml_string(str(item))}")
             else:
-                # String - quote if it contains special chars
-                if any(c in str(value) for c in [':', '#', '{', '}', '[', ']', ',', '&', '*', '!', '|', '>', "'", '"', '%', '@', '`']):
-                    lines.append(f'{key}: "{value}"')
-                else:
-                    lines.append(f"{key}: {value}")
+                lines.append(f"{key}: {_yaml_string(str(value))}")
         lines.append("---")
         lines.append("")
 
@@ -535,6 +551,8 @@ class GSheetSyncService:
         # Add readable summary
         for column_name, value in entry.fields.items():
             clean_label = column_name.rstrip("?").strip()
+            if isinstance(value, list):
+                value = "; ".join(str(item) for item in value)
             lines.append(f"**{clean_label}:** {value}")
         lines.append("")
 
@@ -548,7 +566,10 @@ class GSheetSyncService:
         Parse a field value to appropriate Python type for YAML.
 
         Only converts pure numbers. Keeps categorical values (like "3-4 drinks") as strings.
+        Lists pass through unchanged.
         """
+        if isinstance(value, list):
+            return value
         if not value:
             return ""
 
@@ -637,6 +658,66 @@ class GSheetSyncService:
 
         return {"new_rows": len(new_entries), "skipped_rows": skipped}
 
+    def _sync_dailies_db(self, fetch_rows=None) -> dict:
+        """Sync the Dailies database source into journal notes.
+
+        Only rows written in Home are synced (`dailies_db.is_home_authored`);
+        imported, unedited rows leave the existing note as it is. A row's
+        note is left alone when its hash of date and `updated_at` is both
+        recorded in `synced_rows` and present in the note on disk, and is
+        rewritten otherwise, so a sheet rewrite of the same date is replaced.
+        A missing credential, an unreachable database or a table holding
+        more than one member's entries skips the source and logs a fixed
+        category, leaving every note untouched. Failed note writes are
+        counted in `failed`.
+        """
+        from api.services import dailies_db
+
+        def skipped(reason: str) -> dict:
+            logger.warning(f"Dailies database source skipped: {reason}")
+            return {"status": "skipped", "reason": reason, "new_rows": 0, "skipped_rows": 0, "failed": 0}
+
+        dsn = settings.dailies_database_url
+        if not dsn:
+            return skipped("dailies_db_not_configured")
+        try:
+            rows = (fetch_rows or dailies_db.fetch_rows)(dsn)
+        except Exception:
+            return skipped("dailies_db_unreachable")
+        if len({row.get("subject") for row in rows}) > 1:
+            return skipped("dailies_db_multiple_members")
+
+        config = dailies_db.SHEET_CONFIG
+        written = unchanged = failed = 0
+        for row in rows:
+            entry = dailies_db.row_to_entry(row) if dailies_db.is_home_authored(row) else None
+            if entry is None:
+                unchanged += 1
+                continue
+            path = Path(self.vault_path) / dailies_db.JOURNAL_FOLDER / f"{entry.date_str}.md"
+            try:
+                on_disk = path.exists() and f"row_hash: {entry.row_hash}" in path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                on_disk = False
+            if on_disk and self._is_row_synced(config.sheet_id, entry.row_hash):
+                unchanged += 1
+                continue
+            try:
+                self._create_journal_note(entry, config)
+            except Exception:
+                logger.error("Dailies database source: journal note write failed")
+                failed += 1
+                continue
+            self._mark_row_synced(config.sheet_id, entry)
+            written += 1
+        logger.info(
+            f"Dailies database source: {written} notes written, {unchanged} unchanged, {failed} failed"
+        )
+        return {
+            "status": "failed" if failed else "success",
+            "new_rows": written, "skipped_rows": unchanged, "failed": failed,
+        }
+
     def sync_all(self) -> dict:
         """
         Sync all configured sheets.
@@ -651,7 +732,7 @@ class GSheetSyncService:
             "sheets": [],
         }
 
-        if not self.configs:
+        if not self.configs and not self.dailies_db_enabled:
             if self.config_load_error:
                 # The config file EXISTS but failed to parse/load (e.g. a
                 # hand-edited gsheet_sync.yaml with broken indentation) --
@@ -701,6 +782,23 @@ class GSheetSyncService:
                     "error": str(e),
                 })
                 logger.error(f"Failed to sync {config.name}: {e}")
+
+        # After the sheets, so on a night both write the same date the
+        # database version is the one left on disk.
+        if self.dailies_db_enabled:
+            result = self._sync_dailies_db()
+            stats["synced"] += result["new_rows"]
+            stats["skipped"] += result["skipped_rows"]
+            stats["failed"] += result["failed"]
+            stats["dailies_db"] = {k: v for k, v in result.items() if k in ("status", "reason")}
+            if result["failed"]:
+                # A note that could not be written is a failed run, so a
+                # "clean nightly run" means every note landed.
+                stats["status"] = "error"
+                stats["reason"] = "dailies_db_note_write_failed"
+            elif result["status"] == "skipped" and not self.configs:
+                stats["status"] = "skipped"
+                stats["reason"] = result["reason"]
 
         logger.info(f"GSheet sync complete: {stats['synced']} synced, {stats['failed']} failed")
         return stats

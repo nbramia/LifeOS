@@ -533,6 +533,12 @@ Natural-language messages run through the chat pipeline (search, synthesis, tool
 | `TELEGRAM_FINANCE_BOT_TOKEN` / `TELEGRAM_FINANCE_CHAT_ID` | `finance` | Pure chat — financial-planning surface grounded in the investments snapshot + Monarch. |
 | `TELEGRAM_JOURNAL_BOT_TOKEN` / `TELEGRAM_JOURNAL_CHAT_ID` | `journal` | Pure chat — captures disjointed fragments into `LifeOS/Log/Journal/`, never `Personal/Journal/`. |
 
+### Dailies Journal Source
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_DAILIES_DATABASE_URL` | str (secret) | — | Postgres connection string for Home's read-only `home_dailies_reader` role, read when `config/gsheet_sync.yaml` sets `dailies_db: {enabled: true}`. Keep it in `.env` only, never in git. Use TLS with certificate checks and an explicit CA bundle path, e.g. `sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt` on Debian/Ubuntu (macOS needs its own bundle path); psycopg's bundled libpq can't find the system store with `sslrootcert=system`. Unset means the source is skipped and no journal note is touched. See [journal-analytics.md](../specs/product/journal-analytics.md#data-source). |
+
 ### Monarch Money
 
 | Variable | Type | Default | Sets |

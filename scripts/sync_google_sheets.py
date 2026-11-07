@@ -45,13 +45,19 @@ def sync_google_sheets(dry_run: bool = True) -> dict:
             # Declare the skip so the parent records SKIPPED instead of a
             # zero-count "success" — same pattern as Photos/Apple Contacts/
             # Monarch.
-            logger.info(f"GSheet sync skipped: {results.get('reason', 'not configured')}")
-            print(
-                "SYNC_SKIPPED: No Google Sheets configured — copy "
-                "config/gsheet_sync.example.yaml to config/gsheet_sync.yaml "
-                "to enable",
-                flush=True,
-            )
+            reason = results.get("reason", "not configured")
+            logger.info(f"GSheet sync skipped: {reason}")
+            if reason.startswith("dailies_db_"):
+                # Only the Dailies database source is enabled, and it could
+                # not run (no credential, unreachable, ambiguous members).
+                print(f"SYNC_SKIPPED: Dailies database source skipped ({reason})", flush=True)
+            else:
+                print(
+                    "SYNC_SKIPPED: No Google Sheets configured — copy "
+                    "config/gsheet_sync.example.yaml to config/gsheet_sync.yaml "
+                    "to enable",
+                    flush=True,
+                )
             return results
 
         if results.get("status") == "error":

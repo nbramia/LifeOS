@@ -541,6 +541,15 @@ sheets:
             with patch("api.services.gsheet_sync.CONFIG_PATH", config_path):
                 assert journal_notes_configured() is True
 
+    def test_true_when_only_the_dailies_db_source_is_enabled(self):
+        from api.services.gsheet_sync import journal_notes_configured
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "config.yaml"
+            config_path.write_text("sync_enabled: true\ndailies_db:\n  enabled: true\n")
+            with patch("api.services.gsheet_sync.CONFIG_PATH", config_path):
+                assert journal_notes_configured() is True
+
     def test_true_when_config_malformed(self):
         """A config file that exists but fails to parse is treated as
         configured (conservative default) rather than silently reserving
