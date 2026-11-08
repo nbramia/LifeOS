@@ -718,7 +718,6 @@ def _default_llm_caller(prompt: str) -> str:
             response = client.create(
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=_PREFLIGHT_MAX_TOKENS,
-                temperature=0.0,
             )
             return response.text
         # Fail closed: a forced engine never silently reverts to
@@ -739,7 +738,6 @@ def _default_llm_caller(prompt: str) -> str:
             response = client.create(
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=_PREFLIGHT_MAX_TOKENS,
-                temperature=0.0,
             )
             return response.text
         raise RuntimeError(
@@ -759,7 +757,6 @@ def _default_llm_caller(prompt: str) -> str:
         response = local_client.create(
             messages=[{"role": "user", "content": prompt}],
             max_tokens=_PREFLIGHT_MAX_TOKENS,
-            temperature=0.0,
         )
         return response.text
 
@@ -774,7 +771,6 @@ def _default_llm_caller(prompt: str) -> str:
         response = client.create(
             messages=[{"role": "user", "content": prompt}],
             max_tokens=_PREFLIGHT_MAX_TOKENS,
-            temperature=0.0,
         )
         return response.text
 
@@ -794,7 +790,6 @@ def _default_llm_caller(prompt: str) -> str:
     response = client.create(
         messages=[{"role": "user", "content": prompt}],
         max_tokens=_PREFLIGHT_MAX_TOKENS,
-        temperature=0.0,
     )
     return response.text
 

@@ -40,6 +40,7 @@ SOURCE_TYPES = {
     "phone_call",
     "phone",
     "photos",
+    "outlook",  # work Outlook account (PST import); always categorized as work
 }
 
 
