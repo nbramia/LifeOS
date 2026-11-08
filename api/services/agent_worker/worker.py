@@ -5968,6 +5968,7 @@ class Worker:
             else cli_readiness(settings.codex_binary)
         )
 
+        logger.info("executor readiness: claude_code state=%s detail=%s (in-process executor=%s)", claude_code_state.value, claude_code_detail, self._claude_code_executor is not None)
         from api.services.agent_worker.remote_spawn import api_host_name
 
         return ExecutionFacts(

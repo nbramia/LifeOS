@@ -1,0 +1,12 @@
+[Unit]
+Description=LifeOS Google Messages Import (after the nightly sync)
+After=lifeos-sync.service
+
+[Service]
+Type=oneshot
+User=__USER__
+WorkingDirectory=__LIFEOS_DIR__
+ExecStart=__LIFEOS_DIR__/scripts/gmessages_nightly.sh
+TimeoutStartSec=7200
+StandardOutput=append:__LIFEOS_DIR__/logs/gmessages-import.log
+StandardError=append:__LIFEOS_DIR__/logs/gmessages-import.log
