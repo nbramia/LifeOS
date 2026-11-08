@@ -23,7 +23,20 @@ from pydantic import BaseModel, Field
 from api.services.person_entity import PersonEntity, get_person_entity_store, compute_person_category
 from api.services.interaction_store import get_interaction_store
 from api.services.aggregate_cache import cached_aggregate
+from api.services.social_links import (
+    InvalidContactDetail,
+    build_social_link,
+    contact_entry_id,
+    find_account_for_url,
+    merge_entries,
+    normalize_email,
+    normalize_label,
+    platform_catalog,
+    social_identity,
+    social_link_id,
+)
 from config.people_config import InteractionConfig
+from config.social_platforms import PLATFORMS_BY_KEY
 from config.settings import settings
 from api.services.source_entity import (
     SourceEntity,
@@ -204,6 +217,15 @@ def _search_matches(query: str, person) -> bool:
     if person.company and q_lower in person.company.lower():
         return True
 
+    # A pasted profile URL matches the account however it was spelled
+    profile = find_account_for_url(query)
+    if profile:
+        platform, account = profile
+        return any(
+            link["platform"] == platform and link.get("match_key") == account.match_key
+            for link in person.social_links
+        )
+
     return False
 
 
@@ -240,6 +262,71 @@ class RelationshipResponse(BaseModel):
     person_b_name: Optional[str] = None
 
 
+class SocialLinkResponse(BaseModel):
+    """One account on a registered social platform."""
+    id: str
+    platform: str
+    platform_label: str
+    icon: str
+    value: str
+    url: Optional[str] = None
+    handle: str
+    label: Optional[str] = None
+    source: str
+
+
+class ContactEntryResponse(BaseModel):
+    """An email address or phone number with its optional label."""
+    id: str
+    value: str
+    label: Optional[str] = None
+
+
+class ContactDetailsResponse(BaseModel):
+    """A person's contact details after a write."""
+    linkedin_url: Optional[str] = None
+    emails: list[str] = []
+    phone_numbers: list[str] = []
+    phone_primary: Optional[str] = None
+    social_links: list[SocialLinkResponse] = []
+    labeled_emails: list[ContactEntryResponse] = []
+    labeled_phones: list[ContactEntryResponse] = []
+
+
+class SocialPlatformResponse(BaseModel):
+    """A platform from the registry."""
+    key: str
+    label: str
+    icon: str
+    placeholder: str
+
+
+class SocialLinkCreateRequest(BaseModel):
+    """Request to add a social account."""
+    platform: str
+    value: str
+    label: Optional[str] = None
+
+
+class SocialLinkUpdateRequest(BaseModel):
+    """Request to edit a social account; omitted fields are unchanged."""
+    platform: Optional[str] = None
+    value: Optional[str] = None
+    label: Optional[str] = None
+
+
+class ContactEntryCreateRequest(BaseModel):
+    """Request to add an email address or phone number."""
+    value: str
+    label: Optional[str] = None
+
+
+class ContactEntryUpdateRequest(BaseModel):
+    """Request to edit an email or phone; omitted fields are unchanged."""
+    value: Optional[str] = None
+    label: Optional[str] = None
+
+
 class PersonDetailResponse(BaseModel):
     """Extended person response with CRM data."""
     id: str
@@ -250,6 +337,9 @@ class PersonDetailResponse(BaseModel):
     company: Optional[str] = None
     position: Optional[str] = None
     linkedin_url: Optional[str] = None
+    social_links: list[SocialLinkResponse] = []
+    labeled_emails: list[ContactEntryResponse] = []
+    labeled_phones: list[ContactEntryResponse] = []
     category: str = "unknown"
     vault_contexts: list[str] = []
     tags: list[str] = []
@@ -547,6 +637,33 @@ def _relationship_to_response(
 _CATEGORY_BATCH_SOURCE_LIMIT = 50
 
 
+def _social_link_responses(person: PersonEntity) -> list[SocialLinkResponse]:
+    """Serialize a person's links with their registry display fields."""
+    responses = []
+    for link in person.social_links:
+        platform = PLATFORMS_BY_KEY.get(link["platform"])
+        responses.append(SocialLinkResponse(
+            id=social_link_id(link),
+            platform=link["platform"],
+            platform_label=platform.label if platform else link["platform"],
+            icon=platform.icon if platform else "🔗",
+            value=link["value"],
+            url=link.get("url"),
+            handle=link.get("handle") or link["value"],
+            label=link.get("label"),
+            source=link.get("source") or "manual",
+        ))
+    return responses
+
+
+def _contact_entry_responses(kind: str, entries: list[dict]) -> list[ContactEntryResponse]:
+    """Serialize labeled emails or phones."""
+    return [
+        ContactEntryResponse(id=contact_entry_id(kind, e["value"]), value=e["value"], label=e.get("label"))
+        for e in entries
+    ]
+
+
 def _person_to_detail_response(
     person: PersonEntity,
     include_related: bool = True,
@@ -590,6 +707,9 @@ def _person_to_detail_response(
         company=person.company,
         position=person.position,
         linkedin_url=person.linkedin_url,
+        social_links=_social_link_responses(person),
+        labeled_emails=_contact_entry_responses("email", person.email_entries),
+        labeled_phones=_contact_entry_responses("phone", person.phone_entries),
         category=computed_category,
         vault_contexts=person.vault_contexts,
         tags=person.tags,
@@ -971,6 +1091,234 @@ def update_person(person_id: str, request: PersonUpdateRequest):
     person_store.save()
 
     return _person_to_detail_response(person, include_related=True)
+
+
+# ============================================================================
+# Social Links and Labeled Contact Info
+# ============================================================================
+
+
+def _contact_details_response(person: PersonEntity) -> ContactDetailsResponse:
+    """Build the response every contact-detail write returns."""
+    return ContactDetailsResponse(
+        linkedin_url=person.linkedin_url,
+        emails=person.emails,
+        phone_numbers=person.phone_numbers,
+        phone_primary=person.phone_primary,
+        social_links=_social_link_responses(person),
+        labeled_emails=_contact_entry_responses("email", person.email_entries),
+        labeled_phones=_contact_entry_responses("phone", person.phone_entries),
+    )
+
+
+def _load_person_for_contact_edit(person_id: str) -> PersonEntity:
+    person = get_person_entity_store().get_by_id(person_id)
+    if not person:
+        raise HTTPException(status_code=404, detail=f"Person '{person_id}' not found")
+    return person
+
+
+def _save_contact_edit(person: PersonEntity) -> ContactDetailsResponse:
+    store = get_person_entity_store()
+    store.update(person)
+    store.save()
+    return _contact_details_response(person)
+
+
+def _validated(build):
+    """Run a contact-detail builder, reporting bad input as HTTP 422."""
+    try:
+        return build()
+    except InvalidContactDetail as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+def _ensure_social_available(person: PersonEntity, link: dict) -> None:
+    owners = get_person_entity_store().get_social_link_owners(link["platform"], link["match_key"])
+    if any(owner.id != person.id for owner in owners):
+        raise HTTPException(status_code=409, detail="That account belongs to another contact; merge them instead")
+
+
+def _ensure_email_available(person: PersonEntity, email: str) -> None:
+    store = get_person_entity_store()
+    if store.is_blocked(email):
+        raise HTTPException(status_code=409, detail="That email address is blocked")
+    owner = store.get_by_email(email)
+    if owner and owner.id != person.id:
+        raise HTTPException(status_code=409, detail="That email belongs to another contact; merge them instead")
+
+
+def _ensure_phone_available(person: PersonEntity, phone: str) -> None:
+    store = get_person_entity_store()
+    if store.is_blocked(phone):
+        raise HTTPException(status_code=409, detail="That phone number is blocked")
+    owner = store.get_by_phone(phone)
+    if owner and owner.id != person.id:
+        raise HTTPException(status_code=409, detail="That phone belongs to another contact; merge them instead")
+
+
+def _normalized_phone(value: str) -> str:
+    from api.services.phone_utils import normalize_phone
+
+    phone = normalize_phone(value or "")
+    if not phone:
+        raise HTTPException(status_code=422, detail="Not a valid phone number")
+    return phone
+
+
+@router.get("/social-platforms", response_model=list[SocialPlatformResponse])
+def list_social_platforms():
+    """List the platforms a contact can have accounts on."""
+    return platform_catalog()
+
+
+@router.post("/people/{person_id}/social-links", response_model=ContactDetailsResponse, status_code=201)
+def add_social_link(person_id: str, request: SocialLinkCreateRequest):
+    """Add an account on a registered platform to a person."""
+    with _mutation_lock:
+        person = _load_person_for_contact_edit(person_id)
+        link = _validated(lambda: build_social_link(request.platform, request.value, request.label))
+        _ensure_social_available(person, link)
+        if not person.add_social_link(link):
+            raise HTTPException(status_code=409, detail="This contact already has that account")
+        return _save_contact_edit(person)
+
+
+@router.patch("/people/{person_id}/social-links/{link_id}", response_model=ContactDetailsResponse)
+def update_social_link(person_id: str, link_id: str, request: SocialLinkUpdateRequest):
+    """Edit a link's platform, value, or label. An empty or null label clears it."""
+    with _mutation_lock:
+        person = _load_person_for_contact_edit(person_id)
+        current = person.find_social_link(link_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail="Social link not found")
+        platform = request.platform or current["platform"]
+        value = request.value if request.value is not None else current["value"]
+        label = request.label if "label" in request.model_fields_set else current.get("label")
+        if platform == current["platform"] and value == current["value"]:
+            updated = {**current, "label": _validated(lambda: normalize_label(label))}
+        else:
+            updated = _validated(lambda: build_social_link(platform, value, label))
+            _ensure_social_available(person, updated)
+            if any(
+                social_identity(other) == social_identity(updated)
+                for other in person.social_links
+                if other is not current
+            ):
+                raise HTTPException(status_code=409, detail="This contact already has that account")
+        person.replace_social_link(link_id, updated)
+        return _save_contact_edit(person)
+
+
+@router.delete("/people/{person_id}/social-links/{link_id}", response_model=ContactDetailsResponse)
+def delete_social_link(person_id: str, link_id: str):
+    """Remove a link. Syncs and imports will not add that account back."""
+    with _mutation_lock:
+        person = _load_person_for_contact_edit(person_id)
+        if person.find_social_link(link_id) is None:
+            raise HTTPException(status_code=404, detail="Social link not found")
+        person.remove_social_link(link_id)
+        return _save_contact_edit(person)
+
+
+@router.post("/people/{person_id}/emails", response_model=ContactDetailsResponse, status_code=201)
+def add_person_email(person_id: str, request: ContactEntryCreateRequest):
+    """Add a labeled email address to a person."""
+    with _mutation_lock:
+        person = _load_person_for_contact_edit(person_id)
+        email = _validated(lambda: normalize_email(request.value))
+        label = _validated(lambda: normalize_label(request.label))
+        _ensure_email_available(person, email)
+        if not person.add_email(email):
+            raise HTTPException(status_code=409, detail="This contact already has that email")
+        person.label_contact_entry("email", email, label)
+        return _save_contact_edit(person)
+
+
+@router.patch("/people/{person_id}/emails/{entry_id}", response_model=ContactDetailsResponse)
+def update_person_email(person_id: str, entry_id: str, request: ContactEntryUpdateRequest):
+    """Edit an email address or its label. An empty or null label clears it."""
+    with _mutation_lock:
+        person = _load_person_for_contact_edit(person_id)
+        entry = person.find_contact_entry("email", entry_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="Email not found")
+        current = entry["value"]
+        label = _validated(lambda: normalize_label(
+            request.label if "label" in request.model_fields_set else entry.get("label")
+        ))
+        email = current
+        if request.value is not None:
+            email = _validated(lambda: normalize_email(request.value))
+            if email != current.lower():
+                _ensure_email_available(person, email)
+                if person.has_email(email):
+                    raise HTTPException(status_code=409, detail="This contact already has that email")
+                person.replace_email(current, email)
+        person.label_contact_entry("email", email, label)
+        return _save_contact_edit(person)
+
+
+@router.delete("/people/{person_id}/emails/{entry_id}", response_model=ContactDetailsResponse)
+def delete_person_email(person_id: str, entry_id: str):
+    """Remove an email address from a person."""
+    with _mutation_lock:
+        person = _load_person_for_contact_edit(person_id)
+        entry = person.find_contact_entry("email", entry_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="Email not found")
+        person.remove_email(entry["value"])
+        return _save_contact_edit(person)
+
+
+@router.post("/people/{person_id}/phones", response_model=ContactDetailsResponse, status_code=201)
+def add_person_phone(person_id: str, request: ContactEntryCreateRequest):
+    """Add a labeled phone number to a person."""
+    with _mutation_lock:
+        person = _load_person_for_contact_edit(person_id)
+        phone = _normalized_phone(request.value)
+        label = _validated(lambda: normalize_label(request.label))
+        _ensure_phone_available(person, phone)
+        if not person.add_phone(phone):
+            raise HTTPException(status_code=409, detail="This contact already has that phone")
+        person.label_contact_entry("phone", phone, label)
+        return _save_contact_edit(person)
+
+
+@router.patch("/people/{person_id}/phones/{entry_id}", response_model=ContactDetailsResponse)
+def update_person_phone(person_id: str, entry_id: str, request: ContactEntryUpdateRequest):
+    """Edit a phone number or its label. An empty or null label clears it."""
+    with _mutation_lock:
+        person = _load_person_for_contact_edit(person_id)
+        entry = person.find_contact_entry("phone", entry_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="Phone not found")
+        current = entry["value"]
+        label = _validated(lambda: normalize_label(
+            request.label if "label" in request.model_fields_set else entry.get("label")
+        ))
+        phone = current
+        if request.value is not None:
+            phone = _normalized_phone(request.value)
+            if phone != current:
+                _ensure_phone_available(person, phone)
+                if person.has_phone(phone):
+                    raise HTTPException(status_code=409, detail="This contact already has that phone")
+                person.replace_phone(current, phone)
+        person.label_contact_entry("phone", phone, label)
+        return _save_contact_edit(person)
+
+
+@router.delete("/people/{person_id}/phones/{entry_id}", response_model=ContactDetailsResponse)
+def delete_person_phone(person_id: str, entry_id: str):
+    """Remove a phone number from a person."""
+    with _mutation_lock:
+        person = _load_person_for_contact_edit(person_id)
+        entry = person.find_contact_entry("phone", entry_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="Phone not found")
+        person.remove_phone(entry["value"])
+        return _save_contact_edit(person)
 
 
 class PersonMergeResponse(BaseModel):
@@ -1593,6 +1941,11 @@ def split_person(request: PersonSplitRequest):
         for email in moved_emails:
             if email and not to_person.has_email(email):
                 to_person.emails.append(email)
+
+        # Moved addresses keep their labels
+        to_person.reconcile_contact_details()
+        to_person.email_entries = merge_entries(to_person.email_entries, from_person.email_entries, str.lower)
+        to_person.phone_entries = merge_entries(to_person.phone_entries, from_person.phone_entries)
 
         # Remove phones from from_person that have no remaining source entities
         cursor = conn.execute("""

@@ -29,6 +29,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from api.services.person_entity import get_person_entity_store
+from api.services.social_links import linkedin_field_value, social_identity
 from api.services.interaction_store import get_interaction_db_path
 from api.services.source_entity import get_crm_db_path
 from scripts.merge_people import load_merged_ids, save_merged_ids
@@ -249,6 +250,28 @@ def undo_merge(secondary_id: str, dry_run: bool = True) -> dict:
                 (phone, primary_id),
             )
         logger.info("  Updated primary identifiers")
+
+        # Return the secondary's social accounts to it
+        secondary_links = json.loads(row["social_links"] or "[]")
+        secondary_identities = {social_identity(link) for link in secondary_links}
+        primary_links = json.loads(conn.execute(
+            "SELECT social_links FROM person_entities WHERE id = ?", (primary_id,),
+        ).fetchone()[0] or "[]")
+        remaining_links = [item for item in primary_links if social_identity(item) not in secondary_identities]
+        linkedin = next((item for item in remaining_links if item["platform"] == "linkedin"), None)
+        conn.execute(
+            "UPDATE person_entities SET social_links = ?, linkedin_url = ? WHERE id = ?",
+            (json.dumps(remaining_links), linkedin_field_value(linkedin) if linkedin else None, primary_id),
+        )
+        conn.execute("DELETE FROM person_social_links WHERE person_id IN (?, ?)", (primary_id, secondary_id))
+        for person_id, links in ((primary_id, remaining_links), (secondary_id, secondary_links)):
+            for link in links:
+                if link.get("match_key"):
+                    conn.execute(
+                        "INSERT OR REPLACE INTO person_social_links (platform, match_key, person_id) "
+                        "VALUES (?, ?, ?)",
+                        (link["platform"], link["match_key"], person_id),
+                    )
 
         # Commit CRM changes first (most critical)
         conn.commit()
