@@ -13,15 +13,17 @@ import bisect
 import contextlib
 import json
 import logging
+import re
 import sqlite3
 import threading
 import time
+import uuid
 
 from fastapi import APIRouter, HTTPException, Query, UploadFile, File
-from pydantic import BaseModel, Field
+from pydantic import AwareDatetime, BaseModel, Field
 
 from api.services.person_entity import PersonEntity, get_person_entity_store, compute_person_category
-from api.services.interaction_store import get_interaction_store
+from api.services.interaction_store import Interaction, get_interaction_store
 from api.services.aggregate_cache import cached_aggregate
 from config.people_config import InteractionConfig
 from config.settings import settings
@@ -457,6 +459,25 @@ class PersonUpdateRequest(BaseModel):
     category: Optional[str] = None
     birthday: Optional[str] = None  # "MM-DD" format (month-day only), empty string to clear
     display_name: Optional[str] = None
+
+
+class ManualEventRequest(BaseModel):
+    """Request for recording an event that no calendar sync captured."""
+    title: str = Field(max_length=300)
+    timestamp: AwareDatetime
+    end_time: Optional[AwareDatetime] = None
+    location: Optional[str] = Field(default=None, max_length=500)
+    notes: Optional[str] = Field(default=None, max_length=5000)
+    source_account: str = Field(default="manual", max_length=100)
+    attendee_person_ids: list[str] = Field(default_factory=list, max_length=100)  # Other CRM people
+    attendee_names: list[str] = Field(default_factory=list, max_length=100)  # People not in the CRM
+
+
+class ManualEventResponse(BaseModel):
+    """Result of recording a manual event."""
+    created: int
+    skipped: int
+    person_ids: list[str]
 
 
 class PersonMergeRequest(BaseModel):
@@ -971,6 +992,100 @@ def update_person(person_id: str, request: PersonUpdateRequest):
     person_store.save()
 
     return _person_to_detail_response(person, include_related=True)
+
+
+def _manual_event_snippet(
+    request: ManualEventRequest,
+    location: str,
+    notes: str,
+    other_attendees: list[str],
+) -> Optional[str]:
+    """Fold the fields the interactions table has no column for into the snippet."""
+    parts = [notes, location]
+    if request.end_time:
+        end = request.end_time.astimezone(request.timestamp.tzinfo)
+        same_day = end.date() == request.timestamp.date()
+        parts.append("Until " + end.strftime("%-I:%M %p" if same_day else "%b %-d, %-I:%M %p"))
+    if other_attendees:
+        parts.append("With " + ", ".join(other_attendees))
+    return " · ".join(part for part in parts if part) or None
+
+
+@router.post("/people/{person_id}/interactions", response_model=ManualEventResponse, status_code=201)
+def create_manual_event(person_id: str, request: ManualEventRequest):
+    """
+    Record an event interaction by hand, one row per CRM attendee.
+
+    Uses the manual-event convention: source_type "calendar" and source_id
+    "manual_<slug>_<date>:<person_id>", so resubmitting an event is a no-op.
+    """
+    title = request.title.strip()
+    if not title:
+        raise HTTPException(status_code=422, detail="Title is required")
+    if request.end_time and request.end_time <= request.timestamp:
+        raise HTTPException(status_code=422, detail="End time must be after the start time")
+
+    person_store = get_person_entity_store()
+
+    # Keyed on canonical id: a merged-away id and its survivor are one attendee.
+    attendees: dict[str, str] = {}
+    for candidate_id in [person_id, *request.attendee_person_ids]:
+        canonical_id = person_store.get_canonical_id(candidate_id)
+        person = person_store.get_by_id(canonical_id)
+        if not person:
+            status_code = 404 if candidate_id == person_id else 422
+            raise HTTPException(status_code=status_code, detail=f"Person '{candidate_id}' not found")
+        attendees[canonical_id] = person.canonical_name
+
+    extra_names = [name.strip() for name in request.attendee_names if name.strip()]
+    location = (request.location or "").strip()
+    notes = (request.notes or "").strip()
+    slug = re.sub(r"\W+", "_", title.lower()).strip("_")[:80] or "event"
+    event_date = request.timestamp.date().isoformat()
+    created_at = datetime.now(timezone.utc)
+
+    interactions = [
+        Interaction(
+            id=str(uuid.uuid4()),
+            person_id=attendee_id,
+            timestamp=request.timestamp,
+            source_type="calendar",
+            title=title,
+            snippet=_manual_event_snippet(
+                request,
+                location,
+                notes,
+                [name for other_id, name in attendees.items() if other_id != attendee_id] + extra_names,
+            ),
+            source_id=f"manual_{slug}_{event_date}:{attendee_id}",
+            created_at=created_at,
+            source_account=request.source_account.strip() or "manual",
+            attendee_count=len(attendees) + len(extra_names),
+        )
+        for attendee_id in attendees
+    ]
+
+    try:
+        result = get_interaction_store().batch_add(interactions)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    if result["added"] == 0:
+        raise HTTPException(status_code=409, detail="This event is already recorded")
+
+    # The rows are committed, so a failed stats refresh must not read as a
+    # failed save: a retry would only hit the duplicate check above.
+    try:
+        from api.services.person_stats import refresh_person_stats
+        refresh_person_stats(sorted(result["affected_person_ids"]))
+    except Exception:
+        logger.exception("Stats refresh failed after recording manual event")
+
+    return ManualEventResponse(
+        created=result["added"],
+        skipped=result["skipped"],
+        person_ids=list(attendees),
+    )
 
 
 class PersonMergeResponse(BaseModel):

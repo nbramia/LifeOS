@@ -64,6 +64,14 @@ Chronological interaction history.
 - `days_back` (int): Lookback period
 - `limit` (int): Max items
 
+### POST /api/crm/people/{id}/interactions
+
+Record an event no calendar sync captured. Writes one `calendar` interaction per CRM attendee, with `source_id` `manual_<slug>_<date>:<person_id>` (`<date>` is the event's local date), and refreshes those people's stats.
+
+**Body:** `title` and `timestamp` (ISO 8601 with UTC offset) are required. Optional: `end_time`, `location`, `notes`, `source_account` (default `manual`), `attendee_person_ids` (other CRM people), `attendee_names` (people not in the CRM). `location`, `end_time`, notes, and the other attendees' names are stored in the row's `snippet`.
+
+**Response:** `201` with `{"created", "skipped", "person_ids"}`. `skipped` counts attendees who already had this event. **Errors:** `404` unknown person, `409` already recorded for everyone, `422` invalid fields, an unknown attendee, or a timestamp before 2000 or over 90 days ahead.
+
 ### GET /api/crm/people/{id}/connections
 
 Related people with overlap scores.

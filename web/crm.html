@@ -1026,6 +1026,204 @@
         }
 
         /* Merge modal */
+        /* Log Event */
+        .log-event-btn {
+            align-self: center;
+            flex-shrink: 0;
+            margin-left: 0.75rem;
+            padding: 0.5rem 0.875rem;
+            border: none;
+            border-radius: 8px;
+            background: var(--accent);
+            color: #fff;
+            font-size: 0.85rem;
+            font-weight: 600;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+
+        .log-event-modal {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.7);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .log-event-modal.visible {
+            display: flex;
+        }
+
+        .log-event-content {
+            box-sizing: border-box;
+            background: var(--bg-secondary);
+            border-radius: 12px;
+            max-width: 500px;
+            width: 90%;
+            max-height: 85vh;
+            overflow-y: auto;
+            padding: 1.5rem;
+        }
+
+        .log-event-header {
+            font-size: 1.25rem;
+            font-weight: 600;
+            margin-bottom: 1rem;
+        }
+
+        .log-event-field {
+            display: block;
+            margin-bottom: 0.75rem;
+            color: var(--text-secondary);
+            font-size: 0.8rem;
+        }
+
+        .log-event-field input,
+        .log-event-field textarea {
+            display: block;
+            box-sizing: border-box;
+            width: 100%;
+            min-width: 0;
+            margin-top: 0.25rem;
+            padding: 0.625rem;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            color-scheme: dark;
+            font: inherit;
+            font-size: 0.9rem;
+        }
+
+        .log-event-times {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 0.75rem;
+        }
+
+        .log-event-chips {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.375rem;
+            margin-top: 0.375rem;
+        }
+
+        .log-event-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.25rem;
+            padding: 0.25rem 0.25rem 0.25rem 0.625rem;
+            border-radius: 999px;
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            font-size: 0.8rem;
+        }
+
+        .log-event-chip button {
+            min-width: 28px;
+            min-height: 28px;
+            border: none;
+            background: none;
+            color: var(--text-secondary);
+            font-size: 1rem;
+            cursor: pointer;
+        }
+
+        .log-event-result {
+            padding: 0.625rem;
+            border-radius: 6px;
+            color: var(--text-primary);
+            font-size: 0.875rem;
+            cursor: pointer;
+        }
+
+        .log-event-result:hover {
+            background: var(--bg-tertiary);
+        }
+
+        .log-event-error {
+            margin-bottom: 0.75rem;
+            color: var(--error);
+            font-size: 0.85rem;
+        }
+
+        .log-event-actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 0.5rem;
+        }
+
+        .log-event-actions button {
+            min-height: 44px;
+            padding: 0.5rem 1rem;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            font-size: 0.9rem;
+            cursor: pointer;
+        }
+
+        .log-event-actions .log-event-save {
+            border-color: var(--accent);
+            background: var(--accent);
+            color: #fff;
+            font-weight: 600;
+        }
+
+        .log-event-actions button:disabled {
+            opacity: 0.6;
+            cursor: default;
+        }
+
+        @media (max-width: 768px) {
+            .log-event-btn {
+                position: fixed;
+                right: calc(1rem + var(--safe-right));
+                bottom: calc(1rem + var(--safe-bottom));
+                z-index: 900;
+                min-height: 48px;
+                margin: 0;
+                padding: 0.75rem 1.125rem;
+                border-radius: 999px;
+                font-size: 0.95rem;
+                box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+            }
+
+            .log-event-modal {
+                align-items: flex-end;
+            }
+
+            .log-event-content {
+                width: 100%;
+                max-width: 100%;
+                max-height: 90vh;
+                max-height: 90dvh;
+                border-radius: 16px 16px 0 0;
+                padding: 1.25rem;
+                padding-bottom: calc(1.5rem + var(--safe-bottom));
+                animation: slideUp 0.3s ease-out;
+            }
+
+            /* Under 16px, iOS Safari zooms the page when a field takes focus. */
+            .log-event-field input,
+            .log-event-field textarea {
+                font-size: 16px;
+                min-height: 44px;
+            }
+
+            .log-event-times {
+                grid-template-columns: 1fr;
+                gap: 0;
+            }
+
+            .log-event-actions button {
+                flex: 1;
+            }
+        }
+
         .merge-modal {
             display: none;
             position: fixed;
@@ -7588,6 +7786,7 @@
                             <span class="header-indicator-label" id="headerDunbarLabel">Intimate</span>
                         </div>
                     </div>
+                    <button type="button" class="log-event-btn" id="logEventBtn" style="display: none;" onclick="openLogEventModal()">+ Log event</button>
                 </div>
 
                 <!-- Mobile-only collapsible details (tags, birthday, contact) -->
@@ -8635,6 +8834,50 @@
                 </div>
             </div>
         </div>
+    </div>
+
+    <!-- Log Event Modal -->
+    <div class="log-event-modal" id="logEventModal">
+        <form class="log-event-content" id="logEventForm" novalidate onsubmit="saveLogEvent(event)">
+            <div class="log-event-header" id="logEventHeader">Log event</div>
+            <label class="log-event-field">Title
+                <input type="text" id="logEventTitle" maxlength="300" placeholder="Coffee, dinner, party…" autocomplete="off">
+            </label>
+            <div class="log-event-times">
+                <label class="log-event-field">Starts
+                    <input type="datetime-local" id="logEventStart">
+                </label>
+                <label class="log-event-field">Ends (optional)
+                    <input type="datetime-local" id="logEventEnd">
+                </label>
+            </div>
+            <label class="log-event-field">Location
+                <input type="text" id="logEventLocation" maxlength="500" autocomplete="off">
+            </label>
+            <label class="log-event-field">Notes
+                <textarea id="logEventNotes" rows="3" maxlength="5000"></textarea>
+            </label>
+            <label class="log-event-field">Source account
+                <input type="text" id="logEventAccount" maxlength="100" list="logEventAccounts" autocomplete="off">
+                <datalist id="logEventAccounts">
+                    <option value="manual"></option>
+                    <option value="personal"></option>
+                    <option value="work"></option>
+                </datalist>
+            </label>
+            <div class="log-event-field">
+                <label for="logEventAttendeeSearch">Other attendees</label>
+                <input type="text" id="logEventAttendeeSearch" placeholder="Search people or type a name" autocomplete="off"
+                       oninput="searchLogEventAttendees()" onkeydown="handleLogEventAttendeeKey(event)">
+                <div id="logEventAttendeeResults"></div>
+                <div class="log-event-chips" id="logEventAttendeeChips"></div>
+            </div>
+            <div class="log-event-error" id="logEventError" role="alert" style="display: none;"></div>
+            <div class="log-event-actions">
+                <button type="button" onclick="closeLogEventModal()">Cancel</button>
+                <button type="submit" class="log-event-save" id="logEventSave">Save</button>
+            </div>
+        </form>
     </div>
 
     <!-- Merge Modal -->
@@ -10365,6 +10608,175 @@
 
         // Load person detail - shows skeleton immediately, loads data progressively
         // Uses caching to provide instant display for recently viewed people
+        // ===============================
+        // Log Event Modal
+        // ===============================
+
+        let logEventPersonId = null;
+        let logEventAttendees = []; // { id, name }; id is null for someone not in the CRM
+        let logEventOptions = []; // What the attendee results list currently offers
+        let logEventSearchTimer = null;
+        let logEventSearchToken = 0;
+
+        function toDatetimeLocalValue(date) {
+            const pad = (n) => String(n).padStart(2, '0');
+            return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+        }
+
+        // datetime-local values carry no zone, and the event's date in its
+        // source_id has to be the local one, so send the local wall-clock
+        // time with the offset in force on that date.
+        function datetimeLocalToIso(value) {
+            const offset = -new Date(value).getTimezoneOffset();
+            const abs = Math.abs(offset);
+            const pad = (n) => String(n).padStart(2, '0');
+            const seconds = value.length === 16 ? ':00' : '';
+            return `${value}${seconds}${offset < 0 ? '-' : '+'}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`;
+        }
+
+        function updateLogEventButton(visible) {
+            document.getElementById('logEventBtn').style.display = visible ? '' : 'none';
+        }
+
+        function showLogEventError(message) {
+            const el = document.getElementById('logEventError');
+            el.textContent = message;
+            el.style.display = message ? '' : 'none';
+        }
+
+        function openLogEventModal() {
+            if (!selectedPersonId) return;
+            logEventPersonId = selectedPersonId;
+            logEventAttendees = [];
+            logEventOptions = [];
+            logEventSearchToken++;
+            document.getElementById('logEventForm').reset();
+            document.getElementById('logEventStart').value = toDatetimeLocalValue(new Date());
+            document.getElementById('logEventAccount').value = 'manual';
+            document.getElementById('logEventAttendeeResults').innerHTML = '';
+            renderLogEventChips();
+            showLogEventError('');
+            const name = getCachedPerson(logEventPersonId)?.canonical_name;
+            document.getElementById('logEventHeader').textContent = name ? `Log event with ${name}` : 'Log event';
+            document.getElementById('logEventModal').classList.add('visible');
+        }
+
+        function closeLogEventModal() {
+            logEventSearchToken++;
+            document.getElementById('logEventModal').classList.remove('visible');
+        }
+
+        function renderLogEventChips() {
+            document.getElementById('logEventAttendeeChips').innerHTML = logEventAttendees.map((attendee, index) => `
+                <span class="log-event-chip">${escapeHtml(attendee.name)}<button type="button" aria-label="Remove ${escapeHtml(attendee.name)}" onclick="removeLogEventAttendee(${index})">×</button></span>
+            `).join('');
+        }
+
+        function renderLogEventOptions() {
+            document.getElementById('logEventAttendeeResults').innerHTML = logEventOptions.map((option, index) => `
+                <div class="log-event-result" onclick="addLogEventAttendee(${index})">${option.id ? '' : 'Add '}${escapeHtml(option.id ? option.name : `“${option.name}” (not in CRM)`)}${option.company ? `<span style="color: var(--text-secondary);"> · ${escapeHtml(option.company)}</span>` : ''}</div>
+            `).join('');
+        }
+
+        function searchLogEventAttendees() {
+            clearTimeout(logEventSearchTimer);
+            const token = ++logEventSearchToken;
+            const query = document.getElementById('logEventAttendeeSearch').value.trim();
+            const typedOption = query ? [{ id: null, name: query }] : [];
+            logEventOptions = typedOption;
+            renderLogEventOptions();
+            if (query.length < 2) return;
+
+            logEventSearchTimer = setTimeout(async () => {
+                try {
+                    const data = await api(`/people?q=${encodeURIComponent(query)}&limit=8`);
+                    if (token !== logEventSearchToken) return;
+                    const excluded = new Set([logEventPersonId, DUNBAR_CONFIG.myPersonId, ...logEventAttendees.map(a => a.id)]);
+                    logEventOptions = data.people
+                        .filter(p => !excluded.has(p.id))
+                        .map(p => ({ id: p.id, name: p.canonical_name, company: p.company }))
+                        .concat(typedOption);
+                    renderLogEventOptions();
+                } catch (error) {
+                    console.error('Attendee search failed:', error);
+                }
+            }, 200);
+        }
+
+        function addLogEventAttendee(index) {
+            const option = logEventOptions[index];
+            if (!option) return;
+            logEventAttendees.push({ id: option.id, name: option.name });
+            clearTimeout(logEventSearchTimer);
+            logEventSearchToken++;
+            logEventOptions = [];
+            document.getElementById('logEventAttendeeSearch').value = '';
+            renderLogEventOptions();
+            renderLogEventChips();
+        }
+
+        function removeLogEventAttendee(index) {
+            logEventAttendees.splice(index, 1);
+            renderLogEventChips();
+        }
+
+        function handleLogEventAttendeeKey(event) {
+            if (event.key !== 'Enter') return;
+            event.preventDefault();
+            addLogEventAttendee(0);
+        }
+
+        async function saveLogEvent(event) {
+            event.preventDefault();
+            const title = document.getElementById('logEventTitle').value.trim();
+            const start = document.getElementById('logEventStart').value;
+            const end = document.getElementById('logEventEnd').value;
+            if (!title) return showLogEventError('Add a title.');
+            if (!start) return showLogEventError('Add a start time.');
+            if (end && new Date(end) <= new Date(start)) return showLogEventError('End time must be after the start time.');
+
+            const personId = logEventPersonId;
+            const attendeeIds = logEventAttendees.filter(a => a.id).map(a => a.id);
+            const saveBtn = document.getElementById('logEventSave');
+            saveBtn.disabled = true;
+            showLogEventError('');
+
+            try {
+                const response = await fetch(`/api/crm/people/${encodeURIComponent(personId)}/interactions`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        title,
+                        timestamp: datetimeLocalToIso(start),
+                        end_time: end ? datetimeLocalToIso(end) : null,
+                        location: document.getElementById('logEventLocation').value,
+                        notes: document.getElementById('logEventNotes').value,
+                        source_account: document.getElementById('logEventAccount').value,
+                        attendee_person_ids: attendeeIds,
+                        attendee_names: logEventAttendees.filter(a => !a.id).map(a => a.name),
+                    }),
+                });
+                if (!response.ok) {
+                    const body = await response.json().catch(() => ({}));
+                    showLogEventError(typeof body.detail === 'string' ? body.detail : `Could not save (error ${response.status}).`);
+                    return;
+                }
+                closeLogEventModal();
+                for (const id of [personId, ...attendeeIds]) {
+                    invalidatePersonCache(id);
+                    invalidateTimelineCache(id);
+                }
+                if (selectedPersonId === personId) {
+                    await loadPersonDetail(personId, true);
+                }
+            } catch (error) {
+                console.error('Failed to save event:', error);
+                showLogEventError('Could not reach the server. Your entry is still here; try again.');
+            } finally {
+                saveBtn.disabled = false;
+            }
+        }
+
         async function loadPersonDetail(personId, stayOnCurrentTab = false) {
             // Clear date range filter when loading a new person
             const fromInput = document.getElementById('timelineDateFrom');
@@ -10613,6 +11025,7 @@
 
             // Header indicators (strength ring, dunbar circle) - hide for Me page
             const headerIndicators = document.querySelector('.header-indicators');
+            updateLogEventButton(!isMePage);
             if (headerIndicators) {
                 headerIndicators.style.display = isMePage ? 'none' : 'flex';
             }
@@ -11758,6 +12171,7 @@
 
         // Show family dashboard
         async function showFamilyDashboard() {
+            updateLogEventButton(false);
             // Hide birthdays page and show main container
             document.getElementById('birthdaysPage').style.display = 'none';
             document.getElementById('birthdaysPage').classList.remove('visible');
@@ -12178,6 +12592,7 @@
 
         // Show relationship dashboard for configured partner
         async function showRelationshipDashboard() {
+            updateLogEventButton(false);
             // Hide birthdays page and show main container
             document.getElementById('birthdaysPage').style.display = 'none';
             document.getElementById('birthdaysPage').classList.remove('visible');
