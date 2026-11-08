@@ -84,6 +84,7 @@ HIGH_DIRECTORIES = {
     "personal",
     "work",
     "omi",
+    "pendant",
     "lifeos",
 }
 

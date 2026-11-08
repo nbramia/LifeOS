@@ -13,7 +13,7 @@ top-level folders:
   - `Work/Job Search/`       career exploration
   - `Personal/`              Relationship, Self-Improvement, Finance,
                              User Manual, Coding, Lifelogs, Records
-  - `Granola/`, `Omi/`       meeting + ambient-recorder transcripts
+  - `Granola/`, `Pendant/`   meeting + ambient-recorder transcripts
   - `LifeOS/Tasks/Inbox.md`  where `#agent`-tagged tasks (yours) live
   - `<curated org context doc>.md`  curated background on your employer
 
