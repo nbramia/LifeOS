@@ -730,7 +730,7 @@ class Settings(BaseSettings):
     )
 
     jev_vault_restricted_paths: str = Field(
-        default="Lifelogs,Omi,Therapy,Relationship,Finance",
+        default="Lifelogs,Omi,Pendant,Therapy,Relationship,Finance",
         alias="LIFEOS_JEV_VAULT_RESTRICTED_PATHS",
         description="Comma-separated folder names or vault-relative prefixes whose "
                     "notes are classed restricted and never sent to Jev for tagging. "
