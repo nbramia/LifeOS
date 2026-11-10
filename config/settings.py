@@ -227,6 +227,25 @@ class Settings(BaseSettings):
                     "link to people who already exist, but never add new contacts, because "
                     "extraction picks up headings and product names as if they were people."
     )
+    vault_upload_max_mb: int = Field(
+        default=100,
+        alias="LIFEOS_VAULT_UPLOAD_MAX_MB",
+        description="Largest file the vault page accepts, in megabytes. The tunnel in front of the "
+                    "site rejects larger requests anyway."
+    )
+    vault_upload_blocked_extensions: str = Field(
+        default="exe,msi,bat,cmd,com,scr,ps1,vbs,vbe,js,jse,wsf,hta,jar,dll,lnk,app,apk",
+        alias="LIFEOS_VAULT_UPLOAD_BLOCKED_EXTENSIONS",
+        description="Comma-separated file extensions the vault page refuses, so a program cannot be "
+                    "dropped into a folder that OneDrive syncs to other devices."
+    )
+    vault_upload_ai: bool = Field(
+        default=True,
+        alias="LIFEOS_VAULT_UPLOAD_AI",
+        description="When true, an uploaded file is summarized, tagged, and scanned for tasks, dates, "
+                    "and people by the orchestrator model (needs ANTHROPIC_API_KEY). Off keeps the "
+                    "extracted text only."
+    )
     chroma_path: Path = Field(
         default=_REPO_ROOT / "data" / "chromadb",
         alias="LIFEOS_CHROMA_PATH"

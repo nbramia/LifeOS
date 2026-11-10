@@ -59,3 +59,8 @@ ddgs>=9.0  # DuckDuckGo web search (no API key) — backend-agnostic search_web 
 
 # macOS Integrations (optional)
 pyobjc-framework-Contacts>=10.0; sys_platform == "darwin"  # Apple Contacts integration
+
+# Vault file intake (PDF, Word, Excel readers)
+pypdf>=4.0.0  # PDF text extraction
+python-docx>=1.1.0  # Word text extraction
+openpyxl>=3.1.0  # Excel text extraction
