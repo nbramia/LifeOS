@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** CRM
-**Last Updated:** 2026-09-05
+**Last Updated:** 2026-11-08
 
 People management: the list and detail views at `/crm`, the contact-source model behind entity splitting/merging, the relationship-strength score that drives ranking and Dunbar circles, and the multi-stage fact-extraction pipeline that surfaces memorable personal details.
 
@@ -18,13 +18,14 @@ See [crm-ui.md](crm-ui.md) for the CRM index and the sibling specs that cover in
 4. [Dunbar Circles](#dunbar-circles)
 5. [People List View](#people-list-view)
 6. [Person Detail View](#person-detail-view)
-7. [Two-Tier Entity Model](#two-tier-entity-model)
-8. [Contact Sources API](#contact-sources-api)
-9. [Split Operation](#split-operation)
-10. [Link Overrides](#link-overrides)
-11. [Split Modal UI](#split-modal-ui)
-12. [Merge Toolbar](#merge-toolbar)
-13. [Person Facts Pipeline](#person-facts-pipeline)
+7. [Social Links and Labeled Contact Info](#social-links-and-labeled-contact-info)
+8. [Two-Tier Entity Model](#two-tier-entity-model)
+9. [Contact Sources API](#contact-sources-api)
+10. [Split Operation](#split-operation)
+11. [Link Overrides](#link-overrides)
+12. [Split Modal UI](#split-modal-ui)
+13. [Merge Toolbar](#merge-toolbar)
+14. [Person Facts Pipeline](#person-facts-pipeline)
 
 ---
 
@@ -91,6 +92,13 @@ Returns full PersonEntity fields including emails, phones, vault contexts, tags,
   "canonical_name": "Alex Chen",
   "emails": ["alex.chen@example.com"],
   "phone_numbers": ["+15550123"],
+  "labeled_emails": [{"id": "a1b2", "value": "alex.chen@example.com", "label": "work"}],
+  "labeled_phones": [{"id": "c3d4", "value": "+15550123", "label": "mobile"}],
+  "social_links": [{
+    "id": "e5f6", "platform": "instagram", "platform_label": "Instagram", "icon": "📷",
+    "value": "@alexc_example", "url": "https://www.instagram.com/alexc_example",
+    "handle": "alexc_example", "label": "finsta", "source": "manual"
+  }],
   "company": null,
   "category": "personal",
   "vault_contexts": ["Personal/Relationship/"],
@@ -193,7 +201,7 @@ Behavior:
 
 ## Person Detail View
 
-Detail panel that slides in when a person is selected. Shows contact info (emails, phones), interaction statistics (per-source counts), source badges, last-seen date, relationship-strength indicator, notes textarea (saves on blur), and tags (add/remove inline).
+Detail panel that slides in when a person is selected. Shows contact info (labeled emails and phones, social accounts), interaction statistics (per-source counts), source badges, last-seen date, relationship-strength indicator, notes textarea (saves on blur), and tags (add/remove inline).
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -230,6 +238,33 @@ The Overview tab shows a compact Tone card for any person who isn't the owner an
 - **Failed** (`status: "failed"`) — a `compute=true` attempt that couldn't produce or find any real score; the one-line notice, plus the explainer/button.
 
 Switching to a different person cancels a still-in-flight tone request (and any pending "in progress" poll) for the one left behind. This card is independent of the Relationship page's own Tone Evolution chart ([crm-analytics.md](crm-analytics.md#communication-visualizations)), which always shows separate user/partner scores for the configured partner.
+
+---
+
+## Social Links and Labeled Contact Info
+
+A person can have any number of accounts per platform, each a URL or handle with an optional free-text label such as `finsta`. Email addresses and phone numbers take the same optional labels, such as `work` or `mobile`. The person page lists all three with add, edit, and remove controls.
+
+Supported platforms are LinkedIn, X (Twitter), Facebook, Instagram, Telegram, TikTok, YouTube, and Discord. The list lives in `config/social_platforms.py`; a new platform is one entry there and needs no schema change.
+
+**Matching.** Different spellings of one profile (`twitter.com/Name`, `x.com/name/`, `@name`; `facebook.com/profile.php?id=123` and `facebook.com/123`) count as the same account. A profile URL finds its person in CRM search and in imports, and the LinkedIn sync matches on URL before email and name. An account held by two visible people never matches; merge them first.
+
+**`linkedin_url`** stays on every person and always equals the first LinkedIn account.
+
+**Removal.** A removed social account stays removed: syncs and imports will not restore it, and adding it by hand clears that memory. A removed email or phone that a sync still observes can return on a later sync.
+
+**Conflicts.** An account, email, or phone already held by another person is rejected with `409`; merge the two people instead. Blocked addresses are also rejected.
+
+**Reading exports.** `scripts/import_contact_exports.py` reads Dex and Notion CSV exports into existing people. See [Utility Scripts](../../guides/scripts.md#import_contact_exportspy). Columns are recognized from their headers:
+
+| Export shape | Example | Result |
+|--------------|---------|--------|
+| Platform column | `Linkedin`, `Twitter/X`, `Instagram (finsta)` | Account, with `finsta` as its label |
+| Label in the header | `Work Email`, `Email (School)`, `Mobile` | Labeled address |
+| Paired label column | `Phone 1 - Label`, `E-mail 1 - Type` | Labeled address |
+| Label in the cell | `work: name@example.com`, `name@example.com (work)` | Labeled address |
+
+`Primary` and `Secondary` in a header describe column position and are not kept as labels. Rows match by profile URL, then email, then phone, then exact full name of at least two words. A row that matches nobody or two different people changes nothing and is counted. Existing labels are never overwritten.
 
 ---
 

@@ -1,7 +1,7 @@
 # Scripts Reference
 
 > **Status:** Complete
-> **Last Updated:** 2026-09-18
+> **Last Updated:** 2026-11-08
 > **Audience:** Operators
 
 Reference for the operator-facing scripts under `scripts/`, with usage examples. One-off CRM entity-repair scripts (`merge_people.py`, `split_person.py`, `fix_*`, etc.), git hooks, and Claude Code worktree/session-diagnostic helpers aren't covered here — they're self-documenting via `--help` or their own docstring.
@@ -323,6 +323,17 @@ The display `sources` column stores each call as `tool(json-args)` cut to 80 cha
 | `apple_data_export.py` | Export Apple data (iMessage, Contacts, Photos) on macOS |
 | `apple_data_import.py` | Import Apple data exports on the server |
 | `apple_data_agent.sh` | Apple Data Agent orchestrator (runs on macOS, rsyncs to server) |
+
+### import_contact_exports.py
+
+Reads social and contact columns from Dex or Notion CSV exports into existing people, keeping labels where the export has them. Dry run by default; output is aggregate counts only. Safe to re-run.
+
+```bash
+~/.venvs/lifeos/bin/python scripts/import_contact_exports.py --source notion export.csv
+~/.venvs/lifeos/bin/python scripts/import_contact_exports.py --source dex export.csv --execute
+```
+
+Column recognition and matching are described in [crm-people.md](../specs/product/crm-people.md#social-links-and-labeled-contact-info).
 
 ---
 
