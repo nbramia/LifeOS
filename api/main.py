@@ -295,6 +295,14 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"Failed to start PR status prefetch loop: {e}")
 
+        # Startup: day-context job (Dailies suggestions -> Home's database).
+        # A no-op unless LIFEOS_DAY_CONTEXT_DATABASE_URL is set.
+        try:
+            from api.services import day_context
+            day_context.start()
+        except Exception as e:
+            logger.error(f"Failed to start day-context job: {e}")
+
         # Hint for new users who haven't set their person ID yet
         if not settings.my_person_id and settings.user_name and settings.user_name != "User":
             logger.info(
@@ -370,6 +378,12 @@ async def lifespan(app: FastAPI):
     try:
         from api.services import pr_status_prefetch
         pr_status_prefetch.stop()
+    except Exception:
+        pass
+
+    try:
+        from api.services import day_context
+        day_context.stop()
     except Exception:
         pass
 

@@ -540,6 +540,15 @@ Natural-language messages run through the chat pipeline (search, synthesis, tool
 |---|---|---|---|
 | `LIFEOS_DAILIES_DATABASE_URL` | str (secret) | — | Postgres connection string for Home's read-only `home_dailies_reader` role, read when `config/gsheet_sync.yaml` sets `dailies_db: {enabled: true}`. Keep it in `.env` only, never in git. Use TLS with certificate checks and an explicit CA bundle path, e.g. `sslmode=verify-full&sslrootcert=/etc/ssl/certs/ca-certificates.crt` on Debian/Ubuntu (macOS needs its own bundle path); psycopg's bundled libpq can't find the system store with `sslrootcert=system`. Unset means the source is skipped and no journal note is touched. See [journal-analytics.md](../specs/product/journal-analytics.md#data-source). |
 
+### Day Context (Dailies suggestions)
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_DAY_CONTEXT_DATABASE_URL` | str (secret) | — | Postgres connection string for Home's `home_day_context_writer` role, which the day-context job writes `home_day_context` with. Keep it in `.env` only. Use the same TLS options as `LIFEOS_DAILIES_DATABASE_URL`. Unset disables the job. The job also needs `LIFEOS_DAILIES_DATABASE_URL` (for the subject). See [day-context.md](day-context.md). |
+| `LIFEOS_PENDANT_FEED_URL` | str | `http://127.0.0.1:9796/pendant/feed` | Base URL of the pendant-direct feed the job reads day signals from. |
+| `LIFEOS_PENDANT_FEED_TOKEN` | str (secret) | — | Bearer token for that feed. Empty reads `LIFEOS_PENDANT_FEED_TOKEN_FILE`. |
+| `LIFEOS_PENDANT_FEED_TOKEN_FILE` | str | `~/.config/pendant-direct/token` | File holding the feed token. |
+
 ### Monarch Money
 
 | Variable | Type | Default | Sets |

@@ -1788,6 +1788,31 @@ class Settings(BaseSettings):
                     "the source."
     )
 
+    # Day context (Dailies suggestions written to Home)
+    day_context_database_url: str = Field(
+        default="",
+        alias="LIFEOS_DAY_CONTEXT_DATABASE_URL",
+        description="Postgres connection string for Home's home_day_context_writer "
+                    "role, used by the day-context job. A secret: set it in .env. "
+                    "Empty disables the job."
+    )
+    pendant_feed_url: str = Field(
+        default="http://127.0.0.1:9796/pendant/feed",
+        alias="LIFEOS_PENDANT_FEED_URL",
+        description="Base URL of the pendant-direct feed server."
+    )
+    pendant_feed_token: str = Field(
+        default="",
+        alias="LIFEOS_PENDANT_FEED_TOKEN",
+        description="Bearer token for the pendant-direct feed. Empty reads "
+                    "LIFEOS_PENDANT_FEED_TOKEN_FILE instead."
+    )
+    pendant_feed_token_file: str = Field(
+        default="~/.config/pendant-direct/token",
+        alias="LIFEOS_PENDANT_FEED_TOKEN_FILE",
+        description="File holding the pendant-direct feed bearer token."
+    )
+
     # Monarch Money
     monarch_email: str = Field(
         default="",
