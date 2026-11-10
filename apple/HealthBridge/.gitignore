@@ -9,3 +9,6 @@ DerivedData/
 *.xcuserstate
 xcuserdata/
 .DS_Store
+
+# Server URL and ingest token (copy Secrets.xcconfig.example)
+Secrets.xcconfig
