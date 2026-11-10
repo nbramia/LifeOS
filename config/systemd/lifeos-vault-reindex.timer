@@ -1,0 +1,10 @@
+[Unit]
+Description=LifeOS incremental vault reindex timer (every 30 minutes)
+
+[Timer]
+OnBootSec=15min
+OnUnitInactiveSec=30min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

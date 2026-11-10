@@ -66,6 +66,7 @@ fi
 MCP_BEARER_TOKEN=$(_read_env "LIFEOS_MCP_BEARER_TOKEN" "")
 AGENT_WORKER_AUTOSTART=$(_read_env "LIFEOS_AGENT_WORKER_AUTOSTART" "false")
 AUTODEPLOY_ENABLED=$(_read_env "LIFEOS_AUTODEPLOY_ENABLED" "false")
+VAULT_REINDEX_AUTOSTART=$(_read_env "LIFEOS_VAULT_REINDEX_AUTOSTART" "false")
 
 # Normalize boolean
 case "$(echo "$LLM_AUTOSTART" | tr '[:upper:]' '[:lower:]')" in
@@ -76,6 +77,11 @@ esac
 case "$(echo "$AGENT_WORKER_AUTOSTART" | tr '[:upper:]' '[:lower:]')" in
     true|1|yes) AGENT_WORKER_AUTOSTART="true" ;;
     *)          AGENT_WORKER_AUTOSTART="false" ;;
+esac
+
+case "$(echo "$VAULT_REINDEX_AUTOSTART" | tr '[:upper:]' '[:lower:]')" in
+    true|1|yes) VAULT_REINDEX_AUTOSTART="true" ;;
+    *)          VAULT_REINDEX_AUTOSTART="false" ;;
 esac
 
 case "$(echo "$AUTODEPLOY_ENABLED" | tr '[:upper:]' '[:lower:]')" in
@@ -127,6 +133,7 @@ else
     echo "  MCP HTTP:   disabled (set LIFEOS_MCP_BEARER_TOKEN to enable)"
 fi
 echo "  Agent Worker: $AGENT_WORKER_AUTOSTART"
+echo "  Vault Reindex Timer: $VAULT_REINDEX_AUTOSTART"
 echo "  Auto-Deploy:  $AUTODEPLOY_ENABLED"
 echo ""
 
@@ -215,6 +222,18 @@ fi
 
 systemctl enable --now lifeos-sync.timer
 echo "  lifeos-sync.timer: $(systemctl is-active lifeos-sync.timer)"
+
+# The periodic vault reindex is opt-in via LIFEOS_VAULT_REINDEX_AUTOSTART: notes edited from
+# Windows tools are not seen by the file watcher inside WSL, and each pass loads the
+# embedding model, so it stays off unless asked for.
+if [ "$VAULT_REINDEX_AUTOSTART" = "true" ]; then
+    systemctl enable --now lifeos-vault-reindex.timer
+    echo "  lifeos-vault-reindex.timer: $(systemctl is-active lifeos-vault-reindex.timer)"
+else
+    systemctl disable lifeos-vault-reindex.timer 2>/dev/null || true
+    systemctl stop lifeos-vault-reindex.timer 2>/dev/null || true
+    echo "  lifeos-vault-reindex.timer: disabled (set LIFEOS_VAULT_REINDEX_AUTOSTART=true to enable)"
+fi
 
 # MCP HTTP transport is only enabled when a bearer token is configured.
 # The systemd unit reads the live .env at runtime; we check the token here
