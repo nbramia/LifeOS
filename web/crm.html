@@ -5965,6 +5965,12 @@
             position: relative;
         }
 
+        .tracked-line-chart {
+            width: 100%;
+            height: 100%;
+            position: relative;
+        }
+
         .health-chart-svg {
             width: 100%;
             height: 100%;
@@ -6136,6 +6142,8 @@
         }
 
         .tracked-people-list {
+            position: relative;
+            flex-shrink: 0;
             display: flex;
             flex-wrap: wrap;
             gap: 0.375rem;
@@ -6265,6 +6273,24 @@
         /* Chart Panels */
         .me-chart-panel {
             min-height: 220px;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* Network Growth fills the panel (the row height is set by the panel/sibling, not by the chart) */
+        .me-chart-panel .chart-container {
+            flex: 1;
+            height: auto;
+            min-height: 180px;
+            padding: 0.5rem 0.5rem 0;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .me-chart-panel .chart-container > .growth-chart {
+            flex: 1;
+            min-height: 0;
+            height: auto;
         }
 
         .me-compact-panel {
@@ -6314,7 +6340,8 @@
         .growth-chart-inner {
             display: flex;
             position: relative;
-            height: 120px;
+            flex: 1;
+            min-height: 120px;
         }
 
         .growth-y-axis {
@@ -6324,7 +6351,6 @@
             width: 24px;
             padding-right: 4px;
             text-align: right;
-            height: 120px;
             padding-bottom: 4px;
         }
 
@@ -6362,7 +6388,6 @@
             align-items: flex-end;
             gap: 2px;
             flex: 1;
-            height: 120px;
             padding-bottom: 4px;
         }
 
@@ -6477,12 +6502,18 @@
             transition: height 0.3s ease-out;
         }
 
-        .messaging-segment-0 { background: #ef4444; }
-        .messaging-segment-1 { background: #f97316; }
-        .messaging-segment-2 { background: #eab308; }
-        .messaging-segment-3 { background: #22c55e; }
-        .messaging-segment-4 { background: #3b82f6; }
-        .messaging-segment-5 { background: #6b7280; }
+        .messaging-segment-0 { background: #a855f7; }
+        .messaging-segment-1 { background: #ef4444; }
+        .messaging-segment-2 { background: #f97316; }
+        .messaging-segment-3 { background: #eab308; }
+        .messaging-segment-4 { background: #22c55e; }
+        .messaging-segment-5 { background: #3b82f6; }
+        .messaging-segment-6 { background: #6b7280; }
+
+        /* Current (partial) month */
+        .messaging-stacked-bar.messaging-bar-partial {
+            opacity: 0.6;
+        }
 
         .messaging-bar-container {
             cursor: pointer;
@@ -6652,6 +6683,18 @@
 
         .legend-toggle:hover {
             background: var(--bg-tertiary);
+        }
+
+        /* Circle with no people in any month: still clickable, but visibly disabled */
+        .legend-toggle.legend-empty,
+        .legend-toggle.legend-empty.selected {
+            opacity: 0.35;
+            cursor: not-allowed;
+            background: transparent;
+        }
+
+        .legend-toggle.legend-empty .legend-dot {
+            filter: grayscale(1);
         }
 
         .messaging-insight {
@@ -8145,7 +8188,7 @@
                                 <div class="overview-panel me-messaging-panel">
                                     <div class="overview-panel-header">
                                         <span class="overview-panel-title">Messaging by Circle</span>
-                                        <span class="chart-subtitle">iMessage + WhatsApp</span>
+                                        <span class="chart-subtitle">Text + WhatsApp</span>
                                     </div>
                                     <div class="chart-container chart-container-tall" id="messagingByCircleChart"></div>
                                 </div>
@@ -13945,7 +13988,7 @@
             const months = [];
             for (let i = 11; i >= 0; i--) {
                 const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
-                months.push(d.toISOString().slice(0, 7)); // YYYY-MM
+                months.push(localMonthKey(d)); // YYYY-MM
             }
 
             // Group by month and channel (excluding iMessage)
@@ -14025,7 +14068,7 @@
             const monthLabels = months.map((m, i) => {
                 if (i % showEvery !== 0 && i !== months.length - 1) return '';
                 const x = leftMargin + (i / (months.length - 1)) * chartWidth;
-                const label = new Date(m + '-01').toLocaleDateString('en-US', { month: 'short' });
+                const label = parseLocalDate(m).toLocaleDateString('en-US', { month: 'short' });
                 return `<text x="${x}" y="${height - 5}" text-anchor="middle" style="font-size: 0.5rem; fill: var(--text-muted);">${label}</text>`;
             }).join('');
 
@@ -14493,7 +14536,7 @@
             for (let i = 0; i < labelCount; i++) {
                 const idx = Math.floor(i * (history.length - 1) / (labelCount - 1));
                 const point = history[idx];
-                const date = new Date(point.date);
+                const date = parseLocalDate(point.date);
                 const label = date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
                 xLabels.push(`<text x="${xScale(idx)}" y="${height - 5}" text-anchor="middle" fill="var(--text-muted)" font-size="10">${label}</text>`);
             }
@@ -15518,8 +15561,67 @@
                 : '<div style="color: var(--text-muted); font-size: 0.75rem; padding: 0.25rem;">No cooling trends</div>';
         }
 
+        // Date-only strings ("2026-11-09", "2026-11") must NOT go through new Date(str): that parses as UTC midnight and
+        // renders a day/month early west of UTC. Build the Date in local time from the parts instead.
+        function parseLocalDate(s) {
+            const m = /^(\d{4})-(\d{2})(?:-(\d{2}))?/.exec(String(s == null ? '' : s).slice(0, 10));
+            if (!m) return new Date(NaN);
+            const y = parseInt(m[1], 10);
+            const mo = parseInt(m[2], 10);
+            const day = m[3] ? parseInt(m[3], 10) : 1;
+            if (mo < 1 || mo > 12 || day < 1 || day > 31) return new Date(NaN);
+            return new Date(y, mo - 1, day);
+        }
+
+        // 'YYYY-MM' from the LOCAL year/month (toISOString would use UTC)
+        function localMonthKey(d = new Date()) {
+            return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+        }
+
+        // Content-box pixel size of a chart container, so an SVG viewBox can match the rendered size 1:1.
+        // Falls back when the element is hidden or too small to measure.
+        function chartBox(container, fallbackW = 600, fallbackH = 132) {
+            if (!container) return { width: fallbackW, height: fallbackH };
+            const cs = window.getComputedStyle(container);
+            const px = (v) => parseFloat(v) || 0;
+            const w = container.clientWidth - px(cs.paddingLeft) - px(cs.paddingRight);
+            const h = container.clientHeight - px(cs.paddingTop) - px(cs.paddingBottom);
+            return {
+                width: w >= 120 ? Math.round(w) : fallbackW,
+                height: h >= 60 ? Math.round(h) : fallbackH
+            };
+        }
+
+        // Insert empty entries for every missing 'YYYY-MM' between the first month and max(last data month, current
+        // local month). sortedList must be sorted ascending by `month`. Month math uses integers, not Date parsing.
+        function fillMonthGaps(sortedList, makeEmpty) {
+            if (!sortedList || sortedList.length === 0) return sortedList || [];
+            const re = /^(\d{4})-(\d{2})$/;
+            const toIdx = (key) => {
+                const m = re.exec(key || '');
+                return m ? parseInt(m[1], 10) * 12 + (parseInt(m[2], 10) - 1) : NaN;
+            };
+            const fromIdx = (i) => `${String(Math.floor(i / 12)).padStart(4, '0')}-${String((i % 12) + 1).padStart(2, '0')}`;
+            const start = toIdx(sortedList[0].month);
+            const lastIdx = toIdx(sortedList[sortedList.length - 1].month);
+            if (isNaN(start) || isNaN(lastIdx)) return sortedList;
+            const end = Math.max(lastIdx, toIdx(localMonthKey()));
+            if (end - start > 1200) return sortedList;
+            const byMonth = new Map(sortedList.map(e => [e.month, e]));
+            const filled = [];
+            for (let i = start; i <= end; i++) {
+                const key = fromIdx(i);
+                filled.push(byMonth.has(key) ? byMonth.get(key) : makeEmpty(key));
+            }
+            return filled;
+        }
+
         // Render Relationship Health Score
         let currentHealthPeriod = 'quarter';
+        let lastHealthRenderData = null; // last data renderHealthScore drew (for resize redraw)
+        let lastTrackedRenderData = { parent: null, coparent: null }; // last data renderTrackedChart drew, per type
+        let lastChartBoxKeys = {}; // container id -> "WxH" the chart was last drawn at
+        let chartResizeTimer = null;
         let healthChartData = []; // Store for tooltip lookups
 
         // Render Health Score Line Chart
@@ -15527,6 +15629,7 @@
             const container = document.getElementById('healthChartContainer');
             const scoreEl = document.getElementById('healthCurrentScore');
             if (!container) return;
+            lastHealthRenderData = data;
 
             const history = data.health_score_history || [];
             healthChartData = history; // Store for tooltip
@@ -15551,9 +15654,9 @@
                 return;
             }
 
-            // SVG dimensions - match typical container aspect ratio (roughly 4:1)
-            const width = 600;
-            const height = 120;
+            // SVG dimensions - match the container's pixel size so the viewBox scale is 1:1
+            const { width, height } = chartBox(container);
+            lastChartBoxKeys[container.id] = `${width}x${height}`;
             const padding = { top: 10, right: 15, bottom: 20, left: 30 };
             const chartWidth = width - padding.left - padding.right;
             const chartHeight = height - padding.top - padding.bottom;
@@ -15609,7 +15712,7 @@
             const xLabels = [];
             if (history.length > 0) {
                 const formatLabel = (dateStr) => {
-                    const d = new Date(dateStr);
+                    const d = parseLocalDate(dateStr);
                     return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
                 };
                 xLabels.push(`<text x="${xScale(0)}" y="${height - 2}" font-size="11" fill="var(--text-primary)" text-anchor="start">${formatLabel(history[0].date)}</text>`);
@@ -15652,7 +15755,7 @@
                     const count = dot.dataset.count || 0;
                     const avg = dot.dataset.avg || 0;
                     const dateStr = dot.dataset.date;
-                    const d = new Date(dateStr);
+                    const d = parseLocalDate(dateStr);
                     const formattedDate = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 
                     tooltip.innerHTML = `
@@ -15680,6 +15783,7 @@
         // Change health score period
         async function changeHealthPeriod(period) {
             currentHealthPeriod = period;
+            lastHealthRenderData = null;  // a resize must not redraw old data over Loading.../Failed to load
 
             // Update pill states (only the main health panel, not tracked panels)
             document.querySelectorAll('#healthChartContainer').forEach(container => {
@@ -15740,6 +15844,7 @@
             const peopleListEl = document.getElementById(peopleListId);
 
             if (!container) return;
+            lastTrackedRenderData[type] = data;
 
             const history = data.history || [];
             const isInverse = data.healthy_direction === 'less';  // fewer = healthier
@@ -15776,9 +15881,9 @@
             // Fixed 0-100 Y-axis for scores (like health score)
             const yAxisMax = 100;
 
-            // SVG dimensions
-            const width = 600;
-            const height = 120;
+            // SVG dimensions - match the container's pixel size so the viewBox scale is 1:1
+            const { width, height } = chartBox(container);
+            lastChartBoxKeys[container.id] = `${width}x${height}`;
             const padding = { top: 10, right: 15, bottom: 20, left: 30 };
             const chartWidth = width - padding.left - padding.right;
             const chartHeight = height - padding.top - padding.bottom;
@@ -15834,7 +15939,7 @@
             const xLabels = [];
             if (history.length > 0) {
                 const formatLabel = (dateStr) => {
-                    const d = new Date(dateStr);
+                    const d = parseLocalDate(dateStr);
                     return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
                 };
                 xLabels.push(`<text x="${xScale(0)}" y="${height - 2}" font-size="11" fill="var(--text-primary)" text-anchor="start">${formatLabel(history[0].date)}</text>`);
@@ -15877,7 +15982,7 @@
                     const count = dot.dataset.count || 0;
                     const avg = dot.dataset.avg || 0;
                     const dateStr = dot.dataset.date;
-                    const d = new Date(dateStr);
+                    const d = parseLocalDate(dateStr);
                     const formattedDate = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 
                     tooltip.innerHTML = `
@@ -15904,6 +16009,7 @@
         // Change tracked relationship period
         async function changeTrackedPeriod(type, period) {
             currentTrackedPeriods[type] = period;
+            lastTrackedRenderData[type] = null;  // a resize must not redraw old data over Loading.../Failed to load
 
             // Update pill states for this panel only
             const selectorId = type === 'parent' ? 'parentPeriodSelector' : 'coparentPeriodSelector';
@@ -15938,6 +16044,27 @@
             }
         }
 
+        // Redraw the Health / tracked line charts when the window (and so the container width) changes.
+        // Only re-renders when the container is visible and its measured size actually changed, so it cannot loop.
+        function rerenderMeLineCharts() {
+            const jobs = [
+                ['healthChartContainer', lastHealthRenderData, (d) => renderHealthScore(d)],
+                ['parentChartContainer', lastTrackedRenderData.parent, (d) => renderTrackedChart('parent', d)],
+                ['coparentChartContainer', lastTrackedRenderData.coparent, (d) => renderTrackedChart('coparent', d)]
+            ];
+            jobs.forEach(([id, data, draw]) => {
+                const el = document.getElementById(id);
+                if (!el || !data || el.offsetParent === null || el.clientWidth === 0) return;
+                const box = chartBox(el);
+                if (lastChartBoxKeys[id] === `${box.width}x${box.height}`) return;
+                draw(data);
+            });
+        }
+        window.addEventListener('resize', () => {
+            clearTimeout(chartResizeTimer);
+            chartResizeTimer = setTimeout(rerenderMeLineCharts, 150);
+        });
+
         // Render Neglected Contacts
         function renderNeglectedContacts(data) {
             const container = document.getElementById('neglectedContactsList');
@@ -15967,9 +16094,9 @@
 
         function setGrowthCenterMonth(month) {
             const today = new Date();
-            const currentMonth = today.toISOString().slice(0, 7);
-            const clickedDate = new Date(month + '-01');
-            const currentDate = new Date(currentMonth + '-01');
+            const currentMonth = localMonthKey(today);
+            const clickedDate = parseLocalDate(month);
+            const currentDate = parseLocalDate(currentMonth);
             const monthsBack = (currentDate.getFullYear() - clickedDate.getFullYear()) * 12 + (currentDate.getMonth() - clickedDate.getMonth());
 
             if (monthsBack < 6) {
@@ -15988,7 +16115,11 @@
         function getGrowthWindowData() {
             const allData = networkGrowthData;
             if (allData.length === 0) return [];
-            const sortedData = [...allData].sort((a, b) => a.month.localeCompare(b.month));
+            // The API omits months with zero new people; fill the gaps so the axis has no skipped month
+            const sortedData = fillMonthGaps(
+                [...allData].sort((a, b) => a.month.localeCompare(b.month)),
+                (month) => ({ month, new_people: 0 })
+            );
 
             if (!networkGrowthCenterMonth) {
                 return sortedData.slice(-12);
@@ -16028,18 +16159,21 @@
             // Reset button if not at default view
             const resetBtnHtml = networkGrowthCenterMonth ? `<button class="growth-reset-btn" onclick="resetGrowthCenter()">↻ Now</button>` : '';
 
+            // Even axis maximum so the middle tick is always an integer
+            const axisMax = maxNew + (maxNew % 2);
+
             // Generate y-axis labels (0, mid, max)
-            const yAxisMid = Math.round(maxNew / 2);
+            const yAxisMid = axisMax / 2;
             const yAxisLabels = `
                 <div class="growth-y-axis">
-                    <div class="growth-y-label">${maxNew}</div>
+                    <div class="growth-y-label">${axisMax}</div>
                     <div class="growth-y-label">${yAxisMid}</div>
                     <div class="growth-y-label">0</div>
                 </div>
             `;
 
             const barsHtml = growth.map((g, idx) => {
-                const height = (g.new_people / maxNew) * 100;
+                const height = (g.new_people / axisMax) * 100;
                 return `
                     <div class="growth-bar-container" data-index="${idx}">
                         <div class="growth-bar" style="height: ${Math.max(height, 2)}%;"></div>
@@ -16083,7 +16217,7 @@
                     const g = windowedData[idx];
                     if (!g) return;
 
-                    const d = new Date(g.month + '-01');
+                    const d = parseLocalDate(g.month);
                     const monthName = d.toLocaleDateString('en-US', { month: 'short', year: 'numeric' });
 
                     tooltip.innerHTML = `
@@ -16109,7 +16243,8 @@
         // Render Messaging Volume by Circle Chart
         // Store raw messaging data for filtering
         let messagingByCircleData = [];
-        let messagingCircleFilters = new Set(['1', '2', '3', '4']);  // Inner circle excluded by default
+        let messagingCircleFilters = new Set(['1', '2', '3', '4', '5']);  // replaced with all circles present in the data on first load
+        let messagingFiltersInitialised = false;  // set once, so user toggles are not reset when the chart re-renders
         let messagingDisplayMode = 'raw';  // 'raw' or 'percent'
         let messagingCountMode = 'all';  // 'all' (message counts) or 'unique' (unique people)
         let messagingCenterMonth = null;  // null = default (most recent 12 months), or 'YYYY-MM' to center on
@@ -16127,11 +16262,11 @@
         function setMessagingCenterMonth(month) {
             // Get today's month
             const today = new Date();
-            const currentMonth = today.toISOString().slice(0, 7);
+            const currentMonth = localMonthKey(today);
 
             // Calculate how many months back the clicked month is
-            const clickedDate = new Date(month + '-01');
-            const currentDate = new Date(currentMonth + '-01');
+            const clickedDate = parseLocalDate(month);
+            const currentDate = parseLocalDate(currentMonth);
             const monthsBack = (currentDate.getFullYear() - clickedDate.getFullYear()) * 12 + (currentDate.getMonth() - clickedDate.getMonth());
 
             // If clicking on a recent month (within last 6 months), cap at current view
@@ -16154,7 +16289,11 @@
             if (allData.length === 0) return [];
 
             // Sort data by month
-            const sortedData = [...allData].sort((a, b) => a.month.localeCompare(b.month));
+            // Fill months the API omitted (no messages) so the axis has no skipped month
+            const sortedData = fillMonthGaps(
+                [...allData].sort((a, b) => a.month.localeCompare(b.month)),
+                (month) => ({ month, by_circle: {}, unique_by_circle: {}, total: 0 })
+            );
 
             if (!messagingCenterMonth) {
                 // Default: show most recent 12 months
@@ -16190,10 +16329,29 @@
                 return;
             }
 
+            if (!messagingFiltersInitialised) {
+                // Start with every circle that has data (value > 0 in any month, either mode);
+                // if no circle has data at all, fall back to the standard circles 1-5
+                const initial = new Set();
+                messagingByCircleData.forEach(m => {
+                    [m.by_circle, m.unique_by_circle].forEach(src => {
+                        Object.keys(src || {}).forEach(c => { if ((src[c] || 0) > 0) initial.add(c); });
+                    });
+                });
+                messagingCircleFilters = initial.size > 0 ? initial : new Set(['1', '2', '3', '4', '5']);
+                messagingFiltersInitialised = true;
+            }
+
             renderMessagingChart();
         }
 
+        // True if the circle has a value > 0 in any month (messages or unique people)
+        function messagingCircleHasData(c) {
+            return messagingByCircleData.some(m => ((m.by_circle && m.by_circle[c]) || 0) > 0 || ((m.unique_by_circle && m.unique_by_circle[c]) || 0) > 0);
+        }
+
         function toggleCircleFilter(circle) {
+            if (!messagingCircleHasData(circle)) return;  // nothing to show for an empty circle
             if (messagingCircleFilters.has(circle)) {
                 // Don't allow removing the last filter
                 if (messagingCircleFilters.size > 1) {
@@ -16212,7 +16370,20 @@
             // Use windowed data based on center month selection
             const messaging = getMessagingWindowData();
             const selectedCircles = Array.from(messagingCircleFilters);
-            const circleLabels = ['Inner', 'Close', 'Friend', 'Acquaint', 'Familiar', 'Outer'];
+            // Indexed by the API bucket key. The backend caps the bucket at 5 (min(circle, 5)), so bucket 5 is every
+            // Dunbar circle from 5 up (including "no circle"), i.e. the catch-all outer bucket. 'Beyond' (key 6) is
+            // only defensive for a future key. Bucket 0 is reserved for manual overrides and only shown if it has data.
+            const circleLabels = ['Core', 'Inner', 'Close', 'Friend', 'Acquaint', 'Outer', 'Beyond'];
+            const circleTitles = {
+                '0': 'Core: manual override circle',
+                '1': 'Dunbar circle 1: top 5 people',
+                '2': 'Dunbar circle 2: next 15',
+                '3': 'Dunbar circle 3: next 50',
+                '4': 'Dunbar circle 4: next 150',
+                '5': 'Dunbar circle 5 and beyond: everyone else',
+                '6': 'Beyond circle 5'
+            };
+            const currentMonthKey = localMonthKey();
             const isPercentMode = messagingDisplayMode === 'percent';
             const isUniqueMode = messagingCountMode === 'unique';
 
@@ -16231,10 +16402,13 @@
 
             const maxTotal = Math.max(...filteredData.map(m => m.filteredTotal), 1);
 
-            // Calculate average distribution for comparison
+            // Calculate average distribution for comparison, from COMPLETE months only
+            // (the current month is partial); if only the partial month exists, use it
+            const completeData = filteredData.filter(m => m.month !== currentMonthKey);
+            const avgSource = completeData.length > 0 ? completeData : filteredData;
             const avgByCircle = {};
             selectedCircles.forEach(c => {
-                avgByCircle[c] = filteredData.reduce((sum, m) => sum + (m.dataSource[c] || 0), 0);
+                avgByCircle[c] = avgSource.reduce((sum, m) => sum + (m.dataSource[c] || 0), 0);
             });
             const avgTotal = Object.values(avgByCircle).reduce((a, b) => a + b, 0);
             const avgPercentages = {};
@@ -16243,7 +16417,7 @@
             });
 
             // Build stacked bars with data attributes for tooltips
-            // Order: outer circles (4) at bottom, inner circles (0) at top
+            // Order: higher circle numbers (outer) at the bottom, lower numbers (inner) at the top
             // Sort descending so higher circle numbers render first (at bottom of stack)
             const orderedCircles = [...selectedCircles].sort((a, b) => parseInt(b) - parseInt(a));
 
@@ -16259,7 +16433,7 @@
 
                 return `
                     <div class="messaging-bar-container" data-index="${idx}">
-                        <div class="messaging-stacked-bar" style="height: ${Math.max(barHeight, 2)}%;">${segments}</div>
+                        <div class="messaging-stacked-bar${m.month === currentMonthKey ? ' messaging-bar-partial' : ''}" style="height: ${Math.max(barHeight, 2)}%;">${segments}</div>
                     </div>
                 `;
             }).join('');
@@ -16310,10 +16484,18 @@
             `;
 
             // Legend with toggles
-            const legendHtml = ['0', '1', '2', '3', '4'].map(c => {
-                const isSelected = messagingCircleFilters.has(c);
+            // Circles 1-5 always; 0 and 6 only if any month has that key. A circle with no people in ANY month is dimmed.
+            const hasKey = (c) => messagingByCircleData.some(m => (m.by_circle && c in m.by_circle) || (m.unique_by_circle && c in m.unique_by_circle));
+            const legendCircles = ['1', '2', '3', '4', '5'];
+            if (hasKey('0')) legendCircles.unshift('0');
+            if (hasKey('6')) legendCircles.push('6');
+            const legendHtml = legendCircles.map(c => {
+                const isEmpty = !messagingCircleHasData(c);
+                const isSelected = !isEmpty && messagingCircleFilters.has(c);
+                const chipTitle = isEmpty ? 'No people in this circle yet' : (circleTitles[c] || '');
+                const chipActions = isEmpty ? ' aria-disabled="true"' : ` onclick="toggleCircleFilter('${c}')" onkeydown="if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggleCircleFilter('${c}'); }"`;
                 return `
-                    <div class="legend-item legend-toggle ${isSelected ? 'selected' : ''}" onclick="toggleCircleFilter('${c}')">
+                    <div class="legend-item legend-toggle ${isSelected ? 'selected' : ''}${isEmpty ? ' legend-empty' : ''}" role="button" tabindex="0" aria-pressed="${isSelected}" title="${chipTitle}"${chipActions}>
                         <div class="legend-dot messaging-segment-${c}"></div>
                         <span>${circleLabels[parseInt(c)]}</span>
                     </div>
@@ -16358,8 +16540,8 @@
                     const m = filteredData[idx];
                     if (!m) return;
 
-                    const d = new Date(m.month + '-01');
-                    const monthName = d.toLocaleDateString('en-US', { month: 'short', year: 'numeric' });
+                    const d = parseLocalDate(m.month);
+                    const monthName = d.toLocaleDateString('en-US', { month: 'short', year: 'numeric' }) + (m.month === localMonthKey() ? ' (so far)' : '');
 
                     // Build breakdown by circle - use the appropriate data source
                     const breakdown = selectedCircles.map(c => {
@@ -16395,13 +16577,20 @@
             const insights = [];
             if (filteredData.length < 2 || avgTotal === 0) return insights;
 
-            const recent = filteredData[filteredData.length - 1];
-            const previous = filteredData[filteredData.length - 2];
-            const avgMonthlyTotal = avgTotal / filteredData.length;
+            // The current local month is partial: when it is the latest bar and there are enough months,
+            // compare the last COMPLETE month against the one before it, and average over complete months only.
+            const hasPartial = filteredData[filteredData.length - 1].month === localMonthKey();
+            if (hasPartial && filteredData.length < 3) return insights;  // only one complete month: nothing meaningful to compare
+            const completeMonths = hasPartial ? filteredData.slice(0, -1) : filteredData;
+            const useComplete = hasPartial && filteredData.length >= 3;
+            const recent = useComplete ? filteredData[filteredData.length - 2] : filteredData[filteredData.length - 1];
+            const previous = useComplete ? filteredData[filteredData.length - 3] : filteredData[filteredData.length - 2];
+            const avgMonthCount = completeMonths.length > 0 ? completeMonths.length : filteredData.length;
+            const avgMonthlyTotal = avgTotal / avgMonthCount;
             const recentTotal = recent.filteredTotal;
 
             // Helper to get month name
-            const getMonthName = (monthStr) => new Date(monthStr + '-01').toLocaleDateString('en-US', { month: 'short' });
+            const getMonthName = (monthStr) => parseLocalDate(monthStr).toLocaleDateString('en-US', { month: 'short' });
             const recentMonthName = getMonthName(recent.month);
 
             // 1. Volume comparison vs average
@@ -16453,12 +16642,13 @@
             }
 
             // 5. Trend over time (first half vs second half of data)
-            if (filteredData.length >= 6) {
-                const midpoint = Math.floor(filteredData.length / 2);
-                const firstHalfTotal = filteredData.slice(0, midpoint).reduce((sum, m) => sum + m.filteredTotal, 0);
-                const secondHalfTotal = filteredData.slice(midpoint).reduce((sum, m) => sum + m.filteredTotal, 0);
+            const trendData = useComplete ? completeMonths : filteredData;
+            if (trendData.length >= 6) {
+                const midpoint = Math.floor(trendData.length / 2);
+                const firstHalfTotal = trendData.slice(0, midpoint).reduce((sum, m) => sum + m.filteredTotal, 0);
+                const secondHalfTotal = trendData.slice(midpoint).reduce((sum, m) => sum + m.filteredTotal, 0);
                 const firstHalfAvg = firstHalfTotal / midpoint;
-                const secondHalfAvg = secondHalfTotal / (filteredData.length - midpoint);
+                const secondHalfAvg = secondHalfTotal / (trendData.length - midpoint);
                 const trendChange = firstHalfAvg > 0 ? ((secondHalfAvg - firstHalfAvg) / firstHalfAvg * 100) : 0;
 
                 if (Math.abs(trendChange) >= 20) {
