@@ -204,10 +204,16 @@
                 <div class="card-title">Journal</div>
                 <div class="card-description">See which emotions dominate your entries, and how they trend</div>
             </a>
+
+            <a href="/vault" class="card">
+                <div class="card-icon">🗂️</div>
+                <div class="card-title">Vault</div>
+                <div class="card-description">Browse your folders and drop files in to be read, summarized, and filed</div>
+            </a>
         </div>
 
         <p class="keyboard-hint">
-            Press <kbd>1</kbd> for Chat, <kbd>2</kbd> for CRM, <kbd>3</kbd> for Agents, or <kbd>4</kbd> for Journal
+            Press <kbd>1</kbd> for Chat, <kbd>2</kbd> for CRM, <kbd>3</kbd> for Agents, <kbd>4</kbd> for Journal, or <kbd>5</kbd> for Vault
         </p>
     </div>
 
@@ -217,6 +223,7 @@
             if (e.key === '2') window.location.href = '/crm';
             if (e.key === '3') window.location.href = '/agents';
             if (e.key === '4') window.location.href = '/journal';
+            if (e.key === '5') window.location.href = '/vault';
         });
     </script>
 </body>

@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Vault">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LifeOS · Vault</title>
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+    <link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png">
+    <link rel="manifest" href="/manifests/vault.webmanifest">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        :root {
+            color-scheme: dark;
+            --bg-primary: #0a0a0f;
+            --bg-secondary: #12121a;
+            --bg-card: #1a1a24;
+            --bg-hover: #23232f;
+            --text-primary: #e8e8ed;
+            --text-secondary: #8888a0;
+            --border: #2a2a38;
+            --accent: #5b8cff;
+            --accent-dim: rgba(91, 140, 255, 0.16);
+            --good: #46c98b;
+            --bad: #ff6b6b;
+            --warn: #f0b429;
+        }
+
+        body {
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            min-height: 100vh;
+        }
+
+        header {
+            position: sticky; top: 0; z-index: 5;
+            display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+            padding: 12px 16px; background: var(--bg-secondary); border-bottom: 1px solid var(--border);
+        }
+        header a.home { color: var(--text-secondary); text-decoration: none; font-weight: 600; }
+        header h1 { font-size: 17px; font-weight: 650; }
+        .target { color: var(--text-secondary); font-size: 13px; margin-left: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .target b { color: var(--text-primary); font-weight: 600; }
+
+        button, .btn {
+            font: inherit; color: var(--text-primary); background: var(--bg-card);
+            border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; cursor: pointer;
+            min-height: 40px;
+        }
+        button:hover, .btn:hover { background: var(--bg-hover); }
+        button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+        button:focus-visible, .row:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+        main {
+            display: grid; grid-template-columns: minmax(280px, 380px) 1fr; gap: 16px;
+            padding: 16px; max-width: 1400px; margin: 0 auto;
+        }
+        section { background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 12px; min-width: 0; }
+        section > h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-secondary); padding: 12px 14px 4px; }
+
+        #tree { padding: 6px 6px 12px; max-height: calc(100vh - 140px); overflow: auto; }
+        .row {
+            display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
+            padding: 7px 8px; border-radius: 8px; border: 0; background: transparent; min-height: 36px; cursor: pointer;
+            color: var(--text-primary);
+        }
+        .row:hover { background: var(--bg-hover); }
+        .row.selected { background: var(--accent-dim); }
+        .row.drop-target { background: var(--accent-dim); outline: 2px dashed var(--accent); }
+        .row .icon { width: 18px; text-align: center; flex: none; color: var(--text-secondary); }
+        .row .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .row .meta { color: var(--text-secondary); font-size: 12px; flex: none; }
+        .children { margin-left: 16px; border-left: 1px solid var(--border); padding-left: 4px; }
+        .note-badge { font-size: 11px; color: var(--good); flex: none; }
+
+        #side { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+        #detail { padding: 0 14px 14px; }
+        #detail pre {
+            white-space: pre-wrap; word-break: break-word; font: 13px/1.5 ui-monospace, Menlo, Consolas, monospace;
+            background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 12px; max-height: 60vh; overflow: auto;
+        }
+        .detail-actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+        .empty { color: var(--text-secondary); padding: 8px 0; }
+
+        #activity { padding: 0 14px 14px; display: flex; flex-direction: column; gap: 10px; }
+        .card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
+        .card .top { display: flex; gap: 8px; align-items: baseline; }
+        .card .top .name { font-weight: 600; flex: 1; min-width: 0; overflow-wrap: anywhere; }
+        .status { font-size: 12px; color: var(--text-secondary); }
+        .status.done { color: var(--good); }
+        .status.error { color: var(--bad); }
+        progress { width: 100%; height: 6px; margin-top: 8px; accent-color: var(--accent); }
+        .summary { margin-top: 8px; color: var(--text-primary); }
+        .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+        .chip { background: var(--accent-dim); color: var(--accent); border-radius: 999px; padding: 2px 10px; font-size: 12px; }
+        .list { margin: 8px 0 0 18px; color: var(--text-primary); font-size: 14px; }
+        .list li { margin: 2px 0; }
+        .sub { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--text-secondary); margin-top: 10px; }
+        .suggest { margin-top: 10px; padding: 8px 10px; background: var(--bg-secondary); border: 1px dashed var(--border); border-radius: 8px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+        #overlay {
+            position: fixed; inset: 0; z-index: 20; display: none; align-items: center; justify-content: center;
+            background: rgba(10, 10, 15, 0.82); border: 3px dashed var(--accent); margin: 8px; border-radius: 16px;
+            font-size: 22px; font-weight: 600; text-align: center; padding: 24px; pointer-events: none;
+        }
+        #overlay.show { display: flex; }
+
+        #toast { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); background: var(--bg-card); border: 1px solid var(--border); padding: 10px 16px; border-radius: 10px; display: none; z-index: 30; max-width: 90vw; }
+        #toast.show { display: block; }
+
+        @media (max-width: 800px) {
+            main { grid-template-columns: 1fr; padding: 10px; }
+            #tree { max-height: 50vh; }
+            .target { width: 100%; margin-left: 0; }
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <a class="home" href="/">LifeOS</a>
+        <h1>Vault</h1>
+        <button class="primary" id="uploadBtn" type="button">Upload files</button>
+        <button id="refreshBtn" type="button" aria-label="Refresh the folder tree">Refresh</button>
+        <input id="fileInput" type="file" multiple hidden>
+        <div class="target" id="target"></div>
+    </header>
+
+    <main>
+        <section>
+            <h2>Folders</h2>
+            <div id="tree" role="tree" aria-label="Vault folders"></div>
+        </section>
+        <div id="side">
+            <section>
+                <h2>Uploads</h2>
+                <div id="activity"><div class="empty" id="activityEmpty">Drop files anywhere on this page, or onto a folder. They are saved there and processed into a searchable note.</div></div>
+            </section>
+            <section>
+                <h2>Selected</h2>
+                <div id="detail"><div class="empty">Choose a file to open it.</div></div>
+            </section>
+        </div>
+    </main>
+
+    <div id="overlay" aria-hidden="true"></div>
+    <div id="toast" role="status"></div>
+
+    <script>
+    (function () {
+        'use strict';
+
+        var state = {
+            target: '',
+            selected: null,
+            open: {},
+            dragDepth: 0
+        };
+        var treeEl = document.getElementById('tree');
+        var targetEl = document.getElementById('target');
+        var activityEl = document.getElementById('activity');
+        var detailEl = document.getElementById('detail');
+        var overlayEl = document.getElementById('overlay');
+        var toastEl = document.getElementById('toast');
+        var fileInput = document.getElementById('fileInput');
+
+        function el(tag, props, children) {
+            var node = document.createElement(tag);
+            Object.keys(props || {}).forEach(function (k) {
+                if (k === 'class') node.className = props[k];
+                else if (k === 'text') node.textContent = props[k];
+                else if (k.indexOf('on') === 0) node.addEventListener(k.slice(2), props[k]);
+                else node.setAttribute(k, props[k]);
+            });
+            (children || []).forEach(function (c) { if (c) node.appendChild(c); });
+            return node;
+        }
+
+        function toast(message) {
+            toastEl.textContent = message;
+            toastEl.classList.add('show');
+            clearTimeout(toast.timer);
+            toast.timer = setTimeout(function () { toastEl.classList.remove('show'); }, 4000);
+        }
+
+        function describeTarget() {
+            targetEl.textContent = '';
+            targetEl.appendChild(document.createTextNode('Uploads go to: '));
+            targetEl.appendChild(el('b', { text: state.target || 'vault root' }));
+        }
+
+        function size(bytes) {
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1048576) return (bytes / 1024).toFixed(0) + ' KB';
+            return (bytes / 1048576).toFixed(1) + ' MB';
+        }
+
+        function parseError(xhrOrResponse, body) {
+            if (body && body.detail) return typeof body.detail === 'string' ? body.detail : 'request was rejected';
+            return 'request failed';
+        }
+
+        function getJson(url) {
+            return fetch(url, { credentials: 'same-origin' }).then(function (r) {
+                return r.json().catch(function () { return {}; }).then(function (body) {
+                    if (!r.ok) throw new Error(parseError(r, body));
+                    return body;
+                });
+            });
+        }
+
+        function postJson(url, payload) {
+            return fetch(url, {
+                method: 'POST', credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
+            }).then(function (r) {
+                return r.json().catch(function () { return {}; }).then(function (body) {
+                    if (!r.ok) throw new Error(parseError(r, body));
+                    return body;
+                });
+            });
+        }
+
+        var ICONS = { note: '📝', pdf: '📕', image: '🖼️', document: '📄', other: '📎' };
+
+        function renderFolder(path, container) {
+            container.textContent = '';
+            container.appendChild(el('div', { class: 'empty', text: 'Loading…' }));
+            return getJson('/api/vault/tree?path=' + encodeURIComponent(path)).then(function (data) {
+                container.textContent = '';
+                data.folders.forEach(function (folder) { container.appendChild(folderNode(folder)); });
+                data.files.forEach(function (file) { container.appendChild(fileNode(file)); });
+                if (!data.folders.length && !data.files.length) container.appendChild(el('div', { class: 'empty', text: 'Empty folder' }));
+                if (data.truncated) container.appendChild(el('div', { class: 'empty', text: 'Showing the first 1,000 entries.' }));
+            }).catch(function (err) {
+                container.textContent = '';
+                container.appendChild(el('div', { class: 'empty', text: 'Could not load: ' + err.message }));
+            });
+        }
+
+        function folderNode(folder) {
+            var holder = el('div', { 'data-path': folder.path });
+            var children = el('div', { class: 'children' });
+            var icon = el('span', { class: 'icon', text: state.open[folder.path] ? '▾' : '▸' });
+            var row = el('button', {
+                class: 'row', type: 'button', 'data-folder': folder.path, role: 'treeitem',
+                'aria-expanded': state.open[folder.path] ? 'true' : 'false',
+                onclick: function () {
+                    state.target = folder.path;
+                    describeTarget();
+                    state.open[folder.path] = !state.open[folder.path];
+                    icon.textContent = state.open[folder.path] ? '▾' : '▸';
+                    row.setAttribute('aria-expanded', state.open[folder.path] ? 'true' : 'false');
+                    markSelected(row);
+                    if (state.open[folder.path]) renderFolder(folder.path, children); else children.textContent = '';
+                }
+            }, [icon, el('span', { class: 'name', text: folder.name })]);
+            holder.appendChild(row);
+            holder.appendChild(children);
+            if (state.open[folder.path]) renderFolder(folder.path, children);
+            return holder;
+        }
+
+        function fileNode(file) {
+            var badge = file.sidecar ? el('span', { class: 'note-badge', text: 'note' }) : null;
+            return el('button', {
+                class: 'row', type: 'button', role: 'treeitem', 'data-file': file.path,
+                onclick: function () { openFile(file); }
+            }, [
+                el('span', { class: 'icon', text: ICONS[file.kind] || ICONS.other }),
+                el('span', { class: 'name', text: file.name }),
+                badge,
+                el('span', { class: 'meta', text: size(file.size) })
+            ]);
+        }
+
+        function markSelected(row) {
+            var old = treeEl.querySelector('.row.selected');
+            if (old) old.classList.remove('selected');
+            row.classList.add('selected');
+        }
+
+        function openFile(file) {
+            state.selected = file;
+            detailEl.textContent = '';
+            detailEl.appendChild(el('div', { class: 'top' }, [el('strong', { text: file.name })]));
+            var actions = el('div', { class: 'detail-actions' });
+            var download = el('a', { class: 'btn', href: '/api/vault/download?path=' + encodeURIComponent(file.path), text: 'Download' });
+            actions.appendChild(download);
+            if (file.kind === 'pdf' || file.kind === 'image') {
+                actions.appendChild(el('a', { class: 'btn', target: '_blank', rel: 'noopener', href: '/api/vault/download?inline=true&path=' + encodeURIComponent(file.path), text: 'View' }));
+            }
+            if (file.sidecar) actions.appendChild(el('button', { type: 'button', text: 'Open note', onclick: function () { showNote(file.sidecar); } }));
+            detailEl.appendChild(actions);
+            if (file.kind === 'note') showNote(file.path);
+        }
+
+        function showNote(path) {
+            var pre = el('pre', { text: 'Loading…' });
+            var old = detailEl.querySelector('pre');
+            if (old) old.remove();
+            detailEl.appendChild(pre);
+            getJson('/api/vault/read?path=' + encodeURIComponent(path)).then(function (note) {
+                pre.textContent = note.content;
+            }).catch(function (err) { pre.textContent = 'Could not open the note: ' + err.message; });
+        }
+
+        function refreshAll() {
+            renderFolder('', treeEl);
+        }
+
+        function refreshFolder(path) {
+            if (!path) return refreshAll();
+            var holder = treeEl.querySelector('[data-path="' + CSS.escape(path) + '"] > .children');
+            return holder ? renderFolder(path, holder) : null;
+        }
+
+        function parentOf(path) {
+            var i = path.lastIndexOf('/');
+            return i < 0 ? '' : path.slice(0, i);
+        }
+
+        // Upload: one request per file so each file shows its own progress.
+        function uploadFile(file, folder) {
+            var empty = document.getElementById('activityEmpty');
+            if (empty) empty.remove();
+            var bar = el('progress', { max: '100', value: '0' });
+            var status = el('span', { class: 'status', text: 'Uploading…' });
+            var body = el('div');
+            var card = el('div', { class: 'card' }, [
+                el('div', { class: 'top' }, [el('span', { class: 'name', text: file.name }), status]),
+                bar, body
+            ]);
+            activityEl.insertBefore(card, activityEl.firstChild);
+
+            var form = new FormData();
+            form.append('folder', folder);
+            form.append('files', file, file.name);
+            var xhr = new XMLHttpRequest();
+            xhr.open('POST', '/api/vault/upload');
+            xhr.withCredentials = true;
+            xhr.upload.onprogress = function (e) {
+                if (e.lengthComputable) bar.value = Math.round((e.loaded / e.total) * 100);
+            };
+            xhr.onerror = function () { fail('Upload failed (network)'); };
+            xhr.onload = function () {
+                var data = {};
+                try { data = JSON.parse(xhr.responseText); } catch (e) { data = {}; }
+                if (xhr.status < 200 || xhr.status >= 300) return fail(parseError(xhr, data));
+                var result = (data.results || [])[0];
+                if (!result || !result.ok) return fail((result && result.error) || 'Upload was refused');
+                bar.value = 100;
+                status.textContent = 'Saved. Processing…';
+                refreshFolder(folder);
+                poll(result.job_id, card, status, bar, body, folder);
+            };
+            function fail(message) {
+                bar.remove();
+                status.textContent = message;
+                status.className = 'status error';
+            }
+            xhr.send(form);
+        }
+
+        function poll(jobId, card, status, bar, body, folder) {
+            var labels = { queued: 'Waiting…', extracting: 'Reading the file…', analyzing: 'Summarizing…', writing: 'Writing the note…', indexing: 'Making it searchable…' };
+            function tick() {
+                getJson('/api/vault/jobs/' + encodeURIComponent(jobId)).then(function (job) {
+                    if (job.status === 'done') {
+                        bar.remove();
+                        status.textContent = 'Done';
+                        status.className = 'status done';
+                        renderResult(job, body, folder);
+                        refreshFolder(folder);
+                    } else if (job.status === 'error') {
+                        bar.remove();
+                        status.textContent = 'Saved, but processing failed';
+                        status.className = 'status error';
+                        body.appendChild(el('div', { class: 'summary', text: job.error || '' }));
+                    } else {
+                        status.textContent = labels[job.status] || job.status;
+                        setTimeout(tick, 1500);
+                    }
+                }).catch(function () { setTimeout(tick, 3000); });
+            }
+            tick();
+        }
+
+        function listBlock(title, items) {
+            if (!items || !items.length) return null;
+            var ul = el('ul', { class: 'list' }, items.map(function (t) { return el('li', { text: t }); }));
+            return el('div', {}, [el('div', { class: 'sub', text: title }), ul]);
+        }
+
+        function renderResult(job, body, folder) {
+            var a = job.analysis;
+            if (a) {
+                if (a.summary) body.appendChild(el('div', { class: 'summary', text: a.summary }));
+                if (a.tags && a.tags.length) body.appendChild(el('div', { class: 'chips' }, a.tags.map(function (t) { return el('span', { class: 'chip', text: t }); })));
+                body.appendChild(listBlock('Suggested actions', (a.tasks || []).map(function (t) { return t.text + (t.due ? ' (due ' + t.due + ')' : ''); })));
+                body.appendChild(listBlock('Dates', (a.dates || []).map(function (d) { return d.date + ': ' + d.what; })));
+                body.appendChild(listBlock('People mentioned', a.people));
+                if (a.suggested_folder && a.suggested_folder !== folder) {
+                    var line = el('div', { class: 'suggest' }, [
+                        el('span', { text: 'Suggested folder: ' }),
+                        el('b', { text: a.suggested_folder }),
+                        el('button', { type: 'button', text: 'Move there', onclick: function (e) { moveTo(job.path, a.suggested_folder, e.target, line); } })
+                    ]);
+                    if (a.folder_reason) line.appendChild(el('span', { class: 'status', text: a.folder_reason }));
+                    body.appendChild(line);
+                }
+            } else if (job.message) {
+                body.appendChild(el('div', { class: 'summary', text: job.message }));
+            }
+            var actions = el('div', { class: 'detail-actions' });
+            if (job.note_path) actions.appendChild(el('button', { type: 'button', text: 'Open note', onclick: function () { showNote(job.note_path); } }));
+            body.appendChild(actions);
+            if (!job.searchable) body.appendChild(el('div', { class: 'status', text: 'Not searchable yet; the nightly index will pick it up.' }));
+        }
+
+        function moveTo(path, folder, button, line) {
+            button.disabled = true;
+            postJson('/api/vault/move', { path: path, to_folder: folder }).then(function () {
+                line.textContent = 'Moved to ' + folder;
+                refreshFolder(parentOf(path));
+                refreshFolder(folder);
+            }).catch(function (err) { button.disabled = false; toast('Move failed: ' + err.message); });
+        }
+
+        function handleFiles(fileList, folder) {
+            var files = Array.prototype.slice.call(fileList || []).filter(function (f) { return f.size >= 0; });
+            if (!files.length) return;
+            if (files.length > 25) { toast('Drop at most 25 files at a time.'); files = files.slice(0, 25); }
+            files.forEach(function (f) { uploadFile(f, folder); });
+        }
+
+        // Drag and drop: dropping on a folder row uploads there; anywhere else uses the selected folder.
+        function hasFiles(e) {
+            var types = (e.dataTransfer && e.dataTransfer.types) || [];
+            return Array.prototype.indexOf.call(types, 'Files') >= 0;
+        }
+
+        function folderUnder(e) {
+            var node = e.target && e.target.closest ? e.target.closest('[data-folder]') : null;
+            return node ? node.getAttribute('data-folder') : null;
+        }
+
+        function clearDropTargets() {
+            Array.prototype.forEach.call(document.querySelectorAll('.drop-target'), function (n) { n.classList.remove('drop-target'); });
+        }
+
+        function showOverlay(folder) {
+            overlayEl.textContent = 'Drop to upload to ' + (folder || 'the vault root');
+            overlayEl.classList.add('show');
+        }
+
+        document.addEventListener('dragenter', function (e) {
+            if (!hasFiles(e)) return;
+            e.preventDefault();
+            state.dragDepth += 1;
+            showOverlay(folderUnder(e) || state.target);
+        });
+        document.addEventListener('dragover', function (e) {
+            if (!hasFiles(e)) return;
+            e.preventDefault();
+            e.dataTransfer.dropEffect = 'copy';
+            clearDropTargets();
+            var node = e.target && e.target.closest ? e.target.closest('[data-folder]') : null;
+            if (node) node.classList.add('drop-target');
+            showOverlay(folderUnder(e) || state.target);
+        });
+        document.addEventListener('dragleave', function (e) {
+            if (!hasFiles(e)) return;
+            state.dragDepth = Math.max(0, state.dragDepth - 1);
+            if (state.dragDepth === 0) { overlayEl.classList.remove('show'); clearDropTargets(); }
+        });
+        document.addEventListener('drop', function (e) {
+            if (!hasFiles(e)) return;
+            e.preventDefault();
+            var folder = folderUnder(e);
+            if (folder === null) folder = state.target;
+            state.dragDepth = 0;
+            overlayEl.classList.remove('show');
+            clearDropTargets();
+            handleFiles(e.dataTransfer.files, folder);
+        });
+
+        document.getElementById('uploadBtn').addEventListener('click', function () { fileInput.click(); });
+        fileInput.addEventListener('change', function () {
+            handleFiles(fileInput.files, state.target);
+            fileInput.value = '';
+        });
+        document.getElementById('refreshBtn').addEventListener('click', refreshAll);
+
+        describeTarget();
+        refreshAll();
+    })();
+    </script>
+</body>
+</html>
