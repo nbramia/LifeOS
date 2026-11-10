@@ -1363,14 +1363,22 @@ class Settings(BaseSettings):
         alias="SLACK_REDIRECT_URI"
     )
 
-    # Notion People database sync (scripts/sync_notion_people.py). The token
-    # belongs to an internal Notion integration shared with the database; empty
-    # disables the nightly run.
+    # Notion People sync (scripts/sync_notion_people.py). The token belongs to
+    # an internal Notion integration shared with the People data source; empty
+    # disables the nightly run. The template ID is applied to pages the sync
+    # creates; empty creates pages with properties only.
     notion_token: str = Field(default="", alias="LIFEOS_NOTION_TOKEN")
-    notion_people_database_id: str = Field(
-        default="aaf1f807b4d6820d9097819e5b8aca7c",
-        alias="LIFEOS_NOTION_PEOPLE_DB",
+    notion_people_data_source_id: str = Field(
+        default="c841f807-b4d6-824f-8105-87105c118db7",
+        alias="LIFEOS_NOTION_PEOPLE_DATA_SOURCE",
     )
+    notion_person_template_id: str = Field(
+        default="4141f807-b4d6-8093-8836-ce6c9bbd4417",
+        alias="LIFEOS_NOTION_PERSON_TEMPLATE",
+    )
+    notion_version: str = Field(default="2025-09-03", alias="LIFEOS_NOTION_VERSION")
+    # Comma-separated Notion property names the sync may only fill when empty.
+    notion_fill_only_fields: str = Field(default="", alias="LIFEOS_NOTION_FILL_ONLY_FIELDS")
 
     # Work email domain for CRM category detection
     work_email_domain: str = Field(

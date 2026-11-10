@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Nightly LifeOS -> Notion People sync (Email, Phone, Last Check-In).
+# Nightly LifeOS -> Notion People sync (field updates, LifeOS_ID, new pages).
 # Skips cleanly when LIFEOS_NOTION_TOKEN is not configured. Always executes
-# (never a dry run) and caps page updates at 50 per night.
+# (never a dry run) with at most 100 field updates and 25 new pages per night.
 set -u
 LIFEOS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PY="${LIFEOS_VENV_PYTHON:-$HOME/.venvs/lifeos/bin/python}"
@@ -33,7 +33,7 @@ fi
 
 log "start"
 # --no-file-log: stdout is appended to the same log below.
-"$PY" scripts/sync_notion_people.py --execute --max-writes 50 --no-file-log >> "$LOG" 2>&1
+"$PY" scripts/sync_notion_people.py --execute --max-writes 100 --max-creates 25 --no-file-log >> "$LOG" 2>&1
 rc=$?
 if [ $rc -ne 0 ]; then log "ERROR: sync exited $rc"; exit $rc; fi
 log "done"

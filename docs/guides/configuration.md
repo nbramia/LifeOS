@@ -469,7 +469,10 @@ Read directly from the environment by `scripts/setup-tailscale.sh` and `scripts/
 | Variable | Type | Default | Sets |
 |---|---|---|---|
 | `LIFEOS_NOTION_TOKEN` | str | — | Internal Notion integration token for the [People sync](notion-people-sync.md). Empty makes the nightly run skip and the script refuse to start. Never logged. |
-| `LIFEOS_NOTION_PEOPLE_DB` | str | `aaf1f807b4d6820d9097819e5b8aca7c` | ID of the Notion People database the sync reads and updates. |
+| `LIFEOS_NOTION_PEOPLE_DATA_SOURCE` | str | `c841f807-b4d6-824f-8105-87105c118db7` | ID of the Notion People data source the sync reads, updates and adds pages to. |
+| `LIFEOS_NOTION_PERSON_TEMPLATE` | str | `4141f807-b4d6-8093-8836-ce6c9bbd4417` | ID of the Notion page template applied to pages the sync creates. Empty creates pages with properties only. |
+| `LIFEOS_NOTION_FILL_ONLY_FIELDS` | str | — | Comma-separated Notion properties (`Email`, `Phone`, `Company`, `Title`, `LinkedIn`, `Instagram`, `Twitter/X`, `Website`, `Last Check-In`) the sync may only fill when the Notion cell is empty, never overwrite. An unknown name stops the run with exit status 2. The `--fill-only-fields` option overrides it. |
+| `LIFEOS_NOTION_VERSION` | str | `2025-09-03` | `Notion-Version` header sent with every request. The data-source endpoints need `2025-09-03` or later. |
 
 ### Telegram
 
