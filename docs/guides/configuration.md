@@ -13,6 +13,7 @@ Each section corresponds roughly to a section in [`config/settings.py`](../../co
 | Variable | Type | Default | Sets |
 |---|---|---|---|
 | `LIFEOS_VAULT_PATH` | path | — | Absolute or `~`-prefixed path to your Obsidian vault. Every sync, every search, and every chat reads from here. |
+| `LIFEOS_VAULT_CREATE_PEOPLE` | bool | `false` | When true, indexing a vault note creates a new CRM person for every name it extracts. Off by default: notes still link to people who already exist but never add contacts, because extraction picks up headings and product names as if they were people. |
 
 ## Server
 

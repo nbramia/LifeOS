@@ -219,6 +219,14 @@ class Settings(BaseSettings):
         default=_REPO_ROOT / "vault",
         alias="LIFEOS_VAULT_PATH"
     )
+    vault_create_people: bool = Field(
+        default=False,
+        alias="LIFEOS_VAULT_CREATE_PEOPLE",
+        description="When true, indexing a vault note creates a new CRM person for every name "
+                    "it extracts (bold words, 'Attendees:' lines). Off by default: notes still "
+                    "link to people who already exist, but never add new contacts, because "
+                    "extraction picks up headings and product names as if they were people."
+    )
     chroma_path: Path = Field(
         default=_REPO_ROOT / "data" / "chromadb",
         alias="LIFEOS_CHROMA_PATH"

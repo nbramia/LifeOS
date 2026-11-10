@@ -18,6 +18,7 @@ from api.services.chunker import chunk_document, extract_frontmatter, add_contex
 from api.services.vectorstore import VectorStore, is_people_tag
 from api.services.bm25_index import BM25Index
 from api.services.people import extract_people_from_text, people_from_tags
+from config.settings import settings
 
 # V2 People System integration
 try:
@@ -679,10 +680,10 @@ class IndexerService:
                 result = resolver.resolve(
                     name=person_name,
                     context_path=file_path_str,
-                    create_if_missing=True,
+                    create_if_missing=settings.vault_create_people,
                 )
 
-                if not result:
+                if not result or not result.entity:
                     logger.debug(f"Could not resolve person: {person_name}")
                     continue
 
