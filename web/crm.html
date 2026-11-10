@@ -7792,7 +7792,7 @@
             <div class="filters">
                 <div class="people-filter-dropdown" id="peopleCategoryDropdown">
                     <button class="people-filter-btn" onclick="togglePeopleCategoryFilter()">
-                        <span id="peopleCategoryLabel">3 Selected</span>
+                        <span id="peopleCategoryLabel">Categories</span>
                         <span class="dropdown-arrow">▼</span>
                     </button>
                     <div class="people-filter-options" id="peopleCategoryOptions">
@@ -7813,7 +7813,7 @@
                             <span class="category-dot" style="background: #00bcd4;"></span> Personal
                         </label>
                         <label class="people-filter-option">
-                            <input type="checkbox" value="work" onchange="updatePeopleCategoryFilter()">
+                            <input type="checkbox" value="work" checked onchange="updatePeopleCategoryFilter()">
                             <span class="category-dot" style="background: #4f46e5;"></span> Work
                         </label>
                     </div>
@@ -9131,7 +9131,7 @@
         const TONE_POLL_INTERVAL_MS = 5000;
         const TONE_POLL_MAX_ATTEMPTS = 60; // 60 * 5s = 5 minutes
         // People list filters (multi-select)
-        let peopleCategoryFilters = new Set(['self', 'family', 'personal']);  // Work excluded by default
+        let peopleCategoryFilters = new Set(['self', 'family', 'personal', 'work']);  // All categories selected by default
         let peopleDunbarFilters = new Set(['0', '1', '2', '3', '4', '5', '6+']);
         let peopleTagFilters = new Set();  // Empty = all tags (no filter)
         let allAvailableTags = [];  // All tags from loaded people
