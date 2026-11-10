@@ -1,0 +1,10 @@
+[Unit]
+Description=LifeOS Notion People Sync Timer (4:15 AM)
+
+[Timer]
+OnCalendar=*-*-* 04:15:00
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

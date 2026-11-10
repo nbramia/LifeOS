@@ -323,6 +323,7 @@ The display `sources` column stores each call as `tool(json-args)` cut to 80 cha
 | `apple_data_export.py` | Export Apple data (iMessage, Contacts, Photos) on macOS |
 | `apple_data_import.py` | Import Apple data exports on the server |
 | `apple_data_agent.sh` | Apple Data Agent orchestrator (runs on macOS, rsyncs to server) |
+| `sync_notion_people.py` | One-way sync of Email, Phone and Last Check-In from LifeOS to a Notion People database. Dry run by default; `--execute` applies. `notion_people_sync_nightly.sh` runs it from `lifeos-notion-people-sync.timer`. See [notion-people-sync.md](notion-people-sync.md). |
 
 ### import_contact_exports.py
 

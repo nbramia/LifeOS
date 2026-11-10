@@ -344,6 +344,7 @@ Both binary settings resolve the same way (`api/services/agent_worker/binary_res
 | `LIFEOS_WORK_DOMAIN` | str | — | Your primary work email domain. |
 | `LIFEOS_WORK_DOMAIN_2` | str | — | Second work email domain if you have one. |
 | `LIFEOS_WORK_DOMAINS_EXTRA` | str | — | Comma-separated list of any further work email domains beyond the first two (e.g. `thirdco.com,fourthco.com`). |
+| `LIFEOS_WORK_COMPANIES` | str | — | Comma-separated company names. A person whose company field contains any of them (part of a name is enough, case-insensitive) is categorized as Work. Blank turns the rule off. |
 | `LIFEOS_TIMEZONE` | str | — | IANA timezone (e.g., `America/New_York`). |
 
 ## Relationships
@@ -462,6 +463,13 @@ Read directly from the environment by `scripts/setup-tailscale.sh` and `scripts/
 | `SLACK_REDIRECT_URI` | str | — | Slack OAuth redirect URL (e.g., `http://localhost:8000/api/crm/slack/callback`). |
 | `SLACK_USER_TOKEN` | str | — | Direct user OAuth token (`xoxp-...`) — alternative to the full OAuth flow. |
 | `SLACK_TEAM_ID` | str | — | Workspace ID. |
+
+### Notion
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_NOTION_TOKEN` | str | — | Internal Notion integration token for the [People sync](notion-people-sync.md). Empty makes the nightly run skip and the script refuse to start. Never logged. |
+| `LIFEOS_NOTION_PEOPLE_DB` | str | `aaf1f807b4d6820d9097819e5b8aca7c` | ID of the Notion People database the sync reads and updates. |
 
 ### Telegram
 

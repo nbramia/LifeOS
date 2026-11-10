@@ -1363,6 +1363,15 @@ class Settings(BaseSettings):
         alias="SLACK_REDIRECT_URI"
     )
 
+    # Notion People database sync (scripts/sync_notion_people.py). The token
+    # belongs to an internal Notion integration shared with the database; empty
+    # disables the nightly run.
+    notion_token: str = Field(default="", alias="LIFEOS_NOTION_TOKEN")
+    notion_people_database_id: str = Field(
+        default="aaf1f807b4d6820d9097819e5b8aca7c",
+        alias="LIFEOS_NOTION_PEOPLE_DB",
+    )
+
     # Work email domain for CRM category detection
     work_email_domain: str = Field(
         default="",
