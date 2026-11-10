@@ -1,7 +1,7 @@
 import SwiftUI
 
 struct ContentView: View {
-    @AppStorage("serverURL") private var serverURL: String = "https://your-machine.tailXXXX.ts.net/api/fitness/health/ingest"
+    @AppStorage("serverURL") private var serverURL: String = ""
     @AppStorage("token") private var token: String = ""
     @StateObject private var engine = SyncEngine.shared
 
@@ -44,8 +44,11 @@ struct ContentView: View {
             }
             .navigationTitle("HealthBridge")
             .task {
+                // Ask for Health access, then sync straight away so a fresh install
+                // needs no further taps.
                 await engine.requestAuthorization()
                 engine.startBackgroundDelivery()
+                await engine.syncNow(serverURL: serverURL, token: token)
             }
         }
     }

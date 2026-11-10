@@ -1,20 +1,23 @@
-# XcodeGen spec for HealthBridge (#333).
-# Generate the Xcode project with:  xcodegen generate
-# Then open HealthBridge.xcodeproj, set your signing team, and run to your iPhone.
+# XcodeGen spec for HealthBridge.
+# Copy Secrets.xcconfig.example to Secrets.xcconfig (gitignored), then:  xcodegen generate
 name: HealthBridge
 options:
-  bundleIdPrefix: tech.lifeos
+  bundleIdPrefix: com.nbramia
   deploymentTarget:
     iOS: "17.0"
   createIntermediateGroups: true
+
+configFiles:
+  Debug: Secrets.xcconfig
+  Release: Secrets.xcconfig
 
 settings:
   base:
     MARKETING_VERSION: "1.0"
     CURRENT_PROJECT_VERSION: "1"
     SWIFT_VERSION: "5.9"
-    # Set your own free-Apple-ID team in Xcode (Signing & Capabilities) or here:
-    # DEVELOPMENT_TEAM: ABCDE12345
+    DEVELOPMENT_TEAM: 872CQP9C37
+    CODE_SIGN_STYLE: Automatic
 
 targets:
   HealthBridge:
@@ -29,6 +32,9 @@ targets:
         UILaunchScreen: {}
         NSHealthShareUsageDescription: "HealthBridge reads your workouts and health metrics so LifeOS can track training and recovery."
         NSHealthUpdateUsageDescription: "HealthBridge does not write health data; read-only access only."
+        # Preset server settings from Secrets.xcconfig; editable in the app.
+        HBIngestURL: $(HB_INGEST_URL)
+        HBIngestToken: $(HB_INGEST_TOKEN)
         UIBackgroundModes:
           - processing
           - fetch
@@ -39,6 +45,6 @@ targets:
         com.apple.developer.healthkit.background-delivery: true
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: tech.lifeos.healthbridge
+        PRODUCT_BUNDLE_IDENTIFIER: com.nbramia.healthbridge
         INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
         TARGETED_DEVICE_FAMILY: "1"  # iPhone
