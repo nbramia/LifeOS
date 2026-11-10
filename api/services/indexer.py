@@ -85,6 +85,28 @@ def _resolve_undated_note_date(path) -> datetime:
     return UNDATED_SENTINEL
 
 
+def excluded_prefixes() -> list[tuple[str, ...]]:
+    """The configured exclusion entries as lowercase path-part tuples."""
+    entries = []
+    for item in (settings.vault_exclude_dirs or "").split(","):
+        parts = tuple(p.casefold() for p in item.strip().replace("\\", "/").split("/") if p not in ("", "."))
+        if parts:
+            entries.append(parts)
+    return entries
+
+
+def is_excluded_path(vault_root: Path, path: Path) -> bool:
+    """True when  is inside the vault and matches an exclusion entry from the vault root."""
+    entries = excluded_prefixes()
+    if not entries:
+        return False
+    try:
+        parts = tuple(p.casefold() for p in Path(path).resolve().relative_to(Path(vault_root).resolve()).parts)
+    except (ValueError, OSError):
+        return False
+    return any(parts[: len(entry)] == entry for entry in entries)
+
+
 class VaultEventHandler(FileSystemEventHandler):
     """Handle file system events in the vault with global batch debouncing.
 
@@ -271,7 +293,7 @@ class IndexerService:
         index_state = self._load_index_state()
 
         # Get all current markdown files with their mtimes
-        all_md_files = list(self.vault_path.rglob("*.md"))
+        all_md_files = [f for f in self.vault_path.rglob("*.md") if not is_excluded_path(self.vault_path, f)]
         current_files = {str(f): f.stat().st_mtime for f in all_md_files}
 
         # Tag tuples used at index time live under a reserved key beside the
@@ -390,6 +412,8 @@ class IndexerService:
         """
         path = Path(file_path)
         if not path.exists() or not path.suffix == ".md":
+            return
+        if is_excluded_path(self.vault_path, path):
             return
 
         try:

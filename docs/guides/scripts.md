@@ -260,6 +260,7 @@ Example:
 | Script | Purpose |
 |--------|---------|
 | `sync_vault_reindex.py` | Reindex vault to ChromaDB + BM25 |
+| `vault_reindex_timer.sh` | Locked incremental vault reindex run by `lifeos-vault-reindex.timer` (opt-in, every 30 minutes) |
 | `sync_vault_tag.py` | Tag changed vault notes (`--execute`, or `--dry-run` to count only; skipped when tagging is unconfigured) |
 | `sync_crm_to_vectorstore.py` | Index CRM people for search |
 

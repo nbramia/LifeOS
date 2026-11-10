@@ -227,6 +227,21 @@ class Settings(BaseSettings):
                     "link to people who already exist, but never add new contacts, because "
                     "extraction picks up headings and product names as if they were people."
     )
+    vault_exclude_dirs: str = Field(
+        default="",
+        alias="LIFEOS_VAULT_EXCLUDE_DIRS",
+        description="Comma-separated vault-relative folders or files left out of the search index, "
+                    "matched as path prefixes from the vault root and ignoring case (for example "
+                    "'skills,.claude,Meta/templates,CLAUDE.md'). Use it for tooling notes, such as "
+                    "agent prompts, that would clutter search results."
+    )
+    vault_reindex_autostart: bool = Field(
+        default=False,
+        alias="LIFEOS_VAULT_REINDEX_AUTOSTART",
+        description="Enable the systemd timer that runs an incremental vault reindex every 30 minutes. "
+                    "Read by scripts/setup-systemd.sh. Off by default; turn it on when notes are "
+                    "edited from Windows tools, which the file watcher inside WSL cannot see."
+    )
     vault_upload_max_mb: int = Field(
         default=100,
         alias="LIFEOS_VAULT_UPLOAD_MAX_MB",

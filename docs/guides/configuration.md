@@ -14,6 +14,8 @@ Each section corresponds roughly to a section in [`config/settings.py`](../../co
 |---|---|---|---|
 | `LIFEOS_VAULT_PATH` | path | — | Absolute or `~`-prefixed path to your Obsidian vault. Every sync, every search, and every chat reads from here. |
 | `LIFEOS_VAULT_CREATE_PEOPLE` | bool | `false` | When true, indexing a vault note creates a new CRM person for every name it extracts. Off by default: notes still link to people who already exist but never add contacts, because extraction picks up headings and product names as if they were people. |
+| `LIFEOS_VAULT_EXCLUDE_DIRS` | string | (empty) | Comma-separated vault-relative folders or files left out of the search index, matched as path prefixes from the vault root and ignoring case (for example `skills,.claude,Meta/templates,CLAUDE.md`). Notes already indexed from an excluded path are removed on the next full or incremental pass. |
+| `LIFEOS_VAULT_REINDEX_AUTOSTART` | bool | `false` | Enable the systemd timer that runs an incremental vault reindex every 30 minutes (read by `scripts/setup-systemd.sh`). Turn it on when notes are edited from Windows tools, which the file watcher inside WSL cannot see. |
 | `LIFEOS_VAULT_UPLOAD_MAX_MB` | int | `100` | Largest file the vault page (`/vault`) accepts, in megabytes. |
 | `LIFEOS_VAULT_UPLOAD_BLOCKED_EXTENSIONS` | string | `exe,msi,bat,cmd,com,scr,ps1,vbs,vbe,js,jse,wsf,hta,jar,dll,lnk,app,apk` | Comma-separated extensions the vault page refuses, so a program cannot be dropped into a folder that OneDrive syncs to other devices. |
 | `LIFEOS_VAULT_UPLOAD_AI` | bool | `true` | When true, an uploaded file is summarized, tagged, and scanned for tasks, dates, and people by the orchestrator model (needs `ANTHROPIC_API_KEY`). Off keeps the extracted text only. |
