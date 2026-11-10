@@ -27,6 +27,7 @@ This directory contains operational guides — how to set up, configure, and run
 - `agent-worker-setup.md` — External agent worker prerequisites (Gemma swap, MCP HTTP transport, Cloudflare Tunnel, bearer token)
 - `mcp-connected-apps.md` — Connect the Claude and ChatGPT apps to LifeOS over OAuth: host setup, approval, revocation
 - `agents-go-to.md` — /agents "Go To" wezterm pane setup (SessionStart hook + FD probe)
+- `notion-people-sync.md` — One-way LifeOS → Notion People sync (contact fields, LifeOS_ID, new pages, change ledger): setup, first run, nightly timer, row matching, guardrails
 
 ## Key Principles
 

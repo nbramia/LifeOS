@@ -344,6 +344,7 @@ Both binary settings resolve the same way (`api/services/agent_worker/binary_res
 | `LIFEOS_WORK_DOMAIN` | str | — | Your primary work email domain. |
 | `LIFEOS_WORK_DOMAIN_2` | str | — | Second work email domain if you have one. |
 | `LIFEOS_WORK_DOMAINS_EXTRA` | str | — | Comma-separated list of any further work email domains beyond the first two (e.g. `thirdco.com,fourthco.com`). |
+| `LIFEOS_WORK_COMPANIES` | str | — | Comma-separated company names. A person whose company field contains any of them (part of a name is enough, case-insensitive) is categorized as Work. Blank turns the rule off. |
 | `LIFEOS_TIMEZONE` | str | — | IANA timezone (e.g., `America/New_York`). |
 
 ## Relationships
@@ -462,6 +463,16 @@ Read directly from the environment by `scripts/setup-tailscale.sh` and `scripts/
 | `SLACK_REDIRECT_URI` | str | — | Slack OAuth redirect URL (e.g., `http://localhost:8000/api/crm/slack/callback`). |
 | `SLACK_USER_TOKEN` | str | — | Direct user OAuth token (`xoxp-...`) — alternative to the full OAuth flow. |
 | `SLACK_TEAM_ID` | str | — | Workspace ID. |
+
+### Notion
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_NOTION_TOKEN` | str | — | Internal Notion integration token for the [People sync](notion-people-sync.md). Empty makes the nightly run skip and the script refuse to start. Never logged. |
+| `LIFEOS_NOTION_PEOPLE_DATA_SOURCE` | str | `c841f807-b4d6-824f-8105-87105c118db7` | ID of the Notion People data source the sync reads, updates and adds pages to. |
+| `LIFEOS_NOTION_PERSON_TEMPLATE` | str | `4141f807-b4d6-8093-8836-ce6c9bbd4417` | ID of the Notion page template applied to pages the sync creates. Empty creates pages with properties only. |
+| `LIFEOS_NOTION_FILL_ONLY_FIELDS` | str | — | Comma-separated Notion properties (`Email`, `Phone`, `Company`, `Title`, `LinkedIn`, `Instagram`, `Twitter/X`, `Website`, `Last Check-In`) the sync may only fill when the Notion cell is empty, never overwrite. An unknown name stops the run with exit status 2. The `--fill-only-fields` option overrides it. |
+| `LIFEOS_NOTION_VERSION` | str | `2025-09-03` | `Notion-Version` header sent with every request. The data-source endpoints need `2025-09-03` or later. |
 
 ### Telegram
 
