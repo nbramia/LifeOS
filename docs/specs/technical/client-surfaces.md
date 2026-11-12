@@ -53,7 +53,7 @@ Every LifeOS persona bot — fitness, therapist, doctor, finance, journal — an
 
 ## whisper-relay (voice transport API)
 
-Voice transport in the same GitHub org: [github.com/nbramia/whisper-relay](https://github.com/nbramia/whisper-relay). Local checkout: `~/Code/whisper-relay`. After #21 it is **API-only** — no `static/` UI, no `/api/voice/personas` or `/api/voice/conversations*` proxies. Review `src/voice_gateway/adapters/lifeos.py` when changing chat or conversation APIs.
+Voice transport in the same GitHub org: [github.com/nbramia/whisper-relay](https://github.com/nbramia/whisper-relay). Local checkout: `~/Code/Personal/whisper-relay`. After #21 it is **API-only** — no `static/` UI, no `/api/voice/personas` or `/api/voice/conversations*` proxies. Review `src/voice_gateway/adapters/lifeos.py` when changing chat or conversation APIs.
 
 The gateway connects to LifeOS at `LIFEOS_BASE_URL` for orchestration (ask/stream, handoff). Persona listing and conversation CRUD are **LifeOS-owned** — consumed by `/chat` directly, not through whisper-relay.
 
@@ -601,7 +601,7 @@ The sidebar shows a conversation's persona as a subtitle suffix (`· <Persona La
 ## Before changing chat or conversation APIs
 
 1. Read [api-reference.md](../product/api-reference.md) § Chat and Conversations endpoints.
-2. Compare `web/index.html`, `api/services/telegram.py`, `~/Code/whisper-relay/src/voice_gateway/adapters/lifeos.py`, and the Hermes proxy (`api/routes/hermes_proxy.py`, plus its shared plumbing in `api/routes/_proxy.py` — a change there also affects `api/routes/agent_proxy.py`).
+2. Compare `web/index.html`, `api/services/telegram.py`, `~/Code/Personal/whisper-relay/src/voice_gateway/adapters/lifeos.py`, and the Hermes proxy (`api/routes/hermes_proxy.py`, plus its shared plumbing in `api/routes/_proxy.py` — a change there also affects `api/routes/agent_proxy.py`).
 3. Run contract tests listed in [testing-standards.md](../standards/testing-standards.md#http-client-contract-tests).
 4. Treat removals or renames of public fields/events as a **breaking change** — update whisper-relay in the same release or maintain backward compatibility.
 

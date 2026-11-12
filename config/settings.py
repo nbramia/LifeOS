@@ -1853,7 +1853,7 @@ class Settings(BaseSettings):
                     "'investments' chat tool action. Expanduser'd at read time."
     )
     investments_dir: str = Field(
-        default="~/Code/investments",
+        default="~/Code/Personal/investments",
         alias="LIFEOS_INVESTMENTS_DIR",
         description="Checkout of nbramia/investments on this host; "
                     "/api/investments/today and /movers run its day_digest.py "

@@ -1,6 +1,6 @@
 """Investments snapshot — the operator's Schwab pipeline, served from Syncthing.
 
-The publisher's weekday refresh (nathan-linux ~/Code/investments, private
+The publisher's weekday refresh (nathan-linux ~/Code/Personal/investments, private
 repo nbramia/investments) aggregates the Schwab accounts + Guideline 401(k) +
 TSP and writes summary.json / portfolio.json into ~/Code/Sync/investments;
 Syncthing carries them to the LifeOS host. These endpoints serve the files

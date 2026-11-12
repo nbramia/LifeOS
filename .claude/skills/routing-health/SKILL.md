@@ -64,12 +64,12 @@ If the script itself crashed (a `deterministic-harness FAIL` line or a Python tr
 | `inventory/model-picker-options` | `web/index.html` `#modelPicker` options vs the handled set in `api/routes/chat.py` (`model_override` resolution, ~L1243) |
 | `equivalence/*` | `config/settings.py` (`resolve_persona`, `list_http_personas`, telegram bot registry) and `api/services/telegram.py` (`chat_via_api`) |
 | `text-matrix/<persona>/<model>` | `api/routes/chat.py` `ask_stream` — model_override resolution + persona handling + the `claude_code` short-circuit |
-| `voice/whisper-relay-*` | `~/Code/whisper-relay` adapter (`src/voice_gateway/adapters/lifeos.py`) + `web/chat/voice.js` (model_override on the voice FormData) |
+| `voice/whisper-relay-*` | `~/Code/Personal/whisper-relay` adapter (`src/voice_gateway/adapters/lifeos.py`) + `web/chat/voice.js` (model_override on the voice FormData) |
 | `live/*`, `live-text/*`, `live-voice/*` | deployed service (restart `lifeos-api`); for voice cells, the whisper-relay gateway on :9788 |
 
 ## Notes
 
 - **Read-mostly.** The only writes are throwaway probe conversations (auto-deleted) and, under `--live`, one Claude Code worker session — killed, OS process included (operator-kill alone leaves the process; see issue #379).
 - **Requirements:** `lifeos-api` running; for voice checks, the whisper-relay gateway on :9788; for the local/`gemma` cells, `lifeos-llm` active.
-- **whisper-relay location** defaults to `~/Code/whisper-relay` — override with `WHISPER_RELAY_DIR`. If it's absent, the voice-forwarding checks WARN (skipped) rather than fail, and the verdict degrades to 🟡 rather than 🔴.
+- **whisper-relay location** defaults to `~/Code/Personal/whisper-relay` — override with `WHISPER_RELAY_DIR`. If it's absent, the voice-forwarding checks WARN (skipped) rather than fail, and the verdict degrades to 🟡 rather than 🔴.
 - The deterministic matrix loads the app in-process (TestClient) and mocks `run_agent_loop`, so it makes **no** real LLM calls and spawns nothing — it's safe to run frequently. The cost and side effects live entirely in `--live`.
