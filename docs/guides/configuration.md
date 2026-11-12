@@ -567,7 +567,7 @@ Both `MONARCH_EMAIL`/`MONARCH_PASSWORD` unset AND no cached session at `data/mon
 | Variable | Type | Default | Sets |
 |---|---|---|---|
 | `LIFEOS_INVESTMENTS_SYNC_DIR` | path | `~/Code/Sync/investments` | Directory `summary.json`/`portfolio.json` are read from by the investments API route and the `search_finances` "investments" chat tool action. |
-| `LIFEOS_INVESTMENTS_DIR` | path | `~/Code/investments` | Checkout of nbramia/investments on this host; `/api/investments/today` and `/movers` run its `day_digest.py` and `movers.py` with its venv. |
+| `LIFEOS_INVESTMENTS_DIR` | path | `~/Code/Personal/investments` | Checkout of nbramia/investments on this host; `/api/investments/today` and `/movers` run its `day_digest.py` and `movers.py` with its venv. |
 
 This directory is populated by a separate Schwab export pipeline outside this repo, not by LifeOS itself. Without that pipeline (or with this unset and the default directory absent), the API route and chat tool both report a clean "not synced yet" — there is no error and nothing else to configure.
 

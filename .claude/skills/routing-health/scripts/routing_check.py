@@ -40,7 +40,7 @@ os.chdir(REPO)
 sys.path.insert(0, str(REPO))
 
 BASE = os.environ.get("LIFEOS_BASE_URL", "http://localhost:8000")
-WHISPER_RELAY = Path(os.environ.get("WHISPER_RELAY_DIR", str(Path.home() / "Code" / "whisper-relay")))
+WHISPER_RELAY = Path(os.environ.get("WHISPER_RELAY_DIR", str(Path.home() / "Code" / "Personal" / "whisper-relay")))
 LIVE = "--live" in sys.argv or "--deep" in sys.argv
 MODELS = ["auto", "opus", "sonnet", "gemma", "claude_code"]
 BACKEND_HANDLED = {"auto", "sonnet", "opus", "gemma", "local", "claude_code"}
