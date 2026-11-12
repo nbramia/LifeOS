@@ -35,6 +35,82 @@ _LIFEOS_DIR = os.path.join(_CODE_DIR, "LifeOS")
 # Cache for scanned project directories
 _project_dirs: list[tuple[str, str]] | None = None
 
+# Project discovery treats the code folder as a tree of checkouts (contain a
+# `.git`) and group folders (don't). It looks this many levels below the code
+# folder: `Work/movementlabs-adhoc/planning` is level 3.
+_MAX_SCAN_DEPTH = 3
+_SKIP_DIR_NAMES = {"node_modules"}
+
+# checkout path -> lowercase repo name its `origin` remote points at (or None)
+_origin_cache: dict[str, str | None] = {}
+
+_ORIGIN_URL_RE = re.compile(r"^\s*url\s*=\s*(\S+)\s*$")
+
+
+def _is_checkout(path: Path) -> bool:
+    # A `.git` directory marks a clone. A `.git` file marks a linked worktree
+    # or submodule, which is not a project of its own: a folder of worktrees
+    # (`LifeOS-wt/`) stays the plain folder it is today.
+    return (path / ".git").is_dir()
+
+
+def _child_dirs(path: Path) -> list[Path]:
+    """Visible, non-`node_modules` subdirectories of `path`, sorted by name."""
+    try:
+        entries = sorted(path.iterdir(), key=lambda e: e.name)
+    except OSError:
+        return []
+    return [
+        e for e in entries
+        if not e.name.startswith(".") and e.name not in _SKIP_DIR_NAMES and e.is_dir()
+    ]
+
+
+def _contains_checkout(path: Path, depth: int) -> bool:
+    """Whether a checkout sits within `depth` levels below the group folder `path`."""
+    if depth <= 0:
+        return False
+    for child in _child_dirs(path):
+        if _is_checkout(child) or _contains_checkout(child, depth - 1):
+            return True
+    return False
+
+
+def _discover_projects(root: str) -> list[tuple[str, str]]:
+    """Project directories under `root` as (name_lower, full_path), longest
+    name first. Checkouts are found up to `_MAX_SCAN_DEPTH` levels down through
+    group folders (never into a checkout). A top-level directory that is not a
+    checkout and holds none within the bound is still a plain project folder.
+    When a name occurs at two depths the shallower wins; ties go to the path
+    that sorts first."""
+    root_path = Path(root)
+    if not root_path.is_dir():
+        return []
+
+    found: dict[str, str] = {}
+
+    def offer(entry: Path) -> None:
+        found.setdefault(entry.name.lower(), str(entry))
+
+    level = _child_dirs(root_path)
+    for depth in range(1, _MAX_SCAN_DEPTH + 1):
+        next_level: list[Path] = []
+        for entry in level:
+            if _is_checkout(entry):
+                offer(entry)
+            elif depth < _MAX_SCAN_DEPTH:
+                next_level.append(entry)
+            if depth == 1 and not _is_checkout(entry) and not _contains_checkout(
+                entry, _MAX_SCAN_DEPTH - 1
+            ):
+                offer(entry)  # plain project folder, not a group folder
+        level = sorted(
+            (c for g in next_level for c in _child_dirs(g)), key=lambda e: str(e)
+        )
+    projects = list(found.items())
+    projects.sort(key=lambda p: len(p[0]), reverse=True)
+    return projects
+
 
 def _scan_projects() -> list[tuple[str, str]]:
     """Scan code directory for project directories. Returns (name_lower, full_path) sorted longest-name-first."""
@@ -42,17 +118,47 @@ def _scan_projects() -> list[tuple[str, str]]:
     if _project_dirs is not None:
         return _project_dirs
 
-    projects = []
-    code_path = Path(_CODE_DIR)
-    if code_path.is_dir():
-        for entry in code_path.iterdir():
-            if entry.is_dir() and not entry.name.startswith("."):
-                projects.append((entry.name.lower(), str(entry)))
-
-    # Sort by name length descending so longest match wins
-    projects.sort(key=lambda p: len(p[0]), reverse=True)
-    _project_dirs = projects
+    _origin_cache.clear()
+    _project_dirs = _discover_projects(_CODE_DIR)
     return _project_dirs
+
+
+def _origin_repo(path: str) -> str | None:
+    """Lowercase repo name the checkout's `origin` remote points at, read from
+    `.git/config` directly (no git subprocess). None when unreadable or absent."""
+    if path in _origin_cache:
+        return _origin_cache[path]
+    repo = None
+    try:
+        in_origin = False
+        with open(os.path.join(path, ".git", "config"), encoding="utf-8", errors="replace") as f:
+            for line in f:
+                stripped = line.strip()
+                if stripped.startswith("["):
+                    in_origin = bool(re.match(r'^\[remote\s+"origin"\]', stripped))
+                elif in_origin:
+                    m = _ORIGIN_URL_RE.match(line)
+                    if m:
+                        tail = re.split(r"[/:]", m.group(1).rstrip("/"))[-1]
+                        repo = (tail[:-4] if tail.endswith(".git") else tail).lower() or None
+                        break
+    except OSError:
+        repo = None
+    _origin_cache[path] = repo
+    return repo
+
+
+def _find_checkout(name: str, projects: list[tuple[str, str]]) -> str | None:
+    """Existing local copy of GitHub repo `name`: a project folder with that
+    name, else a checkout whose origin remote points at that repo."""
+    key = name.lower()
+    by_name = dict(projects)
+    if key in by_name:
+        return by_name[key]
+    for _n, path in sorted(projects, key=lambda p: p[1]):
+        if _origin_repo(path) == key:
+            return path
+    return None
 
 
 _GITHUB_CACHE_TTL_SECONDS = 24 * 60 * 60
@@ -77,10 +183,12 @@ def _code_root() -> Path:
 
 
 def _repo_path(name: str) -> str:
-    """Where `name` would live under `code_dir`. Never derived from
-    anything but a validated name — a cached or gh-reported `path` is
-    never trusted directly (see `_valid_repo_name`)."""
-    return str(_code_root() / name)
+    """Where `name` lives under `code_dir`: its existing checkout anywhere in
+    the tree if there is one, else where a clone would land (the top level).
+    Never derived from anything but a validated name — a cached or gh-reported
+    `path` is never trusted directly (see `_valid_repo_name`)."""
+    existing = _find_checkout(name, _scan_projects())
+    return existing if existing else str(_code_root() / name)
 
 
 def _github_cache_path() -> Path:
@@ -296,6 +404,10 @@ def ensure_cloned(path: str) -> bool:
     name = resolved.name
     if not _valid_repo_name(name):
         return False
+    # Fresh walk (not the cached scan): never clone a repo that already has a
+    # checkout elsewhere in the tree.
+    if _find_checkout(name, _discover_projects(str(code_root))):
+        return True
     known_names = {repo_name for repo_name, _desc, _path in _github_repos()}
     if name not in known_names:
         return False

@@ -558,3 +558,146 @@ class TestEnsureCloned:
 
         monkeypatch.setattr(mod.subprocess, "run", fail_if_called)
         assert mod.ensure_cloned(str(code_dir / "..")) is False
+
+
+def _checkout(path, origin=None):
+    (path / ".git").mkdir(parents=True)
+    if origin:
+        (path / ".git" / "config").write_text(
+            f'[core]\n\tbare = false\n[remote "origin"]\n\turl = {origin}\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n'
+        )
+    return path
+
+
+class TestNestedProjectDiscovery:
+    """Group folders hold checkouts; only checkouts (and plain top-level
+    folders) are projects."""
+
+    @pytest.fixture
+    def code(self, monkeypatch, tmp_path):
+        import api.services.directory_resolver as mod
+        code = tmp_path / "Code"
+        code.mkdir()
+        monkeypatch.setattr(mod, "_CODE_DIR", str(code))
+        monkeypatch.setattr(settings, "code_dir", str(code), raising=False)
+        mod._project_dirs = None
+        mod._origin_cache.clear()
+        yield code
+        mod._project_dirs = None
+        mod._origin_cache.clear()
+
+    def _names(self, mod):
+        return dict(mod._scan_projects())
+
+    def test_nested_checkouts_found_group_folders_excluded(self, code):
+        import api.services.directory_resolver as mod
+        inv = _checkout(code / "Personal" / "investments")
+        plan = _checkout(code / "Work" / "movementlabs-adhoc" / "planning")
+        found = self._names(mod)
+        assert found == {"investments": str(inv), "planning": str(plan)}
+
+    def test_flat_layout_unchanged(self, code):
+        import api.services.directory_resolver as mod
+        h = _checkout(code / "hermes")
+        p = _checkout(code / "pebble")
+        assert self._names(mod) == {"hermes": str(h), "pebble": str(p)}
+
+    def test_plain_top_level_folder_still_a_project(self, code):
+        import api.services.directory_resolver as mod
+        (code / "scratch").mkdir()
+        (code / "Empty" / "sub").mkdir(parents=True)
+        found = self._names(mod)
+        assert found["scratch"] == str(code / "scratch")
+        assert found["empty"] == str(code / "Empty")
+
+    def test_depth_bound_and_no_descent_into_checkouts_or_hidden(self, code):
+        import api.services.directory_resolver as mod
+        _checkout(code / "a" / "b" / "c" / "toodeep")
+        _checkout(code / "g" / "ok")
+        _checkout(code / "outer")
+        _checkout(code / "outer" / "inner")
+        _checkout(code / "g2" / "node_modules" / "pkg")
+        _checkout(code / "g3" / ".hidden" / "repo")
+        found = self._names(mod)
+        assert "toodeep" not in found
+        assert "ok" in found
+        assert "inner" not in found
+        assert "pkg" not in found and "repo" not in found
+        # a group that only has too-deep checkouts holds none in bound -> plain folder
+        assert found["a"] == str(code / "a")
+
+    def test_linked_worktrees_are_not_checkouts(self, code):
+        import api.services.directory_resolver as mod
+        _checkout(code / "App")
+        wt = code / "App-wt" / "feat-x"
+        wt.mkdir(parents=True)
+        (wt / ".git").write_text("gitdir: /elsewhere\n")
+        found = self._names(mod)
+        assert "feat-x" not in found
+        assert found["app-wt"] == str(code / "App-wt")
+
+    def test_shallower_wins_then_sorted_path(self, code):
+        import api.services.directory_resolver as mod
+        top = _checkout(code / "dup")
+        _checkout(code / "Work" / "dup")
+        assert self._names(mod)["dup"] == str(top)
+        _checkout(code / "B" / "same")
+        a = _checkout(code / "A" / "same")
+        mod._project_dirs = None
+        assert self._names(mod)["same"] == str(a)
+
+    def test_affinity_resolves_to_nested_checkout(self, code, monkeypatch):
+        import api.services.directory_resolver as mod
+        inv = _checkout(code / "Personal" / "investments")
+        monkeypatch.setattr(
+            mod, "_github_repos", lambda: [("investments", "d", mod._repo_path("investments"))]
+        )
+        assert mod.resolve_location_affinity("investments") == str(inv)
+        assert mod.resolve_existing_location_affinity("investments") == str(inv)
+
+    def test_github_entry_resolves_to_checkout_by_origin_remote(self, code):
+        import api.services.directory_resolver as mod
+        co = _checkout(code / "Work" / "local-name", origin="git@github.com:nbramia/remote-name.git")
+        assert mod._repo_path("remote-name") == str(co)
+        co2 = _checkout(code / "other", origin="https://github.com/nbramia/another/")
+        mod._project_dirs = None
+        assert mod._repo_path("Another") == str(co2)
+        assert mod._repo_path("unknown") == str(code.resolve() / "unknown")
+
+    def test_ensure_cloned_skips_gh_when_checkout_exists_nested(self, code, monkeypatch):
+        import api.services.directory_resolver as mod
+        _checkout(code / "Personal" / "investments")
+        _checkout(code / "Work" / "x", origin="git@github.com:nbramia/viaremote.git")
+
+        def fail(argv, **kwargs):
+            raise AssertionError("gh must not run when a checkout exists")
+
+        monkeypatch.setattr(mod.subprocess, "run", fail)
+        monkeypatch.setattr(mod, "_github_repos", lambda: pytest.fail("no catalog lookup"))
+        assert mod.ensure_cloned(str(code / "investments")) is True
+        assert mod.ensure_cloned(str(code / "viaremote")) is True
+
+    def test_ensure_cloned_still_clones_at_top_level_when_absent(self, code, monkeypatch):
+        import api.services.directory_resolver as mod
+        _checkout(code / "Personal" / "other")
+        target = code / "fresh"
+        monkeypatch.setattr(settings, "github_owner", "nbramia")
+        monkeypatch.setattr(mod, "_github_repos", lambda: [("fresh", "d", str(target))])
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            target.mkdir()
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(mod.subprocess, "run", fake_run)
+        assert mod.ensure_cloned(str(target)) is True
+        assert calls and calls[0][:3] == ["gh", "repo", "clone"]
+
+    def test_keyword_routing_never_picks_group_folder(self, code, monkeypatch):
+        import api.services.directory_resolver as mod
+        _checkout(code / "Personal" / "investments")
+        monkeypatch.setattr("api.services.jev_task_routing.judge_task", lambda t: None)
+        result = mod.resolve_working_directory("plan my personal finances")
+        assert result != str(code / "Personal")
+        assert result == os.path.expanduser("~")
