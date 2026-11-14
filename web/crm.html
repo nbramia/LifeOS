@@ -4312,6 +4312,7 @@
         .channel-meeting { background: linear-gradient(135deg, #8b5cf6 0%, #7c3aed 100%); }
         .channel-linkedin { background: linear-gradient(135deg, #0077b5 0%, #005582 100%); }
         .channel-photos { background: linear-gradient(135deg, #e040fb 0%, #aa00ff 100%); }
+        .channel-in_person { background: linear-gradient(135deg, #14b8a6 0%, #0d9488 100%); }
         .channel-other { background: linear-gradient(135deg, #6b7280 0%, #4b5563 100%); }
 
         /* Channel Mix Legend */
@@ -8415,6 +8416,7 @@
                             <div class="timeline-filter-chip" data-source="slack" id="filterSlack" onclick="filterTimeline('slack')">💼 Slack</div>
                             <div class="timeline-filter-chip" data-source="notes" id="filterNotes" onclick="filterTimeline('notes')">📝 Notes</div>
                             <div class="timeline-filter-chip" data-source="photos" id="filterPhotos" onclick="filterTimeline('photos')">📷 Photos</div>
+                            <div class="timeline-filter-chip" data-source="in_person" id="filterInPerson" onclick="filterTimeline('in_person')">🗣️ In person</div>
                             <div class="timeline-date-range">
                                 <label>From:</label>
                                 <input type="date" id="timelineDateFrom" onchange="applyTimelineDateRange()">
@@ -11279,7 +11281,7 @@
             // Check if a date filter is active
             const hasDateFilter = timelineDateRangeFrom || timelineDateRangeTo;
 
-            let emailCount, eventCount, messageCount, phoneCount, slackCount, notesCount, photosCount;
+            let emailCount, eventCount, messageCount, phoneCount, slackCount, notesCount, photosCount, inPersonCount;
 
             if (hasDateFilter && timelineData && timelineData.length >= 0) {
                 // When date filter is active, count from actual timeline data
@@ -11296,6 +11298,7 @@
                 slackCount = counts['slack'] || 0;
                 notesCount = (counts['vault'] || 0) + (counts['meeting'] || 0);
                 photosCount = counts['photos'] || 0;
+                inPersonCount = counts['in_person'] || 0;
             } else {
                 // No date filter - use global sourceTotals
                 emailCount = (sourceTotals['gmail'] || 0);
@@ -11305,6 +11308,7 @@
                 slackCount = (sourceTotals['slack'] || 0);
                 notesCount = (sourceTotals['vault'] || 0) + (sourceTotals['meeting'] || 0);
                 photosCount = (sourceTotals['photos'] || 0);
+                inPersonCount = (sourceTotals['in_person'] || 0);
             }
 
             // Show/hide filter chips based on whether there's data
@@ -11320,6 +11324,7 @@
             updateFilter('filterSlack', slackCount);
             updateFilter('filterNotes', notesCount);
             updateFilter('filterPhotos', photosCount);
+            updateFilter('filterInPerson', inPersonCount);
         }
 
         // Birthday toast - check and show once per day
@@ -11675,7 +11680,8 @@
             'signal': { badge: String.fromCodePoint(0x1F510), label: 'Signal' },
             'phone': { badge: String.fromCodePoint(0x1F4DE), label: 'Calls' },
             'contacts': { badge: String.fromCodePoint(0x1F4C7), label: 'Contacts' },
-            'photos': { badge: String.fromCodePoint(0x1F4F7), label: 'Photos' }
+            'photos': { badge: String.fromCodePoint(0x1F4F7), label: 'Photos' },
+            'in_person': { badge: String.fromCodePoint(0x1F5E3, 0xFE0F), label: 'In person' }
         };
 
         // Load and render heat map
@@ -14377,6 +14383,7 @@
             meeting: 'channel-meeting',
             linkedin: 'channel-linkedin',
             photos: 'channel-photos',
+            in_person: 'channel-in_person',
         };
 
         const CHANNEL_LABELS = {
@@ -14390,6 +14397,7 @@
             meeting: '📝 Meetings',
             linkedin: '🔗 LinkedIn',
             photos: '📷 Photos',
+            in_person: '🗣️ In person',
         };
 
         // Render Channel Mix visualization

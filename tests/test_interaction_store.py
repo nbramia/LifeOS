@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from api.services.interaction_store import (
     Interaction,
     InteractionStore,
+    VALID_SOURCE_TYPES,
     build_obsidian_link,
     build_gmail_link,
     build_calendar_link,
@@ -1338,6 +1339,49 @@ class TestMassMeetingExclusion:
         self._calendar(temp_store, "p1", 1, title="Coffee")
 
         assert self._subtypes(temp_store, "p1") == {"calendar_1on1": 1}
+
+
+class TestInPersonSubtypes:
+    """in_person rows split into one-on-one and group by attendee_count."""
+
+    @pytest.fixture
+    def temp_store(self):
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            store = InteractionStore(f.name, strict=False)
+            yield store
+            Path(f.name).unlink(missing_ok=True)
+
+    def _add(self, store, attendee_count):
+        store.add(Interaction(
+            id=str(uuid.uuid4()),
+            person_id="p1",
+            timestamp=datetime.now(timezone.utc),
+            source_type="in_person",
+            title="In person · 1 conversation · 10 min",
+            source_id=str(uuid.uuid4()),
+            attendee_count=attendee_count,
+            provider="pendant",
+        ))
+
+    def test_subtypes(self, temp_store):
+        for count in (None, 0, 1, 2, 5):
+            self._add(temp_store, count)
+        got = {r["subtype"]: r["count"] for r in temp_store.get_interaction_counts_with_subtypes("p1")}
+        assert got == {"in_person_1on1": 3, "in_person_group": 2}
+
+    def test_validates_and_has_badge(self):
+        assert "in_person" in VALID_SOURCE_TYPES
+        row = Interaction(
+            id="i1", person_id="p1", timestamp=datetime.now(timezone.utc),
+            source_type="in_person", title="In person", provider="pendant",
+        )
+        row.validate()
+        assert row.source_badge == "🗣️"
+
+    def test_mass_meeting_limit_does_not_apply(self, temp_store):
+        self._add(temp_store, InteractionConfig.MASS_MEETING_ATTENDEE_LIMIT + 1)
+        counts = temp_store.get_interaction_counts_with_subtypes("p1")
+        assert sum(r["count"] for r in counts) == 1
 
 
 class TestWhatsAppSubtypesAndAttendeeCount:

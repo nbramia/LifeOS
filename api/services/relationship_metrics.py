@@ -28,7 +28,7 @@ See config/relationship_weights.py for all weights.
 """
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from typing import Optional
 
@@ -194,6 +194,29 @@ def compute_relationship_strength(
     )
 
 
+def _one_in_person_per_day(buckets: list) -> list:
+    """
+    Cap in_person buckets at one interaction per day, keeping the heaviest.
+
+    A day's face-to-face time is one interaction however many rows record it
+    (two person ids merged into one each carry a row for the same day).
+    """
+    best: dict[str, tuple[float, object]] = {}
+    kept = []
+    for bucket in buckets:
+        if bucket.source_type != "in_person":
+            kept.append(bucket)
+            continue
+        weight = get_interaction_weight(
+            bucket.source_type, bucket.subtype, bucket.source_account
+        )
+        if bucket.day not in best or weight > best[bucket.day][0]:
+            best[bucket.day] = (weight, bucket)
+    for _, bucket in best.values():
+        kept.append(replace(bucket, count=1))
+    return kept
+
+
 @dataclass(frozen=True)
 class StrengthComponents:
     """One person's component scores and the measurements behind them."""
@@ -233,7 +256,7 @@ def compute_strength_components(
     recency_interactions = 0
     sources = set(person.sources)
 
-    for bucket in inputs.buckets:
+    for bucket in _one_in_person_per_day(inputs.buckets):
         weight = bucket.count * get_interaction_weight(
             bucket.source_type, bucket.subtype, bucket.source_account
         )
@@ -312,6 +335,7 @@ def compute_strength_for_person(
     multipliers:
     - Gmail: sent (1.2x), received (1.0x), CC (0.3x)
     - Calendar: 1on1 (6.0x), small group (4.0x), large meeting (2.0x)
+    - In person: 1on1 (6.0x), group (4.0x), at most one per day
     - WhatsApp: direct (1.5x), group received (0.525x), group sent (0.225x, and
       no recency credit)
     - Personal account: 2x gmail, 3x calendar
