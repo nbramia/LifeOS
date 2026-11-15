@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from api.services.interaction_store import get_interaction_db_path
 from api.services.sqlite_connect import connect_closing
@@ -36,7 +37,7 @@ CALENDAR_BEFORE_SLACK = timedelta(hours=3)
 # Row timestamps are text in whatever offset their source wrote; padding the
 # indexed text range by a day covers every offset before the exact comparison.
 _TEXT_PAD = timedelta(days=1)
-HISTORY_DAYS = 365
+HISTORY_DAYS = 180
 RECURRING_MIN_DAYS = 3
 READ_CANDIDATES = 5
 MAX_READ_MESSAGES = 30
@@ -109,8 +110,16 @@ def _span(delta: timedelta) -> str:
     return f"{hours} h"
 
 
+def _local(dt: datetime) -> datetime:
+    """`dt` in the configured LifeOS timezone (UTC when it is unset or unknown)."""
+    try:
+        return dt.astimezone(ZoneInfo(settings.timezone))
+    except (ZoneInfoNotFoundError, ValueError):
+        return dt.astimezone(timezone.utc)
+
+
 def _band(dt: datetime) -> str:
-    hour = dt.astimezone().hour
+    hour = _local(dt).hour
     if 5 <= hour < 12:
         return "morning"
     if 12 <= hour < 17:
@@ -121,7 +130,7 @@ def _band(dt: datetime) -> str:
 
 
 def _day_type(dt: datetime) -> str:
-    return "weekend" if dt.astimezone().weekday() >= 5 else "weekday"
+    return "weekend" if _local(dt).weekday() >= 5 else "weekday"
 
 
 def _text_bounds(lo: datetime, hi: datetime) -> tuple[str, str]:
@@ -150,10 +159,12 @@ def _signal_rows(conn, start: datetime, end: datetime) -> list[tuple]:
 
 
 def _history_rows(conn, start: datetime) -> list[tuple]:
-    floor = (start - timedelta(days=HISTORY_DAYS)).isoformat()
+    """In-person rows from the HISTORY_DAYS before `start`, none at or after it."""
+    lo, hi = _text_bounds(start - timedelta(days=HISTORY_DAYS), start)
     return conn.execute(
-        "SELECT person_id, timestamp FROM interactions WHERE source_type = 'in_person' AND timestamp >= ?",
-        (floor,),
+        "SELECT person_id, timestamp FROM interactions WHERE source_type = 'in_person'"
+        " AND timestamp >= ? AND timestamp <= ?",
+        (lo, hi),
     ).fetchall()
 
 
@@ -184,7 +195,7 @@ def _gather_signals(conn, start: datetime, end: datetime, resolve) -> dict[str, 
                 weight = CALENDAR_NEAR_WEIGHT
             else:
                 continue
-            label = f"invited to an event at {when.astimezone().strftime('%H:%M')}"
+            label = f"invited to an event at {_local(when).strftime('%H:%M')}"
             if pid not in best_calendar or weight > best_calendar[pid][0]:
                 best_calendar[pid] = (weight, label)
         else:
@@ -207,13 +218,15 @@ def _gather_signals(conn, start: datetime, end: datetime, resolve) -> dict[str, 
     band_start, band_end = _band(start), _band(end)
     bands = {band_start, band_end}
     day_type = _day_type(start)
-    start_day = start.astimezone().date()
+    start_day = _local(start).date()
     days: dict[str, set] = {}
     for pid, ts in _history_rows(conn, start):
         when = _parse_ts(ts)
         if not pid or when is None:
             continue
-        local = when.astimezone()
+        if not (start - timedelta(days=HISTORY_DAYS) <= when < start):
+            continue
+        local = _local(when)
         if local.date() == start_day or _band(when) not in bands or _day_type(when) != day_type:
             continue
         days.setdefault(resolve(pid), set()).add(local.date())
@@ -298,7 +311,7 @@ def _read_texts(person_id: str, start: datetime, end: datetime, db_path: str) ->
     out: list[str] = []
     total = 0
     for when, text in reversed(lines):
-        stamp = when.astimezone().strftime("%H:%M")
+        stamp = _local(when).strftime("%H:%M")
         entry = f"[{stamp}] {text}"
         total += len(entry)
         if total > MAX_READ_CHARS:
@@ -313,8 +326,8 @@ def _judge(person_id: str, start: datetime, end: datetime, db_path: str, timeout
     if not texts:
         return None
     prompt = (
-        f"Window (local time): {start.astimezone().strftime('%Y-%m-%d %H:%M')} to "
-        f"{end.astimezone().strftime('%H:%M')}.\nMessages:\n" + "\n".join(texts)
+        f"Window (local time): {_local(start).strftime('%Y-%m-%d %H:%M')} to "
+        f"{_local(end).strftime('%H:%M')}.\nMessages:\n" + "\n".join(texts)
     )
     try:
         from api.services.llm_client import extract_json

@@ -70,6 +70,7 @@ def env(monkeypatch, tmp_path):
     InteractionStore(str(db), strict=False)
     monkeypatch.setattr(lp, "get_interaction_db_path", lambda: str(db))
     monkeypatch.setattr(settings, "my_person_id", OWNER)
+    monkeypatch.setattr(settings, "timezone", "UTC")
     monkeypatch.setattr(settings, "likely_present_read_messages", False)
     monkeypatch.setattr(settings, "likely_present_llm_timeout", 8.0)
     monkeypatch.setattr(settings, "remote_llm_base_url", "")
@@ -143,6 +144,37 @@ def test_recurring_ignores_other_time_band(env):
     for day in (3, 4, 5):
         add(env, ALEX, "in_person", datetime(2025, 11, day, 8, 0, tzinfo=timezone.utc))
     assert ALEX not in by_id(run(limit=10))
+
+
+def test_recurring_ignores_rows_after_the_window(env):
+    for day in (19, 20, 21):  # later weekday evenings, none before start
+        add(env, ALEX, "in_person", datetime(2025, 11, day, 18, 30, tzinfo=timezone.utc))
+    assert ALEX not in by_id(run(limit=10))
+
+
+def test_recurring_ignores_rows_older_than_the_lookback(env):
+    for weeks in (30, 31, 32):  # same weekday evening, over 180 days back
+        add(env, ALEX, "in_person", datetime(2025, 11, 12, 18, 30, tzinfo=timezone.utc) - timedelta(weeks=weeks))
+    assert ALEX not in by_id(run(limit=10))
+
+
+def test_recurring_uses_configured_timezone_for_bands(env, monkeypatch):
+    monkeypatch.setattr(settings, "timezone", "America/New_York")
+    start = datetime(2025, 11, 12, 23, 0, tzinfo=timezone.utc)  # 18:00 in New York, "night" in UTC
+    for day in (4, 5, 6):  # 19:00 New York the evening before
+        add(env, ALEX, "in_person", datetime(2025, 11, day, 0, 0, tzinfo=timezone.utc))
+        add(env, BLAIR, "in_person", datetime(2025, 11, day, 4, 30, tzinfo=timezone.utc))  # 23:30 New York
+    got = by_id(lp.likely_present(start, start + timedelta(hours=1), limit=10))
+    assert any("weekday evenings" in r for r in got[ALEX]["reasons"])
+    assert BLAIR not in got
+
+
+def test_calendar_label_uses_configured_timezone(env, monkeypatch):
+    monkeypatch.setattr(settings, "timezone", "America/New_York")
+    start = datetime(2025, 11, 12, 23, 0, tzinfo=timezone.utc)
+    add(env, ALEX, "calendar", datetime(2025, 11, 12, 23, 15, tzinfo=timezone.utc), attendees=2)
+    got = by_id(lp.likely_present(start, start + timedelta(hours=1), limit=10))
+    assert "invited to an event at 18:15" in got[ALEX]["reasons"]
 
 
 def test_owner_hidden_and_merged_owner_never_returned(env):
@@ -339,6 +371,13 @@ def test_remote_timeout_answers_within_budget(env, reading, monkeypatch):
     assert time.monotonic() - t0 < 1.5
     assert all("plans to meet in messages" not in p["reasons"] for p in result)
     assert len(result) == 2
+
+
+def test_prompt_times_use_configured_timezone(env, reading, monkeypatch):
+    monkeypatch.setattr(settings, "timezone", "America/New_York")
+    add(env, ALEX, "whatsapp", START - timedelta(minutes=30), snippet="synthetic")
+    run()
+    assert "2025-11-12 13:00 to 14:00" in reading.prompts[0]  # 18:00 UTC is 13:00 in New York
 
 
 def test_remote_call_gets_the_configured_budget(env, reading):
