@@ -1813,6 +1813,34 @@ class Settings(BaseSettings):
         description="File holding the pendant-direct feed bearer token."
     )
 
+    # Pendant in-person interactions (scripts/sync_pendant_interactions.py)
+    pendant_interactions_window_days: int = Field(
+        default=14,
+        ge=1,
+        alias="LIFEOS_PENDANT_INTERACTIONS_WINDOW_DAYS",
+        description="Days, ending today, that each Pendant interaction sync "
+                    "recomputes and reconciles."
+    )
+    pendant_match_score_margin: float = Field(
+        default=0.05,
+        alias="LIFEOS_PENDANT_MATCH_SCORE_MARGIN",
+        description="Added to the feed's match_threshold to form the score floor "
+                    "a voiceprint-matched speaker must reach to count."
+    )
+    pendant_match_min_speech_seconds: float = Field(
+        default=60.0,
+        ge=0,
+        alias="LIFEOS_PENDANT_MATCH_MIN_SPEECH_SECONDS",
+        description="Seconds a voiceprint-matched person must speak across a "
+                    "day's counted conversations for those conversations to count."
+    )
+    pendant_note_path_template: str = Field(
+        default="Pendant/Raw/{day}.md",
+        alias="LIFEOS_PENDANT_NOTE_PATH",
+        description="Vault-relative path of a day's Pendant note; {day} is "
+                    "YYYY-MM-DD. In-person rows link to it."
+    )
+
     # Monarch Money
     monarch_email: str = Field(
         default="",

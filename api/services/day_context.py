@@ -19,16 +19,12 @@ sleep, signal or entry content, and never propagate to the caller.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import urllib.error
-import urllib.parse
-import urllib.request
 from datetime import date, datetime, timedelta
-from pathlib import Path
 from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
+from api.services import pendant_feed
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -96,25 +92,12 @@ def sleep_hours_for(day: date, store=None) -> Optional[float]:
     return hours if 0 <= hours <= 24 else None
 
 
-def _feed_token() -> str:
-    if settings.pendant_feed_token:
-        return settings.pendant_feed_token
-    try:
-        return Path(settings.pendant_feed_token_file).expanduser().read_text(encoding="utf-8").strip()
-    except OSError:
-        return ""
-
-
 def fetch_pendant_signals(day: date) -> Optional[dict]:
     """The Pendant feed's day signals, or None on 404, error or bad JSON."""
-    url = f"{settings.pendant_feed_url.rstrip('/')}/day-signals?{urllib.parse.urlencode({'day': day.isoformat()})}"
-    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {_feed_token()}"})
     try:
-        with urllib.request.urlopen(request, timeout=10) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, OSError, ValueError):
+        return pendant_feed.get_json("day-signals", {"day": day.isoformat()})
+    except pendant_feed.PendantFeedError:
         return None
-    return data if isinstance(data, dict) else None
 
 
 # ---------------------------------------------------------------- assembly

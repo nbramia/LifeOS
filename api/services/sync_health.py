@@ -79,6 +79,11 @@ def _is_source_disabled(source: str) -> bool:
     if source in ("slack", "link_slack") and not getattr(settings, "sync_slack", False):
         return True
 
+    if source == "pendant_interactions":
+        from api.services.pendant_feed import feed_token
+        if not feed_token():
+            return True
+
     # Personal Google has no on/off toggle (it's the default account), so
     # "disabled" means its OAuth credentials file is absent — same signal
     # run_all_syncs.get_disabled_work_sources() uses to skip the source
@@ -208,6 +213,16 @@ SYNC_SOURCES = {
         "frequency": "daily",
         "phase": 2,
         "depends_on": ["contacts"],
+    },
+    "pendant_interactions": {
+        "description": "In-person interactions from Pendant conversations",
+        "script": "scripts/sync_pendant_interactions.py",
+        "frequency": "daily",
+        "phase": 2,
+        # Days with no counted conversation are normal (nothing recorded, or
+        # everything already covered by calendar, call or meeting rows).
+        "idle_is_normal": True,
+        "depends_on": ["calendar_personal", "calendar_work", "calendar_work2", "apple_import"],
     },
 
     # === Phase 2b: Stale ID Cleanup ===

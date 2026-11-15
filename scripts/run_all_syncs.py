@@ -1002,6 +1002,7 @@ SYNC_ORDER = [
     "create_contact_persons",   # Create people for contacts with iMessage evidence but no person yet
     "link_source_entities",     # Retroactive linking for all unlinked entities
     "photos",                   # Sync Photos face data to people
+    "pendant_interactions",     # In-person rows from the Pendant feed (after calendar and phone rows exist, which it dedups against)
 
     # === Phase 2b: Stale ID Cleanup ===
     # Re-point interactions with stale merged person IDs BEFORE relationship building
@@ -1074,6 +1075,7 @@ SYNC_SCRIPTS = {
     "create_contact_persons": ("scripts/create_contact_persons.py", ["--execute"]),
     "link_source_entities": ("scripts/link_source_entities.py", ["--execute"]),
     "photos": ("scripts/sync_photos.py", ["--execute"]),
+    "pendant_interactions": ("scripts/sync_pendant_interactions.py", []),
 
     # Phase 2b: Stale ID Cleanup
     "repoint_stale_ids": ("scripts/sync_repoint_stale_ids.py", ["--execute"]),
@@ -1136,6 +1138,11 @@ def _personal_google_credentials_exist() -> bool:
     return (Path(__file__).parent.parent / "config" / "credentials-personal.json").exists()
 
 
+def _pendant_feed_configured() -> bool:
+    from api.services.pendant_feed import feed_token
+    return bool(feed_token())
+
+
 def get_disabled_work_sources() -> set[str]:
     """
     Return set of sources that should be skipped because they aren't configured.
@@ -1172,6 +1179,9 @@ def get_disabled_work_sources() -> set[str]:
 
     if not _personal_google_credentials_exist():
         disabled.update(PERSONAL_GOOGLE_SOURCES)
+
+    if not _pendant_feed_configured():
+        disabled.add("pendant_interactions")
 
     return disabled
 
@@ -2277,6 +2287,9 @@ def run_all_syncs(
                 if source in PERSONAL_GOOGLE_SOURCES:
                     logger.info(f"Skipping {source}: personal Google account not configured")
                     results[source] = {"skipped": True, "reason": "google_account_not_configured"}
+                elif source == "pendant_interactions":
+                    logger.info(f"Skipping {source}: Pendant feed not configured")
+                    results[source] = {"skipped": True, "reason": "pendant_feed_not_configured"}
                 else:
                     logger.info(f"Skipping {source}: work integration disabled")
                     results[source] = {"skipped": True, "reason": "work_integration_disabled"}
