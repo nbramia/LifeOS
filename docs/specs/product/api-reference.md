@@ -309,6 +309,48 @@ category.
 - `limit` (integer, optional, default 50, max 500): Max results to return
 - `category` (string, optional): Filter to this category
 
+### GET /api/crm/people/likely-present
+
+People the wearer was probably with in a time window, best first. Ranked from
+interaction metadata only: calendar events in or near the window that the
+person was invited to, messages, calls, emails and Slack messages in the six
+hours before it (closer is stronger), in-person days with the person at the
+same time of day and day type (three or more days count as recurring), and
+relationship strength as a tie-breaker. The wearer, hidden people and services
+are never returned.
+
+**Query Parameters:**
+- `start` (ISO 8601, required): Window start. A value without an offset is UTC.
+- `end` (ISO 8601, required): Window end, at most 12 hours after `start`.
+- `limit` (integer, optional, default 5, max 10): Max people to return.
+
+**Response:**
+```json
+{
+  "start": "2025-11-12T18:00:00+00:00",
+  "end": "2025-11-12T19:00:00+00:00",
+  "people": [
+    {
+      "person_id": "person-alex",
+      "name": "Alex Rivera",
+      "score": 0.62,
+      "reasons": ["texted on iMessage 20 min before", "seen in person on 4 weekday evenings"]
+    }
+  ]
+}
+```
+
+`score` runs from 0 to 1. `reasons` are short labels; no message, email, note
+text or title appears anywhere in the response. `400` when `end` precedes
+`start`, the window exceeds 12 hours, or a bound is not ISO 8601.
+
+When `LIFEOS_LIKELY_PRESENT_READ_MESSAGES` is on and a remote provider is
+configured, recent iMessage and WhatsApp text with the top candidates is
+judged by that provider for plans to meet; a positive judgment raises the score
+and adds the reason `plans to meet in messages`. Any provider error or timeout
+leaves the metadata answer. See
+[configuration](../../guides/configuration.md#likely-present-message-reading).
+
 ---
 
 ## Photos Endpoints

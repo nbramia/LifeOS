@@ -900,6 +900,51 @@ def list_people(
     return result
 
 
+class LikelyPresentPerson(BaseModel):
+    person_id: str
+    name: str
+    score: float
+    reasons: list[str]
+
+
+class LikelyPresentResponse(BaseModel):
+    start: str
+    end: str
+    people: list[LikelyPresentPerson]
+
+
+def _parse_window_bound(value: str, name: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.strip())
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"{name} is not an ISO 8601 datetime")
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+@router.get("/people/likely-present", response_model=LikelyPresentResponse)
+def likely_present_people(
+    start: str = Query(description="Window start, ISO 8601 (no offset means UTC)"),
+    end: str = Query(description="Window end, ISO 8601; at most 12 hours after start"),
+    limit: int = Query(default=5, ge=1, le=10, description="Max people to return"),
+):
+    """
+    People the wearer was probably with in a time window, best first.
+
+    Ranked from interaction metadata (calendar, messages, calls, email, past
+    in-person days, relationship strength). Each person carries a 0-1 score
+    and short reason labels; no message or note text is returned.
+    """
+    from api.services.likely_present import likely_present
+
+    start_dt = _parse_window_bound(start, "start")
+    end_dt = _parse_window_bound(end, "end")
+    try:
+        people = likely_present(start_dt, end_dt, limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return LikelyPresentResponse(start=start, end=end, people=people)
+
+
 @router.get("/people/{person_id}", response_model=PersonDetailResponse)
 def get_person(
     person_id: str,

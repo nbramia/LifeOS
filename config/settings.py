@@ -1841,6 +1841,23 @@ class Settings(BaseSettings):
                     "YYYY-MM-DD. In-person rows link to it."
     )
 
+    likely_present_read_messages: bool = Field(
+        default=False,
+        alias="LIFEOS_LIKELY_PRESENT_READ_MESSAGES",
+        description="When true and a remote provider is configured, the "
+                    "likely-present endpoint sends a few candidates' recent "
+                    "iMessage and WhatsApp text to that provider to judge "
+                    "whether they planned to meet in person. Off by default."
+    )
+    likely_present_llm_timeout: float = Field(
+        default=8.0,
+        gt=0,
+        alias="LIFEOS_LIKELY_PRESENT_LLM_TIMEOUT",
+        description="Seconds the likely-present endpoint waits for the remote "
+                    "provider's message judgments before answering from "
+                    "metadata alone."
+    )
+
     # Monarch Money
     monarch_email: str = Field(
         default="",

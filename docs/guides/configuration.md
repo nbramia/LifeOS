@@ -560,6 +560,17 @@ The `pendant_interactions` sync reads the same feed (`LIFEOS_PENDANT_FEED_URL` a
 | `LIFEOS_PENDANT_MATCH_MIN_SPEECH_SECONDS` | float | `60` | Seconds a voiceprint-matched person must speak across a day's counted conversations for them to count. |
 | `LIFEOS_PENDANT_NOTE_PATH` | str | `Pendant/Raw/{day}.md` | Vault-relative path of a day's Pendant note, which each row links to. `{day}` is `YYYY-MM-DD`. |
 
+### Likely-Present Message Reading
+
+`GET /api/crm/people/likely-present` ranks who the wearer was probably with from interaction metadata, and answers from metadata alone by default. Message reading is opt in.
+
+**Enabling `LIFEOS_LIKELY_PRESENT_READ_MESSAGES` sends text to the remote provider.** For up to five top candidates per request, the iMessage and WhatsApp messages exchanged with the candidate from six hours before the window through its end go to the provider set in [OpenAI-compatible Remote Provider](#openai-compatible-remote-provider) (`LIFEOS_REMOTE_LLM_*`), and only a yes/maybe/no judgment comes back. The endpoint never uses the Anthropic API for this, never logs message text and never returns it. It does nothing unless a remote provider is also configured.
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_LIKELY_PRESENT_READ_MESSAGES` | bool | `false` | Turns on the message judgment described above. |
+| `LIFEOS_LIKELY_PRESENT_LLM_TIMEOUT` | float | `8` | Seconds the endpoint waits for the provider's judgments before answering from metadata alone. |
+
 ### Monarch Money
 
 | Variable | Type | Default | Sets |
