@@ -1230,7 +1230,8 @@ class InteractionStore:
                     source_type,
                     source_account,
                     {_WEIGHT_SUBTYPE_SQL} as subtype,
-                    date(timestamp) as day,
+                    CASE WHEN source_type = 'in_person' THEN date(timestamp, 'localtime')
+                         ELSE date(timestamp) END as day,
                     COUNT(*)
                 FROM interactions
                 WHERE {person_sql}

@@ -847,3 +847,35 @@ class TestInPerson:
             ],
         )
         assert compute_strength_components(person, inputs, NOW).lifetime_weight == pytest.approx(12.0)
+
+
+class TestInPersonLocalDay:
+    """In-person rows are bucketed by the local day they were written for."""
+
+    @pytest.fixture
+    def eastern(self, monkeypatch):
+        import time
+        monkeypatch.setenv("TZ", "America/New_York")
+        time.tzset()
+        yield
+        monkeypatch.undo()
+        time.tzset()
+
+    def _days(self, store, *whens):
+        for when in whens:
+            _add(store, "p1", when, source_type="in_person", attendee_count=1)
+        now = datetime(2026, 1, 15, 12, tzinfo=timezone.utc)
+        inputs = store.get_strength_inputs(person_id="p1", days_back=365, now=now)["p1"]
+        return sorted(b.day for b in inputs.buckets)
+
+    def test_one_evening_across_midnight_utc_is_one_day(self, interaction_store, eastern):
+        days = self._days(interaction_store,
+                          datetime(2026, 1, 10, 23, 30, tzinfo=timezone.utc),   # 18:30 local
+                          datetime(2026, 1, 11, 1, 30, tzinfo=timezone.utc))    # 20:30 local
+        assert days == ["2026-01-10"]
+
+    def test_late_evening_and_next_morning_are_two_days(self, interaction_store, eastern):
+        days = self._days(interaction_store,
+                          datetime(2026, 1, 11, 4, 30, tzinfo=timezone.utc),    # 23:30 local, Jan 10
+                          datetime(2026, 1, 11, 15, 0, tzinfo=timezone.utc))    # 10:00 local, Jan 11
+        assert days == ["2026-01-10", "2026-01-11"]

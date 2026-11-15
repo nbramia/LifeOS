@@ -199,7 +199,8 @@ def _one_in_person_per_day(buckets: list) -> list:
     Cap in_person buckets at one interaction per day, keeping the heaviest.
 
     A day's face-to-face time is one interaction however many rows record it
-    (two person ids merged into one each carry a row for the same day).
+    (two person ids merged into one each carry a row for the same day). In-person
+    buckets are keyed by the local calendar day, the day the rows are written for.
     """
     best: dict[str, tuple[float, object]] = {}
     kept = []
