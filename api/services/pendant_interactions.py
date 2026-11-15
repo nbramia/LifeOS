@@ -45,6 +45,7 @@ from typing import Callable, Iterable, Optional
 
 from api.services import pendant_feed
 from api.services.interaction_store import Interaction, build_obsidian_link
+from api.services.sqlite_connect import connect_closing
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -413,8 +414,7 @@ def reconcile(
     span_start = datetime.combine(min(date.fromisoformat(d) for d in all_days), datetime.min.time(), timezone.utc)
     span_end = datetime.combine(max(date.fromisoformat(d) for d in all_days), datetime.min.time(), timezone.utc)
 
-    conn = sqlite3.connect(db_path)
-    try:
+    with connect_closing(db_path) as conn:
         covered = _load_covered(conn, resolver, span_start - timedelta(days=2), span_end + timedelta(days=3))
         desired: dict[str, dict] = {}
         for days, conversations, threshold in fetched:
@@ -467,8 +467,6 @@ def reconcile(
                     updates,
                 )
                 conn.executemany("DELETE FROM interactions WHERE id = ?", [(old["id"],) for old in stale])
-    finally:
-        conn.close()
 
     result.created, result.updated, result.deleted = len(inserts), len(updates), len(stale)
     result.days_reconciled = len(all_days)
