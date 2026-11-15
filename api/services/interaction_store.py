@@ -41,7 +41,7 @@ TEMP_PREFIXES = ('/tmp', '/private/var/folders', '/var/folders')
 # Valid source types for interactions
 VALID_SOURCE_TYPES = frozenset({
     "gmail", "calendar", "vault", "meeting", "imessage",
-    "whatsapp", "contacts", "phone", "photos", "slack",
+    "whatsapp", "contacts", "phone", "photos", "slack", "in_person",
 })
 
 # Chunk size for any SQL IN/NOT IN clause built from a caller-supplied list
@@ -92,6 +92,8 @@ _WEIGHT_SUBTYPE_SQL = f"""CASE
     WHEN source_type = 'calendar' AND attendee_count = 1 THEN 'calendar_1on1'
     WHEN source_type = 'calendar' AND attendee_count BETWEEN 2 AND 5 THEN 'calendar_small_group'
     WHEN source_type = 'calendar' AND attendee_count >= 6 THEN 'calendar_large_meeting'
+    WHEN source_type = 'in_person' AND COALESCE(attendee_count, 0) <= 1 THEN 'in_person_1on1'
+    WHEN source_type = 'in_person' THEN 'in_person_group'
     WHEN {_WHATSAPP_GROUP_SENT_SQL} THEN 'whatsapp_group_sent'
     WHEN source_type = 'whatsapp' AND attendee_count IS NOT NULL THEN 'whatsapp_group_received'
     ELSE NULL
@@ -212,12 +214,12 @@ class Interaction:
 
     # Account and subtype info (for weighted scoring)
     source_account: Optional[str] = None  # "personal" or "work"
-    # Calendar: number of other attendees. WhatsApp: group size for a group
+    # Calendar and in_person: number of other attendees. WhatsApp: group size for a group
     # message (0 when the group's membership isn't known), NULL for a direct one.
     attendee_count: Optional[int] = None
 
-    # Meeting notes only: the tool that recorded the note ("wispr", "granola"),
-    # NULL when the note names neither.
+    # The tool that produced the row: for meeting notes, the recorder ("wispr",
+    # "granola"), NULL when the note names neither; for in_person rows, "pendant".
     provider: Optional[str] = None
 
     def to_dict(self) -> dict:
@@ -304,6 +306,7 @@ class Interaction:
             "contacts": "📇",
             "phone": "📞",
             "photos": "📷",
+            "in_person": "🗣️",
         }
         return badges.get(self.source_type, "📄")
 
@@ -1227,7 +1230,8 @@ class InteractionStore:
                     source_type,
                     source_account,
                     {_WEIGHT_SUBTYPE_SQL} as subtype,
-                    date(timestamp) as day,
+                    CASE WHEN source_type = 'in_person' THEN date(timestamp, 'localtime')
+                         ELSE date(timestamp) END as day,
                     COUNT(*)
                 FROM interactions
                 WHERE {person_sql}

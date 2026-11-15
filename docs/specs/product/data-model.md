@@ -30,9 +30,11 @@ LifeOS uses a two-tier data model to separate raw observations from canonical re
 
 Source entities are tagged with one of the following types:
 
-`gmail`, `calendar`, `slack`, `imessage`, `whatsapp`, `signal`, `contacts`, `phone_contacts`, `linkedin`, `vault`, `meeting`, `phone_call`, `phone`, `photos`
+`gmail`, `calendar`, `slack`, `imessage`, `whatsapp`, `signal`, `contacts`, `phone_contacts`, `linkedin`, `vault`, `meeting`, `phone_call`, `phone`, `photos`, `in_person`
 
 `meeting` marks a meeting note, one with `wispr_id` or `granola_id` in its frontmatter or filed under a `Granola` folder. Meeting source entities and interactions also carry a `provider`: `wispr`, `granola`, or null when the note names neither. Omi and Limitless notes are also transcripts but stay under `vault`. API filters accept `granola` as an alias of `meeting`.
+
+`in_person` marks time spent talking with someone face to face. An `in_person` interaction carries `provider` `pendant`, holds only counts, duration and a link, and records the number of other people present in `attendee_count`.
 
 ### Current and Past Organizations
 
@@ -91,6 +93,8 @@ Where:
 The result takes a 3% LinkedIn and a 5% family multiplier, capped at 100. Every input comes from the `interactions` table and ignores future-dated rows.
 
 WhatsApp group messages weigh less than direct ones: a group message you sent carries 15% of the WhatsApp weight (it is one row per participant), and one you received carries 35%. A group message you sent earns no recency credit, because it says nothing about the other person's activity: it doesn't set the last interaction or count toward the 15. A WhatsApp row marks a group message by holding the group's size in `attendee_count`, which is NULL for a direct message.
+
+An `in_person` interaction weighs as much as a calendar meeting: 6.0 as `in_person_1on1` (at most one other person, including an unknown count) and 4.0 as `in_person_group` (two or more others), with no account multiplier. Scoring counts at most one `in_person` interaction per person per day, however many rows exist for that day, and keeps the heaviest.
 
 ### Last Seen
 

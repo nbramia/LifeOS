@@ -50,6 +50,7 @@ SOURCE_TYPES = {
     "phone_call",
     "phone",
     "photos",
+    "in_person",
 }
 
 

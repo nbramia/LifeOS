@@ -3777,7 +3777,7 @@ def get_me_interactions(
     # Uses "vs. average" approach with personal/family interactions only
     # Counts: iMessage, WhatsApp, phone calls, calendar events, and email
     # Limited to top 25 family/personal contacts by relationship strength
-    HEALTH_INTERACTION_TYPES = {'imessage', 'whatsapp', 'phone', 'phone_call', 'calendar', 'gmail'}
+    HEALTH_INTERACTION_TYPES = {'imessage', 'whatsapp', 'phone', 'phone_call', 'calendar', 'gmail', 'in_person'}
 
     # Get top 25 family/personal contacts by relationship strength (chosen
     # from the full person list — lifetime relationship_strength, not

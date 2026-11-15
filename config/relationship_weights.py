@@ -200,6 +200,9 @@ INTERACTION_TYPE_WEIGHTS: dict[str, float] = {
     "calendar": 4.0,          # Meetings - strong relationship signal
     # Future: calendar_1on1: 1.5, calendar_small_group: 1.0, calendar_large_meeting: 0.5
 
+    # In person (face-to-face conversation, same weight as a meeting)
+    "in_person": 4.0,
+
     # Email (async, often broadcast/CC)
     "gmail": 0.8,             # Email - often CC'd or mass
     # Future: gmail_to: 1.0, gmail_cc: 0.3, gmail_sent: 1.2
@@ -243,6 +246,10 @@ INTERACTION_SUBTYPE_WEIGHTS: dict[str, float] = {
     "calendar_1on1": 6.0,         # 1 other attendee - high intimacy
     "calendar_small_group": 4.0,  # 2-5 other attendees
     "calendar_large_meeting": 2.0,  # 6+ other attendees - diluted attention
+
+    # In-person subtypes (derived from attendee_count; NULL or 0 counts as 1on1)
+    "in_person_1on1": 6.0,        # At most 1 other person
+    "in_person_group": 4.0,       # 2+ other people
 
     # WhatsApp group subtypes (derived from attendee_count and source_id)
     "whatsapp_group_sent": INTERACTION_TYPE_WEIGHTS["whatsapp"] * WHATSAPP_GROUP_SENT_MULTIPLIER,

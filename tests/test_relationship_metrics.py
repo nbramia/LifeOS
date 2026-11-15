@@ -176,7 +176,7 @@ class TestDiversityScore:
     def test_multiple_sources(self):
         """Test with multiple sources."""
         score = compute_diversity_score(["gmail", "calendar", "slack"])
-        assert score > 0.2
+        assert score == pytest.approx(3 / len(rm.SOURCE_TYPES))
 
     def test_duplicate_sources(self):
         """Test that duplicates are counted once."""
@@ -311,7 +311,7 @@ class TestStrengthComponents:
         person = self._person(sources=["contacts", "linkedin"])
         c = self._components(StrengthBucket("imessage", None, None, TODAY, 1), person=person)
         assert c.sources == ["contacts", "imessage", "linkedin"]
-        assert c.diversity == pytest.approx(3 / 14)
+        assert c.diversity == pytest.approx(3 / len(rm.SOURCE_TYPES))
 
 
 @pytest.fixture
@@ -368,7 +368,7 @@ class TestStrengthForPerson:
             0.25 * 0.5 ** (90 / 45)
             + 0.55 * math.log(1 + recent) / math.log(601)
             + 0.15 * math.log(1 + 30) / math.log(2501)
-            + 0.05 * (1 / 14)
+            + 0.05 * (1 / len(rm.SOURCE_TYPES))
         )
         assert compute_strength_for_person(person, now=now) == pytest.approx(expected, abs=0.1)
 
@@ -788,3 +788,94 @@ class TestSelfStrength:
         monkeypatch.setattr(settings, "my_person_id", "", raising=False)
         person = self._owner(person_id="")
         assert rm.compute_strength_for_person(person) < rm.SELF_STRENGTH
+
+
+class TestInPerson:
+    """The in_person type: weights, diversity membership and the per-day cap."""
+
+    def test_weights(self):
+        assert INTERACTION_TYPE_WEIGHTS["in_person"] == 4.0
+        assert get_interaction_weight("in_person", "in_person_1on1") == 6.0
+        assert get_interaction_weight("in_person", "in_person_group") == 4.0
+        # No account multiplier applies.
+        assert get_interaction_weight("in_person", "in_person_1on1", "personal") == 6.0
+
+    def test_in_person_is_a_diversity_source(self):
+        assert "in_person" in rm.SOURCE_TYPES
+        person = PersonEntity(id="p1", canonical_name="Pat Example")
+        inputs = StrengthInputs(
+            last_interaction=NOW,
+            buckets=[StrengthBucket("in_person", "in_person_1on1", None, TODAY, 1)],
+        )
+        c = compute_strength_components(person, inputs, NOW)
+        assert c.sources == ["in_person"]
+        assert c.diversity == pytest.approx(1 / len(rm.SOURCE_TYPES))
+
+    def test_two_rows_on_one_day_score_as_one(self, interaction_store, no_relationships):
+        now = datetime.now(timezone.utc)
+        when = now - timedelta(days=3)
+        one = PersonEntity(id="p1", canonical_name="Pat Example")
+        two = PersonEntity(id="p2", canonical_name="Pat Example")
+        _add(interaction_store, "p1", when, source_type="in_person", attendee_count=1,
+             source_id="pendant:day:a")
+        _add(interaction_store, "p2", when, source_type="in_person", attendee_count=1,
+             source_id="pendant:day:b")
+        _add(interaction_store, "p2", when + timedelta(minutes=5), source_type="in_person",
+             attendee_count=1, source_id="pendant:day:c")
+        assert compute_strength_for_person(two, now=now) == compute_strength_for_person(one, now=now)
+
+    def test_cap_keeps_the_heaviest_row_of_a_day(self):
+        person = PersonEntity(id="p1", canonical_name="Pat Example")
+        inputs = StrengthInputs(
+            last_interaction=NOW,
+            buckets=[
+                StrengthBucket("in_person", "in_person_group", None, TODAY, 2),
+                StrengthBucket("in_person", "in_person_1on1", None, TODAY, 1),
+            ],
+        )
+        c = compute_strength_components(person, inputs, NOW)
+        assert c.lifetime_weight == pytest.approx(6.0)
+        assert c.total_interactions == 1
+
+    def test_different_days_each_count(self):
+        person = PersonEntity(id="p1", canonical_name="Pat Example")
+        inputs = StrengthInputs(
+            last_interaction=NOW,
+            buckets=[
+                StrengthBucket("in_person", "in_person_1on1", None, TODAY, 1),
+                StrengthBucket("in_person", "in_person_1on1", None, _day(1), 1),
+            ],
+        )
+        assert compute_strength_components(person, inputs, NOW).lifetime_weight == pytest.approx(12.0)
+
+
+class TestInPersonLocalDay:
+    """In-person rows are bucketed by the local day they were written for."""
+
+    @pytest.fixture
+    def eastern(self, monkeypatch):
+        import time
+        monkeypatch.setenv("TZ", "America/New_York")
+        time.tzset()
+        yield
+        monkeypatch.undo()
+        time.tzset()
+
+    def _days(self, store, *whens):
+        for when in whens:
+            _add(store, "p1", when, source_type="in_person", attendee_count=1)
+        now = datetime(2026, 1, 15, 12, tzinfo=timezone.utc)
+        inputs = store.get_strength_inputs(person_id="p1", days_back=365, now=now)["p1"]
+        return sorted(b.day for b in inputs.buckets)
+
+    def test_one_evening_across_midnight_utc_is_one_day(self, interaction_store, eastern):
+        days = self._days(interaction_store,
+                          datetime(2026, 1, 10, 23, 30, tzinfo=timezone.utc),   # 18:30 local
+                          datetime(2026, 1, 11, 1, 30, tzinfo=timezone.utc))    # 20:30 local
+        assert days == ["2026-01-10"]
+
+    def test_late_evening_and_next_morning_are_two_days(self, interaction_store, eastern):
+        days = self._days(interaction_store,
+                          datetime(2026, 1, 11, 4, 30, tzinfo=timezone.utc),    # 23:30 local, Jan 10
+                          datetime(2026, 1, 11, 15, 0, tzinfo=timezone.utc))    # 10:00 local, Jan 11
+        assert days == ["2026-01-10", "2026-01-11"]
