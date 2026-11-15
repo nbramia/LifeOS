@@ -37,6 +37,7 @@ How LifeOS ingests and stores data from multiple sources.
 | Vault Notes | Obsidian markdown | Name mentions, context paths |
 | LinkedIn | CSV Import | Connections, companies, titles |
 | LinkedIn Profiles | Browser Scraping | Full profile data (experience, education, skills) |
+| Pendant | Local pendant-direct feed (`GET /interactions`) | Conversation times, named speakers and how they were named, matched calendar events and meeting notes; no text |
 | Meeting notes (Wispr, Granola) | Vault index job and nightly vault reindex (notes placed by the external `local-processing` watchers) | Meeting transcripts, attendees |
 
 ### Example Data Volume
@@ -93,6 +94,8 @@ All data syncing is consolidated into a single daily sync with proper phase orde
                └─ Link source entities (retroactive linking for all unlinked)
                └─ Photos (sync face recognition to people; macOS-only —
                  reports `skipped` on Linux)
+               └─ Pendant interactions (in-person rows from the Pendant
+                 feed, deduplicated against calendar, phone and meeting rows)
 
                === PHASE 2b: Stale ID Cleanup ===
                Re-point interactions with stale merged person IDs before
@@ -154,7 +157,7 @@ The 7-phase structure ensures correct data flow:
 
 **Note:** Apple data (contacts, phone calls, iMessage, photos, WhatsApp) is exported from an Apple Data Agent (any spare Mac with FDA granted) via `scripts/apple_data_agent.sh` at 2:50 AM, before the main pipeline, and imported on Linux by the `apple_import` source. The export runs on that Mac (which has FDA access) and syncs to the Linux server via rsync. Three sources are macOS-only and report `skipped` (not a failure) when the nightly sync runs on the Linux host: `contacts`, `photos`, `push_birthdays`.
 
-**Unconfigured-source clean skip:** a source with no way to authenticate or nothing set up reports `skipped`, not `failed`, so one missing integration never fails the whole run and never repeats as a nightly error. This covers the macOS-only sources above on a Linux host, plus config-gated sources checked at run time: `gmail_personal`/`calendar_personal` when `config/credentials-personal.json` is absent, `monarch_money` when there's no cached session and `MONARCH_EMAIL`/`MONARCH_PASSWORD` are unset, and `google_sheets` when `config/gsheet_sync.yaml` doesn't exist (the gsheet-journal pipeline was never set up) or when its only enabled source, the Dailies database (`dailies_db`), has no `LIFEOS_DAILIES_DATABASE_URL`, can't be reached, or holds more than one Home member's entries (see [journal-analytics.md](../product/journal-analytics.md#data-source)). A source that *is* configured but genuinely fails (bad credentials, network, expired session with no fallback) still records `failed` exactly as before — this only short-circuits the "never configured at all" case.
+**Unconfigured-source clean skip:** a source with no way to authenticate or nothing set up reports `skipped`, not `failed`, so one missing integration never fails the whole run and never repeats as a nightly error. This covers the macOS-only sources above on a Linux host, plus config-gated sources checked at run time: `gmail_personal`/`calendar_personal` when `config/credentials-personal.json` is absent, `monarch_money` when there's no cached session and `MONARCH_EMAIL`/`MONARCH_PASSWORD` are unset, and `pendant_interactions` when neither `LIFEOS_PENDANT_FEED_TOKEN` nor the token file is set, `google_sheets` when `config/gsheet_sync.yaml` doesn't exist (the gsheet-journal pipeline was never set up) or when its only enabled source, the Dailies database (`dailies_db`), has no `LIFEOS_DAILIES_DATABASE_URL`, can't be reached, or holds more than one Home member's entries (see [journal-analytics.md](../product/journal-analytics.md#data-source)). A source that *is* configured but genuinely fails (bad credentials, network, expired session with no fallback) still records `failed` exactly as before — this only short-circuits the "never configured at all" case.
 
 ### Process Summary
 
@@ -239,6 +242,36 @@ Any database a store opens migrates, including a `.bak-*` copy opened by path. A
 
 `scripts/migrate_meeting_source_type.py` runs the migration or `--rollback` against explicitly named database files, and reports counts per source type and per person before and after. Rollback belongs before reverting the code, with services stopped, because a store initializing on this code relabels the rows again.
 
+### In-Person Source Type
+
+`scripts/sync_pendant_interactions.py` (`api/services/pendant_interactions.py`) writes `in_person` rows with provider `pendant` from the pendant-direct feed's `GET /interactions?from=&to=` view, which holds conversation times and speaker labels but no text. Requests cover at most 31 days each. Settings are in [configuration.md § Pendant In-Person Interactions](../../guides/configuration.md#pendant-in-person-interactions).
+
+**Who counts.** Per conversation, a speaker counts for a person when:
+
+- it is labelled by the user, a meeting note or a calendar event (`labeled_by` `user`, `meeting`, `calendar`), or
+- it is a voiceprint match (`labeled_by` `match`) with a `score` at or above the feed's `match_threshold` plus `LIFEOS_PENDANT_MATCH_SCORE_MARGIN`. Conversations a person holds only through matches count when the person spoke at least `LIFEOS_PENDANT_MATCH_MIN_SPEECH_SECONDS` across that day's remaining conversations.
+
+The wearer, the LifeOS owner (`LIFEOS_MY_PERSON_ID`), labels of a kind other than `person` (an empty `label_kind` is a person label), speakers with no `entity_id`, ids that resolve to no person or a hidden one, and `media` conversations never count. Ids resolve through the merge map to the surviving person.
+
+**Double counting.** A conversation drops out for a person who already has a row covering it:
+
+| Existing row for the person | Covers the conversation when |
+|---|---|
+| `calendar` | Its timestamp is within 2 minutes of the start of the calendar event the feed matched to the conversation (timestamps are compared, not ids) |
+| `phone` | Its timestamp falls within the conversation, widened by 5 minutes at each end |
+| `meeting` | Its `source_id` (an absolute note path) ends with, or has the same file name as, one of the conversation's `meeting_notes` |
+
+Rows under a merged id cover the survivor. A speaker who was not invited to the matched event still counts. Meeting rows written after a run are picked up by the next run inside the window.
+
+**Rows.** One row per person per local day (the feed's `day`), with `source_id` `pendant:<YYYY-MM-DD>:<person_id>`:
+
+- `timestamp`: start of the day's last counted conversation, in UTC.
+- `title`: `In person · N conversation(s) · M min`, where M is the counted conversations' total length. No conversation titles, text or names.
+- `snippet`: empty. `source_link`: an `obsidian://` link to the day's note (`LIFEOS_PENDANT_NOTE_PATH`).
+- `attendee_count`: people who count in the largest counted conversation (at least 1), which picks the one-on-one or group weight.
+
+**Reconcile.** Each run covers the `LIFEOS_PENDANT_INTERACTIONS_WINDOW_DAYS` days ending today (`--days N` overrides). For each day it upserts the rows that should exist and deletes that day's other `in_person` rows from provider `pendant`, so relabels and deleted conversations flow through. A feed request that fails (network, HTTP error, bad JSON) leaves its days untouched and adds to `errors`; the script exits 1 only when no day was reconciled. `--backfill` reconciles from the first day `GET /days` lists to today. `--dry-run` prints a `PENDANT_INTERACTIONS:{json}` line of counts (people, rows, dropped by each rule, matches rejected by score and by seconds) and writes nothing. After writing, the script refreshes the affected people's stats and `last_seen`. It depends on the calendar sources and `apple_import`, whose rows it dedups against.
+
 ### Backups
 
 `interactions.db` and `crm.db` are snapshotted to `LIFEOS_BACKUP_PATH` before
@@ -311,7 +344,7 @@ WhatsApp data flows through the same Apple Data Agent → Linux pipeline. The Ma
 
 ### Phase 2: Entity Processing
 
-Runs in this order (see [iMessage Sync Ordering](#imessage-sync-ordering) below): `link_slack` → `imessage` → `link_imessage` → `create_contact_persons` → `link_source_entities` → `photos`.
+Runs in this order (see [iMessage Sync Ordering](#imessage-sync-ordering) below): `link_slack` → `imessage` → `link_imessage` → `create_contact_persons` → `link_source_entities` → `photos` → `pendant_interactions`.
 
 | Script | Purpose | Data Source |
 |--------|---------|-------------|
@@ -321,6 +354,7 @@ Runs in this order (see [iMessage Sync Ordering](#imessage-sync-ordering) below)
 | `create_contact_persons.py` | For an unlinked `contacts` SourceEntity whose normalized phone or lowercased email appears as an iMessage handle at least `LIFEOS_CONTACT_PERSON_MIN_MESSAGES` times (default 5), create a person and link both the contact and the matching messages to it — closes the gap where a contact who only ever texts, with no WhatsApp or email correspondence, would otherwise never get a person entity | `data/crm.db`, `data/imessage.db` |
 | `link_source_entities.py` | Retroactive linking for all unlinked entities | `data/crm.db` |
 | `sync_photos.py` | Sync Photos face recognition to people (macOS-only — `skipped` on Linux) | Apple Data Agent export |
+| `sync_pendant_interactions.py` | Reconcile `in_person` rows over a rolling window; see [In-Person Source Type](#in-person-source-type) | Pendant feed |
 
 ### Phase 2b: Stale ID Cleanup
 

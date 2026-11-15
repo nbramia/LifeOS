@@ -255,6 +255,7 @@ Example:
 | `link_imessage_entities.py` | Link iMessage handles by phone |
 | `link_source_entities.py` | Retroactive linking for unlinked entities |
 | `sync_photos.py` | Sync Photos face recognition |
+| `sync_pendant_interactions.py` | In-person interactions from the Pendant feed (`--days N`, `--backfill`, `--dry-run`; writes unless `--dry-run`) |
 
 #### Relationship Building
 

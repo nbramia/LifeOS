@@ -549,6 +549,17 @@ Natural-language messages run through the chat pipeline (search, synthesis, tool
 | `LIFEOS_PENDANT_FEED_TOKEN` | str (secret) | — | Bearer token for that feed. Empty reads `LIFEOS_PENDANT_FEED_TOKEN_FILE`. |
 | `LIFEOS_PENDANT_FEED_TOKEN_FILE` | str | `~/.config/pendant-direct/token` | File holding the feed token. |
 
+### Pendant In-Person Interactions
+
+The `pendant_interactions` sync reads the same feed (`LIFEOS_PENDANT_FEED_URL` and its token). With no token and no token file it is skipped. See [data-and-sync.md § In-Person Source Type](../specs/technical/data-and-sync.md#in-person-source-type).
+
+| Variable | Type | Default | Sets |
+|---|---|---|---|
+| `LIFEOS_PENDANT_INTERACTIONS_WINDOW_DAYS` | int | `14` | Days, ending today, that each run recomputes. Rows for those days that the feed does not support are removed. |
+| `LIFEOS_PENDANT_MATCH_SCORE_MARGIN` | float | `0.05` | Added to the feed's `match_threshold` to form the score a voiceprint-matched speaker must reach to count. |
+| `LIFEOS_PENDANT_MATCH_MIN_SPEECH_SECONDS` | float | `60` | Seconds a voiceprint-matched person must speak across a day's counted conversations for them to count. |
+| `LIFEOS_PENDANT_NOTE_PATH` | str | `Pendant/Raw/{day}.md` | Vault-relative path of a day's Pendant note, which each row links to. `{day}` is `YYYY-MM-DD`. |
+
 ### Monarch Money
 
 | Variable | Type | Default | Sets |
