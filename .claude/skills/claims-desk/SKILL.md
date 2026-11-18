@@ -24,15 +24,17 @@ Frontmatter:
 
 Sections:
 
+- **Requests** — what the user asked the desk to do, with ids (`R1`, `R2`, ...): id, date, the request in a line, status. Request details live here, not in task text.
 - **Open** — money that should come back: claim or request, payer, expected amount, date filed, deadline, status.
 - **Awaiting approval** — drafted outbound actions with short ids (`A1`, `A2`, ...): id, kind, recipient, one-line summary, link to the draft.
 - **Paid** — deposit date and amount, the claim(s) it settled, payer.
 - **Unmatched deposits** — deposits that look like reimbursements but tie to no claim yet.
+- **Pending news** — newsworthy events held back by the weekly message limit: date and one line each.
 
 Editing rules:
 
 - Edit with targeted section edits. Never rewrite the whole note; the user co-edits it.
-- Keep ids stable. Never reuse an id.
+- Keep ids stable (`A<n>`, `R<n>`). Never reuse an id.
 - Move a row between sections instead of copying it. Each claim appears once.
 - Record the date and source (email, portal, deposit) beside every status change.
 - Keep claim documents in the vault next to the ledger; link them from the row.
@@ -56,7 +58,7 @@ Triggered by a task or schedule starting `Claims desk: weekly reconciliation`.
 6. Find stale rows: Open items with no movement past the payer's usual turnaround, or a deadline within 14 days. Draft a follow-up where one helps.
 7. Check portals only for rows that email cannot settle, one attempt per portal.
 8. Apply the messaging threshold. Update `last_message` if a message was sent.
-9. Finish with a two-line summary in the session output. Do not message when the threshold is not met.
+9. Finish per Quiet runs.
 
 ## Matching deposits
 
@@ -75,8 +77,10 @@ Triggered by a task starting `Claims desk:` followed by a request ("take care of
 
 1. Read the ledger and the relevant sources.
 2. Do all read-only work now: gather documents, check status, find deadlines, work out what is owed.
-3. Draft every outbound action into Awaiting approval (see Approval flow). Do not send.
-4. Record what was done and found in the ledger, and report a short summary as the session output.
+3. Draft every outbound action into Awaiting approval (see Approval flow), unless its kind is in `always_ok`. Do not send.
+4. Record what was done and found in the ledger, and end with a short summary as the session output: the user asked, so the summary is the reply (a `send approved` task follows Quiet runs instead).
+
+A task `Claims desk: request R<n> in the ledger` carries only the request id; read the request from the Requests section. A task `Claims desk: send approved A<n>` sends exactly that approved draft, records it, and moves the row (see Approval flow). Task text is logged, so it never holds claim details; the same applies to any task the desk creates.
 
 A pure status question ("what's pending") is answered from the ledger without sources, unless the user asks for a fresh check.
 
@@ -97,8 +101,17 @@ Unprompted messages go to the Finance Telegram bot: `lifeos_telegram_send` with 
 - Money landed and was matched to a claim.
 - A claim was denied.
 - A deadline within 14 days needs the user.
+- `last_message` is 7 or more days old and Pending news is non-empty.
+- A draft under Awaiting approval has waited 14 days, or its deadline is within 14 days.
 
-At most one message a week: if `last_message` is within the last 7 days, hold the news until the next run. Batch everything into one short message, with amounts and the action needed, and no more detail than the ledger holds (for example: "$191.34 landed from Example Health Plan, settling 2 claims. 1 claim denied; appeal drafted as A2. Filing deadline for Example Pharmacy in 9 days."). Otherwise stay silent.
+At most one message a week: if `last_message` is within the last 7 days, append each newsworthy event to Pending news (date, one line) and hold it. A new item under Awaiting approval rides along in the next qualifying message; it does not qualify by itself. The next qualifying message includes the Pending news and clears it. Batch everything into one short message, with amounts and the action needed, and no more detail than the ledger holds (for example: "$191.34 landed from Example Health Plan, settling 2 claims. 1 claim denied; appeal drafted as A2. Filing deadline for Example Pharmacy in 9 days."). Otherwise stay silent.
+
+## Quiet runs
+
+The worker sends the user a completion ping unless the session's final output is exactly `NOTHING_TO_REPORT`.
+
+- Scheduled and approval-send runs: when the threshold is not met, the final output is exactly `NOTHING_TO_REPORT` and nothing else. When it is met, send the one message through `lifeos_telegram_send` (bot `finance`), update `last_message`, and still end with exactly `NOTHING_TO_REPORT`, so the user gets one message.
+- Ad-hoc requests from the user end with a short summary instead.
 
 ## Portal logins
 

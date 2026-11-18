@@ -293,6 +293,8 @@ The agent worker uses your existing Telegram bot (no second bot needed). Three m
 
 1. **Completion notifications** — one paragraph summarizing what the agent did, the key result, total tokens + cost + active seconds. If a tool failed mid-run, the summary includes a footer listing the affected MCPs.
 
+   **Quiet completion.** When the agent's final text, after trimming whitespace, is exactly one of the scheduler's "nothing to report" sentinels (`NO_MEETING`, `NO_MEETINGS`, `NOTHING_TO_REPORT`, `NO_ACTION`), the task still completes, is tagged `#agent-completed` and records its card outcome, but no completion notification is sent. Text that merely contains a sentinel notifies as usual.
+
 2. **Clarification requests** — if the preflight can't determine routing OR if a task title is genuinely ambiguous (e.g., "reply to Alex" with no email reference), the worker pauses the task at `#agent-blocked` and asks one targeted question on Telegram. Reply by using Telegram's native reply feature (long-press the bot's message, hit Reply). The worker picks up your answer within the next poll cycle and resumes. A budget breach (see Budgets, above) parks the task at the same `#agent-blocked` tag and asks the same way — `yes` / `yes $12` / `yes 90 min` resumes it, `stop` ends it.
 
 3. **Failure notifications** — short message naming the task and the failure reason, plus a transcript path so you can debug. Examples: "task X failed: managed_create_session 4xx" or "task Y hit its budget (max_dollars)" (the budget example is seen only after you reply `stop` to a budget question — a breach alone doesn't produce this notification).

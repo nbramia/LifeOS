@@ -14,7 +14,7 @@ Everything the desk knows about the user lives in the vault: the ledger, the cla
 - **Weekly reconciliation.** Pulls deposits from Monarch and mail from Gmail, matches deposits to open claims (including batched payouts that sum several claims), updates statuses, and drafts filings or follow-ups for anything missing or stale.
 - **Ad-hoc requests.** "Take care of X" through the Finance persona runs the same procedure for one item.
 - **Approval flow.** Anything sent to another person or organization (insurer, provider, merchant, support desk) is drafted into the ledger's Awaiting approval section and sent only after the user approves, unless its kind is in `always_ok`.
-- **Quiet by default.** Unprompted messages go to the Finance Telegram bot only when money landed and was matched, a claim was denied, or a deadline within 14 days needs the user. At most one a week.
+- **Quiet by default.** Unprompted messages go to the Finance Telegram bot only when money landed and was matched, a claim was denied, a deadline within 14 days needs the user, held news has waited a week, or a draft has waited 14 days or is due within 14 days. At most one a week; news held by that limit waits in the ledger. A run with nothing to say ends with `NOTHING_TO_REPORT`, so the worker sends no completion ping.
 
 ## The ledger note
 
@@ -27,18 +27,22 @@ always_ok: []
 last_message:
 ---
 
+## Requests
 ## Open
 ## Awaiting approval
 ## Paid
 ## Unmatched deposits
+## Pending news
 ```
 
 | Section | Holds |
 |---|---|
+| Requests | What the user asked the desk to do, with ids (`R1`, `R2`) |
 | Open | Money that should come back, with payer, expected amount, filing date and deadline |
 | Awaiting approval | Drafted outbound actions with short ids (`A1`, `A2`) |
 | Paid | Each deposit tied to the claim or claims it settled |
 | Unmatched deposits | Reimbursement-like deposits with no claim yet |
+| Pending news | Events held by the weekly message limit, sent with the next message |
 
 `always_ok` lists action kinds the user approved as standing (for example `file-insurance-claim`). A kind enters the list only when the user says "always". `last_message` is the date of the last unprompted message; the desk reads it to enforce the weekly limit.
 
@@ -57,9 +61,9 @@ last_message:
 
 ## Handing the desk work
 
-- **From the Finance persona.** Say "take care of X". The persona records the request in the ledger and creates the task.
-- **From another agent.** Create a task with `lifeos_task_create`, tag `claude`, a description that starts `Claims desk:` and says to follow the `claims-desk` skill by its absolute path in the LifeOS checkout, and `working_dir` set to the vault root in `fields`. Routing and the `#claude` tag are described in [agent-worker.md](../specs/product/agent-worker.md).
-- **Approvals.** Reply `yes A1` to the Finance persona. The persona records the decision and creates a task so the desk sends the approved draft. `always` adds the item's kind to `always_ok`.
+- **From the Finance persona.** Say "take care of X". The persona records the request in the ledger under Requests with an id, then creates the task `Claims desk: request R<n> in the ledger`. Task text is logged, so it never carries claim details.
+- **From another agent.** Create a task with `lifeos_task_create`, tag `claude`, a description that starts `Claims desk:`, holds only a ledger reference, and says to follow the `claims-desk` skill by its absolute path in the LifeOS checkout, and `working_dir` set to the vault root in `fields`. Routing and the `#claude` tag are described in [agent-worker.md](../specs/product/agent-worker.md).
+- **Approvals.** Reply `yes A1` to the Finance persona. The persona records the decision and creates the task `Claims desk: send approved A<n>` so the desk sends the approved draft. `always` adds the item's kind to `always_ok`.
 
 ## Reading status
 

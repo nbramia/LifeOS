@@ -119,6 +119,7 @@ from api.services.hermes_notify import HERMES_CHANNEL
 from api.services.hermes_question_thread_store import get_question_thread_store
 from api.services.interaction_store import build_obsidian_link
 from api.services.log_redaction import configure_telegram_log_redaction
+from api.services.scheduler_store import SUPPRESS_SENTINELS
 from api.services.runtime_identity import (
     capture_runtime_identity,
     heartbeat_runtime_identity,
@@ -7863,7 +7864,15 @@ class Worker:
                 # reply to this completion message and resume the task as a
                 # follow-up turn (e.g., "now turn this into a .md in my vault").
                 body = self._completion_summary(session, task, outcome)
-                self._notify_terminal(session, body, label=title)
+                # A final text that is exactly a scheduler "nothing to report"
+                # sentinel completes the task without a completion ping.
+                if (outcome.final_text or "").strip() in SUPPRESS_SENTINELS:
+                    self.transcript_store.append(sid, "completion_notice_suppressed", {
+                        "reason": "suppress_sentinel",
+                        "sentinel": outcome.final_text.strip(),
+                    })
+                else:
+                    self._notify_terminal(session, body, label=title)
                 if has_vault_task:
                     self._record_card_outcome(session, body)
             else:
