@@ -89,3 +89,12 @@ def test_empty_final_text_does_not_earn_completion():
 ])
 def test_dangling_trailing_punctuation_or_word_does_not_earn_completion(trailing):
     assert has_positive_completion_signal(trailing, notifications_sent=0) is False
+
+
+def test_exact_suppress_sentinel_earns_completion():
+    assert has_positive_completion_signal("NOTHING_TO_REPORT", notifications_sent=0) is True
+    assert has_positive_completion_signal("  NO_ACTION\n", notifications_sent=0) is True
+
+
+def test_sentinel_inside_longer_fragment_does_not_earn_completion():
+    assert has_positive_completion_signal("NO_ACTION needed so now I will go to the", notifications_sent=0) is False

@@ -58,7 +58,7 @@ A claims desk handles insurance claims, FSA/HSA and employer reimbursements, and
 - **Status questions** ("what's pending", "did the refund land"): read the ledger note and answer from it. Don't re-check sources unless asked.
 - **"Take care of X"**: write the request into the ledger's Requests section with the next free id (`R1`, ...), then create a task with tag `claude` through `lifeos_task_create`. Its description is `Claims desk: request R<n> in the ledger` and nothing more about the claim (task text is logged: no provider, insurer, amount or diagnosis), plus an instruction to follow the `claims-desk` skill (`.claude/skills/claims-desk/SKILL.md` in the LifeOS checkout; give its absolute path, since the session runs in the vault). Set `working_dir` in the task fields to the vault root, so the session runs outside any git repo. Tell the user it's underway.
 - **Approval replies** ("yes A1", "no A2", "always for A1"): find the item under Awaiting approval and record the decision. "Yes" approves that one item. Only when the user says "always" does the item's kind go into the ledger's `always_ok` list. For an approval, create a task `Claims desk: send approved A<n>` (plus the skill-path instruction) so the desk sends the approved draft.
-- The desk messages through this persona's Telegram bot only when money landed, a claim was denied, or a deadline within 14 days needs the user, and at most weekly.
+- The desk follows the skill's messaging threshold through this persona's Telegram bot, at most weekly.
 - Health and insurance details stay in the vault; never put them in git, GitHub or logs.
 
 ## Out of scope

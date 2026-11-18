@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import re
 
+from api.services.scheduler_store import SUPPRESS_SENTINELS
+
 # A URL is the strong signal — unambiguous evidence a PR/issue was actually
 # opened. A bare issue-number mention is kept conservative: it only counts alongside
 # merge/PR-ish phrasing nearby, so a passing mention of an issue number isn't
@@ -67,6 +69,12 @@ def _looks_like_summary(text: str) -> bool:
     return len(text) >= _MIN_SUMMARY_CHARS and looks_like_finished_thought(text)
 
 
+def is_suppress_sentinel(final_text: str | None) -> bool:
+    """True when the final text, trimmed, is exactly a scheduler "nothing to
+    report" sentinel: a valid completion that sends no completion notice."""
+    return (final_text or "").strip() in SUPPRESS_SENTINELS
+
+
 def has_positive_completion_signal(final_text: str | None, notifications_sent: int) -> bool:
     """True iff a ``claude_code``/``codex`` session earned a ``completed``
     status.
@@ -85,7 +93,7 @@ def has_positive_completion_signal(final_text: str | None, notifications_sent: i
     A subprocess exiting cleanly is necessary but not sufficient — see the
     module docstring.
     """
-    if notifications_sent > 0:
+    if notifications_sent > 0 or is_suppress_sentinel(final_text):
         return True
     text = (final_text or "").strip()
     if not text:

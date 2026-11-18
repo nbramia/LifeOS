@@ -1010,3 +1010,40 @@ def test_child_session_bypasses_interrupted_gate(tmp_path: Path):
     kinds = [e["kind"] for e in transcripts.read(child.session_id)]
     assert "cli_session_interrupted" not in kinds
     assert "code_handled_completion" in kinds
+
+
+def _quiet_run(tmp_path: Path, final_text: str):
+    stub = _StubClaudeCodeExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=final_text)
+    )
+    worker, calls = _recording_worker(tmp_path, claude_code_executor=stub)
+    sent: list[str] = []
+    worker._telegram_send = lambda text, **_kw: sent.append(text) or True
+    worker._telegram_send_with_id = lambda text, **_kw: sent.append(text) or [1]
+    session = worker.session_store.create(task_id="quiet-1", routing="claude_code")
+    worker._dispatch_claude_code_session(session, [{"content": "weekly check"}])
+    return worker, session, calls, sent
+
+
+@pytest.mark.parametrize("final_text", ["NOTHING_TO_REPORT", "  NOTHING_TO_REPORT\n"])
+def test_suppress_sentinel_completes_quietly(tmp_path: Path, final_text: str):
+    """An exact suppress sentinel is a valid completion with no notification
+    streamed: the task completes with the completed tag and no completion
+    message goes out."""
+    worker, session, calls, sent = _quiet_run(tmp_path, final_text)
+
+    assert ("PUT", "/api/tasks/quiet-1/complete") in calls
+    assert ("POST", "/api/tasks/quiet-1/swap-tag") in calls
+    assert sent == []
+    kinds = [e["kind"] for e in worker.transcript_store.read(session.session_id)]
+    assert "completion_notice_suppressed" in kinds
+    assert "cli_session_interrupted" not in kinds
+
+
+def test_text_containing_suppress_sentinel_still_sends_completion(tmp_path: Path):
+    _, _, calls, sent = _quiet_run(
+        tmp_path, "NOTHING_TO_REPORT, but one claim was denied today.",
+    )
+
+    assert ("PUT", "/api/tasks/quiet-1/complete") in calls
+    assert len(sent) == 1

@@ -77,7 +77,7 @@ Triggered by a task starting `Claims desk:` followed by a request ("take care of
 
 1. Read the ledger and the relevant sources.
 2. Do all read-only work now: gather documents, check status, find deadlines, work out what is owed.
-3. Draft every outbound action into Awaiting approval (see Approval flow), unless its kind is in `always_ok`. Do not send.
+3. Draft each outbound action into Awaiting approval (see Approval flow) unless its kind is in `always_ok`. Send `always_ok` actions now and record them. Send nothing else.
 4. Record what was done and found in the ledger, and end with a short summary as the session output: the user asked, so the summary is the reply (a `send approved` task follows Quiet runs instead).
 
 A task `Claims desk: request R<n> in the ledger` carries only the request id; read the request from the Requests section. A task `Claims desk: send approved A<n>` sends exactly that approved draft, records it, and moves the row (see Approval flow). Task text is logged, so it never holds claim details; the same applies to any task the desk creates.
