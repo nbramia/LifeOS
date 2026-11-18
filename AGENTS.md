@@ -76,6 +76,7 @@ Runs on Linux or macOS. Optionally, a Mac can act as an Apple Data Agent for iMe
 | How do agents hand work to the human? | [guides/human-queue.md](docs/guides/human-queue.md) |
 | How do I pause/resume household internet access via eero? | [guides/home-eero.md](docs/guides/home-eero.md) |
 | How do schedules (triggers + actions) work? | [guides/scheduler.md](docs/guides/scheduler.md) |
+| How does the claims desk track claims, reimbursements and refunds? | [guides/claims-desk.md](docs/guides/claims-desk.md) |
 | How do I import Apple Health/Fitness data? | [guides/apple-health.md](docs/guides/apple-health.md) |
 | How does the day-context job feed Dailies suggestions to Home? | [guides/day-context.md](docs/guides/day-context.md) |
 | How do I configure a capture device (e.g. the Pebble Index ring) to feed the journal persona? | [guides/journal-ring-ingest.md](docs/guides/journal-ring-ingest.md) |
