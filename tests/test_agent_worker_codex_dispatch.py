@@ -796,3 +796,25 @@ def test_codex_resume_crash_records_dispatch_crashed_event(tmp_path: Path):
     assert len(crashed) == 1
     assert crashed[0]["payload"]["phase"] == "resume"
     assert "boom-resume" in crashed[0]["payload"]["error"]
+
+
+def test_codex_suppress_sentinel_completes_quietly(tmp_path: Path):
+    plain_sends: list[str] = []
+    withid_sends: list[str] = []
+    stub = _StubCodexExecutor(
+        outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=" NOTHING_TO_REPORT\n")
+    )
+    worker = _make_worker(
+        tmp_path, codex_executor=stub,
+        plain_sends=plain_sends, withid_sends=withid_sends,
+    )
+    session = worker.session_store.create(
+        task_id="cx-quiet", routing="codex", origin="operator",
+    )
+
+    worker._dispatch_codex_session(session, [{"content": "weekly check"}])
+
+    assert plain_sends == [] and withid_sends == []
+    kinds = [e["kind"] for e in worker.transcript_store.read(session.session_id)]
+    assert "completion_notice_suppressed" in kinds
+    assert "codex_handled_completion" in kinds

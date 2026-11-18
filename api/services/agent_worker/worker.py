@@ -39,7 +39,10 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 from api.services.agent_worker import doctor_repair
-from api.services.agent_worker.completion_signal import has_positive_completion_signal
+from api.services.agent_worker.completion_signal import (
+    has_positive_completion_signal,
+    is_suppress_sentinel,
+)
 from api.services.agent_worker.assignment import ENGINE_HERMES, extract_assignment
 from api.services.agent_worker.binary_resolver import describe_candidates, resolve_binary
 from api.services.agent_worker.executor_lifecycle import (
@@ -5176,7 +5179,16 @@ class Worker:
             # the same completion notice. No-ops for a session with no
             # worker-provisioned worktree, leaving `body` unchanged.
             git_result = self._finalize_worktree_for_session(session, task, outcome, open_pr=True)
+            quiet = is_suppress_sentinel(outcome.final_text)
             body = _with_git_status_note(body, git_result, want_pr=True)
+            # An exact suppress sentinel completes the run with no message,
+            # unless the git outcome added something worth reporting.
+            quiet = quiet and body == (outcome.final_text or "").strip()
+            if quiet:
+                self.transcript_store.append(sid, "completion_notice_suppressed", {
+                    "reason": "suppress_sentinel",
+                })
+                body = ""
             if body and not session.parent_session_id:
                 try:
                     sent_ids = _send_with_id(_with_reply_footer(body)) or []
@@ -5684,7 +5696,14 @@ class Worker:
             # request — parity with the claude_code branch. No-ops for a
             # session with no worker-provisioned worktree.
             git_result = self._finalize_worktree_for_session(session, task, outcome, open_pr=True)
+            quiet = is_suppress_sentinel(outcome.final_text)
             body = _with_git_status_note(body, git_result, want_pr=True)
+            quiet = quiet and body == (outcome.final_text or "").strip()
+            if quiet:
+                self.transcript_store.append(sid, "completion_notice_suppressed", {
+                    "reason": "suppress_sentinel",
+                })
+                body = ""
             if body and not session.parent_session_id:
                 try:
                     sent_ids = self._send_session_message(session, body) or []
@@ -7863,7 +7882,15 @@ class Worker:
                 # reply to this completion message and resume the task as a
                 # follow-up turn (e.g., "now turn this into a .md in my vault").
                 body = self._completion_summary(session, task, outcome)
-                self._notify_terminal(session, body, label=title)
+                # A final text that is exactly a scheduler "nothing to report"
+                # sentinel completes the task without a completion ping.
+                if is_suppress_sentinel(outcome.final_text):
+                    self.transcript_store.append(sid, "completion_notice_suppressed", {
+                        "reason": "suppress_sentinel",
+                        "sentinel": outcome.final_text.strip(),
+                    })
+                else:
+                    self._notify_terminal(session, body, label=title)
                 if has_vault_task:
                     self._record_card_outcome(session, body)
             else:

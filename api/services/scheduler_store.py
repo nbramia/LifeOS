@@ -1319,6 +1319,11 @@ def _misroute_notice(bot: str) -> str:
             f"— delivered from the primary bot instead.\n\n")
 
 
+# Final-response sentinels that mean "nothing to report"; shared by the
+# scheduler's prompt delivery and the agent worker's completion notice.
+SUPPRESS_SENTINELS = ("NO_MEETING", "NO_MEETINGS", "NOTHING_TO_REPORT", "NO_ACTION")
+
+
 class SchedulerScheduler:
     """
     Background thread that fires due schedules every 60 seconds.
@@ -1788,7 +1793,7 @@ class SchedulerScheduler:
             "attempt": max_retries,
         }
 
-    _SUPPRESS_SENTINELS = ("NO_MEETING", "NO_MEETINGS", "NOTHING_TO_REPORT", "NO_ACTION")
+    _SUPPRESS_SENTINELS = SUPPRESS_SENTINELS
 
     @staticmethod
     def _should_suppress(message: str) -> bool:

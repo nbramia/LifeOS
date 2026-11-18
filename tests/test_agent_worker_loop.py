@@ -2267,6 +2267,54 @@ def test_empty_final_text_with_side_effect_tool_still_marks_completed(tmp_path: 
     assert FAILED_TAG not in api.tasks["t1"]["tags"]
 
 
+def _complete_with_final_text(tmp_path: Path, final_text: str):
+    api = FakeApi(tasks=[
+        {"id": "t1", "description": "quiet check", "status": "todo",
+         "tags": ["agent-running"]},
+    ])
+    w = _make_worker(tmp_path, api,
+                     preflight_caller=_golden_preflight(routing="local"),
+                     local_executor=_StubExecutor(outcome=ExecutorOutcome(
+                         status=STATUS_COMPLETED, final_text=final_text,
+                     )))
+    sess = w.session_store.create(task_id="t1", routing="local",
+                                   expected_output="text")
+    w._handle_outcome(
+        sess,
+        {"id": "t1", "description": "quiet check"},
+        ExecutorOutcome(status=STATUS_COMPLETED, final_text=final_text),
+    )
+    return api, w, sess
+
+
+@pytest.mark.unit
+def test_suppress_sentinel_final_text_completes_without_notice(tmp_path: Path):
+    api, w, sess = _complete_with_final_text(tmp_path, "NOTHING_TO_REPORT")
+    assert api.tasks["t1"]["status"] == "done"
+    assert COMPLETED_TAG in api.tasks["t1"]["tags"]
+    assert w._sent_telegram == []
+    events = [e["kind"] for e in w.transcript_store.read(sess.session_id)]
+    assert "completion_notice_suppressed" in events
+
+
+@pytest.mark.unit
+def test_suppress_sentinel_with_whitespace_completes_without_notice(tmp_path: Path):
+    api, w, _ = _complete_with_final_text(tmp_path, "  \nNOTHING_TO_REPORT\n ")
+    assert api.tasks["t1"]["status"] == "done"
+    assert COMPLETED_TAG in api.tasks["t1"]["tags"]
+    assert w._sent_telegram == []
+
+
+@pytest.mark.unit
+def test_text_containing_suppress_sentinel_still_notifies(tmp_path: Path):
+    api, w, _ = _complete_with_final_text(
+        tmp_path, "NOTHING_TO_REPORT, but one claim was denied.",
+    )
+    assert api.tasks["t1"]["status"] == "done"
+    assert COMPLETED_TAG in api.tasks["t1"]["tags"]
+    assert len(w._sent_telegram) == 1
+
+
 @pytest.mark.unit
 
 def test_claim_sets_vault_status_to_in_progress(tmp_path: Path):
