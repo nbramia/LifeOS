@@ -48,7 +48,7 @@ last_message:
 2. Add a weekly schedule to `LifeOS/Scheduler/Inbox.md`:
 
    ```markdown
-   - [ ] Claims desk: weekly reconciliation [cron:: 0 9 * * 6] [action:: agent] [mtype:: prompt] [working_dir:: <vault root>] #claude <!-- id:c1a2b3 -->
+   - [ ] Claims desk: weekly reconciliation. Follow <LifeOS checkout>/.claude/skills/claims-desk/SKILL.md [cron:: 0 9 * * 6] [action:: agent] [mtype:: prompt] [working_dir:: <vault root>] #claude <!-- id:c1a2b3 -->
    ```
 
    The title is the prompt the session receives. `working_dir` is the vault root, which is not a git repo, so the Claude Code session creates no worktree, branch or PR. See [scheduler.md](scheduler.md).
@@ -58,7 +58,7 @@ last_message:
 ## Handing the desk work
 
 - **From the Finance persona.** Say "take care of X". The persona records the request in the ledger and creates the task.
-- **From another agent.** Create a task with `lifeos_task_create`, tag `claude`, a description that starts `Claims desk:` and says to follow the `claims-desk` skill, and `working_dir` set to the vault root in `fields`. Routing and the `#claude` tag are described in [agent-worker.md](../specs/product/agent-worker.md).
+- **From another agent.** Create a task with `lifeos_task_create`, tag `claude`, a description that starts `Claims desk:` and says to follow the `claims-desk` skill by its absolute path in the LifeOS checkout, and `working_dir` set to the vault root in `fields`. Routing and the `#claude` tag are described in [agent-worker.md](../specs/product/agent-worker.md).
 - **Approvals.** Reply `yes A1` to the Finance persona. The persona records the decision and creates a task so the desk sends the approved draft. `always` adds the item's kind to `always_ok`.
 
 ## Reading status

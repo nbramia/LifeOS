@@ -98,7 +98,7 @@ Unprompted messages go to the Finance Telegram bot: `lifeos_telegram_send` with 
 - A claim was denied.
 - A deadline within 14 days needs the user.
 
-At most one message a week: if `last_message` is within the last 7 days, hold the news until the next run, unless a deadline falls within 3 days. Batch everything into one short message, with amounts and the action needed, and no more detail than the ledger holds (for example: "$191.34 landed from Example Health Plan, settling 2 claims. 1 claim denied; appeal drafted as A2. Filing deadline for Example Pharmacy in 9 days."). Otherwise stay silent.
+At most one message a week: if `last_message` is within the last 7 days, hold the news until the next run. Batch everything into one short message, with amounts and the action needed, and no more detail than the ledger holds (for example: "$191.34 landed from Example Health Plan, settling 2 claims. 1 claim denied; appeal drafted as A2. Filing deadline for Example Pharmacy in 9 days."). Otherwise stay silent.
 
 ## Portal logins
 
