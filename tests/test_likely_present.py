@@ -72,6 +72,7 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "my_person_id", OWNER)
     monkeypatch.setattr(settings, "timezone", "UTC")
     monkeypatch.setattr(settings, "likely_present_read_messages", False)
+    monkeypatch.setattr(settings, "likely_present_title_names", True)
     monkeypatch.setattr(settings, "likely_present_llm_timeout", 8.0)
     monkeypatch.setattr(settings, "remote_llm_base_url", "")
     people = People()
@@ -561,3 +562,9 @@ def test_a_failing_calendar_leaves_the_other_signals(env, monkeypatch):
     add(env, ALEX, "imessage", START - timedelta(minutes=20))
     got = by_id(lp.likely_present(START, END))
     assert ALEX in got and not [r for r in got[ALEX]["reasons"] if r.startswith("named in")]
+
+
+def test_title_names_are_off_unless_turned_on(env, monkeypatch):
+    monkeypatch.setattr(settings, "likely_present_title_names", False)
+    event(env, "Dinner with Alex Rivera", START)
+    assert not named(run(), ALEX)

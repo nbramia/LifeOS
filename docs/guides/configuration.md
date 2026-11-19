@@ -569,6 +569,7 @@ The `pendant_interactions` sync reads the same feed (`LIFEOS_PENDANT_FEED_URL` a
 | Variable | Type | Default | Sets |
 |---|---|---|---|
 | `LIFEOS_LIKELY_PRESENT_READ_MESSAGES` | bool | `false` | Turns on the message judgment described above. |
+| `LIFEOS_LIKELY_PRESENT_TITLE_NAMES` | bool | `false` | Counts people named in nearby calendar event titles (events with no invitees included) toward the ranking. Off by default because an event can name someone whose own activity it is. |
 | `LIFEOS_LIKELY_PRESENT_LLM_TIMEOUT` | float | `8` | Seconds the endpoint waits for the provider's judgments before answering from metadata alone. |
 
 ### Monarch Money
