@@ -1,7 +1,7 @@
 # Pebble Capture Filing
 
 **Status:** Complete
-**Last Updated:** 2026-10-02
+**Last Updated:** 2026-11-19
 **Audience:** Operators
 
 Pebble owns `LifeOS/Log/Pebble`, where each recording day is two files:
@@ -92,6 +92,36 @@ or an operator deleted it. Completed objects are likewise never recreated
 after operator edits or deletion. A persisted one-time schedule which elapses
 before apply is held and creates no dead Scheduler entry.
 
+## Addressed Captures (Hand-off)
+
+A capture that opens with the operator's configured phrase is a message for
+whoever the phrase names, not a journal entry. With
+`LIFEOS_PEBBLE_HANDOFF_PHRASE` and `LIFEOS_PEBBLE_HANDOFF_COMMAND` both set,
+such a capture skips classification and the rest of its text is piped, once,
+to the command on stdin. It files no task, schedule, or human-queue card. Pebble's
+own log and digest are untouched, as for every capture.
+
+- **Matching** (`api/services/pebble_handoff.py`): the phrase must open the
+  capture, in any capitalization, with hyphens or spaces between its words,
+  and any punctuation after it; up to three leading filler words ("um",
+  "okay so", "hey", ...) are skipped. A capture that only mentions the phrase
+  later, uses it as a possessive ("<phrase>'s ..."), or has nothing after it
+  is an ordinary capture.
+- **Command contract**: the command is split into words shell-style (no
+  shell runs), gets the message on stdin plus `LIFEOS_HANDOFF_RECORDED_AT`
+  (the capture's UTC timestamp) and `LIFEOS_HANDOFF_KEY` (stable per
+  capture) in its environment, and must exit 0 within 60 seconds. Its output
+  is never logged.
+- **Failure**: a non-zero exit, timeout, or missing command leaves the capture
+  pending; the next recovery scan (every `LIFEOS_PEBBLE_CAPTURE_SCAN_SECONDS`)
+  retries it until the command succeeds. It is never filed as a task instead.
+- **At most once**: the send is a ledger effect like a task. A crash after the
+  command returned is recovered as sent; a crash while it was running leaves
+  the outcome unknown, so the capture is held (`ambiguous_outcome`) rather
+  than sent twice.
+- In classification-only mode (`LIFEOS_PEBBLE_CAPTURE_APPLY=false`) the
+  hand-off is planned in the ledger but not sent.
+
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -100,6 +130,8 @@ before apply is held and creates no dead Scheduler entry.
 | `LIFEOS_PEBBLE_CAPTURE_APPLY` | `false` | Permit canonical task/schedule/card writes after dry-run validation. |
 | `LIFEOS_PEBBLE_CAPTURE_DIR` | `LifeOS/Log/Pebble` | Producer-owned archive location; only this directory is accepted. |
 | `LIFEOS_PEBBLE_CAPTURE_SCAN_SECONDS` | `60` | Periodic recovery scan interval (minimum 10). |
+| `LIFEOS_PEBBLE_HANDOFF_PHRASE` | empty | Phrase that addresses a capture to the hand-off command (above). Empty disables the hand-off. |
+| `LIFEOS_PEBBLE_HANDOFF_COMMAND` | empty | Command that receives an addressed capture's message on stdin. Empty disables the hand-off. |
 | `LIFEOS_PEBBLE_CLASSIFIER` | `llm` | Which classifier files a capture: `llm` (`PebbleJournalClassifier`, below) or `jev` (`JevPebbleClassifier`, TypeSafe's typed-judgment API; requires `TYPESAFE_API_KEY`). |
 
 `PebbleJournalClassifier` (`api/services/pebble_capture.py`) routes to the
@@ -201,6 +233,7 @@ concrete project rather than the vault or home, `fields.project` names it.
 | Jev-judged filing, assignee and title | mocked-Jev plain-task-only rescue and log-only guard, agent schedule and executor-fallback locks, self-assignment, unnamed/unbound/unconfirmed agent, Jev-sourced `validate_plan` evidence, literal-title property, speech-recognition state and question wording, and fallback cases; `scripts/jev_eval/e7_pebble_filing.py` against real Jev |
 | Crash, restart, duplicate event, and revision conflict recovery | ledger consumer crash/replay and ambiguous-deletion cases; thread and process operation-key tests |
 | Human queue lifecycle | stable-key filing through `human_queue.add_card`, replay deduplication, and existing resolve-by-key transition |
+| Addressed-capture hand-off | `tests/test_pebble_handoff.py`: phrase variants and non-matches, command contract, send-once with no task, failure retry, dry run, crash recovery, watcher end to end with a real command |
 | Golden producer conformance | copied `tests/fixtures/pebble-result-*-v1.json` plus fixture-frame tests |
 
 The full repository suite remains the merge gate. Run `./scripts/test.sh` from

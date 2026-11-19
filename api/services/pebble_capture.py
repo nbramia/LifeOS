@@ -3,7 +3,10 @@
 The archive is producer-owned quoted data.  This module never edits it and
 never feeds its text into a general tool loop: a structured classifier may
 select a small plan, and this applicator can only file Inbox tasks,
-Scheduler Inbox entries, or a deduplicated human-queue card.  SQLite is a
+Scheduler Inbox entries, or a deduplicated human-queue card.  A capture that
+opens with the operator's configured hand-off phrase skips classification and
+is piped, once, to the operator's hand-off command instead
+(``api.services.pebble_handoff``).  SQLite is a
 receipt ledger, not a second content store; Markdown remains authoritative for
 the objects it creates.
 """
@@ -21,6 +24,7 @@ import threading
 import time
 import unicodedata
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
@@ -30,6 +34,7 @@ from zoneinfo import ZoneInfo
 from croniter import croniter
 
 from api.services.human_queue import add_card
+from api.services.pebble_handoff import PebbleHandoff
 from api.services.agent_board import (
     AGENT_EXECUTOR_TAGS,
     AGENT_PICKUP_TAGS,
@@ -2001,8 +2006,10 @@ class PebbleCaptureConsumer:
     def __init__(
         self, ledger: CaptureLedger, task_manager: TaskManager, scheduler_store: SchedulerStore,
         classifier: Optional[Any] = None, *, apply: bool = False,
+        handoff: Optional[PebbleHandoff] = None,
     ):
         self.ledger = ledger
+        self.handoff = handoff
         self.task_manager = task_manager
         self.scheduler_store = scheduler_store
         self.classifier = classifier or _default_pebble_classifier()
@@ -2054,6 +2061,10 @@ class PebbleCaptureConsumer:
         self, action: PlannedAction, operation_key: str, object_id: Optional[str]
     ) -> Optional[Any]:
         """Reconcile a stale claim from Markdown without creating anything."""
+        if action.kind == "handoff":
+            # Only a returned command records an object id, so a missing id
+            # leaves it unknown whether the message went out.
+            return SimpleNamespace(id=object_id) if object_id else None
         if action.kind == "task":
             self.task_manager.rebuild_index()
             return ((self.task_manager.get(object_id) if object_id else None)
@@ -2080,6 +2091,10 @@ class PebbleCaptureConsumer:
             return "complete"
         if revision_state == "same":
             actions = self.ledger.load_plan(identity)
+        elif self.handoff and (handoff_message := self.handoff.message(final_text)) is not None:
+            # Addressed to the hand-off recipient: never classified, so it
+            # files no task or schedule.
+            actions = [PlannedAction("handoff", handoff_message, 0)]
         else:
             raw_actions = await self.classifier.classify(final_text, recorded_at)
             actions = validate_plan(
@@ -2167,6 +2182,17 @@ class PebbleCaptureConsumer:
                     identity, action, "schedule", entry.id, generation
                 )
                 self.ledger.record_effect(identity, action, "schedule", entry.id, generation)
+            elif action.kind == "handoff":
+                try:
+                    if self.handoff is None:
+                        raise PebbleCaptureError("capture is planned as a hand-off but none is configured")
+                    self.handoff.send(action.title, recorded_at=recorded_at, key=key)
+                except Exception:
+                    # Unsent: the claim is released and the next scan retries.
+                    self.ledger.clear_uncommitted_claim(identity, action, generation)
+                    raise
+                self.ledger.note_effect_object(identity, action, "handoff", "sent", generation)
+                self.ledger.record_effect(identity, action, "handoff", "sent", generation)
             else:
                 try:
                     card = add_card(
