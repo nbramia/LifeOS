@@ -1776,6 +1776,18 @@ class Settings(BaseSettings):
                     "(requires TYPESAFE_API_KEY; falls back to 'llm' with a "
                     "warning if the key is absent)."
     )
+    pebble_handoff_phrase: str = Field(
+        default="", alias="LIFEOS_PEBBLE_HANDOFF_PHRASE",
+        description="A capture opening with this phrase is piped to "
+                    "LIFEOS_PEBBLE_HANDOFF_COMMAND instead of being filed. "
+                    "Empty disables the hand-off."
+    )
+    pebble_handoff_command: str = Field(
+        default="", alias="LIFEOS_PEBBLE_HANDOFF_COMMAND",
+        description="Command (shell-style words, no shell) that receives a "
+                    "hand-off capture's message on stdin. Empty disables the "
+                    "hand-off."
+    )
 
     # Dailies (Home) journal source
     dailies_database_url: str = Field(

@@ -1,7 +1,7 @@
 # Configuration Guide
 
 **Status:** Complete
-**Last Updated:** 2026-11-03
+**Last Updated:** 2026-11-19
 **Audience:** Operators
 
 **This is the single authoritative reference for every `LIFEOS_*` environment variable and the third-party service variables (`ANTHROPIC_API_KEY`, `OLLAMA_*`, `SLACK_*`, `TELEGRAM_*`, `MONARCH_*`) that LifeOS reads.** Other guides reference this file rather than restating defaults — when documentation conflicts, this file wins (and `config/settings.py` wins over both, since the code is the source of truth).
@@ -466,6 +466,8 @@ A capture device (e.g. the Pebble Index ring) posts transcriptions here. See [jo
 | `LIFEOS_PEBBLE_CAPTURE_APPLY` | bool | `false` | Permit Pebble filing effects after classification-only validation; false records plans without creating tasks or schedules. |
 | `LIFEOS_PEBBLE_CAPTURE_DIR` | str | `LifeOS/Log/Pebble` | Producer-owned Pebble archive directory under the vault. |
 | `LIFEOS_PEBBLE_CAPTURE_SCAN_SECONDS` | int | `60` | Startup/periodic recovery scan interval, seconds (minimum `10`). |
+| `LIFEOS_PEBBLE_HANDOFF_PHRASE` | str | — | A capture opening with this phrase is piped to the hand-off command instead of filed. Empty disables. See [pebble-capture.md](pebble-capture.md#addressed-captures-hand-off). |
+| `LIFEOS_PEBBLE_HANDOFF_COMMAND` | str | — | Command that receives an addressed capture's message on stdin (shell-style words, no shell). Empty disables. |
 
 ## Host Routes and Dependencies
 

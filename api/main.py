@@ -248,6 +248,7 @@ async def lifespan(app: FastAPI):
         if settings.pebble_capture_enabled:
             try:
                 from api.services.pebble_capture import CaptureLedger, PebbleCaptureConsumer
+                from api.services.pebble_handoff import configured_handoff
                 from api.services.pebble_capture_watcher import PebbleCaptureWatcher
                 from api.services.scheduler_store import get_scheduler_store
                 from api.services.task_manager import get_task_manager
@@ -257,6 +258,9 @@ async def lifespan(app: FastAPI):
                 ledger = CaptureLedger(Path("data") / "pebble_capture.db")
                 consumer = PebbleCaptureConsumer(
                     ledger, get_task_manager(), get_scheduler_store(), apply=settings.pebble_capture_apply,
+                    handoff=configured_handoff(
+                        settings.pebble_handoff_phrase, settings.pebble_handoff_command,
+                    ),
                 )
                 _pebble_capture_watcher = PebbleCaptureWatcher(
                     capture_dir, consumer, scan_seconds=settings.pebble_capture_scan_seconds,
