@@ -86,13 +86,14 @@ def env(monkeypatch, tmp_path):
     time.tzset()
 
 
-def add(env, pid, source_type, when, snippet=None, attendees=None, n=[0]):
+def add(env, pid, source_type, when, snippet=None, attendees=None, n=[0], source_id=None):
     n[0] += 1
     with connect_closing(env.db) as conn:
         conn.execute(
             "INSERT INTO interactions (id, person_id, timestamp, source_type, title, snippet, source_id, attendee_count)"
             " VALUES (?,?,?,?,?,?,?,?)",
-            (f"i{n[0]}", pid, when.isoformat(), source_type, f"title {SECRET}", snippet, f"s{n[0]}", attendees),
+            (f"i{n[0]}", pid, when.isoformat(), source_type, f"title {SECRET}", snippet, source_id or f"s{n[0]}",
+             attendees),
         )
 
 
@@ -429,8 +430,9 @@ def test_metadata_only_is_fast_over_50k_rows(env):
 
 # --- People named in calendar event titles -----------------------------------
 
-def event(env, title, start, minutes=60, attendees=0):
-    env.events.append(lp._Event(title, start, start + timedelta(minutes=minutes), attendees))
+def event(env, title, start, minutes=60, attendees=0, event_id="", series="", owner_there=True):
+    env.events.append(lp._Event(title, start, start + timedelta(minutes=minutes), attendees,
+                                event_id, series or event_id, owner_there))
 
 
 def person(env, pid, name, strength=0.0, emails=("someone@example.com",)):
@@ -568,3 +570,63 @@ def test_title_names_are_off_unless_turned_on(env, monkeypatch):
     monkeypatch.setattr(settings, "likely_present_title_names", False)
     event(env, "Dinner with Alex Rivera", START)
     assert not named(run(), ALEX)
+
+
+
+# --- Events that say nothing about who the owner was with ---------------------
+
+def test_invites_from_events_the_owner_wasnt_at_count_for_nothing(env):
+    # an invite a calendar sent (a family member's calendar), with the person also named in the title
+    add(env, ALEX, "calendar", START + timedelta(minutes=15), attendees=2, source_id="kid-1")
+    event(env, "Alex Rivera rehearsal", START, event_id="kid-1", owner_there=False)
+    got = by_id(run())
+    assert ALEX not in got
+    # the same invite on an event the owner attends counts
+    env.events.clear()
+    event(env, "Rehearsal", START, event_id="kid-1", owner_there=True)
+    assert "invited to an event at 18:15" in by_id(run())[ALEX]["reasons"]
+
+
+def test_an_invite_whose_event_cant_be_read_still_counts(env):
+    add(env, ALEX, "calendar", START + timedelta(minutes=15), attendees=2, source_id="unknown")
+    assert ALEX in by_id(run())
+
+
+def test_muted_series_count_for_nothing(env):
+    add(env, ALEX, "calendar", START, attendees=2, source_id="s1_20251112")
+    add(env, BLAIR, "calendar", START, attendees=2, source_id="other")
+    event(env, "Alex Rivera weekly", START, event_id="s1_20251112", series="s1")
+    event(env, "Planning", START, event_id="other")
+    got = by_id(lp.likely_present(START, END, muted=["s1"]))
+    assert ALEX not in got and BLAIR in got
+    got = by_id(lp.likely_present(START, END, muted=["s1_20251112"]))
+    assert ALEX not in got
+    assert ALEX in by_id(lp.likely_present(START, END))
+
+
+def test_a_first_name_with_someone_elses_surname_is_someone_else(env):
+    env.people.entities[ALEX].relationship_strength = 40.0
+    env.people.entities[ALEX].emails = ["alex@example.com"]
+    event(env, "Festival with Alex Turner and friends", START)
+    assert not named(run(), ALEX)
+    env.events.clear()
+    event(env, "Alex-Owner week-ahead prep", START)       # joined to another first name: still Alex
+    assert named(run(), ALEX)
+    env.events.clear()
+    event(env, "Alex at the cafe", START)
+    assert named(run(), ALEX)
+    env.events.clear()
+    event(env, "Alex Rivera at the cafe", START)          # the full name
+    assert named(run(), ALEX)
+
+
+def test_endpoint_passes_muted_ids(env, client, monkeypatch):
+    seen = {}
+
+    def fake(start, end, limit, muted=()):
+        seen["muted"] = list(muted)
+        return []
+    monkeypatch.setattr(lp, "likely_present", fake)
+    r = client.get("/api/crm/people/likely-present",
+                   params={"start": START.isoformat(), "end": END.isoformat(), "muted": "s1, s2_x,"})
+    assert r.status_code == 200 and seen["muted"] == ["s1", "s2_x"]

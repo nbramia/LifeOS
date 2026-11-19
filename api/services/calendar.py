@@ -46,6 +46,12 @@ class CalendarEvent:
     is_all_day: bool = False
     calendar_id: str = "primary"
     html_link: Optional[str] = None  # Google Calendar URL for this event
+    # Who sent it and how the owner answered, as the owner's own calendar copy shows them
+    # (Google's `self` flags), and the series a recurring instance belongs to.
+    organizer_email: Optional[str] = None
+    organizer_self: bool = False
+    my_response: Optional[str] = None  # accepted | declined | tentative | needsAction | None
+    recurring_event_id: Optional[str] = None
     attachments: list[CalendarAttachment] = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -119,6 +125,34 @@ def parse_attendees(raw_attendees: Optional[list]) -> list[str]:
             attendees.append(name)
 
     return attendees
+
+
+def is_calendar_address(email: Optional[str]) -> bool:
+    """A calendar's own address (a shared, secondary or imported calendar), not a person's."""
+    return bool(email) and email.lower().endswith("calendar.google.com")
+
+
+def series_id(event: "CalendarEvent") -> str:
+    """The id that names an event's series: its recurring event id, else its own id."""
+    return event.recurring_event_id or event.event_id
+
+
+def with_owner(event: "CalendarEvent", muted=()) -> bool:
+    """Whether an event says its owner was there with the people it lists or names.
+
+    True when the owner created it (and hasn't declined), or accepted an invite a person
+    sent. An invite a calendar sent (a family member's or a shared calendar: the owner's
+    "accepted" there is automatic), an invite declined, unanswered or answered "maybe",
+    and any event whose id or series is in `muted` say nothing about who the owner was
+    with."""
+    muted = set(muted or ())
+    if muted and (event.event_id in muted or series_id(event) in muted):
+        return False
+    if event.organizer_self:
+        return event.my_response != "declined"
+    if is_calendar_address(event.organizer_email):
+        return False
+    return event.my_response == "accepted"
 
 
 class CalendarService:
@@ -551,7 +585,14 @@ class CalendarService:
                     icon_link=att.get("iconLink"),
                 ))
 
+            organizer = item.get("organizer") or {}
+            me = next((a for a in item.get("attendees") or [] if a.get("self")), None)
+
             return CalendarEvent(
+                organizer_email=(organizer.get("email") or None),
+                organizer_self=bool(organizer.get("self")),
+                my_response=me.get("responseStatus") if me else None,
+                recurring_event_id=item.get("recurringEventId"),
                 event_id=event_id,
                 title=title,
                 start_time=start_time,

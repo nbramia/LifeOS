@@ -174,7 +174,7 @@ def _signal_rows(conn, start: datetime, end: datetime) -> list[tuple]:
     marks = ",".join("?" * len(types))
     return conn.execute(
         f"""
-        SELECT person_id, source_type, timestamp, attendee_count FROM interactions
+        SELECT person_id, source_type, timestamp, attendee_count, source_id FROM interactions
         WHERE timestamp >= ? AND timestamp <= ? AND source_type IN ({marks})
         """,
         (lo, hi, *types),
@@ -191,8 +191,18 @@ def _history_rows(conn, start: datetime) -> list[tuple]:
     ).fetchall()
 
 
-def _gather_signals(conn, start: datetime, end: datetime, resolve, person_store=None) -> dict[str, _Candidate]:
+def _counts(ev: "_Event", muted: set[str]) -> bool:
+    """Whether an event says the owner was with the people it lists or names (calendar.with_owner,
+    and neither the event nor its series muted)."""
+    return ev.owner_there and ev.event_id not in muted and ev.series not in muted
+
+
+def _gather_signals(conn, start: datetime, end: datetime, resolve, person_store=None,
+                    muted=()) -> dict[str, _Candidate]:
     cands: dict[str, _Candidate] = {}
+    muted = set(muted or ())
+    events = _events_near(start, end)
+    by_id = {ev.event_id: ev for ev in events if ev.event_id}
 
     def cand(pid: str) -> _Candidate:
         pid = resolve(pid)
@@ -202,7 +212,7 @@ def _gather_signals(conn, start: datetime, end: datetime, resolve, person_store=
 
     best_message: dict[str, tuple[timedelta, str, float]] = {}
     best_calendar: dict[str, tuple[float, str]] = {}
-    for pid, source_type, ts, attendees in _signal_rows(conn, start, end):
+    for pid, source_type, ts, attendees, source_id in _signal_rows(conn, start, end):
         if not pid:
             continue
         when = _parse_ts(ts)
@@ -212,6 +222,9 @@ def _gather_signals(conn, start: datetime, end: datetime, resolve, person_store=
         if source_type == "calendar":
             if (attendees or 0) > InteractionConfig.MASS_MEETING_ATTENDEE_LIMIT:
                 continue
+            ev = by_id.get(source_id or "")
+            if ev is not None and not _counts(ev, muted):
+                continue        # someone else's event on the calendar, unanswered, declined or muted
             if start - CALENDAR_AFTER_SLACK <= when <= end + CALENDAR_AFTER_SLACK:
                 weight = CALENDAR_OVERLAP_WEIGHT
             elif start - CALENDAR_BEFORE_SLACK <= when < start - CALENDAR_AFTER_SLACK:
@@ -231,7 +244,8 @@ def _gather_signals(conn, start: datetime, end: datetime, resolve, person_store=
             if pid not in best_message or gap < best_message[pid][0]:
                 best_message[pid] = (gap, source_type, weight)
 
-    for pid, weight, label in _title_signals(start, end, resolve, person_store):
+    for pid, weight, label in _title_signals(start, end, resolve, person_store,
+                                             [ev for ev in events if _counts(ev, muted)]):
         if pid not in best_calendar or weight > best_calendar[pid][0]:
             best_calendar[pid] = (weight, label)
 
@@ -272,6 +286,9 @@ class _Event:
     start: datetime
     end: datetime
     attendees: int
+    event_id: str = ""
+    series: str = ""
+    owner_there: bool = True    # calendar.with_owner, before mutes
 
 
 _events_cache: dict[tuple[str, str], tuple[float, list[_Event]]] = {}
@@ -279,14 +296,15 @@ _index_cache: dict[str, tuple[float, object]] = {}
 
 
 def _fetch_day(account, day) -> list[_Event]:
-    from api.services.calendar import get_calendar_service
+    from api.services.calendar import get_calendar_service, series_id, with_owner
     tz = ZoneInfo(settings.timezone)
     lo = datetime(day.year, day.month, day.day, tzinfo=tz)
     out = []
     for ev in get_calendar_service(account).get_events_in_range(lo, lo + timedelta(days=1), max_results=None):
         if ev.is_all_day or not ev.title:
             continue
-        out.append(_Event(ev.title, _utc(ev.start_time), _utc(ev.end_time), len(ev.attendees or [])))
+        out.append(_Event(ev.title, _utc(ev.start_time), _utc(ev.end_time), len(ev.attendees or []),
+                          ev.event_id, series_id(ev), with_owner(ev)))
     return out
 
 
@@ -341,7 +359,7 @@ _NOT_FIRST_NAMES = frozenset({
     "coffee", "call", "meeting", "sync", "review", "project", "board", "group", "company", "weekly",
 })
 
-_WORD = re.compile(r"[^\W\d_][\w'’.-]*", re.UNICODE)
+_WORD = re.compile(r"[^\W\d_][\w'’.]*", re.UNICODE)
 
 
 def _norm(word: str) -> str:
@@ -358,6 +376,7 @@ def _title_index(person_store, excluded: set[str]):
         return hit[1]
     full: dict[tuple[str, ...], set[str]] = {}
     first: dict[str, list[tuple[float, str]]] = {}
+    others: dict[str, set[str]] = {}
     for e in person_store.get_all():
         if e.hidden or e.id in excluded:
             continue
@@ -370,12 +389,13 @@ def _title_index(person_store, excluded: set[str]):
             words = tuple(w for w in words if w)
             if len(words) >= 2:
                 full.setdefault(words, set()).add(e.id)
+            others.setdefault(e.id, set()).update(words[1:])
         words = [_norm(w) for w in _WORD.findall(e.canonical_name or "")]
         reachable = bool(getattr(e, "emails", None) or getattr(e, "phone_numbers", None))
         if (words and len(words[0]) >= TITLE_FIRST_NAME_MIN_LEN and words[0] not in _NOT_FIRST_NAMES
                 and reachable and _strength_of(e) >= TITLE_FIRST_NAME_MIN_STRENGTH):
             first.setdefault(words[0], []).append((_strength_of(e), e.id))
-    out = (full, {w: _first_name_owner(people) for w, people in first.items()})
+    out = (full, {w: _first_name_owner(people) for w, people in first.items()}, others)
     _index_cache.clear()
     _index_cache[key] = (_time.time() + TITLE_INDEX_CACHE_S, out)
     return out
@@ -390,11 +410,15 @@ def _first_name_owner(people: list[tuple[float, str]]) -> Optional[str]:
 
 
 def title_people(title: str, index) -> list[str]:
-    """Person ids a title names (see the module docstring), in title order."""
-    full, first = index
-    raw = _WORD.findall(title or "")
+    """Person ids a title names (see the module docstring), in title order. A first name
+    followed, after a plain space, by a capitalized word that isn't one of that person's
+    other names is someone else ("with Hayley Williams" is not the contact Hayley Quinn)."""
+    full, first = index[0], index[1]
+    others = index[2] if len(index) > 2 else {}
+    matches = list(_WORD.finditer(title or ""))
+    raw = [m.group(0) for m in matches]
     words = [_norm(w) for w in raw]
-    found: list[str] = []
+    found: list[tuple[int, str]] = []
     used = [False] * len(words)
     for n in range(4, 1, -1):
         for i in range(len(words) - n + 1):
@@ -409,8 +433,13 @@ def title_people(title: str, index) -> list[str]:
         if used[i] or not raw[i][:1].isupper():
             continue
         pid = first.get(w)
-        if pid:
-            found.append((i, pid))
+        if not pid:
+            continue
+        if i + 1 < len(words) and raw[i + 1][:1].isupper() \
+                and not title[matches[i].end():matches[i + 1].start()].strip() \
+                and words[i + 1] not in others.get(pid, ()):
+            continue
+        found.append((i, pid))
     out: list[str] = []
     for _i, pid in sorted(found):
         if pid not in out:
@@ -418,13 +447,12 @@ def title_people(title: str, index) -> list[str]:
     return out
 
 
-def _title_signals(start: datetime, end: datetime, resolve, store) -> list[tuple[str, float, str]]:
-    """(person id, weight, reason) for people named in event titles near the window,
-    under the same time rules as invitations, mass meetings skipped."""
+def _title_signals(start: datetime, end: datetime, resolve, store, events) -> list[tuple[str, float, str]]:
+    """(person id, weight, reason) for people named in the titles of `events` (the ones that
+    count) near the window, under the same time rules as invitations, mass meetings skipped."""
     if store is None or not settings.likely_present_title_names:
         return []
-    events = [ev for ev in _events_near(start, end)
-              if ev.attendees <= InteractionConfig.MASS_MEETING_ATTENDEE_LIMIT]
+    events = [ev for ev in events if ev.attendees <= InteractionConfig.MASS_MEETING_ATTENDEE_LIMIT]
     if not events:
         return []
     index = _title_index(store, _excluded_ids(store))
@@ -579,6 +607,7 @@ def likely_present(
     *,
     db_path: Optional[str] = None,
     person_store=None,
+    muted=(),
 ) -> list[dict]:
     """Ranked people for the window, as `{person_id, name, score, reasons}` dicts."""
     start, end = _utc(start), _utc(end)
@@ -601,7 +630,7 @@ def likely_present(
         return canon_cache[pid]
 
     with connect_closing(db_path) as conn:
-        cands = _gather_signals(conn, start, end, resolve, person_store)
+        cands = _gather_signals(conn, start, end, resolve, person_store, muted)
 
     entities = _eligible(person_store, list(cands), excluded)
     cands = {pid: c for pid, c in cands.items() if pid in entities}

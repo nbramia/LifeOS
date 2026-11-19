@@ -288,6 +288,14 @@ Search calendar events.
 - `q` (string): Search query
 - `attendee` (string): Filter by attendee
 
+Each event in `/upcoming` and `/search` carries, besides its title, times and
+attendees: `organizer_email`, `organizer_self` (the wearer created it),
+`my_response` (the wearer's own answer: `accepted`, `declined`, `tentative`,
+`needsAction` or null), `recurring_event_id` (the series of a recurring
+instance) and `with_owner`, true when the event says the wearer was there: the
+wearer created it and hasn't declined, or accepted an invite a person sent (an
+invite a calendar sent, such as a family member's calendar, never counts).
+
 ### GET /api/calendar/meeting-prep
 
 Get intelligent meeting preparation context for a date.
