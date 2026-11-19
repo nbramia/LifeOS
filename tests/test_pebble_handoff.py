@@ -58,6 +58,15 @@ def test_phrase_is_operator_configured_not_built_in():
     assert handoff_message("Chief of Staff, water the plants.", "Assistant") is None
 
 
+@pytest.mark.parametrize("text", [
+    "Sam's helper, water the synthetic plants.",
+    "Sam’s helper: water the synthetic plants.",
+    "sams helper water the synthetic plants.",
+])
+def test_phrase_with_an_apostrophe_matches_its_spoken_and_typed_forms(text):
+    assert handoff_message(text, "Sam's helper") == "water the synthetic plants."
+
+
 def test_handoff_is_disabled_unless_phrase_and_command_are_both_set():
     assert configured_handoff("", "/bin/true") is None
     assert configured_handoff(PHRASE, "  ") is None

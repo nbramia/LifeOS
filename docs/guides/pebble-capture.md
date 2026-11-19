@@ -110,15 +110,17 @@ own log and digest are untouched, as for every capture.
 - **Command contract**: the command is split into words shell-style (no
   shell runs), gets the message on stdin plus `LIFEOS_HANDOFF_RECORDED_AT`
   (the capture's UTC timestamp) and `LIFEOS_HANDOFF_KEY` (stable per
-  capture) in its environment, and must exit 0 within 60 seconds. Its output
-  is never logged.
+  capture) in its environment, and must exit 0 within 60 seconds once it has
+  delivered the message, and non-zero only when it has not. Its output is
+  never logged.
 - **Failure**: a non-zero exit, timeout, or missing command leaves the capture
   pending; the next recovery scan (every `LIFEOS_PEBBLE_CAPTURE_SCAN_SECONDS`)
   retries it until the command succeeds. It is never filed as a task instead.
 - **At most once**: the send is a ledger effect like a task. A crash after the
-  command returned is recovered as sent; a crash while it was running leaves
-  the outcome unknown, so the capture is held (`ambiguous_outcome`) rather
-  than sent twice.
+  ledger noted the send is recovered as sent; a crash before that leaves the
+  outcome unknown, so the capture is held (`ambiguous_outcome`) rather than
+  sent twice. A command that exits non-zero after delivering anyway is sent
+  again on retry; `LIFEOS_HANDOFF_KEY` lets such a command deduplicate.
 - In classification-only mode (`LIFEOS_PEBBLE_CAPTURE_APPLY=false`) the
   hand-off is planned in the ledger but not sent.
 

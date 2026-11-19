@@ -38,14 +38,18 @@ class PebbleHandoffError(RuntimeError):
 
 @lru_cache(maxsize=8)
 def _phrase_pattern(phrase: str) -> Optional[re.Pattern[str]]:
-    words = re.findall(r"\w+", phrase)
+    words = [w for w in (re.sub(r"^\W+|\W+$", "", part) for part in re.split(r"[\s\-–—]+", phrase)) if w]
     if not words:
         return None
     fillers = "|".join(
         _WORD_SEPARATOR.join(re.escape(part) for part in filler.split())
         for filler in sorted(_FILLERS, key=len, reverse=True)
     )
-    body = _WORD_SEPARATOR.join(re.escape(word) for word in words)
+    # An apostrophe in the phrase ("Sam's helper") may be typed straight,
+    # curly, or dropped by speech recognition.
+    body = _WORD_SEPARATOR.join(
+        "['’]?".join(re.escape(piece) for piece in re.split(r"['’]", word)) for word in words
+    )
     return re.compile(
         rf"^{_LEAD}(?:(?:{fillers})\b{_PUNCT}){{0,3}}{body}"
         # A whole-word match that is not the possessive ("<phrase>'s desk").
