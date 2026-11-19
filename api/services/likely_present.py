@@ -1,9 +1,22 @@
 """Who the wearer was probably with in a time window.
 
 Ranks people from interaction metadata alone: calendar invitations near the
-window, messages, calls and emails in the hours before it, in-person days at
-the same time of day and day type, and relationship strength as a tie-breaker.
-Reasons are fixed labels; no message, email or note text reaches the result.
+window, people named in the titles of calendar events near the window (events
+with no invitees included), messages, calls and emails in the hours before it,
+in-person days at the same time of day and day type, and relationship strength
+as a tie-breaker. Reasons are fixed labels; no message, email, note or event
+title text reaches the result.
+
+A title names a person by a full name (canonical, display or alias, two words
+or more) that exactly one person carries, or by a capitalized first name of a close contact: one no other close
+contact shares, or, when several share it, the closest one at least
+TITLE_FIRST_NAME_DOMINANCE times as strong as the next. A close contact has
+relationship strength at least
+TITLE_FIRST_NAME_MIN_STRENGTH, an email or phone number on file (a person,
+not a group), and a first name that isn't one of _NOT_FIRST_NAMES. Events are read from the configured
+Google calendars, a local day at a time, cached for EVENTS_CACHE_S (past days
+EVENTS_PAST_CACHE_S); a calendar that fails or is slower than EVENTS_BUDGET_S
+leaves the other signals as they are.
 
 When `LIFEOS_LIKELY_PRESENT_READ_MESSAGES` is on and a remote provider is
 configured, the top few candidates' iMessage and WhatsApp text from the hours
@@ -14,6 +27,7 @@ verdict is used. An error or timeout leaves the metadata answer unchanged.
 from __future__ import annotations
 
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -53,6 +67,14 @@ PLANS_YES_WEIGHT = 0.4
 PLANS_MAYBE_WEIGHT = 0.2
 STRENGTH_MAX_WEIGHT = 0.08
 STRENGTH_ONLY_MIN = 10.0
+
+TITLE_FIRST_NAME_MIN_STRENGTH = 20.0
+TITLE_FIRST_NAME_MIN_LEN = 3
+TITLE_FIRST_NAME_DOMINANCE = 2.0
+TITLE_INDEX_CACHE_S = 600
+EVENTS_CACHE_S = 900
+EVENTS_PAST_CACHE_S = 6 * 3600
+EVENTS_BUDGET_S = 4.0
 
 MESSAGE_TYPES = ("imessage", "whatsapp", "phone", "gmail", "slack")
 _PLANS_REASON = "plans to meet in messages"
@@ -168,7 +190,7 @@ def _history_rows(conn, start: datetime) -> list[tuple]:
     ).fetchall()
 
 
-def _gather_signals(conn, start: datetime, end: datetime, resolve) -> dict[str, _Candidate]:
+def _gather_signals(conn, start: datetime, end: datetime, resolve, person_store=None) -> dict[str, _Candidate]:
     cands: dict[str, _Candidate] = {}
 
     def cand(pid: str) -> _Candidate:
@@ -208,6 +230,10 @@ def _gather_signals(conn, start: datetime, end: datetime, resolve) -> dict[str, 
             if pid not in best_message or gap < best_message[pid][0]:
                 best_message[pid] = (gap, source_type, weight)
 
+    for pid, weight, label in _title_signals(start, end, resolve, person_store):
+        if pid not in best_calendar or weight > best_calendar[pid][0]:
+            best_calendar[pid] = (weight, label)
+
     for pid, (weight, label) in best_calendar.items():
         cand(pid).add(weight, label)
     for pid, (gap, source_type, weight) in best_message.items():
@@ -235,6 +261,184 @@ def _gather_signals(conn, start: datetime, end: datetime, resolve) -> dict[str, 
             weight = min(RECURRING_MAX_WEIGHT, RECURRING_BASE_WEIGHT + RECURRING_PER_DAY_WEIGHT * len(seen))
             cand(pid).add(weight, f"seen in person on {len(seen)} {day_type} {band_start}s")
     return cands
+
+
+# --- People named in calendar event titles ---------------------------------
+
+@dataclass
+class _Event:
+    title: str
+    start: datetime
+    end: datetime
+    attendees: int
+
+
+_events_cache: dict[tuple[str, str], tuple[float, list[_Event]]] = {}
+_index_cache: dict[str, tuple[float, object]] = {}
+
+
+def _fetch_day(account, day) -> list[_Event]:
+    from api.services.calendar import get_calendar_service
+    tz = ZoneInfo(settings.timezone)
+    lo = datetime(day.year, day.month, day.day, tzinfo=tz)
+    out = []
+    for ev in get_calendar_service(account).get_events_in_range(lo, lo + timedelta(days=1), max_results=None):
+        if ev.is_all_day or not ev.title:
+            continue
+        out.append(_Event(ev.title, _utc(ev.start_time), _utc(ev.end_time), len(ev.attendees or [])))
+    return out
+
+
+def _events_near(start: datetime, end: datetime) -> list[_Event]:
+    """Timed events from every configured calendar on the local days that
+    [start - CALENDAR_BEFORE_SLACK, end + CALENDAR_AFTER_SLACK] touches. Days are
+    cached; a calendar that fails or runs past EVENTS_BUDGET_S adds nothing."""
+    import time as _time
+
+    from api.services.google_auth import get_configured_accounts
+    lo, hi = _local(start - CALENDAR_BEFORE_SLACK).date(), _local(end + CALENDAR_AFTER_SLACK).date()
+    days = [lo + timedelta(days=i) for i in range((hi - lo).days + 1)]
+    today = _local(datetime.now(timezone.utc)).date()
+    now = _time.time()
+    try:
+        accounts = list(get_configured_accounts())
+    except Exception:  # noqa: BLE001 - no calendars: no title signal
+        return []
+    todo = []
+    events: list[_Event] = []
+    for account in accounts:
+        for day in days:
+            key = (str(getattr(account, "value", account)), day.isoformat())
+            hit = _events_cache.get(key)
+            if hit and hit[0] > now:
+                events.extend(hit[1])
+            else:
+                todo.append((key, account, day))
+    if todo:
+        pool = ThreadPoolExecutor(max_workers=min(4, len(todo)), thread_name_prefix="likely-present-cal")
+        try:
+            futures = {pool.submit(_fetch_day, account, day): (key, day) for key, account, day in todo}
+            done, _pending = wait(futures, timeout=EVENTS_BUDGET_S)
+            for fut in done:
+                key, day = futures[fut]
+                try:
+                    got = fut.result()
+                except Exception:  # noqa: BLE001
+                    logger.warning("likely-present: calendar read failed")
+                    continue
+                ttl = EVENTS_PAST_CACHE_S if day < today else EVENTS_CACHE_S
+                _events_cache[key] = (now + ttl, got)
+                events.extend(got)
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+    return events
+
+
+# Words a title uses for things, never taken as someone's first name.
+_NOT_FIRST_NAMES = frozenset({
+    "all", "and", "the", "team", "staff", "office", "family", "home", "lunch", "dinner", "breakfast",
+    "coffee", "call", "meeting", "sync", "review", "project", "board", "group", "company", "weekly",
+})
+
+_WORD = re.compile(r"[^\W\d_][\w'’.-]*", re.UNICODE)
+
+
+def _norm(word: str) -> str:
+    return re.sub(r"['’]s$", "", word.strip(".-'’")).lower()
+
+
+def _title_index(person_store, excluded: set[str]):
+    """(full names -> person ids, first names of close contacts -> person ids), built
+    from every visible person and cached for TITLE_INDEX_CACHE_S."""
+    import time as _time
+    key = str(id(person_store))
+    hit = _index_cache.get(key)
+    if hit and hit[0] > _time.time():
+        return hit[1]
+    full: dict[tuple[str, ...], set[str]] = {}
+    first: dict[str, list[tuple[float, str]]] = {}
+    for e in person_store.get_all():
+        if e.hidden or e.id in excluded:
+            continue
+        names = {e.canonical_name, getattr(e, "display_name", "") or "", *(getattr(e, "aliases", None) or [])}
+        for n in names:
+            n = re.sub(r"\(.*?\)", " ", str(n or ""))
+            if "@" in n:
+                continue
+            words = tuple(_norm(w) for w in _WORD.findall(n))
+            words = tuple(w for w in words if w)
+            if len(words) >= 2:
+                full.setdefault(words, set()).add(e.id)
+        words = [_norm(w) for w in _WORD.findall(e.canonical_name or "")]
+        reachable = bool(getattr(e, "emails", None) or getattr(e, "phone_numbers", None))
+        if (words and len(words[0]) >= TITLE_FIRST_NAME_MIN_LEN and words[0] not in _NOT_FIRST_NAMES
+                and reachable and _strength_of(e) >= TITLE_FIRST_NAME_MIN_STRENGTH):
+            first.setdefault(words[0], []).append((_strength_of(e), e.id))
+    out = (full, {w: _first_name_owner(people) for w, people in first.items()})
+    _index_cache.clear()
+    _index_cache[key] = (_time.time() + TITLE_INDEX_CACHE_S, out)
+    return out
+
+
+def _first_name_owner(people: list[tuple[float, str]]) -> Optional[str]:
+    """The close contact a shared first name stands for, or None when it's ambiguous."""
+    ranked = sorted(people, reverse=True)
+    if len(ranked) == 1 or ranked[0][0] >= TITLE_FIRST_NAME_DOMINANCE * max(ranked[1][0], 1e-9):
+        return ranked[0][1]
+    return None
+
+
+def title_people(title: str, index) -> list[str]:
+    """Person ids a title names (see the module docstring), in title order."""
+    full, first = index
+    raw = _WORD.findall(title or "")
+    words = [_norm(w) for w in raw]
+    found: list[str] = []
+    used = [False] * len(words)
+    for n in range(4, 1, -1):
+        for i in range(len(words) - n + 1):
+            if any(used[i:i + n]):
+                continue
+            ids = full.get(tuple(words[i:i + n]))
+            if ids and len(ids) == 1:
+                found.append((i, next(iter(ids))))
+                for j in range(i, i + n):
+                    used[j] = True
+    for i, w in enumerate(words):
+        if used[i] or not raw[i][:1].isupper():
+            continue
+        pid = first.get(w)
+        if pid:
+            found.append((i, pid))
+    out: list[str] = []
+    for _i, pid in sorted(found):
+        if pid not in out:
+            out.append(pid)
+    return out
+
+
+def _title_signals(start: datetime, end: datetime, resolve, store) -> list[tuple[str, float, str]]:
+    """(person id, weight, reason) for people named in event titles near the window,
+    under the same time rules as invitations, mass meetings skipped."""
+    if store is None:
+        return []
+    events = [ev for ev in _events_near(start, end)
+              if ev.attendees <= InteractionConfig.MASS_MEETING_ATTENDEE_LIMIT]
+    if not events:
+        return []
+    index = _title_index(store, _excluded_ids(store))
+    out = []
+    for ev in events:
+        if ev.start <= end + CALENDAR_AFTER_SLACK and ev.end >= start - CALENDAR_AFTER_SLACK:
+            weight = CALENDAR_OVERLAP_WEIGHT
+        elif start - CALENDAR_BEFORE_SLACK <= ev.start < start - CALENDAR_AFTER_SLACK:
+            weight = CALENDAR_NEAR_WEIGHT
+        else:
+            continue
+        label = f"named in an event at {_local(ev.start).strftime('%H:%M')}"
+        for pid in title_people(ev.title, index):
+            out.append((resolve(pid), weight, label))
+    return out
 
 
 def _eligible(person_store, pids, excluded: set[str]) -> dict:
@@ -396,7 +600,7 @@ def likely_present(
         return canon_cache[pid]
 
     with connect_closing(db_path) as conn:
-        cands = _gather_signals(conn, start, end, resolve)
+        cands = _gather_signals(conn, start, end, resolve, person_store)
 
     entities = _eligible(person_store, list(cands), excluded)
     cands = {pid: c for pid, c in cands.items() if pid in entities}
