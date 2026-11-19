@@ -313,11 +313,22 @@ category.
 
 People the wearer was probably with in a time window, best first. Ranked from
 interaction metadata only: calendar events in or near the window that the
-person was invited to, messages, calls, emails and Slack messages in the six
+person was invited to or is named in (by title, events with no invitees
+included; reason `named in an event at HH:MM`), messages, calls, emails and Slack messages in the six
 hours before it (closer is stronger), in-person days with the person at the
 same time of day and day type (three or more days count as recurring), and
 relationship strength as a tie-breaker. The wearer, hidden people and services
 are never returned.
+
+A title names a person by a full name (canonical, display or alias) that only
+one person carries, or by a capitalized first name of a close contact
+(relationship strength 20 or more, with an email or phone number): one no
+other close contact shares, or the closest of several when at least twice as
+strong as the next. Common title words ("All", "Team", "Lunch", ...) are never
+first names. Events come from the configured Google calendars, a local day at a
+time, cached 15 minutes (past days 6 hours); mass meetings are skipped, and a
+calendar that fails or takes over 4 seconds leaves the other signals. No title
+text reaches the response.
 
 **Query Parameters:**
 - `start` (ISO 8601, required): Window start. A value without an offset is UTC.

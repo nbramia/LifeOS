@@ -76,7 +76,12 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "remote_llm_base_url", "")
     people = People()
     monkeypatch.setattr("api.services.person_entity.get_person_entity_store", lambda *a, **k: people)
-    yield SimpleNamespace(db=str(db), people=people)
+    events: list = []
+    real_events_near = lp._events_near
+    monkeypatch.setattr(lp, "_events_near", lambda start, end: list(events))   # no real calendar
+    lp._index_cache.clear()
+    yield SimpleNamespace(db=str(db), people=people, events=events, real_events_near=real_events_near)
+    lp._index_cache.clear()
     time.tzset()
 
 
@@ -419,3 +424,140 @@ def test_metadata_only_is_fast_over_50k_rows(env):
     elapsed = time.perf_counter() - t0
     assert result and result[0]["person_id"] == ALEX
     assert elapsed < 0.3, f"{elapsed:.3f}s"
+
+
+# --- People named in calendar event titles -----------------------------------
+
+def event(env, title, start, minutes=60, attendees=0):
+    env.events.append(lp._Event(title, start, start + timedelta(minutes=minutes), attendees))
+
+
+def person(env, pid, name, strength=0.0, emails=("someone@example.com",)):
+    env.people.entities[pid] = SimpleNamespace(id=pid, canonical_name=name, hidden=False,
+                                               relationship_strength=strength, emails=list(emails))
+
+
+def test_full_name_in_an_event_with_no_invitees(env):
+    event(env, "Dinner with Alex Rivera", START - timedelta(hours=2, minutes=30), minutes=90)
+    got = by_id(run())
+    assert got[ALEX]["reasons"][0] == "named in an event at 15:30"
+    assert got[ALEX]["score"] > 0
+
+
+def test_title_text_never_reaches_the_result(env):
+    event(env, f"Alex Rivera {SECRET}", START)
+    assert SECRET not in json.dumps(run())
+
+
+def named(result, pid):
+    """Whether a title named `pid` (strong contacts may appear as close contacts anyway)."""
+    p = by_id(result).get(pid)
+    return bool(p and [r for r in p["reasons"] if r.startswith("named in")])
+
+
+def test_first_name_only_for_one_close_contact(env):
+    env.people.entities[ALEX].relationship_strength = 40.0
+    env.people.entities[ALEX].emails = ["alex@example.com"]
+    event(env, "Coffee w/ Alex", START)
+    assert "named in an event at 18:00" in by_id(run())[ALEX]["reasons"]
+    # lowercase is a word, not a name
+    env.events.clear()
+    event(env, "coffee w/ alex", START)
+    assert not named(run(), ALEX)
+    # two close contacts share it: nobody
+    env.events.clear()
+    lp._index_cache.clear()
+    person(env, "person-alex2", "Alex Moreno", strength=35.0)
+    event(env, "Coffee w/ Alex", START)
+    got = run()
+    assert not named(got, ALEX) and not named(got, "person-alex2")
+    # the full name still settles it
+    env.events.clear()
+    event(env, "Coffee w/ Alex Moreno", START)
+    assert named(run(), "person-alex2")
+
+
+def test_first_name_of_a_group_or_a_common_word_is_not_enough(env):
+    person(env, "group-all", "All Staff Example Co", strength=60.0, emails=())   # a group: nobody to reach
+    person(env, "person-will", "Will Tanaka", strength=60.0)
+    person(env, "person-team", "Team Okafor", strength=60.0)
+    event(env, "All Staff", START)
+    event(env, "Team offsite", START)
+    event(env, "Will Tanaka & co", START)
+    got = run()
+    assert not named(got, "group-all") and not named(got, "person-team") and named(got, "person-will")
+
+
+def test_a_shared_first_name_goes_to_a_much_closer_contact(env):
+    person(env, "person-jo", "Joan Ramos", strength=95.0)
+    person(env, "person-jo-dentist", "Joan Dentist Office", strength=30.0)
+    event(env, "Joan recital rehearsal", START)
+    got = run()
+    assert named(got, "person-jo") and not named(got, "person-jo-dentist")
+    assert lp._first_name_owner([(40.0, "a"), (35.0, "b")]) is None
+    assert lp._first_name_owner([(40.0, "a"), (20.0, "b")]) == "a"
+
+
+def test_first_name_of_a_distant_contact_is_not_enough(env):
+    event(env, "Call Blair", START)
+    assert BLAIR not in by_id(run())
+
+
+def test_ordinary_titles_name_nobody(env):
+    for pid in (ALEX, BLAIR, CASEY, DREW):
+        env.people.entities[pid].relationship_strength = 40.0
+    for t in ("Lunch", "Project Phoenix review", "Gym", "Focus time", "Park run", "Drive to airport"):
+        event(env, t, START)
+    got = run()
+    assert not [p for p in got for r in p["reasons"] if r.startswith("named in")]
+
+
+def test_title_events_keep_the_time_window_and_skip_mass_meetings(env):
+    event(env, "Alex Rivera office hours", START + timedelta(hours=3))          # long after the window
+    event(env, "Blair Quinn breakfast", START - timedelta(hours=5), minutes=30)  # long before
+    event(env, "All hands with Casey Lin", START, attendees=400)               # a mass meeting
+    got = by_id(run())
+    assert not ({ALEX, BLAIR, CASEY} & set(got))
+
+
+def test_named_during_a_long_event_counts_as_overlap(env):
+    event(env, "Dinner with Alex Rivera", START - timedelta(hours=2), minutes=180)
+    near = lp.CALENDAR_OVERLAP_WEIGHT
+    got = by_id(run())
+    assert got[ALEX]["reasons"] == ["named in an event at 16:00"] and got[ALEX]["score"] >= near - 1e-9
+
+
+def test_invited_and_named_keeps_one_calendar_reason(env):
+    add(env, ALEX, "calendar", START + timedelta(minutes=15), attendees=2)
+    event(env, "Alex Rivera / Owner", START + timedelta(minutes=15), attendees=2)
+    reasons = by_id(run())[ALEX]["reasons"]
+    assert len([r for r in reasons if "event" in r]) == 1
+
+
+def test_the_owner_is_never_named(env):
+    event(env, "Owner Person and Alex Rivera", START)
+    got = by_id(run())
+    assert OWNER not in got and ALEX in got
+
+
+def test_title_people_matches_aliases_and_possessives():
+    index = ({("alex", "rivera"): {"a"}, ("sam", "lee"): {"s1", "s2"}}, {"drew": "d", "kim": None})
+    assert lp.title_people("Alex Rivera's birthday", index) == ["a"]
+    assert lp.title_people("Sam Lee sync", index) == []              # two people share the full name
+    assert lp.title_people("Drew + Alex Rivera", index) == ["d", "a"]
+    assert lp.title_people("Drewery visit", index) == []             # whole words only
+    assert lp.title_people("Kim's recital", index) == []             # an ambiguous first name
+
+
+def test_a_failing_calendar_leaves_the_other_signals(env, monkeypatch):
+    monkeypatch.setattr(lp, "_events_near", env.real_events_near)
+    import api.services.google_auth as ga
+    monkeypatch.setattr(ga, "get_configured_accounts", lambda: ["personal"])
+
+    def boom(account, day):
+        raise RuntimeError("calendar down")
+    monkeypatch.setattr(lp, "_fetch_day", boom)
+    lp._events_cache.clear()
+    add(env, ALEX, "imessage", START - timedelta(minutes=20))
+    got = by_id(lp.likely_present(START, END))
+    assert ALEX in got and not [r for r in got[ALEX]["reasons"] if r.startswith("named in")]
