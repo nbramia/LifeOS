@@ -20,6 +20,8 @@ from api.services.calendar import (
     CalendarEvent,
     format_event_time,
     parse_attendees,
+    series_id,
+    with_owner,
 )
 from api.services.google_auth import GoogleAccount
 
@@ -163,6 +165,19 @@ class TestCalendarService:
         assert len(events) >= 1
         assert events[0].is_all_day is True
 
+    def test_reads_organizer_my_response_and_series(self, calendar_service):
+        calendar_service._service.events().list().execute.return_value = {"items": [{
+            "id": "ev_20260107", "summary": "Class", "recurringEventId": "ev",
+            "start": {"dateTime": "2026-01-07T14:00:00-08:00"}, "end": {"dateTime": "2026-01-07T15:00:00-08:00"},
+            "organizer": {"email": "abc@group.calendar.google.com"},
+            "attendees": [{"email": "owner@example.com", "self": True, "responseStatus": "accepted"},
+                          {"email": "other@example.com"}],
+        }]}
+        e = calendar_service.get_upcoming_events(days=7)[0]
+        assert (e.organizer_email, e.organizer_self, e.my_response, e.recurring_event_id) == \
+            ("abc@group.calendar.google.com", False, "accepted", "ev")
+        assert not with_owner(e)
+
     def test_extracts_attendees(self, calendar_service):
         """Should extract attendee names and emails."""
         mock_events = {
@@ -301,6 +316,37 @@ class TestCalendarService:
 
         assert len(events) == 1
         assert list_mock.call_count == 1
+
+
+class TestWithOwner:
+    """Whether an event says its owner was there (calendar.with_owner)."""
+
+    def ev(self, **kw):
+        base = dict(event_id="e1", title="Coffee", start_time=datetime(2026, 1, 7, 14, tzinfo=timezone.utc),
+                    end_time=datetime(2026, 1, 7, 15, tzinfo=timezone.utc), source_account="personal")
+        return CalendarEvent(**{**base, **kw})
+
+    def test_created_by_the_owner(self):
+        assert with_owner(self.ev(organizer_self=True))
+        assert with_owner(self.ev(organizer_self=True, my_response="accepted"))
+        assert not with_owner(self.ev(organizer_self=True, my_response="declined"))
+
+    def test_invites_from_a_person_count_only_when_accepted(self):
+        person = dict(organizer_email="friend@example.com")
+        assert with_owner(self.ev(**person, my_response="accepted"))
+        for status in ("declined", "tentative", "needsAction", None):
+            assert not with_owner(self.ev(**person, my_response=status))
+
+    def test_invites_from_a_calendar_never_count(self):
+        for addr in ("abc123@group.calendar.google.com", "xyz@import.calendar.google.com"):
+            assert not with_owner(self.ev(organizer_email=addr, my_response="accepted"))
+
+    def test_muted_event_or_series(self):
+        e = self.ev(organizer_self=True, event_id="e1_20260107", recurring_event_id="e1")
+        assert series_id(e) == "e1"
+        assert not with_owner(e, muted={"e1"}) and not with_owner(e, muted={"e1_20260107"})
+        assert with_owner(e, muted={"other"})
+        assert series_id(self.ev(event_id="solo")) == "solo"
 
 
 class TestHelperFunctions:

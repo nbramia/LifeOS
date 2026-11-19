@@ -313,27 +313,39 @@ category.
 
 People the wearer was probably with in a time window, best first. Ranked from
 interaction metadata only: calendar events in or near the window that the
-person was invited to or, with `LIFEOS_LIKELY_PRESENT_TITLE_NAMES` on, is
-named in (by title, events with no invitees included; reason `named in an
-event at HH:MM`), messages, calls, emails and Slack messages in the six
-hours before it (closer is stronger), in-person days with the person at the
-same time of day and day type (three or more days count as recurring), and
-relationship strength as a tie-breaker. The wearer, hidden people and services
-are never returned.
+person was invited to or is named in (by title, events with no invitees
+included; reason `named in an event at HH:MM`; `LIFEOS_LIKELY_PRESENT_TITLE_NAMES`,
+on by default), messages, calls, emails and Slack messages in the six hours
+before it (closer is stronger), in-person days with the person at the same time
+of day and day type (three or more days count as recurring), and relationship
+strength as a tie-breaker. The wearer, hidden people and services are never
+returned.
+
+A calendar event counts only when it says the wearer was there
+(`calendar.with_owner`): the wearer created it and hasn't declined, or accepted
+an invite a person sent. An invite sent by a calendar (a family member's,
+shared or secondary calendar, where "accepted" is automatic), an invite
+declined, unanswered or answered "maybe", and any event or series listed in
+`muted` count for nothing, by invitation or by title. An invitation whose event
+can't be read from the calendar still counts.
 
 A title names a person by a full name (canonical, display or alias) that only
 one person carries, or by a capitalized first name of a close contact
 (relationship strength 20 or more, with an email or phone number): one no
 other close contact shares, or the closest of several when at least twice as
-strong as the next. Common title words ("All", "Team", "Lunch", ...) are never
-first names. Events come from the configured Google calendars, a local day at a
-time, cached 15 minutes (past days 6 hours); mass meetings are skipped, and a
-calendar that fails or takes over 4 seconds leaves the other signals. No title
-text reaches the response.
+strong as the next. A first name followed, after a plain space, by a
+capitalized word that isn't one of that person's other names is someone else
+("with Hayley Williams"). Common title words ("All", "Team", "Lunch", ...) are
+never first names. Events come from the configured Google calendars, a local
+day at a time, cached 15 minutes (past days 6 hours); mass meetings are
+skipped, and a calendar that fails or takes over 4 seconds leaves the other
+signals. No title text reaches the response.
 
 **Query Parameters:**
 - `start` (ISO 8601, required): Window start. A value without an offset is UTC.
 - `end` (ISO 8601, required): Window end, at most 12 hours after `start`.
+- `muted` (optional): comma-separated calendar event or series ids (a recurring
+  event's `recurring_event_id`, else its `event_id`) that count for nothing.
 - `limit` (integer, optional, default 5, max 10): Max people to return.
 
 **Response:**

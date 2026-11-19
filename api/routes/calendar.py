@@ -14,6 +14,7 @@ from api.services.calendar import (
     get_calendar_service,
     CalendarEvent,
     format_event_time,
+    with_owner,
 )
 from api.services.google_auth import resolve_account
 from api.services.meeting_prep import get_meeting_prep
@@ -56,6 +57,11 @@ class EventResponse(BaseModel):
     location: Optional[str] = None
     is_all_day: bool
     source_account: str
+    organizer_email: Optional[str] = None
+    organizer_self: bool = False
+    my_response: Optional[str] = None
+    recurring_event_id: Optional[str] = None
+    with_owner: bool = True
 
 
 class UpcomingResponse(BaseModel):
@@ -127,6 +133,11 @@ def _event_to_response(event: CalendarEvent) -> EventResponse:
         location=event.location,
         is_all_day=event.is_all_day,
         source_account=event.source_account,
+        organizer_email=event.organizer_email,
+        organizer_self=event.organizer_self,
+        my_response=event.my_response,
+        recurring_event_id=event.recurring_event_id,
+        with_owner=with_owner(event),
     )
 
 

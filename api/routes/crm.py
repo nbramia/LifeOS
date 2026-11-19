@@ -926,6 +926,10 @@ def likely_present_people(
     start: str = Query(description="Window start, ISO 8601 (no offset means UTC)"),
     end: str = Query(description="Window end, ISO 8601; at most 12 hours after start"),
     limit: int = Query(default=5, ge=1, le=10, description="Max people to return"),
+    muted: Optional[str] = Query(
+        default=None, max_length=8000,
+        description="Comma-separated calendar event or series ids that say nothing about who the wearer was with",
+    ),
 ):
     """
     People the wearer was probably with in a time window, best first.
@@ -939,7 +943,8 @@ def likely_present_people(
     start_dt = _parse_window_bound(start, "start")
     end_dt = _parse_window_bound(end, "end")
     try:
-        people = likely_present(start_dt, end_dt, limit)
+        muted_ids = [m.strip() for m in (muted or "").split(",") if m.strip()]
+        people = likely_present(start_dt, end_dt, limit, muted=muted_ids)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return LikelyPresentResponse(start=start, end=end, people=people)

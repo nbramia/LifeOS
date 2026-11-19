@@ -1854,12 +1854,12 @@ class Settings(BaseSettings):
     )
 
     likely_present_title_names: bool = Field(
-        default=False,
+        default=True,
         alias="LIFEOS_LIKELY_PRESENT_TITLE_NAMES",
-        description="When true, people named in the titles of calendar events "
-                    "near the window count toward the likely-present ranking. "
-                    "Off by default: an event can name someone whose own "
-                    "activity it is, with the owner elsewhere."
+        description="When true (the default), people named in the titles of "
+                    "calendar events near the window count toward the "
+                    "likely-present ranking, only for events that say the "
+                    "owner was there (calendar.with_owner)."
     )
     likely_present_read_messages: bool = Field(
         default=False,
