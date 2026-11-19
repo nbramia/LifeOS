@@ -313,8 +313,9 @@ category.
 
 People the wearer was probably with in a time window, best first. Ranked from
 interaction metadata only: calendar events in or near the window that the
-person was invited to or is named in (by title, events with no invitees
-included; reason `named in an event at HH:MM`), messages, calls, emails and Slack messages in the six
+person was invited to or, with `LIFEOS_LIKELY_PRESENT_TITLE_NAMES` on, is
+named in (by title, events with no invitees included; reason `named in an
+event at HH:MM`), messages, calls, emails and Slack messages in the six
 hours before it (closer is stronger), in-person days with the person at the
 same time of day and day type (three or more days count as recurring), and
 relationship strength as a tie-breaker. The wearer, hidden people and services

@@ -1841,6 +1841,14 @@ class Settings(BaseSettings):
                     "YYYY-MM-DD. In-person rows link to it."
     )
 
+    likely_present_title_names: bool = Field(
+        default=False,
+        alias="LIFEOS_LIKELY_PRESENT_TITLE_NAMES",
+        description="When true, people named in the titles of calendar events "
+                    "near the window count toward the likely-present ranking. "
+                    "Off by default: an event can name someone whose own "
+                    "activity it is, with the owner elsewhere."
+    )
     likely_present_read_messages: bool = Field(
         default=False,
         alias="LIFEOS_LIKELY_PRESENT_READ_MESSAGES",

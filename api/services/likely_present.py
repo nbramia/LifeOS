@@ -2,7 +2,8 @@
 
 Ranks people from interaction metadata alone: calendar invitations near the
 window, people named in the titles of calendar events near the window (events
-with no invitees included), messages, calls and emails in the hours before it,
+with no invitees included; only with LIFEOS_LIKELY_PRESENT_TITLE_NAMES on,
+since an event can name someone whose own activity it is), messages, calls and emails in the hours before it,
 in-person days at the same time of day and day type, and relationship strength
 as a tie-breaker. Reasons are fixed labels; no message, email, note or event
 title text reaches the result.
@@ -420,7 +421,7 @@ def title_people(title: str, index) -> list[str]:
 def _title_signals(start: datetime, end: datetime, resolve, store) -> list[tuple[str, float, str]]:
     """(person id, weight, reason) for people named in event titles near the window,
     under the same time rules as invitations, mass meetings skipped."""
-    if store is None:
+    if store is None or not settings.likely_present_title_names:
         return []
     events = [ev for ev in _events_near(start, end)
               if ev.attendees <= InteractionConfig.MASS_MEETING_ATTENDEE_LIMIT]
