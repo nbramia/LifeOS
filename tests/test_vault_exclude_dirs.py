@@ -3,7 +3,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from api.services import indexer as indexer_module
 from api.services.indexer import IndexerService, excluded_prefixes, is_excluded_path
 from config.settings import settings
 

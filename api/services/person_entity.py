@@ -14,10 +14,11 @@ import re
 import sqlite3
 import threading
 import uuid
-from dataclasses import dataclass, field, asdict
-from datetime import datetime, timedelta, timezone
+from collections.abc import Iterable
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Iterable, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from api.services.people_aggregator import PersonRecord
@@ -29,9 +30,9 @@ from api.services.social_links import (
     find_account_for_url,
     merge_entries,
     merge_social_links,
+    parse_social_value,
     reconcile_entries,
     reconcile_linkedin,
-    parse_social_value,
     social_identity,
     social_link_id,
 )
@@ -78,9 +79,9 @@ class PersonEntity:
     emails: list[str] = field(default_factory=list)
 
     # Professional info
-    company: Optional[str] = None
-    position: Optional[str] = None
-    linkedin_url: Optional[str] = None
+    company: str | None = None
+    position: str | None = None
+    linkedin_url: str | None = None
 
     # Context
     category: str = "unknown"  # work, personal, family
@@ -90,8 +91,8 @@ class PersonEntity:
     sources: list[str] = field(default_factory=list)  # linkedin, gmail, calendar, vault, granola
 
     # Timestamps
-    first_seen: Optional[datetime] = None
-    last_seen: Optional[datetime] = None
+    first_seen: datetime | None = None
+    last_seen: datetime | None = None
 
     # Aggregated stats
     meeting_count: int = 0
@@ -107,7 +108,7 @@ class PersonEntity:
 
     # Phone numbers (E.164 format: +1XXXXXXXXXX)
     phone_numbers: list[str] = field(default_factory=list)
-    phone_primary: Optional[str] = None  # Preferred phone (mobile > business > home)
+    phone_primary: str | None = None  # Preferred phone (mobile > business > home)
 
     # Resolution metadata
     confidence_score: float = 1.0  # 0.0-1.0, how confident we are in merges
@@ -116,18 +117,18 @@ class PersonEntity:
     tags: list[str] = field(default_factory=list)  # User-defined tags
     notes: str = ""  # User notes about the person
     source_entity_count: int = 0  # Count of linked SourceEntity records
-    birthday: Optional[str] = None  # Birthday as "MM-DD" (month-day only, no year)
+    birthday: str | None = None  # Birthday as "MM-DD" (month-day only, no year)
 
     # Hidden person (soft delete)
     # When hidden=True, person is excluded from search/list results and their
     # emails/phones are added to a blocklist to prevent sync recreation.
     hidden: bool = False
-    hidden_at: Optional[datetime] = None
+    hidden_at: datetime | None = None
     hidden_reason: str = ""
 
     # Relationship strength (computed, not stored - see relationship_metrics.py)
     # Formula: (recency × 0.3) + (frequency × 0.6) + (diversity × 0.1)
-    _relationship_strength: Optional[float] = field(default=None, repr=False)
+    _relationship_strength: float | None = field(default=None, repr=False)
 
     # Peripheral contact flag - True means excluded from expensive aggregations
     # Set automatically when relationship_strength < PERIPHERAL_THRESHOLD (default 3.0)
@@ -135,7 +136,7 @@ class PersonEntity:
 
     # Pre-computed Dunbar circle (0-6 for meaningful contacts, 7 for peripheral)
     # Calculated based on relationship_strength ranking among non-peripheral contacts
-    dunbar_circle: Optional[int] = None
+    dunbar_circle: int | None = None
 
     # Accounts per registered platform; see api/services/social_links.py
     social_links: list[dict] = field(default_factory=list)
@@ -180,11 +181,11 @@ class PersonEntity:
         ]
         self.reconcile_contact_details()
 
-    def find_social_link(self, link_id: str) -> Optional[dict]:
+    def find_social_link(self, link_id: str) -> dict | None:
         """Return the link addressed by an API link id."""
         return next((item for item in self.social_links if social_link_id(item) == link_id), None)
 
-    def find_contact_entry(self, kind: str, entry_id: str) -> Optional[dict]:
+    def find_contact_entry(self, kind: str, entry_id: str) -> dict | None:
         """Return the email or phone entry addressed by an API entry id."""
         entries = self.email_entries if kind == "email" else self.phone_entries
         return next((e for e in entries if contact_entry_id(kind, e["value"]) == entry_id), None)
@@ -228,7 +229,7 @@ class PersonEntity:
             self.dismissed_social_keys.append(identity)
         self._refresh_primary_linkedin()
 
-    def label_contact_entry(self, kind: str, value: str, label: Optional[str]) -> None:
+    def label_contact_entry(self, kind: str, value: str, label: str | None) -> None:
         """Set the label on the entry for an existing email or phone."""
         self.reconcile_contact_details()
         entries = self.email_entries if kind == "email" else self.phone_entries
@@ -271,7 +272,7 @@ class PersonEntity:
             raise ValueError("PersonEntity.canonical_name is required")
 
     @property
-    def primary_email(self) -> Optional[str]:
+    def primary_email(self) -> str | None:
         """Get the primary (first) email address."""
         return self.emails[0] if self.emails else None
 
@@ -376,13 +377,13 @@ class PersonEntity:
 
         # Take earliest first_seen (use _make_aware for safe comparison)
         first_seen = self.first_seen
-        if other.first_seen:
+        if other.first_seen:  # noqa: SIM102
             if first_seen is None or _make_aware(other.first_seen) < _make_aware(first_seen):
                 first_seen = other.first_seen
 
         # Take latest last_seen (use _make_aware for safe comparison)
         last_seen = self.last_seen
-        if other.last_seen:
+        if other.last_seen:  # noqa: SIM102
             if last_seen is None or _make_aware(other.last_seen) > _make_aware(last_seen):
                 last_seen = other.last_seen
 
@@ -643,7 +644,7 @@ class PersonEntityStore:
     _PLACEHOLDERS = ", ".join(["?"] * len(_COLUMNS))
     _COLUMNS_STR = ", ".join(_COLUMNS)
 
-    def __init__(self, db_path: str = None):
+    def __init__(self, db_path: str = None):  # noqa: RUF013
         """
         Initialize the entity store.
 
@@ -661,7 +662,7 @@ class PersonEntityStore:
         ] = {}
         self._get_all_cache_generation = 0
         self._get_all_cache_lock = threading.Lock()
-        self._data_version_conn: Optional[sqlite3.Connection] = None
+        self._data_version_conn: sqlite3.Connection | None = None
         self._init_db()
         self._load_blocklist()
         self._load_merged_ids()
@@ -947,7 +948,7 @@ class PersonEntityStore:
             conn.close()
             if self._blocklist:
                 logger.info(f"Loaded {len(self._blocklist)} blocked identifiers")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning(f"Failed to load blocklist: {e}")
 
     def is_blocked(self, identifier: str) -> bool:
@@ -973,14 +974,14 @@ class PersonEntityStore:
                 (identifier, identifier_type, person_name, reason, created_at)
                 VALUES (?, ?, ?, ?, ?)
             """, (identifier, identifier_type, person_name, reason,
-                  datetime.now(timezone.utc).isoformat()))
+                  datetime.now(UTC).isoformat()))
             conn.commit()
         finally:
             conn.close()
         self._bump_get_all_cache_generation()
         self._blocklist.add(identifier)
 
-    def hide_person(self, entity_id: str, reason: str = "") -> Optional[PersonEntity]:
+    def hide_person(self, entity_id: str, reason: str = "") -> PersonEntity | None:
         """
         Hide a person (soft delete) and blocklist their identifiers.
 
@@ -1000,7 +1001,7 @@ class PersonEntityStore:
 
         # Mark as hidden
         entity.hidden = True
-        entity.hidden_at = datetime.now(timezone.utc)
+        entity.hidden_at = datetime.now(UTC)
         entity.hidden_reason = reason
 
         # Add all emails and phones to blocklist
@@ -1033,7 +1034,7 @@ class PersonEntityStore:
         Returns:
             Number of entities permanently deleted
         """
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).isoformat()
+        cutoff = (datetime.now(UTC) - timedelta(days=older_than_days)).isoformat()
 
         conn = self._get_connection()
         try:
@@ -1098,7 +1099,7 @@ class PersonEntityStore:
                     merged_ids = json.load(f)
                 if merged_ids:
                     logger.info(f"Loaded {len(merged_ids)} merged ID mappings")
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.warning(f"Failed to load merged IDs: {e}")
                 return
         with self._get_all_cache_lock:
@@ -1122,7 +1123,7 @@ class PersonEntityStore:
         """
         self._bump_get_all_cache_generation()
 
-    def add(self, entity: PersonEntity) -> Optional[PersonEntity]:
+    def add(self, entity: PersonEntity) -> PersonEntity | None:
         """
         Add a new entity to the store.
 
@@ -1226,7 +1227,7 @@ class PersonEntityStore:
         finally:
             conn.close()
 
-    def get_by_id(self, entity_id: str) -> Optional[PersonEntity]:
+    def get_by_id(self, entity_id: str) -> PersonEntity | None:
         """
         Get entity by ID, following merge chain if needed.
 
@@ -1350,7 +1351,7 @@ class PersonEntityStore:
         finally:
             conn.close()
 
-    def get_by_email(self, email: str) -> Optional[PersonEntity]:
+    def get_by_email(self, email: str) -> PersonEntity | None:
         """Get entity by email address (case-insensitive), following merge chain."""
         conn = self._get_connection()
         try:
@@ -1363,7 +1364,7 @@ class PersonEntityStore:
         finally:
             conn.close()
 
-    def get_by_phone(self, phone: str) -> Optional[PersonEntity]:
+    def get_by_phone(self, phone: str) -> PersonEntity | None:
         """Get entity by phone number (normalizes to E.164), following merge chain."""
         from api.services.phone_utils import normalize_phone
         normalized = normalize_phone(phone)
@@ -1396,7 +1397,7 @@ class PersonEntityStore:
                 owners[entity.id] = entity
         return list(owners.values())
 
-    def get_by_social_link(self, platform: str, value: str) -> Optional[PersonEntity]:
+    def get_by_social_link(self, platform: str, value: str) -> PersonEntity | None:
         """Get the person with this profile URL or handle.
 
         Returns None for an unparseable value, or when more than one person
@@ -1409,7 +1410,7 @@ class PersonEntityStore:
         owners = self.get_social_link_owners(platform, account.match_key)
         return owners[0] if len(owners) == 1 else None
 
-    def get_by_name(self, name: str) -> Optional[PersonEntity]:
+    def get_by_name(self, name: str) -> PersonEntity | None:
         """Get entity by canonical name or alias (case-insensitive), following merge chain."""
         conn = self._get_connection()
         try:
@@ -1458,7 +1459,7 @@ class PersonEntityStore:
         conn = self._get_connection()
         try:
             conditions = [
-                "(LOWER(canonical_name) LIKE ? ESCAPE '\\' OR LOWER(display_name) LIKE ? ESCAPE '\\' "
+                "(LOWER(canonical_name) LIKE ? ESCAPE '\\' OR LOWER(display_name) LIKE ? ESCAPE '\\' "  # noqa: ISC004
                 "OR LOWER(emails) LIKE ? ESCAPE '\\' OR LOWER(aliases) LIKE ? ESCAPE '\\')"
             ]
             params: list = [pattern, pattern, pattern, pattern]
@@ -1513,7 +1514,7 @@ class PersonEntityStore:
         conn = self._get_connection()
         try:
             conditions = [
-                "(LOWER(canonical_name) LIKE ? ESCAPE '\\' OR LOWER(display_name) LIKE ? ESCAPE '\\' "
+                "(LOWER(canonical_name) LIKE ? ESCAPE '\\' OR LOWER(display_name) LIKE ? ESCAPE '\\' "  # noqa: ISC004
                 "OR LOWER(emails) LIKE ? ESCAPE '\\' OR LOWER(aliases) LIKE ? ESCAPE '\\')"
             ]
             params: list = [pattern, pattern, pattern, pattern]
@@ -1539,7 +1540,7 @@ class PersonEntityStore:
         finally:
             conn.close()
 
-    def list_recent(self, limit: int = 50, category: Optional[str] = None,
+    def list_recent(self, limit: int = 50, category: str | None = None,
                      include_hidden: bool = False,
                      include_merged: bool = False) -> list[PersonEntity]:
         """
@@ -1683,7 +1684,7 @@ class PersonEntityStore:
         finally:
             conn.close()
 
-    def export_json(self, path: str = None) -> str:
+    def export_json(self, path: str = None) -> str:  # noqa: RUF013
         """
         Export all entities to JSON file for backup.
 
@@ -1704,7 +1705,7 @@ class PersonEntityStore:
 
 
 # Singleton instance
-_entity_store: Optional[PersonEntityStore] = None
+_entity_store: PersonEntityStore | None = None
 # CRM/people/photos handlers run on worker threads, not the event loop, so
 # two first-requests after a restart can race this check-and-set.
 # Double-checked locking: the lock is only taken while _entity_store is
@@ -1712,7 +1713,7 @@ _entity_store: Optional[PersonEntityStore] = None
 _entity_store_lock = threading.Lock()
 
 
-def get_person_entity_store(db_path: str = None) -> PersonEntityStore:
+def get_person_entity_store(db_path: str = None) -> PersonEntityStore:  # noqa: RUF013
     """
     Get or create the singleton PersonEntityStore.
 
@@ -1742,11 +1743,11 @@ def _load_family_config():
             with open(config_path) as f:
                 config = json.load(f)
             return (
-                set(name.lower() for name in config.get("family_last_names", [])),
-                set(name.lower() for name in config.get("family_exact_names", [])),
+                set(name.lower() for name in config.get("family_last_names", [])),  # noqa: C401
+                set(name.lower() for name in config.get("family_exact_names", [])),  # noqa: C401
                 set(config.get("family_person_ids", []))
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning(f"Failed to load family config: {e}")
     return set(), set(), set()
 
@@ -1769,7 +1770,7 @@ def _check_family_config_coverage(last_names: set, exact_names: set) -> None:
         return
     try:
         people = get_person_entity_store().get_all(include_hidden=True, include_merged=True)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning(f"Could not verify family config coverage: {e}")
         return
 
@@ -1825,7 +1826,7 @@ def _is_family_member(name: str) -> bool:
     return False
 
 
-def compute_person_category(person: PersonEntity, source_entities: list = None) -> str:
+def compute_person_category(person: PersonEntity, source_entities: list = None) -> str:  # noqa: RUF013
     """
     Compute category with priority: self → family → work → personal.
 
@@ -1836,8 +1837,8 @@ def compute_person_category(person: PersonEntity, source_entities: list = None) 
     4. Otherwise → personal
     """
     # Import here to avoid circular dependency
-    from config.settings import settings
     from api.services.source_entity import get_source_entity_store
+    from config.settings import settings
 
     work_email_domains = settings.work_email_domains if settings.work_email_domains else ["example.com"]
 

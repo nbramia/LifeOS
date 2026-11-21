@@ -12,11 +12,16 @@ spellings of one profile compare equal. Labeled email and phone entries are
 import hashlib
 import re
 import unicodedata
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Optional
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
-from config.social_platforms import PLATFORMS_BY_KEY, SOCIAL_PLATFORMS, ProfileRule, SocialPlatform
+from config.social_platforms import (
+    PLATFORMS_BY_KEY,
+    SOCIAL_PLATFORMS,
+    ProfileRule,
+    SocialPlatform,
+)
 
 MAX_LABEL_LENGTH = 64
 LINKEDIN = "linkedin"
@@ -31,12 +36,12 @@ class InvalidContactDetail(ValueError):
 class ParsedAccount:
     """A social value resolved to one account on a platform."""
 
-    url: Optional[str]
+    url: str | None
     handle: str
     match_key: str
 
 
-def normalize_label(label: Optional[str]) -> Optional[str]:
+def normalize_label(label: str | None) -> str | None:
     """Return a free-text label with collapsed whitespace, or None when blank."""
     if label is None:
         return None
@@ -67,7 +72,7 @@ def _account(
     identifier: str,
     kind: str,
     preserve_case: bool,
-    url_template: Optional[str],
+    url_template: str | None,
 ) -> ParsedAccount:
     url = url_template.format(id=quote(identifier, safe="@/")) if url_template else None
     comparable = identifier if preserve_case else identifier.lower()
@@ -85,7 +90,7 @@ def _unwrap_doubled_url(raw: str) -> str:
     return raw[start:] if start > 0 else raw
 
 
-def _apply_rule(platform: SocialPlatform, rule: ProfileRule, path: str, query: str) -> Optional[ParsedAccount]:
+def _apply_rule(platform: SocialPlatform, rule: ProfileRule, path: str, query: str) -> ParsedAccount | None:
     match = re.match(rule.pattern, path, re.IGNORECASE)
     if not match:
         return None
@@ -108,7 +113,7 @@ def _apply_rule(platform: SocialPlatform, rule: ProfileRule, path: str, query: s
     )
 
 
-def _parse_url(platform: SocialPlatform, raw: str) -> Optional[ParsedAccount]:
+def _parse_url(platform: SocialPlatform, raw: str) -> ParsedAccount | None:
     parts = urlsplit(raw)
     host = (parts.hostname or "").lower()
     if parts.scheme.lower() not in ("http", "https") or not _host_matches(platform, host):
@@ -148,7 +153,7 @@ def parse_social_value(platform_key: str, value: str) -> ParsedAccount:
     return _account(platform, handle, "", False, platform.url_template)
 
 
-def find_account_for_url(value: str) -> Optional[tuple[str, ParsedAccount]]:
+def find_account_for_url(value: str) -> tuple[str, ParsedAccount] | None:
     """Identify which registered platform a profile URL belongs to."""
     raw = _unwrap_doubled_url((value or "").strip())
     for platform in SOCIAL_PLATFORMS:
@@ -164,7 +169,7 @@ def find_account_for_url(value: str) -> Optional[tuple[str, ParsedAccount]]:
 def build_social_link(
     platform: str,
     value: str,
-    label: Optional[str] = None,
+    label: str | None = None,
     source: str = "manual",
 ) -> dict:
     """Build a validated link, raising InvalidContactDetail on a bad value."""
@@ -263,11 +268,11 @@ def merge_social_links(target: list[dict], incoming: list[dict]) -> list[dict]:
 
 def reconcile_linkedin(
     links: list[dict],
-    linkedin_url: Optional[str],
+    linkedin_url: str | None,
     dismissed: list[str],
     *,
     empty_means_cleared: bool,
-) -> tuple[list[dict], Optional[str]]:
+) -> tuple[list[dict], str | None]:
     """Keep ``linkedin_url`` and the first LinkedIn link pointing at one account.
 
     Sync jobs and repair scripts assign ``linkedin_url`` directly, so a new

@@ -5,34 +5,41 @@ Watches the Obsidian vault for file changes and indexes content to ChromaDB.
 Supports incremental indexing based on file modification times.
 """
 import gc
-import os
 import json
-import threading
 import logging
+import os
+import threading
+from datetime import UTC, datetime
 from pathlib import Path
-from datetime import datetime, timezone
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler, FileSystemEvent
 
-from api.services.chunker import chunk_document, extract_frontmatter, add_context_to_chunks, normalize_tags, tag_phrase_key
-from api.services.vectorstore import VectorStore, is_people_tag
+from watchdog.events import FileSystemEvent, FileSystemEventHandler
+from watchdog.observers import Observer
+
 from api.services.bm25_index import BM25Index
+from api.services.chunker import (
+    add_context_to_chunks,
+    chunk_document,
+    extract_frontmatter,
+    normalize_tags,
+    tag_phrase_key,
+)
 from api.services.people import extract_people_from_text, people_from_tags
+from api.services.vectorstore import VectorStore, is_people_tag
 from config.settings import settings
 
 # V2 People System integration
 try:
     from api.services.entity_resolver import EntityResolver, get_entity_resolver  # noqa: F401
     from api.services.interaction_store import (
-        InteractionStore,  # noqa: F401
-        get_interaction_store,
-        create_vault_interaction,
         UNDATED_SENTINEL,
+        InteractionStore,  # noqa: F401
+        create_vault_interaction,
+        get_interaction_store,
     )
     from api.services.source_entity import (
-        get_source_entity_store,
-        create_vault_source_entity,
         create_granola_source_entity,
+        create_vault_source_entity,
+        get_source_entity_store,
     )
     HAS_V2_PEOPLE = True
 except ImportError:
@@ -53,7 +60,7 @@ def _mtime_trust_cutoff() -> datetime | None:
     if not raw:
         return None
     try:
-        return datetime.strptime(raw, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        return datetime.strptime(raw, "%Y-%m-%d").replace(tzinfo=UTC)
     except ValueError:
         logger.warning(
             "LIFEOS_VAULT_MTIME_TRUSTED_AFTER=%r is not a valid YYYY-MM-DD date; "
@@ -77,8 +84,8 @@ def _resolve_undated_note_date(path) -> datetime:
     if _MTIME_TRUST_CUTOFF is None:
         return UNDATED_SENTINEL
     try:
-        mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
-    except Exception:
+        mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+    except Exception:  # noqa: BLE001
         return UNDATED_SENTINEL
     if mtime > _MTIME_TRUST_CUTOFF:
         return mtime
@@ -150,7 +157,7 @@ class VaultEventHandler(FileSystemEventHandler):
                     self.indexer.delete_file(file_path)
                 else:
                     self.indexer.index_file(file_path)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"Failed to {action} {file_path}: {e}")
 
     def on_created(self, event: FileSystemEvent):
@@ -246,14 +253,14 @@ class IndexerService:
             try:
                 from api.services.vault_tag_store import VaultTagStore
                 self._tag_store = VaultTagStore()
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.warning(f"Tag store unavailable, indexing without tag phrases: {e}")
                 self._tag_store_failed = True
                 return None
         try:
             key = Path(path).relative_to(self.vault_path).as_posix()
             return self._tag_store.get(key)
-        except Exception:
+        except Exception:  # noqa: BLE001
             return None
 
     def _load_index_state(self) -> dict:
@@ -262,7 +269,7 @@ class IndexerService:
         if state_path.exists():
             try:
                 return json.loads(state_path.read_text())
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.warning(f"Failed to load index state: {e}")
         return {}
 
@@ -341,7 +348,7 @@ class IndexerService:
                 index_state.pop(file_path, None)
                 tag_keys.pop(file_path, None)
                 logger.info(f"Removed deleted file from index: {file_path}")
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"Failed to remove {file_path} from index: {e}")
 
         # Index changed files, saving progress incrementally
@@ -371,11 +378,11 @@ class IndexerService:
                         import torch
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
-                    except Exception:
+                    except Exception:  # noqa: BLE001, S110
                         pass
                     logger.info(f"  Indexed {count}/{len(files_to_index)} files (progress saved)...")
 
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"Failed to index {file_path}: {e}")
 
         # Final save
@@ -411,14 +418,14 @@ class IndexerService:
             Set of affected person IDs if skip_stats_refresh=True, else None
         """
         path = Path(file_path)
-        if not path.exists() or not path.suffix == ".md":
+        if not path.exists() or not path.suffix == ".md":  # noqa: SIM201
             return
         if is_excluded_path(self.vault_path, path):
             return
 
         try:
             content = path.read_text(encoding="utf-8")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.error(f"Failed to read {file_path}: {e}")
             return
 
@@ -427,7 +434,7 @@ class IndexerService:
             try:
                 from api.services.task_manager import get_task_manager
                 get_task_manager().reindex_file(str(path))
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.warning(f"Task reindex failed for {file_path}: {e}")
 
         # Extract frontmatter
@@ -454,12 +461,11 @@ class IndexerService:
         affected_person_ids: set[str] = set()
         if HAS_V2_PEOPLE and all_people:
             try:
-                from datetime import timezone
                 note_date_str = self._extract_note_date(path, frontmatter, body)
 
                 if note_date_str:
                     # Dated note: use extracted date
-                    note_date = datetime.strptime(note_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                    note_date = datetime.strptime(note_date_str, "%Y-%m-%d").replace(tzinfo=UTC)
                 else:
                     # Undated note: fall back to filesystem mtime so the
                     # interaction lands on the timeline at a meaningful date
@@ -487,7 +493,7 @@ class IndexerService:
                     from api.services.person_stats import refresh_person_stats
                     refresh_person_stats(list(affected_person_ids))
 
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.warning(f"Failed to sync people to v2 for {file_path}: {e}")
 
         # Build metadata - use resolve() to get real path (handles symlinks like /var -> /private/var)
@@ -528,7 +534,10 @@ class IndexerService:
         if not skip_summaries:
             try:
                 from api.services.summarizer import (
-                    generate_summary, get_summary_tier, SummaryTier, add_summary_failure
+                    SummaryTier,
+                    add_summary_failure,
+                    generate_summary,
+                    get_summary_tier,
                 )
 
                 tier = get_summary_tier(file_path)
@@ -554,7 +563,7 @@ class IndexerService:
                     elif not success:
                         # Track failure for retry at end of indexing
                         add_summary_failure(file_path, path.name)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.warning(f"Summary generation failed for {file_path}: {e}")
 
         logger.debug(f"Indexed {file_path} with {len(chunks)} chunks")
@@ -590,7 +599,9 @@ class IndexerService:
             Number of files successfully retried
         """
         from api.services.summarizer import (
-            load_summary_failures, clear_summary_failures, retry_summary
+            clear_summary_failures,
+            load_summary_failures,
+            retry_summary,
         )
 
         failures = load_summary_failures()
@@ -630,7 +641,7 @@ class IndexerService:
                     )
                     success_count += 1
 
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.warning(f"Retry failed for {file_path}: {e}")
 
         # Clear failures list after processing
@@ -755,7 +766,7 @@ class IndexerService:
                 source_entity.canonical_person_id = entity.id
                 source_entity.link_confidence = result.confidence
                 source_entity.link_method = result.match_type
-                source_entity.linked_at = datetime.now(timezone.utc)
+                source_entity.linked_at = datetime.now(UTC)
 
                 # Add or update (handles duplicates on re-index)
                 source_entity_store.add_or_update(source_entity)
@@ -782,7 +793,7 @@ class IndexerService:
                         f"({result.match_type}, conf={result.confidence:.2f})"
                     )
 
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.warning(
                     f"Failed to sync person '{person_name}' to v2: {e}"
                 )

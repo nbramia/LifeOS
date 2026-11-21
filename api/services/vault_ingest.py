@@ -19,12 +19,13 @@ import logging
 import re
 import threading
 import uuid
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from email import policy as email_policy
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from config.settings import settings
 
@@ -386,7 +387,7 @@ def render_note(
     *,
     uploaded_at: datetime | None = None,
 ) -> str:
-    uploaded_at = uploaded_at or datetime.now(timezone.utc)
+    uploaded_at = uploaded_at or datetime.now(UTC)
     tags = ["upload"] + (analysis["tags"] if analysis else [])
     lines = [
         "---",
@@ -485,7 +486,7 @@ def process_file(job: dict[str, Any], *, client: Any = None, index: Callable[[Pa
         text, info = extract_text(path)
         _set(job, status="analyzing")
         analysis, status = analyze(path, text, _vault_folders(), client=client)
-        rel = path.relative_to(root).as_posix()
+        rel = path.relative_to(root).as_posix()  # noqa: F841
         note_path = unique_path(path.parent, path.name + ".md")
         _set(job, status="writing")
         note_path.write_text(render_note(path, text, info, analysis, status), encoding="utf-8")
@@ -499,7 +500,7 @@ def process_file(job: dict[str, Any], *, client: Any = None, index: Callable[[Pa
             analysis=analysis,
             message=status if not analysis else "",
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.exception("processing failed for %s", job.get("path"))
         _set(job, status="error", error=f"{type(exc).__name__}: {exc}")
 
@@ -515,7 +516,7 @@ def start_job(abs_path: Path, rel_path: str, *, submit: bool = True, **kwargs: A
         "analysis": None,
         "message": "",
         "error": None,
-        "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "created": datetime.now(UTC).isoformat(timespec="seconds"),
     }
     with _JOBS_LOCK:
         _JOBS[job["id"]] = job

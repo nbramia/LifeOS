@@ -9,7 +9,7 @@ import os
 import shutil
 import subprocess
 import sys
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -21,8 +21,8 @@ pytestmark = pytest.mark.unit
 
 REPO = Path(__file__).resolve().parent.parent
 TOKEN = "secret_FAKE_TOKEN_0123456789"
-NOW = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
-UTC = timezone.utc
+NOW = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+UTC = UTC  # noqa: PLW0127
 
 
 # ---------------------------------------------------------------------------
@@ -690,7 +690,7 @@ def test_run_caps_field_updates_and_id_writes_separately(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_abort_when_under_half_match_writes_nothing(tmp_path):
-    pages, people, dexmap = many(3)
+    pages, people, dexmap = many(3)  # noqa: RUF059
     write_dexmap(tmp_path, {"d0": "L0"})
     client = FakeClient(pages)
     with pytest.raises(sync.MappingAbort):
@@ -2032,7 +2032,7 @@ def test_intent_line_is_on_disk_before_each_patch(tmp_path):
 
     pages = [page("p1", lifeos_id="L1", email="old@example.com", company="Old Co")]
     run(Checking(pages), [person("L1", emails=["new@example.com"], company="Acme")], tmp_path, execute=True)
-    page_id, phases, fields = snapshots[0]
+    page_id, phases, fields = snapshots[0]  # noqa: RUF059
     assert phases == ["intent", "intent"] and set(fields) == {"Email", "Company"}  # no result yet
     assert [l["phase"] for l in ledger_lines(tmp_path)] == ["intent", "intent", "result", "result"]
 
@@ -2279,7 +2279,7 @@ def test_possible_duplicates_by_surname_and_initial_are_not_created(tmp_path, ca
     people = [person("E", name="Somebody Else"), person("X", name=lifeos_name, message_count=4)]
     client = FakeClient(existing)
     with caplog.at_level(logging.WARNING, logger="notion_people_sync"):
-        stats = run(client, people, tmp_path, execute=True)
+        stats = run(client, people, tmp_path, execute=True)  # noqa: F841
     assert client.creates == []
     # an exact-name hit is reported as a possible match, a near hit as a possible duplicate
     assert "review by hand" in caplog.text
@@ -2422,7 +2422,7 @@ def _wrapper_env(tmp_path, token):
 
 @needs_bash
 def test_nightly_wrapper_skips_cleanly_without_token(tmp_path):
-    proc = subprocess.run(
+    proc = subprocess.run(  # noqa: PLW1510
         ["bash", str(REPO / "scripts" / "notion_people_sync_nightly.sh")],
         env=_wrapper_env(tmp_path, ""), capture_output=True, text=True, timeout=120,
     )
@@ -2436,7 +2436,7 @@ def test_nightly_wrapper_skips_cleanly_without_token(tmp_path):
 def test_nightly_wrapper_broken_python_is_an_error_not_a_skip(tmp_path):
     env = _wrapper_env(tmp_path, "")
     env["LIFEOS_VENV_PYTHON"] = str(tmp_path / "no-such-python")
-    proc = subprocess.run(
+    proc = subprocess.run(  # noqa: PLW1510
         ["bash", str(REPO / "scripts" / "notion_people_sync_nightly.sh")],
         env=env, capture_output=True, text=True, timeout=60,
     )
@@ -2452,7 +2452,7 @@ def test_nightly_wrapper_unexpected_check_output_is_an_error(tmp_path):
     stub.chmod(0o755)
     env = _wrapper_env(tmp_path, "")
     env["LIFEOS_VENV_PYTHON"] = str(stub)
-    proc = subprocess.run(
+    proc = subprocess.run(  # noqa: PLW1510
         ["bash", str(REPO / "scripts" / "notion_people_sync_nightly.sh")],
         env=env, capture_output=True, text=True, timeout=60,
     )
@@ -2474,14 +2474,14 @@ def test_nightly_wrapper_runs_execute_with_caps_and_propagates_status(tmp_path):
     env["LIFEOS_VENV_PYTHON"] = str(stub)
     script = str(REPO / "scripts" / "notion_people_sync_nightly.sh")
 
-    ok = subprocess.run(["bash", script], env=env, capture_output=True, text=True, timeout=60)
+    ok = subprocess.run(["bash", script], env=env, capture_output=True, text=True, timeout=60)  # noqa: PLW1510
     assert ok.returncode == 0
     log = (tmp_path / "logs" / "notion-people-sync.log").read_text()
     assert "sync_notion_people.py --execute --max-writes 100 --max-creates 25" in log and "done" in log
     assert TOKEN not in log
 
     env["STUB_RC"] = "3"
-    bad = subprocess.run(["bash", script], env=env, capture_output=True, text=True, timeout=60)
+    bad = subprocess.run(["bash", script], env=env, capture_output=True, text=True, timeout=60)  # noqa: PLW1510
     assert bad.returncode == 3
     assert "ERROR: sync exited 3" in (tmp_path / "logs" / "notion-people-sync.log").read_text()
 

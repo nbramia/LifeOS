@@ -1,7 +1,6 @@
 """Unit tests for vault file intake: names, extraction, analysis validation, and the sidecar note."""
-import csv
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -268,7 +267,7 @@ def test_note_has_frontmatter_sections_and_text(vault, tmp_path):
     analysis = vault_ingest._validated_analysis(GOOD, ["Reference"])
     note = vault_ingest.render_note(
         path, "Some extracted text", {"pages": 3}, analysis, "analyzed",
-        uploaded_at=datetime(2026, 11, 10, tzinfo=timezone.utc),
+        uploaded_at=datetime(2026, 11, 10, tzinfo=UTC),
     )
     assert note.startswith("---\ntype: upload\n")
     assert 'source_file: "lease.pdf"' in note and "uploaded: 2026-11-10" in note

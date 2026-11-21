@@ -61,9 +61,10 @@ import re
 import tempfile
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone, tzinfo
-from typing import Any, Callable, Optional
+from datetime import UTC, date, datetime, tzinfo
+from typing import Any
 from urllib.parse import unquote
 
 import httpx
@@ -163,7 +164,7 @@ logger = logging.getLogger("notion_people_sync")
 class NotionError(RuntimeError):
     """A Notion API failure. The message never contains the token."""
 
-    def __init__(self, message: str, status: Optional[int] = None, code: Optional[str] = None):
+    def __init__(self, message: str, status: int | None = None, code: str | None = None):
         super().__init__(message)
         self.status = status
         self.code = code
@@ -216,13 +217,13 @@ class RedactingFilter(logging.Filter):
 # Value helpers
 # ---------------------------------------------------------------------------
 
-def last10(value: Optional[str]) -> Optional[str]:
+def last10(value: str | None) -> str | None:
     """Last 10 digits of a phone number, or None when it has fewer than 10."""
     digits = re.sub(r"\D", "", value or "")
     return digits[-10:] if len(digits) >= 10 else None
 
 
-def normalize_email(value: Optional[str]) -> str:
+def normalize_email(value: str | None) -> str:
     return (value or "").strip().lower()
 
 
@@ -230,7 +231,7 @@ _LINKEDIN_COUNTRY_HOST = re.compile(r"^[a-z]{2,3}\.linkedin\.com")
 _X_HOST = re.compile(r"^x\.com(?=/|$)")
 
 
-def normalize_url(url: Optional[str]) -> Optional[str]:
+def normalize_url(url: str | None) -> str | None:
     """Lowercase, no scheme, www., query, fragment or trailing slash. x.com is
     read as twitter.com. Returns None for an empty value."""
     if not url or not str(url).strip():
@@ -244,13 +245,13 @@ def normalize_url(url: Optional[str]) -> Optional[str]:
     return s or None
 
 
-def normalize_linkedin(url: Optional[str]) -> Optional[str]:
+def normalize_linkedin(url: str | None) -> str | None:
     """normalize_url, or None unless the result contains linkedin.com/in/."""
     s = normalize_url(url)
     return s if s and "linkedin.com/in/" in s else None
 
 
-def https_url(url: str) -> Optional[str]:
+def https_url(url: str) -> str | None:
     """The URL with an https scheme and no query or fragment, or None when it
     has no host containing a dot (a bare handle such as "@annlong")."""
     s = re.split(r"[?#]", url.strip(), maxsplit=1)[0].rstrip("/")
@@ -264,7 +265,7 @@ def https_url(url: str) -> Optional[str]:
     return s
 
 
-def norm_text(value: Optional[str]) -> str:
+def norm_text(value: str | None) -> str:
     """Lowercase, '&' read as 'and', punctuation and quotes removed, spaces
     collapsed. This is the form in which Company and Title values are compared."""
     s = (value or "").lower().replace("&", " and ")
@@ -272,7 +273,7 @@ def norm_text(value: Optional[str]) -> str:
     return " ".join(s.split())
 
 
-def reject_reason(value: str) -> Optional[str]:
+def reject_reason(value: str) -> str | None:
     """Why a LifeOS Company or Title value must not be written, or None."""
     if not any(ch.isalpha() for ch in value):
         return "no letters"
@@ -293,12 +294,12 @@ def notion_is_richer(new_norm: str, current_norm: str) -> bool:
     return new_norm in current_norm or set(new_norm.split()) < set(current_norm.split())
 
 
-def name_key(name: Optional[str]) -> str:
+def name_key(name: str | None) -> str:
     """Normalised full name (credentials after a comma dropped) for equality."""
     return " ".join(name_tokens(name))
 
 
-def parse_fill_only(text: Optional[str]) -> frozenset:
+def parse_fill_only(text: str | None) -> frozenset:
     """Validate a comma-separated list of Notion property names. Raises
     ConfigError naming any unknown entry."""
     wanted = [t.strip() for t in (text or "").split(",") if t.strip()]
@@ -312,7 +313,7 @@ def parse_fill_only(text: Optional[str]) -> frozenset:
     return frozenset(lookup[t.casefold()] for t in wanted)
 
 
-def name_tokens(name: Optional[str]) -> list[str]:
+def name_tokens(name: str | None) -> list[str]:
     """Case-folded, letters-only tokens of a name, cut at the first comma
     (which drops credentials such as ", CFP")."""
     tokens = []
@@ -326,7 +327,7 @@ def name_tokens(name: Optional[str]) -> list[str]:
 _PAREN = re.compile(r"\(([^)]*)\)")
 
 
-def name_candidates(name: Optional[str]) -> list[list[str]]:
+def name_candidates(name: str | None) -> list[list[str]]:
     """Token lists a LifeOS name can be known by. Without parentheses that is
     just its own tokens. "Adrienne (Szarmack) Smith" gives ["adrienne", "smith"]
     (parenthesised part removed), ["adrienne", "szarmack"] (the parenthesised
@@ -344,7 +345,7 @@ def name_candidates(name: Optional[str]) -> list[list[str]]:
     return candidates
 
 
-def names_compatible(notion_name: Optional[str], *lifeos_names: Optional[str]) -> bool:
+def names_compatible(notion_name: str | None, *lifeos_names: str | None) -> bool:
     """True when the first AND last token of the Notion name equal the first and
     last token of at least one candidate of at least one LifeOS name."""
     theirs = name_tokens(notion_name)
@@ -377,7 +378,7 @@ def _short(value: Any, width: int = 40) -> str:
     return text if len(text) <= width else text[: width - 1] + "…"
 
 
-def local_timezone_name() -> Optional[str]:
+def local_timezone_name() -> str | None:
     """The machine's IANA time zone name, or None when it cannot be found."""
     env = os.environ.get("TZ", "").lstrip(":")
     if "/" in env:
@@ -407,15 +408,15 @@ class NotionRow:
     name: str = ""
     dex_id: str = ""
     lifeos_id: str = ""
-    email: Optional[str] = None
-    phone: Optional[str] = None
+    email: str | None = None
+    phone: str | None = None
     company: str = ""
     title: str = ""
-    linkedin: Optional[str] = None
-    instagram: Optional[str] = None
-    twitter: Optional[str] = None
-    website: Optional[str] = None
-    last_checkin: Optional[str] = None  # YYYY-MM-DD (or whatever Notion held)
+    linkedin: str | None = None
+    instagram: str | None = None
+    twitter: str | None = None
+    website: str | None = None
+    last_checkin: str | None = None  # YYYY-MM-DD (or whatever Notion held)
     raw: dict = field(default_factory=dict, compare=False, repr=False)  # page properties as read
 
 
@@ -457,7 +458,7 @@ def parse_row(page: dict) -> NotionRow:
 # Mapping files and ledger
 # ---------------------------------------------------------------------------
 
-def load_json(path: Optional[Path]) -> dict:
+def load_json(path: Path | None) -> dict:
     """A JSON object from path; {} when the file is absent or unreadable."""
     if not path or not Path(path).exists():
         return {}
@@ -469,7 +470,7 @@ def load_json(path: Optional[Path]) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def load_stored_map(path: Optional[Path], strict: bool = False) -> dict[str, dict]:
+def load_stored_map(path: Path | None, strict: bool = False) -> dict[str, dict]:
     """The stored page mapping. An absent file is an empty mapping. A file that
     exists but cannot be parsed raises MapFileError when strict, else warns."""
     if not path or not Path(path).exists():
@@ -492,7 +493,7 @@ def load_stored_map(path: Optional[Path], strict: bool = False) -> dict[str, dic
     return pages
 
 
-def load_dexmap(path: Optional[Path]) -> dict[str, str]:
+def load_dexmap(path: Path | None) -> dict[str, str]:
     mapping = load_json(path).get("dex_to_lifeos")
     return mapping if isinstance(mapping, dict) else {}
 
@@ -533,10 +534,10 @@ class Ledger:
             raise LedgerError(f"Ledger {self.path} cannot be written: {exc}") from exc
 
     def record(self, phase: str, action: str, page_id: str, lifeos_id: str, field_name: str,
-               old: Any, new: Any, old_full: Any = None, status: Optional[str] = None,
-               error: Optional[str] = None) -> None:
+               old: Any, new: Any, old_full: Any = None, status: str | None = None,
+               error: str | None = None) -> None:
         line = {
-            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "ts": datetime.now(UTC).isoformat(timespec="seconds"),
             "run_id": self.run_id,
             "phase": phase,
             "action": action,
@@ -566,10 +567,10 @@ class Ledger:
 
 @dataclass
 class Resolution:
-    person: Optional[dict] = None
-    matched_by: Optional[str] = None  # lifeos_id | dex_map | identifiers
-    source: Optional[str] = None      # lifeos_id | map | dexmap | identifiers
-    reason: Optional[str] = None      # why unmatched
+    person: dict | None = None
+    matched_by: str | None = None  # lifeos_id | dex_map | identifiers
+    source: str | None = None      # lifeos_id | map | dexmap | identifiers
+    reason: str | None = None      # why unmatched
     orphan: bool = False              # LifeOS_ID points at no person
 
 
@@ -581,7 +582,7 @@ class PeopleIndex:
     by_linkedin: dict[str, set] = field(default_factory=dict)
 
 
-def _linkedin_of(person: dict) -> Optional[str]:
+def _linkedin_of(person: dict) -> str | None:
     return _clean(person.get("linkedin_url")) or social_url(person, {"linkedin"})
 
 
@@ -622,7 +623,7 @@ def resolve_row(
         return Resolution(reason=f"orphan: LifeOS_ID {row.lifeos_id} matches no LifeOS person",
                           orphan=True)
 
-    candidate: Optional[dict] = None
+    candidate: dict | None = None
     matched_by = source = None
 
     stored = stored_map.get(row.page_id)
@@ -702,7 +703,7 @@ class Change:
     name: str
     lifeos_id: str
     fields: list[FieldChange] = field(default_factory=list)
-    id_value: Optional[str] = None  # LifeOS_ID to write, when the cell is empty
+    id_value: str | None = None  # LifeOS_ID to write, when the cell is empty
 
     def properties(self, with_fields: bool = True, with_id: bool = True) -> dict:
         props: dict = {}
@@ -713,7 +714,7 @@ class Change:
         return props
 
 
-def social_url(person: dict, platforms: set) -> Optional[str]:
+def social_url(person: dict, platforms: set) -> str | None:
     """First social_links URL whose platform is in platforms."""
     for item in person.get("social_links") or []:
         if not isinstance(item, dict):
@@ -726,20 +727,20 @@ def social_url(person: dict, platforms: set) -> Optional[str]:
 
 
 def last_seen_local_date(
-    last_seen: Optional[str], now: Optional[datetime] = None, tz: Optional[tzinfo] = None
-) -> Optional[date]:
+    last_seen: str | None, now: datetime | None = None, tz: tzinfo | None = None
+) -> date | None:
     """Local calendar date of an ISO timestamp, or None when it is missing,
     unparseable or in the future. A timestamp without an offset is read as UTC.
     tz=None means the machine's local zone."""
     if not last_seen:
         return None
     try:
-        dt = datetime.fromisoformat(str(last_seen).strip().replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(str(last_seen).strip().replace("Z", "+00:00"))  # noqa: FURB162
     except ValueError:
         return None
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    now = now or datetime.now(timezone.utc)
+        dt = dt.replace(tzinfo=UTC)
+    now = now or datetime.now(UTC)
     if dt > now:
         return None
     return dt.astimezone(tz).date()
@@ -760,12 +761,12 @@ def _old_full(row: NotionRow, prop_name: str, plain: Any) -> Any:
 def compute_changes(
     row: NotionRow,
     person: dict,
-    now: Optional[datetime] = None,
-    tz: Optional[tzinfo] = None,
-    available: Optional[set] = None,
+    now: datetime | None = None,
+    tz: tzinfo | None = None,
+    available: set | None = None,
     fill_only: frozenset = frozenset(),
-    skips: Optional[list] = None,
-) -> tuple[Optional[Change], list[str]]:
+    skips: list | None = None,
+) -> tuple[Change | None, list[str]]:
     """What to write for one matched row, plus messages for values that cannot
     be compared. LifeOS wins; an empty LifeOS value never blanks Notion.
     available is the set of optional properties the schema has (None = all);
@@ -783,14 +784,14 @@ def compute_changes(
         return prop_name in fill_only and bool(current)
 
     emails = _str_list(person.get("emails"))
-    if emails and (not row.email or normalize_email(row.email) not in {normalize_email(e) for e in emails}):
+    if emails and (not row.email or normalize_email(row.email) not in {normalize_email(e) for e in emails}):  # noqa: SIM102
         if not fill_blocked(PROP_EMAIL, row.email):
             fields.append(FieldChange(PROP_EMAIL, row.email, emails[0], {"email": emails[0]},
                                       _old_full(row, PROP_EMAIL, row.email), displaces=bool(row.email)))
 
     phones = _str_list(person.get("phone_numbers"))
     known_phones = {last10(p) for p in phones if last10(p)}
-    if phones and (not row.phone or last10(row.phone) not in known_phones):
+    if phones and (not row.phone or last10(row.phone) not in known_phones):  # noqa: SIM102
         if not fill_blocked(PROP_PHONE, row.phone):
             fields.append(FieldChange(PROP_PHONE, row.phone, phones[0], {"phone_number": phones[0]},
                                       _old_full(row, PROP_PHONE, row.phone), displaces=bool(row.phone)))
@@ -835,7 +836,7 @@ def compute_changes(
 
     seen = last_seen_local_date(person.get("last_seen"), now=now, tz=tz)
     if seen is not None and not fill_blocked(PROP_CHECKIN, row.last_checkin):
-        current_date: Optional[date] = None
+        current_date: date | None = None
         readable = True
         if row.last_checkin:
             try:
@@ -942,7 +943,7 @@ def _is_credentials(text: str) -> bool:
     return bool(tokens) and all(t.lower() in _CREDENTIALS or (t.isupper() and len(t) <= 5) for t in tokens)
 
 
-def loose_name_keys(name: Optional[str]) -> set:
+def loose_name_keys(name: str | None) -> set:
     """Keys "surname|first initial" for a name, after handling "Last, First"
     order and dropping titles (Dr, Mr, ...) and credentials after a comma. A
     parenthesised part is handled like name_candidates. Single-word names give
@@ -1011,10 +1012,10 @@ def build_plan(
     people: list[dict],
     stored_map: dict[str, dict],
     dexmap: dict[str, str],
-    now: Optional[datetime] = None,
-    tz: Optional[tzinfo] = None,
-    today: Optional[date] = None,
-    available: Optional[set] = None,
+    now: datetime | None = None,
+    tz: tzinfo | None = None,
+    today: date | None = None,
+    available: set | None = None,
     fill_only: frozenset = frozenset(),
 ) -> Plan:
     index = build_index(people)
@@ -1136,7 +1137,7 @@ def build_plan(
             continue
         if loose & planned_loose:
             plan.possible_duplicate_skips.append(
-                (person, "possible duplicate, review by hand: another person planned in this run has the "
+                (person, "possible duplicate, review by hand: another person planned in this run has the "  # noqa: ISC004
                          "same surname and first initial"))
             continue
         planned_keys |= keys
@@ -1167,7 +1168,7 @@ class NotionClient:
         data_source_id: str,
         *,
         version: str = DEFAULT_NOTION_VERSION,
-        transport: Optional[httpx.BaseTransport] = None,
+        transport: httpx.BaseTransport | None = None,
         sleep: Callable[[float], None] = time.sleep,
         pace: float = PACE_SECONDS,
         max_retries: int = MAX_RETRIES,
@@ -1178,7 +1179,7 @@ class NotionClient:
         self._sleep = sleep
         self._pace = pace
         self._max_retries = max_retries
-        self._last_request: Optional[float] = None
+        self._last_request: float | None = None
         self._http = httpx.Client(
             base_url=base_url,
             transport=transport,
@@ -1193,11 +1194,11 @@ class NotionClient:
     def close(self) -> None:
         self._http.close()
 
-    def _fail(self, message: str, status: Optional[int] = None, code: Optional[str] = None) -> NotionError:
+    def _fail(self, message: str, status: int | None = None, code: str | None = None) -> NotionError:
         return NotionError(redact(message, self._token), status, code)
 
     @staticmethod
-    def _detail(resp: httpx.Response) -> tuple[Optional[str], str]:
+    def _detail(resp: httpx.Response) -> tuple[str | None, str]:
         """The Notion error code and message from an error response."""
         try:
             body = resp.json()
@@ -1207,7 +1208,7 @@ class NotionClient:
             return body.get("code"), str(body.get("message") or "")[:500]
         return None, str(body)[:300]
 
-    def _request(self, method: str, path: str, payload: Optional[dict] = None,
+    def _request(self, method: str, path: str, payload: dict | None = None,
                  retry_server_errors: bool = True) -> dict:
         """One paced request. retry_server_errors=False limits retries to 409
         and 429, for calls that must not run twice (page creation)."""
@@ -1288,10 +1289,10 @@ class NotionClient:
             present.add(name)
         return present
 
-    def query_rows(self, limit: Optional[int] = None) -> list[dict]:
+    def query_rows(self, limit: int | None = None) -> list[dict]:
         """All pages of the People data source (following next_cursor)."""
         pages: list[dict] = []
-        cursor: Optional[str] = None
+        cursor: str | None = None
         while True:
             payload: dict = {"page_size": 100}
             if cursor:
@@ -1308,7 +1309,7 @@ class NotionClient:
         return self._request("PATCH", f"/pages/{page_id}", {"properties": properties})
 
     def create_page(self, name: str, lifeos_id: str, template_id: str = "",
-                    timezone_name: Optional[str] = None) -> dict:
+                    timezone_name: str | None = None) -> dict:
         """Create a page holding only Full Name and LifeOS_ID, from the template
         when one is given. Never retried after a server error."""
         payload: dict = {
@@ -1350,7 +1351,7 @@ class NotionClient:
 # LifeOS API
 # ---------------------------------------------------------------------------
 
-def fetch_people(api_base: str, transport: Optional[httpx.BaseTransport] = None) -> list[dict]:
+def fetch_people(api_base: str, transport: httpx.BaseTransport | None = None) -> list[dict]:
     url = api_base.rstrip("/") + "/api/crm/people"
     try:
         with httpx.Client(transport=transport, timeout=120.0) as client:
@@ -1447,8 +1448,8 @@ def _patch_with_ledger(client: Any, ledger: Ledger, page_id: str, lifeos_id: str
         ledger.record("result", action, page_id, lifeos_id, field_name, old, new, old_full, status="ok")
 
 
-def _create_page_flow(client: Any, person: dict, template_id: str, timezone_name: Optional[str],
-                      now: Optional[datetime], tz: Optional[tzinfo], available: Optional[set],
+def _create_page_flow(client: Any, person: dict, template_id: str, timezone_name: str | None,
+                      now: datetime | None, tz: tzinfo | None, available: set | None,
                       ledger: Ledger, stored_map: dict, map_path: Path,
                       stamp: str, stats: dict, fill_only: frozenset) -> None:
     """Create one page, wait for its template, then write the other properties.
@@ -1520,18 +1521,18 @@ def run_sync(
     max_writes: int = DEFAULT_MAX_WRITES,
     max_id_writes: int = DEFAULT_MAX_ID_WRITES,
     max_creates: int = DEFAULT_MAX_CREATES,
-    map_path: Optional[Path] = DEFAULT_MAP_PATH,
-    dexmap_path: Optional[Path] = DEFAULT_DEXMAP_PATH,
-    ledger_path: Optional[Path] = DEFAULT_LEDGER_PATH,
-    limit: Optional[int] = None,
+    map_path: Path | None = DEFAULT_MAP_PATH,
+    dexmap_path: Path | None = DEFAULT_DEXMAP_PATH,
+    ledger_path: Path | None = DEFAULT_LEDGER_PATH,
+    limit: int | None = None,
     template_id: str = "",
-    timezone_name: Optional[str] = None,
+    timezone_name: str | None = None,
     fill_only: frozenset = frozenset(),
-    now: Optional[datetime] = None,
-    tz: Optional[tzinfo] = None,
-    today: Optional[date] = None,
-    run_id: Optional[str] = None,
-    stats: Optional[dict] = None,
+    now: datetime | None = None,
+    tz: tzinfo | None = None,
+    today: date | None = None,
+    run_id: str | None = None,
+    stats: dict | None = None,
 ) -> dict:
     """Run one sync and return the stats dict. Raises MapFileError, LedgerError,
     MappingAbort or NotionError (schema, query or a 401) without writing
@@ -1541,7 +1542,7 @@ def run_sync(
         stats = new_stats(execute, max_writes, max_id_writes, max_creates)
     stats["fill_only"] = sorted(fill_only)
     stored_map = load_stored_map(map_path, strict=execute)
-    ledger: Optional[Ledger] = None
+    ledger: Ledger | None = None
     if execute:
         ledger = Ledger(Path(ledger_path), run_id or uuid.uuid4().hex[:12])
         stats["ledger_path"] = str(ledger.path)
@@ -1705,7 +1706,7 @@ def run_sync(
 # CLI
 # ---------------------------------------------------------------------------
 
-def setup_logging(log_path: Optional[Path], token: str = "") -> None:
+def setup_logging(log_path: Path | None, token: str = "") -> None:
     logger.setLevel(logging.INFO)
     logger.propagate = False
     for handler in list(logger.handlers):
@@ -1755,7 +1756,7 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     from config.settings import settings

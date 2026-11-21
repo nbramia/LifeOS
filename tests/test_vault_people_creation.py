@@ -3,7 +3,7 @@
 Name extraction picks up bold headings and product names ("Eval", "Calendar") as if
 they were people, so by default notes may only link to people who already exist.
 """
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -46,7 +46,7 @@ def _indexer(resolver):
     return indexer
 
 
-NOTE = datetime(2026, 11, 1, tzinfo=timezone.utc)
+NOTE = datetime(2026, 11, 1, tzinfo=UTC)
 
 
 def test_setting_is_off_by_default():

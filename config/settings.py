@@ -11,8 +11,8 @@ from typing import Annotated
 
 import frontmatter
 from dotenv import dotenv_values
-from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
 

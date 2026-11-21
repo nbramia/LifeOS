@@ -9,12 +9,15 @@ Implements three-pass entity resolution:
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import UTC, datetime
 
 from rapidfuzz import fuzz
 
-from api.services.person_entity import PersonEntity, PersonEntityStore, get_person_entity_store
+from api.services.person_entity import (
+    PersonEntity,
+    PersonEntityStore,
+    get_person_entity_store,
+)
 from config.nickname_lookup import are_name_variants
 
 # Name prefixes to strip before parsing (case-insensitive)
@@ -33,7 +36,7 @@ class ParsedName:
     """Structured representation of a parsed name."""
     first: str  # First name (required)
     middles: list[str]  # Middle names (may be empty)
-    last: Optional[str]  # Last name (None for single-word names)
+    last: str | None  # Last name (None for single-word names)
     original: str  # Original input string
 
 
@@ -93,23 +96,23 @@ def parse_name(name: str) -> ParsedName:
             last=parts[-1],
             original=original,
         )
-from api.services.people import resolve_person_name  # noqa: E402
-from api.services.link_override import get_link_override_store  # noqa: E402
-from config.people_config import (  # noqa: E402
+from api.services.link_override import get_link_override_store
+from api.services.people import resolve_person_name
+from api.utils.datetime_utils import make_aware as _make_aware
+from config.people_config import (
     COMPANY_NORMALIZATION,
     EntityResolutionConfig,
-    get_vault_contexts_for_domain,
     get_domains_for_company,
     get_vault_contexts_for_company,
+    get_vault_contexts_for_domain,
     normalize_domain,
 )
-from config.relationship_weights import (  # noqa: E402
+from config.relationship_weights import (
+    FIRST_NAME_ONLY_BOOST_MULTIPLIER,
     RELATIONSHIP_STRENGTH_BOOST_MAX,
     RELATIONSHIP_STRENGTH_BOOST_WEIGHT,
-    FIRST_NAME_ONLY_BOOST_MULTIPLIER,
 )
-from config.settings import settings  # noqa: E402
-from api.utils.datetime_utils import make_aware as _make_aware  # noqa: E402
+from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
@@ -145,7 +148,7 @@ class EntityResolver:
     3. Disambiguation for ambiguous cases
     """
 
-    def __init__(self, entity_store: Optional[PersonEntityStore] = None):
+    def __init__(self, entity_store: PersonEntityStore | None = None):
         """
         Initialize the resolver.
 
@@ -159,7 +162,7 @@ class EntityResolver:
         """Get the entity store."""
         return self._store
 
-    def resolve_by_email(self, email: str) -> Optional[PersonEntity]:
+    def resolve_by_email(self, email: str) -> PersonEntity | None:
         """
         Pass 1: Exact email match.
 
@@ -173,7 +176,7 @@ class EntityResolver:
             return None
         return self._store.get_by_email(email.lower())
 
-    def resolve_by_phone(self, phone: str) -> Optional[PersonEntity]:
+    def resolve_by_phone(self, phone: str) -> PersonEntity | None:
         """
         Phone anchor: Exact phone match (E.164 format).
 
@@ -196,9 +199,9 @@ class EntityResolver:
     def resolve_by_name(
         self,
         name: str,
-        context_path: Optional[str] = None,
+        context_path: str | None = None,
         create_if_missing: bool = False,
-    ) -> Optional[ResolutionResult]:
+    ) -> ResolutionResult | None:
         """
         Pass 2 & 3: Fuzzy name matching with context boost and disambiguation.
 
@@ -291,7 +294,7 @@ class EntityResolver:
         )
 
     def _score_candidates(
-        self, name: str, context_path: Optional[str]
+        self, name: str, context_path: str | None
     ) -> list[ResolutionCandidate]:
         """
         Score all entities against a name using structured matching.
@@ -484,14 +487,14 @@ class EntityResolver:
             # ===== PHASE 3: BONUS SCORING =====
 
             # Context boost
-            if context_path and entity.vault_contexts:
+            if context_path and entity.vault_contexts:  # noqa: SIM102
                 if self._path_matches_context(context_path, entity.vault_contexts):
                     score += EntityResolutionConfig.CONTEXT_BOOST_POINTS
                     match_type = "structured_context"
 
             # Recency boost
             if entity.last_seen:
-                days_since = (datetime.now(timezone.utc) - _make_aware(entity.last_seen)).days
+                days_since = (datetime.now(UTC) - _make_aware(entity.last_seen)).days
                 if days_since < EntityResolutionConfig.RECENCY_THRESHOLD_DAYS:
                     score += EntityResolutionConfig.RECENCY_BOOST_POINTS
 
@@ -514,7 +517,7 @@ class EntityResolver:
 
             # For full names (both have first and last), require first name similarity
             # This prevents "John Smith" from matching "Jane Smith"
-            if not is_first_name_only and query_last_lower and entity_last_lower:
+            if not is_first_name_only and query_last_lower and entity_last_lower:  # noqa: SIM102
                 if not first_matched:
                     # Both have last names, but no first name match - skip
                     continue
@@ -627,7 +630,7 @@ class EntityResolver:
         return False
 
     def _create_new_entity(
-        self, name: str, context_path: Optional[str]
+        self, name: str, context_path: str | None
     ) -> ResolutionResult:
         """
         Create a new PersonEntity for an unknown name.
@@ -666,7 +669,7 @@ class EntityResolver:
         )
 
     def _create_disambiguated_entity(
-        self, name: str, context_path: Optional[str], similar_entity: PersonEntity
+        self, name: str, context_path: str | None, similar_entity: PersonEntity
     ) -> ResolutionResult:
         """
         Create a disambiguated entity when name is ambiguous.
@@ -776,12 +779,12 @@ class EntityResolver:
 
     def resolve(
         self,
-        name: Optional[str] = None,
-        email: Optional[str] = None,
-        phone: Optional[str] = None,
-        context_path: Optional[str] = None,
+        name: str | None = None,
+        email: str | None = None,
+        phone: str | None = None,
+        context_path: str | None = None,
         create_if_missing: bool = False,
-    ) -> Optional[ResolutionResult]:
+    ) -> ResolutionResult | None:
         """
         Main entry point: resolve a person by name, email, and/or phone.
 
@@ -929,7 +932,7 @@ class EntityResolver:
 
         return name
 
-    def resolve_by_social_link(self, platform: str, value: str) -> Optional[PersonEntity]:
+    def resolve_by_social_link(self, platform: str, value: str) -> PersonEntity | None:
         """Find the person holding a profile URL or handle on a registered platform."""
         return self.store.get_by_social_link(platform, value)
 
@@ -937,10 +940,10 @@ class EntityResolver:
         self,
         first_name: str,
         last_name: str,
-        email: Optional[str],
-        company: Optional[str],
-        position: Optional[str],
-        linkedin_url: Optional[str],
+        email: str | None,
+        company: str | None,
+        position: str | None,
+        linkedin_url: str | None,
     ) -> ResolutionResult:
         """
         Resolve a person from LinkedIn data.
@@ -1084,8 +1087,8 @@ class EntityResolver:
             vault_contexts=vault_contexts,
             category=category,
             sources=["linkedin"],
-            first_seen=datetime.now(timezone.utc),
-            last_seen=datetime.now(timezone.utc),
+            first_seen=datetime.now(UTC),
+            last_seen=datetime.now(UTC),
         )
 
         stored = self._store.add(entity)
@@ -1099,11 +1102,11 @@ class EntityResolver:
 
 
 # Singleton instance
-_entity_resolver: Optional[EntityResolver] = None
+_entity_resolver: EntityResolver | None = None
 
 
 def get_entity_resolver(
-    entity_store: Optional[PersonEntityStore] = None,
+    entity_store: PersonEntityStore | None = None,
 ) -> EntityResolver:
     """
     Get or create the singleton EntityResolver.

@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
@@ -97,7 +97,7 @@ def _check_writable_folder(rel: str) -> Path:
 
 
 def _entry_modified(p: Path) -> str:
-    return datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).isoformat(timespec="seconds")
+    return datetime.fromtimestamp(p.stat().st_mtime, tz=UTC).isoformat(timespec="seconds")
 
 
 @router.get("/tree", response_model=TreeResponse)
@@ -177,7 +177,7 @@ async def _save_upload(folder: Path, upload: UploadFile) -> Path:
 @router.post("/upload", response_model=UploadResponse)
 async def vault_upload(
     folder: str = Form("", description="Vault-relative destination folder; created if missing."),
-    files: list[UploadFile] = File(...),
+    files: list[UploadFile] = File(...),  # noqa: B008
 ) -> UploadResponse:
     """Store each file in the folder and start processing it into a sidecar note."""
     dest = _check_writable_folder(folder)

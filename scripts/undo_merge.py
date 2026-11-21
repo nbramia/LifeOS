@@ -19,18 +19,18 @@ Usage:
     python scripts/undo_merge.py --secondary <id> [--execute]
     python scripts/undo_merge.py --list-recoverable
 """
-import sys
-import json
-import sqlite3
-import logging
 import argparse
+import json
+import logging
+import sqlite3
+import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from api.services.interaction_store import get_interaction_db_path
 from api.services.person_entity import get_person_entity_store
 from api.services.social_links import linkedin_field_value, social_identity
-from api.services.interaction_store import get_interaction_db_path
 from api.services.source_entity import get_crm_db_path
 from scripts.merge_people import load_merged_ids, save_merged_ids
 
@@ -140,11 +140,9 @@ def undo_merge(secondary_id: str, dry_run: bool = True) -> dict:
     ).fetchall()
 
     for se_row in rows:
-        se_id, obs_email, obs_phone, obs_name = se_row
+        se_id, obs_email, obs_phone, obs_name = se_row  # noqa: RUF059
         match = False
-        if obs_email and obs_email.lower() in secondary_emails_lower:
-            match = True
-        elif obs_phone and obs_phone in secondary_phones_set:
+        if obs_email and obs_email.lower() in secondary_emails_lower or obs_phone and obs_phone in secondary_phones_set:
             match = True
         if match:
             se_to_move.append(se_id)

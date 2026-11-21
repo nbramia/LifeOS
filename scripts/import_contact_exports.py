@@ -13,8 +13,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from api.services.contact_export_import import import_contact_export  # noqa: E402
-from api.services.person_entity import get_person_entity_store  # noqa: E402
+from api.services.contact_export_import import import_contact_export
+from api.services.person_entity import get_person_entity_store
 
 
 def main() -> int:

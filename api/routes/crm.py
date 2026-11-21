@@ -4,10 +4,6 @@ CRM API endpoints for LifeOS Personal CRM.
 Provides comprehensive endpoints for managing people, relationships,
 and entity linking workflows.
 """
-from collections import defaultdict
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Optional
 import asyncio
 import bisect
 import contextlib
@@ -18,13 +14,36 @@ import sqlite3
 import threading
 import time
 import uuid
+from collections import defaultdict
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Query, UploadFile, File
+from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from pydantic import AwareDatetime, BaseModel, Field
 
-from api.services.person_entity import PersonEntity, get_person_entity_store, compute_person_category
-from api.services.interaction_store import Interaction, get_interaction_store
 from api.services.aggregate_cache import cached_aggregate
+from api.services.interaction_store import Interaction, get_interaction_store
+from api.services.person_entity import (
+    PersonEntity,
+    compute_person_category,
+    get_person_entity_store,
+)
+from api.services.person_facts import (
+    FACT_CATEGORIES,
+    PersonFact,
+    get_person_fact_extractor,
+    get_person_fact_store,
+)
+from api.services.relationship import Relationship, get_relationship_store
+from api.services.relationship_discovery import (
+    get_suggested_connections,
+    run_full_discovery,
+)
+from api.services.relationship_metrics import (
+    get_strength_breakdown,
+    update_all_strengths,
+    update_strength_for_person,
+)
 from api.services.social_links import (
     InvalidContactDetail,
     build_social_link,
@@ -37,31 +56,15 @@ from api.services.social_links import (
     social_identity,
     social_link_id,
 )
-from config.people_config import InteractionConfig
-from config.social_platforms import PLATFORMS_BY_KEY
-from config.settings import settings
 from api.services.source_entity import (
-    SourceEntity,
-    get_source_entity_store,
     LINK_STATUS_CONFIRMED,
     LINK_STATUS_REJECTED,
+    SourceEntity,
+    get_source_entity_store,
 )
-from api.services.relationship import get_relationship_store, Relationship
-from api.services.relationship_metrics import (
-    get_strength_breakdown,
-    update_all_strengths,
-    update_strength_for_person,
-)
-from api.services.relationship_discovery import (
-    run_full_discovery,
-    get_suggested_connections,
-)
-from api.services.person_facts import (
-    PersonFact,
-    get_person_fact_store,
-    get_person_fact_extractor,
-    FACT_CATEGORIES,
-)
+from config.people_config import InteractionConfig
+from config.settings import settings
+from config.social_platforms import PLATFORMS_BY_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +89,7 @@ WORK_EMAIL_DOMAIN = settings.work_email_domain if hasattr(settings, 'work_email_
 MY_PERSON_ID = settings.my_person_id
 
 # Import manual strength overrides from centralized config
-from config.relationship_weights import STRENGTH_OVERRIDES_BY_ID  # noqa: E402
+from config.relationship_weights import STRENGTH_OVERRIDES_BY_ID
 
 
 def _get_strength_override(person_id: str) -> float | None:
@@ -96,7 +99,7 @@ def _get_strength_override(person_id: str) -> float | None:
     return STRENGTH_OVERRIDES_BY_ID.get(person_id)
 
 
-def _me_exclude_ids(person_store, all_people: Optional[list] = None) -> list[str]:
+def _me_exclude_ids(person_store, all_people: list | None = None) -> list[str]:
     """
     Self + hidden + peripheral + merged-secondary person ids — the
     population both /me/interactions and /me/interactions/span exclude.
@@ -148,9 +151,9 @@ def _bucket_counts_by_period(
             continue
         if hasattr(ts, 'tzinfo'):
             if ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
+                ts = ts.replace(tzinfo=UTC)
         else:
-            ts = datetime.fromisoformat(str(ts)[:10]).replace(tzinfo=timezone.utc)
+            ts = datetime.fromisoformat(str(ts)[:10]).replace(tzinfo=UTC)
         resolved.append(ts)
     resolved.sort()
 
@@ -238,13 +241,13 @@ class SourceEntityResponse(BaseModel):
     """Response model for a source entity."""
     id: str
     source_type: str
-    source_id: Optional[str] = None
-    observed_name: Optional[str] = None
-    observed_email: Optional[str] = None
-    observed_phone: Optional[str] = None
+    source_id: str | None = None
+    observed_name: str | None = None
+    observed_email: str | None = None
+    observed_phone: str | None = None
     link_confidence: float = 0.0
     link_status: str = "auto"
-    observed_at: Optional[str] = None
+    observed_at: str | None = None
     source_badge: str = ""
 
 
@@ -257,11 +260,11 @@ class RelationshipResponse(BaseModel):
     shared_contexts: list[str] = []
     shared_events_count: int = 0
     shared_threads_count: int = 0
-    first_seen_together: Optional[str] = None
-    last_seen_together: Optional[str] = None
+    first_seen_together: str | None = None
+    last_seen_together: str | None = None
     # Include person names for UI
-    person_a_name: Optional[str] = None
-    person_b_name: Optional[str] = None
+    person_a_name: str | None = None
+    person_b_name: str | None = None
 
 
 class SocialLinkResponse(BaseModel):
@@ -271,9 +274,9 @@ class SocialLinkResponse(BaseModel):
     platform_label: str
     icon: str
     value: str
-    url: Optional[str] = None
+    url: str | None = None
     handle: str
-    label: Optional[str] = None
+    label: str | None = None
     source: str
 
 
@@ -281,15 +284,15 @@ class ContactEntryResponse(BaseModel):
     """An email address or phone number with its optional label."""
     id: str
     value: str
-    label: Optional[str] = None
+    label: str | None = None
 
 
 class ContactDetailsResponse(BaseModel):
     """A person's contact details after a write."""
-    linkedin_url: Optional[str] = None
+    linkedin_url: str | None = None
     emails: list[str] = []
     phone_numbers: list[str] = []
-    phone_primary: Optional[str] = None
+    phone_primary: str | None = None
     social_links: list[SocialLinkResponse] = []
     labeled_emails: list[ContactEntryResponse] = []
     labeled_phones: list[ContactEntryResponse] = []
@@ -307,26 +310,26 @@ class SocialLinkCreateRequest(BaseModel):
     """Request to add a social account."""
     platform: str
     value: str
-    label: Optional[str] = None
+    label: str | None = None
 
 
 class SocialLinkUpdateRequest(BaseModel):
     """Request to edit a social account; omitted fields are unchanged."""
-    platform: Optional[str] = None
-    value: Optional[str] = None
-    label: Optional[str] = None
+    platform: str | None = None
+    value: str | None = None
+    label: str | None = None
 
 
 class ContactEntryCreateRequest(BaseModel):
     """Request to add an email address or phone number."""
     value: str
-    label: Optional[str] = None
+    label: str | None = None
 
 
 class ContactEntryUpdateRequest(BaseModel):
     """Request to edit an email or phone; omitted fields are unchanged."""
-    value: Optional[str] = None
-    label: Optional[str] = None
+    value: str | None = None
+    label: str | None = None
 
 
 class PersonDetailResponse(BaseModel):
@@ -336,20 +339,20 @@ class PersonDetailResponse(BaseModel):
     display_name: str
     emails: list[str] = []
     phone_numbers: list[str] = []
-    company: Optional[str] = None
-    position: Optional[str] = None
-    linkedin_url: Optional[str] = None
+    company: str | None = None
+    position: str | None = None
+    linkedin_url: str | None = None
     social_links: list[SocialLinkResponse] = []
     labeled_emails: list[ContactEntryResponse] = []
     labeled_phones: list[ContactEntryResponse] = []
     category: str = "unknown"
     vault_contexts: list[str] = []
     tags: list[str] = []
-    birthday: Optional[str] = None  # "MM-DD" format (month-day only)
+    birthday: str | None = None  # "MM-DD" format (month-day only)
     notes: str = ""
     sources: list[str] = []
-    first_seen: Optional[str] = None
-    last_seen: Optional[str] = None
+    first_seen: str | None = None
+    last_seen: str | None = None
     relationship_strength: float = 0.0
     source_entity_count: int = 0
     meeting_count: int = 0
@@ -358,7 +361,7 @@ class PersonDetailResponse(BaseModel):
     message_count: int = 0  # iMessage/SMS count
     slack_message_count: int = 0  # Actual Slack messages (not daily summaries)
     # Pre-computed Dunbar circle (0-6 for meaningful, 7 for peripheral)
-    dunbar_circle: Optional[int] = None
+    dunbar_circle: int | None = None
     # True when photo_count > 0, so the client knows to request an avatar
     # instead of rendering initials -- no per-person probe needed.
     has_profile_photo: bool = False
@@ -382,10 +385,10 @@ class TimelineItem(BaseModel):
     timestamp: str
     source_type: str
     title: str
-    snippet: Optional[str] = None
+    snippet: str | None = None
     source_link: str = ""
     source_badge: str = ""
-    source_id: Optional[str] = None
+    source_id: str | None = None
 
 
 class TimelineResponse(BaseModel):
@@ -401,7 +404,7 @@ class AggregatedTimelineItem(BaseModel):
     source_type: str
     source_badge: str
     count: int
-    preview: Optional[str] = None  # First item's title/subject
+    preview: str | None = None  # First item's title/subject
     items: list[TimelineItem] = []  # Individual items (populated when expanded)
 
 
@@ -417,15 +420,15 @@ class AggregatedTimelineResponse(BaseModel):
     """Response for aggregated timeline endpoint."""
     days: list[AggregatedDayGroup]
     total_interactions: int
-    date_range_start: Optional[str] = None
-    date_range_end: Optional[str] = None
+    date_range_start: str | None = None
+    date_range_end: str | None = None
 
 
 class ConnectionResponse(BaseModel):
     """Response model for a connection."""
     person_id: str
     name: str
-    company: Optional[str] = None
+    company: str | None = None
     relationship_type: str
     shared_events_count: int = 0
     shared_threads_count: int = 0
@@ -435,7 +438,7 @@ class ConnectionResponse(BaseModel):
     shared_phone_calls_count: int = 0   # Phone calls
     shared_contexts: list[str] = []
     relationship_strength: float = 0.0
-    last_seen_together: Optional[str] = None
+    last_seen_together: str | None = None
 
 
 class ConnectionsResponse(BaseModel):
@@ -448,7 +451,7 @@ class SuggestedConnectionResponse(BaseModel):
     """Response for a suggested connection."""
     person_id: str
     name: str
-    company: Optional[str] = None
+    company: str | None = None
     score: float = 0.0
     shared_contexts: list[str] = []
     shared_sources: list[str] = []
@@ -512,12 +515,12 @@ class PersonFactResponse(BaseModel):
     key: str
     value: str
     confidence: float = 0.5
-    source_interaction_id: Optional[str] = None
-    source_quote: Optional[str] = None  # Verbatim quote proving this fact
-    source_link: Optional[str] = None  # Deep link to source (Gmail, Calendar, Obsidian)
-    extracted_at: Optional[str] = None
+    source_interaction_id: str | None = None
+    source_quote: str | None = None  # Verbatim quote proving this fact
+    source_link: str | None = None  # Deep link to source (Gmail, Calendar, Obsidian)
+    extracted_at: str | None = None
     confirmed_by_user: bool = False
-    created_at: Optional[str] = None
+    created_at: str | None = None
     category_icon: str = ""
 
 
@@ -530,10 +533,10 @@ class PersonFactsResponse(BaseModel):
 
 class FactUpdateRequest(BaseModel):
     """Request for updating a fact."""
-    value: Optional[str] = None
-    confidence: Optional[float] = None
-    category: Optional[str] = None
-    key: Optional[str] = None
+    value: str | None = None
+    confidence: float | None = None
+    category: str | None = None
+    key: str | None = None
 
 
 class FactExtractionResponse(BaseModel):
@@ -545,20 +548,20 @@ class FactExtractionResponse(BaseModel):
 
 class PersonUpdateRequest(BaseModel):
     """Request for updating a person."""
-    notes: Optional[str] = None
-    tags: Optional[list[str]] = None
-    category: Optional[str] = None
-    birthday: Optional[str] = None  # "MM-DD" format (month-day only), empty string to clear
-    display_name: Optional[str] = None
+    notes: str | None = None
+    tags: list[str] | None = None
+    category: str | None = None
+    birthday: str | None = None  # "MM-DD" format (month-day only), empty string to clear
+    display_name: str | None = None
 
 
 class ManualEventRequest(BaseModel):
     """Request for recording an event that no calendar sync captured."""
     title: str = Field(max_length=300)
     timestamp: AwareDatetime
-    end_time: Optional[AwareDatetime] = None
-    location: Optional[str] = Field(default=None, max_length=500)
-    notes: Optional[str] = Field(default=None, max_length=5000)
+    end_time: AwareDatetime | None = None
+    location: str | None = Field(default=None, max_length=500)
+    notes: str | None = Field(default=None, max_length=5000)
     source_account: str = Field(default="manual", max_length=100)
     attendee_person_ids: list[str] = Field(default_factory=list, max_length=100)  # Other CRM people
     attendee_names: list[str] = Field(default_factory=list, max_length=100)  # People not in the CRM
@@ -583,7 +586,7 @@ class LinkConfirmRequest(BaseModel):
         default=False,
         description="If rejecting, create a new person from the source entity"
     )
-    new_person_name: Optional[str] = Field(
+    new_person_name: str | None = Field(
         default=None,
         description="Name for the new person (required if create_new_person=True)"
     )
@@ -689,7 +692,7 @@ def _contact_entry_responses(kind: str, entries: list[dict]) -> list[ContactEntr
 def _person_to_detail_response(
     person: PersonEntity,
     include_related: bool = True,
-    category_source_entities: Optional[list] = None,
+    category_source_entities: list | None = None,
 ) -> PersonDetailResponse:
     """Convert PersonEntity to detailed API response.
 
@@ -791,7 +794,7 @@ def _load_family_default_selected_ids() -> list[str]:
             with open(config_path) as f:
                 config = json.load(f)
             return config.get("default_selected_ids", [])
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning(f"Failed to load family default selected IDs: {e}")
     return []
 
@@ -805,7 +808,7 @@ def _get_partner_name() -> str:
         partner = person_store.get_by_id(PARTNER_PERSON_ID)
         if partner:
             return partner.canonical_name
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning(f"Failed to load partner name: {e}")
     return ""
 
@@ -875,7 +878,7 @@ def get_all_birthdays():
             })
 
     # Sort people within each date by name
-    for date in by_date:
+    for date in by_date:  # noqa: PLC0206
         by_date[date].sort(key=lambda x: x["name"].lower())
 
     return {
@@ -897,12 +900,12 @@ def _people_cache_eligible(kwargs: dict) -> bool:
 @router.get("/people", response_model=PersonListResponse)
 @cached_aggregate(should_cache=_people_cache_eligible)
 def list_people(
-    q: Optional[str] = Query(default=None, description="Search query"),
-    category: Optional[str] = Query(default=None, description="Filter by category"),
-    source: Optional[str] = Query(default=None, description="Filter by source"),
-    dunbar_circles: Optional[str] = Query(default=None, description="Filter by dunbar circles (comma-separated, e.g., '5,6+')"),
-    tags: Optional[str] = Query(default=None, description="Filter by tags (comma-separated, person must have at least one)"),
-    has_interactions: Optional[bool] = Query(default=None, description="Filter by interaction count > 0"),
+    q: str | None = Query(default=None, description="Search query"),
+    category: str | None = Query(default=None, description="Filter by category"),
+    source: str | None = Query(default=None, description="Filter by source"),
+    dunbar_circles: str | None = Query(default=None, description="Filter by dunbar circles (comma-separated, e.g., '5,6+')"),
+    tags: str | None = Query(default=None, description="Filter by tags (comma-separated, person must have at least one)"),
+    has_interactions: bool | None = Query(default=None, description="Filter by interaction count > 0"),
     min_interactions: int = Query(default=0, ge=0, description="Minimum total interactions (emails + meetings + mentions + messages)"),
     sort: str = Query(default="strength", description="Sort field: interactions, last_seen, name, strength"),
     offset: int = Query(default=0, ge=0, description="Offset for pagination"),
@@ -965,7 +968,7 @@ def list_people(
 
     # Apply tags filter (person must have at least one of the specified tags)
     if tags:
-        tag_set = set(t.strip().lower() for t in tags.split(',') if t.strip())
+        tag_set = set(t.strip().lower() for t in tags.split(',') if t.strip())  # noqa: C401
         people = [p for p in people if any(t in tag_set for t in (p.tags or []))]
 
     total = len(people)
@@ -984,7 +987,7 @@ def list_people(
         )
     else:  # last_seen
         people.sort(
-            key=lambda p: p.last_seen or datetime.min.replace(tzinfo=timezone.utc),
+            key=lambda p: p.last_seen or datetime.min.replace(tzinfo=UTC),
             reverse=True
         )
 
@@ -1051,7 +1054,7 @@ def get_person(
             update_strength_for_person(person_id)
             # Refresh person object to get updated values
             person = person_store.get_by_id(person_id)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning(f"Failed to compute relationship strength: {e}")
 
     response = _person_to_detail_response(person, include_related=include_related)
@@ -1105,7 +1108,7 @@ def update_person(person_id: str, request: PersonUpdateRequest):
             else:
                 # Try parsing as ISO date and extract month/day
                 from datetime import datetime
-                dt = datetime.fromisoformat(bday.replace('Z', '+00:00'))
+                dt = datetime.fromisoformat(bday.replace('Z', '+00:00'))  # noqa: FURB162
                 month, day = dt.month, dt.day
             person.birthday = f"{month:02d}-{day:02d}"
 
@@ -1120,7 +1123,7 @@ def _manual_event_snippet(
     location: str,
     notes: str,
     other_attendees: list[str],
-) -> Optional[str]:
+) -> str | None:
     """Fold the fields the interactions table has no column for into the snippet."""
     parts = [notes, location]
     if request.end_time:
@@ -1163,7 +1166,7 @@ def create_manual_event(person_id: str, request: ManualEventRequest):
     notes = (request.notes or "").strip()
     slug = re.sub(r"\W+", "_", title.lower()).strip("_")[:80] or "event"
     event_date = request.timestamp.date().isoformat()
-    created_at = datetime.now(timezone.utc)
+    created_at = datetime.now(UTC)
 
     interactions = [
         Interaction(
@@ -1469,7 +1472,7 @@ def merge_people(request: PersonMergeRequest):
         from scripts.merge_people import merge_people as do_merge
 
         person_store = get_person_entity_store()
-        _source_store = get_source_entity_store()  # noqa: F841
+        _source_store = get_source_entity_store()
 
         # Validate primary exists
         primary = person_store.get_by_id(request.primary_id)
@@ -1504,9 +1507,9 @@ def merge_people(request: PersonMergeRequest):
                 merged_ids.append(sec_id)
                 for key in total_stats:
                     total_stats[key] += stats.get(key, 0)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"Failed to merge {sec_id} into {request.primary_id}: {e}")
-                raise HTTPException(status_code=500, detail=f"Merge failed for {sec_id}: {str(e)}")
+                raise HTTPException(status_code=500, detail=f"Merge failed for {sec_id}: {e!s}")
 
         logger.info(f"Merged {len(merged_ids)} people into {request.primary_id}: {merged_ids}")
 
@@ -1565,8 +1568,9 @@ def _recalculate_relationship_with_me(person_id: str, my_person_id: str, int_con
     Queries interactions to get accurate shared_* counts.
     Returns dict with relationship changes for logging.
     """
-    from api.services.relationship import get_relationship_store, Relationship
-    from datetime import datetime, timezone
+    from datetime import datetime
+
+    from api.services.relationship import Relationship, get_relationship_store
 
     if not my_person_id or person_id == my_person_id:
         return {}
@@ -1590,8 +1594,8 @@ def _recalculate_relationship_with_me(person_id: str, my_person_id: str, int_con
         WHERE person_id = ?
     """, (person_id,))
     row = cursor.fetchone()
-    first_seen = datetime.fromisoformat(row[0]).replace(tzinfo=timezone.utc) if row and row[0] else None
-    last_seen = datetime.fromisoformat(row[1]).replace(tzinfo=timezone.utc) if row and row[1] else None
+    first_seen = datetime.fromisoformat(row[0]).replace(tzinfo=UTC) if row and row[0] else None
+    last_seen = datetime.fromisoformat(row[1]).replace(tzinfo=UTC) if row and row[1] else None
 
     # Calculate shared counts (interactions with this person = shared with me)
     shared_events = counts.get('calendar', 0)
@@ -1669,8 +1673,8 @@ def _recalculate_relationship_with_me(person_id: str, my_person_id: str, int_con
 class PersonSplitRequest(BaseModel):
     """Request to split source entities from a person to another."""
     from_person_id: str
-    to_person_id: Optional[str] = None  # None = create new person
-    new_person_name: Optional[str] = None  # Required if to_person_id is None
+    to_person_id: str | None = None  # None = create new person
+    new_person_name: str | None = None  # Required if to_person_id is None
     source_entity_ids: list[str]  # IDs of source entities to move
     create_overrides: bool = True  # Create link override rules for durability
 
@@ -1700,8 +1704,8 @@ class ContactSource(BaseModel):
     observation_count: int  # Number of individual observations
     source_entity_ids: list[str]  # IDs for split operation
     observed_names: list[str]  # Names seen with this identifier
-    first_seen: Optional[str] = None
-    last_seen: Optional[str] = None
+    first_seen: str | None = None
+    last_seen: str | None = None
 
 
 @router.get("/people/{person_id}/contact-sources")
@@ -1939,13 +1943,13 @@ def split_person(request: PersonSplitRequest):
     """
     with _mutation_lock:
         import uuid
+        from datetime import datetime
         from pathlib import Path
-        from datetime import datetime, timezone
 
-        from api.services.link_override import get_link_override_store, LinkOverride
+        from api.services.link_override import LinkOverride, get_link_override_store
 
         person_store = get_person_entity_store()
-        _source_store = get_source_entity_store()  # noqa: F841
+        _source_store = get_source_entity_store()
 
         # Validate from_person exists
         from_person = person_store.get_by_id(request.from_person_id)
@@ -1965,8 +1969,8 @@ def split_person(request: PersonSplitRequest):
                 id=str(uuid.uuid4()),
                 canonical_name=request.new_person_name,
                 sources=[],
-                first_seen=datetime.now(timezone.utc),
-                last_seen=datetime.now(timezone.utc),
+                first_seen=datetime.now(UTC),
+                last_seen=datetime.now(UTC),
             )
             person_store.add(to_person)
             person_store.save()
@@ -2006,12 +2010,12 @@ def split_person(request: PersonSplitRequest):
             UPDATE source_entities
             SET canonical_person_id = ?, linked_at = ?, link_status = 'confirmed'
             WHERE id IN ({placeholders})
-        """, [to_person.id, datetime.now(timezone.utc).isoformat()] + request.source_entity_ids)
+        """, [to_person.id, datetime.now(UTC).isoformat()] + request.source_entity_ids)
         source_entities_moved = cursor.rowcount
         conn.commit()
 
         # Move interactions - get source_types from the source entities
-        _source_types = list({se['source_type'] for se in source_entity_details})  # noqa: F841
+        _source_types = list({se['source_type'] for se in source_entity_details})
         source_ids = [se['source_id'] for se in source_entity_details if se['source_id']]
 
         interactions_moved = 0
@@ -2201,7 +2205,7 @@ def split_person(request: PersonSplitRequest):
 @router.get("/people/{person_id}/timeline", response_model=TimelineResponse)
 def get_person_timeline(
     person_id: str,
-    source_type: Optional[str] = Query(
+    source_type: str | None = Query(
         default=None,
         description="Filter by source type. Supports comma-separated values for compound "
                     "filters (e.g., 'imessage,whatsapp' for all messages, 'vault,granola' for notes)"
@@ -2212,7 +2216,7 @@ def get_person_timeline(
         le=InteractionConfig.MAX_WINDOW_DAYS,
         description="Days to look back (default 3650, max 3660)"
     ),
-    date: Optional[str] = Query(default=None, description="Filter to specific date (YYYY-MM-DD)"),
+    date: str | None = Query(default=None, description="Filter to specific date (YYYY-MM-DD)"),
     offset: int = Query(default=0, ge=0, description="Offset for pagination"),
     limit: int = Query(default=50, ge=1, le=2000, description="Max results"),
 ):
@@ -2284,7 +2288,7 @@ SOURCE_BADGES = {
 @router.get("/people/{person_id}/timeline/aggregated", response_model=AggregatedTimelineResponse)
 def get_person_timeline_aggregated(
     person_id: str,
-    source_type: Optional[str] = Query(
+    source_type: str | None = Query(
         default=None,
         description="Filter by source type. Supports comma-separated values for compound "
                     "filters (e.g., 'imessage,whatsapp' for all messages)"
@@ -2386,7 +2390,7 @@ def get_person_timeline_aggregated(
         day_total = 0
 
         # Sort by interaction count descending
-        for source_type in sorted(source_groups.keys(), key=lambda st: -len(source_groups[st])):
+        for source_type in sorted(source_groups.keys(), key=lambda st: -len(source_groups[st])):  # noqa: PLR1704
             items_list = source_groups[source_type]
             count = len(items_list)
             day_total += count
@@ -2448,7 +2452,7 @@ def get_person_timeline_aggregated(
 @router.get("/people/{person_id}/connections", response_model=ConnectionsResponse)
 def get_person_connections(
     person_id: str,
-    relationship_type: Optional[str] = Query(default=None, description="Filter by type"),
+    relationship_type: str | None = Query(default=None, description="Filter by type"),
     limit: int = Query(default=50, ge=1, le=200, description="Max results"),
 ):
     """
@@ -2591,7 +2595,7 @@ def get_person_facts(person_id: str):
 
 
 @router.post("/people/{person_id}/facts/extract", response_model=FactExtractionResponse)
-async def extract_person_facts(person_id: str, model: Optional[str] = None):
+async def extract_person_facts(person_id: str, model: str | None = None):
     """
     Trigger fact extraction for a person.
 
@@ -2670,9 +2674,9 @@ async def extract_person_facts(person_id: str, model: Optional[str] = None):
             extracted_count=len(extracted_facts),
             facts=[_fact_to_response(f) for f in extracted_facts],
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.error(f"Fact extraction failed for {person_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Fact extraction failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Fact extraction failed: {e!s}")
 
 
 @router.put("/people/{person_id}/facts/{fact_id}", response_model=PersonFactResponse)
@@ -2790,7 +2794,7 @@ def hide_person(person_id: str, request: HidePersonRequest):
 
 @router.get("/discover", response_model=DiscoverResponse)
 def discover_connections(
-    person_id: Optional[str] = Query(default=None, description="Person to find suggestions for"),
+    person_id: str | None = Query(default=None, description="Person to find suggestions for"),
     limit: int = Query(default=10, ge=1, le=50, description="Max suggestions"),
 ):
     """
@@ -2863,7 +2867,7 @@ def discover_connections(
 @router.post("/sources/import")
 async def import_source_data(
     source_type: str = Query(..., description="Source type: whatsapp, signal"),
-    file: UploadFile = File(...),
+    file: UploadFile = File(...),  # noqa: B008
 ):
     """
     Import data from WhatsApp or Signal export files.
@@ -2884,7 +2888,7 @@ async def import_source_data(
                 content_str = content.decode("latin-1")
         else:
             content_str = content
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"Failed to decode file: {e}")
 
     # get_source_entity_store() itself runs inside the thread hop, not just
@@ -3046,10 +3050,10 @@ def _build_network_edge(rel: Relationship, source_id: str, target_id: str, weigh
 
 @router.get("/network", response_model=NetworkGraphResponse)
 def get_network_graph(
-    center_on: Optional[str] = Query(default=None, description="Person ID to center the graph on"),
+    center_on: str | None = Query(default=None, description="Person ID to center the graph on"),
     depth: int = Query(default=2, ge=1, le=4, description="Hops from center person"),
     min_strength: float = Query(default=0.0, ge=0.0, le=1.0, description="Minimum relationship strength"),
-    category: Optional[str] = Query(default=None, description="Filter by category"),
+    category: str | None = Query(default=None, description="Filter by category"),
     max_nodes: int = Query(
         default=150, ge=1, le=500,
         description="Maximum nodes to return for a centered request (ignored with allow_full_graph)",
@@ -3453,8 +3457,8 @@ class RelationshipDetailResponse(BaseModel):
     is_linkedin_connection: bool = False
     # Computed totals
     total_interactions: int = 0
-    first_seen_together: Optional[str] = None
-    last_seen_together: Optional[str] = None
+    first_seen_together: str | None = None
+    last_seen_together: str | None = None
     weight: int = 0  # Same as network edge weight
 
 
@@ -3538,7 +3542,7 @@ def get_relationship_details(person_a_id: str, person_b_id: str):
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception(f"Error in get_relationship_details: {e}")
+        logger.exception(f"Error in get_relationship_details: {e}")  # noqa: TRY401
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -3565,7 +3569,7 @@ def get_slack_status():
 
 
 @router.get("/slack/oauth/start")
-def start_slack_oauth(state: Optional[str] = None):
+def start_slack_oauth(state: str | None = None):
     """
     Start Slack OAuth flow.
 
@@ -3584,13 +3588,13 @@ def start_slack_oauth(state: Optional[str] = None):
 
 
 @router.get("/slack/callback")
-def slack_oauth_callback(code: str, state: Optional[str] = None):
+def slack_oauth_callback(code: str, state: str | None = None):
     """
     Handle Slack OAuth callback.
 
     Exchanges the authorization code for access token.
     """
-    from api.services.slack_integration import get_slack_client, SlackAPIError
+    from api.services.slack_integration import SlackAPIError, get_slack_client
 
     client = get_slack_client()
 
@@ -3616,9 +3620,9 @@ def sync_slack_users_endpoint(workspace_id: str = "default"):
     """
     with _mutation_lock:
         from api.services.slack_integration import (
+            SlackAPIError,
             get_slack_client,
             sync_slack_users,
-            SlackAPIError,
         )
 
         client = get_slack_client()
@@ -3826,8 +3830,8 @@ class MeInteractionsResponse(BaseModel):
 
 class MeInteractionsSpanResponse(BaseModel):
     """Earliest/latest interaction dates, for sizing the Me heatmap window."""
-    earliest: Optional[str] = None  # ISO timestamp, or null if there's no data
-    latest: Optional[str] = None
+    earliest: str | None = None  # ISO timestamp, or null if there's no data
+    latest: str | None = None
     years: int  # Suggested heatmap window, clamped to [1, 10]
 
 
@@ -3836,8 +3840,8 @@ class FamilyMember(BaseModel):
     id: str
     name: str
     relationship_strength: float = 0.0
-    dunbar_circle: Optional[int] = None
-    last_seen: Optional[str] = None
+    dunbar_circle: int | None = None
+    last_seen: str | None = None
     # Interaction breakdowns for channel mix visualization
     by_source: dict[str, int] = {}
     # Current streak (consecutive days with contact)
@@ -3905,7 +3909,7 @@ def get_me_stats():
 @router.get("/me/timeline", response_model=TimelineResponse)
 @cached_aggregate()
 def get_me_timeline(
-    source_type: Optional[str] = Query(
+    source_type: str | None = Query(
         default=None,
         description="Filter by source type. Supports comma-separated values for compound "
                     "filters (e.g., 'imessage,whatsapp' for all messages, 'vault,granola' for notes)"
@@ -3916,7 +3920,7 @@ def get_me_timeline(
         le=InteractionConfig.MAX_WINDOW_DAYS,
         description="Days to look back (default 365, max 3650)"
     ),
-    date: Optional[str] = Query(default=None, description="Filter to specific date (YYYY-MM-DD)"),
+    date: str | None = Query(default=None, description="Filter to specific date (YYYY-MM-DD)"),
     offset: int = Query(default=0, ge=0, description="Offset for pagination"),
     limit: int = Query(default=50, ge=1, le=2000, description="Max results"),
 ):
@@ -3936,7 +3940,7 @@ def get_me_timeline(
     person_store = get_person_entity_store()
 
     # Calculate date range
-    end_date = datetime.now(timezone.utc)
+    end_date = datetime.now(UTC)
     start_date = end_date - timedelta(days=days_back)
 
     # Get hidden person IDs to exclude from results (targeted query, not a
@@ -3999,14 +4003,14 @@ def get_me_interactions(
 
     Returns pre-aggregated data for heatmaps, charts, and trends.
     """
-    from datetime import timedelta
     from collections import defaultdict
+    from datetime import timedelta
 
     interaction_store = get_interaction_store()
     person_store = get_person_entity_store()
 
     # Calculate date range
-    end_date = datetime.now(timezone.utc)
+    end_date = datetime.now(UTC)
     start_date = end_date - timedelta(days=days_back)
 
     # Single full-person-list load. Cheap (PersonEntityStore.get_all() is
@@ -4047,7 +4051,7 @@ def get_me_interactions(
     }
     circle_map[MY_PERSON_ID] = -1  # Self
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     period_days = {
         "week": 7,
         "month": 30,
@@ -4279,8 +4283,7 @@ def get_me_interactions(
         typical_gap = gaps_sorted[len(gaps_sorted)//2]
         # Minimum based on circle - closer relationships have lower thresholds
         min_gap = {0: 3, 1: 5, 2: 7, 3: 14}.get(circle, 14)
-        if typical_gap < min_gap:
-            typical_gap = min_gap
+        typical_gap = max(typical_gap, min_gap)
         # Days since last contact
         last_contact_jd = jds_sorted[-1]
         days_since = int(now_jd - last_contact_jd)
@@ -4406,7 +4409,7 @@ def get_me_interactions(
                 with open(config_path) as f:
                     config = json.load(f)
                 return config.get("tracked_relationships", [])
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
         return []
 
@@ -4569,8 +4572,8 @@ def get_me_interactions_span():
     if earliest:
         earliest_dt = datetime.fromisoformat(earliest)
         if earliest_dt.tzinfo is None:
-            earliest_dt = earliest_dt.replace(tzinfo=timezone.utc)
-        days_since = (datetime.now(timezone.utc) - earliest_dt).days
+            earliest_dt = earliest_dt.replace(tzinfo=UTC)
+        days_since = (datetime.now(UTC) - earliest_dt).days
         if days_since > 0:
             years = max(1, min(10, (days_since + 364) // 365))
 
@@ -4598,7 +4601,7 @@ def get_family_members():
     all_people = person_store.get_all()
 
     # Get current date for streak calculation
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     today = now.date()
 
     # Helper to get week number (week 0 = last 7 days, week -1 = 8-14 days ago, etc.)
@@ -4636,9 +4639,9 @@ def get_family_members():
                 interaction_dates.add(i.timestamp.date())
             else:
                 try:
-                    dt = datetime.fromisoformat(str(i.timestamp).replace('Z', '+00:00'))
+                    dt = datetime.fromisoformat(str(i.timestamp).replace('Z', '+00:00'))  # noqa: FURB162
                     interaction_dates.add(dt.date())
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
 
         weeks_with_contact = set()
@@ -4723,7 +4726,7 @@ def get_family_timeline(
         ...,
         description="Comma-separated list of person IDs to include in timeline"
     ),
-    source_type: Optional[str] = Query(
+    source_type: str | None = Query(
         default=None,
         description="Filter by source type. Supports comma-separated values."
     ),
@@ -4733,7 +4736,7 @@ def get_family_timeline(
         le=InteractionConfig.MAX_WINDOW_DAYS,
         description="Days to look back (default 365, max 3650)"
     ),
-    date: Optional[str] = Query(default=None, description="Filter to specific date (YYYY-MM-DD)"),
+    date: str | None = Query(default=None, description="Filter to specific date (YYYY-MM-DD)"),
     offset: int = Query(default=0, ge=0, description="Offset for pagination"),
     limit: int = Query(default=50, ge=1, le=2000, description="Max results"),
 ):
@@ -4754,7 +4757,7 @@ def get_family_timeline(
     person_store = get_person_entity_store()
 
     # Calculate date range
-    end_date = datetime.now(timezone.utc)
+    end_date = datetime.now(UTC)
     start_date = end_date - timedelta(days=days_back)
 
     # Filter by person_id IN (...) directly in SQL, and paginate there too
@@ -4813,8 +4816,8 @@ def get_family_interactions(
 
     Similar to /me/interactions but aggregates only interactions WITH the selected people.
     """
-    from datetime import timedelta
     from collections import defaultdict
+    from datetime import timedelta
 
     # Parse person IDs
     selected_ids = [pid.strip() for pid in person_ids.split(",") if pid.strip()]
@@ -4825,7 +4828,7 @@ def get_family_interactions(
     person_store = get_person_entity_store()
 
     # Calculate date range
-    end_date = datetime.now(timezone.utc)
+    end_date = datetime.now(UTC)
     start_date = end_date - timedelta(days=days_back)
 
     # Batch-lookup names for just the selected people
@@ -4840,7 +4843,7 @@ def get_family_interactions(
         else:
             selected_names.append("Unknown")
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     period_days = {
         "week": 7,
         "month": 30,
@@ -4997,7 +5000,7 @@ class CommunicationGap(BaseModel):
     end_date: str
     gap_days: int
     # Context: what was typical contact frequency before/after
-    avg_gap_days_before: Optional[float] = None
+    avg_gap_days_before: float | None = None
 
 
 class CommunicationGapsResponse(BaseModel):
@@ -5031,8 +5034,8 @@ def get_family_communication_gaps(
     person_store = get_person_entity_store()
     interaction_store = get_interaction_store()
 
-    now = datetime.now(timezone.utc)
-    _cutoff = now - timedelta(days=days_back)  # noqa: F841
+    now = datetime.now(UTC)
+    _cutoff = now - timedelta(days=days_back)
 
     gaps = []
     person_summaries = []
@@ -5052,9 +5055,9 @@ def get_family_communication_gaps(
                 interaction_dates.append(i.timestamp.date())
             else:
                 try:
-                    dt = datetime.fromisoformat(str(i.timestamp).replace('Z', '+00:00'))
+                    dt = datetime.fromisoformat(str(i.timestamp).replace('Z', '+00:00'))  # noqa: FURB162
                     interaction_dates.append(dt.date())
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
 
         if not interaction_dates:
@@ -5185,11 +5188,11 @@ class SyncHealthResponse(BaseModel):
     """Response for a single sync source health."""
     source: str
     description: str
-    last_sync: Optional[str] = None
-    last_status: Optional[str] = None
-    last_error: Optional[str] = None
+    last_sync: str | None = None
+    last_status: str | None = None
+    last_error: str | None = None
     is_stale: bool = True
-    hours_since_sync: Optional[float] = None
+    hours_since_sync: float | None = None
     expected_frequency: str = "daily"
 
 
@@ -5211,9 +5214,9 @@ class SyncErrorResponse(BaseModel):
     id: int
     source: str
     timestamp: str
-    error_type: Optional[str] = None
+    error_type: str | None = None
     error_message: str
-    context: Optional[str] = None
+    context: str | None = None
 
 
 @router.get("/sync/health", response_model=list[SyncHealthResponse])
@@ -5263,7 +5266,8 @@ def get_source_sync_health(source: str):
     """
     Get health status for a specific sync source.
     """
-    from api.services.sync_health import get_sync_health as _get_health, SYNC_SOURCES
+    from api.services.sync_health import SYNC_SOURCES
+    from api.services.sync_health import get_sync_health as _get_health
 
     if source not in SYNC_SOURCES:
         raise HTTPException(
@@ -5287,7 +5291,7 @@ def get_source_sync_health(source: str):
 
 @router.get("/sync/errors", response_model=list[SyncErrorResponse])
 def get_sync_errors(
-    source: Optional[str] = Query(default=None, description="Filter by source"),
+    source: str | None = Query(default=None, description="Filter by source"),
     limit: int = Query(default=50, ge=1, le=200, description="Max results"),
 ):
     """
@@ -5347,15 +5351,15 @@ class ReviewQueueItem(BaseModel):
     id: str
     source_entity_id: str
     source_type: str
-    observed_name: Optional[str] = None
-    observed_email: Optional[str] = None
-    observed_phone: Optional[str] = None
+    observed_name: str | None = None
+    observed_email: str | None = None
+    observed_phone: str | None = None
     proposed_person_id: str
     proposed_person_name: str
     confidence: float
     reason: str
-    link_method: Optional[str] = None
-    created_at: Optional[str] = None
+    link_method: str | None = None
+    created_at: str | None = None
 
 
 class ReviewQueueResponse(BaseModel):
@@ -5369,7 +5373,7 @@ class ReviewQueueResponse(BaseModel):
 def get_review_queue(
     min_confidence: float = Query(default=0.0, ge=0.0, le=1.0, description="Minimum confidence"),
     max_confidence: float = Query(default=0.85, ge=0.0, le=1.0, description="Maximum confidence"),
-    link_method: Optional[str] = Query(default=None, description="Filter by resolution method (e.g. email_exact, name_fuzzy)"),
+    link_method: str | None = Query(default=None, description="Filter by resolution method (e.g. email_exact, name_fuzzy)"),
     limit: int = Query(default=50, ge=1, le=200, description="Max results"),
 ):
     """
@@ -5690,18 +5694,18 @@ class LinkOverrideResponse(BaseModel):
     """Response model for a link override rule."""
     id: str
     name_pattern: str
-    source_type: Optional[str] = None
-    context_pattern: Optional[str] = None
+    source_type: str | None = None
+    context_pattern: str | None = None
     preferred_person_id: str
-    preferred_person_name: Optional[str] = None
-    rejected_person_id: Optional[str] = None
-    rejected_person_name: Optional[str] = None
-    reason: Optional[str] = None
-    created_at: Optional[str] = None
+    preferred_person_name: str | None = None
+    rejected_person_id: str | None = None
+    rejected_person_name: str | None = None
+    reason: str | None = None
+    created_at: str | None = None
 
 
 @router.get("/link-overrides")
-def get_link_overrides(person_id: Optional[str] = Query(default=None)):
+def get_link_overrides(person_id: str | None = Query(default=None)):
     """
     Get all link override rules.
 
@@ -5775,7 +5779,7 @@ def _load_partner_person_id() -> str:
             with open(config_path) as f:
                 config = json.load(f)
             return config.get("partner_person_id", "")
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
     return ""
 
@@ -5788,18 +5792,18 @@ class RelationshipInsightResponse(BaseModel):
     person_id: str
     category: str
     text: str
-    source_title: Optional[str] = None
-    source_link: Optional[str] = None
-    source_date: Optional[str] = None
+    source_title: str | None = None
+    source_link: str | None = None
+    source_date: str | None = None
     confirmed: bool = False
-    created_at: Optional[str] = None
+    created_at: str | None = None
     category_icon: str = ""
 
 
 class RelationshipInsightsResponse(BaseModel):
     """Response for relationship insights endpoint."""
     insights: list[RelationshipInsightResponse]
-    last_generated: Optional[str] = None
+    last_generated: str | None = None
     confirmed_count: int = 0
     unconfirmed_count: int = 0
 
@@ -5813,7 +5817,7 @@ class ToneDataPoint(BaseModel):
     placeholder convention."""
     month: str  # YYYY-MM
     score: float  # combined_score, 0-100 scale (placeholder 50.0 when status="error")
-    status: Optional[str] = None  # None = fresh; "stale" = last stored score, not recomputed; "error" = never stored
+    status: str | None = None  # None = fresh; "stale" = last stored score, not recomputed; "error" = never stored
 
 
 class ToneDataPointDetailed(BaseModel):
@@ -5824,7 +5828,7 @@ class ToneDataPointDetailed(BaseModel):
     combined_score: float  # Average of the two
     user_sample_count: int = 0
     partner_sample_count: int = 0
-    status: Optional[str] = None  # None = ok; "error" if the LLM failed for this month
+    status: str | None = None  # None = ok; "error" if the LLM failed for this month
 
 
 class ToneAnalysisResponse(BaseModel):
@@ -5836,8 +5840,8 @@ class ToneAnalysisResponse(BaseModel):
     `analyze_relationship_tone`'s docstring for the four values."""
     monthly_tones: list[ToneDataPoint]
     trend: str  # not-analyzed, insufficient-data, stable-positive, stable-neutral, improving, declining, variable
-    average: Optional[float] = None
-    analyzed_through: Optional[str] = None
+    average: float | None = None
+    analyzed_through: str | None = None
     status: str  # "ok", "no-messages", "in-progress", "failed"
     generated_at: str
 
@@ -5854,7 +5858,7 @@ class ToneAnalysisDetailedResponse(BaseModel):
 
 
 @router.get("/relationship/insights", response_model=RelationshipInsightsResponse)
-def get_relationship_insights(person_id: Optional[str] = None):
+def get_relationship_insights(person_id: str | None = None):
     """
     Get all relationship insights for the configured partner.
 
@@ -5896,8 +5900,8 @@ def get_relationship_insights(person_id: Optional[str] = None):
 
 @router.post("/relationship/insights/generate", response_model=RelationshipInsightsResponse)
 def generate_relationship_insights(
-    person_id: Optional[str] = None,
-    category: Optional[str] = None
+    person_id: str | None = None,
+    category: str | None = None
 ):
     """
     Generate new relationship insights from therapy notes.
@@ -5909,8 +5913,8 @@ def generate_relationship_insights(
     Uses Claude Sonnet for insight extraction.
     """
     from api.services.relationship_insights import (
-        get_relationship_insight_store,
         get_relationship_insight_generator,
+        get_relationship_insight_store,
     )
 
     target_id = person_id or PARTNER_PERSON_ID
@@ -5985,7 +5989,7 @@ def delete_relationship_insight(insight_id: str):
 
 
 @router.post("/relationship/tone-analysis", response_model=ToneAnalysisResponse)
-def analyze_relationship_tone(person_id: Optional[str] = None, months: int = 12, compute: bool = False):
+def analyze_relationship_tone(person_id: str | None = None, months: int = 12, compute: bool = False):
     """
     Compact monthly relationship-tone summary for `person_id`: one combined
     score per month in the window plus trend/average, backed by the exact
@@ -6296,7 +6300,7 @@ def _bucket_interactions_by_month_and_week(interactions: list) -> tuple:
     partner_by_month_week: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
 
     for interaction in interactions:
-        dt = interaction.timestamp.astimezone(timezone.utc)
+        dt = interaction.timestamp.astimezone(UTC)
         month_key = dt.strftime("%Y-%m")
         week_key = dt.strftime("%Y-W%W")
 
@@ -6357,14 +6361,15 @@ def _run_tone_analysis(
     was ever stored for it (ADR-025 fallback preserved via
     get_anthropic_llm).
     """
+    from datetime import datetime, timedelta
+
     from api.services.llm_client import get_anthropic_llm
     from api.services.tone_analysis_store import get_tone_analysis_store
-    from datetime import datetime, timezone, timedelta
 
     interaction_store = get_interaction_store()
     tone_store = get_tone_analysis_store()
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     start_date = _tone_analysis_window_start(now, months)
 
     # Cheap freshness check: counts only, no rows loaded.
@@ -6458,7 +6463,7 @@ def _run_tone_analysis(
                                 client, chunk, user_by_month_week, partner_by_month_week,
                                 user_name, partner_name,
                             )
-                        except Exception as e:
+                        except Exception as e:  # noqa: BLE001
                             # Never a 500 for an LLM failure or unavailability --
                             # catches both client acquisition (get_anthropic_llm)
                             # and the call itself. Log without personal data (no
@@ -6559,7 +6564,7 @@ def _run_tone_analysis(
 
 
 @router.post("/relationship/tone-analysis-detailed", response_model=ToneAnalysisDetailedResponse)
-def analyze_relationship_tone_detailed(person_id: Optional[str] = None, months: int = 12, refresh: bool = False):
+def analyze_relationship_tone_detailed(person_id: str | None = None, months: int = 12, refresh: bool = False):
     """
     Analyze tone/sentiment separately for the user and their partner in
     iMessage conversations, always attempting to recompute any stale or

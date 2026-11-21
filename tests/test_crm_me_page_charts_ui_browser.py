@@ -357,7 +357,7 @@ def test_line_charts_redraw_to_new_width_on_resize(load_me):
             }""",
             arg=[cid, before[cid][4]],
         )
-        sx, sy, rendered_w, _, vb_w, _ = _svg_scale(page, cid)
+        sx, sy, rendered_w, _, vb_w, _ = _svg_scale(page, cid)  # noqa: RUF059
         assert vb_w < before[cid][4]
         assert sx == pytest.approx(1.0, abs=0.02)
         assert sy == pytest.approx(1.0, abs=0.02)

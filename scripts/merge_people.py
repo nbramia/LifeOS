@@ -13,19 +13,19 @@ Usage:
     python scripts/merge_people.py --list-duplicates
     python scripts/merge_people.py --search "name pattern"
 """
-import sys
-import json
-import sqlite3
-import logging
 import argparse
+import json
+import logging
+import sqlite3
+import sys
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
-from datetime import datetime, timezone
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from api.services.person_entity import get_person_entity_store
 from api.services.interaction_store import get_interaction_db_path
+from api.services.person_entity import get_person_entity_store
 from api.services.source_entity import get_crm_db_path
 
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
@@ -50,9 +50,9 @@ def save_merged_ids(merged_ids: dict):
 
     Uses temp file + rename to prevent corruption if process crashes mid-write.
     """
-    import tempfile
-    import shutil
     import os
+    import shutil
+    import tempfile
 
     MERGED_IDS_FILE.parent.mkdir(parents=True, exist_ok=True)
 
@@ -69,14 +69,14 @@ def save_merged_ids(merged_ids: dict):
 
 def write_merge_intent(primary_id: str, secondary_id: str):
     """Write intent log for crash recovery. Atomic write like save_merged_ids()."""
-    import tempfile
     import os
+    import tempfile
 
     log = {
         "operation": "merge",
         "primary_id": primary_id,
         "secondary_id": secondary_id,
-        "started_at": datetime.now(timezone.utc).isoformat(),
+        "started_at": datetime.now(UTC).isoformat(),
         "phase": "pending",
     }
     MERGE_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -94,8 +94,8 @@ def write_merge_intent(primary_id: str, secondary_id: str):
 
 def update_merge_phase(phase: str):
     """Atomically update the phase field in the merge intent log."""
-    import tempfile
     import os
+    import tempfile
 
     log = load_merge_log()
     if log is None:
@@ -168,11 +168,7 @@ def search_people(pattern: str) -> list:
 
     for p in people:
         # Match against name, emails, phones
-        if pattern_lower in p.canonical_name.lower():
-            matches.append(p)
-        elif any(pattern_lower in e.lower() for e in (p.emails or [])):
-            matches.append(p)
-        elif any(pattern_lower in ph for ph in (p.phone_numbers or [])):
+        if pattern_lower in p.canonical_name.lower() or any(pattern_lower in e.lower() for e in (p.emails or [])) or any(pattern_lower in ph for ph in (p.phone_numbers or [])):
             matches.append(p)
 
     return matches
@@ -256,7 +252,7 @@ def _earliest(a: str | None, b: str | None) -> str | None:
         return b
     if not b:
         return a
-    return a if a < b else b
+    return min(b, a)
 
 
 def _latest(a: str | None, b: str | None) -> str | None:
@@ -265,7 +261,7 @@ def _latest(a: str | None, b: str | None) -> str | None:
         return b
     if not b:
         return a
-    return a if a > b else b
+    return max(b, a)
 
 
 def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> dict:
@@ -469,10 +465,10 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
     # === EXECUTE PATH (crash-safe with intent log) ===
 
     # Update last_seen/first_seen on in-memory primary before persisting
-    if secondary.last_seen:
+    if secondary.last_seen:  # noqa: SIM102
         if primary.last_seen is None or secondary.last_seen > primary.last_seen:
             primary.last_seen = secondary.last_seen
-    if secondary.first_seen:
+    if secondary.first_seen:  # noqa: SIM102
         if primary.first_seen is None or secondary.first_seen < primary.first_seen:
             primary.first_seen = secondary.first_seen
 
@@ -624,7 +620,7 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
             if existing:
                 ex = dict(zip(col_names, existing))
                 # Merge counts
-                now = datetime.now(timezone.utc).isoformat()
+                now = datetime.now(UTC).isoformat()
                 crm_conn.execute("""
                     UPDATE relationships SET
                         shared_events_count = ?,
@@ -662,7 +658,7 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
             else:
                 # Transfer: delete old, insert new with primary ID
                 new_id = str(uuid.uuid4())
-                now = datetime.now(timezone.utc).isoformat()
+                now = datetime.now(UTC).isoformat()
                 crm_conn.execute("DELETE FROM relationships WHERE id = ?", (rel['id'],))
                 crm_conn.execute("""
                     INSERT INTO relationships
@@ -731,7 +727,7 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True) -> di
                     (alias.lower(), canonical_primary_id))
 
         # 4f. Soft-delete secondary person entity, remove lookup tables
-        now_iso = datetime.now(timezone.utc).isoformat()
+        now_iso = datetime.now(UTC).isoformat()
         crm_conn.execute(
             "UPDATE person_entities SET hidden = 1, hidden_at = ?, hidden_reason = ? WHERE id = ?",
             (now_iso, f"merged_into:{canonical_primary_id}", canonical_secondary_id),
@@ -841,7 +837,7 @@ def recover_incomplete_merge() -> bool:
             refresh_person_stats([primary_id])
             from api.services.relationship_metrics import update_strength_for_person
             update_strength_for_person(primary_id)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning(f"Post-merge cleanup during recovery had issues: {e}")
         clear_merge_log()
         return True

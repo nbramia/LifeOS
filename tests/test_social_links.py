@@ -7,7 +7,11 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from api.services.contact_export_import import import_contact_export, map_columns, read_row_values
+from api.services.contact_export_import import (
+    import_contact_export,
+    map_columns,
+    read_row_values,
+)
 from api.services.entity_resolver import EntityResolver
 from api.services.person_entity import PersonEntity, PersonEntityStore
 from api.services.social_links import (
@@ -289,7 +293,7 @@ class TestMerge:
 
 @pytest.fixture
 def client(store, monkeypatch):
-    import api.routes.crm as crm
+    from api.routes import crm
 
     monkeypatch.setattr(crm, "get_person_entity_store", lambda: store)
     monkeypatch.setattr(crm, "get_source_entity_store", lambda: type("S", (), {"get_for_person": lambda *a, **k: []})())
@@ -470,7 +474,7 @@ class TestExportColumns:
 
 
 class TestExportImport:
-    HEADERS = ["Full Name", "Work Email", "Phone", "LinkedIn", "Facebook", "Instagram (finsta)"]
+    HEADERS = ["Full Name", "Work Email", "Phone", "LinkedIn", "Facebook", "Instagram (finsta)"]  # noqa: RUF012
 
     def _run(self, store, tmp_path, rows, execute=True, headers=None):
         path = _write_csv(tmp_path / "export.csv", headers or self.HEADERS, rows)
@@ -568,7 +572,10 @@ class TestMergeScriptAndUndo:
 
         from scripts.merge_people import merge_people
         from scripts.undo_merge import undo_merge
-        from tests.test_merge_crash_safety import _create_crm_db, _create_interactions_db
+        from tests.test_merge_crash_safety import (
+            _create_crm_db,
+            _create_interactions_db,
+        )
 
         crm_path = str(tmp_path / "crm.db")
         int_path = str(tmp_path / "interactions.db")

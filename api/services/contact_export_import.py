@@ -10,9 +10,9 @@ matches nobody, or matches two different people, is counted and left alone.
 import csv
 import re
 from collections import Counter
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Optional
 
 from api.services.person_entity import PersonEntity, PersonEntityStore
 from api.services.phone_utils import normalize_phone
@@ -49,7 +49,7 @@ def _normalize_header(header: str) -> str:
     return " ".join(re.sub(r"[^a-z0-9]+", " ", (header or "").lower()).split())
 
 
-def _label_from_words(text: Optional[str], noise: set[str]) -> Optional[str]:
+def _label_from_words(text: str | None, noise: set[str]) -> str | None:
     words = [w for w in (text or "").split() if w not in noise and not w.isdigit()]
     return " ".join(words) or None
 
@@ -58,21 +58,21 @@ def _label_from_words(text: Optional[str], noise: set[str]) -> Optional[str]:
 class _ValueColumn:
     header: str
     kind: str  # "email", "phone", or a platform key
-    label: Optional[str] = None
-    label_header: Optional[str] = None
+    label: str | None = None
+    label_header: str | None = None
 
 
 @dataclass
 class ColumnMap:
     """Which columns of an export hold names, addresses, and accounts."""
 
-    name: Optional[str] = None
-    first_name: Optional[str] = None
-    last_name: Optional[str] = None
+    name: str | None = None
+    first_name: str | None = None
+    last_name: str | None = None
     values: list[_ValueColumn] = field(default_factory=list)
 
 
-def _match_social_column(normalized: str) -> Optional[tuple[str, Optional[str]]]:
+def _match_social_column(normalized: str) -> tuple[str, str | None] | None:
     aliases = sorted(
         ((alias, p.key) for p in SOCIAL_PLATFORMS for alias in p.export_columns),
         key=lambda pair: -len(pair[0]),
@@ -88,8 +88,8 @@ def _match_social_column(normalized: str) -> Optional[tuple[str, Optional[str]]]
 def map_columns(headers: Iterable[str]) -> ColumnMap:
     """Classify an export's headers."""
     result = ColumnMap()
-    label_columns: dict[tuple[str, Optional[str]], str] = {}
-    pending: list[tuple[_ValueColumn, Optional[str]]] = []
+    label_columns: dict[tuple[str, str | None], str] = {}
+    pending: list[tuple[_ValueColumn, str | None]] = []
 
     for header in headers:
         normalized = _normalize_header(header)
@@ -138,15 +138,15 @@ class ExportValue:
 
     kind: str
     value: str
-    label: Optional[str]
+    label: str | None
 
 
-def _clean_exported_label(text: Optional[str]) -> Optional[str]:
+def _clean_exported_label(text: str | None) -> str | None:
     """Strip the ``*`` marker Google-format exports put on labels."""
     return (text or "").replace("*", " ").strip() or None
 
 
-def _split_cell(cell: str) -> list[tuple[str, Optional[str]]]:
+def _split_cell(cell: str) -> list[tuple[str, str | None]]:
     items = []
     for part in _CELL_SPLIT_RE.split(cell.strip()):
         if not part:
@@ -186,7 +186,7 @@ def _row_name(row: dict, columns: ColumnMap) -> str:
     return " ".join(f"{first} {last}".split())
 
 
-def _safe_label(label: Optional[str]) -> Optional[str]:
+def _safe_label(label: str | None) -> str | None:
     try:
         return normalize_label(label)
     except InvalidContactDetail:
@@ -197,9 +197,9 @@ class _Normalized:
     """Validated values of a row, ready for matching and applying."""
 
     def __init__(self, values: list[ExportValue], stats: Counter):
-        self.emails: list[tuple[str, Optional[str]]] = []
-        self.phones: list[tuple[str, Optional[str]]] = []
-        self.socials: list[tuple[str, str, Optional[str]]] = []
+        self.emails: list[tuple[str, str | None]] = []
+        self.phones: list[tuple[str, str | None]] = []
+        self.socials: list[tuple[str, str, str | None]] = []
         for item in values:
             label = _safe_label(item.label)
             try:
@@ -222,7 +222,7 @@ def _find_match(
     row: _Normalized,
     name: str,
     stats: Counter,
-) -> Optional[PersonEntity]:
+) -> PersonEntity | None:
     found: dict[str, tuple[PersonEntity, str]] = {}
     for platform, value, _label in row.socials:
         person = store.get_by_social_link(platform, value)
@@ -302,7 +302,7 @@ def _fill_contact_label(
     person: PersonEntity,
     kind: str,
     value: str,
-    label: Optional[str],
+    label: str | None,
     stats: Counter,
 ) -> bool:
     person.reconcile_contact_details()

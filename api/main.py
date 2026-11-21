@@ -41,6 +41,7 @@ See CLAUDE.md for full instructions for AI coding agents.
 # the only configuration source.
 import os
 from pathlib import Path
+
 if os.environ.get("LIFEOS_TEST_INSTANCE") != "1":
     from dotenv import load_dotenv
     load_dotenv(Path(__file__).resolve().parent.parent / ".env")
@@ -52,21 +53,61 @@ import logging
 import re
 import socket
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from email.utils import formatdate
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
 from starlette.middleware.gzip import GZipMiddleware
 
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-from api.routes import search, ask, calendar, gmail, drive, people, chat, briefings, admin, conversations, memories, imessage, crm, slack, photos, reminders, scheduler, tasks, monarch, investments, jobs, perf, agents, agent_assignment, vault, fitness, voice, agent_proxy, hermes_proxy, journal, journal_trends, journal_ingest, home, vault_files
-from api.services.log_redaction import configure_telegram_log_redaction, install_query_string_redaction_filter
+from api.routes import (
+    admin,
+    agent_assignment,
+    agent_proxy,
+    agents,
+    ask,
+    briefings,
+    calendar,
+    chat,
+    conversations,
+    crm,
+    drive,
+    fitness,
+    gmail,
+    hermes_proxy,
+    home,
+    imessage,
+    investments,
+    jobs,
+    journal,
+    journal_ingest,
+    journal_trends,
+    memories,
+    monarch,
+    people,
+    perf,
+    photos,
+    reminders,
+    scheduler,
+    search,
+    slack,
+    tasks,
+    vault,
+    vault_files,
+    voice,
+)
+from api.services.log_redaction import (
+    configure_telegram_log_redaction,
+    install_query_string_redaction_filter,
+)
 from api.services.route_timing import RouteTimingMiddleware
-from api.services.runtime_identity import capture_runtime_identity, publish_runtime_identity
+from api.services.runtime_identity import (
+    capture_runtime_identity,
+    publish_runtime_identity,
+)
 from config.settings import settings
 
 # Configure root logging here, explicitly, rather than leaving it to whatever
@@ -168,7 +209,7 @@ async def lifespan(app: FastAPI):
             from scripts.merge_people import recover_incomplete_merge
             if recover_incomplete_merge():
                 logger.warning("Recovered incomplete merge operation on startup")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.error(f"Failed to check for incomplete merges: {e}")
 
         # Startup: Initialize and start Calendar indexer at specific times (Eastern)
@@ -181,7 +222,7 @@ async def lifespan(app: FastAPI):
                 timezone=settings.timezone
             )
             logger.info("Calendar indexer scheduler started (8:00, 12:00, 15:00 Eastern)")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.error(f"Failed to start Calendar indexer: {e}")
 
         # Health monitoring runs out-of-band in nbramia/local-processing via
@@ -193,7 +234,7 @@ async def lifespan(app: FastAPI):
             _telegram_listeners = get_telegram_listeners()
             for _listener in _telegram_listeners:
                 _listener.start()
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.error(f"Failed to start Telegram bot listeners: {e}")
 
         # Startup: Start the scheduler (cron/one-off triggers → actions) and watch
@@ -208,7 +249,7 @@ async def lifespan(app: FastAPI):
             _reminder_scheduler.start()
             _scheduler_watcher = SchedulerWatcher(scheduler_dir=store.scheduler_dir)
             _scheduler_watcher.start()
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.error(f"Failed to start scheduler: {e}")
 
         # Startup: Start job queue worker
@@ -217,7 +258,7 @@ async def lifespan(app: FastAPI):
             _job_queue = get_job_queue()
             _job_queue.start_worker()
             logger.info("Job queue worker started")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.error(f"Failed to start job queue worker: {e}")
 
         # Startup: Watch LifeOS/Tasks/ for external edits (e.g. via Obsidian) so
@@ -230,7 +271,7 @@ async def lifespan(app: FastAPI):
             tm.rebuild_index()
             _task_watcher = TaskWatcher(tasks_dir=tm.tasks_dir)
             _task_watcher.start()
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.error(f"Failed to start task file watcher: {e}")
 
         # Wake expired agent-board snoozes even when no board tab is open.
@@ -238,7 +279,7 @@ async def lifespan(app: FastAPI):
             from api.services.snooze_notifier import SnoozeNotifier
             _snooze_notifier = SnoozeNotifier(task_manager=tm)
             _snooze_notifier.start()
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.error(f"Failed to start agent-board snooze notifier: {e}")
 
         # Pebble archive consumer is deliberately separate from native Journal
@@ -247,7 +288,10 @@ async def lifespan(app: FastAPI):
         # default until dry-run validation is complete.
         if settings.pebble_capture_enabled:
             try:
-                from api.services.pebble_capture import CaptureLedger, PebbleCaptureConsumer
+                from api.services.pebble_capture import (
+                    CaptureLedger,
+                    PebbleCaptureConsumer,
+                )
                 from api.services.pebble_capture_watcher import PebbleCaptureWatcher
                 from api.services.scheduler_store import get_scheduler_store
                 from api.services.task_manager import get_task_manager
@@ -265,7 +309,7 @@ async def lifespan(app: FastAPI):
                 # bounded filesystem work off FastAPI's event loop; startup
                 # recovery itself is queued onto the watcher's consumer thread.
                 await asyncio.to_thread(_pebble_capture_watcher.start)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"Failed to start Pebble capture watcher: {e}")
 
         # Startup: Background prefetch for /agents session summaries — so the
@@ -273,7 +317,7 @@ async def lifespan(app: FastAPI):
         try:
             from api.services import agent_viz_summary_prefetch
             agent_viz_summary_prefetch.start()
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.error(f"Failed to start agent_viz prefetch loop: {e}")
 
         # Startup: background transcript mirror — pulls each registered
@@ -283,7 +327,7 @@ async def lifespan(app: FastAPI):
         try:
             from api.services import agent_transcript_mirror
             agent_transcript_mirror.start()
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.error(f"Failed to start agent transcript mirror loop: {e}")
 
         # Startup: background PR-status refresher — keeps the merge status
@@ -292,7 +336,7 @@ async def lifespan(app: FastAPI):
         try:
             from api.services import pr_status_prefetch
             pr_status_prefetch.start()
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.error(f"Failed to start PR status prefetch loop: {e}")
 
         # Hint for new users who haven't set their person ID yet
@@ -319,7 +363,7 @@ async def lifespan(app: FastAPI):
     try:
         from api.services.chat_turns import get_turn_registry
         await get_turn_registry().shutdown()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.error(f"Failed to drain in-flight chat turns: {e}")
 
     # Shutdown: Stop services
@@ -358,19 +402,19 @@ async def lifespan(app: FastAPI):
     try:
         from api.services import agent_viz_summary_prefetch
         agent_viz_summary_prefetch.stop()
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
 
     try:
         from api.services import agent_transcript_mirror
         agent_transcript_mirror.stop()
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
 
     try:
         from api.services import pr_status_prefetch
         pr_status_prefetch.stop()
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
 
 
@@ -607,9 +651,9 @@ async def health_raw_state(clear: bool = False):
     same incidents aren't reported twice. Safe to call without `clear` for
     read-only polls.
     """
-    from api.services.notifications import get_recent_failures, clear_failures
-    from api.services.sync_health import get_stale_syncs, get_failed_syncs
+    from api.services.notifications import clear_failures, get_recent_failures
     from api.services.service_health import get_service_health
+    from api.services.sync_health import get_failed_syncs, get_stale_syncs
 
     processor_failures = get_recent_failures(hours=24)
     stale = get_stale_syncs()
@@ -624,7 +668,7 @@ async def health_raw_state(clear: bool = False):
         cleared["degradation_events"] = registry.clear_degradation_events()
 
     return {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "processor_failures": [
             {"timestamp": ts.isoformat(), "source": src, "error": err}
             for ts, src, err in processor_failures
@@ -692,7 +736,10 @@ def _check_vault_root_sanity(vault_search_check: "dict | None", vault_path) -> N
     if not vault_search_check or vault_search_check.get("status") != "ok":
         return
     try:
-        from api.services.vectorstore import get_vector_store, sample_paths_match_vault_root
+        from api.services.vectorstore import (
+            get_vector_store,
+            sample_paths_match_vault_root,
+        )
         sample = get_vector_store().sample_file_paths(limit=50)
         if not sample:
             vault_search_check["vault_root_check"] = "no vault documents sampled"
@@ -715,7 +762,7 @@ def _check_vault_root_sanity(vault_search_check: "dict | None", vault_path) -> N
             vault_search_check["vault_root_check"] = (
                 f"{matched}/{len(sample)} sampled vault paths under root"
             )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         # Never let this additive sanity check take down the primary
         # vault_search result — a vector-store hiccup here is already
         # visible via the chromadb_server check above.
@@ -733,7 +780,9 @@ async def full_health_check():
     Returns detailed status for each service with timing.
     """
     import time
+
     import httpx
+
     from config.settings import settings
 
     BASE_URL = f"http://localhost:{settings.port}"
@@ -745,7 +794,7 @@ async def full_health_check():
         "errors": [],
     }
 
-    async def test_endpoint(name: str, method: str, path: str, params: dict = None, json_body: dict = None):
+    async def test_endpoint(name: str, method: str, path: str, params: dict = None, json_body: dict = None):  # noqa: RUF013
         """Test an endpoint by actually calling it."""
         start = time.time()
         try:
@@ -795,14 +844,14 @@ async def full_health_check():
                     results["errors"].append(f"{name}: HTTP {resp.status_code}")
                     return False
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             elapsed = int((time.time() - start) * 1000)
             results["checks"][name] = {
                 "status": "error",
                 "latency_ms": elapsed,
                 "error": str(e)
             }
-            results["errors"].append(f"{name}: {str(e)}")
+            results["errors"].append(f"{name}: {e!s}")
             return False
 
     # 1. Local LLM — `local_llm_url` has a non-empty default regardless of
@@ -823,7 +872,7 @@ async def full_health_check():
         try:
             from api.services.llm_client import LocalLLMClient
             reachable = await LocalLLMClient().ais_available()
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             # ais_available() already catches its own network errors and
             # returns False; this is belt-and-suspenders against anything
             # else (e.g. client construction) so a local-LLM problem always
@@ -867,7 +916,7 @@ async def full_health_check():
                     "url": settings.chroma_url
                 }
                 results["errors"].append(f"chromadb_server: HTTP {resp.status_code}")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         elapsed = int((time.time() - start) * 1000)
         results["checks"]["chromadb_server"] = {
             "status": "error",
@@ -875,7 +924,7 @@ async def full_health_check():
             "error": str(e),
             "url": settings.chroma_url
         }
-        results["errors"].append(f"chromadb_server: {str(e)}")
+        results["errors"].append(f"chromadb_server: {e!s}")
 
     # 3. Vault Search (POST /api/search) - tests ChromaDB + BM25
     await test_endpoint(
@@ -913,7 +962,7 @@ async def full_health_check():
     # routes let a missing-credentials FileNotFoundError surface as a 401.
     # Preflight a plain file-existence check for the account this probe uses
     # so all three Google rows report the same not-configured shape.
-    from api.services.google_auth import get_google_auth, GoogleAccount
+    from api.services.google_auth import GoogleAccount, get_google_auth
     if not get_google_auth(GoogleAccount.PERSONAL).credentials_path.exists():
         # Same shape as test_endpoint()'s error rows below (status/latency_ms/
         # error) so a monitor parsing "error" rows doesn't need a special
@@ -1053,7 +1102,7 @@ def data_integrity_check():
 
     try:
         result = _run_consistency_check()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.error(f"Data integrity check failed: {e}")
         return {"status": "error", "error": str(e), "cached": False}
 
@@ -1151,7 +1200,7 @@ def _if_none_match_hits(if_none_match: str, etag: str) -> bool:
     candidates = [tag.strip() for tag in if_none_match.split(",")]
     if "*" in candidates:
         return True
-    normalized = [tag[2:] if tag.startswith("W/") else tag for tag in candidates]
+    normalized = [tag.removeprefix("W/") for tag in candidates]
     return etag in normalized
 
 

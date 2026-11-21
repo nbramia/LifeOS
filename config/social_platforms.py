@@ -5,7 +5,6 @@ JSON rows keyed by the platform ``key``, so no schema change is involved, and
 the API, CRM page, profile-URL matching, and export reader all read this list.
 """
 from dataclasses import dataclass
-from typing import Optional
 
 
 @dataclass(frozen=True)
@@ -19,9 +18,9 @@ class ProfileRule:
 
     pattern: str
     kind: str = ""
-    query_param: Optional[str] = None
+    query_param: str | None = None
     preserve_case: bool = False
-    url_template: Optional[str] = None
+    url_template: str | None = None
 
 
 @dataclass(frozen=True)
@@ -34,12 +33,12 @@ class SocialPlatform:
     hosts: tuple[str, ...]
     rules: tuple[ProfileRule, ...]
     handle_pattern: str
-    url_template: Optional[str]  # None when a bare handle has no profile URL
+    url_template: str | None  # None when a bare handle has no profile URL
     placeholder: str
     export_columns: tuple[str, ...]
     reserved_paths: frozenset[str] = frozenset()
-    id_pattern: Optional[str] = None  # bare values that are numeric account ids
-    id_url_template: Optional[str] = None
+    id_pattern: str | None = None  # bare values that are numeric account ids
+    id_url_template: str | None = None
 
 
 SOCIAL_PLATFORMS: tuple[SocialPlatform, ...] = (
