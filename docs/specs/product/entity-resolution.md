@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** CRM
-> **Last Updated:** 2026-11-02
+> **Last Updated:** 2026-11-08
 
 How LifeOS links source entities from different data sources to canonical person records.
 
@@ -43,6 +43,10 @@ The `EntityResolver` uses a multi-pass algorithm. Each pass is tried in order; t
 - A person named only after their number or address takes the real multi-word name supplied by a `create_if_missing` call that matches them by that identifier, unless someone else holds that name. A single-word name does not replace it, a real name is never replaced, and a read-only lookup renames no one
 
 ---
+
+## Profile URL Matching
+
+`resolve_by_social_link(platform, value)` finds the person holding a URL or handle on any platform in `config/social_platforms.py`, comparing normalized account identities rather than raw strings. `resolve_from_linkedin` tries it before email and name matching. An account held by more than one visible person returns no match.
 
 ## Structured Name Scoring (Pass 4)
 

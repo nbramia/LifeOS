@@ -1040,6 +1040,10 @@ class EntityResolver:
 
         return name
 
+    def resolve_by_social_link(self, platform: str, value: str) -> Optional[PersonEntity]:
+        """Find the person holding a profile URL or handle on a registered platform."""
+        return self.store.get_by_social_link(platform, value)
+
     def resolve_from_linkedin(
         self,
         first_name: str,
@@ -1069,7 +1073,25 @@ class EntityResolver:
         """
         full_name = f"{first_name} {last_name}".strip()
 
-        # Try email first
+        # An exact profile URL identifies the person regardless of name or email changes
+        if linkedin_url:
+            entity = self.resolve_by_social_link("linkedin", linkedin_url)
+            if entity:
+                entity.linkedin_url = linkedin_url
+                entity.company = company or entity.company
+                entity.position = position or entity.position
+                if "linkedin" not in entity.sources:
+                    entity.sources.append("linkedin")
+                self._store.update(entity)
+
+                return ResolutionResult(
+                    entity=entity,
+                    is_new=False,
+                    confidence=1.0,
+                    match_type="linkedin_url_exact",
+                )
+
+        # Then try email
         if email:
             entity = self.resolve_by_email(email)
             if entity:

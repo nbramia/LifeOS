@@ -1026,6 +1026,205 @@
         }
 
         /* Merge modal */
+        /* Log Event */
+        .log-event-btn {
+            align-self: flex-start;
+            flex-shrink: 0;
+            margin-top: 0.4rem;
+            margin-left: 0.75rem;
+            padding: 0.5rem 0.875rem;
+            border: none;
+            border-radius: 8px;
+            background: var(--accent);
+            color: #fff;
+            font-size: 0.85rem;
+            font-weight: 600;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+
+        .log-event-modal {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, 0.7);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .log-event-modal.visible {
+            display: flex;
+        }
+
+        .log-event-content {
+            box-sizing: border-box;
+            background: var(--bg-secondary);
+            border-radius: 12px;
+            max-width: 500px;
+            width: 90%;
+            max-height: 85vh;
+            overflow-y: auto;
+            padding: 1.5rem;
+        }
+
+        .log-event-header {
+            font-size: 1.25rem;
+            font-weight: 600;
+            margin-bottom: 1rem;
+        }
+
+        .log-event-field {
+            display: block;
+            margin-bottom: 0.75rem;
+            color: var(--text-secondary);
+            font-size: 0.8rem;
+        }
+
+        .log-event-field input,
+        .log-event-field textarea {
+            display: block;
+            box-sizing: border-box;
+            width: 100%;
+            min-width: 0;
+            margin-top: 0.25rem;
+            padding: 0.625rem;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            color-scheme: dark;
+            font: inherit;
+            font-size: 0.9rem;
+        }
+
+        .log-event-times {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 0.75rem;
+        }
+
+        .log-event-chips {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.375rem;
+            margin-top: 0.375rem;
+        }
+
+        .log-event-chip {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.25rem;
+            padding: 0.25rem 0.25rem 0.25rem 0.625rem;
+            border-radius: 999px;
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            font-size: 0.8rem;
+        }
+
+        .log-event-chip button {
+            min-width: 28px;
+            min-height: 28px;
+            border: none;
+            background: none;
+            color: var(--text-secondary);
+            font-size: 1rem;
+            cursor: pointer;
+        }
+
+        .log-event-result {
+            padding: 0.625rem;
+            border-radius: 6px;
+            color: var(--text-primary);
+            font-size: 0.875rem;
+            cursor: pointer;
+        }
+
+        .log-event-result:hover {
+            background: var(--bg-tertiary);
+        }
+
+        .log-event-error {
+            margin-bottom: 0.75rem;
+            color: var(--error);
+            font-size: 0.85rem;
+        }
+
+        .log-event-actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 0.5rem;
+        }
+
+        .log-event-actions button {
+            min-height: 44px;
+            padding: 0.5rem 1rem;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            background: var(--bg-tertiary);
+            color: var(--text-primary);
+            font-size: 0.9rem;
+            cursor: pointer;
+        }
+
+        .log-event-actions .log-event-save {
+            border-color: var(--accent);
+            background: var(--accent);
+            color: #fff;
+            font-weight: 600;
+        }
+
+        .log-event-actions button:disabled {
+            opacity: 0.6;
+            cursor: default;
+        }
+
+        @media (max-width: 768px) {
+            .log-event-btn {
+                position: fixed;
+                right: calc(1rem + var(--safe-right));
+                bottom: calc(1rem + var(--safe-bottom));
+                z-index: 900;
+                min-height: 48px;
+                margin: 0;
+                padding: 0.75rem 1.125rem;
+                border-radius: 999px;
+                font-size: 0.95rem;
+                box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+            }
+
+            .log-event-modal {
+                align-items: flex-end;
+            }
+
+            .log-event-content {
+                width: 100%;
+                max-width: 100%;
+                max-height: 90vh;
+                max-height: 90dvh;
+                border-radius: 16px 16px 0 0;
+                padding: 1.25rem;
+                padding-bottom: calc(1.5rem + var(--safe-bottom));
+                animation: slideUp 0.3s ease-out;
+            }
+
+            /* Under 16px, iOS Safari zooms the page when a field takes focus. */
+            .log-event-field input,
+            .log-event-field textarea {
+                font-size: 16px;
+                min-height: 44px;
+            }
+
+            .log-event-times {
+                grid-template-columns: 1fr;
+                gap: 0;
+            }
+
+            .log-event-actions button {
+                flex: 1;
+            }
+        }
+
         .merge-modal {
             display: none;
             position: fixed;
@@ -2195,6 +2394,93 @@
 
         .contact-value-link:hover {
             color: var(--people-hover);
+        }
+
+        .contact-values .contact-value-link,
+        .contact-value-text {
+            display: inline;
+            font-size: 0.8125rem;
+            word-break: break-all;
+        }
+
+        .contact-platform-name {
+            display: block;
+            font-size: 0.6875rem;
+            color: var(--text-secondary);
+        }
+
+        .contact-label-chip {
+            display: inline-block;
+            margin-left: 0.375rem;
+            padding: 0 0.375rem;
+            border-radius: 999px;
+            background: var(--bg-tertiary);
+            color: var(--text-secondary);
+            font-size: 0.6875rem;
+        }
+
+        .contact-row-actions {
+            display: flex;
+            gap: 0.125rem;
+            flex-shrink: 0;
+        }
+
+        .contact-row-actions button,
+        .contact-add-row button,
+        .contact-editor button {
+            min-width: 24px;
+            min-height: 24px;
+            padding: 0 0.375rem;
+            border: 1px solid transparent;
+            border-radius: 6px;
+            background: transparent;
+            color: var(--text-secondary);
+            font-size: 0.75rem;
+            cursor: pointer;
+        }
+
+        .contact-row-actions button:hover,
+        .contact-add-row button:hover,
+        .contact-editor button:hover {
+            background: var(--bg-tertiary);
+            color: var(--people);
+        }
+
+        .contact-add-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.25rem;
+        }
+
+        .contact-editor {
+            display: flex;
+            flex-direction: column;
+            gap: 0.375rem;
+            padding: 0.5rem;
+            border-radius: 6px;
+            background: var(--bg-tertiary);
+        }
+
+        .contact-editor input,
+        .contact-editor select {
+            width: 100%;
+            min-height: 28px;
+            padding: 0.25rem 0.375rem;
+            border: 1px solid var(--border);
+            border-radius: 4px;
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            font-size: 0.8125rem;
+        }
+
+        .contact-editor-actions {
+            display: flex;
+            gap: 0.25rem;
+        }
+
+        .contact-editor-error {
+            color: var(--error, #d9534f);
+            font-size: 0.75rem;
         }
 
         .contact-meta-row {
@@ -5779,6 +6065,12 @@
             position: relative;
         }
 
+        .tracked-line-chart {
+            width: 100%;
+            height: 100%;
+            position: relative;
+        }
+
         .health-chart-svg {
             width: 100%;
             height: 100%;
@@ -5950,6 +6242,8 @@
         }
 
         .tracked-people-list {
+            position: relative;
+            flex-shrink: 0;
             display: flex;
             flex-wrap: wrap;
             gap: 0.375rem;
@@ -6079,6 +6373,24 @@
         /* Chart Panels */
         .me-chart-panel {
             min-height: 220px;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* Network Growth fills the panel (the row height is set by the panel/sibling, not by the chart) */
+        .me-chart-panel .chart-container {
+            flex: 1;
+            height: auto;
+            min-height: 180px;
+            padding: 0.5rem 0.5rem 0;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .me-chart-panel .chart-container > .growth-chart {
+            flex: 1;
+            min-height: 0;
+            height: auto;
         }
 
         .me-compact-panel {
@@ -6128,7 +6440,8 @@
         .growth-chart-inner {
             display: flex;
             position: relative;
-            height: 120px;
+            flex: 1;
+            min-height: 120px;
         }
 
         .growth-y-axis {
@@ -6138,7 +6451,6 @@
             width: 24px;
             padding-right: 4px;
             text-align: right;
-            height: 120px;
             padding-bottom: 4px;
         }
 
@@ -6176,7 +6488,6 @@
             align-items: flex-end;
             gap: 2px;
             flex: 1;
-            height: 120px;
             padding-bottom: 4px;
         }
 
@@ -6291,12 +6602,18 @@
             transition: height 0.3s ease-out;
         }
 
-        .messaging-segment-0 { background: #ef4444; }
-        .messaging-segment-1 { background: #f97316; }
-        .messaging-segment-2 { background: #eab308; }
-        .messaging-segment-3 { background: #22c55e; }
-        .messaging-segment-4 { background: #3b82f6; }
-        .messaging-segment-5 { background: #6b7280; }
+        .messaging-segment-0 { background: #a855f7; }
+        .messaging-segment-1 { background: #ef4444; }
+        .messaging-segment-2 { background: #f97316; }
+        .messaging-segment-3 { background: #eab308; }
+        .messaging-segment-4 { background: #22c55e; }
+        .messaging-segment-5 { background: #3b82f6; }
+        .messaging-segment-6 { background: #6b7280; }
+
+        /* Current (partial) month */
+        .messaging-stacked-bar.messaging-bar-partial {
+            opacity: 0.6;
+        }
 
         .messaging-bar-container {
             cursor: pointer;
@@ -6466,6 +6783,18 @@
 
         .legend-toggle:hover {
             background: var(--bg-tertiary);
+        }
+
+        /* Circle with no people in any month: still clickable, but visibly disabled */
+        .legend-toggle.legend-empty,
+        .legend-toggle.legend-empty.selected {
+            opacity: 0.35;
+            cursor: not-allowed;
+            background: transparent;
+        }
+
+        .legend-toggle.legend-empty .legend-dot {
+            filter: grayscale(1);
         }
 
         .messaging-insight {
@@ -7563,7 +7892,7 @@
             <div class="filters">
                 <div class="people-filter-dropdown" id="peopleCategoryDropdown">
                     <button class="people-filter-btn" onclick="togglePeopleCategoryFilter()">
-                        <span id="peopleCategoryLabel">3 Selected</span>
+                        <span id="peopleCategoryLabel">Categories</span>
                         <span class="dropdown-arrow">▼</span>
                     </button>
                     <div class="people-filter-options" id="peopleCategoryOptions">
@@ -7584,7 +7913,7 @@
                             <span class="category-dot" style="background: #00bcd4;"></span> Personal
                         </label>
                         <label class="people-filter-option">
-                            <input type="checkbox" value="work" onchange="updatePeopleCategoryFilter()">
+                            <input type="checkbox" value="work" checked onchange="updatePeopleCategoryFilter()">
                             <span class="category-dot" style="background: #4f46e5;"></span> Work
                         </label>
                     </div>
@@ -7688,6 +8017,7 @@
                             <span class="header-indicator-label" id="headerDunbarLabel">Intimate</span>
                         </div>
                     </div>
+                    <button type="button" class="log-event-btn" id="logEventBtn" style="display: none;" onclick="openLogEventModal()">+ Log event</button>
                 </div>
 
                 <!-- Mobile-only collapsible details (tags, birthday, contact) -->
@@ -7958,7 +8288,7 @@
                                 <div class="overview-panel me-messaging-panel">
                                     <div class="overview-panel-header">
                                         <span class="overview-panel-title">Messaging by Circle</span>
-                                        <span class="chart-subtitle">iMessage + WhatsApp</span>
+                                        <span class="chart-subtitle">Text + WhatsApp</span>
                                     </div>
                                     <div class="chart-container chart-container-tall" id="messagingByCircleChart"></div>
                                 </div>
@@ -8747,6 +9077,50 @@
         </div>
     </div>
 
+    <!-- Log Event Modal -->
+    <div class="log-event-modal" id="logEventModal">
+        <form class="log-event-content" id="logEventForm" novalidate onsubmit="saveLogEvent(event)">
+            <div class="log-event-header" id="logEventHeader">Log event</div>
+            <label class="log-event-field">Title
+                <input type="text" id="logEventTitle" maxlength="300" placeholder="Coffee, dinner, party…" autocomplete="off">
+            </label>
+            <div class="log-event-times">
+                <label class="log-event-field">Starts
+                    <input type="datetime-local" id="logEventStart">
+                </label>
+                <label class="log-event-field">Ends (optional)
+                    <input type="datetime-local" id="logEventEnd">
+                </label>
+            </div>
+            <label class="log-event-field">Location
+                <input type="text" id="logEventLocation" maxlength="500" autocomplete="off">
+            </label>
+            <label class="log-event-field">Notes
+                <textarea id="logEventNotes" rows="3" maxlength="5000"></textarea>
+            </label>
+            <label class="log-event-field">Source account
+                <input type="text" id="logEventAccount" maxlength="100" list="logEventAccounts" autocomplete="off">
+                <datalist id="logEventAccounts">
+                    <option value="manual"></option>
+                    <option value="personal"></option>
+                    <option value="work"></option>
+                </datalist>
+            </label>
+            <div class="log-event-field">
+                <label for="logEventAttendeeSearch">Other attendees</label>
+                <input type="text" id="logEventAttendeeSearch" placeholder="Search people or type a name" autocomplete="off"
+                       oninput="searchLogEventAttendees()" onkeydown="handleLogEventAttendeeKey(event)">
+                <div id="logEventAttendeeResults"></div>
+                <div class="log-event-chips" id="logEventAttendeeChips"></div>
+            </div>
+            <div class="log-event-error" id="logEventError" role="alert" style="display: none;"></div>
+            <div class="log-event-actions">
+                <button type="button" onclick="closeLogEventModal()">Cancel</button>
+                <button type="submit" class="log-event-save" id="logEventSave">Save</button>
+            </div>
+        </form>
+    </div>
+
     <!-- Merge Modal -->
     <div class="merge-modal" id="mergeModal">
         <div class="merge-modal-content">
@@ -8883,7 +9257,7 @@
         const TONE_POLL_INTERVAL_MS = 5000;
         const TONE_POLL_MAX_ATTEMPTS = 60; // 60 * 5s = 5 minutes
         // People list filters (multi-select)
-        let peopleCategoryFilters = new Set(['self', 'family', 'personal']);  // Work excluded by default
+        let peopleCategoryFilters = new Set(['self', 'family', 'personal', 'work']);  // All categories selected by default
         let peopleDunbarFilters = new Set(['0', '1', '2', '3', '4', '5', '6+']);
         let peopleTagFilters = new Set();  // Empty = all tags (no filter)
         let allAvailableTags = [];  // All tags from loaded people
@@ -10496,6 +10870,175 @@
 
         // Load person detail - shows skeleton immediately, loads data progressively
         // Uses caching to provide instant display for recently viewed people
+        // ===============================
+        // Log Event Modal
+        // ===============================
+
+        let logEventPersonId = null;
+        let logEventAttendees = []; // { id, name }; id is null for someone not in the CRM
+        let logEventOptions = []; // What the attendee results list currently offers
+        let logEventSearchTimer = null;
+        let logEventSearchToken = 0;
+
+        function toDatetimeLocalValue(date) {
+            const pad = (n) => String(n).padStart(2, '0');
+            return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+        }
+
+        // datetime-local values carry no zone, and the event's date in its
+        // source_id has to be the local one, so send the local wall-clock
+        // time with the offset in force on that date.
+        function datetimeLocalToIso(value) {
+            const offset = -new Date(value).getTimezoneOffset();
+            const abs = Math.abs(offset);
+            const pad = (n) => String(n).padStart(2, '0');
+            const seconds = value.length === 16 ? ':00' : '';
+            return `${value}${seconds}${offset < 0 ? '-' : '+'}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`;
+        }
+
+        function updateLogEventButton(visible) {
+            document.getElementById('logEventBtn').style.display = visible ? '' : 'none';
+        }
+
+        function showLogEventError(message) {
+            const el = document.getElementById('logEventError');
+            el.textContent = message;
+            el.style.display = message ? '' : 'none';
+        }
+
+        function openLogEventModal() {
+            if (!selectedPersonId) return;
+            logEventPersonId = selectedPersonId;
+            logEventAttendees = [];
+            logEventOptions = [];
+            logEventSearchToken++;
+            document.getElementById('logEventForm').reset();
+            document.getElementById('logEventStart').value = toDatetimeLocalValue(new Date());
+            document.getElementById('logEventAccount').value = 'manual';
+            document.getElementById('logEventAttendeeResults').innerHTML = '';
+            renderLogEventChips();
+            showLogEventError('');
+            const name = getCachedPerson(logEventPersonId)?.canonical_name;
+            document.getElementById('logEventHeader').textContent = name ? `Log event with ${name}` : 'Log event';
+            document.getElementById('logEventModal').classList.add('visible');
+        }
+
+        function closeLogEventModal() {
+            logEventSearchToken++;
+            document.getElementById('logEventModal').classList.remove('visible');
+        }
+
+        function renderLogEventChips() {
+            document.getElementById('logEventAttendeeChips').innerHTML = logEventAttendees.map((attendee, index) => `
+                <span class="log-event-chip">${escapeHtml(attendee.name)}<button type="button" aria-label="Remove ${escapeHtml(attendee.name)}" onclick="removeLogEventAttendee(${index})">×</button></span>
+            `).join('');
+        }
+
+        function renderLogEventOptions() {
+            document.getElementById('logEventAttendeeResults').innerHTML = logEventOptions.map((option, index) => `
+                <div class="log-event-result" onclick="addLogEventAttendee(${index})">${option.id ? '' : 'Add '}${escapeHtml(option.id ? option.name : `“${option.name}” (not in CRM)`)}${option.company ? `<span style="color: var(--text-secondary);"> · ${escapeHtml(option.company)}</span>` : ''}</div>
+            `).join('');
+        }
+
+        function searchLogEventAttendees() {
+            clearTimeout(logEventSearchTimer);
+            const token = ++logEventSearchToken;
+            const query = document.getElementById('logEventAttendeeSearch').value.trim();
+            const typedOption = query ? [{ id: null, name: query }] : [];
+            logEventOptions = typedOption;
+            renderLogEventOptions();
+            if (query.length < 2) return;
+
+            logEventSearchTimer = setTimeout(async () => {
+                try {
+                    const data = await api(`/people?q=${encodeURIComponent(query)}&limit=8`);
+                    if (token !== logEventSearchToken) return;
+                    const excluded = new Set([logEventPersonId, DUNBAR_CONFIG.myPersonId, ...logEventAttendees.map(a => a.id)]);
+                    logEventOptions = data.people
+                        .filter(p => !excluded.has(p.id))
+                        .map(p => ({ id: p.id, name: p.canonical_name, company: p.company }))
+                        .concat(typedOption);
+                    renderLogEventOptions();
+                } catch (error) {
+                    console.error('Attendee search failed:', error);
+                }
+            }, 200);
+        }
+
+        function addLogEventAttendee(index) {
+            const option = logEventOptions[index];
+            if (!option) return;
+            logEventAttendees.push({ id: option.id, name: option.name });
+            clearTimeout(logEventSearchTimer);
+            logEventSearchToken++;
+            logEventOptions = [];
+            document.getElementById('logEventAttendeeSearch').value = '';
+            renderLogEventOptions();
+            renderLogEventChips();
+        }
+
+        function removeLogEventAttendee(index) {
+            logEventAttendees.splice(index, 1);
+            renderLogEventChips();
+        }
+
+        function handleLogEventAttendeeKey(event) {
+            if (event.key !== 'Enter') return;
+            event.preventDefault();
+            addLogEventAttendee(0);
+        }
+
+        async function saveLogEvent(event) {
+            event.preventDefault();
+            const title = document.getElementById('logEventTitle').value.trim();
+            const start = document.getElementById('logEventStart').value;
+            const end = document.getElementById('logEventEnd').value;
+            if (!title) return showLogEventError('Add a title.');
+            if (!start) return showLogEventError('Add a start time.');
+            if (end && new Date(end) <= new Date(start)) return showLogEventError('End time must be after the start time.');
+
+            const personId = logEventPersonId;
+            const attendeeIds = logEventAttendees.filter(a => a.id).map(a => a.id);
+            const saveBtn = document.getElementById('logEventSave');
+            saveBtn.disabled = true;
+            showLogEventError('');
+
+            try {
+                const response = await fetch(`/api/crm/people/${encodeURIComponent(personId)}/interactions`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        title,
+                        timestamp: datetimeLocalToIso(start),
+                        end_time: end ? datetimeLocalToIso(end) : null,
+                        location: document.getElementById('logEventLocation').value,
+                        notes: document.getElementById('logEventNotes').value,
+                        source_account: document.getElementById('logEventAccount').value,
+                        attendee_person_ids: attendeeIds,
+                        attendee_names: logEventAttendees.filter(a => !a.id).map(a => a.name),
+                    }),
+                });
+                if (!response.ok) {
+                    const body = await response.json().catch(() => ({}));
+                    showLogEventError(typeof body.detail === 'string' ? body.detail : `Could not save (error ${response.status}).`);
+                    return;
+                }
+                closeLogEventModal();
+                for (const id of [personId, ...attendeeIds]) {
+                    invalidatePersonCache(id);
+                    invalidateTimelineCache(id);
+                }
+                if (selectedPersonId === personId) {
+                    await loadPersonDetail(personId, true);
+                }
+            } catch (error) {
+                console.error('Failed to save event:', error);
+                showLogEventError('Could not reach the server. Your entry is still here; try again.');
+            } finally {
+                saveBtn.disabled = false;
+            }
+        }
+
         async function loadPersonDetail(personId, stayOnCurrentTab = false) {
             // Clear date range filter when loading a new person
             const fromInput = document.getElementById('timelineDateFrom');
@@ -10744,6 +11287,7 @@
 
             // Header indicators (strength ring, dunbar circle) - hide for Me page
             const headerIndicators = document.querySelector('.header-indicators');
+            updateLogEventButton(!isMePage);
             if (headerIndicators) {
                 headerIndicators.style.display = isMePage ? 'none' : 'flex';
             }
@@ -11405,48 +11949,169 @@
             labelEl.textContent = getDunbarCircleLabel(circle);
         }
 
+        // ===============================
+        // Labeled contact details and social links
+        // ===============================
+
+        let contactDetailsPerson = null;
+        let socialPlatforms = [];
+        let contactEditor = null;  // { section, id } while the add/edit form is open
+
+        const CONTACT_SECTIONS = {
+            emails: { field: 'labeled_emails', path: 'emails', icon: '📧', noun: 'Email', placeholder: 'name@example.com' },
+            phones: { field: 'labeled_phones', path: 'phones', icon: '📞', noun: 'Phone', placeholder: '+1 555 010 0100' },
+            social: { field: 'social_links', path: 'social-links', icon: '🔗', noun: 'Social' },
+        };
+
+        function escapeContactAttr(text) {
+            return escapeHtml(text).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        }
+
+        function contactEntryLink(section, entry) {
+            const text = section === 'social' && entry.handle ? entry.handle : entry.value;
+            let href = null;
+            if (section === 'emails') href = `mailto:${encodeURIComponent(entry.value)}`;
+            else if (section === 'phones') href = `tel:${encodeURIComponent(entry.value)}`;
+            else if (/^https?:\/\//i.test(entry.url || '')) href = entry.url;
+            if (!href) return `<span class="contact-value-text">${escapeHtml(text)}</span>`;
+            const target = section === 'social' ? ' target="_blank" rel="noopener noreferrer"' : '';
+            return `<a href="${escapeContactAttr(href)}"${target} class="contact-value-link">${escapeHtml(text)}</a>`;
+        }
+
+        function renderContactEditor(section, entry) {
+            const config = CONTACT_SECTIONS[section];
+            let platformField = '';
+            if (section === 'social') {
+                const options = socialPlatforms.map(p =>
+                    `<option value="${escapeContactAttr(p.key)}"${entry && entry.platform === p.key ? ' selected' : ''}>${escapeHtml(p.label)}</option>`
+                ).join('');
+                platformField = `<select name="platform" aria-label="Platform">${options}</select>`;
+            }
+            const placeholder = config.placeholder || 'URL or handle';
+            return `
+                <form class="contact-editor" data-section="${section}" data-id="${entry ? escapeContactAttr(entry.id) : ''}">
+                    ${platformField}
+                    <input name="value" required aria-label="${config.noun} value" placeholder="${placeholder}" value="${entry ? escapeContactAttr(entry.value) : ''}">
+                    <input name="label" maxlength="64" aria-label="Label" placeholder="Label (optional)" value="${entry ? escapeContactAttr(entry.label || '') : ''}">
+                    <div class="contact-editor-actions">
+                        <button type="submit">Save</button>
+                        <button type="button" data-contact-action="cancel">Cancel</button>
+                    </div>
+                    <div class="contact-editor-error" role="alert"></div>
+                </form>`;
+        }
+
+        function renderContactSection(section, entries) {
+            const config = CONTACT_SECTIONS[section];
+            return entries.map(entry => {
+                if (contactEditor && contactEditor.section === section && contactEditor.id === entry.id) {
+                    return renderContactEditor(section, entry);
+                }
+                const icon = section === 'social' ? entry.icon : config.icon;
+                const platform = section === 'social'
+                    ? `<span class="contact-platform-name">${escapeHtml(entry.platform_label)}</span>` : '';
+                const label = entry.label ? `<span class="contact-label-chip">${escapeHtml(entry.label)}</span>` : '';
+                const name = escapeContactAttr(section === 'social' ? entry.platform_label : config.noun);
+                return `
+                    <div class="contact-row" data-contact-entry="${escapeContactAttr(entry.id)}">
+                        <div class="contact-icon-box">${escapeHtml(icon)}</div>
+                        <div class="contact-values">${platform}${contactEntryLink(section, entry)}${label}</div>
+                        <div class="contact-row-actions">
+                            <button type="button" data-contact-action="edit" data-section="${section}" data-id="${escapeContactAttr(entry.id)}" aria-label="Edit ${name}">✎</button>
+                            <button type="button" data-contact-action="remove" data-section="${section}" data-id="${escapeContactAttr(entry.id)}" aria-label="Remove ${name}">×</button>
+                        </div>
+                    </div>`;
+            }).join('');
+        }
+
+        function renderContactDetailSections(person) {
+            let html = '';
+            for (const section of Object.keys(CONTACT_SECTIONS)) {
+                html += renderContactSection(section, person[CONTACT_SECTIONS[section].field] || []);
+                if (contactEditor && contactEditor.section === section && !contactEditor.id) {
+                    html += renderContactEditor(section, null);
+                }
+            }
+            html += `<div class="contact-add-row">${Object.keys(CONTACT_SECTIONS).map(section =>
+                `<button type="button" data-contact-action="add" data-section="${section}">+ ${CONTACT_SECTIONS[section].noun}</button>`
+            ).join('')}</div>`;
+            return html;
+        }
+
+        async function contactDetailsRequest(path, method, body) {
+            const response = await fetch(`/api/crm/people/${encodeURIComponent(selectedPersonId)}/${path}`, {
+                method,
+                headers: { 'Content-Type': 'application/json' },
+                body: body ? JSON.stringify(body) : undefined,
+            });
+            const data = await response.json().catch(() => ({}));
+            if (!response.ok) {
+                throw new Error(typeof data.detail === 'string' ? data.detail : `Could not save (${response.status})`);
+            }
+            return data;
+        }
+
+        function applyContactDetails(data) {
+            Object.assign(contactDetailsPerson, data);
+            contactEditor = null;
+            renderCompactContactInfo(contactDetailsPerson);
+        }
+
+        async function openContactEditor(section, id) {
+            if (section === 'social' && socialPlatforms.length === 0) {
+                socialPlatforms = await api('/social-platforms');
+            }
+            contactEditor = { section, id: id || null };
+            renderCompactContactInfo(contactDetailsPerson);
+        }
+
+        async function handleContactClick(event) {
+            const button = event.target.closest('[data-contact-action]');
+            if (!button) return;
+            const { contactAction: action, section, id } = button.dataset;
+            try {
+                if (action === 'add') await openContactEditor(section, null);
+                if (action === 'edit') await openContactEditor(section, id);
+                if (action === 'cancel') {
+                    contactEditor = null;
+                    renderCompactContactInfo(contactDetailsPerson);
+                }
+                if (action === 'remove') {
+                    if (!window.confirm('Remove this contact detail?')) return;
+                    applyContactDetails(await contactDetailsRequest(`${CONTACT_SECTIONS[section].path}/${id}`, 'DELETE'));
+                }
+            } catch (error) {
+                showNotification(error.message, 'error');
+            }
+        }
+
+        async function handleContactSubmit(event) {
+            const form = event.target.closest('.contact-editor');
+            if (!form) return;
+            event.preventDefault();
+            const { section, id } = form.dataset;
+            const body = { value: form.elements.value.value, label: form.elements.label.value };
+            if (form.elements.platform) body.platform = form.elements.platform.value;
+            const path = CONTACT_SECTIONS[section].path;
+            try {
+                applyContactDetails(await contactDetailsRequest(id ? `${path}/${id}` : path, id ? 'PATCH' : 'POST', body));
+            } catch (error) {
+                form.querySelector('.contact-editor-error').textContent = error.message;
+            }
+        }
+
         // Render compact contact info for new two-column layout
         function renderCompactContactInfo(person) {
             const container = document.getElementById('contactInfoCompact');
             if (!container) return;
+            container.onclick = handleContactClick;
+            container.onsubmit = handleContactSubmit;
+            if (contactDetailsPerson && contactDetailsPerson.id !== person.id) contactEditor = null;
 
             let html = '';
 
-            // Emails
-            if (person.emails && person.emails.length > 0) {
-                html += `
-                    <div class="contact-row">
-                        <div class="contact-icon-box">📧</div>
-                        <div class="contact-values">
-                            ${person.emails.map(e => `<a href="mailto:${e}" class="contact-value-link">${escapeHtml(e)}</a>`).join('')}
-                        </div>
-                    </div>
-                `;
-            }
-
-            // Phone numbers
-            if (person.phone_numbers && person.phone_numbers.length > 0) {
-                html += `
-                    <div class="contact-row">
-                        <div class="contact-icon-box">📞</div>
-                        <div class="contact-values">
-                            ${person.phone_numbers.map(p => `<a href="tel:${p}" class="contact-value-link">${escapeHtml(p)}</a>`).join('')}
-                        </div>
-                    </div>
-                `;
-            }
-
-            // LinkedIn
-            if (person.linkedin_url) {
-                html += `
-                    <div class="contact-row">
-                        <div class="contact-icon-box">🔗</div>
-                        <div class="contact-values">
-                            <a href="${person.linkedin_url}" target="_blank" class="contact-value-link">LinkedIn Profile</a>
-                        </div>
-                    </div>
-                `;
-            }
+            contactDetailsPerson = person;
+            html += renderContactDetailSections(person);
 
             // Meta info (Past organizations, First Seen, Last Seen, Category)
             const metaItems = [];
@@ -11665,6 +12330,15 @@
 
             // Clamp between 1 and 10
             return Math.max(1, Math.min(10, yearsNeeded));
+        }
+
+        // Timeline tag text. Google Messages rows are stored as 'imessage' so the
+        // message pipelines include them; their source_id prefix tells them apart.
+        function timelineSourceLabel(item) {
+            if (item.source_type === 'imessage' && (item.source_id || '').startsWith('gmessages_')) {
+                return 'Google Messages';
+            }
+            return item.source_type || 'Unknown';
         }
 
         // Source type badges mapping
@@ -11891,6 +12565,7 @@
 
         // Show family dashboard
         async function showFamilyDashboard() {
+            updateLogEventButton(false);
             // Hide birthdays page and show main container
             document.getElementById('birthdaysPage').style.display = 'none';
             document.getElementById('birthdaysPage').classList.remove('visible');
@@ -12311,6 +12986,7 @@
 
         // Show relationship dashboard for configured partner
         async function showRelationshipDashboard() {
+            updateLogEventButton(false);
             // Hide birthdays page and show main container
             document.getElementById('birthdaysPage').style.display = 'none';
             document.getElementById('birthdaysPage').classList.remove('visible');
@@ -13445,7 +14121,7 @@
             const months = [];
             for (let i = 11; i >= 0; i--) {
                 const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
-                months.push(d.toISOString().slice(0, 7)); // YYYY-MM
+                months.push(localMonthKey(d)); // YYYY-MM
             }
 
             // Group by month and channel (excluding iMessage)
@@ -13525,7 +14201,7 @@
             const monthLabels = months.map((m, i) => {
                 if (i % showEvery !== 0 && i !== months.length - 1) return '';
                 const x = leftMargin + (i / (months.length - 1)) * chartWidth;
-                const label = new Date(m + '-01').toLocaleDateString('en-US', { month: 'short' });
+                const label = parseLocalDate(m).toLocaleDateString('en-US', { month: 'short' });
                 return `<text x="${x}" y="${height - 5}" text-anchor="middle" style="font-size: 0.5rem; fill: var(--text-muted);">${label}</text>`;
             }).join('');
 
@@ -13993,7 +14669,7 @@
             for (let i = 0; i < labelCount; i++) {
                 const idx = Math.floor(i * (history.length - 1) / (labelCount - 1));
                 const point = history[idx];
-                const date = new Date(point.date);
+                const date = parseLocalDate(point.date);
                 const label = date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
                 xLabels.push(`<text x="${xScale(idx)}" y="${height - 5}" text-anchor="middle" fill="var(--text-muted)" font-size="10">${label}</text>`);
             }
@@ -15021,8 +15697,67 @@
                 : '<div style="color: var(--text-muted); font-size: 0.75rem; padding: 0.25rem;">No cooling trends</div>';
         }
 
+        // Date-only strings ("2026-11-09", "2026-11") must NOT go through new Date(str): that parses as UTC midnight and
+        // renders a day/month early west of UTC. Build the Date in local time from the parts instead.
+        function parseLocalDate(s) {
+            const m = /^(\d{4})-(\d{2})(?:-(\d{2}))?/.exec(String(s == null ? '' : s).slice(0, 10));
+            if (!m) return new Date(NaN);
+            const y = parseInt(m[1], 10);
+            const mo = parseInt(m[2], 10);
+            const day = m[3] ? parseInt(m[3], 10) : 1;
+            if (mo < 1 || mo > 12 || day < 1 || day > 31) return new Date(NaN);
+            return new Date(y, mo - 1, day);
+        }
+
+        // 'YYYY-MM' from the LOCAL year/month (toISOString would use UTC)
+        function localMonthKey(d = new Date()) {
+            return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+        }
+
+        // Content-box pixel size of a chart container, so an SVG viewBox can match the rendered size 1:1.
+        // Falls back when the element is hidden or too small to measure.
+        function chartBox(container, fallbackW = 600, fallbackH = 132) {
+            if (!container) return { width: fallbackW, height: fallbackH };
+            const cs = window.getComputedStyle(container);
+            const px = (v) => parseFloat(v) || 0;
+            const w = container.clientWidth - px(cs.paddingLeft) - px(cs.paddingRight);
+            const h = container.clientHeight - px(cs.paddingTop) - px(cs.paddingBottom);
+            return {
+                width: w >= 120 ? Math.round(w) : fallbackW,
+                height: h >= 60 ? Math.round(h) : fallbackH
+            };
+        }
+
+        // Insert empty entries for every missing 'YYYY-MM' between the first month and max(last data month, current
+        // local month). sortedList must be sorted ascending by `month`. Month math uses integers, not Date parsing.
+        function fillMonthGaps(sortedList, makeEmpty) {
+            if (!sortedList || sortedList.length === 0) return sortedList || [];
+            const re = /^(\d{4})-(\d{2})$/;
+            const toIdx = (key) => {
+                const m = re.exec(key || '');
+                return m ? parseInt(m[1], 10) * 12 + (parseInt(m[2], 10) - 1) : NaN;
+            };
+            const fromIdx = (i) => `${String(Math.floor(i / 12)).padStart(4, '0')}-${String((i % 12) + 1).padStart(2, '0')}`;
+            const start = toIdx(sortedList[0].month);
+            const lastIdx = toIdx(sortedList[sortedList.length - 1].month);
+            if (isNaN(start) || isNaN(lastIdx)) return sortedList;
+            const end = Math.max(lastIdx, toIdx(localMonthKey()));
+            if (end - start > 1200) return sortedList;
+            const byMonth = new Map(sortedList.map(e => [e.month, e]));
+            const filled = [];
+            for (let i = start; i <= end; i++) {
+                const key = fromIdx(i);
+                filled.push(byMonth.has(key) ? byMonth.get(key) : makeEmpty(key));
+            }
+            return filled;
+        }
+
         // Render Relationship Health Score
         let currentHealthPeriod = 'quarter';
+        let lastHealthRenderData = null; // last data renderHealthScore drew (for resize redraw)
+        let lastTrackedRenderData = { parent: null, coparent: null }; // last data renderTrackedChart drew, per type
+        let lastChartBoxKeys = {}; // container id -> "WxH" the chart was last drawn at
+        let chartResizeTimer = null;
         let healthChartData = []; // Store for tooltip lookups
 
         // Render Health Score Line Chart
@@ -15030,6 +15765,7 @@
             const container = document.getElementById('healthChartContainer');
             const scoreEl = document.getElementById('healthCurrentScore');
             if (!container) return;
+            lastHealthRenderData = data;
 
             const history = data.health_score_history || [];
             healthChartData = history; // Store for tooltip
@@ -15054,9 +15790,9 @@
                 return;
             }
 
-            // SVG dimensions - match typical container aspect ratio (roughly 4:1)
-            const width = 600;
-            const height = 120;
+            // SVG dimensions - match the container's pixel size so the viewBox scale is 1:1
+            const { width, height } = chartBox(container);
+            lastChartBoxKeys[container.id] = `${width}x${height}`;
             const padding = { top: 10, right: 15, bottom: 20, left: 30 };
             const chartWidth = width - padding.left - padding.right;
             const chartHeight = height - padding.top - padding.bottom;
@@ -15112,7 +15848,7 @@
             const xLabels = [];
             if (history.length > 0) {
                 const formatLabel = (dateStr) => {
-                    const d = new Date(dateStr);
+                    const d = parseLocalDate(dateStr);
                     return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
                 };
                 xLabels.push(`<text x="${xScale(0)}" y="${height - 2}" font-size="11" fill="var(--text-primary)" text-anchor="start">${formatLabel(history[0].date)}</text>`);
@@ -15155,7 +15891,7 @@
                     const count = dot.dataset.count || 0;
                     const avg = dot.dataset.avg || 0;
                     const dateStr = dot.dataset.date;
-                    const d = new Date(dateStr);
+                    const d = parseLocalDate(dateStr);
                     const formattedDate = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 
                     tooltip.innerHTML = `
@@ -15183,6 +15919,7 @@
         // Change health score period
         async function changeHealthPeriod(period) {
             currentHealthPeriod = period;
+            lastHealthRenderData = null;  // a resize must not redraw old data over Loading.../Failed to load
 
             // Update pill states (only the main health panel, not tracked panels)
             document.querySelectorAll('#healthChartContainer').forEach(container => {
@@ -15243,6 +15980,7 @@
             const peopleListEl = document.getElementById(peopleListId);
 
             if (!container) return;
+            lastTrackedRenderData[type] = data;
 
             const history = data.history || [];
             const isInverse = data.healthy_direction === 'less';  // fewer = healthier
@@ -15279,9 +16017,9 @@
             // Fixed 0-100 Y-axis for scores (like health score)
             const yAxisMax = 100;
 
-            // SVG dimensions
-            const width = 600;
-            const height = 120;
+            // SVG dimensions - match the container's pixel size so the viewBox scale is 1:1
+            const { width, height } = chartBox(container);
+            lastChartBoxKeys[container.id] = `${width}x${height}`;
             const padding = { top: 10, right: 15, bottom: 20, left: 30 };
             const chartWidth = width - padding.left - padding.right;
             const chartHeight = height - padding.top - padding.bottom;
@@ -15337,7 +16075,7 @@
             const xLabels = [];
             if (history.length > 0) {
                 const formatLabel = (dateStr) => {
-                    const d = new Date(dateStr);
+                    const d = parseLocalDate(dateStr);
                     return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
                 };
                 xLabels.push(`<text x="${xScale(0)}" y="${height - 2}" font-size="11" fill="var(--text-primary)" text-anchor="start">${formatLabel(history[0].date)}</text>`);
@@ -15380,7 +16118,7 @@
                     const count = dot.dataset.count || 0;
                     const avg = dot.dataset.avg || 0;
                     const dateStr = dot.dataset.date;
-                    const d = new Date(dateStr);
+                    const d = parseLocalDate(dateStr);
                     const formattedDate = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 
                     tooltip.innerHTML = `
@@ -15407,6 +16145,7 @@
         // Change tracked relationship period
         async function changeTrackedPeriod(type, period) {
             currentTrackedPeriods[type] = period;
+            lastTrackedRenderData[type] = null;  // a resize must not redraw old data over Loading.../Failed to load
 
             // Update pill states for this panel only
             const selectorId = type === 'parent' ? 'parentPeriodSelector' : 'coparentPeriodSelector';
@@ -15441,6 +16180,27 @@
             }
         }
 
+        // Redraw the Health / tracked line charts when the window (and so the container width) changes.
+        // Only re-renders when the container is visible and its measured size actually changed, so it cannot loop.
+        function rerenderMeLineCharts() {
+            const jobs = [
+                ['healthChartContainer', lastHealthRenderData, (d) => renderHealthScore(d)],
+                ['parentChartContainer', lastTrackedRenderData.parent, (d) => renderTrackedChart('parent', d)],
+                ['coparentChartContainer', lastTrackedRenderData.coparent, (d) => renderTrackedChart('coparent', d)]
+            ];
+            jobs.forEach(([id, data, draw]) => {
+                const el = document.getElementById(id);
+                if (!el || !data || el.offsetParent === null || el.clientWidth === 0) return;
+                const box = chartBox(el);
+                if (lastChartBoxKeys[id] === `${box.width}x${box.height}`) return;
+                draw(data);
+            });
+        }
+        window.addEventListener('resize', () => {
+            clearTimeout(chartResizeTimer);
+            chartResizeTimer = setTimeout(rerenderMeLineCharts, 150);
+        });
+
         // Render Neglected Contacts
         function renderNeglectedContacts(data) {
             const container = document.getElementById('neglectedContactsList');
@@ -15470,9 +16230,9 @@
 
         function setGrowthCenterMonth(month) {
             const today = new Date();
-            const currentMonth = today.toISOString().slice(0, 7);
-            const clickedDate = new Date(month + '-01');
-            const currentDate = new Date(currentMonth + '-01');
+            const currentMonth = localMonthKey(today);
+            const clickedDate = parseLocalDate(month);
+            const currentDate = parseLocalDate(currentMonth);
             const monthsBack = (currentDate.getFullYear() - clickedDate.getFullYear()) * 12 + (currentDate.getMonth() - clickedDate.getMonth());
 
             if (monthsBack < 6) {
@@ -15491,7 +16251,11 @@
         function getGrowthWindowData() {
             const allData = networkGrowthData;
             if (allData.length === 0) return [];
-            const sortedData = [...allData].sort((a, b) => a.month.localeCompare(b.month));
+            // The API omits months with zero new people; fill the gaps so the axis has no skipped month
+            const sortedData = fillMonthGaps(
+                [...allData].sort((a, b) => a.month.localeCompare(b.month)),
+                (month) => ({ month, new_people: 0 })
+            );
 
             if (!networkGrowthCenterMonth) {
                 return sortedData.slice(-12);
@@ -15531,18 +16295,21 @@
             // Reset button if not at default view
             const resetBtnHtml = networkGrowthCenterMonth ? `<button class="growth-reset-btn" onclick="resetGrowthCenter()">↻ Now</button>` : '';
 
+            // Even axis maximum so the middle tick is always an integer
+            const axisMax = maxNew + (maxNew % 2);
+
             // Generate y-axis labels (0, mid, max)
-            const yAxisMid = Math.round(maxNew / 2);
+            const yAxisMid = axisMax / 2;
             const yAxisLabels = `
                 <div class="growth-y-axis">
-                    <div class="growth-y-label">${maxNew}</div>
+                    <div class="growth-y-label">${axisMax}</div>
                     <div class="growth-y-label">${yAxisMid}</div>
                     <div class="growth-y-label">0</div>
                 </div>
             `;
 
             const barsHtml = growth.map((g, idx) => {
-                const height = (g.new_people / maxNew) * 100;
+                const height = (g.new_people / axisMax) * 100;
                 return `
                     <div class="growth-bar-container" data-index="${idx}">
                         <div class="growth-bar" style="height: ${Math.max(height, 2)}%;"></div>
@@ -15586,7 +16353,7 @@
                     const g = windowedData[idx];
                     if (!g) return;
 
-                    const d = new Date(g.month + '-01');
+                    const d = parseLocalDate(g.month);
                     const monthName = d.toLocaleDateString('en-US', { month: 'short', year: 'numeric' });
 
                     tooltip.innerHTML = `
@@ -15612,7 +16379,8 @@
         // Render Messaging Volume by Circle Chart
         // Store raw messaging data for filtering
         let messagingByCircleData = [];
-        let messagingCircleFilters = new Set(['1', '2', '3', '4']);  // Inner circle excluded by default
+        let messagingCircleFilters = new Set(['1', '2', '3', '4', '5']);  // replaced with all circles present in the data on first load
+        let messagingFiltersInitialised = false;  // set once, so user toggles are not reset when the chart re-renders
         let messagingDisplayMode = 'raw';  // 'raw' or 'percent'
         let messagingCountMode = 'all';  // 'all' (message counts) or 'unique' (unique people)
         let messagingCenterMonth = null;  // null = default (most recent 12 months), or 'YYYY-MM' to center on
@@ -15630,11 +16398,11 @@
         function setMessagingCenterMonth(month) {
             // Get today's month
             const today = new Date();
-            const currentMonth = today.toISOString().slice(0, 7);
+            const currentMonth = localMonthKey(today);
 
             // Calculate how many months back the clicked month is
-            const clickedDate = new Date(month + '-01');
-            const currentDate = new Date(currentMonth + '-01');
+            const clickedDate = parseLocalDate(month);
+            const currentDate = parseLocalDate(currentMonth);
             const monthsBack = (currentDate.getFullYear() - clickedDate.getFullYear()) * 12 + (currentDate.getMonth() - clickedDate.getMonth());
 
             // If clicking on a recent month (within last 6 months), cap at current view
@@ -15657,7 +16425,11 @@
             if (allData.length === 0) return [];
 
             // Sort data by month
-            const sortedData = [...allData].sort((a, b) => a.month.localeCompare(b.month));
+            // Fill months the API omitted (no messages) so the axis has no skipped month
+            const sortedData = fillMonthGaps(
+                [...allData].sort((a, b) => a.month.localeCompare(b.month)),
+                (month) => ({ month, by_circle: {}, unique_by_circle: {}, total: 0 })
+            );
 
             if (!messagingCenterMonth) {
                 // Default: show most recent 12 months
@@ -15693,10 +16465,29 @@
                 return;
             }
 
+            if (!messagingFiltersInitialised) {
+                // Start with every circle that has data (value > 0 in any month, either mode);
+                // if no circle has data at all, fall back to the standard circles 1-5
+                const initial = new Set();
+                messagingByCircleData.forEach(m => {
+                    [m.by_circle, m.unique_by_circle].forEach(src => {
+                        Object.keys(src || {}).forEach(c => { if ((src[c] || 0) > 0) initial.add(c); });
+                    });
+                });
+                messagingCircleFilters = initial.size > 0 ? initial : new Set(['1', '2', '3', '4', '5']);
+                messagingFiltersInitialised = true;
+            }
+
             renderMessagingChart();
         }
 
+        // True if the circle has a value > 0 in any month (messages or unique people)
+        function messagingCircleHasData(c) {
+            return messagingByCircleData.some(m => ((m.by_circle && m.by_circle[c]) || 0) > 0 || ((m.unique_by_circle && m.unique_by_circle[c]) || 0) > 0);
+        }
+
         function toggleCircleFilter(circle) {
+            if (!messagingCircleHasData(circle)) return;  // nothing to show for an empty circle
             if (messagingCircleFilters.has(circle)) {
                 // Don't allow removing the last filter
                 if (messagingCircleFilters.size > 1) {
@@ -15715,7 +16506,20 @@
             // Use windowed data based on center month selection
             const messaging = getMessagingWindowData();
             const selectedCircles = Array.from(messagingCircleFilters);
-            const circleLabels = ['Inner', 'Close', 'Friend', 'Acquaint', 'Familiar', 'Outer'];
+            // Indexed by the API bucket key. The backend caps the bucket at 5 (min(circle, 5)), so bucket 5 is every
+            // Dunbar circle from 5 up (including "no circle"), i.e. the catch-all outer bucket. 'Beyond' (key 6) is
+            // only defensive for a future key. Bucket 0 is reserved for manual overrides and only shown if it has data.
+            const circleLabels = ['Core', 'Inner', 'Close', 'Friend', 'Acquaint', 'Outer', 'Beyond'];
+            const circleTitles = {
+                '0': 'Core: manual override circle',
+                '1': 'Dunbar circle 1: top 5 people',
+                '2': 'Dunbar circle 2: next 15',
+                '3': 'Dunbar circle 3: next 50',
+                '4': 'Dunbar circle 4: next 150',
+                '5': 'Dunbar circle 5 and beyond: everyone else',
+                '6': 'Beyond circle 5'
+            };
+            const currentMonthKey = localMonthKey();
             const isPercentMode = messagingDisplayMode === 'percent';
             const isUniqueMode = messagingCountMode === 'unique';
 
@@ -15734,10 +16538,13 @@
 
             const maxTotal = Math.max(...filteredData.map(m => m.filteredTotal), 1);
 
-            // Calculate average distribution for comparison
+            // Calculate average distribution for comparison, from COMPLETE months only
+            // (the current month is partial); if only the partial month exists, use it
+            const completeData = filteredData.filter(m => m.month !== currentMonthKey);
+            const avgSource = completeData.length > 0 ? completeData : filteredData;
             const avgByCircle = {};
             selectedCircles.forEach(c => {
-                avgByCircle[c] = filteredData.reduce((sum, m) => sum + (m.dataSource[c] || 0), 0);
+                avgByCircle[c] = avgSource.reduce((sum, m) => sum + (m.dataSource[c] || 0), 0);
             });
             const avgTotal = Object.values(avgByCircle).reduce((a, b) => a + b, 0);
             const avgPercentages = {};
@@ -15746,7 +16553,7 @@
             });
 
             // Build stacked bars with data attributes for tooltips
-            // Order: outer circles (4) at bottom, inner circles (0) at top
+            // Order: higher circle numbers (outer) at the bottom, lower numbers (inner) at the top
             // Sort descending so higher circle numbers render first (at bottom of stack)
             const orderedCircles = [...selectedCircles].sort((a, b) => parseInt(b) - parseInt(a));
 
@@ -15762,7 +16569,7 @@
 
                 return `
                     <div class="messaging-bar-container" data-index="${idx}">
-                        <div class="messaging-stacked-bar" style="height: ${Math.max(barHeight, 2)}%;">${segments}</div>
+                        <div class="messaging-stacked-bar${m.month === currentMonthKey ? ' messaging-bar-partial' : ''}" style="height: ${Math.max(barHeight, 2)}%;">${segments}</div>
                     </div>
                 `;
             }).join('');
@@ -15813,10 +16620,18 @@
             `;
 
             // Legend with toggles
-            const legendHtml = ['0', '1', '2', '3', '4'].map(c => {
-                const isSelected = messagingCircleFilters.has(c);
+            // Circles 1-5 always; 0 and 6 only if any month has that key. A circle with no people in ANY month is dimmed.
+            const hasKey = (c) => messagingByCircleData.some(m => (m.by_circle && c in m.by_circle) || (m.unique_by_circle && c in m.unique_by_circle));
+            const legendCircles = ['1', '2', '3', '4', '5'];
+            if (hasKey('0')) legendCircles.unshift('0');
+            if (hasKey('6')) legendCircles.push('6');
+            const legendHtml = legendCircles.map(c => {
+                const isEmpty = !messagingCircleHasData(c);
+                const isSelected = !isEmpty && messagingCircleFilters.has(c);
+                const chipTitle = isEmpty ? 'No people in this circle yet' : (circleTitles[c] || '');
+                const chipActions = isEmpty ? ' aria-disabled="true"' : ` onclick="toggleCircleFilter('${c}')" onkeydown="if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggleCircleFilter('${c}'); }"`;
                 return `
-                    <div class="legend-item legend-toggle ${isSelected ? 'selected' : ''}" onclick="toggleCircleFilter('${c}')">
+                    <div class="legend-item legend-toggle ${isSelected ? 'selected' : ''}${isEmpty ? ' legend-empty' : ''}" role="button" tabindex="0" aria-pressed="${isSelected}" title="${chipTitle}"${chipActions}>
                         <div class="legend-dot messaging-segment-${c}"></div>
                         <span>${circleLabels[parseInt(c)]}</span>
                     </div>
@@ -15861,8 +16676,8 @@
                     const m = filteredData[idx];
                     if (!m) return;
 
-                    const d = new Date(m.month + '-01');
-                    const monthName = d.toLocaleDateString('en-US', { month: 'short', year: 'numeric' });
+                    const d = parseLocalDate(m.month);
+                    const monthName = d.toLocaleDateString('en-US', { month: 'short', year: 'numeric' }) + (m.month === localMonthKey() ? ' (so far)' : '');
 
                     // Build breakdown by circle - use the appropriate data source
                     const breakdown = selectedCircles.map(c => {
@@ -15898,13 +16713,20 @@
             const insights = [];
             if (filteredData.length < 2 || avgTotal === 0) return insights;
 
-            const recent = filteredData[filteredData.length - 1];
-            const previous = filteredData[filteredData.length - 2];
-            const avgMonthlyTotal = avgTotal / filteredData.length;
+            // The current local month is partial: when it is the latest bar and there are enough months,
+            // compare the last COMPLETE month against the one before it, and average over complete months only.
+            const hasPartial = filteredData[filteredData.length - 1].month === localMonthKey();
+            if (hasPartial && filteredData.length < 3) return insights;  // only one complete month: nothing meaningful to compare
+            const completeMonths = hasPartial ? filteredData.slice(0, -1) : filteredData;
+            const useComplete = hasPartial && filteredData.length >= 3;
+            const recent = useComplete ? filteredData[filteredData.length - 2] : filteredData[filteredData.length - 1];
+            const previous = useComplete ? filteredData[filteredData.length - 3] : filteredData[filteredData.length - 2];
+            const avgMonthCount = completeMonths.length > 0 ? completeMonths.length : filteredData.length;
+            const avgMonthlyTotal = avgTotal / avgMonthCount;
             const recentTotal = recent.filteredTotal;
 
             // Helper to get month name
-            const getMonthName = (monthStr) => new Date(monthStr + '-01').toLocaleDateString('en-US', { month: 'short' });
+            const getMonthName = (monthStr) => parseLocalDate(monthStr).toLocaleDateString('en-US', { month: 'short' });
             const recentMonthName = getMonthName(recent.month);
 
             // 1. Volume comparison vs average
@@ -15956,12 +16778,13 @@
             }
 
             // 5. Trend over time (first half vs second half of data)
-            if (filteredData.length >= 6) {
-                const midpoint = Math.floor(filteredData.length / 2);
-                const firstHalfTotal = filteredData.slice(0, midpoint).reduce((sum, m) => sum + m.filteredTotal, 0);
-                const secondHalfTotal = filteredData.slice(midpoint).reduce((sum, m) => sum + m.filteredTotal, 0);
+            const trendData = useComplete ? completeMonths : filteredData;
+            if (trendData.length >= 6) {
+                const midpoint = Math.floor(trendData.length / 2);
+                const firstHalfTotal = trendData.slice(0, midpoint).reduce((sum, m) => sum + m.filteredTotal, 0);
+                const secondHalfTotal = trendData.slice(midpoint).reduce((sum, m) => sum + m.filteredTotal, 0);
                 const firstHalfAvg = firstHalfTotal / midpoint;
-                const secondHalfAvg = secondHalfTotal / (filteredData.length - midpoint);
+                const secondHalfAvg = secondHalfTotal / (trendData.length - midpoint);
                 const trendChange = firstHalfAvg > 0 ? ((secondHalfAvg - firstHalfAvg) / firstHalfAvg * 100) : 0;
 
                 if (Math.abs(trendChange) >= 20) {
@@ -17064,7 +17887,7 @@
                         ${snippet && !isDuplicate ? `<div class="timeline-snippet">${escapeHtml(snippet)}</div>` : ''}
                         <div class="timeline-meta">
                             ${formatDate(item.timestamp)}
-                            <span class="timeline-source-badge">${escapeHtml(item.source_type || 'Unknown')}</span>
+                            <span class="timeline-source-badge">${escapeHtml(timelineSourceLabel(item))}</span>
                         </div>
                     </div>
                 </div>

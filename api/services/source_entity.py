@@ -51,6 +51,7 @@ SOURCE_TYPES = {
     "phone",
     "photos",
     "in_person",
+    "outlook",  # work Outlook account (PST import); always categorized as work
 }
 
 

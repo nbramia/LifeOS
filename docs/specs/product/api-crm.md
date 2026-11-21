@@ -2,7 +2,7 @@
 
 **Status:** Complete
 **Owner:** API Gateway
-**Last Updated:** 2026-11-03
+**Last Updated:** 2026-11-08
 
 Every `/api/crm/*` HTTP endpoint. Split out of the main [api-reference.md](api-reference.md) because the CRM endpoint catalog is large enough to deserve its own file. For the consumer view of the CRM features these endpoints back, see the [CRM specs](crm-ui.md).
 
@@ -55,6 +55,26 @@ Each returned person carries `has_profile_photo` (bool, from `photo_count > 0`) 
 
 Get person detail with source entities.
 
+### GET /api/crm/social-platforms
+
+List the platforms a contact can have accounts on: `key`, `label`, `icon`, `placeholder`.
+
+### Social links and labeled contact info
+
+| Method and path | Body | Effect |
+|-----------------|------|--------|
+| `POST /api/crm/people/{id}/social-links` | `{platform, value, label?}` | Add an account |
+| `PATCH /api/crm/people/{id}/social-links/{link_id}` | `{platform?, value?, label?}` | Edit an account |
+| `DELETE /api/crm/people/{id}/social-links/{link_id}` | | Remove an account |
+| `POST /api/crm/people/{id}/emails` | `{value, label?}` | Add an email |
+| `PATCH /api/crm/people/{id}/emails/{entry_id}` | `{value?, label?}` | Edit an email or its label |
+| `DELETE /api/crm/people/{id}/emails/{entry_id}` | | Remove an email |
+| `POST /api/crm/people/{id}/phones` | `{value, label?}` | Add a phone |
+| `PATCH /api/crm/people/{id}/phones/{entry_id}` | `{value?, label?}` | Edit a phone or its label |
+| `DELETE /api/crm/people/{id}/phones/{entry_id}` | | Remove a phone |
+
+Ids come from `social_links`, `labeled_emails`, and `labeled_phones` on the person response, and change when the value changes. Every write returns those three lists plus `linkedin_url`, `emails`, `phone_numbers`, and `phone_primary`. An empty or null `label` clears the label. Invalid values return `422`; duplicates and values held by another person return `409`. Behavior is described in [crm-people.md](crm-people.md#social-links-and-labeled-contact-info).
+
 ### GET /api/crm/people/{id}/timeline
 
 Chronological interaction history.
@@ -63,6 +83,14 @@ Chronological interaction history.
 - `source_type` (string): Filter by source
 - `days_back` (int): Lookback period
 - `limit` (int): Max items
+
+### POST /api/crm/people/{id}/interactions
+
+Record an event no calendar sync captured. Writes one `calendar` interaction per CRM attendee, with `source_id` `manual_<slug>_<date>:<person_id>` (`<date>` is the event's local date), and refreshes those people's stats.
+
+**Body:** `title` and `timestamp` (ISO 8601 with UTC offset) are required. Optional: `end_time`, `location`, `notes`, `source_account` (default `manual`), `attendee_person_ids` (other CRM people), `attendee_names` (people not in the CRM). `location`, `end_time`, notes, and the other attendees' names are stored in the row's `snippet`.
+
+**Response:** `201` with `{"created", "skipped", "person_ids"}`. `skipped` counts attendees who already had this event. **Errors:** `404` unknown person, `409` already recorded for everyone, `422` invalid fields, an unknown attendee, or a timestamp before 2000 or over 90 days ahead.
 
 ### GET /api/crm/people/{id}/connections
 

@@ -85,7 +85,7 @@ class TestRefreshUpdatesFirstSeenAndCounts:
         # CRM DB with older source_entity
         crm_db = str(tmp_path / "crm.db")
         _create_crm_db(crm_db, [
-            ("se1", person_id, source_entity_first.isoformat(), "linkedin"),
+            ("se1", person_id, source_entity_first.isoformat(), "email"),
         ])
 
         entity = PersonEntity(id=person_id, canonical_name="Alex Test")
@@ -101,6 +101,32 @@ class TestRefreshUpdatesFirstSeenAndCounts:
         # first_seen should be the source_entity date (older)
         assert entity.first_seen is not None
         assert abs((entity.first_seen - source_entity_first).total_seconds()) < 2
+
+    def test_linkedin_source_does_not_set_first_seen(self, tmp_path):
+        """LinkedIn export rows carry the import day, not contact activity, so they never set first_seen."""
+        person_id = "test-person-linkedin"
+        now = datetime.now(timezone.utc)
+        import_day = now - timedelta(days=90)
+
+        int_db = str(tmp_path / "interactions.db")
+        _create_interaction_db(int_db, [])
+
+        crm_db = str(tmp_path / "crm.db")
+        _create_crm_db(crm_db, [
+            ("se1", person_id, import_day.isoformat(), "linkedin"),
+        ])
+
+        entity = PersonEntity(id=person_id, canonical_name="Alex Test")
+        mock_store = _mock_store()
+        mock_store.get_by_id.return_value = entity
+        mock_store.get_legacy_ids.return_value = set()
+
+        with patch("api.services.person_entity.get_person_entity_store", return_value=mock_store), \
+             patch("api.services.interaction_store.get_interaction_db_path", return_value=int_db), \
+             patch("api.services.person_stats.Path", return_value=Path(crm_db)):
+            refresh_person_stats([person_id], save=False)
+
+        assert entity.first_seen is None
 
     def test_phone_source_type_counted(self, tmp_path):
         """'phone' source_type should contribute to message_count (not 'sms')."""

@@ -259,7 +259,9 @@ def _update_first_seen(entity, person_ids, int_conn) -> bool:
     if row and row[0]:
         interaction_first = datetime.fromisoformat(row[0]).replace(tzinfo=timezone.utc)
 
-    # Earliest source_entity observation across the same variants
+    # Get timestamp range from source_entities across the same variants.
+    # LinkedIn exports carry no event dates, so their observed_at is the import
+    # day, not contact activity. Excluding them keeps first/last seen honest.
     # (source_entities.canonical_person_id may also still carry legacy IDs
     # if a merge happened without backfilling that column).
     # Same physical database as PersonEntityStore's default — reuse its anchored
@@ -272,6 +274,7 @@ def _update_first_seen(entity, person_ids, int_conn) -> bool:
             SELECT MIN(observed_at)
             FROM source_entities
             WHERE canonical_person_id IN ({placeholders})
+              AND source_type != 'linkedin'
         """, tuple(person_ids))
         se_row = crm_cursor.fetchone()
         crm_conn.close()

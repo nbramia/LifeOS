@@ -1,0 +1,10 @@
+[Unit]
+Description=LifeOS Google Messages Import Timer (4:00 AM)
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

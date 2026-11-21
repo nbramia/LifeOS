@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** CRM
-> **Last Updated:** 2026-11-02
+> **Last Updated:** 2026-11-08
 
 LifeOS uses a two-tier data model to separate raw observations from canonical records.
 
@@ -54,6 +54,22 @@ A person's `company` and `position` are their current organization and role, as 
 `scripts/backfill_person_organizations.py` fills the list from the scraped profiles and leaves a person with a hand-entered organization alone; see [scripts](../../guides/scripts.md). The CRM person responses, the people responses, the person page, the people-index profile, the MCP profile and the model's person block show the list.
 
 ---
+
+## Contact Details
+
+`PersonEntity.emails` and `phone_numbers` are the identity lists used for resolution. `email_entries` and `phone_entries` mirror them as `{value, label}` rows. `social_links` holds one row per account:
+
+| Field | Description |
+|-------|-------------|
+| `platform` | Key in the registry at `config/social_platforms.py` |
+| `value` | The URL or handle as entered |
+| `url` | Canonical profile URL, when the platform has one |
+| `handle` | Account identifier |
+| `match_key` | Normalized identity; empty for a stored value that cannot be parsed |
+| `label` | Optional free text |
+| `source` | Origin, such as `manual`, `linkedin_url`, `dex`, or `notion` |
+
+These are JSON columns on `person_entities`, so a new platform needs no schema change. `person_social_links` indexes `(platform, match_key)` to people for matching. `linkedin_url` always equals the first LinkedIn account. On startup, rows from before these columns existed are copied into them; the original columns are unchanged. `dismissed_social_keys` records accounts the user removed so syncs cannot restore them.
 
 ## Relationship Tracking
 

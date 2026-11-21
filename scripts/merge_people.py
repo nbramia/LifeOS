@@ -438,6 +438,9 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True, resum
             stats['phones_merged'] += 1
             logger.info("   + Phone merged")
 
+    # Merge social links and contact labels
+    primary.merge_contact_details_from(secondary)
+
     # Add secondary's name as alias
     if secondary.canonical_name and secondary.canonical_name != primary.canonical_name:
         if primary.aliases is None:
@@ -805,6 +808,12 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True, resum
         crm_conn.execute("DELETE FROM person_emails WHERE person_id = ?", (canonical_primary_id,))
         crm_conn.execute("DELETE FROM person_phones WHERE person_id = ?", (canonical_primary_id,))
         crm_conn.execute("DELETE FROM person_names WHERE person_id = ?", (canonical_primary_id,))
+        crm_conn.execute("DELETE FROM person_social_links WHERE person_id = ?", (canonical_primary_id,))
+        for link in primary.social_links:
+            if link.get("match_key"):
+                crm_conn.execute(
+                    "INSERT OR REPLACE INTO person_social_links (platform, match_key, person_id) VALUES (?, ?, ?)",
+                    (link["platform"], link["match_key"], canonical_primary_id))
         for email in (primary.emails or []):
             crm_conn.execute(
                 "INSERT OR REPLACE INTO person_emails (email, person_id) VALUES (?, ?)",
@@ -833,6 +842,7 @@ def merge_people(primary_id: str, secondary_id: str, dry_run: bool = True, resum
         crm_conn.execute("DELETE FROM person_emails WHERE person_id = ?", (canonical_secondary_id,))
         crm_conn.execute("DELETE FROM person_phones WHERE person_id = ?", (canonical_secondary_id,))
         crm_conn.execute("DELETE FROM person_names WHERE person_id = ?", (canonical_secondary_id,))
+        crm_conn.execute("DELETE FROM person_social_links WHERE person_id = ?", (canonical_secondary_id,))
 
         crm_conn.commit()
         logger.info("   CRM transaction committed")

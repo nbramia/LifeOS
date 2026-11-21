@@ -27,6 +27,19 @@ from api.services.meeting_source import (
     normalize_sources,
     run_at_store_init,
 )
+from api.services.social_links import (
+    InvalidContactDetail,
+    build_preserved_link,
+    contact_entry_id,
+    find_account_for_url,
+    merge_entries,
+    merge_social_links,
+    reconcile_entries,
+    reconcile_linkedin,
+    parse_social_value,
+    social_identity,
+    social_link_id,
+)
 from api.utils.datetime_utils import make_aware as _make_aware
 
 logger = logging.getLogger(__name__)
@@ -142,10 +155,126 @@ class PersonEntity:
     # Calculated based on relationship_strength ranking among non-peripheral contacts
     dunbar_circle: Optional[int] = None
 
+    # Accounts per registered platform; see api/services/social_links.py
+    social_links: list[dict] = field(default_factory=list)
+    # Labels for `emails` and `phone_numbers`, which remain the identity lists
+    email_entries: list[dict] = field(default_factory=list)
+    phone_entries: list[dict] = field(default_factory=list)
+    # Accounts the user removed, so a sync cannot bring them back
+    dismissed_social_keys: list[str] = field(default_factory=list)
+
     def __post_init__(self):
-        """Set display_name to canonical_name if not specified."""
+        """Set display_name to canonical_name and align the contact-detail lists."""
         if not self.display_name and self.canonical_name:
             self.display_name = self.canonical_name
+        self.reconcile_contact_details()
+
+    def reconcile_contact_details(self, persisting: bool = False) -> None:
+        """Align structured contact details with the fields syncs write directly.
+
+        Args:
+            persisting: True when saving, where an empty `linkedin_url` means
+                the primary LinkedIn account was cleared.
+        """
+        self.email_entries = reconcile_entries(self.emails, self.email_entries, str.lower)
+        self.phone_entries = reconcile_entries(self.phone_numbers, self.phone_entries)
+        self.social_links, self.linkedin_url = reconcile_linkedin(
+            self.social_links,
+            self.linkedin_url,
+            self.dismissed_social_keys,
+            empty_means_cleared=persisting,
+        )
+
+    def merge_contact_details_from(self, other: "PersonEntity") -> None:
+        """Union another person's links and labels into this one."""
+        self.reconcile_contact_details()
+        self.social_links = merge_social_links(self.social_links, other.social_links)
+        self.email_entries = merge_entries(self.email_entries, other.email_entries, str.lower)
+        self.phone_entries = merge_entries(self.phone_entries, other.phone_entries)
+        present = {social_identity(link) for link in self.social_links}
+        self.dismissed_social_keys = [
+            key for key in dict.fromkeys(self.dismissed_social_keys + other.dismissed_social_keys)
+            if key not in present
+        ]
+        self.reconcile_contact_details()
+
+    def find_social_link(self, link_id: str) -> Optional[dict]:
+        """Return the link addressed by an API link id."""
+        return next((item for item in self.social_links if social_link_id(item) == link_id), None)
+
+    def find_contact_entry(self, kind: str, entry_id: str) -> Optional[dict]:
+        """Return the email or phone entry addressed by an API entry id."""
+        entries = self.email_entries if kind == "email" else self.phone_entries
+        return next((e for e in entries if contact_entry_id(kind, e["value"]) == entry_id), None)
+
+    def _refresh_primary_linkedin(self) -> None:
+        """Point `linkedin_url` at the first remaining LinkedIn link."""
+        self.linkedin_url = None
+        self.reconcile_contact_details()
+
+    def add_social_link(self, link: dict) -> bool:
+        """Add a user-entered link, restoring it if previously removed.
+
+        Returns:
+            True when added, False when this account is already present.
+        """
+        identity = social_identity(link)
+        if any(social_identity(existing) == identity for existing in self.social_links):
+            return False
+        self.dismissed_social_keys = [k for k in self.dismissed_social_keys if k != identity]
+        self.social_links.append(link)
+        self._refresh_primary_linkedin()
+        return True
+
+    def replace_social_link(self, link_id: str, replacement: dict) -> None:
+        """Swap a link in place, remembering a replaced account as removed."""
+        index = next(i for i, item in enumerate(self.social_links) if social_link_id(item) == link_id)
+        previous = social_identity(self.social_links[index])
+        current = social_identity(replacement)
+        self.social_links[index] = replacement
+        self.dismissed_social_keys = [k for k in self.dismissed_social_keys if k != current]
+        if previous != current and previous not in self.dismissed_social_keys:
+            self.dismissed_social_keys.append(previous)
+        self._refresh_primary_linkedin()
+
+    def remove_social_link(self, link_id: str) -> None:
+        """Remove a link and keep syncs from restoring that account."""
+        link = self.find_social_link(link_id)
+        self.social_links.remove(link)
+        identity = social_identity(link)
+        if identity not in self.dismissed_social_keys:
+            self.dismissed_social_keys.append(identity)
+        self._refresh_primary_linkedin()
+
+    def label_contact_entry(self, kind: str, value: str, label: Optional[str]) -> None:
+        """Set the label on the entry for an existing email or phone."""
+        self.reconcile_contact_details()
+        entries = self.email_entries if kind == "email" else self.phone_entries
+        for entry in entries:
+            if entry["value"].lower() == value.lower():
+                entry["label"] = label
+
+    def replace_email(self, old: str, new: str) -> None:
+        """Replace an email in place, keeping its position."""
+        self.emails = [new if e.lower() == old.lower() else e for e in self.emails]
+
+    def remove_email(self, value: str) -> None:
+        """Remove an email address."""
+        self.emails = [e for e in self.emails if e.lower() != value.lower()]
+        self.reconcile_contact_details()
+
+    def replace_phone(self, old: str, new: str) -> None:
+        """Replace a phone number in place, keeping its position and primary status."""
+        self.phone_numbers = [new if p == old else p for p in self.phone_numbers]
+        if self.phone_primary == old:
+            self.phone_primary = new
+
+    def remove_phone(self, value: str) -> None:
+        """Remove a phone number, moving primary status to the next number."""
+        self.phone_numbers = [p for p in self.phone_numbers if p != value]
+        if self.phone_primary == value:
+            self.phone_primary = self.phone_numbers[0] if self.phone_numbers else None
+        self.reconcile_contact_details()
 
     def validate(self) -> None:
         """Validate required fields and value constraints.
@@ -323,7 +452,7 @@ class PersonEntity:
         # Birthday: prefer self, then other
         birthday = self.birthday or other.birthday
 
-        return PersonEntity(
+        merged = PersonEntity(
             id=self.id,  # Keep original ID
             canonical_name=self.canonical_name,
             display_name=self.display_name,
@@ -350,7 +479,13 @@ class PersonEntity:
             notes=notes,
             source_entity_count=source_entity_count,
             birthday=birthday,
+            social_links=self.social_links,
+            email_entries=self.email_entries,
+            phone_entries=self.phone_entries,
+            dismissed_social_keys=self.dismissed_social_keys,
         )
+        merged.merge_contact_details_from(other)
+        return merged
 
     def to_dict(self) -> dict:
         """Convert to dict for JSON serialization."""
@@ -517,6 +652,7 @@ class PersonEntityStore:
         "tags", "notes", "source_entity_count", "birthday", "hidden", "hidden_at",
         "hidden_reason", "relationship_strength", "is_peripheral_contact", "dunbar_circle",
         "past_organizations",
+        "social_links", "email_entries", "phone_entries", "dismissed_social_keys",
     )
     _PLACEHOLDERS = ", ".join(["?"] * len(_COLUMNS))
     _COLUMNS_STR = ", ".join(_COLUMNS)
@@ -591,7 +727,11 @@ class PersonEntityStore:
                     hidden_reason TEXT NOT NULL DEFAULT '',
                     relationship_strength REAL,
                     is_peripheral_contact INTEGER NOT NULL DEFAULT 0,
-                    dunbar_circle INTEGER
+                    dunbar_circle INTEGER,
+                    social_links TEXT NOT NULL DEFAULT '[]',
+                    email_entries TEXT NOT NULL DEFAULT '[]',
+                    phone_entries TEXT NOT NULL DEFAULT '[]',
+                    dismissed_social_keys TEXT NOT NULL DEFAULT '[]'
                 );
 
                 CREATE TABLE IF NOT EXISTS person_emails (
@@ -609,6 +749,13 @@ class PersonEntityStore:
                     person_id TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS person_social_links (
+                    platform TEXT NOT NULL,
+                    match_key TEXT NOT NULL,
+                    person_id TEXT NOT NULL,
+                    PRIMARY KEY (platform, match_key, person_id)
+                );
+
                 CREATE TABLE IF NOT EXISTS person_blocklist (
                     identifier TEXT PRIMARY KEY,
                     identifier_type TEXT NOT NULL,
@@ -624,6 +771,7 @@ class PersonEntityStore:
                 CREATE INDEX IF NOT EXISTS idx_person_emails_pid ON person_emails(person_id);
                 CREATE INDEX IF NOT EXISTS idx_person_phones_pid ON person_phones(person_id);
                 CREATE INDEX IF NOT EXISTS idx_person_names_pid ON person_names(person_id);
+                CREATE INDEX IF NOT EXISTS idx_person_social_links_pid ON person_social_links(person_id);
             """)
             # Migration: add photo_count column if missing
             try:
@@ -634,10 +782,56 @@ class PersonEntityStore:
                 conn.execute("ALTER TABLE person_entities ADD COLUMN past_organizations TEXT NOT NULL DEFAULT '[]'")
             except sqlite3.OperationalError:
                 pass  # Column already exists
+            for column in ("social_links", "email_entries", "phone_entries", "dismissed_social_keys"):
+                try:
+                    conn.execute(f"ALTER TABLE person_entities ADD COLUMN {column} TEXT NOT NULL DEFAULT '[]'")
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
             conn.commit()
+            self._backfill_contact_details(conn)
         finally:
             conn.close()
         run_at_store_init(migrate_crm_db, str(self.db_path))
+
+    @staticmethod
+    def _backfill_contact_details(conn: sqlite3.Connection) -> None:
+        """Copy `linkedin_url`, `emails`, and `phone_numbers` into the structured
+        columns for rows that have not been converted. Source columns are kept."""
+        unconverted = """
+            FROM person_entities
+            WHERE (COALESCE(linkedin_url, '') <> '' AND social_links = '[]')
+               OR (emails <> '[]' AND email_entries = '[]')
+               OR (phone_numbers <> '[]' AND phone_entries = '[]')
+        """
+        # Most startups have nothing to convert and must not take the write lock.
+        if conn.execute(f"SELECT 1 {unconverted} LIMIT 1").fetchone() is None:
+            return
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            rows = conn.execute(
+                f"SELECT id, emails, phone_numbers, linkedin_url, social_links {unconverted}"
+            ).fetchall()
+            for person_id, emails, phones, linkedin_url, social_links in rows:
+                links = json.loads(social_links or "[]")
+                if linkedin_url and not links:
+                    links = [build_preserved_link("linkedin", linkedin_url, "linkedin_url")]
+                email_entries = reconcile_entries(json.loads(emails or "[]"), [], str.lower)
+                phone_entries = reconcile_entries(json.loads(phones or "[]"), [])
+                conn.execute(
+                    "UPDATE person_entities SET social_links = ?, email_entries = ?, phone_entries = ? WHERE id = ?",
+                    (json.dumps(links), json.dumps(email_entries), json.dumps(phone_entries), person_id),
+                )
+                for link in links:
+                    if link.get("match_key"):
+                        conn.execute(
+                            "INSERT OR IGNORE INTO person_social_links (platform, match_key, person_id) "
+                            "VALUES (?, ?, ?)",
+                            (link["platform"], link["match_key"], person_id),
+                        )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
     def _get_connection(self) -> sqlite3.Connection:
         """Get a new SQLite connection with WAL mode and row factory."""
@@ -680,6 +874,7 @@ class PersonEntityStore:
 
     def _entity_to_values(self, entity: PersonEntity) -> tuple:
         """Convert PersonEntity to tuple of values for SQL INSERT/UPDATE."""
+        entity.reconcile_contact_details(persisting=True)
         return (
             entity.id,
             entity.canonical_name,
@@ -714,6 +909,10 @@ class PersonEntityStore:
             1 if entity.is_peripheral_contact else 0,
             entity.dunbar_circle,
             json.dumps(entity.past_organizations),
+            json.dumps(entity.social_links),
+            json.dumps(entity.email_entries),
+            json.dumps(entity.phone_entries),
+            json.dumps(entity.dismissed_social_keys),
         )
 
     def _row_to_entity(self, row: sqlite3.Row) -> PersonEntity:
@@ -721,7 +920,8 @@ class PersonEntityStore:
         data = dict(row)
         # Parse JSON list fields
         for list_field in ('emails', 'vault_contexts', 'sources', 'related_notes',
-                           'aliases', 'phone_numbers', 'tags', 'past_organizations'):
+                           'aliases', 'phone_numbers', 'tags', 'past_organizations', 'social_links',
+                           'email_entries', 'phone_entries', 'dismissed_social_keys'):
             val = data.get(list_field)
             data[list_field] = json.loads(val) if val else []
         data['sources'] = normalize_sources(data['sources'])
@@ -736,7 +936,14 @@ class PersonEntityStore:
         conn.execute("DELETE FROM person_emails WHERE person_id = ?", (pid,))
         conn.execute("DELETE FROM person_phones WHERE person_id = ?", (pid,))
         conn.execute("DELETE FROM person_names WHERE person_id = ?", (pid,))
+        conn.execute("DELETE FROM person_social_links WHERE person_id = ?", (pid,))
 
+        for link in entity.social_links:
+            if link.get("match_key"):
+                conn.execute(
+                    "INSERT OR REPLACE INTO person_social_links (platform, match_key, person_id) "
+                    "VALUES (?, ?, ?)",
+                    (link["platform"], link["match_key"], pid))
         for email in entity.emails:
             conn.execute(
                 "INSERT OR REPLACE INTO person_emails (email, person_id) VALUES (?, ?)",
@@ -910,6 +1117,7 @@ class PersonEntityStore:
                 conn.execute("DELETE FROM person_emails WHERE person_id = ?", (entity_id,))
                 conn.execute("DELETE FROM person_phones WHERE person_id = ?", (entity_id,))
                 conn.execute("DELETE FROM person_names WHERE person_id = ?", (entity_id,))
+                conn.execute("DELETE FROM person_social_links WHERE person_id = ?", (entity_id,))
                 conn.execute("DELETE FROM person_entities WHERE id = ?", (entity_id,))
                 count += 1
 
@@ -1075,6 +1283,7 @@ class PersonEntityStore:
             conn.execute("DELETE FROM person_emails WHERE person_id = ?", (entity_id,))
             conn.execute("DELETE FROM person_phones WHERE person_id = ?", (entity_id,))
             conn.execute("DELETE FROM person_names WHERE person_id = ?", (entity_id,))
+            conn.execute("DELETE FROM person_social_links WHERE person_id = ?", (entity_id,))
             conn.execute("DELETE FROM person_entities WHERE id = ?", (entity_id,))
             conn.commit()
             self._bump_get_all_cache_generation()
@@ -1246,6 +1455,35 @@ class PersonEntityStore:
         finally:
             conn.close()
 
+    def get_social_link_owners(self, platform: str, match_key: str) -> list[PersonEntity]:
+        """Return the distinct visible people holding an account, following merges."""
+        conn = self._get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT person_id FROM person_social_links WHERE platform = ? AND match_key = ?",
+                (platform, match_key)).fetchall()
+        finally:
+            conn.close()
+        owners: dict[str, PersonEntity] = {}
+        for row in rows:
+            entity = self.get_by_id(row['person_id'])
+            if entity and not entity.hidden:
+                owners[entity.id] = entity
+        return list(owners.values())
+
+    def get_by_social_link(self, platform: str, value: str) -> Optional[PersonEntity]:
+        """Get the person with this profile URL or handle.
+
+        Returns None for an unparseable value, or when more than one person
+        holds the account, so an ambiguous profile never picks a person.
+        """
+        try:
+            account = parse_social_value(platform, value)
+        except InvalidContactDetail:
+            return None
+        owners = self.get_social_link_owners(platform, account.match_key)
+        return owners[0] if len(owners) == 1 else None
+
     def get_by_name(self, name: str) -> Optional[PersonEntity]:
         """Get entity by canonical name or alias (case-insensitive), following merge chain."""
         conn = self._get_connection()
@@ -1262,7 +1500,7 @@ class PersonEntityStore:
     def search(self, query: str, limit: int = 20, include_hidden: bool = False,
                include_merged: bool = False) -> list[PersonEntity]:
         """
-        Search entities by name, email, or alias.
+        Search entities by name, email, alias, or exact profile URL.
 
         `%` and `_` in `query` are escaped so they match literally rather
         than as SQL LIKE wildcards.
@@ -1282,6 +1520,12 @@ class PersonEntityStore:
         Returns:
             List of matching entities
         """
+        profile = find_account_for_url(query)
+        if profile:
+            owners = self.get_social_link_owners(profile[0], profile[1].match_key)
+            if owners:
+                return owners[:limit]
+
         query_lower = query.lower()
         merged_ids = set(self._merged_ids.keys()) if not include_merged else set()
         pattern = f"%{_escape_like_pattern(query_lower)}%"
@@ -1697,6 +1941,16 @@ def compute_person_category(person: PersonEntity, source_entities: list = None) 
 
     # Check sources list for slack
     if "slack" in person.sources:
+        return "work"
+
+    # Outlook is only the work account, so any Outlook source means work.
+    # The graph path calls this with no source entities, so check the list here.
+    if "outlook" in person.sources:
+        return "work"
+
+    # Check company against the configured work companies (LIFEOS_WORK_COMPANIES)
+    company = (person.company or "").lower()
+    if company and any(name in company for name in settings.work_companies):
         return "work"
 
     # If no source entities provided, fetch them

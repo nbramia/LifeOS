@@ -372,6 +372,7 @@ Both binary settings resolve the same way (`api/services/agent_worker/binary_res
 | `LIFEOS_WORK_DOMAIN` | str | — | Your primary work email domain. |
 | `LIFEOS_WORK_DOMAIN_2` | str | — | Second work email domain if you have one. |
 | `LIFEOS_WORK_DOMAINS_EXTRA` | str | — | Comma-separated list of any further work email domains beyond the first two (e.g. `thirdco.com,fourthco.com`). |
+| `LIFEOS_WORK_COMPANIES` | str | — | Comma-separated company names (part of a name is enough, case-insensitive) whose contacts are categorized as work, e.g. `Acme Corp`. |
 | `LIFEOS_TIMEZONE` | str | — | IANA timezone (e.g., `America/New_York`). |
 
 ## Relationships
