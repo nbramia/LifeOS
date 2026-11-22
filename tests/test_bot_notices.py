@@ -24,6 +24,8 @@ SHELL_SENDERS = {
     "gpu-watchdog.sh": "LifeOS/gpu-watchdog",
     "auto-deploy.sh": "LifeOS/auto-deploy",
     "run_sync_wrapper.sh": "LifeOS/run_sync_wrapper",
+    "apple_data_agent.sh": "LifeOS/apple_data_agent",
+    "auto-update-macos.sh": "LifeOS/auto-update-macos",
 }
 TS = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
 
@@ -240,3 +242,94 @@ def test_record_gives_up_when_the_lock_is_held(log, monkeypatch):
         )
     assert child.stdout.strip() == "False"
     assert _entries(log) == []
+
+
+# --- remote log (Mac senders) ----------------------------------------------------
+
+FAKE_SSH = """#!/bin/sh
+printf '%s\\n' "$*" > "$FAKE_SSH_ARGS"
+cat >> "$FAKE_SSH_LOG"
+exit "${FAKE_SSH_RC:-0}"
+"""
+
+
+@pytest.fixture
+def fake_ssh(tmp_path, monkeypatch):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    ssh = bin_dir / "ssh"
+    ssh.write_text(FAKE_SSH)
+    ssh.chmod(0o755)
+    remote_log = tmp_path / "remote.jsonl"
+    args = tmp_path / "ssh-args"
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_SSH_LOG", str(remote_log))
+    monkeypatch.setenv("FAKE_SSH_ARGS", str(args))
+    monkeypatch.delenv("BOT_NOTICE_LOG")
+    monkeypatch.setenv("BOT_NOTICE_REMOTE_HOST", "log-host")
+    return remote_log, args
+
+
+def test_remote_host_appends_over_ssh_under_flock(fake_ssh):
+    remote_log, args = fake_ssh
+    assert bot_notices.record("Apple export failed", "LifeOS/apple_data_agent")
+    [entry] = _entries(remote_log)
+    assert entry["source"] == "LifeOS/apple_data_agent"
+    assert entry["text"] == "Apple export failed"
+    call = args.read_text()
+    assert "log-host" in call and "BatchMode=yes" in call
+    assert "flock" in call and "~/.local/state/bot-notices/notices.jsonl" in call
+
+
+def test_remote_failure_returns_false(fake_ssh, monkeypatch):
+    monkeypatch.setenv("FAKE_SSH_RC", "255")
+    assert bot_notices.record("x", "LifeOS/test") is False
+
+
+def test_remote_timeout_returns_false(fake_ssh, monkeypatch):
+    def hang(*a, **k):
+        raise subprocess.TimeoutExpired("ssh", bot_notices.REMOTE_TIMEOUT_SECONDS)
+
+    monkeypatch.setattr(bot_notices.subprocess, "run", hang)
+    assert bot_notices.record("x", "LifeOS/test") is False
+
+
+def test_explicit_log_path_wins_over_remote_host(fake_ssh, log):
+    remote_log, _ = fake_ssh
+    assert bot_notices.record("local", "LifeOS/test")
+    assert [e["text"] for e in _entries(log)] == ["local"]
+    assert not remote_log.exists()
+
+
+def test_mac_sender_reads_remote_host_from_env_file(tmp_path, fake_ssh):
+    """apple_data_agent.sh's record_bot_notice sends the line to the host its .env names."""
+    remote_log, args = fake_ssh
+    checkout = tmp_path / "checkout"
+    (checkout / "api" / "services").mkdir(parents=True)
+    (checkout / "api" / "services" / "bot_notices.py").write_text(MODULE.read_text())
+    (checkout / ".env").write_text("TELEGRAM_BOT_TOKEN=123:synthetic-token\nBOT_NOTICE_REMOTE_HOST=linux-box\n")
+    func = re.search(
+        r"^record_bot_notice\(\) \{.*?^\}\n", (REPO_ROOT / "scripts" / "apple_data_agent.sh").read_text(), re.S | re.M
+    ).group(0)
+    env = {k: v for k, v in os.environ.items() if k != "BOT_NOTICE_REMOTE_HOST"}
+    subprocess.run(
+        ["bash", "-c", f'LIFEOS_DIR="{checkout}"\n{func}\nrecord_bot_notice "Rsync failed: a & b"'],
+        env=env, check=True, timeout=30,
+    )
+    assert "linux-box" in args.read_text()
+    [entry] = _entries(remote_log)
+    assert entry["source"] == "LifeOS/apple_data_agent"
+    assert entry["text"] == "Rsync failed: a & b"
+    assert "synthetic-token" not in remote_log.read_text()
+
+
+# --- what Telegram receives ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("script", sorted(SHELL_SENDERS))
+def test_shell_senders_url_encode_the_message(script):
+    """A raw ``-d text=`` lets ``&`` in a notice end the form field early."""
+    body = (REPO_ROOT / "scripts" / script).read_text()
+    assert "sendMessage" in body
+    assert not re.search(r'-d "(text|chat_id|parse_mode)=', body)
+    assert re.search(r'--data-urlencode "text=', body)

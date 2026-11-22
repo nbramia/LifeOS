@@ -89,9 +89,9 @@ send_telegram() {
     chat_id=$(grep '^TELEGRAM_CHAT_ID=' "$ENV_FILE" | cut -d= -f2)
     [ -n "$bot_token" ] && [ -n "$chat_id" ] || return 0
     /usr/bin/curl -s -X POST "https://api.telegram.org/bot${bot_token}/sendMessage" \
-        -d "chat_id=${chat_id}" \
-        -d "text=${message}" \
-        -d "parse_mode=Markdown" > /dev/null 2>&1 || true
+        --data-urlencode "chat_id=${chat_id}" \
+        --data-urlencode "text=${message}" \
+        --data-urlencode "parse_mode=Markdown" > /dev/null 2>&1 || true
     record_bot_notice "$message"
 }
 

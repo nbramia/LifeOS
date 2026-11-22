@@ -80,6 +80,15 @@ RETRY_DELAYS="30,90,180"
 # must never mask the real error or crash the script. Mirrors the pattern in
 # run_sync_wrapper.sh / auto-deploy.sh: token/chat id are read from the
 # project .env, never hardcoded, and the call is a no-op if either is unset.
+# Copy the notice to the bot-notices log (api/services/bot_notices.py). Best-effort.
+# This runs on a Mac; BOT_NOTICE_REMOTE_HOST in .env names the ssh host that
+# keeps the log, and the line is appended there.
+record_bot_notice() {
+    local remote
+    remote=$(grep '^BOT_NOTICE_REMOTE_HOST=' "${LIFEOS_DIR}/.env" 2>/dev/null | cut -d= -f2-)
+    printf '%s' "$1" | BOT_NOTICE_REMOTE_HOST="$remote" python3 -I "${LIFEOS_DIR}/api/services/bot_notices.py" "LifeOS/apple_data_agent" > /dev/null 2>&1 || true
+}
+
 send_telegram() {
     local message="$1"
     local env_file="${LIFEOS_DIR}/.env"
@@ -89,9 +98,10 @@ send_telegram() {
     chat_id=$(grep '^TELEGRAM_CHAT_ID=' "${env_file}" | cut -d= -f2)
     [[ -n "${bot_token}" && -n "${chat_id}" ]] || return 0
     curl -s -X POST "https://api.telegram.org/bot${bot_token}/sendMessage" \
-        -d "chat_id=${chat_id}" \
-        -d "text=${message}" \
-        -d "parse_mode=Markdown" > /dev/null 2>&1 || true
+        --data-urlencode "chat_id=${chat_id}" \
+        --data-urlencode "text=${message}" \
+        --data-urlencode "parse_mode=Markdown" > /dev/null 2>&1 || true
+    record_bot_notice "$message"
 }
 
 # Only run on macOS

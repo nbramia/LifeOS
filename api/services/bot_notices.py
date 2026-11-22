@@ -11,9 +11,11 @@ The log is JSON Lines at ``~/.local/state/bot-notices/notices.jsonl``
     {"ts": "2026-01-01T09:00:00Z", "bot": "lifeos", "source": "LifeOS/server-watchdog", "text": "..."}
 
 Each line is appended whole under an exclusive ``flock``, waited on for at
-most a second. Recording is
-best-effort: it runs after the send, and a failure is swallowed so it can never
-fail or delay a notice. Tokens and chat ids are never written.
+most a second. On a host that only sends (a Mac running the Apple data
+agent), ``$BOT_NOTICE_REMOTE_HOST`` names the ssh host that keeps the log, and
+the line is appended there with ``flock(1)``, bounded at 15 seconds. Recording
+is best-effort: it runs after the send, and a failure is swallowed so it can
+never fail or delay a notice. Tokens and chat ids are never written.
 
 This module is stdlib-only so the shell senders can run it by path with the
 system interpreter, the text on stdin::
@@ -26,6 +28,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -33,6 +36,13 @@ from pathlib import Path
 
 DEFAULT_LOG = "~/.local/state/bot-notices/notices.jsonl"
 LOCK_TIMEOUT_SECONDS = 1.0
+REMOTE_TIMEOUT_SECONDS = 15
+# Run by the remote user's login shell, so ``~`` is that user's home.
+REMOTE_APPEND = (
+    "mkdir -p ~/.local/state/bot-notices && "
+    "flock -w 5 ~/.local/state/bot-notices/notices.jsonl "
+    "tee -a ~/.local/state/bot-notices/notices.jsonl > /dev/null"
+)
 
 
 def log_path() -> Path | None:
@@ -62,13 +72,19 @@ def _lock(f, timeout: float = LOCK_TIMEOUT_SECONDS) -> bool:
             time.sleep(0.02)
 
 
+def _append_remote(host: str, line: bytes) -> bool:
+    result = subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, REMOTE_APPEND],
+        input=line,
+        capture_output=True,
+        timeout=REMOTE_TIMEOUT_SECONDS,
+    )
+    return result.returncode == 0
+
+
 def record(text: str, source: str, bot: str = "lifeos") -> bool:
     """Append one notice to the log. Returns False instead of raising on failure."""
     try:
-        path = log_path()
-        if path is None:
-            return False
-        path.parent.mkdir(parents=True, exist_ok=True)
         entry = {
             "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "bot": bot,
@@ -76,6 +92,13 @@ def record(text: str, source: str, bot: str = "lifeos") -> bool:
             "text": text,
         }
         line = (json.dumps(entry, ensure_ascii=False) + "\n").encode("utf-8")
+        remote = os.environ.get("BOT_NOTICE_REMOTE_HOST")
+        if remote and not os.environ.get("BOT_NOTICE_LOG"):
+            return _append_remote(remote, line)
+        path = log_path()
+        if path is None:
+            return False
+        path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "ab") as f:
             if not _lock(f):
                 return False
