@@ -191,6 +191,13 @@ A new or edited vault note reaches search through the vault index job, normally 
 
 Configure `LIFEOS_ALERT_EMAIL` in `.env` to receive notifications when sync steps fail.
 
+Every run that reaches its end sends a Telegram summary (`LifeOS Sync Complete`, ✅ or ⚠️). `run_sync_wrapper.sh` covers the runs that don't:
+
+- **Never started** (the venv python won't start): `🚨 LifeOS Sync Failed`.
+- **Stopped before its summary** (a crash, an out-of-memory kill, the 6-hour runtime limit, a stop of `lifeos-sync.service`): `🚨 LifeOS Sync did not finish`, naming the exit code or signal and the run time. `run_all_syncs.py` touches `$LIFEOS_SYNC_SUMMARY_MARKER` when it reaches its summary step, so a non-zero exit after that point (failed sources, already in the summary) sends nothing more. The wrapper traps SIGTERM so it outlives the sync when systemd stops the unit. A host freeze or a run that never begins sends nothing.
+
+All of these reach the [bot-notices log](../../guides/operations.md#bot-notices-log).
+
 The run also files a [Human queue](../../guides/human-queue.md) card keyed
 `sync:<source>` for each genuinely failed source (not a clean skip),
 auto-resolved by the next successful run of that source.
