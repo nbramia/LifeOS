@@ -78,6 +78,15 @@ _read_env() {
     echo "${val:-$default}"
 }
 
+# Copy the notice to the bot-notices log (api/services/bot_notices.py). Best-effort.
+# This runs on a Mac; BOT_NOTICE_REMOTE_HOST in .env names the ssh host that
+# keeps the log, and the line is appended there.
+record_bot_notice() {
+    local remote
+    remote=$(grep '^BOT_NOTICE_REMOTE_HOST=' "$ENV_FILE" 2>/dev/null | cut -d= -f2-)
+    printf '%s' "$1" | BOT_NOTICE_REMOTE_HOST="$remote" python3 -I "$PROJECT_DIR/api/services/bot_notices.py" "LifeOS/auto-update-macos" > /dev/null 2>&1 || true
+}
+
 send_telegram() {
     local message="$1"
     [ -f "$ENV_FILE" ] || return 0
@@ -86,9 +95,10 @@ send_telegram() {
     chat_id=$(grep '^TELEGRAM_CHAT_ID=' "$ENV_FILE" | cut -d= -f2)
     [ -n "$bot_token" ] && [ -n "$chat_id" ] || return 0
     curl -s -X POST "https://api.telegram.org/bot${bot_token}/sendMessage" \
-        -d "chat_id=${chat_id}" \
-        -d "text=${message}" \
-        -d "parse_mode=Markdown" > /dev/null 2>&1 || true
+        --data-urlencode "chat_id=${chat_id}" \
+        --data-urlencode "text=${message}" \
+        --data-urlencode "parse_mode=Markdown" > /dev/null 2>&1 || true
+    record_bot_notice "$message"
 }
 
 NOTIFY=$(_read_env "LIFEOS_AUTODEPLOY_NOTIFY" "failure")
