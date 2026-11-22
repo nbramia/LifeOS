@@ -188,7 +188,7 @@ Every notice the primary Telegram bot sends on its own is also appended to a loc
 
 - **What counts:** sends through `send_message`, `send_message_async` and `send_message_capture_ids` in `api/services/telegram.py` from the primary bot (agent worker, scheduler and reminders, alerts, sync reports), and the Telegram sends in `network-watchdog.sh`, `server-watchdog.sh`, `infra-watchdog.sh`, `gpu-watchdog.sh`, `auto-deploy.sh` and `run_sync_wrapper.sh`. `source` is `LifeOS/<module>` for Python senders (the module that asked for the send, past relays like `send_alert`) and `LifeOS/<script>` for shell senders.
 - **What doesn't:** replies sent while a listener handles an incoming message, and anything from the persona bots. The Mac-only senders (`apple_data_agent.sh`, `auto-update-macos.sh`) don't record, since the log is read on the Linux host.
-- **Writing:** `api/services/bot_notices.py` appends one whole line under an exclusive `flock`, after the send, whether or not it succeeded. It is stdlib-only; shell senders pipe the text to it with the system `python3`. A failed write never fails the send. When run as root (the network watchdog), it writes as the checkout's owner. Tokens and chat ids are never written.
+- **Writing:** `api/services/bot_notices.py` appends one whole line under an exclusive `flock` (waited on for at most a second), after the send, whether or not it succeeded. It is stdlib-only; shell senders pipe the text to it with the system `python3`. A failed write never fails the send. When run as root (the network watchdog), it writes as the checkout's owner. Tokens and chat ids are never written.
 
 ---
 

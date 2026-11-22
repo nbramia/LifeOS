@@ -10,7 +10,8 @@ The log is JSON Lines at ``~/.local/state/bot-notices/notices.jsonl``
 
     {"ts": "2026-01-01T09:00:00Z", "bot": "lifeos", "source": "LifeOS/server-watchdog", "text": "..."}
 
-Each line is appended whole under an exclusive ``flock``. Recording is
+Each line is appended whole under an exclusive ``flock``, waited on for at
+most a second. Recording is
 best-effort: it runs after the send, and a failure is swallowed so it can never
 fail or delay a notice. Tokens and chat ids are never written.
 
@@ -26,10 +27,12 @@ import fcntl
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 DEFAULT_LOG = "~/.local/state/bot-notices/notices.jsonl"
+LOCK_TIMEOUT_SECONDS = 1.0
 
 
 def log_path() -> Path | None:
@@ -44,6 +47,19 @@ def log_path() -> Path | None:
     if not os.environ.get("HOME"):
         return None
     return Path(DEFAULT_LOG).expanduser()
+
+
+def _lock(f, timeout: float = LOCK_TIMEOUT_SECONDS) -> bool:
+    """Take the exclusive lock, giving up after ``timeout`` so a send is never held up."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.02)
 
 
 def record(text: str, source: str, bot: str = "lifeos") -> bool:
@@ -61,7 +77,8 @@ def record(text: str, source: str, bot: str = "lifeos") -> bool:
         }
         line = (json.dumps(entry, ensure_ascii=False) + "\n").encode("utf-8")
         with open(path, "ab") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
+            if not _lock(f):
+                return False
             try:
                 f.write(line)
                 f.flush()
