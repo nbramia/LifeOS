@@ -234,7 +234,7 @@ def test_record_gives_up_when_the_lock_is_held(log, monkeypatch):
     with open(log, "ab") as holder:
         fcntl.flock(holder, fcntl.LOCK_EX)
         child = subprocess.run(
-            ["python3", "-I", "-c", f"import sys; sys.path.insert(0, {str(MODULE.parent)!r}); import bot_notices as b; "
+            ["python3", "-I", "-B", "-c", f"import sys; sys.path.insert(0, {str(MODULE.parent)!r}); import bot_notices as b; "
              "b.LOCK_TIMEOUT_SECONDS = 0.1; print(b.record('x', 'LifeOS/test'))"],
             env={**os.environ, "BOT_NOTICE_LOG": str(log)}, capture_output=True, text=True, timeout=30,
         )
