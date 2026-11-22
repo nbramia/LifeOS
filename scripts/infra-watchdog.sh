@@ -37,15 +37,23 @@ log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
 }
 
+# Copy the notice to the bot-notices log (api/services/bot_notices.py). Best-effort.
+record_bot_notice() {
+    printf '%s' "$1" | python3 -I "$PROJECT_DIR/api/services/bot_notices.py" "LifeOS/infra-watchdog" > /dev/null 2>&1 || true
+}
+
 send_telegram() {
     local message="$1" bot_token chat_id
     [ -f "$ENV_FILE" ] || return 1
     bot_token=$(grep '^TELEGRAM_BOT_TOKEN=' "$ENV_FILE" | cut -d= -f2-)
     chat_id=$(grep '^TELEGRAM_CHAT_ID=' "$ENV_FILE" | cut -d= -f2-)
     [ -n "$bot_token" ] && [ -n "$chat_id" ] || return 1
+    local rc=0
     "${LIFEOS_WATCHDOG_CURL:-/usr/bin/curl}" -s -f --connect-timeout 5 --max-time 15 -X POST "https://api.telegram.org/bot${bot_token}/sendMessage" \
         --data-urlencode "chat_id=${chat_id}" \
-        --data-urlencode "text=${message}" > /dev/null 2>&1
+        --data-urlencode "text=${message}" > /dev/null 2>&1 || rc=$?
+    record_bot_notice "$message"
+    return $rc
 }
 
 # alert <kind> <message>: send at most once per cooldown per kind. The stamp is

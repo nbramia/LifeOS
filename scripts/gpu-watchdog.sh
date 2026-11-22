@@ -76,6 +76,11 @@ log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
 }
 
+# Copy the notice to the bot-notices log (api/services/bot_notices.py). Best-effort.
+record_bot_notice() {
+    printf '%s' "$1" | python3 -I "$PROJECT_DIR/api/services/bot_notices.py" "LifeOS/gpu-watchdog" > /dev/null 2>&1 || true
+}
+
 send_telegram() {
     # Returns 0 on successful POST, non-zero otherwise. ``--data-urlencode``
     # protects against rocm-smi / ps output containing & or = which would
@@ -93,10 +98,13 @@ send_telegram() {
     # ``-f`` makes curl return non-zero on HTTP 4xx/5xx so an invalid bot
     # token / wrong chat_id reports as failure to the caller, not silent
     # success. Binary is overridable so tests can record POSTs without network.
+    local rc=0
     "${LIFEOS_WATCHDOG_CURL:-/usr/bin/curl}" -s -f -X POST "https://api.telegram.org/bot${bot_token}/sendMessage" \
         --data-urlencode "chat_id=${chat_id}" \
         --data-urlencode "text=${message}" \
-        --data-urlencode "parse_mode=Markdown" > /dev/null 2>&1
+        --data-urlencode "parse_mode=Markdown" > /dev/null 2>&1 || rc=$?
+    record_bot_notice "$message"
+    return $rc
 }
 
 # Scan the kernel log for SDMA-queue exhaustion since the previous tick, and

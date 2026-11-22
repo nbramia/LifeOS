@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import re
+import sys
 import threading
 import time
 from collections import deque
@@ -196,6 +197,62 @@ class TypingIndicator:
                 pass
 
 
+# ---------------------------------------------------------------------------
+# Bot-notices log
+# ---------------------------------------------------------------------------
+
+# Modules that only relay a send for someone else; the source is their caller.
+_NOTICE_RELAY_MODULES = {__name__, "api.services.notifications"}
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_NOTICE_SOURCE_PREFIXES = ("api.services.", "api.routes.", "api.", "scripts.")
+
+
+def _main_module_name(file: Optional[str]) -> str:
+    """Dotted module name for a script run as ``__main__`` (``python -m`` or by path)."""
+    if not file:
+        return ""
+    path = Path(file).resolve().with_suffix("")
+    try:
+        path = path.relative_to(_REPO_ROOT)
+    except ValueError:
+        return path.name
+    return ".".join(path.parts)
+
+
+def _notice_source() -> str:
+    """Name the module that asked for the send, as ``LifeOS/<module>``."""
+    frame = sys._getframe(1)
+    while frame is not None:
+        module = frame.f_globals.get("__name__", "")
+        if module not in _NOTICE_RELAY_MODULES:
+            if module == "__main__":
+                module = _main_module_name(frame.f_globals.get("__file__"))
+            for prefix in _NOTICE_SOURCE_PREFIXES:
+                if module.startswith(prefix):
+                    module = module[len(prefix):]
+                    break
+            return f"LifeOS/{module or 'unknown'}"
+        frame = frame.f_back
+    return "LifeOS/unknown"
+
+
+def _record_notice(text: str, bot: Optional[str]) -> None:
+    """Copy a send from the primary bot to the bot-notices log.
+
+    Only notices LifeOS sends on its own count: a send made while a listener
+    handles an incoming update (``_active_bot_token`` is set) is a reply to
+    the operator, and the persona bots are not the main LifeOS bot.
+    """
+    if bot not in (None, "", "primary") or _active_bot_token.get() is not None:
+        return
+    try:
+        from api.services import bot_notices
+
+        bot_notices.record(text, _notice_source())
+    except Exception:
+        logger.debug("bot-notices record failed", exc_info=True)
+
+
 def send_message_capture_ids(
     text: str,
     chat_id: str = None,
@@ -253,6 +310,7 @@ def send_message_capture_ids(
                 logger.error(f"Telegram send failed: {resp.status_code} {resp.text[:200]}")
         except Exception as e:
             logger.error(f"Telegram send error: {e}")
+    _record_notice(text, bot)
     return ids
 
 
@@ -306,6 +364,7 @@ def send_message(
         except Exception as e:
             logger.error(f"Telegram send error: {e}")
             success = False
+    _record_notice(text, bot)
     return success
 
 
@@ -355,6 +414,7 @@ async def send_message_async(
             except Exception as e:
                 logger.error(f"Telegram send error: {e}")
                 success = False
+    _record_notice(text, bot)
     return success
 
 

@@ -178,6 +178,18 @@ Set `LIFEOS_ALERT_EMAIL` in `.env` for alerts. Telegram backup via `telegram_bot
 
 Services are tracked on-use, not by polling. Degradation events (fallback usage) are collected and reported in the nightly health check if there are 5+ in 24 hours.
 
+### Bot-notices log
+
+Every notice the primary Telegram bot sends on its own is also appended to a local log, so a watcher outside LifeOS can act on what the bot told the operator. The log is JSON Lines at `~/.local/state/bot-notices/notices.jsonl` (`BOT_NOTICE_LOG` overrides the path; the directory is created on first write), one object per message:
+
+```json
+{"ts": "2026-01-01T09:00:00Z", "bot": "lifeos", "source": "LifeOS/server-watchdog", "text": "⚠️ LifeOS API not responding"}
+```
+
+- **What counts:** sends through `send_message`, `send_message_async` and `send_message_capture_ids` in `api/services/telegram.py` from the primary bot (agent worker, scheduler and reminders, alerts, sync reports), and the Telegram sends in `network-watchdog.sh`, `server-watchdog.sh`, `infra-watchdog.sh`, `gpu-watchdog.sh`, `auto-deploy.sh` and `run_sync_wrapper.sh`. `source` is `LifeOS/<module>` for Python senders (the module that asked for the send, past relays like `send_alert`) and `LifeOS/<script>` for shell senders.
+- **What doesn't:** replies sent while a listener handles an incoming message, and anything from the persona bots. The Mac-only senders (`apple_data_agent.sh`, `auto-update-macos.sh`) don't record, since the log is read on the Linux host.
+- **Writing:** `api/services/bot_notices.py` appends one whole line under an exclusive `flock` (waited on for at most a second), after the send, whether or not it succeeded. It is stdlib-only; shell senders pipe the text to it with the system `python3`. A failed write never fails the send. When run as root (the network watchdog), it writes as the checkout's owner. Tokens and chat ids are never written.
+
 ---
 
 ## Auto-Deploy (self-hosted redeploy on push to main)

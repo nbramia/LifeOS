@@ -37,6 +37,11 @@ set_failure_count() {
     echo "$1" > "$FAILURE_COUNT_FILE"
 }
 
+# Copy the notice to the bot-notices log (api/services/bot_notices.py). Best-effort.
+record_bot_notice() {
+    printf '%s' "$1" | python3 -I "$PROJECT_DIR/api/services/bot_notices.py" "LifeOS/server-watchdog" > /dev/null 2>&1 || true
+}
+
 send_telegram() {
     local message="$1"
     if [ -f "$ENV_FILE" ]; then
@@ -48,6 +53,7 @@ send_telegram() {
                 -d "chat_id=${chat_id}" \
                 -d "text=${message}" \
                 -d "parse_mode=Markdown" > /dev/null 2>&1 || true
+            record_bot_notice "$message"
         fi
     fi
 }

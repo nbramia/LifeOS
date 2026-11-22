@@ -111,10 +111,13 @@ if [ -f "$ENV_FILE" ]; then
     CHAT_ID=$(grep '^TELEGRAM_CHAT_ID=' "$ENV_FILE" | cut -d= -f2)
 
     if [ -n "$BOT_TOKEN" ] && [ -n "$CHAT_ID" ]; then
+        ALERT=$(printf '🚨 *LifeOS Sync Failed*\n\nNVMe drive not accessible at 3 AM.\nPython venv cannot start — Homebrew is on the NVMe.\n\nCheck if the drive is mounted and awake.')
         /usr/bin/curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             -d "chat_id=${CHAT_ID}" \
-            -d "text=$(printf '🚨 *LifeOS Sync Failed*\n\nNVMe drive not accessible at 3 AM.\nPython venv cannot start — Homebrew is on the NVMe.\n\nCheck if the drive is mounted and awake.')" \
+            -d "text=${ALERT}" \
             -d "parse_mode=Markdown" > /dev/null 2>&1
+        # Copy the notice to the bot-notices log (api/services/bot_notices.py). Best-effort.
+        printf '%s' "$ALERT" | python3 -I "$LIFEOS_DIR/api/services/bot_notices.py" "LifeOS/run_sync_wrapper" > /dev/null 2>&1 || true
     fi
 fi
 

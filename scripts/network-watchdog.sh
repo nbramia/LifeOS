@@ -98,6 +98,11 @@ get_down_count() {
     fi
 }
 
+# Copy the notice to the bot-notices log (api/services/bot_notices.py). Best-effort.
+record_bot_notice() {
+    printf '%s' "$1" | python3 -I "$PROJECT_DIR/api/services/bot_notices.py" "LifeOS/network-watchdog" > /dev/null 2>&1 || true
+}
+
 send_telegram() {
     # Best-effort — never allowed to block or fail the script. While the
     # WiFi link itself is down, no outbound channel can reach out, so that
@@ -107,10 +112,13 @@ send_telegram() {
     bot_token=$(_read_env TELEGRAM_BOT_TOKEN)
     chat_id=$(_read_env TELEGRAM_CHAT_ID)
     [ -n "$bot_token" ] && [ -n "$chat_id" ] || return 1
+    local rc=0
     "${LIFEOS_WATCHDOG_CURL:-/usr/bin/curl}" -s -f -X POST "https://api.telegram.org/bot${bot_token}/sendMessage" \
         --data-urlencode "chat_id=${chat_id}" \
         --data-urlencode "text=${message}" \
-        --data-urlencode "parse_mode=Markdown" > /dev/null 2>&1
+        --data-urlencode "parse_mode=Markdown" > /dev/null 2>&1 || rc=$?
+    record_bot_notice "$message"
+    return $rc
 }
 
 # --- Tailscale address self-heal ---
