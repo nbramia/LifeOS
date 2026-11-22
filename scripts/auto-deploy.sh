@@ -76,6 +76,11 @@ _read_env() {
     echo "${val:-$default}"
 }
 
+# Copy the notice to the bot-notices log (api/services/bot_notices.py). Best-effort.
+record_bot_notice() {
+    printf '%s' "$1" | python3 -I "$PROJECT_DIR/api/services/bot_notices.py" "LifeOS/auto-deploy" > /dev/null 2>&1 || true
+}
+
 send_telegram() {
     local message="$1"
     [ -f "$ENV_FILE" ] || return 0
@@ -87,6 +92,7 @@ send_telegram() {
         -d "chat_id=${chat_id}" \
         -d "text=${message}" \
         -d "parse_mode=Markdown" > /dev/null 2>&1 || true
+    record_bot_notice "$message"
 }
 
 NOTIFY=$(_read_env "LIFEOS_AUTODEPLOY_NOTIFY" "failure")

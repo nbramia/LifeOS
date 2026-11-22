@@ -132,9 +132,19 @@ def _force_cpu_embeddings_for_tests() -> None:
         os.environ.setdefault(_var, "")
 
 
+# Every Telegram send also appends to the operator's bot-notices log
+# (api/services/bot_notices.py). Point it at a throwaway file for the whole
+# session, subprocesses included, so no test writes to the real log.
+def _isolate_bot_notice_log() -> None:
+    os.environ["BOT_NOTICE_LOG"] = os.path.join(
+        tempfile.mkdtemp(prefix="lifeos-test-bot-notices-"), "notices.jsonl"
+    )
+
+
 def pytest_configure(config):
     """Register custom markers."""
     _force_cpu_embeddings_for_tests()
+    _isolate_bot_notice_log()
     config.addinivalue_line("markers", "unit: Fast unit tests")
     config.addinivalue_line("markers", "slow: Slow tests (ChromaDB, embeddings)")
     config.addinivalue_line("markers", "integration: Integration tests (server required)")
