@@ -82,6 +82,7 @@ def wrapper(tmp_path):
             return subprocess.run(
                 ["bash", str(self.script), "--execute"],
                 env=self.env(mode),
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=60,
@@ -129,6 +130,7 @@ def test_systemd_stop_still_sends_the_notice(wrapper):
     proc = subprocess.Popen(
         ["bash", str(wrapper.script), "--execute"],
         env=wrapper.env("hang"),
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
@@ -160,3 +162,15 @@ def test_marker_is_written_before_the_summary_is_sent():
     body = (REPO_ROOT / "scripts" / "run_all_syncs.py").read_text()
     run = body[body.index("def run_all_syncs("):]
     assert run.index("_mark_summary_reached()") < run.index("send_sync_summary_telegram(result")
+
+
+def test_wrapper_leaves_no_watchdog_sleep_behind(wrapper):
+    before = set(subprocess.run(["pgrep", "-x", "sleep"], capture_output=True, text=True).stdout.split())
+    wrapper.run("crash")
+    after = set(subprocess.run(["pgrep", "-x", "sleep"], capture_output=True, text=True).stdout.split())
+    leaked = [
+        pid for pid in after - before
+        if Path(f"/proc/{pid}/cmdline").exists()
+        and Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")[1:2] == [b"21600"]
+    ]
+    assert leaked == []

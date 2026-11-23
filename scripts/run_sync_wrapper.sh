@@ -122,8 +122,12 @@ for i in $(seq 1 $MAX_RETRIES); do
             wait "$SYNC_PID"
             EXIT_CODE=$?
         done
+        # Stop the watchdog and the sleep it is waiting on, which would
+        # otherwise outlive it for up to MAX_RUNTIME.
+        WATCHDOG_CHILDREN=$(pgrep -P "$WATCHDOG_PID" 2>/dev/null)
         kill "$WATCHDOG_PID" 2>/dev/null
         wait "$WATCHDOG_PID" 2>/dev/null
+        [ -n "$WATCHDOG_CHILDREN" ] && kill $WATCHDOG_CHILDREN 2>/dev/null
 
         # A non-zero exit after the summary step is a sync with failed
         # sources, which the summary already reported. Before it, nothing
