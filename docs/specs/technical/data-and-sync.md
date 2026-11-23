@@ -420,6 +420,8 @@ Runs in this order (see [iMessage Sync Ordering](#imessage-sync-ordering) below)
 |--------|---------|-------------|
 | `sync_consistency_verify.py` | Cross-store consistency check (orphans, stale merged IDs, cached counts, `last_seen`, vault files that moved or vanished) and auto-fix | `data/crm.db`, `data/interactions.db` |
 
+**Moved or deleted vault notes.** A vault interaction whose file is gone is sorted by what happened to the note. A note moved to a path with no interactions is re-pointed there; re-pointing keeps every row, so it isn't held back by the auto-fix threshold. A note moved to a path whose interactions name the same people is a duplicate, and a note with no file of that name left is gone; both are deleted, but only when there are no more than the auto-fix threshold (10) of them. A note moved to a path whose interactions name other people is *relinked*, and one whose name matches several files is *ambiguous*; both are left for a human. Anything left for a human, or deletions held back by the threshold, makes the run report "Manual review needed" with the counts per kind, and the sync summary turns ⚠️.
+
 ### Summary Queue
 
 | Script | Purpose | Data Source |
