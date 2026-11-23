@@ -2306,6 +2306,26 @@ def test_suppress_sentinel_with_whitespace_completes_without_notice(tmp_path: Pa
 
 
 @pytest.mark.unit
+def test_sentinel_on_last_line_after_narration_completes_without_notice(tmp_path: Path):
+    api, w, _ = _complete_with_final_text(
+        tmp_path,
+        "I updated the ledger. None of the messaging triggers fired, so I'm "
+        "ending this run silently.\n\nNOTHING_TO_REPORT",
+    )
+    assert api.tasks["t1"]["status"] == "done"
+    assert COMPLETED_TAG in api.tasks["t1"]["tags"]
+    assert w._sent_telegram == []
+
+
+@pytest.mark.unit
+def test_sentinel_before_more_text_still_notifies(tmp_path: Path):
+    api, w, _ = _complete_with_final_text(
+        tmp_path, "NOTHING_TO_REPORT\n\nActually, one claim was denied.",
+    )
+    assert len(w._sent_telegram) == 1
+
+
+@pytest.mark.unit
 def test_text_containing_suppress_sentinel_still_notifies(tmp_path: Path):
     api, w, _ = _complete_with_final_text(
         tmp_path, "NOTHING_TO_REPORT, but one claim was denied.",

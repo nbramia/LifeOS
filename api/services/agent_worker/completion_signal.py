@@ -70,9 +70,13 @@ def _looks_like_summary(text: str) -> bool:
 
 
 def is_suppress_sentinel(final_text: str | None) -> bool:
-    """True when the final text, trimmed, is exactly a scheduler "nothing to
-    report" sentinel: a valid completion that sends no completion notice."""
-    return (final_text or "").strip() in SUPPRESS_SENTINELS
+    """True when the final text's last non-empty line, trimmed, is exactly a
+    scheduler "nothing to report" sentinel: a valid completion that sends no
+    completion notice. Narration before that line ("I updated the ledger.")
+    doesn't change the session's decision to stay quiet; a sentinel sharing
+    its line with other words ("NOTHING_TO_REPORT, but ...") is not one."""
+    lines = [line.strip() for line in (final_text or "").splitlines() if line.strip()]
+    return bool(lines) and lines[-1] in SUPPRESS_SENTINELS
 
 
 def has_positive_completion_signal(final_text: str | None, notifications_sent: int) -> bool:
