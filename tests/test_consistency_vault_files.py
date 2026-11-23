@@ -215,3 +215,93 @@ class TestFixing:
         _check_missing_vault_files(dry_run=False, fix_threshold=100)
 
         assert source_ids() == {str(vault / "Notes.md")}
+
+
+class TestPeopleCoverage:
+    """A moved note is only a duplicate when the new path names the same people."""
+
+    def test_new_path_linking_other_people_is_relinked_not_duplicate(self, vault_env):
+        vault, add, _ = vault_env
+        (vault / "Work" / "Standup.md").write_text("moved here")
+        add(str(vault / "Personal" / "Standup.md"), person_id="p_old")
+        add(str(vault / "Work" / "Standup.md"), person_id="p_new")
+
+        buckets = _classify_missing_vault_files()
+
+        assert buckets["duplicate"] == []
+        assert buckets["relinked"] == [
+            (str(vault / "Personal" / "Standup.md"), str(vault / "Work" / "Standup.md"))
+        ]
+
+    def test_relinked_rows_are_kept_and_flagged_for_review(self, vault_env):
+        vault, add, source_ids = vault_env
+        (vault / "Work" / "Standup.md").write_text("moved here")
+        add(str(vault / "Personal" / "Standup.md"), person_id="p_old")
+        add(str(vault / "Work" / "Standup.md"), person_id="p_new")
+
+        result = _check_missing_vault_files(dry_run=False, fix_threshold=100)
+
+        assert str(vault / "Personal" / "Standup.md") in source_ids()
+        assert result["needs_review"] is True
+        assert "relinked=1" in result["details"]
+
+    def test_ambiguous_candidates_need_the_same_people_to_be_a_duplicate(self, vault_env):
+        vault, add, _ = vault_env
+        for folder in ("Work", "Personal"):
+            (vault / folder / "Notes.md").write_text(folder)
+            add(str(vault / folder / "Notes.md"), person_id="p_other")
+        add(str(vault / "Notes.md"), person_id="p_old")
+
+        buckets = _classify_missing_vault_files()
+
+        assert buckets["duplicate"] == []
+        assert len(buckets["ambiguous"]) == 1
+
+
+class TestThresholdGatesDeletionOnly:
+    def test_repoints_apply_above_the_threshold(self, vault_env):
+        """Re-pointing keeps every row, so the mass-deletion guard does not apply."""
+        vault, add, source_ids = vault_env
+        for i in range(5):
+            (vault / "Work" / f"Moved{i}.md").write_text("moved")
+            add(str(vault / "Personal" / f"Moved{i}.md"))
+        for i in range(5):
+            add(str(vault / "Work" / f"Gone{i}.md"))
+
+        result = _check_missing_vault_files(dry_run=False, fix_threshold=2)
+
+        assert result["fixed"] == 5
+        assert {str(vault / "Work" / f"Moved{i}.md") for i in range(5)} <= source_ids()
+        assert {str(vault / "Work" / f"Gone{i}.md") for i in range(5)} <= source_ids()
+        assert result["needs_review"] is True
+
+    def test_clean_fix_needs_no_review(self, vault_env):
+        vault, add, _ = vault_env
+        (vault / "Work" / "Standup.md").write_text("moved here")
+        add(str(vault / "Personal" / "Standup.md"))
+
+        result = _check_missing_vault_files(dry_run=False, fix_threshold=100)
+
+        assert result["needs_review"] is False
+
+
+class TestSyncSummary:
+    def test_data_issues_needing_review_turn_the_header_and_name_the_check(self):
+        from unittest.mock import patch
+
+        from scripts.run_all_syncs import _parse_sync_output, send_sync_summary_telegram
+
+        output = (
+            'CONSISTENCY_SUMMARY:{"total_issues": 12, "total_fixed": 2, "auto_fix_skipped": true, '
+            '"review": ["moved or deleted vault notes: duplicate=0, repoint=2, relinked=10, gone=0, ambiguous=0"]}\n'
+        )
+        consistency = {"success": True, **_parse_sync_output(output)}
+        result = {
+            "failed": 0, "succeeded": 1, "sources_run": 1, "failed_sources": [], "duration_seconds": 1,
+            "results": {"consistency_verify": consistency},
+        }
+        with patch("api.services.telegram.send_message", return_value=True) as send:
+            send_sync_summary_telegram(result, trigger="test")
+        message = send.call_args[0][0]
+        assert message.startswith("⚠️")
+        assert "relinked=10" in message

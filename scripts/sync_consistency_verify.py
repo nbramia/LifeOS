@@ -450,10 +450,15 @@ def _classify_missing_vault_files() -> dict:
     always, and blanket-deleting them would destroy the exceptions.
 
     Returns lists keyed by disposition:
-      duplicate — the note moved and the new path already has interactions;
-                  the old rows are stale copies and can go
+      duplicate — the note moved and the new path already has interactions
+                  with every person the old rows name; the old rows are
+                  stale copies and can go
       repoint   — the note moved and nothing points at the new path yet;
                   deleting these would lose the interaction entirely
+      relinked  — the note moved, but the rows at the new path name other
+                  people (mention resolution differs from when the old rows
+                  were written); deleting would drop those people's links,
+                  so they are left for a human
       gone      — no file with that name anywhere in the vault
       ambiguous — the name matches several files, so the move target is a
                   guess; left alone for a human
@@ -464,21 +469,22 @@ def _classify_missing_vault_files() -> dict:
 
     conn = sqlite3.connect(get_interaction_db_path(), timeout=60.0)
     try:
-        known_paths = {
-            row[0] for row in conn.execute(
-                "SELECT DISTINCT source_id FROM interactions "
-                "WHERE source_type IN ('vault', 'meeting', 'granola') AND source_id IS NOT NULL "
-                f"AND source_id NOT LIKE '%{COLLISION_SUFFIX}%'"
-            )
-        }
+        people_by_path: dict[str, set] = {}
+        for source_id, person_id in conn.execute(
+            "SELECT source_id, person_id FROM interactions "
+            "WHERE source_type IN ('vault', 'meeting', 'granola') AND source_id IS NOT NULL "
+            f"AND source_id NOT LIKE '%{COLLISION_SUFFIX}%'"
+        ):
+            people_by_path.setdefault(source_id, set()).add(person_id)
     finally:
         conn.close()
+    known_paths = set(people_by_path)
 
     missing = [
         p for p in known_paths
         if p.startswith("/") and not Path(p).exists()
     ]
-    buckets = {"duplicate": [], "repoint": [], "gone": [], "ambiguous": []}
+    buckets = {"duplicate": [], "repoint": [], "relinked": [], "gone": [], "ambiguous": []}
     if not missing:
         return buckets
 
@@ -493,23 +499,28 @@ def _classify_missing_vault_files() -> dict:
     for path in vault_root.rglob("*.md"):
         by_name.setdefault(path.name, []).append(str(path))
 
+    def covered(stale_path: str, candidate: str) -> bool:
+        return people_by_path[stale_path] <= people_by_path.get(candidate, set())
+
     for stale_path in missing:
         candidates = by_name.get(Path(stale_path).name, [])
         if not candidates:
             buckets["gone"].append((stale_path, None))
         elif len(candidates) > 1:
-            if all(c in known_paths for c in candidates):
+            if all(covered(stale_path, c) for c in candidates):
                 # The move target is unknown, but every candidate already has
-                # its own interactions — so whichever one it was, the history is
-                # already represented and this row is a duplicate either way.
-                # No guess required.
+                # interactions with the same people — so whichever one it was,
+                # the history is already represented and this row is a
+                # duplicate either way. No guess required.
                 buckets["duplicate"].append((stale_path, None))
             else:
                 buckets["ambiguous"].append((stale_path, candidates))
-        elif candidates[0] in known_paths:
+        elif candidates[0] not in known_paths:
+            buckets["repoint"].append((stale_path, candidates[0]))
+        elif covered(stale_path, candidates[0]):
             buckets["duplicate"].append((stale_path, candidates[0]))
         else:
-            buckets["repoint"].append((stale_path, candidates[0]))
+            buckets["relinked"].append((stale_path, candidates[0]))
 
     return buckets
 
@@ -528,21 +539,25 @@ def _check_missing_vault_files(dry_run: bool, fix_threshold: int) -> dict:
     buckets = _classify_missing_vault_files()
     deletable = buckets["duplicate"] + buckets["gone"]
     repointable = buckets["repoint"]
-    count = len(deletable) + len(repointable) + len(buckets["ambiguous"])
+    left_for_review = buckets["relinked"] + buckets["ambiguous"]
+    count = len(deletable) + len(repointable) + len(left_for_review)
     if count == 0:
-        return {"count": 0, "fixed": 0}
+        return {"count": 0, "fixed": 0, "needs_review": False}
 
     details = (
         f"duplicate={len(buckets['duplicate'])}, repoint={len(repointable)}, "
-        f"gone={len(buckets['gone'])}, ambiguous={len(buckets['ambiguous'])}"
+        f"relinked={len(buckets['relinked'])}, gone={len(buckets['gone'])}, "
+        f"ambiguous={len(buckets['ambiguous'])}"
     )
 
     fixed = 0
-    actionable = len(deletable) + len(repointable)
-    if not dry_run and 0 < actionable <= fix_threshold:
+    delete_now = not dry_run and 0 < len(deletable) <= fix_threshold
+    if not dry_run and (repointable or delete_now):
         conn = sqlite3.connect(get_interaction_db_path(), timeout=60.0)
         try:
-            # Re-point first: if a later delete ever overlapped, we would rather
+            # Re-pointing keeps every row, so it is not gated by fix_threshold
+            # (which guards against mass deletion) — same as stale merged IDs.
+            # It runs first: if a later delete ever overlapped, we would rather
             # have preserved the row than removed it.
             for stale_path, new_path in repointable:
                 cursor = conn.execute(
@@ -550,15 +565,23 @@ def _check_missing_vault_files(dry_run: bool, fix_threshold: int) -> dict:
                     (new_path, stale_path),
                 )
                 fixed += cursor.rowcount
-            for stale_path, _ in deletable:
-                cursor = conn.execute(
-                    "DELETE FROM interactions WHERE source_id = ?", (stale_path,)
-                )
-                fixed += cursor.rowcount
+            if delete_now:
+                for stale_path, _ in deletable:
+                    cursor = conn.execute(
+                        "DELETE FROM interactions WHERE source_id = ?", (stale_path,)
+                    )
+                    fixed += cursor.rowcount
             conn.commit()
         finally:
             conn.close()
 
+    if buckets["relinked"]:
+        logger.warning(
+            "%d vault interactions point at moved notes whose new path links "
+            "other people — resolve these manually: %s",
+            len(buckets["relinked"]),
+            ", ".join(p for p, _ in buckets["relinked"][:5]),
+        )
     if buckets["ambiguous"]:
         logger.warning(
             "%d vault interactions point at moved notes whose name matches "
@@ -567,7 +590,8 @@ def _check_missing_vault_files(dry_run: bool, fix_threshold: int) -> dict:
             ", ".join(p for p, _ in buckets["ambiguous"][:5]),
         )
 
-    return {"count": count, "fixed": fixed, "details": details}
+    needs_review = bool(left_for_review) or len(deletable) > fix_threshold
+    return {"count": count, "fixed": fixed, "details": details, "needs_review": needs_review}
 
 
 def verify_consistency(dry_run: bool = True, fix_threshold: int = AUTO_FIX_THRESHOLD) -> dict:
@@ -598,6 +622,7 @@ def verify_consistency(dry_run: bool = True, fix_threshold: int = AUTO_FIX_THRES
             "total_issues": 0,
             "total_fixed": 0,
             "auto_fix_skipped": False,
+            "review": [],
         }
 
     # Interaction-modifying checks first (deletions change counts)
@@ -623,10 +648,17 @@ def verify_consistency(dry_run: bool = True, fix_threshold: int = AUTO_FIX_THRES
     total_issues = sum(c["count"] for c in checks)
     total_fixed = sum(c["fixed"] for c in checks)
 
-    auto_fix_skipped = any(
-        check["count"] > fix_threshold and check["count"] > 0
-        for check in [orphaned_interactions, orphaned_crm_records, missing_vault_files]
-    )
+    review = [
+        f"{name}: {check.get('details') or check['count']}"
+        for name, check in (
+            ("orphaned interactions", orphaned_interactions),
+            ("orphaned CRM records", orphaned_crm_records),
+        )
+        if check["count"] > fix_threshold
+    ]
+    if missing_vault_files.get("needs_review"):
+        review.append(f"moved or deleted vault notes: {missing_vault_files['details']}")
+    auto_fix_skipped = bool(review)
 
     return {
         "person_stats_mismatches": person_stats,
@@ -641,6 +673,7 @@ def verify_consistency(dry_run: bool = True, fix_threshold: int = AUTO_FIX_THRES
         "total_issues": total_issues,
         "total_fixed": total_fixed,
         "auto_fix_skipped": auto_fix_skipped,
+        "review": review,
     }
 
 
@@ -673,10 +706,16 @@ def main():
     print(f"Orphaned CRM records: {result['orphaned_crm_records']['count']}")
     if result['orphaned_crm_records'].get('details'):
         print(f"  ({result['orphaned_crm_records']['details']})")
+    mv = result['missing_vault_files']
+    print(f"Moved or deleted vault notes: {mv['count']}")
+    if mv.get('details'):
+        print(f"  ({mv['details']})")
     print(f"Total issues: {result['total_issues']}")
     print(f"Total fixed: {result['total_fixed']}")
     if result['auto_fix_skipped']:
-        print(f"WARNING: Some checks exceeded fix threshold ({args.fix_threshold}), manual review needed")
+        print("WARNING: manual review needed:")
+        for item in result['review']:
+            print(f"  - {item}")
 
     if result['total_issues'] == 0:
         print("All stores consistent.")
@@ -686,6 +725,7 @@ def main():
         "total_issues": result["total_issues"],
         "total_fixed": result["total_fixed"],
         "auto_fix_skipped": result["auto_fix_skipped"],
+        "review": result["review"],
     }
     print(f"CONSISTENCY_SUMMARY:{json.dumps(summary)}")
 

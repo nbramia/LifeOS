@@ -765,6 +765,7 @@ def send_sync_summary_telegram(result: dict, trigger: str = "unknown"):
         and not result.get("apple_agent_sha_drift")
         and not result.get("results", {}).get("crm_vectorstore", {}).get("removal_skipped")
         and not result.get("results", {}).get("strengths", {}).get("service_senders_held_back")
+        and not result.get("results", {}).get("consistency_verify", {}).get("auto_fix_skipped")
         else "⚠️"
     )
     lines = [
@@ -832,7 +833,9 @@ def send_sync_summary_telegram(result: dict, trigger: str = "unknown"):
             lines.append("")
             if consistency.get("auto_fix_skipped"):
                 lines.append(f"⚠️ *Data Issues:* {total_issues} found, {total_fixed} auto-fixed")
-                lines.append("  Manual review needed — threshold exceeded")
+                lines.append("  Manual review needed:")
+                for item in consistency.get("review") or []:
+                    lines.append(f"  • {item}")
             else:
                 lines.append(f"🔧 *Data Issues:* {total_issues} found, {total_fixed} auto-fixed")
 
