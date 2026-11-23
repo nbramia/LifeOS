@@ -9,7 +9,9 @@
 # 1. Wakes the NVMe by touching the mount point
 # 2. Verifies the Python venv can start
 # 3. Sends a Telegram alert if it can't, so failures aren't silent
-# 4. Execs into Python if everything is OK
+# 4. Runs Python under a runtime watchdog
+# 5. Sends a Telegram alert if Python exits non-zero before its summary step
+#    (killed, crashed), since the sync's own summary never goes out then
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIFEOS_DIR="$(dirname "$SCRIPT_DIR")"
@@ -20,6 +22,23 @@ LOG="$LIFEOS_DIR/logs/crm-sync-error.log"
 # Maximum wall-clock runtime (6 hours). If the sync process hangs for any
 # reason, this watchdog kills it so launchd can fire the next night's run.
 MAX_RUNTIME=21600
+
+ENV_FILE="$LIFEOS_DIR/.env"
+
+# Send a Telegram alert from the primary bot and copy it to the bot-notices log
+# (api/services/bot_notices.py). Best-effort: never fails the wrapper.
+send_alert() {
+    local text="$1" bot_token chat_id
+    [ -f "$ENV_FILE" ] || return 0
+    bot_token=$(grep '^TELEGRAM_BOT_TOKEN=' "$ENV_FILE" | cut -d= -f2)
+    chat_id=$(grep '^TELEGRAM_CHAT_ID=' "$ENV_FILE" | cut -d= -f2)
+    [ -n "$bot_token" ] && [ -n "$chat_id" ] || return 0
+    "${LIFEOS_WATCHDOG_CURL:-/usr/bin/curl}" -s -X POST "https://api.telegram.org/bot${bot_token}/sendMessage" \
+        --data-urlencode "chat_id=${chat_id}" \
+        --data-urlencode "text=${text}" \
+        --data-urlencode "parse_mode=Markdown" > /dev/null 2>&1 || true
+    printf '%s' "$text" | python3 -I "$LIFEOS_DIR/api/services/bot_notices.py" "LifeOS/run_sync_wrapper" > /dev/null 2>&1 || true
+}
 
 # --- Free RAM before the heavy sync (opt-in) -----------------------------------
 # The embedding/reindex phase co-resident with a memory-hungry desktop app (e.g.
@@ -57,6 +76,10 @@ for i in $(seq 1 $MAX_RETRIES); do
         # Run Python in the background so we can start a watchdog alongside it.
         # When Python exits normally, we kill the watchdog to prevent it from
         # firing kill on a recycled PID hours later.
+        # run_all_syncs.py touches this file once it reaches its summary step.
+        SUMMARY_MARKER="$(mktemp -u "${TMPDIR:-/tmp}/lifeos-sync-summary.XXXXXX")"
+        export LIFEOS_SYNC_SUMMARY_MARKER="$SUMMARY_MARKER"
+
         "$PYTHON" "$SYNC_SCRIPT" "$@" &
         SYNC_PID=$!
 
@@ -88,10 +111,39 @@ for i in $(seq 1 $MAX_RETRIES); do
         WATCHDOG_PID=$!
 
         # Wait for sync to finish, then clean up watchdog
+        # systemd stops the unit (its own runtime limit, a manual stop) by
+        # sending SIGTERM to every process in it. Catch it here so the wrapper
+        # outlives the sync long enough to report it; the sync handles its own.
+        trap 'true' TERM
         wait "$SYNC_PID"
         EXIT_CODE=$?
+        # A trapped signal ends `wait` early; keep waiting for the real status.
+        while kill -0 "$SYNC_PID" 2>/dev/null; do
+            wait "$SYNC_PID"
+            EXIT_CODE=$?
+        done
+        # Stop the watchdog and the sleep it is waiting on, which would
+        # otherwise outlive it for up to MAX_RUNTIME.
+        WATCHDOG_CHILDREN=$(pgrep -P "$WATCHDOG_PID" 2>/dev/null)
         kill "$WATCHDOG_PID" 2>/dev/null
         wait "$WATCHDOG_PID" 2>/dev/null
+        [ -n "$WATCHDOG_CHILDREN" ] && kill $WATCHDOG_CHILDREN 2>/dev/null
+
+        # A non-zero exit after the summary step is a sync with failed
+        # sources, which the summary already reported. Before it, nothing
+        # has told the operator the run stopped.
+        if [ "$EXIT_CODE" -ne 0 ] && [ ! -e "$SUMMARY_MARKER" ]; then
+            ELAPSED=$(( $(date +%s) - WATCH_START ))
+            HOW="exited with code $EXIT_CODE"
+            if [ "$EXIT_CODE" -gt 128 ]; then
+                HOW="was killed by signal $(( EXIT_CODE - 128 ))"
+                # systemd's limit counts from unit start, a little before this clock.
+                [ "$ELAPSED" -ge $(( MAX_RUNTIME - 600 )) ] && HOW="$HOW at the 6-hour runtime limit"
+            fi
+            echo "$(date '+%Y-%m-%d %H:%M:%S') [WRAPPER] Sync $HOW after ${ELAPSED}s, before its summary" >> "$LOG"
+            send_alert "$(printf '🚨 *LifeOS Sync did not finish*\n\nThe sync %s after %dm %ds, before sending its summary.\n\nCheck journalctl -u lifeos-sync.service and logs/crm-sync-error.log.' "$HOW" $(( ELAPSED / 60 )) $(( ELAPSED % 60 )))"
+        fi
+        rm -f "$SUMMARY_MARKER"
         exit "$EXIT_CODE"
     fi
 
@@ -105,20 +157,6 @@ MSG="$(date '+%Y-%m-%d %H:%M:%S') [WRAPPER] CRITICAL: Nightly sync cannot start 
 echo "$MSG" >> "$LOG"
 
 # Send Telegram alert so this isn't a silent failure
-ENV_FILE="$LIFEOS_DIR/.env"
-if [ -f "$ENV_FILE" ]; then
-    BOT_TOKEN=$(grep '^TELEGRAM_BOT_TOKEN=' "$ENV_FILE" | cut -d= -f2)
-    CHAT_ID=$(grep '^TELEGRAM_CHAT_ID=' "$ENV_FILE" | cut -d= -f2)
-
-    if [ -n "$BOT_TOKEN" ] && [ -n "$CHAT_ID" ]; then
-        ALERT=$(printf '🚨 *LifeOS Sync Failed*\n\nNVMe drive not accessible at 3 AM.\nPython venv cannot start — Homebrew is on the NVMe.\n\nCheck if the drive is mounted and awake.')
-        /usr/bin/curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${CHAT_ID}" \
-            --data-urlencode "text=${ALERT}" \
-            --data-urlencode "parse_mode=Markdown" > /dev/null 2>&1
-        # Copy the notice to the bot-notices log (api/services/bot_notices.py). Best-effort.
-        printf '%s' "$ALERT" | python3 -I "$LIFEOS_DIR/api/services/bot_notices.py" "LifeOS/run_sync_wrapper" > /dev/null 2>&1 || true
-    fi
-fi
+send_alert "$(printf '🚨 *LifeOS Sync Failed*\n\nNVMe drive not accessible at 3 AM.\nPython venv cannot start — Homebrew is on the NVMe.\n\nCheck if the drive is mounted and awake.')"
 
 exit 1

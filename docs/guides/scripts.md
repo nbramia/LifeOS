@@ -340,7 +340,7 @@ The display `sources` column stores each call as `tool(json-args)` cut to 80 cha
 | `taxonomy_bootstrap.py` | Proposes vault taxonomy topics: samples `--sample N` notes (default 200) stratified by top-level folder, collects their frontmatter tags and folder names, and asks the specialist LLM backend (Anthropic, else local, else remote) for `parent/child` topics in the shape of `config/vault_taxonomy.yaml`. Writes `data/taxonomy_proposal.yaml` only, never `config/`; the operator edits it into `config/vault_taxonomy.local.yaml`. Note titles, tags, and short excerpts go to the configured backend. `--dry-run` prints sample sizes and a prompt token estimate without calling the LLM. |
 | `search_attribution_report.py` | Read-only report over the perf-trace database (`--since <date>`, optional `--db`): how many vault searches ran, the mean/median share of final results the keyword arm reaches, the share of searches with zero keyword or zero vector candidates, the keyword match-mode mix, and the `top_k` distribution. Query text is printed only with `--show-queries`. See [observability.md](../specs/technical/observability.md#search-attribution). |
 | `preflight.sh` | Pre-flight checks (called by server.sh) |
-| `run_sync_wrapper.sh` | NVMe wake + pre-flight for nightly sync |
+| `run_sync_wrapper.sh` | NVMe wake + pre-flight for nightly sync; alerts when the sync can't start or stops before its summary |
 | `run_sync_with_fda.sh` | FDA wrapper for phone/iMessage sync (macOS) |
 | `run_fda_syncs.py` | Python FDA sync orchestrator (macOS) |
 | `apple_data_export.py` | Export Apple data (iMessage, Contacts, Photos) on macOS; the photos export also stages one thumbnail per face-linked asset under `data/apple-imports/photos_thumbnails/` |

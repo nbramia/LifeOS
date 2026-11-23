@@ -32,6 +32,7 @@ import argparse
 import fcntl
 import json
 import logging
+import os
 import re
 import signal
 import subprocess
@@ -724,6 +725,17 @@ def file_human_queue_card_for_monarch(mstatus: dict) -> None:
         )
     except Exception as e:
         logger.warning(f"human-queue: Monarch re-auth filing failed: {e}")
+
+
+def _mark_summary_reached() -> None:
+    """Touch ``$LIFEOS_SYNC_SUMMARY_MARKER`` (set by run_sync_wrapper.sh), if set."""
+    marker = os.environ.get("LIFEOS_SYNC_SUMMARY_MARKER")
+    if not marker:
+        return
+    try:
+        Path(marker).touch()
+    except OSError as e:
+        logger.warning(f"Could not write sync summary marker {marker}: {e}")
 
 
 def send_sync_summary_telegram(result: dict, trigger: str = "unknown"):
@@ -2563,6 +2575,10 @@ def run_all_syncs(
 
     # Log summary to markdown (always, not just on failure)
     log_sync_summary_to_markdown(result, trigger=trigger)
+
+    # The wrapper alerts when the run exits non-zero without reaching this
+    # point; the marker tells it the summary step was reached.
+    _mark_summary_reached()
 
     # Send Telegram notification (skip for dry run)
     if not dry_run:
