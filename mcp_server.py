@@ -3346,20 +3346,50 @@ PUBLIC_SOCKET_PATHS = frozenset({
 })
 
 
-def public_socket_app(app):
+def public_socket_app(app, callers=None):
     """ASGI wrapper for the public listener: only `PUBLIC_SOCKET_PATHS` reach `app`.
 
     A unix-socket request has no client address, so it never counts as a
     loopback peer; the allowlist keeps the consent and connected-apps endpoints
     off this listener as well. Every request is marked with
     `PUBLIC_LISTENER_SCOPE_KEY`, so `/mcp` there accepts only OAuth tokens.
+
+    `callers` is an optional `PublicCallerFilter`; in `report` mode it logs each
+    caller's provider, in `enforce` mode it refuses callers outside the Claude
+    and ChatGPT address ranges. Without it, or in `off` mode, nothing is checked.
     """
+    from api.services.mcp_public_callers import forwarded_address
+
+    mode = callers.mode if callers is not None else "off"
+
     async def wrapped(scope, receive, send):
         if scope["type"] == "http" and scope.get("path") not in PUBLIC_SOCKET_PATHS:
             await send({"type": "http.response.start", "status": 404,
                         "headers": [(b"content-type", b"text/plain")]})
             await send({"type": "http.response.body", "body": b"Not Found"})
             return
+        if mode != "off" and scope["type"] in ("http", "websocket"):
+            headers = scope.get("headers") or []
+            addr = forwarded_address(headers)
+            provider = callers.classify(addr)
+            path = scope.get("path")
+            admitted = provider in ("anthropic", "openai", "extra")
+            if mode == "report":
+                extra = "" if admitted else f" addr={addr or 'unknown'}"
+                logger.info(f"mcp public caller: mode=report provider={provider} path={path}{extra}")
+            elif not admitted:
+                logger.warning(
+                    f"mcp public caller refused: provider={provider} addr={addr or 'unknown'} path={path}"
+                )
+                if any(k.lower() == b"authorization" for k, _ in headers) or path == "/oauth/token":
+                    callers.credentials_refused(addr)
+                if scope["type"] == "websocket":
+                    await send({"type": "websocket.close", "code": 1008})
+                    return
+                await send({"type": "http.response.start", "status": 403,
+                            "headers": [(b"content-type", b"text/plain")]})
+                await send({"type": "http.response.body", "body": b"Forbidden"})
+                return
         if scope["type"] in ("http", "websocket"):
             scope = {**scope, PUBLIC_LISTENER_SCOPE_KEY: True}
         await app(scope, receive, send)
@@ -3392,8 +3422,14 @@ def run_http(
     tcp = uvicorn.Server(uvicorn.Config(
         app, host=host, port=port, log_level="info", proxy_headers=False,
     ))
+    from api.services.mcp_public_callers import PublicCallerFilter
+
+    callers = PublicCallerFilter.from_settings()
+    if callers.mode != "off":
+        callers.start()
+        logger.info(f"LifeOS MCP public caller filter: mode={callers.mode}")
     sock = uvicorn.Server(uvicorn.Config(
-        public_socket_app(app), uds=uds, log_level="info", proxy_headers=False,
+        public_socket_app(app, callers), uds=uds, log_level="info", proxy_headers=False,
         lifespan="off",
     ))
 

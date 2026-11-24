@@ -1,7 +1,7 @@
 # Configuration Guide
 
 **Status:** Complete
-**Last Updated:** 2026-11-19
+**Last Updated:** 2026-11-24
 **Audience:** Operators
 
 **This is the single authoritative reference for every `LIFEOS_*` environment variable and the third-party service variables (`ANTHROPIC_API_KEY`, `OLLAMA_*`, `SLACK_*`, `TELEGRAM_*`, `MONARCH_*`) that LifeOS reads.** Other guides reference this file rather than restating defaults — when documentation conflicts, this file wins (and `config/settings.py` wins over both, since the code is the source of truth).
@@ -205,6 +205,9 @@ Scoped file, command and log access over MCP (`lifeos_fs_list`, `lifeos_fs_read`
 | `LIFEOS_HOST_TOOLS_VAULT_WRITE_DIRS` | str (comma-separated) | — | Vault folders or single files, relative to the vault root, that host-tool writes may touch. A folder allows everything inside it; a file allows only that file. Empty: the whole vault. Task files and the scheduler inbox are content-checked either way ([Host Tools](host-tools.md#task-and-schedule-files)). |
 | `LIFEOS_TASK_AGENT_OAUTH_CLIENTS` | str (comma-separated `agent=client_id`) | — | Lets a connected app edit tasks with `lifeos_task_update` as a named external agent (`duet` or `muse`), under the agent assignee rules ([Task Management](../specs/product/task-management.md#external-agents)). Example: `duet=<client_id>`. Unknown agent names are ignored; a client id listed twice is ignored. Empty: no connected app edits tasks. |
 | `LIFEOS_MCP_OAUTH_TOOL_GRANTS` | str (comma-separated `client_id:tool_name`) | — | Adds named curated catalog tools to one OAuth client's tool view, one tool per pair. Example: `<client_id>:lifeos_schedule_create,<client_id>:lifeos_task_complete`. Host tools, `lifeos_agent_*`, `lifeos_task_update`, unknown names and malformed pairs grant nothing; agent tokens never receive grants. Empty: no extra tools. |
+| `LIFEOS_MCP_PUBLIC_CALLERS` | str | `off` | Caller filter on the public MCP listener: `off`, `report` (log each caller's provider, admit all) or `enforce` (refuse callers outside the Claude and ChatGPT apps' address ranges). Any other value behaves as `off`. See [Connected Apps](mcp-connected-apps.md#limit-public-callers-to-claude-and-chatgpt). |
+| `LIFEOS_MCP_PUBLIC_CALLER_EXTRA_RANGES` | str (comma-separated CIDRs) | — | Ranges the public caller filter also admits. Invalid entries are skipped with a warning. |
+| `LIFEOS_MCP_PUBLIC_CALLER_OPENAI_URL` | str | `https://openai.com/chatgpt-connectors.json` | Where the public caller filter fetches the ChatGPT connector address list. |
 | `LIFEOS_MCP_AGENT_TOKENS` | str (comma-separated `agent=sha256`) | — | Bearer tokens for external agents (`duet` or `muse`), stored as SHA-256 hex digests. A matching token gets the connected-app tier and `lifeos_task_update` as that agent, never the full catalog, and only from the host and the tailnet. An agent may have several entries, for rotation. Mint one with `scripts/mcp_agent_token.py new <agent>` ([Connected Apps](mcp-connected-apps.md#a-scoped-token-for-an-agent)). |
 | `LIFEOS_HOST_TOOLS_VAULT_AUTOCOMMIT` | bool | `true` | Commit each host-tools vault write (that path only) when the vault is a git repo. |
 | `LIFEOS_HOST_TOOLS_SHELL_APPROVAL` | bool | `false` | Send commands outside the allowlist to `TELEGRAM_CHAT_ID` through the primary bot; a reply of `APPROVE` lets the caller run that exact command once. Off: they are refused. See [Host Tools](host-tools.md#approval-for-other-commands). |
