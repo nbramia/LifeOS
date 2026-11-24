@@ -1951,7 +1951,9 @@ def test_a_raising_notifier_does_not_fail_or_delay_the_request(server, tmp_path,
     closed, c = _closed_client(server, tmp_path, clock, sent, notify=broken)
     closed.open_registration(600)
     caplog.set_level(logging.WARNING)
-    assert c.post("/oauth/register", json=REGISTRATION_BODY).status_code == 201  # returned while the sender blocks
+    started = time.monotonic()
+    assert c.post("/oauth/register", json=REGISTRATION_BODY).status_code == 201
+    assert time.monotonic() - started < 2  # returned while the sender is still blocked
     release.set()
     _drain(c)
     assert "operator notice failed" in caplog.text
