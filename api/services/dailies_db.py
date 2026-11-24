@@ -26,7 +26,8 @@ JOURNAL_FOLDER = "Personal/Journal"
 SELECT_SQL = """
 SELECT subject, source, revision, entry_date, updated_at, connection_taylor, connection_malea,
        resonant, word, sleep_hours, alcohol, caffeine, food, exercise,
-       mood, stress, body, feelings, feeling_status
+       mood, stress, body, meditation_sessions, meditation_longest_minutes,
+       feelings, feeling_status
 FROM home_dailies
 ORDER BY entry_date
 """
@@ -70,6 +71,9 @@ FIELDS = (
     ("body", "Body today", "body", _number),
     ("caffeine", "Caffeine today", "caffeine", _CAFFEINE.get),
     ("alcohol", "Alcohol yesterday", "alcohol", _ALCOHOL.get),
+    # Home-only questions (no Form history): the sheet mirror's column titles.
+    ("meditation_sessions", "Meditation sessions today", "meditation_sessions", _number),
+    ("meditation_longest_minutes", "Longest meditation today (minutes)", "meditation_longest_minutes", _number),
 )
 
 FEELING_HEADER = "Feelings"

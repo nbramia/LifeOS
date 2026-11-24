@@ -47,6 +47,8 @@ def make_row(**overrides) -> dict:
         "mood": 6,
         "stress": 4,
         "body": 5,
+        "meditation_sessions": 2,
+        "meditation_longest_minutes": 25,
         "feelings": [["Bad", "Tired", "Sleepy"]],
         "feeling_status": "chosen",
     }
@@ -96,10 +98,21 @@ class TestFieldMapping:
         assert fm["body"] == 5
         assert fm["caffeine"] == "2 cups"
         assert fm["alcohol"] == "1-2 drinks"
+        assert fm["meditation_sessions"] == 2
+        assert fm["meditation_longest_minutes"] == 25
         assert fm["feeling"] == "Bad"
         assert fm["bad_feeling"] == "Tired"
         assert fm["tired_feeling"] == "Sleepy"
         assert fm["feelings"] == ["Bad > Tired > Sleepy"]
+
+    def test_no_meditation_is_zero_and_unanswered_meditation_is_omitted(self, service):
+        sync(service, [make_row(meditation_sessions=0, meditation_longest_minutes=None)])
+        fm = read_fm(service)
+        assert fm["meditation_sessions"] == 0
+        assert "meditation_longest_minutes" not in fm
+        sync(service, [make_row(meditation_sessions=None, meditation_longest_minutes=None, updated_at=datetime(2030, 1, 3, tzinfo=timezone.utc))])
+        fm = read_fm(service)
+        assert "meditation_sessions" not in fm and "meditation_longest_minutes" not in fm
 
     def test_half_hour_sleep_is_a_float(self, service):
         sync(service, [make_row(sleep_hours=Decimal("6.5"))])
