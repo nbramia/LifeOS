@@ -12,6 +12,7 @@ import logging
 import re
 import secrets
 import sqlite3
+import time
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlsplit
 
@@ -19,7 +20,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import mcp_server
-from api.services import mcp_oauth
+from api.services import mcp_oauth, mcp_oauth_http
 from api.services.host_tools import HOST_TOOL_NAMES
 from api.services.mcp_oauth import OAuthConfig, OAuthStore, pkce_s256
 from api.services.mcp_tool_tier import OAUTH_ALLOWED_TOOLS, OAUTH_TOOL_TIER
@@ -52,7 +53,16 @@ def clock() -> Clock:
 
 @pytest.fixture
 def store(tmp_path, clock) -> OAuthStore:
-    return OAuthStore(tmp_path / "mcp_oauth.db", clock=clock)
+    """A store whose registration window is open for the length of the test."""
+    opened = OAuthStore(tmp_path / "mcp_oauth.db", clock=clock)
+    opened.open_registration(10 * 365 * 24 * 3600)
+    return opened
+
+
+@pytest.fixture
+def sent() -> list[str]:
+    """Operator notices the app tried to send; tests never reach Telegram."""
+    return []
 
 
 @pytest.fixture
@@ -107,9 +117,9 @@ def server(monkeypatch, calls, vault) -> mcp_server.LifeOSMCPServer:
 
 
 @pytest.fixture
-def config(store) -> OAuthConfig:
+def config(store, sent) -> OAuthConfig:
     return OAuthConfig(issuer=ISSUER, operator_logins=frozenset({OPERATOR, OTHER_OPERATOR}), store=store,
-                       allowed_redirect_hosts=ALLOWED_HOSTS)
+                       allowed_redirect_hosts=ALLOWED_HOSTS, notify=sent.append)
 
 
 @pytest.fixture
@@ -1737,3 +1747,309 @@ def test_agent_token_view_ignores_grants_even_for_a_matching_principal(server, m
     view = mcp_server.OAuthToolAccess(server, principal="muse", agent_token="muse")
     assert "lifeos_task_delete" not in {t["name"] for t in view.tools()}
     assert not view.callable("lifeos_task_delete")
+
+
+# ── registration window and operator notices ─────────────────────────────
+
+
+class _FixedLocal:
+    """`datetime` stand-in whose `fromtimestamp(...).strftime` always reads 07:15."""
+
+    @staticmethod
+    def fromtimestamp(ts):
+        from datetime import datetime
+
+        return datetime(2026, 1, 1, 7, 15)
+
+REGISTRATION_BODY = {"client_name": "Synthetic App", "redirect_uris": [CLAUDE_REDIRECT]}
+
+
+def _drain(client: TestClient) -> None:
+    client.app.state.oauth_notice_drain()
+
+
+def _closed_client(server, tmp_path, clock, sent, notify=None):
+    closed = OAuthStore(tmp_path / "closed.db", clock=clock)
+    cfg = OAuthConfig(issuer=ISSUER, operator_logins=frozenset({OPERATOR}), store=closed,
+                      allowed_redirect_hosts=ALLOWED_HOSTS, notify=notify or sent.append)
+    return closed, TestClient(mcp_server.build_http_app(server, bearer_token=BEARER, oauth=cfg),
+                              client=LOOPBACK, follow_redirects=False)
+
+
+def test_registration_is_closed_by_default_and_creates_nothing(server, tmp_path, clock, sent):
+    closed, c = _closed_client(server, tmp_path, clock, sent)
+    assert closed.registration_open_until() is None and not closed.registration_is_open()
+    resp = c.post("/oauth/register", json=REGISTRATION_BODY)
+    assert resp.status_code == 403
+    assert resp.json() == {
+        "error": "access_denied",
+        "error_description": "registration is closed; the operator opens it from the host",
+    }
+    assert closed.list_clients() == []
+
+
+def test_open_window_accepts_then_expires_on_the_clock(server, tmp_path, clock, sent):
+    closed, c = _closed_client(server, tmp_path, clock, sent)
+    until = closed.open_registration(600)
+    assert until == clock.now + 600 and closed.registration_open_until() == until
+    assert c.post("/oauth/register", json=REGISTRATION_BODY).status_code == 201
+    assert c.post("/oauth/register", json=REGISTRATION_BODY).status_code == 201  # stays open for a second app
+    clock.now += 601
+    assert closed.registration_open_until() is None
+    assert c.post("/oauth/register", json=REGISTRATION_BODY).status_code == 403
+    assert len(closed.list_clients()) == 2
+
+
+def test_close_ends_the_window(server, tmp_path, clock, sent):
+    closed, c = _closed_client(server, tmp_path, clock, sent)
+    closed.open_registration(600)
+    closed.close_registration()
+    assert not closed.registration_is_open()
+    assert c.post("/oauth/register", json=REGISTRATION_BODY).status_code == 403
+
+
+def test_window_is_shared_through_the_database_file(tmp_path, clock):
+    first = OAuthStore(tmp_path / "w.db", clock=clock)
+    second = OAuthStore(tmp_path / "w.db", clock=clock)
+    first.open_registration(60)
+    assert second.registration_is_open()
+    second.close_registration()
+    assert not first.registration_is_open()
+
+
+def test_a_registered_app_can_still_consent_and_exchange_while_closed(client, store):
+    client_id, tokens, _ = _connect(client)
+    store.close_registration()
+    verifier, challenge = _pkce()
+    code = _get_code(client, client_id, challenge)
+    assert _exchange(client, client_id, code, verifier).status_code == 200
+    assert client.post("/oauth/register", json=REGISTRATION_BODY).status_code == 403
+
+
+def test_registered_notice_text(client, sent):
+    _register(client, client_name="Synthetic App")
+    _drain(client)
+    assert sent == [
+        'LifeOS connector: new app registered: "Synthetic App", returns to claude.example.com. '
+        "Approve it only if you started this connection yourself in the last few minutes."
+    ]
+
+
+def test_consent_notices_only_for_a_decided_consent(client, sent):
+    client_id = _register(client)["client_id"]
+    _, challenge = _pkce()
+    for decision in ("approve", "deny"):
+        form = _consent_form(client.get("/oauth/authorize", params=_authorize_params(client_id, challenge),
+                                        headers=OPERATOR_HEADERS))
+        _post_form(client, "/oauth/authorize", {**form, "decision": decision}, headers=OPERATOR_HEADERS)
+    bad = _post_form(client, "/oauth/authorize", {"request_id": "nope", "csrf_token": "x", "decision": "approve"},
+                     headers=OPERATOR_HEADERS)
+    assert bad.status_code == 400
+    _drain(client)
+    assert sent[1:] == [
+        'LifeOS connector: app approved: "Synthetic App", returns to claude.example.com.',
+        'LifeOS connector: app denied: "Synthetic App", returns to claude.example.com.',
+    ]
+
+
+def test_refused_notices_name_each_reason(server, tmp_path, clock, sent):
+    closed, c = _closed_client(server, tmp_path, clock, sent)
+    c.post("/oauth/register", json=REGISTRATION_BODY)
+    clock.now += 601
+    closed.open_registration(3600)
+    c.post("/oauth/register", content=b"not json", headers={"content-type": "application/json"})
+    clock.now += 601
+    c.post("/oauth/register", json={"client_name": "Odd", "redirect_uris": ["https://evil.example.org/cb"]})
+    clock.now += 601
+    c.post("/oauth/register", json={"client_name": "No Uris"})
+    _drain(c)
+    assert sent == [
+        'LifeOS connector: app registration refused (registration closed): "Synthetic App", '
+        "returns to claude.example.com.",
+        'LifeOS connector: app registration refused (invalid request): "-", returns to -.',
+        'LifeOS connector: app registration refused (invalid request): "Odd", returns to evil.example.org.',
+        'LifeOS connector: app registration refused (invalid request): "No Uris", returns to -.',
+    ]
+
+
+def test_a_registration_refused_at_the_pending_ceiling_sends_a_refused_notice(client, monkeypatch, sent):
+    monkeypatch.setattr(mcp_oauth, "MAX_PENDING_CLIENTS", 1)
+    client_id = _register(client)["client_id"]
+    _, challenge = _pkce()
+    client.get("/oauth/authorize", params=_authorize_params(client_id, challenge), headers=OPERATOR_HEADERS)
+    assert client.post("/oauth/register", json=REGISTRATION_BODY).status_code == 429
+    _drain(client)
+    assert sent[0].startswith("LifeOS connector: new app registered")
+    assert sent[1] == (
+        'LifeOS connector: app registration refused (invalid request): "Synthetic App", '
+        "returns to claude.example.com."
+    )
+
+
+def test_hostile_registration_text_is_sanitised(server, tmp_path, clock, sent):
+    closed, c = _closed_client(server, tmp_path, clock, sent)
+    name = "`*_[evil]*`\nline\x07 " + "x" * 80
+    c.post("/oauth/register", json={"client_name": name, "redirect_uris": ["https://ev_il*.example.org/cb"]})
+    _drain(c)
+    (text,) = sent
+    expected_name = ("evilline " + "x" * 80)[:40]
+    assert text == (
+        f'LifeOS connector: app registration refused (registration closed): "{expected_name}", '
+        "returns to evil.example.org."
+    )
+    for ch in "`*_[]\n\x07":
+        assert ch not in text
+
+
+def test_missing_or_non_string_fields_render_as_a_dash(server, tmp_path, clock, sent):
+    _, c = _closed_client(server, tmp_path, clock, sent)
+    c.post("/oauth/register", json={"client_name": 7, "redirect_uris": [5]})
+    _drain(c)
+    assert sent == ['LifeOS connector: app registration refused (registration closed): "-", returns to -.']
+
+
+def test_refused_notices_are_throttled_and_the_next_one_reports_the_count(server, tmp_path, clock, sent, monkeypatch):
+    monkeypatch.setattr(mcp_oauth_http, "datetime", _FixedLocal)
+    _, c = _closed_client(server, tmp_path, clock, sent)
+    for _ in range(4):
+        c.post("/oauth/register", json=REGISTRATION_BODY)
+        clock.now += 100
+    _drain(c)
+    assert len(sent) == 1 and "(+" not in sent[0]
+    clock.now += 600
+    c.post("/oauth/register", json=REGISTRATION_BODY)
+    _drain(c)
+    assert len(sent) == 2
+    assert sent[1].endswith("returns to claude.example.com. (+3 more refused since 07:15)")
+    clock.now += 601
+    c.post("/oauth/register", json=REGISTRATION_BODY)
+    _drain(c)
+    assert len(sent) == 3 and "(+" not in sent[2]
+
+
+def test_successes_and_consents_are_never_throttled(client, sent):
+    for _ in range(3):
+        client_id = _register(client)["client_id"]
+    _, challenge = _pkce()
+    for _ in range(3):
+        form = _consent_form(client.get("/oauth/authorize", params=_authorize_params(client_id, challenge),
+                                        headers=OPERATOR_HEADERS))
+        _post_form(client, "/oauth/authorize", {**form, "decision": "approve"}, headers=OPERATOR_HEADERS)
+    _drain(client)
+    assert len(sent) == 6
+
+
+def test_a_raising_notifier_does_not_fail_or_delay_the_request(server, tmp_path, clock, sent, caplog):
+    import threading
+
+    release = threading.Event()
+
+    def broken(text: str) -> None:
+        release.wait(5)
+        raise RuntimeError("telegram is down")
+
+    closed, c = _closed_client(server, tmp_path, clock, sent, notify=broken)
+    closed.open_registration(600)
+    caplog.set_level(logging.WARNING)
+    assert c.post("/oauth/register", json=REGISTRATION_BODY).status_code == 201  # returned while the sender blocks
+    release.set()
+    _drain(c)
+    assert "operator notice failed" in caplog.text
+    assert c.post("/oauth/register", json=REGISTRATION_BODY).status_code == 201
+
+
+def test_no_notifier_configured_still_registers(server, tmp_path, clock):
+    closed = OAuthStore(tmp_path / "n.db", clock=clock)
+    closed.open_registration(60)
+    cfg = OAuthConfig(issuer=ISSUER, operator_logins=frozenset({OPERATOR}), store=closed,
+                      allowed_redirect_hosts=ALLOWED_HOSTS)
+    c = TestClient(mcp_server.build_http_app(server, bearer_token=BEARER, oauth=cfg), client=LOOPBACK)
+    assert c.post("/oauth/register", json=REGISTRATION_BODY).status_code == 201
+
+
+def test_notices_carry_no_secrets_or_operator_identity(client, sent):
+    info = _register(client, token_endpoint_auth_method="client_secret_post")
+    _drain(client)
+    text = " ".join(sent)
+    assert info["client_secret"] not in text and info["client_id"] not in text and OPERATOR not in text
+
+
+def test_production_notifier_sends_through_the_primary_bot_with_the_http_module_as_source(monkeypatch, tmp_path):
+    from api.services import telegram
+
+    log = tmp_path / "notices.jsonl"
+    monkeypatch.setenv("BOT_NOTICE_LOG", str(log))
+    monkeypatch.delenv("BOT_NOTICE_REMOTE_HOST", raising=False)
+    monkeypatch.setattr(telegram.settings, "telegram_bot_token", "123456:SYNTHETICTOKEN", raising=False)
+    monkeypatch.setattr(telegram.settings, "telegram_chat_id", "1", raising=False)
+    posted = []
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+    monkeypatch.setattr(telegram.httpx, "post", lambda url, **kw: posted.append((url, kw)) or _Resp())
+    mcp_oauth_http.telegram_notify("LifeOS connector: app approved: \"A\", returns to claude.example.com.")
+    assert len(posted) == 1
+    entry = json.loads(log.read_text().splitlines()[-1])
+    assert entry["source"] == "LifeOS/mcp_oauth_http"
+    assert entry["text"].startswith("LifeOS connector:")
+
+
+def test_mcp_process_logging_redacts_a_telegram_bot_token():
+    import subprocess
+    import sys
+
+    code = (
+        "import logging, mcp_server\n"
+        "logging.getLogger('httpx').info('HTTP Request: POST https://api.telegram.org/"
+        "bot123456:ABCdef_ghi-JKL/sendMessage \"HTTP/1.1 200 OK\"')\n"
+        "logging.getLogger('other').warning('failed: /bot123456:ABCdef_ghi-JKL/sendMessage')\n"
+    )
+    done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120,
+                          cwd=str(__import__("pathlib").Path(mcp_server.__file__).parent))
+    assert "ABCdef_ghi-JKL" not in done.stderr and "ABCdef_ghi-JKL" not in done.stdout
+    assert "bot<REDACTED>" in done.stderr
+
+
+def test_cli_registration_window_commands(store, capsys):
+    from scripts import mcp_oauth as cli
+
+    store.close_registration()
+    assert cli.main(["--db", store.db_path, "list"]) == 0
+    assert capsys.readouterr().out.splitlines()[0] == "Registration: closed"
+    assert cli.main(["--db", store.db_path, "open"]) == 0
+    assert "Registration open until" in capsys.readouterr().out
+    assert cli.main(["--db", store.db_path, "list"]) == 0
+    first = capsys.readouterr().out.splitlines()[0]
+    assert re.fullmatch(r"Registration: open until \d{4}-\d\d-\d\d \d\d:\d\d", first)
+    assert cli.main(["--db", store.db_path, "close"]) == 0
+    assert not store.registration_is_open()
+
+
+@pytest.mark.parametrize("duration,seconds", [("90s", 90), ("10m", 600), ("1h", 3600), ("60m", 3600)])
+def test_cli_open_durations(store, duration, seconds):
+    from scripts import mcp_oauth as cli
+
+    assert cli.parse_duration(duration) == seconds
+    assert cli.main(["--db", store.db_path, "open", duration]) == 0
+    real = OAuthStore(store.db_path)  # the CLI wrote on the real clock
+    assert abs(real.registration_open_until() - (time.time() + seconds)) < 60
+
+
+@pytest.mark.parametrize("duration", ["2h", "61m", "3601s", "0s", "0m", "abc", "10", "1.5h"])
+def test_cli_open_rejects_bad_durations_with_exit_2(store, capsys, duration):
+    from scripts import mcp_oauth as cli
+
+    store.close_registration()
+    assert cli.main(["--db", store.db_path, "open", duration]) == 2
+    assert capsys.readouterr().err.strip()
+    assert not store.registration_is_open()
+
+
+def test_cli_open_rejects_a_negative_duration(store, capsys):
+    from scripts import mcp_oauth as cli
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--db", store.db_path, "open", "-5m"])
+    assert exc.value.code == 2

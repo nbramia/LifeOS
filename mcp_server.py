@@ -29,6 +29,11 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     stream=sys.stderr
 )
+# httpx logs full request URLs at INFO and the Telegram Bot API puts the bot
+# token in the URL, so redact it before this process sends anything.
+from api.services.log_redaction import configure_telegram_log_redaction  # noqa: E402
+
+configure_telegram_log_redaction()
 logger = logging.getLogger(__name__)
 
 # Repo-anchored agent-worker store locations. This server is spawned as a
@@ -3500,6 +3505,7 @@ def _oauth_config_from_settings():
         )
         return None
     from api.services.mcp_oauth import OAuthConfig, OAuthStore
+    from api.services.mcp_oauth_http import telegram_notify
 
     store = OAuthStore(Path(_settings.chroma_path).parent / "mcp_oauth.db")
     logger.info("MCP OAuth enabled for %d operator login(s)", len(logins))
@@ -3511,6 +3517,7 @@ def _oauth_config_from_settings():
         allowed_redirect_hosts=frozenset(
             (_settings.oauth_allowed_redirect_hosts or "").split(",")
         ),
+        notify=telegram_notify,
     )
 
 

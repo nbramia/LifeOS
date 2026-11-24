@@ -4,7 +4,10 @@ Public endpoints (reachable wherever the MCP endpoint is):
 
 - `GET /.well-known/oauth-protected-resource[/mcp]` — RFC 9728 metadata.
 - `GET /.well-known/oauth-authorization-server` — RFC 8414 metadata.
-- `POST /oauth/register` — RFC 7591 dynamic client registration.
+- `POST /oauth/register` — RFC 7591 dynamic client registration, accepted only
+  while the operator has opened a registration window from the host
+  (`scripts/mcp_oauth.py open`). Every registration attempt and consent
+  decision sends the operator a Telegram notice.
 - `POST /oauth/token` — authorization-code (PKCE S256) and refresh grants.
 - `POST /oauth/revoke` — RFC 7009 revocation.
 
@@ -24,6 +27,10 @@ import base64
 import hmac
 import html
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from typing import Callable
 from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 from fastapi import FastAPI, Request
@@ -55,6 +62,70 @@ TIER_DESCRIPTION = (
     "reminders, memories and unsent email drafts. No sending, deleting, "
     "home-network control, agents, schedules, syncs or person edits."
 )
+
+
+NOTICE_PREFIX = "LifeOS connector:"
+REFUSAL_NOTICE_WINDOW_SECONDS = 600
+_NOTICE_NAME_MAX = 40
+_NOTICE_HOST_MAX = 60
+_NOTICE_DROPPED_CHARS = frozenset("`*_[]")
+REGISTRATION_CLOSED_ERROR = OAuthError(
+    "access_denied", "registration is closed; the operator opens it from the host", status=403,
+)
+
+
+def telegram_notify(text: str) -> None:
+    """Send an operator notice through the primary Telegram bot (blocking)."""
+    from api.services.telegram import send_message
+
+    send_message(text)
+
+
+def _notice_text(value: object, limit: int) -> str:
+    """A short, printable, Markdown-safe rendering of untrusted input, or `-`."""
+    if not isinstance(value, str):
+        return "-"
+    cleaned = "".join(ch for ch in value if ch.isprintable() and ch not in _NOTICE_DROPPED_CHARS)
+    return cleaned.strip()[:limit].strip() or "-"
+
+
+def _notice_host(redirect_uris: object) -> str:
+    if not isinstance(redirect_uris, list) or not redirect_uris or not isinstance(redirect_uris[0], str):
+        return "-"
+    try:
+        host = urlsplit(redirect_uris[0]).hostname
+    except ValueError:
+        return "-"
+    return _notice_text(host or "", _NOTICE_HOST_MAX)
+
+
+class _RefusalThrottle:
+    """Lets the first refused-registration notice through, then counts the rest.
+
+    Refused attempts inside `REFUSAL_NOTICE_WINDOW_SECONDS` of the last sent
+    notice are counted; the next one after the window sends and reports the count.
+    """
+
+    def __init__(self, clock: Callable[[], float]):
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._last_sent: float | None = None
+        self._suppressed = 0
+
+    def admit(self) -> str | None:
+        """Return the suffix to append when this refusal should be sent, else None."""
+        now = self._clock()
+        with self._lock:
+            if self._last_sent is not None and now - self._last_sent < REFUSAL_NOTICE_WINDOW_SECONDS:
+                self._suppressed += 1
+                return None
+            suffix = ""
+            if self._suppressed and self._last_sent is not None:
+                since = datetime.fromtimestamp(self._last_sent).strftime("%H:%M")
+                suffix = f" (+{self._suppressed} more refused since {since})"
+            self._last_sent = now
+            self._suppressed = 0
+            return suffix
 
 
 def is_loopback_peer(request: Request) -> bool:
@@ -179,6 +250,34 @@ async def _form(request: Request) -> dict:
 
 def install_oauth_routes(app: FastAPI, config: OAuthConfig, *, bearer_token: str) -> None:
     store = config.store
+    notice_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="oauth-notice")
+    refusal_throttle = _RefusalThrottle(store.now)
+
+    def _deliver(text: str) -> None:
+        try:
+            config.notify(text)  # type: ignore[misc]
+        except Exception:
+            logger.warning("mcp oauth: operator notice failed", exc_info=True)
+
+    def notify(text: str) -> None:
+        """Queue an operator notice; never blocks, raises or delays the response."""
+        if config.notify is None:
+            return
+        try:
+            notice_pool.submit(_deliver, text)
+        except Exception:
+            logger.warning("mcp oauth: operator notice not queued", exc_info=True)
+
+    app.state.oauth_notice_drain = lambda: notice_pool.submit(lambda: None).result(timeout=10)
+
+    def notify_refused(reason: str, name: object, redirect_uris: object) -> None:
+        suffix = refusal_throttle.admit()
+        if suffix is None:
+            return
+        notify(
+            f"{NOTICE_PREFIX} app registration refused ({reason}): "
+            f"\"{_notice_text(name, _NOTICE_NAME_MAX)}\", returns to {_notice_host(redirect_uris)}.{suffix}"
+        )
 
     def protected_resource_metadata() -> dict:
         return {
@@ -217,11 +316,25 @@ def install_oauth_routes(app: FastAPI, config: OAuthConfig, *, bearer_token: str
         try:
             metadata = await request.json()
         except Exception:
+            metadata = None
+        fields = metadata if isinstance(metadata, dict) else {}
+        name, uris = fields.get("client_name"), fields.get("redirect_uris")
+        if not store.registration_is_open():
+            notify_refused("registration closed", name, uris)
+            return _oauth_error_json(REGISTRATION_CLOSED_ERROR)
+        if metadata is None:
+            notify_refused("invalid request", name, uris)
             return _oauth_error_json(OAuthError("invalid_client_metadata", "body must be JSON"))
         try:
             info = store.register_client(metadata, allowed_redirect_hosts=config.allowed_redirect_hosts)
         except OAuthError as err:
+            notify_refused("invalid request", name, uris)
             return _oauth_error_json(err)
+        notify(
+            f"{NOTICE_PREFIX} new app registered: \"{_notice_text(info['client_name'], _NOTICE_NAME_MAX)}\", "
+            f"returns to {_notice_host(info['redirect_uris'])}. "
+            "Approve it only if you started this connection yourself in the last few minutes."
+        )
         return JSONResponse(info, status_code=201, headers=_NO_STORE)
 
     def _redirect_error(redirect_uri: str, state: str | None, error: str, description: str) -> RedirectResponse:
@@ -316,6 +429,12 @@ def install_oauth_routes(app: FastAPI, config: OAuthConfig, *, bearer_token: str
         if decided is None:
             return _refusal_page(400, "This approval request is invalid or has expired. Start again from the app.")
         pending, code = decided
+        app_row = store.get_client(pending["client_id"])
+        notify(
+            f"{NOTICE_PREFIX} app {'denied' if code is None else 'approved'}: "
+            f"\"{_notice_text(app_row['client_name'] if app_row else None, _NOTICE_NAME_MAX)}\", "
+            f"returns to {_notice_host([pending['redirect_uri']])}."
+        )
         if code is None:
             return _redirect_error(pending["redirect_uri"], pending["state"], "access_denied", "the operator denied access")
         target = _with_params(pending["redirect_uri"], {

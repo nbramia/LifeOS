@@ -162,6 +162,8 @@ class OAuthConfig:
     store: "OAuthStore"
     authorize_url: str = ""
     allowed_redirect_hosts: frozenset[str] = DEFAULT_ALLOWED_REDIRECT_HOSTS
+    # Operator notice sender (plain text in, nothing out). None sends nothing.
+    notify: Callable[[str], None] | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "issuer", self.issuer.rstrip("/"))
@@ -283,6 +285,10 @@ CREATE TABLE IF NOT EXISTS tokens (
     used_at REAL,
     revoked_at REAL
 );
+CREATE TABLE IF NOT EXISTS registration_window (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    open_until REAL NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_tokens_chain ON tokens(chain_id);
 CREATE INDEX IF NOT EXISTS idx_chains_client ON chains(client_id);
 """
@@ -303,6 +309,34 @@ class OAuthStore:
 
     def now(self) -> float:
         return self._clock()
+
+    # ── Registration window ────────────────────────────────────────────
+
+    def open_registration(self, seconds: float) -> float:
+        """Allow app registration until now + `seconds`. Returns the closing time."""
+        until = self.now() + seconds
+        with self._transaction() as conn:
+            conn.execute(
+                "INSERT INTO registration_window (id, open_until) VALUES (1, ?) "
+                "ON CONFLICT(id) DO UPDATE SET open_until = excluded.open_until",
+                (until,),
+            )
+        return until
+
+    def close_registration(self) -> None:
+        with self._transaction() as conn:
+            conn.execute("DELETE FROM registration_window WHERE id = 1")
+
+    def registration_open_until(self) -> float | None:
+        """The closing time of the open registration window, or None when it is closed."""
+        with self._connect() as conn:
+            row = conn.execute("SELECT open_until FROM registration_window WHERE id = 1").fetchone()
+        if row is None or row[0] <= self.now():
+            return None
+        return row[0]
+
+    def registration_is_open(self) -> bool:
+        return self.registration_open_until() is not None
 
     # ── Clients ────────────────────────────────────────────────────────
 
