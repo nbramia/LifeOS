@@ -30,7 +30,7 @@ logging.basicConfig(
     stream=sys.stderr
 )
 # httpx logs full request URLs at INFO and the Telegram Bot API puts the bot
-# token in the URL, so redact it before this process sends anything.
+# token in the URL, so this process redacts the token from its logs.
 from api.services.log_redaction import configure_telegram_log_redaction  # noqa: E402
 
 configure_telegram_log_redaction()
