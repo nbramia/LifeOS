@@ -39,6 +39,8 @@ MIN_OPENAI_NETWORKS = 10
 FETCH_TIMEOUT_SECONDS = 20.0
 FETCH_USER_AGENT = "Mozilla/5.0 (compatible; LifeOS)"
 TICK_SECONDS = 3600
+# While no ChatGPT list has loaded (first start, failed fetch), retry this often.
+EMPTY_RETRY_SECONDS = 300
 
 _Net = ipaddress.IPv4Network | ipaddress.IPv6Network
 
@@ -170,6 +172,8 @@ class PublicCallerFilter:
             ip = ipaddress.ip_address(addr)
         except ValueError:
             return "unknown"
+        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+            ip = ip.ipv4_mapped
         for label, nets in (
             ("anthropic", self._anthropic), ("openai", self._openai), ("extra", self._extra),
         ):
@@ -230,10 +234,15 @@ class PublicCallerFilter:
                 pass
             raise
 
+    def next_tick_seconds(self) -> int:
+        """Seconds until the next tick: soon while no ChatGPT list is loaded, else hourly."""
+        return EMPTY_RETRY_SECONDS if not self._openai else TICK_SECONDS
+
     def tick(self) -> None:
         """Refresh the list when due, then send the stale-list notice when due."""
         now = self._clock()
-        if self._last_refresh is None or now - self._last_refresh >= REFRESH_INTERVAL_SECONDS:
+        if (not self._openai or self._last_refresh is None
+                or now - self._last_refresh >= REFRESH_INTERVAL_SECONDS):
             self.refresh()
         self._check_stale()
 
@@ -268,7 +277,7 @@ class PublicCallerFilter:
                     self.tick()
                 except Exception:
                     logger.exception("ChatGPT address list refresher failed")
-                time.sleep(TICK_SECONDS)
+                time.sleep(self.next_tick_seconds())
 
         self._thread = threading.Thread(target=loop, name="mcp-public-callers", daemon=True)
         self._thread.start()

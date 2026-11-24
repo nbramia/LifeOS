@@ -199,14 +199,57 @@ def test_path_allowlist_404_comes_first(tmp_path, notices, clock):
     assert c.get("/consent", headers=xff(ANTHROPIC_IP)).status_code == 404
 
 
-def test_tcp_app_unaffected_in_enforce_mode(tmp_path, notices, clock):
-    make_filter("enforce", tmp_path, notices, clock)
-    tcp = mcp_server.build_http_app(mcp_server.LifeOSMCPServer(), bearer_token="tok")
-    r = TestClient(tcp).get("/health")
-    assert r.status_code != 403
-    r = TestClient(tcp).post("/mcp", headers={"Authorization": "Bearer tok"},
-                             json={"jsonrpc": "2.0", "id": 1, "method": "ping"})
-    assert r.status_code == 200
+def test_run_http_filters_only_the_public_listener(tmp_path, notices, clock, monkeypatch):
+    import uvicorn
+
+    filt = make_filter("enforce", tmp_path, notices, clock)
+    monkeypatch.setattr(filt, "start", lambda: None)
+    monkeypatch.setattr(mpc.PublicCallerFilter, "from_settings", classmethod(lambda cls, **kw: filt))
+    configs = []
+
+    class FakeServer:
+        def __init__(self, config):
+            configs.append(config)
+            self.started = True
+            self.should_exit = False
+
+        async def serve(self):
+            return None
+
+    monkeypatch.setattr(uvicorn, "Config", lambda app, **kw: {"app": app, **kw})
+    monkeypatch.setattr(uvicorn, "Server", FakeServer)
+    mcp_server.run_http(
+        mcp_server.LifeOSMCPServer(), "127.0.0.1", 0, "tok", uds=str(tmp_path / "s" / "mcp.sock"),
+    )
+    tcp = next(c["app"] for c in configs if not c.get("uds"))
+    public = next(c["app"] for c in configs if c.get("uds"))
+    ping = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+    bearer = {"Authorization": "Bearer tok"}
+    # The TCP listener (local and tailnet clients) never consults the filter.
+    assert TestClient(tcp).post("/mcp", headers={**bearer, **xff(OUTSIDE_IP)}, json=ping).status_code == 200
+    assert TestClient(tcp).post("/mcp", headers=bearer, json=ping).status_code == 200
+    # The public listener does.
+    assert TestClient(public).post("/mcp", headers={**bearer, **xff(OUTSIDE_IP)}, json=ping).status_code == 403
+
+
+def test_ipv4_mapped_ipv6_is_classified_as_its_ipv4(tmp_path, notices, clock):
+    filt = make_filter("enforce", tmp_path, notices, clock)
+    assert filt.classify(f"::ffff:{ANTHROPIC_IP}") == "anthropic"
+    assert filt.classify(f"::ffff:{OUTSIDE_IP}") == "outside"
+
+
+def test_empty_openai_list_is_retried_soon(tmp_path, notices, clock):
+    calls = []
+
+    def failing(url):
+        calls.append(url)
+        raise OSError("down")
+
+    filt = mpc.PublicCallerFilter("enforce", cache_path=tmp_path / "c.json", fetch=failing,
+                                  notify=notices.append, clock=clock)
+    assert filt.next_tick_seconds() == mpc.EMPTY_RETRY_SECONDS
+    filt.tick()
+    assert len(calls) == 1 and filt.next_tick_seconds() == mpc.EMPTY_RETRY_SECONDS
 
 
 # -- alerts -------------------------------------------------------------------
