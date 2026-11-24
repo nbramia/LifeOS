@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Platform
-> **Last Updated:** 2026-11-01
+> **Last Updated:** 2026-11-24
 
 The MCP HTTP transport (`mcp_server.py --transport http`) accepts two credentials on its MCP endpoint (`POST /mcp`, `POST /`):
 
@@ -19,7 +19,7 @@ OAuth is off unless `LIFEOS_OAUTH_OPERATOR_LOGINS` is non-empty and `LIFEOS_OAUT
 |---|---|---|
 | `GET /.well-known/oauth-protected-resource[/mcp]` | anyone | RFC 9728 metadata; `resource` is `<issuer>/mcp` |
 | `GET /.well-known/oauth-authorization-server` | anyone | RFC 8414 metadata; `code_challenge_methods_supported: ["S256"]`, `authorization_response_iss_parameter_supported: true` |
-| `POST /oauth/register` | anyone | RFC 7591 dynamic client registration (JSON) |
+| `POST /oauth/register` | anyone, while the registration window is open | RFC 7591 dynamic client registration (JSON); `403 access_denied` otherwise |
 | `GET`/`POST /oauth/authorize` | the operator, from the tailnet | Consent page and the approve/deny decision |
 | `POST /oauth/token` | registered clients | `authorization_code` and `refresh_token` grants (form-encoded) |
 | `POST /oauth/revoke` | registered clients | RFC 7009 revocation |
@@ -29,14 +29,16 @@ The bearer-authenticated `/mcp` may also be served to the tailnet only (see [Con
 
 An MCP request with no token, or an unknown, expired or revoked one, gets `401` with `WWW-Authenticate: Bearer resource_metadata="<issuer>/.well-known/oauth-protected-resource/mcp"` (plus `error="invalid_token"` when a token was presented).
 
-`scripts/mcp_oauth.py list|revoke <client_id>|prune` reads, revokes and prunes the store directly.
+`scripts/mcp_oauth.py open [DURATION]|close|list|revoke <client_id>|prune` opens and closes the registration window, and reads, revokes and prunes the store directly.
 
 ## Registration
 
 - Redirect URIs must be `https` on a host in `LIFEOS_OAUTH_ALLOWED_REDIRECT_HOSTS` (default `claude.ai`, `claude.com`, `chatgpt.com`; exact host match), or `http`/`https` on a loopback host (`127.0.0.1`, `localhost`, `::1`) on any port, with no fragment. They are pinned at registration; an `http` loopback URI matches on any port (RFC 8252 §7.3), every other URI matches exactly.
 - `token_endpoint_auth_method` is `none` (public client, the default when omitted), `client_secret_post` or `client_secret_basic`.
 - Client ID Metadata Documents are not supported, and the metadata does not advertise them, so Claude and ChatGPT fall back to registration.
-- Registration is unauthenticated. An unapproved registration is deleted 15 minutes after it was made (pruned on every registration and authorization request, and by `prune`); revoking an unapproved client deletes it. At 5,000 unapproved registrations, a new one evicts the oldest. A registration with a live consent or an unexpired, unused code is never pruned or evicted, and registration is refused (`429`) only when every slot is protected that way. The consent page names only the client of its own authorization request, so registration spam neither locks out nor confuses a real app.
+- Registration is closed by default. The operator opens a window from the host with `scripts/mcp_oauth.py open [DURATION]` (`90s`, `10m`, `1h`; default 10 minutes, at most 1 hour) and `close` ends it early. The window is one expiry time in the OAuth store (`registration_window`), so it works whether or not the transport is running, and it stays open until it expires or is closed, so an app that registers twice in a row succeeds both times. While it is closed, `POST /oauth/register` answers `403 access_denied` with a generic message and creates nothing. Authorization, token, refresh and revoke are unaffected, so an approved app keeps working and can consent again without registering.
+- Operator notices. The MCP HTTP process sends a Telegram message through the primary bot (logged in the bot-notices log with source `LifeOS/mcp_oauth_http`) for every registration, refused registration and consent decision. Each starts with `LifeOS connector:` and names the app and the host of its first redirect URI, never a secret, token, code, login or address. App names and hosts from untrusted input keep only printable characters, drop Markdown-special characters and are capped at 40 characters. Notices of refused registrations are throttled: the first is sent at once, further ones in the next 10 minutes are counted, and the next one after that carries `(+N more refused since HH:MM)`. Successful registrations and consent decisions are never throttled. Sending runs on a worker thread, so a slow or failing Telegram never delays or fails a request.
+- An unapproved registration is deleted 15 minutes after it was made (pruned on every registration and authorization request, and by `prune`); revoking an unapproved client deletes it. At 5,000 unapproved registrations, a new one evicts the oldest. A registration with a live consent or an unexpired, unused code is never pruned or evicted, and registration is refused (`429`) only when every slot is protected that way. The consent page names only the client of its own authorization request, so registration spam neither locks out nor confuses a real app.
 
 ## Consent
 

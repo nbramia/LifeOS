@@ -1,7 +1,7 @@
 # Connected Apps (Claude, ChatGPT)
 
 **Status:** Complete
-**Last Updated:** 2026-11-01
+**Last Updated:** 2026-11-24
 **Audience:** Operator
 
 The Claude and ChatGPT apps can use LifeOS as a custom connector. Their servers reach the MCP HTTP transport through a small, separate Tailscale node, running in its own container, whose port 443 is public (Funnel). Each app is approved once, on a consent page that only the operator's own tailnet devices can open. A connected app gets the restricted "read + safe writes" tool tier, never the full catalog.
@@ -66,6 +66,14 @@ The container restarts with Docker, and its login lives in `LIFEOS_MCP_FUNNEL_ST
 
 The connector URL is `https://lifeos-mcp.<tailnet>.ts.net/mcp`.
 
+An app can register only while a registration window is open, so open one from the host first (it closes by itself after 10 minutes by default):
+
+```bash
+~/.venvs/lifeos/bin/python scripts/mcp_oauth.py open        # or: open 90s, open 1h (at most 1h)
+```
+
+Telegram then tells you about each registration and each approve or deny, so approve only an app you just started connecting yourself.
+
 - **Claude** (web, desktop or mobile): Settings → Connectors → Add custom connector. Paste the URL; leave the OAuth client fields empty.
 - **ChatGPT** (on chatgpt.com): turn on Developer mode (Settings → Security and login, or Settings → Apps → Advanced settings). Then on the Plugins page, the **+** button → Create MCP App, with the URL as the connection. Add it to a conversation from the tools menu.
 
@@ -76,11 +84,13 @@ Apps decide on their own when to call a tool, from the tool descriptions and the
 ## See and revoke connected apps
 
 ```bash
-~/.venvs/lifeos/bin/python scripts/mcp_oauth.py list
+~/.venvs/lifeos/bin/python scripts/mcp_oauth.py list      # first line: Registration: closed | open until <time>
 ~/.venvs/lifeos/bin/python scripts/mcp_oauth.py revoke <client_id>
+~/.venvs/lifeos/bin/python scripts/mcp_oauth.py open      # allow new apps to register
+~/.venvs/lifeos/bin/python scripts/mcp_oauth.py close     # end the window early
 ```
 
-Revoking deletes the app's registration and tokens at once; to reconnect, the app registers again and is approved again. Removing the connector inside the app does not revoke anything on the LifeOS side.
+Revoking deletes the app's registration and tokens at once; to reconnect, open a registration window, and the app registers again and is approved again. Removing the connector inside the app does not revoke anything on the LifeOS side.
 
 ## Turn it off
 
@@ -174,6 +184,7 @@ The app can then claim an unassigned task, update and complete its own or yours,
 |---|---|
 | The app says no server responds at the URL | The URL is not on port 443 of the public node, or the node is down; `./scripts/mcp-funnel-node.sh check` and `docker ps -a --filter name=lifeos-mcp-funnel` tell which. |
 | A public request from the LifeOS host itself fails the TLS handshake | A machine cannot reach its own Funnel address. Test from a device off the tailnet. |
+| The app fails to add the connector with a registration error | The registration window is closed. Run `scripts/mcp_oauth.py open`, then add the connector again. |
 | Consent page returns `403` | The device is off the tailnet, signed in as another login, or reached the page through a public address. |
 | The app says the server needs authentication but never shows the consent page | `LIFEOS_OAUTH_ISSUER_URL` or `LIFEOS_OAUTH_AUTHORIZE_URL` names the wrong host or port; check `/.well-known/oauth-authorization-server`. |
 | Telegram alert: the public MCP node is logged out | Run `./scripts/mcp-funnel-node.sh login`, approve, then `apply`. `logs/infra-watchdog.log` shows each check. |
