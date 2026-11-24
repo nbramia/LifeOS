@@ -84,6 +84,20 @@ A **chain** is everything issued from one code exchange. Revoking a token (RFC 7
 
 `search` and `fetch` exist only for OAuth requests. `search` (`{query}`) runs vault search and returns `{results: [{id, title, url, text}]}`, one per vault document, where `id` is the vault-relative path and `url` an `obsidian://` link. `fetch` (`{id}`) returns `{id, title, text, url, metadata}` for a document an earlier search by the same OAuth client returned in the same process, re-checked to resolve inside the vault. Both results carry the JSON as text content and as `structuredContent`.
 
+## Public caller filter
+
+`public_socket_app` can check every request on the public listener against the Claude and ChatGPT apps' published address ranges (`api/services/mcp_public_callers.py`). It runs after the path allowlist, for HTTP and websocket requests, and never on the TCP listener. `LIFEOS_MCP_PUBLIC_CALLERS` selects `off`, `report` or `enforce`; `LIFEOS_MCP_PUBLIC_CALLER_EXTRA_RANGES` adds CIDRs.
+
+- **Caller address.** Tailscale Serve sets `X-Forwarded-For` to the TCP source address it saw and strips any incoming value. The filter takes the last comma-separated entry and parses it as an IP address; anything unparsable, or a missing header, is `unknown`.
+- **Ranges.** Anthropic: `160.79.104.0/21` and `153.61.208.0/20`, from the "Outbound IP addresses" section of https://platform.claude.com/docs/en/api/ip-addresses. OpenAI: the `ipv4Prefix` and `ipv6Prefix` entries of `LIFEOS_MCP_PUBLIC_CALLER_OPENAI_URL` (default `https://openai.com/chatgpt-connectors.json`), cached at `chatgpt-connectors.json` beside `mcp_oauth.db`. The cache loads at start; a daemon thread refetches it when it is missing or older than 12 hours, then every 12 hours. A fetched file replaces the list only when it parses and holds at least 10 networks, and the cache is written atomically.
+- **Report.** Admits everything and logs `mcp public caller: mode=report provider=<p> path=<path>`, with ` addr=<ip>` appended for `outside` and `unknown`.
+- **Enforce.** `anthropic`, `openai` and `extra` pass silently. `outside` and `unknown` get `403` with body `Forbidden` (a websocket is closed) and a WARNING `mcp public caller refused: provider=<p> addr=<ip> path=<path>`.
+- **Notices** go to Telegram off the event loop:
+  - Stale list (mode not `off`, at most once per 24 hours): `LifeOS connector: the ChatGPT address list has not refreshed for <N> days; ChatGPT calls may be refused if its addresses changed.`, or `has never loaded` in place of `has not refreshed for <N> days`, when the last successful refresh is over 3 days old or absent.
+  - Refused credentials (enforce, at most once per hour, when a refused request carries an `Authorization` header or targets `/oauth/token`): `LifeOS connector: refused a call carrying app credentials from <ip>, outside the Anthropic and OpenAI ranges. If Claude or ChatGPT stopped reaching LifeOS, set LIFEOS_MCP_PUBLIC_CALLERS=report and restart lifeos-mcp-http.` Header values never appear in a notice.
+
+Operator steps are in [Connected Apps](../../guides/mcp-connected-apps.md#limit-public-callers-to-claude-and-chatgpt).
+
 ## Residual risks
 
 - **Local-writer races.** The task-context containment check and `fetch`'s inside-the-vault check resolve paths and then open them. A process on the host that swaps a context file or vault document for a symlink between the check and the open can redirect that one write or read. That needs a concurrent local filesystem writer; an OAuth caller cannot cause one.

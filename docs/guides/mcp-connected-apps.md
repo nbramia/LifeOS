@@ -97,6 +97,30 @@ Revoking deletes the app's registration and tokens at once; to reconnect, open a
 - **Close public access:** set `LIFEOS_MCP_FUNNEL_NODE=false`, then `docker rm -f lifeos-mcp-funnel`. The node goes offline, so nothing is public. Running `docker exec lifeos-mcp-funnel tailscale logout` first also removes it from the tailnet.
 - **Disable OAuth entirely:** empty `LIFEOS_OAUTH_OPERATOR_LOGINS` and restart `lifeos-mcp-http`. Every OAuth endpoint then returns `404`, and issued tokens stop working.
 
+## Limit public callers to Claude and ChatGPT
+
+The public route cannot tell who is calling, so the public listener can check each caller's address against the ranges the Claude and ChatGPT apps publish. Only the public route is checked. Local agents and tailnet clients reach the TCP listener on `127.0.0.1` and never pass through it.
+
+`LIFEOS_MCP_PUBLIC_CALLERS` sets the mode:
+
+- `off` (default): no check.
+- `report`: every request is admitted, and each one is logged with the provider its address belongs to (`anthropic`, `openai`, `extra`, `outside` or `unknown`).
+- `enforce`: callers in the Anthropic, ChatGPT or extra ranges are admitted; any other caller gets `403 Forbidden`.
+
+Any other value behaves as `off` and logs a warning at startup.
+
+Start in `report`, use each app for a while, and confirm its calls classify as the right provider:
+
+```bash
+grep 'mcp public caller' logs/mcp-http.log
+```
+
+Switch to `enforce` once real app calls show `provider=anthropic` or `provider=openai`. Log lines for `outside` and `unknown` carry the address.
+
+`LIFEOS_MCP_PUBLIC_CALLER_EXTRA_RANGES` takes comma-separated CIDRs that are admitted as well; invalid entries are skipped with a warning. `LIFEOS_MCP_PUBLIC_CALLER_OPENAI_URL` names where the ChatGPT address list is fetched from.
+
+Roll back by setting `LIFEOS_MCP_PUBLIC_CALLERS=report` (or `off`) in `.env`, then `sudo systemctl restart lifeos-mcp-http`.
+
 ## Tailnet route for your own clients
 
 The OAuth connected-apps endpoint above remains the route for the Claude and ChatGPT apps. For the operator's own tailnet clients (for example Muse), the same MCP transport can also be served to the tailnet only, authenticated by the full-access bearer token (`LIFEOS_MCP_BEARER_TOKEN`). A bearer client lists and calls the whole curated catalog, not the connected-app tier, including the tools that start agent-worker execution. The token is therefore accepted only from the host and the tailnet: a request that arrives through the public listener, Tailscale Funnel or Cloudflare Tunnel needs an OAuth token and gets `401` with the bearer token, and the consent page and connected-apps endpoints are likewise unavailable through those edges (`LIFEOS_MCP_ALLOW_PUBLIC_BEARER` relaxes the `/mcp` rule; see [Configuration](configuration.md#mcp-http-transport)).

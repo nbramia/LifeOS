@@ -862,6 +862,24 @@ class Settings(BaseSettings):
                     "connected-app tier. Host tools, lifeos_agent_* tools, lifeos_task_update and "
                     "unknown names grant nothing, nor does a malformed pair."
     )
+    mcp_public_callers: str = Field(
+        default="off",
+        alias="LIFEOS_MCP_PUBLIC_CALLERS",
+        description="Caller filter on the public MCP listener: off, report (log each caller's "
+                    "provider, admit all) or enforce (refuse callers outside the Claude and "
+                    "ChatGPT apps' published address ranges). Any other value behaves as off."
+    )
+    mcp_public_caller_extra_ranges: str = Field(
+        default="",
+        alias="LIFEOS_MCP_PUBLIC_CALLER_EXTRA_RANGES",
+        description="Comma-separated CIDRs the public caller filter also admits. Invalid "
+                    "entries are skipped with a warning."
+    )
+    mcp_public_caller_openai_url: str = Field(
+        default="https://openai.com/chatgpt-connectors.json",
+        alias="LIFEOS_MCP_PUBLIC_CALLER_OPENAI_URL",
+        description="Where the public caller filter fetches the ChatGPT connector address list."
+    )
     mcp_agent_tokens: str = Field(
         default="",
         alias="LIFEOS_MCP_AGENT_TOKENS",
