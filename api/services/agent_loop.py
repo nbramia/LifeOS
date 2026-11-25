@@ -493,6 +493,7 @@ async def run_agent_loop(
     force_remote: bool = False,
     persona_id: str = "",
     user_message: str = "",
+    conversation_id: str = "",
 ) -> AsyncGenerator[dict, None]:
     """
     Async generator that runs the agentic chat loop.
@@ -531,7 +532,12 @@ async def run_agent_loop(
             follow-up expansion. Passed through to tool execution so a
             journal-turn `manage_tasks` create can keep only the tags and
             fields the operator actually typed, stripping ones the model
-            invented.
+            invented, and judged by the agent-task approval gate, which lets
+            a task that would start an agent run only when this message asked
+            for agent work (`agent_task_approval`).
+        conversation_id: The conversation this turn belongs to. A task parked
+            for approval records it, so an operator's go-ahead releases it
+            only in a later turn of the same conversation.
 
     Yields:
         Dicts with "type" key: "turn_state" (first event -- a live
@@ -707,6 +713,10 @@ async def run_agent_loop(
     # persona, which keeps `_journal_filter_task_create_input`'s stripping
     # behavior unchanged.
     journal_created_task_ids: set | None = set() if persona_id == JOURNAL_PERSONA_ID else None
+    # One agent-approval turn per call: the operator's message is judged at
+    # most once, and ids parked this turn cannot be released in it.
+    from api.services.agent_task_approval import ApprovalTurn
+    approval_turn = ApprovalTurn(user_message, conversation_id=conversation_id, persona_id=persona_id)
     # (task, start_monotonic, round_num) for every in-loop shadow call
     # fired this turn -- awaited together, capped, just before the final
     # "result" event below on the happy path. Everything from here to that
@@ -847,6 +857,7 @@ async def run_agent_loop(
                     tool_result_str = await execute_tool_parallel(
                         name, block.input, persona_id=persona_id, user_message=user_message,
                         created_task_ids=journal_created_task_ids,
+                        approval_turn=approval_turn,
                     )
                     # str() defensively -- execute_tool_parallel's contract is
                     # always a str, but a non-str result must not raise here.

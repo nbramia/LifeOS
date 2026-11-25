@@ -210,11 +210,10 @@ def _forbidden_tag(tag: str) -> bool:
 def _rendered_tags(arguments: dict) -> set[str]:
     """Every tag the task store would read back from this task once written.
 
-    Renders the would-be task block with the task store's own formatter,
-    re-parses the task line with its own parser, and also scans every
-    rendered line, raw and NFKC-normalized, with the store's tag pattern —
-    so a tag smuggled inside another tag, a text field or a notes line is
-    seen exactly as the store and the worker will see it.
+    `task_manager.rendered_tags` renders the would-be task block with the
+    store's own formatter and parser, so a tag smuggled inside another tag,
+    a text field or a notes line is seen exactly as the store and the worker
+    will see it. The context and operation key are scanned as well.
     """
     from api.services import task_manager as tm
 
@@ -228,13 +227,9 @@ def _rendered_tags(arguments: dict) -> set[str]:
         tags=list(arguments.get("tags") or []),
         notes=arguments.get("notes"),
     )
-    lines = tm._format_task_block(task)
-    found: set[str] = set()
-    parsed = tm._parse_task_line(lines[0], "Inbox.md", 1)
-    if parsed is not None:
-        found.update(parsed.tags)
+    found = tm.rendered_tags(task)
     extra_text = [arguments.get("context") or "", arguments.get("operation_key") or ""]
-    for line in [*lines, *extra_text]:
+    for line in extra_text:
         for variant in (line, unicodedata.normalize("NFKC", line)):
             found.update(tm._TAG_RE.findall(variant))
     return found

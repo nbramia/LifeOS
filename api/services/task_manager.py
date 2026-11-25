@@ -2319,6 +2319,29 @@ def _format_task_block(task: Task) -> list[str]:
     return lines
 
 
+def rendered_tags(task: Task) -> set[str]:
+    """Every tag the task store would read back from `task` once written.
+
+    Renders the task block with the store's own formatter, re-parses the
+    task line with its own parser, and also scans every rendered line, raw
+    and NFKC-normalized, with the store's tag pattern. A tag carried inside
+    the description, a field value or a notes line is therefore seen
+    exactly as the store, and the worker reading the store, will see it.
+    Tags come back as written (case kept, no leading `#`).
+    """
+    import unicodedata
+
+    lines = _format_task_block(task)
+    found: set[str] = set()
+    parsed = _parse_task_line(lines[0], task.source_file or "Inbox.md", 1)
+    if parsed is not None:
+        found.update(t.lstrip("#") for t in parsed.tags)
+    for line in lines:
+        for variant in (line, unicodedata.normalize("NFKC", line)):
+            found.update(_TAG_RE.findall(variant))
+    return found
+
+
 def _parse_task_line(line: str, file_path: str, line_num: int) -> Optional[Task]:
     """Parse one checkbox line into a Task, or None if not a checkbox line.
 

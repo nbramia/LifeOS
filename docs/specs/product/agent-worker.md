@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-09-22
+> **Last Updated:** 2026-11-25
 
 LifeOS includes an external **agent worker** that picks up engine-assigned tasks and completes them autonomously — running locally on a self-hosted LLM or on Anthropic's Managed Agents cloud, with budget caps you can specify in the task title and full audit transcripts on every run. When the agent finishes (or gets stuck), it notifies you on Telegram. If it has a question mid-run, it asks via Telegram and waits for your reply.
 
@@ -19,10 +19,11 @@ The point is hands-free task completion for the long tail of small chores that a
 5. [Budgets](#budgets)
 6. [Tag lifecycle](#tag-lifecycle)
 7. [Telegram interactions](#telegram-interactions)
-8. [Capability boundaries](#capability-boundaries)
-9. [Safety model](#safety-model)
-10. [Configuration knobs](#configuration-knobs)
-11. [Related Documents](#related-documents)
+8. [Approval for agent work created in chat](#approval-for-agent-work-created-in-chat)
+9. [Capability boundaries](#capability-boundaries)
+10. [Safety model](#safety-model)
+11. [Configuration knobs](#configuration-knobs)
+12. [Related Documents](#related-documents)
 
 ---
 
@@ -311,6 +312,35 @@ Default clarification timeout is 72 hours (`LIFEOS_AGENT_CLARIFICATION_TIMEOUT_H
 
 ---
 
+## Approval for agent work created in chat
+
+The chat orchestrator (web chat, the Telegram bots, voice, and `prompt` schedules) can file tasks, so it could hand work to the worker. A chat tool call that would start an agent goes ahead only when **your own message for that turn asked for agent work**. Otherwise the task is saved parked and you are asked.
+
+**What counts as starting an agent.** The task store's own reading of the task decides, so a tag counts wherever the store would find it: the tag list, the title, a notes line or a field value. Covered from chat:
+
+- creating a task, or a sub-task, that carries `#agent` or an engine tag (`#claude`, `#codex`, `#hermes`, `#local`, `#cloud`, `#cloud-haiku`, `#cloud-sonnet`) with a todo or urgent status;
+- an update that assigns an engine, reopens such a task, or rewrites the title, notes, tags or fields of a task already queued for an agent (changing only its priority, due date or status between todo and urgent needs nothing);
+- `resume_execution` on an engine-assigned task, and `plan_project`, which starts a project's agent owner. **Start** on a project starts no agent and is not gated.
+
+**What counts as asking for agent work.** Only the text you typed for the turn is judged. Search results, emails, documents, memories and the assistant's earlier replies are never part of it, so content that says "create a claude task" cannot make a turn explicit. Your message is explicit when it:
+
+- contains an engine or `#agent` tag you typed, not negated ("create a #claude task to fix the parser", but not "don't make a #claude task");
+- hands work to an engine in so many words: "use codex to add the tests", "fix the login redirect with claude code", "have Claude fix the parser", "get codex to write tests", "start an agent to clean up my downloads", "delegate this to codex", "assign the parser bug to claude";
+- or, when Jev is configured, is judged by Jev to ask for work to be handed to an agent ("could you put our coding helper on the CSV bug"). Jev sees only your message.
+
+Anything else is not explicit, including "summarise my email" when the email asks for an agent, questions about agents ("should I have claude fix it?"), and every turn where Jev is unavailable and no literal wording matched.
+
+**Parked.** A parked task has status `blocked` (it shows in the board's Human queue lane, and the worker never claims it) and the fields `agent_approval:: pending` and `agent_approval_id`. A held `plan_project` or `resume_execution` does not run; its task gets the same fields. You can approve in either of two ways:
+
+- **In the conversation.** The assistant tells you what the task is and asks. If your next message in the same conversation is a plain go-ahead ("yes", "go ahead", "do it", "approved"), it releases the task. A go-ahead in the same turn that parked it, in another conversation, or with conditions ("yes but only the first one") does not release it. An explicit request ("have claude run the import") releases it from any turn.
+- **On Telegram.** The primary bot sends the exact task, with its notes, and **Approve** / **Deny** buttons. Approve releases that one task to its engine, or runs the held project action. Deny keeps it parked. Each request is spent on first use, and editing a parked task's title, notes, tags or fields from chat sends a new request and voids the old buttons, so an approval only releases the text you saw. The buttons are answered by the primary bot's listener; with `TELEGRAM_PRIMARY_LISTENER_ENABLED=false` they do nothing, and you approve in the conversation or on the board.
+
+You can also release a parked task yourself: drag it to Assigned on the board, or change `[?]` back to `[ ]` in Obsidian.
+
+Not covered by this approval: tasks you write in Obsidian or on the board, calls from your own scripts to the task API, sub-tasks an already running agent session creates, and the explicit handoffs that read your message directly (`/agent`, the model picker's Claude Code choice, "use codex ..."), which are your own requests by construction. Connected apps cannot set engine tags at all ([mcp-oauth.md](../technical/mcp-oauth.md)).
+
+---
+
 ## Capability boundaries
 
 ### What the agent can do
@@ -324,7 +354,7 @@ Default clarification timeout is 72 hours (`LIFEOS_AGENT_CLARIFICATION_TIMEOUT_H
 
 ### What the agent can't do
 
-- Make decisions you didn't authorize — every task starts from a tag you wrote
+- Make decisions you didn't authorize — every task starts from a tag you wrote, and one the chat assistant files waits for your approval unless you asked for agent work
 - Charge you beyond your configured budgets — both per-task and daily caps enforced externally
 - Run without your knowing — every run lands a Telegram message
 - Persist state beyond the worker's SQLite (sessions, transcripts, daily spend ledger)

@@ -1334,6 +1334,7 @@ async def ask_stream(request: AskStreamRequest):
                     force_remote=force_remote,
                     persona_id=_effective_pid or "",
                     user_message=request.question,
+                    conversation_id=conversation_id or "",
                 ):
                     if event["type"] == "turn_state":
                         # Live, mutable AgentResult -- see the comment by

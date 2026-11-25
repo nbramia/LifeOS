@@ -1202,6 +1202,10 @@ async def execute_tool(name: str, tool_input: dict) -> str:
     Sync handlers are run in a thread pool so they don't block the event loop
     and can execute truly in parallel via asyncio.gather.
     """
+    if name == "manage_tasks":
+        # Task writes always pass the agent-approval gate; with no operator
+        # message here, agent work is parked for approval.
+        return await execute_tool_parallel(name, tool_input)
     try:
         handler = _TOOL_HANDLERS.get(name)
         if not handler:
@@ -1375,7 +1379,7 @@ def _journal_created_task_id(result: str) -> Optional[str]:
 
 async def execute_tool_parallel(
     name: str, tool_input: dict, *, persona_id: str = "", user_message: str = "",
-    created_task_ids: Optional[set] = None,
+    created_task_ids: Optional[set] = None, approval_turn=None,
 ) -> str:
     """Like execute_tool but runs sync handlers in a thread to avoid blocking the event loop.
 
@@ -1387,12 +1391,28 @@ async def execute_tool_parallel(
         passes nothing, which keeps today's stripping behavior exactly.
         Tool calls within one round run in parallel, so a parent created
         this round is only visible to a child call in a later round.
+    approval_turn: the turn's `agent_task_approval.ApprovalTurn` (the
+        operator's own message and the conversation). Every `manage_tasks`
+        call passes its gate: a call that would start agent work runs only
+        when the operator asked for agent work, and is otherwise parked for
+        approval. Without one, a turn is built from `user_message`.
     """
     try:
         if persona_id == JOURNAL_PERSONA_ID:
             tool_input, gate_error = _journal_tool_gate(name, tool_input, user_message, created_task_ids)
             if gate_error:
                 return gate_error
+        task_gate = None
+        if name == "manage_tasks":
+            from api.services import agent_task_approval
+            if approval_turn is None:
+                approval_turn = agent_task_approval.ApprovalTurn(user_message, persona_id=persona_id)
+            task_gate = await asyncio.to_thread(
+                agent_task_approval.check_manage_tasks, tool_input, approval_turn,
+            )
+            if task_gate.refusal is not None:
+                return task_gate.refusal
+            tool_input = task_gate.tool_input
         handler = _TOOL_HANDLERS.get(name)
         if not handler:
             return f"Error: Unknown tool '{name}'"
@@ -1402,6 +1422,10 @@ async def execute_tool_parallel(
             result = handler(tool_input)
         if asyncio.iscoroutine(result):
             result = await result
+        if task_gate is not None and task_gate.park_token:
+            result = await asyncio.to_thread(
+                agent_task_approval.finish_park, task_gate, result, approval_turn,
+            )
         if (
             created_task_ids is not None
             and persona_id == JOURNAL_PERSONA_ID
