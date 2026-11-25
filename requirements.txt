@@ -44,7 +44,7 @@ pytest==9.0.2
 pytest-asyncio==1.3.0
 pytest-xdist==3.8.0  # Parallel test execution
 pytest-playwright==0.7.2  # Browser-based UI tests; tests/conftest.py overrides its fixtures by exact signature
-playwright==1.58.0
+playwright>=1.40.0  # unpinned: the browser build must match the CI runner image
 httpx==0.28.1
 Pillow==12.3.0  # Avatar face crops (api/services/profile_crop.py); image assertions in web manifest tests
 
