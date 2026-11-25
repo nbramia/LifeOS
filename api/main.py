@@ -54,6 +54,7 @@ import socket
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from email.utils import formatdate
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -66,6 +67,7 @@ from fastapi.responses import FileResponse
 from api.routes import search, ask, calendar, gmail, drive, people, chat, briefings, admin, conversations, memories, imessage, crm, slack, photos, reminders, scheduler, tasks, monarch, investments, jobs, perf, agents, agent_assignment, vault, fitness, voice, agent_proxy, hermes_proxy, journal, journal_trends, journal_ingest, home
 from api.services.log_redaction import configure_telegram_log_redaction, install_query_string_redaction_filter
 from api.services.route_timing import RouteTimingMiddleware
+from api.services.request_origin import RequestOriginMiddleware, TrustedOrigins
 from api.services.runtime_identity import capture_runtime_identity, publish_runtime_identity
 from config.settings import settings
 
@@ -423,6 +425,18 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+)
+
+# State-changing requests that a browser marks as coming from another site are
+# refused (api/services/request_origin.py). Same-origin UI requests and clients
+# that are not browsers are unaffected.
+_tailnet_host = urlsplit(settings.tailnet_https_url).hostname if settings.tailnet_https_url else None
+app.add_middleware(
+    RequestOriginMiddleware,
+    trusted=TrustedOrigins(
+        [*_cors_origins, *(settings.api_trusted_origins or "").split(",")],
+        hosts_any_port=[h for h in (_tailnet_host, socket.gethostname()) if h],
+    ),
 )
 
 
