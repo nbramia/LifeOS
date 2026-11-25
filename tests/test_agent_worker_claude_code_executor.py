@@ -186,11 +186,20 @@ def _seed_session(store: SessionStore, *, task_id: str = "task-1"):
     )
 
 
+def _seed_parent(store: SessionStore, routing: str = "claude_code"):
+    return store.get_by_session_id("sess_parent") or store.create(
+        task_id="parent-task", session_id="sess_parent", routing=routing,
+        origin="operator", status="running",
+    )
+
+
 def _seed_child_session(
     store: SessionStore, *, task_id: str = "child-1", claude_code_model: str | None = None,
 ):
     """A claude_code session spawned by another agent — has a parent, so it
-    reports back to that parent rather than streaming to the operator."""
+    reports back to that parent rather than streaming to the operator. The
+    parent is a top-level Claude Code session, so the child's tools match it."""
+    _seed_parent(store)
     return store.create(
         task_id=task_id,
         routing="claude_code",

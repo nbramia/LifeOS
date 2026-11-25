@@ -56,6 +56,10 @@ from api.services.agent_worker.remote_spawn import (
     resolve_host_target,
 )
 from api.services.agent_worker.remote_spawn import api_host_name as _api_host_name
+from api.services.agent_worker.session_capabilities import (
+    codex_disabled_servers,
+    effective_for_executor,
+)
 from api.services.agent_worker.session_store import (
     STATUS_BLOCKED,
     STATUS_COMPLETED,
@@ -88,7 +92,7 @@ def _delegation_header(
     session_id: str, attempt_id: str | None = None, turn_id: str | None = None,
 ) -> str:
     """Per-session preamble line telling Codex its LifeOS session id and how to
-    hand off work it can't do (e.g. browser automation) to another engine."""
+    hand work to a child session."""
     identity = (
         f"\nlifeos_session_id={session_id}; lifeos_attempt_id={attempt_id}; "
         f"lifeos_turn_id={turn_id}."
@@ -96,11 +100,11 @@ def _delegation_header(
     )
     return "=== YOUR SESSION ===\n" + delegation_preamble(
         session_id,
-        trigger=(
-            "If a task needs a capability you lack — e.g. browser/GUI "
-            "automation you can't perform headlessly —"
+        trigger="To run background work in parallel,",
+        model=(
+            '"claude_code" for the Claude Code CLI (a child gets only the MCP '
+            'servers you have, and no Claude in Chrome)'
         ),
-        model='"claude_code" for the browser-enabled Claude Code CLI',
     ) + "\n\n" + PROJECT_TASK_GUIDANCE + identity
 
 
@@ -243,8 +247,8 @@ class CodexExecutor:
         self._warn_if_mcp_missing()
         # Prepend the LifeOS capabilities briefing so the fresh Codex turn has
         # the same situational awareness as the managed/local routes, plus a
-        # per-session delegation header so the agent can hand off work it can't
-        # do (e.g. browser automation → a claude_code child), and — only when
+        # per-session delegation header so the agent can hand work to a child
+        # session, and — only when
         # `working_dir` is a worker-provisioned worktree — the git-discipline
         # instructions. Only on the opening turn — resume() reloads the
         # thread, which already carries this from the first prompt.
@@ -301,6 +305,7 @@ class CodexExecutor:
         model: Optional[str] = None,
         effort: Optional[str] = None,
         is_remote: bool = False,
+        disabled_mcp_servers: tuple[str, ...] = (),
     ) -> list[str]:
         binary = self._binary_resolver()
         # `workspace-write` lets codex edit files inside the working dir
@@ -356,6 +361,10 @@ class CodexExecutor:
                     "mcp_servers.lifeos.env_vars=" + json.dumps(merged_env_vars),
                     *common,
                 ]
+        # A child whose creator lacks some of Codex's configured MCP servers
+        # runs with those servers switched off.
+        for name in disabled_mcp_servers:
+            common = ["-c", f"mcp_servers.{name}.enabled=false", *common]
         if resume_session_id:
             return [binary, "exec", "resume", resume_session_id, *common, prompt]
         return [binary, "exec", *common, prompt]
@@ -515,6 +524,19 @@ class CodexExecutor:
         if target is not None:
             is_remote = True
 
+        capabilities = effective_for_executor(self.session_store, session)
+        disabled_mcp_servers = tuple(codex_disabled_servers(capabilities))
+        refusal = None
+        if not capabilities.host_shell:
+            refusal = "the session that started this one has no host shell"
+        elif is_remote and disabled_mcp_servers:
+            # The disabled set is computed from this machine's Codex config.
+            refusal = "a session with restricted MCP servers runs only on the API host"
+        if refusal:
+            self.transcript_store.append(sid, "capability_refused", {"route": "codex", "host": host})
+            self._cleanup_tempfile(last_msg_path)
+            return ExecutorOutcome(status=STATUS_FAILED, reason=refusal)
+
         command_working_dir = working_dir
         if command_working_dir is None and not is_remote:
             command_working_dir = os.getcwd()
@@ -523,6 +545,7 @@ class CodexExecutor:
             model=getattr(session, "model", None),
             effort=getattr(session, "effort", None),
             is_remote=is_remote,
+            disabled_mcp_servers=disabled_mcp_servers,
         )
 
         if target is not None:
@@ -536,12 +559,15 @@ class CodexExecutor:
                 ).items() if key in {"TMPDIR", "TMP", "TEMP", "LIFEOS_AGENT_ATTEMPT_ID", "LIFEOS_AGENT_TURN_ID"}},
             )
 
-        self.transcript_store.append(sid, "codex_spawn", {
+        spawn_event = {
             "resume": bool(resume_session_id),
             "working_dir": command_working_dir,
             "host": host,
             "remote": is_remote,
-        })
+        }
+        if disabled_mcp_servers:
+            spawn_event["disabled_mcp_servers"] = list(disabled_mcp_servers)
+        self.transcript_store.append(sid, "codex_spawn", spawn_event)
 
         try:
             proc = self._spawn_fn(

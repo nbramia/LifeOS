@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-09-22
+> **Last Updated:** 2026-11-25
 
 Engineering view of the agent worker — the stand-alone process that consumes engine-assigned tasks and runs them on either a local LLM or Anthropic Managed Agents. For consumer-facing behavior, see [product/agent-worker.md](../product/agent-worker.md). For operator setup, see [guides/agent-worker-setup.md](../../guides/agent-worker-setup.md).
 
@@ -805,6 +805,33 @@ Local agents can spawn child sessions and coordinate via the `lifeos_agent_*` to
 Security: lineage checks ensure a session can only message / kill / yield-on its own descendants (rooted at `root_session_id`).
 
 Lineage budgets: every session tracks `root_session_id` + `spawn_depth`. A `lineage_max_dollars` breach at a descendant yields and asks (see [Breach → yield → ask](#breach--yield--ask)) rather than cascade-killing the lineage — the one dimension a spawned child is allowed to ask about, since the cap it names is the lineage root's own, not anything the child owns. Limits configurable via `LIFEOS_AGENT_MAX_SPAWN_DEPTH`, `LIFEOS_AGENT_MAX_DESCENDANTS_PER_ROOT`, `LIFEOS_AGENT_MAX_CONCURRENT_LOCAL`, `LIFEOS_AGENT_MAX_CONCURRENT_MANAGED`.
+
+### Capability inheritance
+
+A child session never has more tools or privileges than the session that started it. `api/services/agent_worker/session_capabilities.py` defines a session's capability set from what the worker grants its route:
+
+| Route | Host shell | Chrome | MCP servers |
+|---|---|---|---|
+| `claude_code` | yes | yes (`--chrome`) | the CLI's own configuration |
+| `codex` | yes | no | the `[mcp_servers]` in Codex's `config.toml` |
+| `local` / `remote` | yes (the `Bash`/file/web tools) | no | `lifeos` |
+| `hermes` | yes (the gateway's terminal runs as the operator) | no | `lifeos` |
+| `claude` (Managed Agents) | no (tools run in Anthropic's container) | no | `lifeos` |
+
+A session's **creator** is its spawning parent (`parent_session_id`) or, for a session claimed from a task, the session the task names in `project_child_creator_session` or `agent_creator_session`. `resolve_lineage` walks creators up to a session nobody started and intersects their route sets; that intersection is the session's ceiling, and its effective set is its own route set intersected with the ceiling. A session with no creator (the operator's own, the board's Open, `/claude` and `/agent` spawns, schedules, and tasks the operator created) has no ceiling and runs exactly as its route grants. A creator named `unattested` (a task write from the shared HTTP MCP transport) or a creator row that no longer exists is treated as a Managed Agents session.
+
+How a ceiling applies, per child route:
+
+- **`claude_code`**: no Chrome in the ceiling → `--no-chrome` in place of `--chrome`, and the appended system prompt says the session has no browser. Restricted servers → `--strict-mcp-config --mcp-config <file>`, where the file lists only the allowed servers, copied from the user-scope `mcpServers` in `~/.claude.json`. It is written per turn into the session's private scratch directory with mode 0600 (`write_strict_mcp_config`); transcripts record server names only (`claude_code_spawn.payload.capabilities`). A restricted session with a board-assigned remote host fails closed, since the file exists only on the API host.
+- **`codex`**: each configured server outside the ceiling gets `-c mcp_servers.<name>.enabled=false` (recorded as `codex_spawn.payload.disabled_mcp_servers`). Codex has no Chrome flag. A restricted remote-host session fails closed for the same reason.
+- **`local` / `remote`**: no host shell in the ceiling → the session runs with LifeOS tools only; `ToolRegistry` omits Read/Write/Edit/Bash/WebFetch/WebSearch from its definitions and refuses them on dispatch.
+- **`claude_code`, `codex`, `hermes`** with no host shell in the ceiling are refused (`host_shell_refusal`): each engine is itself a shell on the operator's machine, so no limited form exists. A Managed Agents session can therefore spawn `claude` children and LifeOS-only `local`/`remote` children.
+
+Enforcement points: `lifeos_agent_spawn` refuses an over-privileged child up front with `capability_exceeds_parent` (and `capability_unverified` when a creator's task cannot be read; the MCP server and the worker both pass a task-field lookup in `InterAgentContext.task_fields`). The worker's `_execute_start`/`_execute_resume` resolve the set before every turn on every route, fail the turn with a `capability_refused` transcript event when the route is refused, and hand the set to the executor through `capability_context`. An executor run outside the worker resolves the set from its spawn chain.
+
+Agent-created tasks carry their creator: the task API stamps `agent_creator_session` (the `X-LifeOS-Agent-Session` value) on every agent-attributed create outside a project, and on an agent-attributed update that adds a pickup tag, through the tag list, an assignee, or a hashtag in a new description, to a task that names no creator yet. Project children keep `project_child_creator_session`. Both are internal fields: an ordinary create or update cannot set or clear them.
+
+Depth: a creator chain counts task-created hops as well as spawns. `lifeos_agent_spawn` refuses a child whose chain depth exceeds `LIFEOS_AGENT_MAX_SPAWN_DEPTH` (`cap_spawn_depth`), and the worker refuses to start a task-claimed session whose chain is already deeper than that cap. The per-root descendant cap counts spawned children only.
 
 ### Operator root-spawn
 

@@ -405,6 +405,7 @@ class TaskManager:
         _log_content: bool = True,
         _project_handoff_operation: Optional[str] = None,
         _project_child_creator_session: Optional[str] = None,
+        _agent_creator_session: Optional[str] = None,
     ) -> Task:
         """Create a new task at the top of its context file, update index.
 
@@ -415,10 +416,13 @@ class TaskManager:
         new task carries `fields.parent_id`, stamps it as agent-created —
         see `CHILD_ORIGIN_FIELD` in `api.services.task_projects`; it is
         never accepted through the caller-supplied `fields` dict itself.
+        `_agent_creator_session` stamps any other new task with the agent
+        session that created it (`AGENT_CREATOR_SESSION_FIELD`).
         """
         if fields:
             from api.services.task_projects import (
                 ABANDONED_AT_FIELD,
+                AGENT_CREATOR_SESSION_FIELD,
                 CANCEL_OPERATION_FIELD,
                 CANCEL_REQUESTED_AT_FIELD,
                 CHILD_CREATOR_SESSION_FIELD,
@@ -455,7 +459,7 @@ class TaskManager:
                 HANDOFF_READY_AT_FIELD, LAST_HANDOFF_OPERATION_FIELD,
                 HANDOFF_ACTIVATED_AT_FIELD, LAST_ABORTED_HANDOFF_FIELD,
                 CHILD_ORIGIN_FIELD, CHILD_CREATOR_SESSION_FIELD,
-                INTEGRATION_BRANCH_FIELD,
+                AGENT_CREATOR_SESSION_FIELD, INTEGRATION_BRANCH_FIELD,
                 PROJECT_PAUSED_FIELD, PROJECT_PAUSED_AT_FIELD, PROJECT_PAUSE_REASON_FIELD,
             }
             if set(fields) & internal_fields:
@@ -493,6 +497,10 @@ class TaskManager:
 
                 task.fields[CHILD_ORIGIN_FIELD] = CHILD_ORIGIN_AGENT
                 task.fields[CHILD_CREATOR_SESSION_FIELD] = _project_child_creator_session
+            elif _agent_creator_session and not (task.fields.get("parent_id") or "").strip():
+                from api.services.task_projects import AGENT_CREATOR_SESSION_FIELD
+
+                task.fields[AGENT_CREATOR_SESSION_FIELD] = _agent_creator_session
             parent_id = (task.fields.get("parent_id") or "").strip()
             if parent_id:
                 # Refresh from Markdown after acquiring the cross-process
@@ -581,6 +589,7 @@ class TaskManager:
         fields: Optional[dict[str, str]] = None,
         _project_handoff_operation: Optional[str] = None,
         _project_child_creator_session: Optional[str] = None,
+        _agent_creator_session: Optional[str] = None,
     ) -> tuple[Task, bool]:
         """Atomically find or create a task for a durable source operation.
 
@@ -621,6 +630,7 @@ class TaskManager:
                 _log_content=False,
                 _project_handoff_operation=_project_handoff_operation,
                 _project_child_creator_session=_project_child_creator_session,
+                _agent_creator_session=_agent_creator_session,
             ), True
 
     def find_by_operation(self, operation_key: str) -> Optional[Task]:
@@ -680,6 +690,10 @@ class TaskManager:
         )
         notes_merge = kwargs.pop("_notes_merge", None)
         expected_updated_at = kwargs.pop("_expected_updated_at", None)
+        # Set by the task API for an agent-attributed write that assigns the
+        # task to an engine: stamps that agent as the task's creator unless
+        # the task already names one.
+        agent_creator_session = kwargs.pop("_agent_creator_session", None)
         # Internal board action hook: called with the latest task, before any
         # of this write's own changes are applied, on every CAS retry. A
         # caller that decided this write was permitted against an earlier read
@@ -810,6 +824,17 @@ class TaskManager:
                         else:
                             merged[k] = v
                     t.fields = merged
+                if agent_creator_session:
+                    from api.services.task_projects import (
+                        AGENT_CREATOR_SESSION_FIELD,
+                        CHILD_CREATOR_SESSION_FIELD,
+                    )
+
+                    if not (
+                        t.fields.get(AGENT_CREATOR_SESSION_FIELD)
+                        or t.fields.get(CHILD_CREATOR_SESSION_FIELD)
+                    ):
+                        t.fields = {**t.fields, AGENT_CREATOR_SESSION_FIELD: agent_creator_session}
                 # Any explicit lifecycle write supersedes the short lease
                 # between interactive launch and hook registration. The
                 # hook's first in_progress write clears it; a failed/terminal
@@ -1332,6 +1357,7 @@ class TaskManager:
     ) -> None:
         from api.services.task_projects import (
             ABANDONED_AT_FIELD,
+            AGENT_CREATOR_SESSION_FIELD,
             CANCEL_OPERATION_FIELD,
             CANCEL_REQUESTED_AT_FIELD,
             CHILD_CREATOR_SESSION_FIELD,
@@ -1383,6 +1409,7 @@ class TaskManager:
             LAST_ABORTED_HANDOFF_FIELD,
             CHILD_ORIGIN_FIELD,
             CHILD_CREATOR_SESSION_FIELD,
+            AGENT_CREATOR_SESSION_FIELD,
             INTEGRATION_BRANCH_FIELD,
             PROJECT_PAUSED_FIELD,
             PROJECT_PAUSED_AT_FIELD,

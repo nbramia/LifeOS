@@ -83,6 +83,11 @@ PROJECT_PAUSE_REASONS = frozenset({"operator", "owner_failed", "owner_budget"})
 CHILD_ORIGIN_FIELD = "project_child_origin"
 CHILD_ORIGIN_AGENT = "agent"
 CHILD_CREATOR_SESSION_FIELD = "project_child_creator_session"
+# Stamped on any other task an agent-attributed request creates or assigns
+# to an engine. Internal like the two above. The worker reads either stamp
+# to give the session that runs the task no more than its creator has (see
+# `api.services.agent_worker.session_capabilities`).
+AGENT_CREATOR_SESSION_FIELD = "agent_creator_session"
 
 HANDOFF_REQUEST_EVENT = "project_handoff_requested"
 HANDOFF_QUIESCENT_EVENT = "project_handoff_quiescent"

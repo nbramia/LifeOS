@@ -986,6 +986,10 @@ def test_codex_child_clarify_folds_into_completion_instead_of_pausing(stores, tm
     ClaudeCodeExecutor's `_CLARIFY_CHILD` convention) so the parent sees
     it via the normal completion path instead of the child hanging."""
     sess_store, tr_store = stores
+    sess_store.create(
+        task_id="t-parent", session_id="sess_parent", routing="codex",
+        origin="operator", status="running",
+    )
     session = sess_store.create(
         task_id="t-child-clarify", session_id="sess_codex_child_clarify", status="claimed",
         routing="codex", parent_session_id="sess_parent",

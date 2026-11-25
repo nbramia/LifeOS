@@ -79,6 +79,11 @@ def _worker(tmp_path: Path, pool, *, claude_code_executor=None, codex_executor=N
 
 def _seed_spawned_child(store: SessionStore, routing: str, *, task_id="cli-child"):
     """A spawned CLI child: parent set, claimed, prompt queued."""
+    if store.get_by_session_id("sess_parent") is None:
+        store.create(
+            task_id="parent-task", session_id="sess_parent", routing=routing,
+            origin="operator", status="running",
+        )
     session = store.create(task_id=task_id, routing=routing, parent_session_id="sess_parent")
     store.enqueue_message(session.session_id, sender_id="sess_parent", content="do work")
     return session

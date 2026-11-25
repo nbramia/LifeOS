@@ -1707,6 +1707,7 @@ class LifeOSMCPServer:
                 InterAgentContext,
                 dispatch as inter_dispatch,
             )
+            from api.services.agent_worker.session_capabilities import http_task_fields_lookup
             from api.services.agent_worker.session_store import SessionStore
             from api.services.agent_worker.transcript_store import TranscriptStore
             from config.settings import settings as _settings
@@ -1746,6 +1747,7 @@ class LifeOSMCPServer:
             managed_driver=managed_driver,
             caller_attempt_id=caller_attempt_id,
             caller_turn_id=caller_turn_id,
+            task_fields=http_task_fields_lookup(self.client, API_BASE),
         )
         return inter_dispatch(ctx, tool_name, arguments)
 
