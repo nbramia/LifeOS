@@ -545,8 +545,8 @@ class TestTelegramListener:
 
 
 def paused(tm: TaskManager, description: str, **kw):
-    """A task whose execution is paused, as the store leaves one whose last
-    child was removed."""
+    """A task whose execution is paused, as the store leaves a project with
+    no remaining children."""
     task = tm.create(description, **kw)
     tm.update(task.id, fields={"execution_paused": "true"}, _project_action=True)
     return tm.get(task.id)

@@ -521,7 +521,7 @@ def _plan_update(current, inp: dict, turn: ApprovalTurn, *, is_project: bool, la
         judged.status = _restore_status(current)
     if not starts_agent(judged):
         if pending:
-            # No longer agent work: the request is void and the task returns
+            # Not agent work: the request is void and the task returns
             # to the status it was parked from.
             return plan("void", {**inp, "status": inp.get("status") or _restore_status(current),
                                  "fields": cleared})

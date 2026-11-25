@@ -494,7 +494,9 @@ class TestChatRouteShadowWiring:
         off_kwargs, shadow_kwargs = captured
         assert off_kwargs["persona_id"] == shadow_kwargs["persona_id"]
         assert off_kwargs["max_tool_rounds"] == shadow_kwargs["max_tool_rounds"] == 5
-        # Nothing about the call differs between modes.
+        # Nothing about the call differs between modes except the
+        # conversation each request runs in.
+        assert off_kwargs.pop("conversation_id") and shadow_kwargs.pop("conversation_id")
         assert off_kwargs == shadow_kwargs
 
     async def test_shadow_mode_records_jev_preturn_span(self, store, monkeypatch):
