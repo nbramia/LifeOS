@@ -1,7 +1,7 @@
 # Host Tools
 
 **Status:** Complete
-**Last Updated:** 2026-11-01
+**Last Updated:** 2026-11-25
 **Audience:** Operator
 
 Host tools give an MCP client scoped access to the LifeOS host: read and list files under named roots, write to the vault or a scratch directory, run a short allowlist of commands as a separate low-privilege account, and read LifeOS service logs. They are off by default. They exist so a connected app can check on and maintain LifeOS without holding a full shell.
@@ -13,7 +13,7 @@ Host tools give an MCP client scoped access to the LifeOS host: read and list fi
 | Tool | Does | Limits |
 |---|---|---|
 | `lifeos_fs_list` | Lists one directory | Roots `vault`, `scratch`, `lifeos`, `logs`; 500 entries |
-| `lifeos_fs_read` | Reads one text file | Same roots; 512 KB; binary files refused |
+| `lifeos_fs_read` | Reads one text file | Same roots; 512 KB; a file with a NUL byte in what is read is refused as binary |
 | `lifeos_fs_write` | Writes one text file (`overwrite`, `create` or `append`) | Roots `vault` and `scratch` only; 1 MB; a vault write is committed when the vault is inside a git repository |
 | `lifeos_shell` | Runs one allowlisted command, argv only, no shell | Runs as `LIFEOS_HOST_TOOLS_RUN_AS`; 30 s; 64 KB of output per stream |
 | `lifeos_logs` | Returns the last lines of a LifeOS service's log, optionally filtered | Named services only; 1,000 lines |
@@ -33,22 +33,24 @@ If the vault on the host is not inside a git repository (for example, a copy kep
 
 ### Task and schedule files
 
-A write to a task file (a `.md` file directly in `LifeOS/Tasks/`) or to the scheduler inbox (`LifeOS/Scheduler/Inbox.md`) is checked against the file's current contents before it lands, whatever `LIFEOS_HOST_TOOLS_VAULT_WRITE_DIRS` allows. For a task file the write is refused if it:
+A write to a task file (a `.md` file directly in `LifeOS/Tasks/`) or to the scheduler inbox (`LifeOS/Scheduler/Inbox.md`) is checked against the file's current contents before it lands, whatever `LIFEOS_HOST_TOOLS_VAULT_WRITE_DIRS` allows. The check reads tasks the way the task store does: a checkbox line is a task whether or not it has an id yet, lines inside a fenced code block are not tasks, and the first block carrying an id owns it. Protected tags are checked per task, in the raw text and in its NFKC form, each on its own. These checks apply to `.md` files only. For a task file the write is refused if it:
 
-- adds any engine, consent, protected-lifecycle or `#human` tag, counted in the raw text and its NFKC form;
-- removes a task's `<!-- id:... -->` comment, or changes the routing tags or `parent_id` of an existing task;
-- changes any line of a task that an engine has claimed or that waits on the operator (`agent`, an engine or consent tag, `agent-running`, `agent-blocked`, `agent-completed`, `#human` and similar);
-- adds a new task with a `parent_id`.
+- gives a new task, in its line or its notes, an engine, consent, protected-lifecycle or `#human` tag, adds one to an existing task's notes, or adds one anywhere outside a task (a heading, a fenced example);
+- changes the routing tags on an existing task's line, or removes a task's `<!-- id:... -->` comment. A tag already in a task's notes is prose: the task store reads routing only from the task line, so the task stays editable;
+- repeats a task id;
+- adds, changes, repeats or removes a `[key:: value]` field other than `due`, `priority` and the dates (every occurrence is compared, since the store keeps the last), so `parent_id`, `operation_key` and the execution fields (`working_dir`, `host`, `model`, `persona_id` and the rest) are set only through the task tools;
+- changes any line of a task that an engine has claimed or that waits on the operator, judged by the tags on its task line (`agent`, an engine or consent tag, `agent-running`, `agent-blocked`, `agent-completed`, `#human` and similar);
+- changes or removes a task that has no id yet but carries one of those tags or a field. Once the task store has given it an id, the rules above apply.
 
-For the scheduler inbox it is refused if it removes a schedule, changes one that is not a static notification, or adds or changes one that is anything but a static notification (no endpoint, executor, persona, model or working directory). A static notification fires a fixed message and runs nothing.
+For the scheduler inbox it is refused if it removes a schedule (with or without an id), repeats a schedule id, changes one that is not a static notification (with or without an id), or adds or changes one that is anything but a static notification (no endpoint, executor, persona, model or working directory). A static notification fires a fixed message and runs nothing; one without an id can be edited in place as long as it stays one.
 
 These checks keep a raw file edit from doing what the task API refuses. For task edits prefer `lifeos_task_update`, which applies the same rules per task and merges with concurrent changes ([Task Management](../specs/product/task-management.md#external-agents)).
 
 ### Concurrent edits
 
-`lifeos_fs_read` returns a `sha256` of the file when it returned the whole file. Pass it back to `lifeos_fs_write` as `expected_sha256`: if the file changed in between (an Obsidian Sync change, another agent), the write is refused with "the file changed since it was read" and nothing is written. Read the file again and redo the edit. A truncated read has no `sha256`, since the edit could not have seen the whole file.
+`lifeos_fs_read` returns a `sha256` of the file when it returned the whole file, and `lifeos_fs_write` returns the `sha256` of the whole file as written (for an append, the file with the appended text). Pass it back to `lifeos_fs_write` as `expected_sha256`: if the file changed in between (an Obsidian Sync change, another agent), the write is refused with "the file changed since it was read" and nothing is written. Read the file again and redo the edit. A truncated read has no `sha256`, since the edit could not have seen the whole file.
 
-A new file is written with mode `0644`. An overwritten file keeps its mode. Writes go through a temporary file that is renamed into place, so extended ACL entries set on the old file are not carried over: give the vault a default ACL for the run-as account (step 3) so rewritten notes stay readable to it.
+A new file is written with mode `0644`. An overwritten file keeps its mode. Writes, appends included, go through a temporary file that is renamed into place, so a reader never sees half a write; appending to a file that is not UTF-8 text is refused. Because of the rename, extended ACL entries set on the old file are not carried over: give the vault a default ACL for the run-as account (step 3) so rewritten notes stay readable to it.
 
 ### The command allowlist
 
@@ -73,13 +75,16 @@ Off by default: a command outside the allowlist is refused. Turn on approval wit
 3. Reply `APPROVE` to that message to allow it, or anything else to refuse it. Only a reply in the configured chat, to a request sent to that chat, counts. The bot answers with the request's age. A bare `APPROVE` that is not a reply approves nothing: while a request is waiting, the bot answers with the waiting request ids instead of treating it as a chat message. A reply to a request that was already decided, ran or expired gets a short answer and changes nothing.
 4. The command runs the next time the same caller asks for the same argv in the same directory as the same account. The approval is spent the moment it runs, so it runs once; a second identical call starts a new request. The bot tells you when it ran, with its exit code and how long ago it was asked and approved.
 
-An approval is bound to a SHA-256 hash of the caller, the run-as account, the directory and the argv, so it cannot be used for any other command or by any other caller. Approving does not run anything by itself: if the caller never asks again (its conversation ended, say), the approval expires unused, and that is logged too. Requests and unused approvals expire after `LIFEOS_HOST_TOOLS_APPROVAL_TIMEOUT_SECONDS` (default 86400, one day); set it to `0` to turn expiry off. A caller can have at most three requests waiting at once.
+An approval is bound to a SHA-256 hash of the caller, the run-as account, the directory (its root and path, and the directory they resolve to) and the argv, so it cannot be used for any other command or by any other caller. Approving does not run anything by itself: if the caller never asks again (its conversation ended, say), the approval expires unused, and that is logged too. Requests and unused approvals expire after `LIFEOS_HOST_TOOLS_APPROVAL_TIMEOUT_SECONDS` (default 86400, one day); set it to `0` to turn expiry off. A caller can have at most three requests waiting at once; the count and the new request are recorded in one transaction, so concurrent calls cannot go past it.
 
 An approved command still:
 
 - runs as `LIFEOS_HOST_TOOLS_RUN_AS`, with the same 30-second and output limits;
 - passes the path checks: every argument that looks like a path (and the value after any `=`) must be relative, stay inside a readable root and miss the denylist;
-- never names a shell, an interpreter, a command that runs other commands, a privilege tool, or a network tool (`bash`, `python`, `env`, `xargs`, `find`, `sed`, `awk`, `make`, `tar`, `systemd-run`, `sudo`, `curl`, `ssh`, `rsync` and others), a git option before the subcommand (`-c`, `-C`, `--git-dir`), or a git subcommand that reaches another host (`push`, `pull`, `fetch`, `clone`, `remote` and others). The full list is `NEVER_APPROVED_COMMANDS` in `api/services/host_tools.py`. These are refused without asking you, because they would let a command step around the path checks or send data off the host.
+- never names a shell, an interpreter or debugger, a command that runs other commands, a scheduler or service manager, an editor or pager with a command escape, a container or privilege tool, or a network tool (`bash`, `python`, `sqlite3`, `gdb`, `env`, `xargs`, `find`, `timeout`, `nohup`, `crontab`, `at`, `systemd-run`, `systemctl`, `vim`, `nano`, `emacs`, `less`, `man`, `docker`, `sudo`, `curl`, `ssh`, `rsync` and others). A command is matched by its own name and by the program it resolves to on the run-as account's PATH, following symlinks, each also without a version or variant suffix, so `python3.12`, `vi` and `nc.openbsd` are caught. Options that make an ordinary program run another (`--exec`, `-exec`, `--to-command`, `--compress-program` and similar, including abbreviations of the long forms) are refused for every command;
+- for git, names one of git's own subcommands (never an alias, which can run a shell command, or a `git-*` program), with no git option before it (`-c`, `-C`, `--git-dir`), and not one that reaches another host (`push`, `pull`, `fetch`, `clone`, `ls-remote`, `remote`, `submodule`, `fetch-pack`, `send-pack`, `imap-send` and others) or runs other programs or changes configuration (`config`, `bisect`, `difftool`, `mergetool`, `filter-branch`, `maintenance`, `hook`, `credential` and others). Subcommands that open an editor for a message or a todo list (`commit`, `rebase`, `merge`, `tag`, `notes`, `revert`, `cherry-pick`, `am`, `replace`) are refused too. Arguments such as `--exec`, `--upload-pack`, `--receive-pack`, `--remote`, `--edit`, `grep -O` and `add -e` are refused, in any abbreviation git accepts and inside a cluster of short options. An approved git command runs with its editor and sequence editor set to `false` and its pager to `cat`, so anything that would still open one fails.
+
+The lists are `NEVER_APPROVED_COMMANDS` and `NEVER_APPROVED_GIT` in `api/services/host_tools.py`. These are refused without asking you, because they would let a command step around the path checks, keep running after the call, or send data off the host. They are a denylist: any other program can still be sent to you, so read the argv before approving.
 
 The path checks look at arguments, not at what a program does with them, so the low-privilege account and its file permissions remain the real boundary.
 
