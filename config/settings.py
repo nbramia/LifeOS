@@ -398,6 +398,13 @@ class Settings(BaseSettings):
     # Also the one non-local origin CORS allows, so a browser loading the UI from
     # the tailnet hostname can call the API. Empty simply drops it from the list.
     tailnet_https_url: str = Field(default="", alias="TAILNET_HTTPS_URL")
+    api_trusted_origins: str = Field(
+        default="",
+        alias="LIFEOS_API_TRUSTED_ORIGINS",
+        description="Comma-separated browser origins (scheme://host[:port]) allowed to make "
+                    "state-changing API requests, beyond loopback, the tailnet HTTPS host and the "
+                    "CORS origins. A browser request from any other origin is refused with 403.",
+    )
 
     # API Keys (no prefix - standard env var names)
     anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")

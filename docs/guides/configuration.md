@@ -1,7 +1,7 @@
 # Configuration Guide
 
 **Status:** Complete
-**Last Updated:** 2026-11-24
+**Last Updated:** 2026-11-25
 **Audience:** Operators
 
 **This is the single authoritative reference for every `LIFEOS_*` environment variable and the third-party service variables (`ANTHROPIC_API_KEY`, `OLLAMA_*`, `SLACK_*`, `TELEGRAM_*`, `MONARCH_*`) that LifeOS reads.** Other guides reference this file rather than restating defaults — when documentation conflicts, this file wins (and `config/settings.py` wins over both, since the code is the source of truth).
@@ -28,6 +28,7 @@ Each section corresponds roughly to a section in [`config/settings.py`](../../co
 | `LIFEOS_BACKUP_PATH` | path | `./data/backups` | Where backup archives are written. |
 | `LIFEOS_BACKUP_KEEP` | int | `2` | Nightly snapshots retained per database. Older ones are pruned only after a fully successful sync whose newest snapshot passes an integrity check, so repeated failures cannot rotate away the last good copy. |
 | `TAILNET_HTTPS_URL` | str | — | Your machine's Tailscale HTTPS URL (no port), e.g. `https://<your-machine>.<tailnet>.ts.net`. Used by `scripts/setup-tailscale.sh` status output, and returned as `secure_url` by `GET /api/chat/config` so `/chat` can offer a one-tap link here when the mic is blocked by an insecure context. **Open `/chat` on this URL for voice** — the mic requires HTTPS. |
+| `LIFEOS_API_TRUSTED_ORIGINS` | str | — | Comma-separated browser origins (`scheme://host[:port]`) allowed to make state-changing API requests, beyond loopback, the `TAILNET_HTTPS_URL` host (any port) and the CORS origins. A browser request the browser marks cross-site, or whose `Origin` is not one of these, is refused with `403`. Clients that are not browsers are unaffected. Add an origin here only for a page served elsewhere that calls this API. |
 | `LIFEOS_VOICE_GATEWAY_URL` | str | `http://127.0.0.1:9788` | whisper-relay base URL; LifeOS reverse-proxies `/api/voice/*` here (ADR-016). |
 | `LIFEOS_VOICE_ENDPOINT_SILENCE_MS` | int | `1600` | Trailing silence (ms) after speech in auto-mode voice recording before a candidate turn-endpoint check runs. Client-side timing only, read via `GET /api/chat/config`. |
 | `LIFEOS_VOICE_ENDPOINT_HARD_CAP_MS` | int | `3000` | Continuous silence (ms) in auto-mode voice recording that finalizes the turn regardless of the completeness check. Client-side timing only. |
