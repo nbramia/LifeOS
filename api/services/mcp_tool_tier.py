@@ -396,11 +396,43 @@ def agent_for_token(token: str) -> str | None:
     return found
 
 
+# What a connected app may send to lifeos_reminder_create: the tool's own
+# schema plus the reminder route's timezone.
+_REMINDER_CREATE_KEYS = frozenset({
+    "name", "schedule_type", "schedule_value", "message_type", "message_content",
+    "endpoint_config", "timezone", "enabled",
+})
+_REMINDER_SINGLE_LINE_KEYS = ("name", "schedule_type", "schedule_value", "message_type", "timezone")
+# Entry-line markup: an inline field's brackets and the id comment. The name
+# is the line's free text, where a `#` would also read as a tag.
+_REMINDER_LINE_MARKUP = ("[", "]", "<!--")
+
+
 def _check_reminder_create(arguments: dict) -> str | None:
+    extra = sorted(set(arguments) - _REMINDER_CREATE_KEYS)
+    if extra:
+        return f"arguments not available to connected apps: {', '.join(extra)}"
     if arguments.get("message_type") != "static":
         return "connected apps can create only static reminders (message_type='static')"
     if arguments.get("endpoint_config") is not None:
         return "endpoint_config is not available to connected apps"
+    for key in (*_REMINDER_SINGLE_LINE_KEYS, "message_content"):
+        value = arguments.get(key)
+        if value is not None and not isinstance(value, str):
+            return f"{key} must be a string"
+    for key in _REMINDER_SINGLE_LINE_KEYS:
+        value = arguments.get(key)
+        if value is None:
+            continue
+        if any(not ch.isprintable() for ch in value):
+            return f"{key} must be a single line without control characters"
+        if any(markup in value for markup in _REMINDER_LINE_MARKUP):
+            return f"{key} must not contain '[', ']' or '<!--'"
+        if key == "name" and "#" in value:
+            return "name must not contain '#'"
+    enabled = arguments.get("enabled")
+    if enabled is not None and not isinstance(enabled, bool):
+        return "enabled must be a boolean"
     return None
 
 
