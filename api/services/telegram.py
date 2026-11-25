@@ -1209,18 +1209,25 @@ class TelegramBotListener:
     async def _handle_callback_query(self, callback_query: dict) -> None:
         """Decide an agent-task approval from its Approve/Deny button.
 
-        Only the primary bot sends those buttons, and only a press in the
-        configured operator chat, on a message in that chat, decides
-        anything. The decision itself is bound to one task and one request
-        token and is spent the first time it is used (see
-        `agent_task_approval.decide`).
+        Only the primary bot sends those buttons, and only the operator's own
+        press decides anything: the press must come from the configured
+        chat's user (the bot's chat with the operator is a private chat, whose
+        id is the operator's user id), on a message in that chat. The
+        decision is bound to the task, its request token, the message that
+        carried the buttons and the content it showed, and is spent the first
+        time it is used (see `agent_task_approval.decide`).
         """
         if not self._is_primary:
             return
         message = callback_query.get("message") or {}
         chat_id = str((message.get("chat") or {}).get("id", ""))
-        if not self._chat_id or chat_id != self._chat_id or chat_id != str(settings.telegram_chat_id):
+        from_id = str((callback_query.get("from") or {}).get("id", ""))
+        operator = str(settings.telegram_chat_id or "")
+        if not operator or not self._chat_id or chat_id != self._chat_id or chat_id != operator:
             logger.warning("Ignoring button press from an unauthorized chat")
+            return
+        if from_id != operator:
+            logger.warning("Ignoring button press from a user other than the operator")
             return
         from api.services import agent_task_approval
 
@@ -1230,7 +1237,10 @@ class TelegramBotListener:
             return
         approve, task_id, token = parsed
         try:
-            outcome = await asyncio.to_thread(agent_task_approval.decide, task_id, token, approve=approve)
+            outcome = await asyncio.to_thread(
+                agent_task_approval.decide, task_id, token, approve=approve,
+                message_id=int(message.get("message_id") or 0),
+            )
         except Exception as exc:  # keep the listener running
             logger.warning(f"agent-task approval decision failed: {exc}")
             outcome = "Could not record that decision; the task stays parked."

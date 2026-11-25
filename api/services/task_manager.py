@@ -2342,6 +2342,37 @@ def rendered_tags(task: Task) -> set[str]:
     return found
 
 
+def claimed_tags(task: Task) -> tuple[set[str], set[str]]:
+    """`(line_tags, block_tags)`: the tags that route `task` once written.
+
+    `line_tags` are read from the rendered task line, raw and
+    NFKC-normalized, with the store's tag pattern: the same reading the
+    host-tool write guard applies, and a superset of what the store's line
+    parser keeps. `block_tags` are the tags the store's own block parser
+    reads back from the whole rendered block (task line plus notes body).
+    Notes prose is not part of the line, so a `#tag` mentioned only in the
+    notes is in neither set unless the store would read it.
+    """
+    import unicodedata
+
+    lines = _format_task_block(task)
+    line_tags = {
+        t for variant in (lines[0], unicodedata.normalize("NFKC", lines[0]))
+        for t in _TAG_RE.findall(variant)
+    }
+    block_tags: set[str] = set()
+    idx = 0
+    while idx < len(lines):
+        block = _match_task_block(lines, idx, task.source_file or "Inbox.md")
+        if block is None:
+            idx += 1
+            continue
+        end, parsed, _had_id = block
+        block_tags.update(t.lstrip("#") for t in parsed.tags)
+        idx = end
+    return line_tags, block_tags
+
+
 def _parse_task_line(line: str, file_path: str, line_num: int) -> Optional[Task]:
     """Parse one checkbox line into a Task, or None if not a checkbox line.
 

@@ -1393,39 +1393,35 @@ async def execute_tool_parallel(
         this round is only visible to a child call in a later round.
     approval_turn: the turn's `agent_task_approval.ApprovalTurn` (the
         operator's own message and the conversation). Every `manage_tasks`
-        call passes its gate: a call that would start agent work runs only
-        when the operator asked for agent work, and is otherwise parked for
-        approval. Without one, a turn is built from `user_message`.
+        create, update and agent-starting project action runs through its
+        gate, which checks and writes in one step: work that would start an
+        agent runs only when the operator asked for agent work, and is
+        otherwise parked for approval. Without one, a turn is built from
+        `user_message`.
     """
     try:
         if persona_id == JOURNAL_PERSONA_ID:
             tool_input, gate_error = _journal_tool_gate(name, tool_input, user_message, created_task_ids)
             if gate_error:
                 return gate_error
-        task_gate = None
+        result = None
         if name == "manage_tasks":
             from api.services import agent_task_approval
             if approval_turn is None:
                 approval_turn = agent_task_approval.ApprovalTurn(user_message, persona_id=persona_id)
-            task_gate = await asyncio.to_thread(
-                agent_task_approval.check_manage_tasks, tool_input, approval_turn,
-            )
-            if task_gate.refusal is not None:
-                return task_gate.refusal
-            tool_input = task_gate.tool_input
-        handler = _TOOL_HANDLERS.get(name)
-        if not handler:
-            return f"Error: Unknown tool '{name}'"
-        if name in _SYNC_HANDLERS:
-            result = await asyncio.to_thread(handler, tool_input)
-        else:
-            result = handler(tool_input)
-        if asyncio.iscoroutine(result):
-            result = await result
-        if task_gate is not None and task_gate.park_token:
             result = await asyncio.to_thread(
-                agent_task_approval.finish_park, task_gate, result, approval_turn,
+                agent_task_approval.handle_manage_tasks, tool_input, approval_turn,
             )
+        if result is None:
+            handler = _TOOL_HANDLERS.get(name)
+            if not handler:
+                return f"Error: Unknown tool '{name}'"
+            if name in _SYNC_HANDLERS:
+                result = await asyncio.to_thread(handler, tool_input)
+            else:
+                result = handler(tool_input)
+            if asyncio.iscoroutine(result):
+                result = await result
         if (
             created_task_ids is not None
             and persona_id == JOURNAL_PERSONA_ID
@@ -2843,7 +2839,7 @@ def _task_complete(inp: dict) -> str:
 _UPDATABLE_FIELDS = ("description", "status", "context", "priority", "due_date", "tags", "notes", "fields")
 
 
-def _task_update(inp: dict) -> str:
+def _task_update(inp: dict, precondition=None) -> str:
     from api.services.task_manager import get_task_manager
     task_id = inp.get("task_id")
     if not task_id:
@@ -2857,7 +2853,11 @@ def _task_update(inp: dict) -> str:
             "Error: no updatable fields provided (description, status, context, "
             "priority, due_date, tags, notes, fields)."
         )
-    task = tm.update(task_id, **updates)
+    if precondition is not None:
+        updates_kwargs = {**updates, "_precondition": precondition}
+    else:
+        updates_kwargs = updates
+    task = tm.update(task_id, **updates_kwargs)
     if not task:
         return f"Error: Task '{task_id}' not found."
     changed = ", ".join(f"{k}={updates[k]!r}" for k in updates)
@@ -2941,10 +2941,10 @@ async def _task_cancel_project(inp: dict) -> str:
     )
 
 
-def _task_resume_execution(inp: dict) -> str:
+def _task_resume_execution(inp: dict, precondition=None) -> str:
     from api.services.task_manager import get_task_manager
     task = _task_project_service(get_task_manager(), lifecycle=True).resume_execution(
-        inp.get("task_id") or ""
+        inp.get("task_id") or "", precondition=precondition,
     )
     return f"Task execution resumed: \"{task.description}\" (id: {task.id})"
 

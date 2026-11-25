@@ -507,7 +507,13 @@ class ProjectTaskService:
             ),
         )
 
-    def resume_execution(self, task_id: str) -> "Task":
+    def resume_execution(
+        self, task_id: str, *, precondition: Callable[["Task"], None] | None = None,
+    ) -> "Task":
+        """Resume a paused ordinary task. `precondition`, when given, is also
+        run against the exact snapshot being written, under the task store's
+        lock, and aborts the write by raising (see `TaskManager.update`)."""
+        extra_precondition = precondition
         hierarchy = self.hierarchy()
         task = hierarchy.tasks.get(task_id)
         if task is None:
@@ -522,6 +528,8 @@ class ProjectTaskService:
                 raise ProjectConflictError("project objectives cannot resume as ordinary task execution")
             if current.fields.get(CANCEL_OPERATION_FIELD):
                 raise ProjectConflictError("project cancellation is pending")
+            if extra_precondition is not None:
+                extra_precondition(current)
 
         return self.manager.update(
             task_id,
