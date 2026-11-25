@@ -511,3 +511,59 @@ class TestAgentSpawnCommand:
         # A routing clarification was registered against the sent message id.
         q = store.get_question_by_message_id(555)
         assert q is not None and q["task_id"] == "op_x"
+
+
+class TestLinkPreviewsDisabled:
+    """Every sendMessage payload turns link previews off, including the retry."""
+
+    @staticmethod
+    def _settings(mock_settings):
+        mock_settings.telegram_enabled = True
+        mock_settings.telegram_bot_token = "test-token"
+        mock_settings.telegram_chat_id = "12345"
+
+    @staticmethod
+    def _assert_no_preview(payload):
+        assert payload["link_preview_options"] == {"is_disabled": True}
+        assert payload["disable_web_page_preview"] is True
+
+    @patch("api.services.telegram.settings")
+    @patch("api.services.telegram.httpx.post")
+    def test_send_message_payload(self, mock_post, mock_settings):
+        from api.services.telegram import send_message
+
+        self._settings(mock_settings)
+        bad = MagicMock(status_code=400, text="bad")
+        ok = MagicMock(status_code=200)
+        mock_post.side_effect = [bad, ok]
+        assert send_message("see https://example.com/page") is True
+        assert mock_post.call_count == 2
+        for call in mock_post.call_args_list:
+            self._assert_no_preview(call.kwargs["json"])
+
+    @patch("api.services.telegram.settings")
+    @patch("api.services.telegram.httpx.post")
+    def test_send_message_capture_ids_payload(self, mock_post, mock_settings):
+        from api.services.telegram import send_message_capture_ids
+
+        self._settings(mock_settings)
+        ok = MagicMock(status_code=200)
+        ok.json.return_value = {"result": {"message_id": 7}}
+        mock_post.return_value = ok
+        assert send_message_capture_ids("see https://example.com/page") == [7]
+        self._assert_no_preview(mock_post.call_args.kwargs["json"])
+
+    @pytest.mark.asyncio
+    @patch("api.services.telegram.settings")
+    async def test_send_message_async_payload(self, mock_settings):
+        from api.services.telegram import send_message_async
+
+        self._settings(mock_settings)
+        client = MagicMock()
+        client.post = AsyncMock(return_value=MagicMock(status_code=200))
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=client)
+        cm.__aexit__ = AsyncMock(return_value=False)
+        with patch("api.services.telegram.httpx.AsyncClient", return_value=cm):
+            assert await send_message_async("see https://example.com/page") is True
+        self._assert_no_preview(client.post.call_args.kwargs["json"])

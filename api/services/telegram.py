@@ -116,6 +116,14 @@ def validate_bot_name(bot: Optional[str]) -> Optional[str]:
 # Message sending
 # ---------------------------------------------------------------------------
 
+# Bot messages never expand link previews. Both fields are sent: Bot API 7.0+
+# reads link_preview_options, older servers read disable_web_page_preview.
+_NO_LINK_PREVIEW = {
+    "link_preview_options": {"is_disabled": True},
+    "disable_web_page_preview": True,
+}
+
+
 def _telegram_url(method: str, token: Optional[str] = None) -> str:
     token = token or _active_bot_token.get() or settings.telegram_bot_token
     return f"{TELEGRAM_API}/bot{token}/{method}"
@@ -283,7 +291,7 @@ def send_message_capture_ids(
         text = _clean_markdown_for_telegram(text)
     ids: list[int] = []
     for part in _split_message(text):
-        payload = {"chat_id": chat_id, "text": part}
+        payload = {"chat_id": chat_id, "text": part, **_NO_LINK_PREVIEW}
         if parse_mode is not None:
             payload["parse_mode"] = parse_mode
         if reply_to_message_id is not None:
@@ -340,7 +348,12 @@ def send_message(
 
     success = True
     for part in _split_message(text):
-        payload = {"chat_id": chat_id, "text": part, "parse_mode": "Markdown"}
+        payload = {
+            "chat_id": chat_id,
+            "text": part,
+            "parse_mode": "Markdown",
+            **_NO_LINK_PREVIEW,
+        }
         if reply_to_message_id is not None:
             payload["reply_to_message_id"] = int(reply_to_message_id)
             payload["allow_sending_without_reply"] = True
@@ -393,7 +406,12 @@ async def send_message_async(
     success = True
     async with httpx.AsyncClient(timeout=30.0) as client:
         for part in _split_message(text):
-            payload = {"chat_id": chat_id, "text": part, "parse_mode": "Markdown"}
+            payload = {
+            "chat_id": chat_id,
+            "text": part,
+            "parse_mode": "Markdown",
+            **_NO_LINK_PREVIEW,
+        }
             if reply_to_message_id is not None:
                 payload["reply_to_message_id"] = int(reply_to_message_id)
                 payload["allow_sending_without_reply"] = True

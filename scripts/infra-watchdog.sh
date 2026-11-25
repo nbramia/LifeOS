@@ -51,6 +51,7 @@ send_telegram() {
     local rc=0
     "${LIFEOS_WATCHDOG_CURL:-/usr/bin/curl}" -s -f --connect-timeout 5 --max-time 15 -X POST "https://api.telegram.org/bot${bot_token}/sendMessage" \
         --data-urlencode "chat_id=${chat_id}" \
+        --data-urlencode "disable_web_page_preview=true" \
         --data-urlencode "text=${message}" > /dev/null 2>&1 || rc=$?
     record_bot_notice "$message"
     return $rc
