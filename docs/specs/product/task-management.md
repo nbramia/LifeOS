@@ -57,6 +57,8 @@ correctly. Todo and Done need no configuration.
 "add a work task to finish the presentation"
 ```
 
+A task the assistant files with `#agent` or an engine tag runs only when your message asked for agent work ("have Claude fix the parser"); otherwise it is saved as `blocked` with `agent_approval:: pending` and you are asked in the chat and on Telegram. See [Approval for agent work created in chat](agent-worker.md#approval-for-agent-work-created-in-chat).
+
 ### Via API
 
 ```bash

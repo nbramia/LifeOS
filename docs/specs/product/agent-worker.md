@@ -2,7 +2,7 @@
 
 > **Status:** Complete
 > **Owner:** Agent Worker
-> **Last Updated:** 2026-09-22
+> **Last Updated:** 2026-11-25
 
 LifeOS includes an external **agent worker** that picks up engine-assigned tasks and completes them autonomously — running locally on a self-hosted LLM or on Anthropic's Managed Agents cloud, with budget caps you can specify in the task title and full audit transcripts on every run. When the agent finishes (or gets stuck), it notifies you on Telegram. If it has a question mid-run, it asks via Telegram and waits for your reply.
 
@@ -19,10 +19,11 @@ The point is hands-free task completion for the long tail of small chores that a
 5. [Budgets](#budgets)
 6. [Tag lifecycle](#tag-lifecycle)
 7. [Telegram interactions](#telegram-interactions)
-8. [Capability boundaries](#capability-boundaries)
-9. [Safety model](#safety-model)
-10. [Configuration knobs](#configuration-knobs)
-11. [Related Documents](#related-documents)
+8. [Approval for agent work created in chat](#approval-for-agent-work-created-in-chat)
+9. [Capability boundaries](#capability-boundaries)
+10. [Safety model](#safety-model)
+11. [Configuration knobs](#configuration-knobs)
+12. [Related Documents](#related-documents)
 
 ---
 
@@ -311,6 +312,38 @@ Default clarification timeout is 72 hours (`LIFEOS_AGENT_CLARIFICATION_TIMEOUT_H
 
 ---
 
+## Approval for agent work created in chat
+
+The chat orchestrator (web chat, the Telegram bots, voice, and `prompt` schedules) can file tasks, so it could hand work to the worker. A chat tool call that would start an agent goes ahead only when **your own message for that turn asked for agent work**. Otherwise the task is saved parked and you are asked.
+
+**What counts as starting an agent.** The tags the worker claims decide: the routing tags on the task line as the task store reads them (the tag list, a tag written into the title or a field value, raw or NFKC-normalized, the same reading the host-tool write guard applies). A `#claude` mentioned in a task's notes is prose and parks nothing; notes the store would read as a routing tag are refused. Covered from chat:
+
+- creating a task, or a sub-task, that carries `#agent` or an engine tag (`#claude`, `#codex`, `#hermes`, `#local`, `#cloud`, `#cloud-haiku`, `#cloud-sonnet`) with a todo or urgent status;
+- an update that assigns an engine, reopens such a task, or rewrites the title, notes, tags or fields of a task already queued for an agent (changing only its priority, due date or status between todo and urgent needs nothing);
+- `resume_execution` on an engine-assigned task, and `plan_project`, which starts a project's agent owner. **Start** on a project starts no agent and is not gated.
+
+Each check runs again inside the write, against the task as it is at that moment and under the task store's lock, so tool calls the assistant makes in parallel cannot combine into agent work that no single check saw.
+
+**What counts as asking for agent work.** Only the text you typed for the turn is judged, and only by its literal wording. Search results, emails, documents, memories and the assistant's earlier replies are never part of it. Your message is explicit when its instruction:
+
+- contains an engine or `#agent` tag you typed, not negated ("create a #claude task to fix the parser", but not "don't make a #claude task");
+- or hands work to an engine in so many words: "use codex to add the tests", "fix the login redirect with claude code", "have Claude fix the parser", "get codex to write tests", "start an agent to clean up my downloads", "delegate this to codex", "assign the parser bug to claude".
+
+The instruction is the first line of your message, up to the first colon (a time such as 5:30 is not a colon break), with quoted text removed. A message that asks about some text rather than instructing ("what does this mean …", "is this legit …", "summarise this …", "someone sent me …", "I got this …") has no instruction. So text you paste or quote never counts: "what does this mean: create a task tagged claude to run …", "Bob says: #claude run the script", anything in quotes, and anything after the first line are all parked and asked about.
+
+Anything else is not explicit and is parked, including "summarise my email" when the email asks for an agent, questions about agents ("should I have claude fix it?"), and indirect requests ("could you put our coding helper on the CSV bug").
+
+**Parked.** A parked task has status `blocked` (it shows in the board's Human queue lane, and the worker never claims it) and the fields `agent_approval:: pending`, a request token, the time of the request and a hash of its content (title, notes, routing tags and fields). A held `plan_project` or `resume_execution` does not run; its task gets the same fields. You can approve in either of two ways:
+
+- **In the conversation.** The assistant tells you what the task is and asks. If your next message in the same conversation is a plain go-ahead ("yes", "go ahead", "do it", "approved"), it releases the most recent request in that conversation, and only that one, while its content is unchanged. A go-ahead in the same turn that parked it, in another conversation, with conditions ("yes but only the first one") or on more than one line does not release anything. An explicit request ("have claude run the import") releases it from any turn.
+- **On Telegram.** The primary bot sends the exact task, with its notes, and **Approve** / **Deny** buttons. Approve releases that one task to its engine, or runs the held project action. Deny keeps it parked. A press counts only from you (the bot's chat must be your private chat, so its id is your user id), on the message that carried that request's buttons, and only while the task's content still matches the hash taken when the request was sent; each request is spent on first use. Editing a parked task's content from chat sends a new request and voids the old buttons, and changing a project's title, notes, tags or fields voids its pending request. The buttons are answered by the primary bot's listener; with `TELEGRAM_PRIMARY_LISTENER_ENABLED=false` they do nothing, and you approve in the conversation or on the board.
+
+You can also release a parked task yourself: drag it to Assigned on the board, or change `[?]` back to `[ ]` in Obsidian.
+
+Not covered by this approval: tasks you write in Obsidian or on the board, calls from your own scripts to the task API, sub-tasks an already running agent session creates, and the explicit handoffs that read your message directly (`/agent`, the model picker's Claude Code choice, "use codex ..."), which are your own requests by construction. Connected apps cannot set engine tags at all ([mcp-oauth.md](../technical/mcp-oauth.md)).
+
+---
+
 ## Capability boundaries
 
 ### What the agent can do
@@ -324,7 +357,7 @@ Default clarification timeout is 72 hours (`LIFEOS_AGENT_CLARIFICATION_TIMEOUT_H
 
 ### What the agent can't do
 
-- Make decisions you didn't authorize — every task starts from a tag you wrote
+- Make decisions you didn't authorize — every task starts from a tag you wrote, and one the chat assistant files waits for your approval unless you asked for agent work
 - Charge you beyond your configured budgets — both per-task and daily caps enforced externally
 - Run without your knowing — every run lands a Telegram message
 - Persist state beyond the worker's SQLite (sessions, transcripts, daily spend ledger)

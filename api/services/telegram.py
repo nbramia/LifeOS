@@ -322,6 +322,62 @@ def send_message_capture_ids(
     return ids
 
 
+def send_message_with_buttons(text: str, buttons: list[tuple[str, str]]) -> Optional[int]:
+    """Send plain `text` from the primary bot to the operator's chat with one
+    row of inline buttons, each `(label, callback_data)`. Returns the sent
+    message's id, or None when Telegram is disabled, the text does not fit
+    one message, or the send failed. The text is never split or reformatted,
+    so the operator sees exactly what the buttons decide."""
+    if not settings.telegram_enabled or len(text) > MAX_MESSAGE_LENGTH:
+        return None
+    payload = {
+        "chat_id": settings.telegram_chat_id,
+        "text": text,
+        "reply_markup": {
+            "inline_keyboard": [[{"text": label, "callback_data": data} for label, data in buttons]],
+        },
+        "link_preview_options": {"is_disabled": True},
+    }
+    try:
+        resp = httpx.post(
+            _telegram_url("sendMessage", settings.telegram_bot_token), json=payload, timeout=30.0,
+        )
+        if resp.status_code == 200:
+            msg_id = (resp.json().get("result") or {}).get("message_id")
+            return int(msg_id) if msg_id is not None else None
+        logger.error(f"Telegram button send failed: {resp.status_code} {resp.text[:200]}")
+    except Exception as e:
+        logger.error(f"Telegram button send error: {e}")
+    return None
+
+
+async def answer_callback_query(callback_query_id: str, text: str = "") -> None:
+    """Acknowledge a button press so the operator's client stops its spinner."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                _telegram_url("answerCallbackQuery"),
+                json={"callback_query_id": callback_query_id, "text": text[:190]},
+            )
+    except Exception as e:
+        logger.warning(f"answerCallbackQuery failed: {e}")
+
+
+async def edit_message_text(chat_id: str, message_id: int, text: str) -> None:
+    """Replace a sent message's text, dropping its inline buttons."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            await client.post(
+                _telegram_url("editMessageText"),
+                json={
+                    "chat_id": chat_id, "message_id": message_id, "text": text[:MAX_MESSAGE_LENGTH],
+                    "link_preview_options": {"is_disabled": True},
+                },
+            )
+    except Exception as e:
+        logger.warning(f"editMessageText failed: {e}")
+
+
 def send_message(
     text: str,
     chat_id: str = None,
@@ -828,7 +884,11 @@ class TelegramBotListener:
                     params={
                         "offset": self._last_update_id + 1,
                         "timeout": 30,
-                        "allowed_updates": json.dumps(["message"]),
+                        # The primary bot also receives button presses: its
+                        # inline Approve/Deny buttons decide agent-task approvals.
+                        "allowed_updates": json.dumps(
+                            ["message", "callback_query"] if self._is_primary else ["message"]
+                        ),
                     },
                 )
                 if resp.status_code != 200:
@@ -1146,11 +1206,60 @@ class TelegramBotListener:
         except Exception as exc:
             logger.warning(f"hermes-fallback notice failed to send: {exc}")
 
+    async def _handle_callback_query(self, callback_query: dict) -> None:
+        """Decide an agent-task approval from its Approve/Deny button.
+
+        Only the primary bot sends those buttons, and only the operator's own
+        press decides anything: the press must come from the configured
+        chat's user (the bot's chat with the operator is a private chat, whose
+        id is the operator's user id), on a message in that chat. The
+        decision is bound to the task, its request token, the message that
+        carried the buttons and the content it showed, and is spent the first
+        time it is used (see `agent_task_approval.decide`).
+        """
+        if not self._is_primary:
+            return
+        message = callback_query.get("message") or {}
+        chat_id = str((message.get("chat") or {}).get("id", ""))
+        from_id = str((callback_query.get("from") or {}).get("id", ""))
+        operator = str(settings.telegram_chat_id or "")
+        if not operator or not self._chat_id or chat_id != self._chat_id or chat_id != operator:
+            logger.warning("Ignoring button press from an unauthorized chat")
+            return
+        if from_id != operator:
+            logger.warning("Ignoring button press from a user other than the operator")
+            return
+        from api.services import agent_task_approval
+
+        parsed = agent_task_approval.parse_callback_data(callback_query.get("data") or "")
+        if parsed is None:
+            await answer_callback_query(callback_query.get("id", ""))
+            return
+        approve, task_id, token = parsed
+        try:
+            outcome = await asyncio.to_thread(
+                agent_task_approval.decide, task_id, token, approve=approve,
+                message_id=int(message.get("message_id") or 0),
+            )
+        except Exception as exc:  # keep the listener running
+            logger.warning(f"agent-task approval decision failed: {exc}")
+            outcome = "Could not record that decision; the task stays parked."
+        await answer_callback_query(callback_query.get("id", ""), outcome)
+        if message.get("message_id"):
+            await edit_message_text(
+                chat_id, int(message["message_id"]), f"{message.get('text') or ''}\n\n{outcome}".strip(),
+            )
+
     async def _handle_update(self, update: dict):
         """Process a single Telegram update."""
         # Route every outbound send during this update through this bot's token.
         # Set once here so the many send sites below need no per-call token.
         _active_bot_token.set(self._token)
+
+        callback_query = update.get("callback_query")
+        if callback_query:
+            await self._handle_callback_query(callback_query)
+            return
 
         message = update.get("message")
         if not message:
