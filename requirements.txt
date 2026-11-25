@@ -14,7 +14,7 @@ pydantic-settings==2.13.1
 sentence-transformers==5.2.3
 transformers==4.57.6  # gte-Qwen2 custom code incompatible with transformers 5.x
 chromadb==1.5.2
-torch==2.9.1  # ROCm 7.2 wheel from repo.radeon.com on the Linux host; PyPI wheel elsewhere
+torch>=2.1.0  # unpinned: the Linux host uses the ROCm wheel from repo.radeon.com and CI installs its own CPU build
 
 # File Watching
 watchdog==6.0.0
