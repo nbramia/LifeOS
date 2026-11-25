@@ -11,7 +11,14 @@ from typing import Callable, Optional
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
-from api.services.pebble_capture import PebbleCaptureConsumer, parse_framed_blocks, process_sync, ready_result
+from api.services.pebble_capture import (
+    FRAME_SIGNED,
+    CaptureIdentity,
+    PebbleCaptureConsumer,
+    parse_frames,
+    process_sync,
+    ready_result,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +81,13 @@ class PebbleCaptureWatcher:
     event storm cannot create a timer or inference thread per file. ``stop``
     rejects new work, cancels queued work, and waits for the currently active
     consumer call before returning.
+
+    Frame authentication: a ready result whose MAC verifies against
+    ``frame_key`` is always processed. Any other ready result is processed
+    with a warning while ``require_signature`` is off. With it on, such a
+    frame is processed only when the ledger already holds a plan for that
+    exact payload, so work admitted before signatures were required still
+    finishes; everything else is refused.
     """
 
     def __init__(
@@ -84,6 +98,8 @@ class PebbleCaptureWatcher:
         scan_seconds: float = 60,
         debounce_seconds: float = _DEBOUNCE_SECONDS,
         max_pending_paths: int = _MAX_PENDING_PATHS,
+        frame_key: Optional[bytes] = None,
+        require_signature: bool = False,
     ):
         if scan_seconds <= 0 or debounce_seconds < 0 or max_pending_paths < 1:
             raise ValueError("watcher timing and queue bounds must be positive")
@@ -92,6 +108,11 @@ class PebbleCaptureWatcher:
         self.scan_seconds = scan_seconds
         self.debounce_seconds = debounce_seconds
         self.max_pending_paths = max_pending_paths
+        self.frame_key = frame_key
+        self.require_signature = require_signature
+        # Identities already warned about, so a rescan every minute does not
+        # repeat the same warning.
+        self._signature_warned: set[str] = set()
         self._observer: Optional[Observer] = None
         self._consumer_thread: Optional[threading.Thread] = None
         self._condition = threading.Condition()
@@ -130,8 +151,9 @@ class PebbleCaptureWatcher:
                 return
             # Preserve bytes so universal-newline handling cannot make a CRLF
             # frame valid and a torn UTF-8 tail cannot hide later frames.
-            payloads = parse_framed_blocks(path.read_bytes())
-            for payload in payloads:
+            frames = parse_frames(path.read_bytes(), self.frame_key)
+            for frame in frames:
+                payload = frame.payload
                 with self._condition:
                     if self._stopping:
                         return
@@ -141,6 +163,8 @@ class PebbleCaptureWatcher:
                     # records, not work: skipping them keeps every scan quiet.
                     logger.debug("Pebble frame skipped: not a ready result")
                     continue
+                if frame.signature != FRAME_SIGNED and not self._admit_unsigned(payload, frame.signature):
+                    continue
                 try:
                     process_sync(self.consumer, payload)
                 except Exception as exc:
@@ -148,6 +172,26 @@ class PebbleCaptureWatcher:
                     logger.warning("Pebble capture remains pending (%s)", type(exc).__name__)
         except (OSError, UnicodeError) as exc:
             logger.warning("Pebble capture file could not be read (%s)", type(exc).__name__)
+
+    def _admit_unsigned(self, payload: dict, signature: str) -> bool:
+        """Decide whether a ready result without a verified MAC may proceed."""
+        identity, _, _ = ready_result(payload)
+        ledger = getattr(self.consumer, "ledger", None)
+        if self.require_signature:
+            if ledger is not None and ledger.admitted(payload):
+                return True
+            self._warn_once(identity, "Pebble frame refused: %s", signature)
+            return False
+        if ledger is None or not ledger.completed(identity):
+            self._warn_once(identity, "Pebble frame accepted without a verified signature: %s", signature)
+        return True
+
+    def _warn_once(self, identity: CaptureIdentity, message: str, signature: str) -> None:
+        if identity.key in self._signature_warned:
+            return
+        self._signature_warned.add(identity.key)
+        # The identity key is an opaque digest; no transcript or path is logged.
+        logger.warning(message + " (capture %s)", signature, identity.key[:12])
 
     def _recover_once(self) -> None:
         try:

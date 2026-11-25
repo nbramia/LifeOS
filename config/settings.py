@@ -1793,6 +1793,20 @@ class Settings(BaseSettings):
     pebble_capture_apply: bool = Field(default=False, alias="LIFEOS_PEBBLE_CAPTURE_APPLY")
     pebble_capture_dir: str = Field(default="LifeOS/Log/Pebble", alias="LIFEOS_PEBBLE_CAPTURE_DIR")
     pebble_capture_scan_seconds: int = Field(default=60, ge=10, alias="LIFEOS_PEBBLE_CAPTURE_SCAN_SECONDS")
+    pebble_frame_key_file: str = Field(
+        default="", alias="LIFEOS_PEBBLE_FRAME_KEY_FILE",
+        description="Path to the key file Pebble signs archive frames with "
+                    "(PEBBLE_FRAME_KEY_FILE on the receiver). Must be private "
+                    "to the API's user and live outside the vault. Empty "
+                    "skips verification."
+    )
+    pebble_require_frame_signature: bool = Field(
+        default=False, alias="LIFEOS_PEBBLE_REQUIRE_FRAME_SIGNATURE",
+        description="Refuse a ready Pebble frame whose MAC does not verify "
+                    "against LIFEOS_PEBBLE_FRAME_KEY_FILE, unless the ledger "
+                    "already holds a plan for that exact payload. Off, such "
+                    "frames are processed with a warning."
+    )
     pebble_classifier: str = Field(
         default="llm", alias="LIFEOS_PEBBLE_CLASSIFIER",
         description="Which classifier files a Pebble capture: 'llm' (default) "
