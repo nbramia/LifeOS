@@ -15,7 +15,9 @@ an agent created or assigned to an engine) gets the intersection of its own
 route's set and its creator's effective set, so a child never has more than
 the session that started it. Sessions nobody started (the operator's own, the
 board's Open, schedules and tasks the operator created) have no ceiling and
-run exactly as their route grants.
+run exactly as their route grants. So does the one exemption: a child the
+doctor's Hermes repair supervisor spawns for its repair
+(`is_doctor_repair_child`).
 
 How each route applies a ceiling:
 
@@ -201,6 +203,41 @@ class Lineage:
         return own if self.ceiling is None else own.intersect(self.ceiling)
 
 
+def is_doctor_repair_root(session_store, session) -> bool:
+    """Whether `session` is the doctor's Hermes repair supervisor.
+
+    Every field read here is written by server code and none by a model:
+    `origin="hermes"` and `routing="hermes"` only by
+    `hermes_session.resolve_hermes_caller_session_id`, the root `bot` from
+    the persona of the doctor's own Hermes conversation, and `workflow_id`
+    by `SessionStore.create` when it opens the repair record for a doctor
+    root. A task's `persona_id` field, a spawn argument, a tag or a prompt
+    reaches none of them.
+    """
+    from api.services.agent_worker.session_store import DOCTOR_PERSONA_ID
+
+    return bool(
+        session.parent_session_id is None
+        and session.origin == "hermes"
+        and session.routing == "hermes"
+        and session.bot == DOCTOR_PERSONA_ID
+        and session_store.get_repair(session.workflow_id) is not None
+    )
+
+
+def is_doctor_repair_child(session_store, session, creator) -> bool:
+    """Whether `session` is a child the doctor's repair supervisor spawned
+    for its repair: a direct `lifeos_agent_spawn` child (not a task the
+    supervisor created) carrying the supervisor's repair workflow, which
+    `lifeos_agent_spawn` attaches only after the operator approved a goal."""
+    return bool(
+        session.parent_session_id == creator.session_id
+        and session.workflow_id
+        and session.workflow_id == creator.workflow_id
+        and is_doctor_repair_root(session_store, creator)
+    )
+
+
 def resolve_lineage(
     session_store,
     session,
@@ -239,6 +276,11 @@ def resolve_lineage(
             creator = session_store.get_by_session_id(creator_id)
         if creator is None:
             tail, hops = _UNIDENTIFIED_CREATOR, len(creators) + 1
+            break
+        if is_doctor_repair_child(session_store, current, creator):
+            # The doctor's repair child runs as a session nobody started;
+            # its own children inherit from it as usual.
+            tail, hops = None, len(creators) + 1
             break
         creators.append(creator)
         current = creator

@@ -820,6 +820,14 @@ A child session never has more tools or privileges than the session that started
 
 A session's **creator** is its spawning parent (`parent_session_id`) or, for a session claimed from a task, the session the task names in `project_child_creator_session` or `agent_creator_session`. `resolve_lineage` walks creators up to a session nobody started and intersects their route sets; that intersection is the session's ceiling, and its effective set is its own route set intersected with the ceiling. A session with no creator (the operator's own, the board's Open, `/claude` and `/agent` spawns, schedules, and tasks the operator created) has no ceiling and runs exactly as its route grants. A creator named `unattested` (a task write from the shared HTTP MCP transport) or a creator row that no longer exists is treated as a Managed Agents session.
 
+**Doctor repair exemption.** A child the doctor's repair supervisor spawns for its repair has no ceiling: it runs exactly as its route grants, like a session nobody started, and its own children inherit from it as usual. `is_doctor_repair_child` requires all of:
+
+- the parent is the doctor's Hermes repair supervisor (`is_doctor_repair_root`): a root session with `origin="hermes"`, `routing="hermes"` and `bot="doctor"`, whose `workflow_id` names an existing repair record. `origin="hermes"` is written only by `hermes_session.resolve_hermes_caller_session_id`, which the Hermes proxy calls with the persona of the conversation it is relaying; `SessionStore.create` opens the repair record for that root;
+- the child is a direct `lifeos_agent_spawn` child of it (`parent_session_id`), not a task it created;
+- the child carries the supervisor's own `workflow_id`, which `lifeos_agent_spawn` attaches only after `doctor_repair.dispatch_allowed` confirms an operator-approved goal.
+
+None of these fields is reachable through a spawn argument, prompt text, task tag, task field or working directory: a claimed task's `persona_id` field sets `persona_id`, never `origin`, so a task claiming the doctor persona is not exempt. A native (non-Hermes) doctor session runs on `claude_code` with no ceiling, so its children are already unrestricted.
+
 How a ceiling applies, per child route:
 
 - **`claude_code`**: no Chrome in the ceiling → `--no-chrome` in place of `--chrome`, and the appended system prompt says the session has no browser. Restricted servers → `--strict-mcp-config --mcp-config <file>`, where the file lists only the allowed servers, copied from the user-scope `mcpServers` in `~/.claude.json`. It is written per turn into the session's private scratch directory with mode 0600 (`write_strict_mcp_config`); transcripts record server names only (`claude_code_spawn.payload.capabilities`). A restricted session with a board-assigned remote host fails closed, since the file exists only on the API host.
