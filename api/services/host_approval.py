@@ -133,15 +133,35 @@ class ApprovalStore:
 
     def create(
         self, *, caller: str, command_hash: str, chat_id: str,
-        expires_at: float | None, now: float | None = None,
-    ) -> str:
+        expires_at: float | None, now: float | None = None, max_pending: int | None = None,
+    ) -> str | None:
+        """Insert a pending request and return its id.
+
+        With `max_pending`, the count of this caller's waiting requests and
+        the insert run in one write transaction, so concurrent calls never
+        go past the limit; returns None when the caller is already at it.
+        """
         request_id = uuid.uuid4().hex
+        now = time.time() if now is None else now
         with self._connect() as conn:
-            conn.execute(
-                "INSERT INTO host_approval_requests "
-                "(id, created_at, expires_at, caller, command_hash, chat_id) VALUES (?, ?, ?, ?, ?, ?)",
-                (request_id, time.time() if now is None else now, expires_at, caller, command_hash, str(chat_id)),
-            )
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                if max_pending is not None and int(conn.execute(
+                    "SELECT COUNT(*) FROM host_approval_requests WHERE caller = ? AND state = 'pending' "
+                    "AND (expires_at IS NULL OR expires_at > ?)",
+                    (caller, now),
+                ).fetchone()[0]) >= max_pending:
+                    conn.execute("ROLLBACK")
+                    return None
+                conn.execute(
+                    "INSERT INTO host_approval_requests "
+                    "(id, created_at, expires_at, caller, command_hash, chat_id) VALUES (?, ?, ?, ?, ?, ?)",
+                    (request_id, now, expires_at, caller, command_hash, str(chat_id)),
+                )
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
         return request_id
 
     def attach_messages(self, request_id: str, message_ids: list[int]) -> None:
@@ -342,11 +362,6 @@ class ApprovalGate:
             elif row.state == "denied":
                 self.store.mark_reported(row.id, now=now)
                 return GateResult("denied", f"the operator refused request {row.short_id}", row)
-        if self.store.count_pending(caller, now=now) >= self.max_pending:
-            return GateResult(
-                "refused",
-                f"{self.max_pending} requests from this caller are already waiting for the operator",
-            )
         expires_at = None if self.timeout_seconds is None else now + self.timeout_seconds
 
         def message(short_id: str) -> str:
@@ -363,8 +378,13 @@ class ApprovalGate:
             return GateResult("refused", "the command is too long to show in one approval message")
         request_id = self.store.create(
             caller=caller, command_hash=command_hash, chat_id=self.chat_id,
-            expires_at=expires_at, now=now,
+            expires_at=expires_at, now=now, max_pending=self.max_pending,
         )
+        if request_id is None:
+            return GateResult(
+                "refused",
+                f"{self.max_pending} requests from this caller are already waiting for the operator",
+            )
         text = message(request_id[:8])
         message_ids = self.send(text)
         if not message_ids:

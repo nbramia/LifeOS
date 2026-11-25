@@ -125,24 +125,128 @@ _LS_FLAGS = frozenset({"-l", "-a", "-A", "-h", "-1", "-t", "-S", "-r", "-la", "-
 _GIT_VALUE_FLAG_RE = re.compile(r"^(-n\d{1,4}|-\d{1,4}|--max-count=\d{1,4}|--since=[^\s]{1,40}|--until=[^\s]{1,40}|-U\d{1,3})$")
 _COUNT_RE = re.compile(r"^\d{1,4}$")
 
-# Commands that are never sent for approval, because they run other commands
-# (so the path checks below would not see what they do), change privilege, or
-# move data off the host. The low-privilege account stays the real boundary;
-# this list removes the obvious ways around the path checks.
+# Commands that are never sent for approval: they run other commands (so the
+# path checks below would not see what they do), schedule or start work that
+# outlives the call, open an editor or pager with a command escape, change
+# privilege, or move data off the host. A command is matched by its name and
+# by the name of the program it resolves to on the run-as PATH (following
+# symlinks), each also without a version or variant suffix, so `python3.12`,
+# `vi` (a link to vim) and `nc.openbsd` match their entries. The low-privilege
+# account stays the real boundary; this list removes the ways around the path
+# checks.
 NEVER_APPROVED_COMMANDS = frozenset({
-    "sh", "bash", "zsh", "dash", "ksh", "mksh", "fish", "csh", "tcsh", "busybox",
+    # shells and command runners
+    "sh", "bash", "zsh", "dash", "ash", "ksh", "mksh", "fish", "csh", "tcsh", "busybox", "toybox",
+    "pwsh", "xonsh", "elvish", "nu", "rc", "es", "yash", "posh",
     "env", "xargs", "parallel", "nohup", "setsid", "timeout", "nice", "ionice", "stdbuf",
-    "watch", "script", "expect", "chroot", "unshare", "nsenter", "flock",
-    "find", "systemd-run", "sed", "make", "tar",
-    "sudo", "su", "doas", "pkexec", "runuser",
-    "python", "python2", "python3", "perl", "ruby", "node", "nodejs", "deno", "bun",
-    "php", "lua", "tclsh", "awk", "gawk", "mawk", "nawk",
-    "curl", "wget", "ssh", "scp", "sftp", "rsync", "nc", "ncat", "netcat", "socat",
-    "telnet", "ftp", "tftp", "mail", "sendmail",
+    "watch", "script", "expect", "chroot", "unshare", "nsenter", "flock", "time", "chrt",
+    "taskset", "prlimit", "numactl", "setpriv", "capsh", "sg", "newgrp", "runcon", "unbuffer",
+    "rlwrap", "entr", "watchexec", "run-parts", "start-stop-daemon", "tmux", "screen",
+    "dtach", "abduco", "byobu", "xdg-open", "gio", "open", "sensible-editor",
+    "sensible-pager", "sensible-browser", "editor", "pager", "select-editor",
+    "find", "sed", "make", "cmake", "ninja", "meson", "tar", "zip", "split",
+    # schedulers and service managers
+    "crontab", "at", "batch", "atq", "atrm", "anacron", "systemd-run", "systemctl",
+    "loginctl", "busctl", "dbus-send", "gdbus", "dbus-launch", "machinectl",
+    # editors and pagers
+    "vi", "vim", "nvim", "view", "vimdiff", "ex", "rvim", "rview", "gvim", "evim", "vimtutor",
+    "emacs", "emacsclient", "nano", "rnano", "pico", "ed", "red", "joe", "jed", "mcedit",
+    "micro", "hx", "helix", "kak", "ne", "less", "more", "most", "pg", "lv", "man", "info", "pinfo",
+    # interpreters, debuggers and build tools
+    "python", "pypy", "pydoc", "ipython", "jupyter", "perl", "ruby", "irb", "node", "nodejs",
+    "deno", "bun", "php", "lua", "luajit", "tclsh", "wish", "awk", "gawk", "mawk", "nawk",
+    "m4", "dc", "sqlite", "gdb", "lldb", "strace", "ltrace", "valgrind", "perf", "bpftrace",
+    "r", "rscript", "julia", "java", "jshell", "jrunscript", "scala", "groovy", "ghci",
+    "runghc", "ocaml", "guile", "racket", "sbcl", "clisp", "osascript",
+    "gcc", "g++", "cc", "c++", "clang", "clang++", "tcc", "go", "cargo", "rustc",
+    "pip", "pipx", "uv", "uvx", "poetry", "conda", "npm", "npx", "yarn", "pnpm", "corepack",
+    "apt", "apt-get", "dpkg", "snap", "flatpak", "rpm", "dnf", "yum", "brew",
+    # containers and sandboxes
+    "docker", "podman", "kubectl", "lxc", "nerdctl", "ctr", "crictl", "buildah",
+    "systemd-nspawn", "bwrap", "firejail", "proot", "fakeroot", "fakechroot",
+    # privilege
+    "sudo", "sudoedit", "visudo", "su", "doas", "pkexec", "runuser",
+    # network
+    "curl", "wget", "ssh", "scp", "sftp", "sshpass", "autossh", "mosh", "rsync", "nc", "ncat",
+    "netcat", "socat", "telnet", "ftp", "tftp", "lftp", "mail", "mailx", "mutt", "sendmail",
+    "openssl", "gnutls-cli", "dig", "nslookup", "host", "drill", "ping", "ping6", "traceroute",
+    "tracepath", "mtr", "nmap", "whois", "aria2c", "lynx", "w3m", "links", "elinks", "http",
+    "xh", "gh", "tailscale", "smbclient",
 })
-_NEVER_APPROVED_RE = re.compile(r"^(python|pypy|perl|ruby|node|php|lua)[\d.]*$")
-# Git subcommands that are never sent for approval: they reach other hosts.
-NEVER_APPROVED_GIT = frozenset({"push", "pull", "fetch", "clone", "ls-remote", "remote", "send-email", "submodule"})
+_NEVER_APPROVED_RE = re.compile(r"^(python|pypy|perl|ruby|node|php|lua|git-|ld-|ld\.so)")
+# Arguments that make an otherwise ordinary program run another command.
+# Single-dash forms (find's) match as written; long options also match any
+# abbreviation, since getopt_long and git both accept an unambiguous prefix.
+_EXEC_ARG_RE = re.compile(r"^-(exec|execdir|ok|okdir)\b")
+_EXEC_LONG_OPTIONS = (
+    "exec", "to-command", "checkpoint-action", "compress-program", "use-compress-program",
+    "filter", "command", "shell",
+)
+# Directories the run-as account may find a command in: this service's PATH
+# for commands, plus sudo's usual secure_path.
+_RESOLVE_PATH = SHELL_PATH + ":/usr/local/sbin:/usr/sbin:/sbin:/snap/bin"
+# Git subcommands that may be sent for approval: git's own commands (so an
+# alias, which may run a shell command, or a `git-*` program on PATH is never
+# one), less those that reach another host, run other programs, or change
+# configuration.
+_GIT_BUILTINS = frozenset("""
+add am annotate apply archive bisect blame branch bugreport bundle cat-file check-attr
+check-ignore check-mailmap check-ref-format checkout checkout--worker checkout-index cherry
+cherry-pick clean clone column commit commit-graph commit-tree config count-objects credential
+credential-cache credential-cache--daemon credential-store daemon describe diagnose diff
+diff-files diff-index diff-tree difftool difftool--helper fast-export fast-import fetch
+fetch-pack filter-branch fmt-merge-msg for-each-ref for-each-repo format-patch fsck
+fsck-objects fsmonitor--daemon gc get-tar-commit-id grep hash-object help hook http-backend
+http-fetch http-push imap-send index-pack init init-db instaweb interpret-trailers log
+ls-files ls-remote ls-tree mailinfo mailsplit maintenance merge merge-base merge-file
+merge-index merge-octopus merge-one-file merge-ours merge-recursive merge-recursive-ours
+merge-recursive-theirs merge-resolve merge-subtree merge-tree mergetool mktag mktree
+multi-pack-index mv name-rev notes pack-objects pack-redundant pack-refs patch-id pickaxe
+prune prune-packed pull push quiltimport range-diff read-tree rebase receive-pack reflog
+remote remote-ext remote-fd remote-ftp remote-ftps remote-http remote-https repack replace
+request-pull rerere reset restore rev-list rev-parse revert rm send-pack sh-i18n--envsubst
+shell shortlog show show-branch show-index show-ref sparse-checkout stage stash status
+stripspace submodule submodule--helper subtree switch symbolic-ref tag unpack-file
+unpack-objects update-index update-ref update-server-info upload-archive
+upload-archive--writer upload-pack var verify-commit verify-pack verify-tag version
+web--browse whatchanged worktree write-tree
+""".split())
+NEVER_APPROVED_GIT = frozenset({
+    # reach another host
+    "push", "pull", "fetch", "clone", "ls-remote", "remote", "send-email", "submodule",
+    "submodule--helper", "subtree", "fetch-pack", "send-pack", "upload-pack", "receive-pack",
+    "upload-archive", "upload-archive--writer", "remote-ext", "remote-fd", "remote-ftp",
+    "remote-ftps", "remote-http", "remote-https", "http-backend", "http-fetch", "http-push",
+    "imap-send", "daemon", "instaweb", "request-pull", "web--browse", "quiltimport",
+    # run other programs or change configuration
+    "config", "credential", "credential-cache", "credential-cache--daemon", "credential-store",
+    "maintenance", "hook", "difftool", "difftool--helper", "mergetool", "filter-branch",
+    "bisect", "for-each-repo", "shell", "help", "fsmonitor--daemon", "merge-one-file",
+    # open an editor for a message or a todo list (rebase also runs --exec)
+    "rebase", "commit", "merge", "tag", "notes", "revert", "cherry-pick", "am", "replace",
+})
+# Git arguments that run a program, or name a remote, whatever the subcommand.
+_GIT_EXEC_LONG_OPTIONS = (
+    "exec", "upload-pack", "receive-pack", "remote", "open-files-in-pager", "extcmd",
+    "tool", "config", "config-env", "edit", "edit-description", "edit-todo",
+)
+# Short options, alone or inside a cluster such as `-Oid`: grep -O runs a
+# pager command, add -e opens an editor.
+_GIT_EXEC_SHORT = {"grep": "O", "add": "e"}
+# Approved git runs with these overrides, so a subcommand that would open an
+# editor or a pager fails instead.
+_GIT_APPROVED_OVERRIDES = (
+    "-c", "core.editor=false", "-c", "sequence.editor=false", "-c", "core.pager=cat",
+    "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+)
+
+
+def _long_option_matches(arg: str, options: tuple[str, ...]) -> bool:
+    """Whether `arg` is `--name[=value]` for one of `options` or a prefix of one."""
+    if not arg.startswith("--") or len(arg) == 2:
+        return False
+    name = arg[2:].split("=", 1)[0]
+    return bool(name) and any(option.startswith(name) for option in options)
 
 # ── Errors and audit ──────────────────────────────────────────────────────
 
@@ -471,7 +575,7 @@ def fs_read(config: HostToolsConfig, arguments: dict) -> dict:
     size = target.stat().st_size
     with open(target, "rb") as f:
         data = f.read(limit)
-    if b"\x00" in data[:8192]:
+    if b"\x00" in data:
         raise HostToolError("binary files are not returned")
     content = redact(data.decode("utf-8", errors="replace"))
     result = {
@@ -561,6 +665,7 @@ def fs_write(config: HostToolsConfig, arguments: dict) -> dict:
     from api.services import host_write_guard
 
     guarded = name == "vault" and host_write_guard.guarded_path(rel)
+    old_bytes = None
     if expected is not None or guarded:
         old_bytes = target.read_bytes() if target.exists() else b""
         if expected is not None and hashlib.sha256(old_bytes).hexdigest() != expected.strip().lower():
@@ -573,18 +678,27 @@ def fs_write(config: HostToolsConfig, arguments: dict) -> dict:
                 raise HostToolError(refusal)
     old_mode = target.stat().st_mode & 0o7777 if target.exists() else None
     if mode == "append" and target.exists():
-        with open(target, "a", encoding="utf-8") as f:
-            f.write(content)
-    else:
-        atomic_write_text(target, content)
-        # The atomic write goes through a private temp file (mode 0600). Keep
-        # an overwritten file's mode, and give a new file ordinary 0644, so
-        # the run-as account can still read it.
-        os.chmod(target, old_mode if old_mode is not None else NEW_FILE_MODE)
+        # An append rewrites the whole file atomically, from the same bytes
+        # the checks above read, so a reader never sees half an append.
+        if old_bytes is None:
+            old_bytes = target.read_bytes()
+        try:
+            content = old_bytes.decode("utf-8") + content
+        except UnicodeDecodeError:
+            raise HostToolError("the file is not UTF-8 text, so it cannot be appended to")
+        encoded = content.encode("utf-8")
+        if len(encoded) > WRITE_MAX_BYTES:
+            raise HostToolError(f"the file would be over {WRITE_MAX_BYTES} bytes")
+    atomic_write_text(target, content)
+    # The atomic write goes through a private temp file (mode 0600). Keep
+    # an overwritten file's mode, and give a new file ordinary 0644, so
+    # the run-as account can still read it.
+    os.chmod(target, old_mode if old_mode is not None else NEW_FILE_MODE)
     result = {
         "root": name,
         "path": str(rel),
         "bytes": len(encoded),
+        # The hash of the whole file as written: pass it as expected_sha256.
         "sha256": hashlib.sha256(encoded).hexdigest(),
         "commit": None,
     }
@@ -784,23 +898,60 @@ def _cap(text: str) -> tuple[str, bool]:
     return raw[-SHELL_OUTPUT_MAX_BYTES:].decode("utf-8", errors="replace"), True
 
 
+def _name_variants(name: str) -> set[str]:
+    """`name`, lowercased, also without a `.suffix` and a trailing version."""
+    name = name.lower()
+    stem = name.split(".", 1)[0]
+    return {name, stem, stem.rstrip("0123456789.-_") or stem}
+
+
+def _command_names(head: str) -> set[str]:
+    """Every name `head` goes by: itself, and each program it resolves to."""
+    names = _name_variants(head)
+    for directory in _RESOLVE_PATH.split(":"):
+        candidate = os.path.join(directory, head)
+        try:
+            if os.path.isfile(candidate):
+                names |= _name_variants(os.path.basename(os.path.realpath(candidate)))
+        except OSError:
+            continue
+    return names
+
+
+def _never_approved(names: set[str]) -> bool:
+    return bool(names & NEVER_APPROVED_COMMANDS) or any(_NEVER_APPROVED_RE.match(n) for n in names)
+
+
 def check_approval_argv(config: HostToolsConfig, argv: list[str], cwd: Path) -> str | None:
     """Refusal for a command that may not be sent for approval, or None.
 
-    Every argument (and the value after any '=') that looks like a path must
-    stay inside a readable root and off the denylist, as for ls and tail.
+    The command, by name and by what it resolves to, must not be one that
+    runs other commands, schedules work, opens an editor or pager, changes
+    privilege or reaches the network. Git must name one of git's own
+    subcommands that stays on this host and runs nothing else. Every argument
+    (and the value after any '=') that looks like a path must stay inside a
+    readable root and off the denylist, as for ls and tail.
     """
-    head = argv[0].lower()
-    if head in NEVER_APPROVED_COMMANDS or _NEVER_APPROVED_RE.match(head):
+    names = _command_names(argv[0])
+    if _never_approved(names):
         return f"{argv[0]!r} is never run through approval"
-    if head == "git":
+    for arg in argv[1:]:
+        if _EXEC_ARG_RE.match(arg) or _long_option_matches(arg, _EXEC_LONG_OPTIONS):
+            return f"options that run another command are never run through approval: {arg!r}"
+    if "git" in names:
         if len(argv) > 1 and argv[1].startswith("-"):
             return f"git options before the subcommand are never run through approval: {argv[1]!r}"
         sub = argv[1] if len(argv) > 1 else ""
         if sub in NEVER_APPROVED_GIT:
             return f"git {sub!r} is never run through approval"
-    if head == "git":
+        if sub not in _GIT_BUILTINS:
+            return f"git {sub!r} is not one of git's own subcommands, so it is never run through approval"
         for arg in argv[2:]:
+            short = _GIT_EXEC_SHORT.get(sub)
+            if _long_option_matches(arg, _GIT_EXEC_LONG_OPTIONS) or (
+                short and arg.startswith("-") and not arg.startswith("--") and short in arg[1:]
+            ):
+                return f"git option {arg!r} is never run through approval"
             if not arg.startswith("-") and ":" in arg:
                 why = _check_git_path_arg(config, cwd, arg)
                 if why:
@@ -856,7 +1007,8 @@ def _shell_via_approval(
     if why:
         audit({**event, "decision": "refused", "reason": why}, path=config.audit_path)
         raise HostToolError(f"refused: {why}. Not sent for approval.")
-    digest = command_hash(caller=caller, run_as=user, cwd=cwd_label, argv=argv)
+    # Bound to the resolved directory the command runs in, not only its label.
+    digest = command_hash(caller=caller, run_as=user, cwd=f"{cwd_label}\n{cwd}", argv=argv)
     details = _approval_details(caller=caller, user=user, cwd_label=cwd_label, argv=argv, digest=digest)
     result = gate.check(caller=caller, command_hash=digest, details=details)
     row = result.request
@@ -899,6 +1051,8 @@ def shell(config: HostToolsConfig, arguments: dict, *, caller: str) -> dict:
         if approval is None:
             return pending
         execute, rule = argv, "approved"
+        if "git" in _command_names(argv[0]):
+            execute = [argv[0], *_GIT_APPROVED_OVERRIDES, *argv[1:]]
         event = {
             **event, "request_id": approval.id, "approver": approval.approver,
             "request_age_s": round(config.approvals.clock() - approval.created_at, 1),
