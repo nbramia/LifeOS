@@ -7,10 +7,14 @@ import { elements } from './session.js';
 // HTML-escape helper. The classic shell script keeps its own copy (it is used
 // pervasively by CRM / agent-thread / review-queue code that cannot import an ES
 // module); this exported copy serves the chat modules.
+// Safe in element text and in quoted attribute values.
 export function escapeHtml(text) {
-  const div = document.createElement('div');
-  div.textContent = text;
-  return div.innerHTML;
+  return String(text ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 // Local copy of the shell's scroll-to-bottom against the shared messages
@@ -66,12 +70,39 @@ export function updateMessage(messageId, content) {
   }
 }
 
+// Link targets chat will render: web pages and mail addresses only.
+const SAFE_HREF = /^(https?:|mailto:)/i;
+
+// Returns the href when it is allowed (input already HTML-escaped), else ''.
+export function safeHref(escapedUrl) {
+  // Ignore whitespace and control characters a browser strips before
+  // reading the scheme.
+  const probe = String(escapedUrl).replace(/[\u0000-\u0020\u007f-\u009f]/g, '');
+  return SAFE_HREF.test(probe) ? probe : '';
+}
+
+// Chat renders message text as text: the whole message is HTML-escaped first,
+// then a small markdown subset (links, bold, italics, code, line breaks) is
+// applied to the escaped text. Markdown images render as links, so no remote
+// resource is loaded by message content.
 export function formatContent(content) {
-  return content
+  const links = [];
+  const stash = (html) => `\u0000${links.push(html) - 1}\u0000`;
+  let text = escapeHtml(String(content ?? '').replace(/\u0000/g, ''));
+
+  text = text.replace(/!?\[([^\]\n]*)\]\(([^)\s]+)\)/g, (match, label, url) => {
+    const href = safeHref(url);
+    if (!href) return stash(label || '');
+    return stash(`<a href="${href}" target="_blank" rel="noopener noreferrer">${label || href}</a>`);
+  });
+
+  text = text
     .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
     .replace(/\*(.*?)\*/g, '<em>$1</em>')
     .replace(/`(.*?)`/g, '<code>$1</code>')
     .replace(/\n/g, '<br>');
+
+  return text.replace(/\u0000(\d+)\u0000/g, (m, i) => links[Number(i)]);
 }
 
 // Build the compact, collapsed-by-default "📄 N sources" block shared by the
@@ -90,12 +121,15 @@ export function buildSourcesHtml(sources) {
 
     if (sourceType === 'calendar' && src.url) {
       // Calendar sources use Google Calendar URL
-      html += `<a href="${src.url}" target="_blank" class="source-link">${fileName}</a>`;
+      const calendarHref = safeHref(escapeHtml(src.url));
+      html += calendarHref
+        ? `<a href="${calendarHref}" target="_blank" rel="noopener noreferrer" class="source-link">${escapeHtml(fileName)}</a>`
+        : `<span class="source-link">${escapeHtml(fileName)}</span>`;
     } else {
       // Vault sources use Obsidian URL
       const obsidianPath = src.obsidian_path || fileName;
       const obsidianUrl = `obsidian://open?vault=Notes%202025&file=${encodeURIComponent(obsidianPath)}`;
-      html += `<a href="${obsidianUrl}" class="source-link">📄 ${fileName}</a>`;
+      html += `<a href="${escapeHtml(obsidianUrl)}" class="source-link">📄 ${escapeHtml(fileName)}</a>`;
     }
   });
   html += `</div></div>`;

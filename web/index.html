@@ -3683,7 +3683,7 @@
                     const data = await response.json();
                     statusEl.innerHTML = `
                         <div class="modal-status success">
-                            Memory saved! Category: ${data.category}
+                            Memory saved! Category: ${escapeHtml(String(data.category))}
                         </div>
                     `;
                     saveBtn.textContent = 'Saved!';
