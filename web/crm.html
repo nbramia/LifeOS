@@ -9029,17 +9029,17 @@
             const email = person.emails?.[0];
             const phone = person.phone_numbers?.[0];
             if (email) {
-                contactHtml += `<a href="mailto:${email}">📧 ${email}</a>`;
+                contactHtml += `<a href="${contactHref('mailto:', email)}">📧 ${escapeHtml(email)}</a>`;
             }
             if (phone) {
-                contactHtml += `<a href="tel:${phone}">📱 ${phone}</a>`;
+                contactHtml += `<a href="${contactHref('tel:', phone)}">📱 ${escapeHtml(phone)}</a>`;
             }
             contactRow.innerHTML = contactHtml;
 
             // Tags
             if (person.tags && person.tags.length > 0) {
                 tagsRow.innerHTML = person.tags.map(tag =>
-                    `<span class="tag-chip">${tag}</span>`
+                    `<span class="tag-chip">${escapeHtml(tag)}</span>`
                 ).join('');
             } else {
                 tagsRow.innerHTML = '';
@@ -10229,10 +10229,12 @@
 
                 return `
                     <div class="split-source-item ${isSelected ? 'selected' : ''}"
-                         onclick="toggleContactSource('${escapeHtml(key)}')">
+                         data-key="${escapeHtml(key)}"
+                         onclick="toggleContactSource(this.dataset.key)">
                         <input type="checkbox" class="split-source-checkbox"
                                ${isSelected ? 'checked' : ''}
-                               onclick="event.stopPropagation(); toggleContactSource('${escapeHtml(key)}')">
+                               data-key="${escapeHtml(key)}"
+                               onclick="event.stopPropagation(); toggleContactSource(this.dataset.key)">
                         <span class="split-source-badge">${icon} ${label}</span>
                         <div class="split-source-info">
                             <div class="split-source-name">${escapeHtml(cs.identifier)}</div>
@@ -10306,7 +10308,8 @@
 
                 resultsEl.innerHTML = filtered.map(p => `
                     <div class="split-person-result ${splitTargetPersonId === p.id ? 'selected' : ''}"
-                         onclick="selectSplitTarget('${p.id}', '${escapeHtml(p.canonical_name)}')">
+                         data-person-id="${escapeHtml(p.id)}" data-person-name="${escapeHtml(p.canonical_name)}"
+                         onclick="selectSplitTarget(this.dataset.personId, this.dataset.personName)">
                         ${escapeHtml(p.canonical_name)}
                         ${p.company ? `<span style="color: var(--text-secondary);"> · ${escapeHtml(p.company)}</span>` : ''}
                     </div>
@@ -10838,10 +10841,10 @@
             } else {
                 let quickContactHtml = '';
                 if (person.emails && person.emails.length > 0) {
-                    quickContactHtml += `<a href="mailto:${person.emails[0]}" class="detail-contact-link">📧 ${escapeHtml(person.emails[0])}</a>`;
+                    quickContactHtml += `<a href="${contactHref('mailto:', person.emails[0])}" class="detail-contact-link">📧 ${escapeHtml(person.emails[0])}</a>`;
                 }
                 if (person.phone_numbers && person.phone_numbers.length > 0) {
-                    quickContactHtml += `<a href="tel:${person.phone_numbers[0]}" class="detail-contact-link">📞 ${escapeHtml(person.phone_numbers[0])}</a>`;
+                    quickContactHtml += `<a href="${contactHref('tel:', person.phone_numbers[0])}" class="detail-contact-link">📞 ${escapeHtml(person.phone_numbers[0])}</a>`;
                 }
                 quickContactEl.innerHTML = quickContactHtml;
             }
@@ -10900,10 +10903,10 @@
             let contactHtml = '';
 
             if (person.emails && person.emails.length > 0) {
-                contactHtml += `<div class="info-item"><div class="info-label">Email${person.emails.length > 1 ? 's' : ''}</div><div class="info-value">${person.emails.map(e => `<a href="mailto:${e}">${escapeHtml(e)}</a>`).join('<br>')}</div></div>`;
+                contactHtml += `<div class="info-item"><div class="info-label">Email${person.emails.length > 1 ? 's' : ''}</div><div class="info-value">${person.emails.map(e => `<a href="${contactHref('mailto:', e)}">${escapeHtml(e)}</a>`).join('<br>')}</div></div>`;
             }
             if (person.phone_numbers && person.phone_numbers.length > 0) {
-                contactHtml += `<div class="info-item"><div class="info-label">Phone${person.phone_numbers.length > 1 ? 's' : ''}</div><div class="info-value">${person.phone_numbers.map(p => `<a href="tel:${p}">${escapeHtml(p)}</a>`).join('<br>')}</div></div>`;
+                contactHtml += `<div class="info-item"><div class="info-label">Phone${person.phone_numbers.length > 1 ? 's' : ''}</div><div class="info-value">${person.phone_numbers.map(p => `<a href="${contactHref('tel:', p)}">${escapeHtml(p)}</a>`).join('<br>')}</div></div>`;
             }
             if (person.linkedin_url) {
                 contactHtml += `<div class="info-item"><div class="info-label">LinkedIn</div><div class="info-value"><a href="${person.linkedin_url}" target="_blank">View Profile</a></div></div>`;
@@ -10974,7 +10977,7 @@
             html += (person.tags || []).map(tag => `
                 <span class="detail-tag-chip">
                     ${escapeHtml(tag)}
-                    <span class="remove-tag" onclick="removeTag('${escapeHtml(tag)}')">×</span>
+                    <span class="remove-tag" data-tag="${escapeHtml(tag)}" onclick="removeTag(this.dataset.tag)">×</span>
                 </span>
             `).join('');
 
@@ -11418,7 +11421,7 @@
                     <div class="contact-row">
                         <div class="contact-icon-box">📧</div>
                         <div class="contact-values">
-                            ${person.emails.map(e => `<a href="mailto:${e}" class="contact-value-link">${escapeHtml(e)}</a>`).join('')}
+                            ${person.emails.map(e => `<a href="${contactHref('mailto:', e)}" class="contact-value-link">${escapeHtml(e)}</a>`).join('')}
                         </div>
                     </div>
                 `;
@@ -11430,7 +11433,7 @@
                     <div class="contact-row">
                         <div class="contact-icon-box">📞</div>
                         <div class="contact-values">
-                            ${person.phone_numbers.map(p => `<a href="tel:${p}" class="contact-value-link">${escapeHtml(p)}</a>`).join('')}
+                            ${person.phone_numbers.map(p => `<a href="${contactHref('tel:', p)}" class="contact-value-link">${escapeHtml(p)}</a>`).join('')}
                         </div>
                     </div>
                 `;
@@ -19976,7 +19979,7 @@
             if (allAvailableTags.length > 0) {
                 const topTags = allAvailableTags.slice(0, 10);  // Show up to 10 suggestions
                 suggestions.innerHTML = topTags.map(tag =>
-                    `<span class="tag-suggestion" onclick="selectTagSuggestion('${escapeHtml(tag)}')">${escapeHtml(tag)}</span>`
+                    `<span class="tag-suggestion" data-tag="${escapeHtml(tag)}" onclick="selectTagSuggestion(this.dataset.tag)">${escapeHtml(tag)}</span>`
                 ).join('');
             } else {
                 suggestions.innerHTML = '';
@@ -20105,10 +20108,19 @@
         }
 
         function escapeHtml(text) {
-            if (!text) return '';
-            const div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
+            if (text === null || text === undefined || text === '') return '';
+            return String(text)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
+        // Escaped href for a mailto:/tel: link; the value is URL-encoded first.
+        function contactHref(scheme, value) {
+            const encoded = encodeURIComponent(String(value)).replace(/%40/g, '@').replace(/%2B/g, '+');
+            return escapeHtml(scheme + encoded);
         }
 
         // Safe inside a double- or single-quoted HTML attribute value.
