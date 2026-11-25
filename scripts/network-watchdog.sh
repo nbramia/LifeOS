@@ -40,16 +40,27 @@
 # managed WiFi device.
 #
 # Linux: triggered by lifeos-network-watchdog.timer (installed by
-# setup-systemd.sh). macOS: not applicable (launchd/networkd differ).
+# setup-systemd.sh, which installs this script as a root-owned copy in
+# /usr/local/libexec/lifeos/; logs go to /var/log, state to /var/lib).
+# macOS: not applicable (launchd/networkd differ).
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-LOG_FILE="$PROJECT_DIR/logs/network-watchdog.log"
-DOWN_COUNT_FILE="$PROJECT_DIR/logs/network-watchdog.count"
-DOWN_SINCE_FILE="$PROJECT_DIR/logs/network-watchdog.since"
-TAILSCALE_RESTART_FILE="$PROJECT_DIR/logs/network-watchdog.tailscale-restart"
+# The systemd unit runs a root-owned copy of this script (installed by
+# setup-systemd.sh), so the checkout is named by LIFEOS_DIR there. Run in
+# place, it is the script's own checkout.
+PROJECT_DIR="${LIFEOS_DIR:-$(dirname "$SCRIPT_DIR")}"
+# Logs and state live in a directory the script owner controls: root-owned
+# paths under systemd (the unit sets these), the checkout's logs/ otherwise.
+STATE_DIR="${LIFEOS_NET_WATCHDOG_STATE_DIR:-$PROJECT_DIR/logs}"
+LOG_FILE="${LIFEOS_NET_WATCHDOG_LOG:-$PROJECT_DIR/logs/network-watchdog.log}"
+DOWN_COUNT_FILE="$STATE_DIR/network-watchdog.count"
+DOWN_SINCE_FILE="$STATE_DIR/network-watchdog.since"
+TAILSCALE_RESTART_FILE="$STATE_DIR/network-watchdog.tailscale-restart"
+# Account that runs checkout code on the script's behalf when the script itself
+# runs as root (set by the unit). Unset when run unprivileged.
+RUN_USER="${LIFEOS_NET_WATCHDOG_RUN_USER:-}"
 # Overridable for testing; defaults to the project .env in production.
 ENV_FILE="${ENV_FILE:-$PROJECT_DIR/.env}"
 # Minimum gap between tailscaled self-heal restarts, so a persistently wedged
@@ -83,7 +94,7 @@ case "$(_read_env LIFEOS_NETWORK_WATCHDOG_ENABLED | tr '[:upper:]' '[:lower:]')"
     *) exit 0 ;;
 esac
 
-mkdir -p "$PROJECT_DIR/logs"
+mkdir -p "$STATE_DIR" "$(dirname "$LOG_FILE")"
 
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
@@ -99,8 +110,15 @@ get_down_count() {
 }
 
 # Copy the notice to the bot-notices log (api/services/bot_notices.py). Best-effort.
+# Checkout code never runs as root: when this script is root, the helper runs as
+# the unprivileged account.
 record_bot_notice() {
-    printf '%s' "$1" | python3 -I "$PROJECT_DIR/api/services/bot_notices.py" "LifeOS/network-watchdog" > /dev/null 2>&1 || true
+    local as_user=()
+    if [ "$(id -u)" = "0" ]; then
+        [ -n "$RUN_USER" ] || return 0
+        as_user=(runuser -u "$RUN_USER" --)
+    fi
+    printf '%s' "$1" | "${as_user[@]}" python3 -I "$PROJECT_DIR/api/services/bot_notices.py" "LifeOS/network-watchdog" > /dev/null 2>&1 || true
 }
 
 send_telegram() {

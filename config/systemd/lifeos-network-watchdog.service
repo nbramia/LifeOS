@@ -5,5 +5,14 @@ After=NetworkManager.service
 [Service]
 Type=oneshot
 # Runs as root (no User=): repair needs nmcli/ip/modprobe/systemctl restart.
-WorkingDirectory=__LIFEOS_DIR__
-ExecStart=__LIFEOS_DIR__/scripts/network-watchdog.sh
+# The script is a root-owned copy installed by setup-systemd.sh, so nothing the
+# unprivileged user can write is executed as root. Its log and state are
+# root-owned too; the checkout is only read for .env, and its notice helper
+# runs as the unprivileged user.
+WorkingDirectory=/
+StateDirectory=lifeos-network-watchdog
+Environment=LIFEOS_DIR=__LIFEOS_DIR__
+Environment=LIFEOS_NET_WATCHDOG_RUN_USER=__USER__
+Environment=LIFEOS_NET_WATCHDOG_STATE_DIR=/var/lib/lifeos-network-watchdog
+Environment=LIFEOS_NET_WATCHDOG_LOG=/var/log/lifeos-network-watchdog.log
+ExecStart=/usr/local/libexec/lifeos/network-watchdog.sh
