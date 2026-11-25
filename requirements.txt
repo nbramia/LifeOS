@@ -1,64 +1,78 @@
+# Every package is pinned to a tested version. auto-deploy.sh runs
+# `pip install -r requirements.txt` without -U, so changing a pin here takes
+# effect on the next deploy. Advisory fixes that need a new major version
+# (starlette 1.x, Pillow 13, cryptography 48+) are not applied; chromadb has an
+# advisory with no fixed release (it listens only on 127.0.0.1).
+
 # Core Framework
-fastapi>=0.109.0
-uvicorn[standard]>=0.27.0
-pydantic>=2.5.0
-pydantic-settings>=2.1.0
+fastapi==0.135.1
+uvicorn[standard]==0.41.0
+pydantic==2.12.5
+pydantic-settings==2.13.1
 
 # Embeddings & Vector DB
-sentence-transformers>=2.2.0
-transformers>=4.40,<5  # gte-Qwen2 custom code incompatible with transformers 5.x
-chromadb>=0.4.22
-torch>=2.1.0
+sentence-transformers==5.2.3
+transformers==4.57.6  # gte-Qwen2 custom code incompatible with transformers 5.x
+chromadb==1.5.2
+torch>=2.1.0  # unpinned: the Linux host uses the ROCm wheel from repo.radeon.com and CI installs its own CPU build
 
 # File Watching
-watchdog>=3.0.0
+watchdog==6.0.0
 
 # Markdown Processing
-python-frontmatter>=1.1.0
-tiktoken>=0.5.0
-markdownify>=0.11.0  # HTML to Markdown conversion
-beautifulsoup4>=4.12.0  # HTML parsing for GDoc CSS stripping
+python-frontmatter==1.1.0
+tiktoken==0.12.0
+markdownify==1.2.2  # HTML to Markdown conversion
+beautifulsoup4==4.14.3  # HTML parsing for GDoc CSS stripping
 
 # Configuration
-pyyaml>=6.0
+pyyaml==6.0.3
 
 # Claude API
-anthropic>=0.18.0
+anthropic==0.84.0
 
 # Google APIs
-google-auth>=2.27.0
-google-auth-oauthlib>=1.2.0
-google-api-python-client>=2.116.0
+google-auth==2.48.0
+google-auth-oauthlib==1.3.0
+google-api-python-client==2.191.0
 
 # Linting
-ruff>=0.15.0
+ruff==0.15.5
 
 # Testing
-pytest>=7.4.0
-pytest-asyncio>=0.23.0
-pytest-xdist>=3.5.0  # Parallel test execution
-pytest-playwright>=0.7.0,<0.8  # Browser-based UI tests; tests/conftest.py overrides its fixtures by exact signature
-playwright>=1.40.0
-httpx>=0.26.0
-Pillow>=10.0  # Avatar face crops (api/services/profile_crop.py); image assertions in web manifest tests
+pytest==9.0.2
+pytest-asyncio==1.3.0
+pytest-xdist==3.8.0  # Parallel test execution
+pytest-playwright==0.7.2  # Browser-based UI tests; tests/conftest.py overrides its fixtures by exact signature
+playwright>=1.40.0  # unpinned: the browser build must match the CI runner image
+httpx==0.28.1
+Pillow==12.3.0  # Avatar face crops (api/services/profile_crop.py); image assertions in web manifest tests
 
 # Scheduling
-croniter>=2.0.0
+croniter==6.0.0
 
 # Utilities
-python-dotenv>=1.0.0
-rapidfuzz>=3.6.0  # Fast fuzzy string matching for entity resolution
-python-multipart
-psutil
+python-dotenv==1.2.2
+rapidfuzz==3.14.3  # Fast fuzzy string matching for entity resolution
+python-multipart==0.0.31
+psutil==7.2.2
 
 # Dailies journal source (Home's Postgres, read-only role)
-psycopg[binary]>=3.2
+psycopg[binary]==3.3.8
 
 # Financial Data
-monarchmoneycommunity>=1.3.0  # Community fork with api.monarch.com domain fix
+monarchmoneycommunity==1.3.0  # Community fork with api.monarch.com domain fix
 
 # Web Search
-ddgs>=9.0  # DuckDuckGo web search (no API key) — backend-agnostic search_web (#467)
+ddgs==9.14.4  # DuckDuckGo web search (no API key) — backend-agnostic search_web (#467)
 
 # macOS Integrations (optional)
 pyobjc-framework-Contacts>=10.0; sys_platform == "darwin"  # Apple Contacts integration
+
+
+# Transitive dependencies pinned for security advisories (lowest fixed release
+# within the current major version). Not imported directly.
+aiohttp==3.14.4
+yarl==1.25.1  # required by aiohttp 3.14.x
+cryptography==46.0.7
+urllib3==2.8.0
