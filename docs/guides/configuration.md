@@ -470,6 +470,8 @@ A capture device (e.g. the Pebble Index ring) posts transcriptions here. See [jo
 | `LIFEOS_PEBBLE_CAPTURE_APPLY` | bool | `false` | Permit Pebble filing effects after classification-only validation; false records plans without creating tasks or schedules. |
 | `LIFEOS_PEBBLE_CAPTURE_DIR` | str | `LifeOS/Log/Pebble` | Producer-owned Pebble archive directory under the vault. |
 | `LIFEOS_PEBBLE_CAPTURE_SCAN_SECONDS` | int | `60` | Startup/periodic recovery scan interval, seconds (minimum `10`). |
+| `LIFEOS_PEBBLE_FRAME_KEY_FILE` | str | — | Path to the shared HMAC key the Pebble receiver signs capture frames with (`PEBBLE_FRAME_KEY_FILE` on the receiver). Must be readable only by the service user. Unset: frames are read without signature checks. See [pebble-capture.md](pebble-capture.md). |
+| `LIFEOS_PEBBLE_REQUIRE_FRAME_SIGNATURE` | bool | `false` | Act only on frames whose signature verifies against `LIFEOS_PEBBLE_FRAME_KEY_FILE`, or on unsigned frames whose capture the ledger has already planned. |
 | `LIFEOS_PEBBLE_HANDOFF_PHRASE` | str | — | A capture opening with this phrase is piped to the hand-off command instead of filed. Empty disables. See [pebble-capture.md](pebble-capture.md#addressed-captures-hand-off). |
 | `LIFEOS_PEBBLE_HANDOFF_COMMAND` | str | — | Command that receives an addressed capture's message on stdin (shell-style words, no shell). Empty disables. |
 

@@ -249,7 +249,7 @@ async def lifespan(app: FastAPI):
         # default until dry-run validation is complete.
         if settings.pebble_capture_enabled:
             try:
-                from api.services.pebble_capture import CaptureLedger, PebbleCaptureConsumer
+                from api.services.pebble_capture import CaptureLedger, PebbleCaptureConsumer, load_frame_key
                 from api.services.pebble_handoff import configured_handoff
                 from api.services.pebble_capture_watcher import PebbleCaptureWatcher
                 from api.services.scheduler_store import get_scheduler_store
@@ -264,8 +264,19 @@ async def lifespan(app: FastAPI):
                         settings.pebble_handoff_phrase, settings.pebble_handoff_command,
                     ),
                 )
+                try:
+                    frame_key = load_frame_key(settings.pebble_frame_key_file)
+                except Exception as e:
+                    # Unverifiable frames are then refused when signatures are
+                    # required, and processed with a warning otherwise.
+                    frame_key = None
+                    logger.error(f"Pebble frame key could not be loaded: {e}")
+                if frame_key is None and settings.pebble_require_frame_signature:
+                    logger.error("Pebble frame signatures are required but no frame key is loaded")
                 _pebble_capture_watcher = PebbleCaptureWatcher(
                     capture_dir, consumer, scan_seconds=settings.pebble_capture_scan_seconds,
+                    frame_key=frame_key,
+                    require_signature=settings.pebble_require_frame_signature,
                 )
                 # Observer setup may touch a network-backed vault. Keep even that
                 # bounded filesystem work off FastAPI's event loop; startup

@@ -15,11 +15,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import hmac
 import ipaddress
 import json
 import logging
+import os
 import re
 import sqlite3
+import stat
 import threading
 import time
 import unicodedata
@@ -177,13 +180,73 @@ def _loopback_llm_url(value: Any) -> str:
     return value
 
 
+FRAME_SIGNED = "signed"
+FRAME_UNSIGNED = "unsigned"
+FRAME_BAD_SIGNATURE = "bad_signature"
+FRAME_UNVERIFIED = "unverified"
+_FRAME_MAC_RE = re.compile(r"^<!-- pebble-capture-v1-mac hmac-sha256=([0-9a-f]{64}) -->$")
+_FRAME_MAC_CONTEXT = b"pebble-capture-v1\0"
+_MIN_FRAME_KEY_BYTES = 32
+
+
+@dataclass(frozen=True)
+class FramedRecord:
+    """One producer frame and whether a MAC line authenticates it.
+
+    ``signature`` is ``signed`` (the MAC verifies), ``unsigned`` (no MAC
+    line), ``bad_signature`` (a MAC line that does not verify), or
+    ``unverified`` (a MAC line, but no key to check it with).
+    """
+    payload: dict[str, Any]
+    signature: str
+
+
+def frame_mac(key: bytes, raw_json: bytes) -> str:
+    """The producer's frame MAC: HMAC-SHA256 over a context label and the payload."""
+    return hmac.new(key, _FRAME_MAC_CONTEXT + raw_json, hashlib.sha256).hexdigest()
+
+
+def load_frame_key(path_text: str) -> Optional[bytes]:
+    """Read the shared frame key, or None when no key file is configured.
+
+    The file must be a regular file owned by this user and closed to group
+    and others; its content, stripped of surrounding whitespace, is the key.
+    """
+    if not path_text:
+        return None
+    path = Path(path_text).expanduser()
+    status = path.lstat()
+    if not stat.S_ISREG(status.st_mode):
+        raise PebbleCaptureError("Pebble frame key must be a regular file")
+    if status.st_uid != os.getuid() or status.st_mode & 0o077:
+        raise PebbleCaptureError("Pebble frame key must be private to this user")
+    key = path.read_bytes().strip()
+    if len(key) < _MIN_FRAME_KEY_BYTES:
+        raise PebbleCaptureError("Pebble frame key is too short")
+    return key
+
+
+def payload_digest(payload: dict[str, Any]) -> str:
+    """The ledger's digest of one result payload."""
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    ).hexdigest()
+
+
 def parse_framed_blocks(document: str | bytes) -> list[dict[str, Any]]:
+    """Read only exact v1 producer frames, never the human-readable view."""
+    return [record.payload for record in parse_frames(document)]
+
+
+def parse_frames(document: str | bytes, key: Optional[bytes] = None) -> list[FramedRecord]:
     """Read only exact v1 producer frames, never the human-readable view.
 
     The framing's byte count and repeated digest deliberately make a partial
     sync write, a truncated final line, and transcript-shaped Markdown inert.
     Invalid blocks are ignored independently so one damaged historical record
-    cannot prevent recovery of a later valid one.
+    cannot prevent recovery of a later valid one.  The digest is integrity
+    only; authenticity comes from the MAC line that may follow the end
+    marker, checked against ``key``.
     """
     start_re = re.compile(r"^<!-- pebble-capture-v1 bytes=(\d+) sha256=([0-9a-f]{64}) -->$")
     end_re = re.compile(r"^<!-- /pebble-capture-v1 sha256=([0-9a-f]{64}) -->$")
@@ -192,7 +255,7 @@ def parse_framed_blocks(document: str | bytes) -> list[dict[str, Any]]:
     # bytes so an unrelated torn UTF-8 tail cannot hide later valid frames.
     encoded_document = document.encode("utf-8") if isinstance(document, str) else document
     lines = encoded_document.split(b"\n")
-    blocks: list[dict[str, Any]] = []
+    blocks: list[FramedRecord] = []
     for index, line in enumerate(lines[:-2]):
         try:
             start_line = line.decode("ascii")
@@ -217,8 +280,23 @@ def parse_framed_blocks(document: str | bytes) -> list[dict[str, Any]]:
             continue
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
         if isinstance(payload, dict) and canonical.encode("utf-8") == raw_json:
-            blocks.append(payload)
+            blocks.append(FramedRecord(payload, _frame_signature(lines, index + 3, raw_json, key)))
     return blocks
+
+
+def _frame_signature(lines: list[bytes], mac_index: int, raw_json: bytes, key: Optional[bytes]) -> str:
+    try:
+        mac_line = lines[mac_index].decode("ascii") if mac_index < len(lines) else ""
+    except UnicodeDecodeError:
+        mac_line = ""
+    match = _FRAME_MAC_RE.fullmatch(mac_line)
+    if match is None:
+        return FRAME_UNSIGNED
+    if key is None:
+        return FRAME_UNVERIFIED
+    if hmac.compare_digest(match.group(1), frame_mac(key, raw_json)):
+        return FRAME_SIGNED
+    return FRAME_BAD_SIGNATURE
 
 
 @dataclass(frozen=True)
@@ -463,6 +541,15 @@ class CaptureLedger:
         if row["revision"] != revision:
             return "revision_changed"
         return "same" if row["payload_digest"] == digest else "conflict"
+
+    def admitted(self, payload: dict[str, Any]) -> bool:
+        """Whether this exact payload already holds a plan in the ledger."""
+        identity, revision, _ = ready_result(payload)
+        return self.revision_state(identity, revision, payload_digest(payload)) == "same"
+
+    def completed(self, identity: CaptureIdentity) -> bool:
+        effect = self.effect(identity, -1)
+        return bool(effect and effect["state"] == "applied")
 
     def load_plan(self, identity: CaptureIdentity) -> list[PlannedAction]:
         with self._connect() as db:
@@ -2082,7 +2169,7 @@ class PebbleCaptureConsumer:
         identity, revision, final_text = ready_result(payload)
         recorded_at = str(payload["recorded_at_utc"])
         # A completed replay never invokes local inference again.
-        digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+        digest = payload_digest(payload)
         revision_state = self.ledger.revision_state(identity, revision, digest)
         if revision_state in {"revision_changed", "conflict"}:
             return revision_state

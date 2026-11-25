@@ -1,7 +1,7 @@
 # Pebble Capture Filing
 
 **Status:** Complete
-**Last Updated:** 2026-11-19
+**Last Updated:** 2026-11-25
 **Audience:** Operators
 
 Pebble owns `LifeOS/Log/Pebble`, where each recording day is two files:
@@ -34,6 +34,33 @@ per file. Shutdown rejects new events, cancels queued work, and drains the one
 active consumer before reporting stopped. A changed final revision is held
 for review rather than silently reclassifying or recreating effects; a pending
 raw revision creates no receipt, so a later ready reconciliation can proceed.
+
+## Frame Signatures
+
+A frame's sha256 digest is integrity only: anyone who can write a vault file
+can compute one. Pebble therefore signs each frame it writes with a key held
+outside the vault. With `PEBBLE_FRAME_KEY_FILE` set on the receiver, a fourth
+line follows each frame's end marker, an HMAC-SHA256 of the payload (format in
+Pebble's `schema/capture-block-v1.md`). LifeOS checks it against the same key
+file, named by `LIFEOS_PEBBLE_FRAME_KEY_FILE`. The file must be a regular file
+private to the API's user; a key that fails those checks is not loaded and is
+logged at startup.
+
+`LIFEOS_PEBBLE_REQUIRE_FRAME_SIGNATURE` decides what happens to a ready
+result whose MAC is missing or does not verify:
+
+- **Off (default):** it is processed, with one warning per capture. A capture
+  already complete in the ledger is skipped without a warning.
+- **On:** it is refused with one warning per capture, unless the ledger
+  already holds a plan for that exact payload. Captures planned or completed
+  before signatures were required therefore still finish and are never run
+  again; a new unsigned or forged frame files nothing.
+
+`scripts/pebble_frame_report.py` reads the directory and the ledger without
+writing and prints counts per signature state, including `would_refuse`: the
+frames the watcher would refuse with signatures required. Turn the setting on
+only once signed captures are arriving and completing (`signed.complete`
+rises) and `would_refuse` is zero.
 
 ## Filing Rules
 
@@ -132,6 +159,8 @@ own log and digest are untouched, as for every capture.
 | `LIFEOS_PEBBLE_CAPTURE_APPLY` | `false` | Permit canonical task/schedule/card writes after dry-run validation. |
 | `LIFEOS_PEBBLE_CAPTURE_DIR` | `LifeOS/Log/Pebble` | Producer-owned archive location; only this directory is accepted. |
 | `LIFEOS_PEBBLE_CAPTURE_SCAN_SECONDS` | `60` | Periodic recovery scan interval (minimum 10). |
+| `LIFEOS_PEBBLE_FRAME_KEY_FILE` | empty | Key file Pebble signs frames with (above). Empty skips verification. |
+| `LIFEOS_PEBBLE_REQUIRE_FRAME_SIGNATURE` | `false` | Refuse ready results without a verifying MAC unless already planned (above). |
 | `LIFEOS_PEBBLE_HANDOFF_PHRASE` | empty | Phrase that addresses a capture to the hand-off command (above). Empty disables the hand-off. |
 | `LIFEOS_PEBBLE_HANDOFF_COMMAND` | empty | Command that receives an addressed capture's message on stdin. Empty disables the hand-off. |
 | `LIFEOS_PEBBLE_CLASSIFIER` | `llm` | Which classifier files a capture: `llm` (`PebbleJournalClassifier`, below) or `jev` (`JevPebbleClassifier`, TypeSafe's typed-judgment API; requires `TYPESAFE_API_KEY`). |
