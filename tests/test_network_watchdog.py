@@ -237,3 +237,24 @@ def test_restarts_again_once_cooldown_elapses(sandbox):
 
     restart_calls = sum(1 for a in sandbox.actions() if a.startswith("systemctl restart"))
     assert restart_calls == 2
+
+
+def test_state_and_log_follow_the_root_owned_locations(sandbox, tmp_path):
+    """Under the unit, state and log go to the configured dirs, not the checkout's logs/."""
+    sandbox.with_tailscale()
+    state_dir = tmp_path / "var_lib"
+    log_file = tmp_path / "var_log" / "lifeos-network-watchdog.log"
+    checkout = sandbox.project_dir
+    result = sandbox.run(
+        state="Running",
+        extra_env={
+            "LIFEOS_DIR": str(checkout),
+            "LIFEOS_NET_WATCHDOG_STATE_DIR": str(state_dir),
+            "LIFEOS_NET_WATCHDOG_LOG": str(log_file),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (state_dir / "network-watchdog.tailscale-restart").exists()
+    assert "tailscaled" in log_file.read_text()
+    assert not (checkout / "logs").exists()

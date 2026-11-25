@@ -130,6 +130,15 @@ echo "  Agent Worker: $AGENT_WORKER_AUTOSTART"
 echo "  Auto-Deploy:  $AUTODEPLOY_ENABLED"
 echo ""
 
+# Root-owned copies of everything a root unit executes. The checkout is writable
+# by the unprivileged user, so a root unit must never run code from it.
+ROOT_LIBEXEC_DIR="/usr/local/libexec/lifeos"
+echo "Installing root-owned watchdog script to $ROOT_LIBEXEC_DIR..."
+install -d -m 0755 -o root -g root "$ROOT_LIBEXEC_DIR"
+install -m 0755 -o root -g root "$SCRIPT_DIR/network-watchdog.sh" "$ROOT_LIBEXEC_DIR/network-watchdog.sh"
+echo "  Installed $ROOT_LIBEXEC_DIR/network-watchdog.sh"
+echo ""
+
 # Install unit files with variable substitution
 echo "Installing unit files to $SYSTEMD_DST..."
 for unit in "$SYSTEMD_SRC"/*.service "$SYSTEMD_SRC"/*.timer; do
