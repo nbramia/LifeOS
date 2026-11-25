@@ -60,7 +60,9 @@ from zoneinfo import ZoneInfo
 from config.settings import settings
 from api.services.agent_board import SNOOZED_UNTIL_FIELD, is_snoozed, parse_snoozed_until
 from api.services.atomic_write import atomic_write_text
+from api.services.markdown_lines import split_body_lines
 from api.services.operation_lock import exclusive_operation_lock
+from api.services.scheduler_validation import validate_entry_fields
 
 logger = logging.getLogger(__name__)
 
@@ -541,11 +543,12 @@ def _parse_entry_line(line: str) -> Optional[ScheduleEntry]:
 def _format_entry_block(entry: ScheduleEntry) -> list[str]:
     """ScheduleEntry → its markdown checkbox line plus an indented ``> ``
     blockquote body carrying the human-editable ``message_content`` (one line
-    per content line). Empty content emits no body lines.
+    per content line, split at every boundary ``str.splitlines()`` reads, so
+    each body line keeps its prefix). Empty content emits no body lines.
     """
     lines = [_format_entry_line(entry)]
     if entry.message_content:
-        for content_line in entry.message_content.split("\n"):
+        for content_line in split_body_lines(entry.message_content):
             lines.append(f"{_BODY_INDENT}> {content_line}" if content_line else f"{_BODY_INDENT}>")
     return lines
 
@@ -843,6 +846,10 @@ class SchedulerStore:
         the block a reindex keeps. When no block carries the id (deleted or
         re-id'd by hand), nothing is written: the entry is dropped from the
         cache and None is returned, so callers treat it as an unknown id.
+
+        Every value a change writes into the entry line is a single-line
+        value (``validate_entry_fields``); one that isn't raises
+        ``ScheduleActionValidationError`` before anything is written.
         """
         lines = self._read_inbox_lines()
         found = None
@@ -859,6 +866,7 @@ class SchedulerStore:
         changes = changes_for(current)
         target = dataclasses.replace(current, **changes)
         attrs = [attr for attr in changes if getattr(disk, attr) != getattr(target, attr)]
+        validate_entry_fields({attr: getattr(target, attr) for attr in attrs})
         block = _edit_block_lines(lines[start:end], target, attrs)
         if block != lines[start:end]:
             self._write_inbox_lines(lines[:start] + block + lines[end:])
@@ -884,16 +892,22 @@ class SchedulerStore:
     # ------------------------------------------------------------------
 
     def create(self, action: Optional[str] = None, _log_content: bool = True, **kwargs) -> ScheduleEntry:
+        """Create a schedule at the top of Inbox.md. Raises
+        ``ScheduleActionValidationError`` when a value written into the entry
+        line isn't a single-line value (``validate_entry_fields``)."""
         with self._lock:
             # Default action from legacy message_type when not given explicitly.
             if action is None:
                 action = _LEGACY_TYPE_TO_ACTION.get(kwargs.get("message_type", "static"), "notify")
+            validate_entry_fields({**kwargs, "action": action})
             entry = ScheduleEntry(
                 id=uuid.uuid4().hex[:8],
                 created_at=datetime.now(timezone.utc).isoformat(),
                 action=action,
                 **kwargs,
             )
+            # The cached entry reads exactly as its body will be re-read.
+            entry.message_content = "\n".join(split_body_lines(entry.message_content or ""))
             # Same rule as update() and rebuild_index(): a disabled entry has
             # no next fire, so the create reply never shows one.
             entry.next_trigger_at = compute_next_trigger(entry) if entry.enabled else None

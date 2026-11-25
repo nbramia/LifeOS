@@ -38,6 +38,7 @@ from api.services.agent_board import (
     is_snoozed as _is_snoozed,
 )
 from api.services.atomic_write import atomic_write_text, atomic_write_lines
+from api.services.markdown_lines import LINE_BREAKS, has_line_break, split_body_lines
 from api.services.operation_lock import exclusive_operation_lock
 
 logger = logging.getLogger(__name__)
@@ -89,22 +90,61 @@ def validate_context(context: object) -> None:
 _CAS_MAX_RETRIES = 3
 
 
+VALID_PRIORITIES = ("high", "medium", "low")
+# A due date is any ISO calendar date `date.fromisoformat` accepts, written
+# with digits and hyphens only (YYYY-MM-DD or YYYYMMDD).
+_DUE_DATE_CHARS_RE = re.compile(r"\d{4}-?\d{2}-?\d{2}")
+
+
+def _check_single_line(name: str, value: str) -> None:
+    """Raise `ValueError` unless `value` is a single-line value for the task
+    line: no line break of any kind (see `api/services/markdown_lines.py`),
+    no `]` and no `<!--`."""
+    if has_line_break(value):
+        raise ValueError(f"{name} must be a single line")
+    for bad in ("]", "<!--"):
+        if bad in value:
+            raise ValueError(f"{name} must not contain {bad!r}")
+
+
+def _validate_priority_and_due(
+    priority: Optional[str] = None, due_date: Optional[str] = None,
+) -> None:
+    """Raise `ValueError` unless `priority` is one of `VALID_PRIORITIES` (or
+    empty) and `due_date` is a `YYYY-MM-DD` calendar date (or empty)."""
+    if priority is not None and priority not in ("", *VALID_PRIORITIES):
+        raise ValueError(
+            "priority must be one of: " + ", ".join(VALID_PRIORITIES) + ", or empty"
+        )
+    if due_date is not None and due_date != "":
+        valid = isinstance(due_date, str) and _DUE_DATE_CHARS_RE.fullmatch(due_date) is not None
+        if valid:
+            try:
+                date.fromisoformat(due_date)
+            except ValueError:
+                valid = False
+        if not valid:
+            raise ValueError("due_date must be YYYY-MM-DD, or empty")
+
+
 def _validate_text_fields(
     description: Optional[str] = None,
     notes: Optional[str] = None,
     fields: Optional[dict] = None,
+    tags: Optional[list] = None,
 ) -> None:
-    """Reject description/notes/fields content that would corrupt the task
-    line's format or hijack another task's id comment when written back.
+    """Reject description/notes/fields/tags content that would corrupt the
+    task line's format or hijack another task's id comment when written back.
 
-    A newline in `description` or a `fields` value would split the single
-    checkbox line; a `]` would truncate an inline field and leak the rest
-    into the description; an HTML comment opener (`<!--`) could forge a new
-    `<!-- id:.. -->`, hijacking another task's id on the next reindex. Notes
-    lines are allowed to be multi-line (that's their whole point) but not
-    `\\r` (would desync from the `\\n`-joined body) or `<!--`. A `fields` key
-    must be a bare word (`_format_task_line` interpolates it directly as
-    `[key:: value]`) and must not shadow a reserved key (see
+    `description`, each `fields` value and each tag are single-line values
+    (`_check_single_line`): a line break of any kind `str.splitlines()`
+    reads would split the checkbox line, a `]` would truncate an inline
+    field and leak the rest into the description, and an HTML comment
+    opener (`<!--`) could forge a new `<!-- id:.. -->`, hijacking another
+    task's id on the next reindex. Notes are multi-line (that's their whole
+    point) with `\\n` as their only line break, and no line holds `<!--`. A
+    `fields` key must be a bare word (`_format_task_line` interpolates it
+    directly as `[key:: value]`) and must not shadow a reserved key (see
     `_RESERVED_FIELD_KEYS`).
 
     Raises `ValueError` — never silently truncates or strips, since that
@@ -112,12 +152,10 @@ def _validate_text_fields(
     The route layer maps `ValueError` to HTTP 422.
     """
     if description is not None:
-        for bad in ("\n", "\r", "]", "<!--"):
-            if bad in description:
-                raise ValueError(f"description must not contain {bad!r}")
+        _check_single_line("description", description)
     if notes is not None:
         for line in notes.split("\n"):
-            for bad in ("\r", "<!--"):
+            for bad in (*sorted(LINE_BREAKS - {"\n"}), "<!--"):
                 if bad in line:
                     raise ValueError(f"notes must not contain {bad!r}")
     if fields:
@@ -128,9 +166,11 @@ def _validate_text_fields(
                 raise ValueError(f"'{key}' is a reserved field and cannot be set via fields")
             if value is None:
                 continue
-            for bad in ("\n", "\r", "]", "<!--"):
-                if bad in value:
-                    raise ValueError(f"fields[{key!r}] must not contain {bad!r}")
+            _check_single_line(f"fields[{key!r}]", value)
+    if tags:
+        for tag in tags:
+            if isinstance(tag, str):
+                _check_single_line("tags", tag)
 
 
 class TaskConflictError(Exception):
@@ -426,7 +466,8 @@ class TaskManager:
             raise ValueError(
                 f"Invalid status '{status}'. Must be one of: {', '.join(sorted(VALID_STATUSES))}"
             )
-        _validate_text_fields(description=description, notes=notes, fields=fields)
+        _validate_text_fields(description=description, notes=notes, fields=fields, tags=tags)
+        _validate_priority_and_due(priority, due_date)
         validate_context(context)
         with self._lock, exclusive_operation_lock(self.index_path.parent / ".task-operation.lock"):
             task = Task(
@@ -667,8 +708,10 @@ class TaskManager:
                 f"Must be one of: {', '.join(sorted(VALID_STATUSES))}"
             )
         _validate_text_fields(
-            description=kwargs.get("description"), notes=kwargs.get("notes"), fields=fields_patch
+            description=kwargs.get("description"), notes=kwargs.get("notes"), fields=fields_patch,
+            tags=kwargs.get("tags"),
         )
+        _validate_priority_and_due(kwargs.get("priority"), kwargs.get("due_date"))
         if kwargs.get("context") is not None:
             validate_context(kwargs["context"])
         with self._lock, exclusive_operation_lock(self.index_path.parent / ".task-operation.lock"):
@@ -2258,16 +2301,20 @@ def _format_task_line(task: Task) -> str:
     # ID comment
     parts.append(f"<!-- id:{task.id} -->")
 
-    return " ".join(parts)
+    line = " ".join(parts)
+    if has_line_break(line):
+        raise ValueError("task line values must be single-line values")
+    return line
 
 
 def _format_task_block(task: Task) -> list[str]:
     """Task → its markdown checkbox line plus an indented ``> `` blockquote
-    body carrying `notes` (one line per content line). Empty notes emit no
-    body lines."""
+    body carrying `notes` (one line per content line, split at every
+    boundary `str.splitlines()` reads, so each body line keeps its prefix).
+    Empty notes emit no body lines."""
     lines = [_format_task_line(task)]
     if task.notes:
-        for content_line in task.notes.split("\n"):
+        for content_line in split_body_lines(task.notes):
             lines.append(f"{_BODY_INDENT}> {content_line}" if content_line else f"{_BODY_INDENT}>")
     return lines
 

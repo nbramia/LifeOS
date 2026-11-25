@@ -5,10 +5,19 @@ CRUD endpoints for scheduled reminders + ad-hoc Telegram messaging.
 """
 import logging
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from api.routes.scheduler import (
+    UpdateScheduleRequest,
+    _TYPE_TO_ACTION,
+    _store_write,
+    _validate_action_inputs,
+    _validate_schedule_value,
+    _validate_update_fields,
+)
 from api.services.reminder_store import get_reminder_store, get_reminder_scheduler, Reminder
 from config.settings import settings
 
@@ -106,9 +115,18 @@ async def create_reminder(request: CreateReminderRequest):
         raise HTTPException(status_code=400, detail="schedule_type must be 'once' or 'cron'")
     if request.message_type not in ("static", "prompt", "endpoint"):
         raise HTTPException(status_code=400, detail="message_type must be 'static', 'prompt', or 'endpoint'")
+    try:
+        ZoneInfo(request.timezone)
+    except Exception:
+        raise HTTPException(status_code=422, detail=f"Unknown timezone '{request.timezone}'")
+    _validate_schedule_value(request.schedule_type, request.schedule_value)
+    request.endpoint_config = _validate_action_inputs(
+        _TYPE_TO_ACTION[request.message_type], request.message_content, request.endpoint_config,
+    )
 
     store = get_reminder_store()
-    reminder = store.create(
+    reminder = _store_write(
+        store.create,
         name=request.name,
         schedule_type=request.schedule_type,
         schedule_value=request.schedule_value,
@@ -159,10 +177,31 @@ async def get_reminder(reminder_id: str):
 
 @router.put("/{reminder_id}", response_model=ReminderResponse)
 async def update_reminder(reminder_id: str, request: UpdateReminderRequest):
-    """Update an existing reminder."""
+    """Update an existing reminder, with the same field rules as
+    PUT /api/scheduler/{id}."""
     store = get_reminder_store()
+    _validate_update_fields(
+        reminder_id,
+        UpdateScheduleRequest(
+            schedule_type=request.schedule_type,
+            schedule_value=request.schedule_value,
+            timezone=request.timezone,
+        ),
+        store,
+    )
+    if request.message_content is not None or request.endpoint_config is not None:
+        entry = store.get(reminder_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="Reminder not found")
+        normalized = _validate_action_inputs(
+            entry.action,
+            request.message_content if request.message_content is not None else entry.message_content,
+            request.endpoint_config if request.endpoint_config is not None else entry.endpoint_config,
+        )
+        if request.endpoint_config is not None:
+            request.endpoint_config = normalized
     updates = {k: v for k, v in request.model_dump().items() if v is not None}
-    reminder = store.update(reminder_id, **updates)
+    reminder = _store_write(store.update, reminder_id, **updates)
     if not reminder:
         raise HTTPException(status_code=404, detail="Reminder not found")
     return ReminderResponse.from_reminder(reminder)

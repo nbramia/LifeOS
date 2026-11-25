@@ -250,6 +250,16 @@ def _validate_action_inputs(
         raise HTTPException(status_code=422, detail=e.detail)
 
 
+def _store_write(write, *args, **kwargs):
+    """Call a store write, mapping its field validation error to 422 — the
+    store refuses an entry-line value that isn't a single-line value (see
+    ``validate_entry_fields``), whichever route or tool sent it."""
+    try:
+        return write(*args, **kwargs)
+    except ScheduleActionValidationError as e:
+        raise HTTPException(status_code=422, detail=e.detail)
+
+
 def _validate_update_fields(schedule_id: str, request: "UpdateScheduleRequest", store) -> None:
     """Validate the fields present in a PUT before anything is written.
 
@@ -331,7 +341,8 @@ async def create_schedule(request: CreateScheduleRequest):
     )
 
     store = get_scheduler_store()
-    entry = store.create(
+    entry = _store_write(
+        store.create,
         name=request.name,
         schedule_type=request.schedule_type,
         schedule_value=request.schedule_value,
@@ -462,7 +473,7 @@ async def update_schedule(schedule_id: str, request: UpdateScheduleRequest):
         if request.endpoint_config is not None:
             request.endpoint_config = normalized
     updates = {k: v for k, v in request.model_dump().items() if v is not None}
-    entry = store.update(schedule_id, **updates)
+    entry = _store_write(store.update, schedule_id, **updates)
     if not entry:
         raise HTTPException(status_code=404, detail="Schedule not found")
     return ScheduleResponse.from_entry(entry)

@@ -69,7 +69,7 @@ def populated_manager(task_manager):
     task_manager.create("Pull 1099 from Schwab", context="Personal", tags=["taxes", "finance"])
     task_manager.create("Review PR", context="Work", priority="high", tags=["code-review"])
     task_manager.create("Buy groceries", context="Personal", due_date="2025-02-15")
-    task_manager.create("Schedule meeting", context="Work", due_date="2025-02-10", priority="urgent")
+    task_manager.create("Schedule meeting", context="Work", due_date="2025-02-10", priority="medium")
     return task_manager
 
 
@@ -1507,7 +1507,7 @@ class TestThreading:
         task = task_manager.create("Update test", context="Concurrent")
 
         def update_task(i):
-            task_manager.update(task.id, priority=f"priority-{i}")
+            task_manager.update(task.id, description=f"Update test {i}")
 
         threads = [threading.Thread(target=update_task, args=(i,)) for i in range(10)]
         for t in threads:
@@ -1518,7 +1518,7 @@ class TestThreading:
         # Verify task still exists and is valid
         updated = task_manager.get(task.id)
         assert updated is not None
-        assert updated.priority.startswith("priority-")
+        assert updated.description.startswith("Update test ")
 
 
 # =============================================================================
