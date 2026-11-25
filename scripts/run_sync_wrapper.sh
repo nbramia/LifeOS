@@ -35,6 +35,7 @@ send_alert() {
     [ -n "$bot_token" ] && [ -n "$chat_id" ] || return 0
     "${LIFEOS_WATCHDOG_CURL:-/usr/bin/curl}" -s -X POST "https://api.telegram.org/bot${bot_token}/sendMessage" \
         --data-urlencode "chat_id=${chat_id}" \
+        --data-urlencode "disable_web_page_preview=true" \
         --data-urlencode "text=${text}" \
         --data-urlencode "parse_mode=Markdown" > /dev/null 2>&1 || true
     printf '%s' "$text" | python3 -I "$LIFEOS_DIR/api/services/bot_notices.py" "LifeOS/run_sync_wrapper" > /dev/null 2>&1 || true

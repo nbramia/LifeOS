@@ -592,8 +592,8 @@ def stores(tmp_path, monkeypatch):
 
 
 def _add_interaction(store, person_id, days_ago=0, source_type="imessage",
-                      title="Hi", tz_offset_hours=0):
-    ts = datetime.now(timezone.utc) - timedelta(days=days_ago)
+                      title="Hi", tz_offset_hours=0, now=None):
+    ts = (now or datetime.now(timezone.utc)) - timedelta(days=days_ago)
     ts = ts.astimezone(timezone(timedelta(hours=tz_offset_hours)))
     store.add(Interaction(
         id=str(uuid.uuid4()), person_id=person_id, timestamp=ts,
@@ -794,10 +794,12 @@ class TestMeInteractionsOracle:
         # (typical_gap=10) and both last contacted 20 days ago (ratio=2.0,
         # alerted since 20 > 10 * 1.5) — an identical sort key except for
         # person_id.
+        # One shared base time, so the two people's timestamps are identical.
+        base = datetime.now(timezone.utc)
         for pid, name in (("p-tie-z", "Tie Z"), ("p-tie-a", "Tie A")):
             _add_person(pstore, pid, name, category="personal", circle=2, strength=50)
             for days_ago in (20, 30, 40, 50, 60):
-                _add_interaction(istore, pid, days_ago=days_ago, source_type="imessage")
+                _add_interaction(istore, pid, days_ago=days_ago, source_type="imessage", now=base)
 
         # get_person_julianday_timestamps' covering index is on person_id,
         # so the real store already returns rows person_id-ascending -- that
