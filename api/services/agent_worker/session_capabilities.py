@@ -63,7 +63,7 @@ PROJECT_CHILD_CREATOR_FIELD = "project_child_creator_session"
 AGENT_CREATOR_FIELD = "agent_creator_session"
 UNATTESTED_CREATOR = "unattested"
 
-# Bound on the creator chain walk; a longer chain is treated as unknown.
+# Bound on the creator walk's depth; a deeper chain is treated as unknown.
 _MAX_CHAIN_HOPS = 32
 
 MCP_CONFIG_FILENAME = "mcp-config.json"
@@ -180,14 +180,29 @@ def _task_backed(session) -> bool:
     return not session.parent_session_id and session.origin in (None, "", "agent")
 
 
-def creator_session_id(fields: Optional[dict]) -> Optional[str]:
-    """The creator a task's fields name, or None for an operator task."""
+def creator_session_ids(fields: Optional[dict]) -> list[str]:
+    """Every creator a task's fields name, empty for an operator task.
+
+    `agent_creator_session` holds a comma-separated list: the agent that
+    created the task, then each agent that later assigned it to an engine.
+    Session ids are bare tokens (no commas), so the split is exact.
+    """
     fields = fields or {}
+    ids: list[str] = []
     for key in (PROJECT_CHILD_CREATOR_FIELD, AGENT_CREATOR_FIELD):
-        value = str(fields.get(key) or "").strip()
-        if value:
-            return value
-    return None
+        for value in str(fields.get(key) or "").split(","):
+            value = value.strip()
+            if value and value not in ids:
+                ids.append(value)
+    return ids
+
+
+def merge_creators(existing: Optional[str], added: str) -> str:
+    """`existing` with `added` appended unless already listed."""
+    ids = [v.strip() for v in (existing or "").split(",") if v.strip()]
+    if added not in ids:
+        ids.append(added)
+    return ",".join(ids)
 
 
 @dataclass(frozen=True)
@@ -245,50 +260,52 @@ def resolve_lineage(
     task_fields: Optional[TaskFieldsLookup] = None,
     own_fields: Optional[dict] = None,
 ) -> Lineage:
-    """Walk from `session` to the session nobody started, intersecting each
-    creator's route set along the way.
+    """Intersect the route sets of every session that started `session`,
+    up to sessions nobody started.
 
-    A session's creator is its spawning parent, or, for a task-backed
-    session, the session its task's fields name. `own_fields` supplies
+    A session's creators are its spawning parent or, for a task-backed
+    session, every session its task's fields name (the creating agent and
+    each agent that later engine-assigned it). `own_fields` supplies
     `session`'s own task fields when the caller already holds them. Without
     a `task_fields` lookup, task stamps are read only from `own_fields`.
     """
-    creators: list = []
-    # What the chain ends in beyond its known creators: nothing (None), a
-    # creator the worker cannot identify, or a chain too long to trust.
-    tail: Optional[SessionCapabilities] = _NOTHING
-    hops = _MAX_CHAIN_HOPS
-    current = session
-    current_fields = own_fields
-    for _ in range(_MAX_CHAIN_HOPS):
-        creator_id: Optional[str] = current.parent_session_id
-        if not creator_id and _task_backed(current):
-            fields = current_fields
-            if fields is None and task_fields is not None and current.task_id:
-                fields = task_fields(current.task_id)
-            creator_id = creator_session_id(fields)
-        current_fields = None
-        if not creator_id:
-            tail, hops = None, len(creators)
-            break
+    ceiling, depth = _lineage(session_store, session, task_fields, own_fields, _MAX_CHAIN_HOPS)
+    return Lineage(ceiling=ceiling, depth=depth)
+
+
+def _lineage(session_store, session, task_fields, own_fields, hops_left):
+    if hops_left <= 0:
+        return _NOTHING, _MAX_CHAIN_HOPS
+    if session.parent_session_id:
+        creator_ids = [session.parent_session_id]
+    elif _task_backed(session):
+        fields = own_fields
+        if fields is None and task_fields is not None and session.task_id:
+            fields = task_fields(session.task_id)
+        creator_ids = creator_session_ids(fields)
+    else:
+        creator_ids = []
+    ceiling: Optional[SessionCapabilities] = None
+    depth = 0
+    for creator_id in creator_ids:
         creator = None
         if creator_id != UNATTESTED_CREATOR:
             creator = session_store.get_by_session_id(creator_id)
         if creator is None:
-            tail, hops = _UNIDENTIFIED_CREATOR, len(creators) + 1
-            break
-        if is_doctor_repair_child(session_store, current, creator):
+            contribution, creator_depth = _UNIDENTIFIED_CREATOR, 1
+        elif is_doctor_repair_child(session_store, session, creator):
             # The doctor's repair child runs as a session nobody started;
             # its own children inherit from it as usual.
-            tail, hops = None, len(creators) + 1
-            break
-        creators.append(creator)
-        current = creator
-    ceiling = tail
-    for creator in creators:
-        own = route_capabilities(creator.routing)
-        ceiling = own if ceiling is None else own.intersect(ceiling)
-    return Lineage(ceiling=ceiling, depth=hops)
+            contribution, creator_depth = None, 1
+        else:
+            above, above_depth = _lineage(session_store, creator, task_fields, None, hops_left - 1)
+            own = route_capabilities(creator.routing)
+            contribution = own if above is None else own.intersect(above)
+            creator_depth = above_depth + 1
+        if contribution is not None:
+            ceiling = contribution if ceiling is None else ceiling.intersect(contribution)
+        depth = max(depth, creator_depth)
+    return ceiling, depth
 
 
 def host_shell_refusal(routing: Optional[str], ceiling: Optional[SessionCapabilities]) -> Optional[str]:
@@ -333,6 +350,31 @@ def effective_for_executor(session_store, session) -> SessionCapabilities:
     if active is not None:
         return active
     return resolve_lineage(session_store, session).effective(session.routing)
+
+
+def remote_codex_refusal(routing: Optional[str], host: Optional[str], ceiling) -> Optional[str]:
+    """Why a Codex session with an inherited ceiling may not run on a remote
+    host, or None. A remote Codex loads that host's own `config.toml`, which
+    this machine cannot read, so its servers cannot be shown to be within
+    the ceiling."""
+    if routing != "codex" or ceiling is None or not host:
+        return None
+    from api.services.agent_worker.remote_spawn import (
+        HostResolutionError,
+        api_host_name,
+        resolve_host_target,
+    )
+
+    try:
+        target = resolve_host_target(host, api_host_name())
+    except HostResolutionError:
+        return None  # the executor fails an unknown host closed itself
+    if target is None:
+        return None
+    return (
+        "a Codex child runs only on the API host: a remote host's Codex "
+        "configuration cannot be checked against what its creator has"
+    )
 
 
 # ---------------------------------------------------------------------------

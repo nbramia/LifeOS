@@ -102,7 +102,7 @@ def validate_action_inputs(
 ENTRY_LINE_FIELDS = (
     "name", "schedule_value", "timezone", "action", "message_type", "executor", "bot",
     "created_at", "last_triggered_at", "operation_key", "snoozed_until",
-    "persona_id", "model_id", "effort", "host", "working_dir",
+    "persona_id", "model_id", "effort", "host", "working_dir", "agent_creator_session",
 )
 # Markup that opens or closes an inline field, or opens the id comment.
 _ENTRY_LINE_MARKUP = ("[", "]", "<!--")

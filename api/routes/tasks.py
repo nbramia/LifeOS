@@ -1122,8 +1122,8 @@ async def update_task(
     attributed: a tags patch that adds `#hermes` or an out-of-scope paid
     route to a task that is, or would become, a project child is refused —
     see `_enforce_agent_child_tag_guard`. An agent-attributed write that
-    assigns the task to an engine stamps the agent as its creator, unless
-    the task already names one. An operator write (no header) is unaffected.
+    assigns the task to an engine adds the agent to the task's creators
+    (`agent_creator_session`). An operator write (no header) is unaffected.
     """
     _require_valid_status(request.status)
     manager = get_task_manager()

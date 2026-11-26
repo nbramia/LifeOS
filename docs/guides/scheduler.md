@@ -56,6 +56,13 @@ handoff context and round-trip through Markdown; omitted fields retain the
 worker's legacy defaults. `bot` remains delivery-only and does not select an
 execution persona or provider.
 
+An agent schedule that an agent created or edited through the API carries
+`[agent_creator_session:: …]`, naming those agent sessions. Every task it
+writes carries the same list, so the session that runs the task gets no more
+tools than those agents have (see
+[agent-worker.md § Capability inheritance](../specs/technical/agent-worker.md#capability-inheritance)).
+Schedules you write yourself never carry it.
+
 An `action:: agent` schedule may also carry its own budget: `[budget:: $2]`
 (dollars — `$2`, `2`, and `2.50` are all accepted) and `[wall:: 30m]`
 (wall-clock time — `30m`, `2h`, `90 min`, and `3600s` are all accepted).

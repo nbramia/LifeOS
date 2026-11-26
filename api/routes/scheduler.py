@@ -28,6 +28,9 @@ from api.services.scheduler_validation import (
 )
 from config.settings import settings
 
+# Same header the task API reads (`api/routes/tasks.py`).
+AGENT_SESSION_HEADER = "X-LifeOS-Agent-Session"
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/scheduler", tags=["scheduler"])
@@ -316,11 +319,24 @@ def _validate_update_fields(schedule_id: str, request: "UpdateScheduleRequest", 
 # Routes (static paths MUST come before {schedule_id} to avoid capture)
 # ---------------------------------------------------------------------------
 
+def _agent_session(header: Optional[str]) -> Optional[str]:
+    from api.routes.tasks import _clean_agent_session_header
+
+    return _clean_agent_session_header(header)
+
+
 @router.post("", response_model=ScheduleResponse)
-async def create_schedule(request: CreateScheduleRequest):
+async def create_schedule(
+    request: CreateScheduleRequest,
+    x_lifeos_agent_session: Optional[str] = Header(default=None, alias=AGENT_SESSION_HEADER),
+):
     """Create a new schedule. A 'manual' schedule has no trigger of its own —
     it fires only via ``POST /{schedule_id}/trigger`` — so its schedule_value
-    is ignored and stored blank regardless of what's supplied."""
+    is ignored and stored blank regardless of what's supplied.
+
+    An agent-attributed (`X-LifeOS-Agent-Session`) `agent` schedule records
+    its creator, and every task it writes carries that creator."""
+    agent_session = _agent_session(x_lifeos_agent_session)
     if request.schedule_type not in ("once", "cron", "manual"):
         raise HTTPException(status_code=400, detail="schedule_type must be 'once', 'cron', or 'manual'")
     try:
@@ -361,6 +377,7 @@ async def create_schedule(request: CreateScheduleRequest):
         working_dir=request.working_dir or "",
         budget_dollars=request.budget_dollars,
         wall_seconds=request.wall_seconds,
+        agent_creator_session=(agent_session or "") if action == "agent" else "",
     )
     return ScheduleResponse.from_entry(entry)
 
@@ -435,9 +452,17 @@ async def get_schedule(schedule_id: str):
 
 
 @router.put("/{schedule_id}", response_model=ScheduleResponse)
-async def update_schedule(schedule_id: str, request: UpdateScheduleRequest):
+async def update_schedule(
+    schedule_id: str,
+    request: UpdateScheduleRequest,
+    x_lifeos_agent_session: Optional[str] = Header(default=None, alias=AGENT_SESSION_HEADER),
+):
     """Update an existing schedule. Converting to schedule_type='manual'
-    clears schedule_value — a manual schedule has no trigger of its own."""
+    clears schedule_value — a manual schedule has no trigger of its own.
+
+    An agent-attributed update that leaves the schedule an `agent` schedule
+    adds the agent to its creators."""
+    agent_session = _agent_session(x_lifeos_agent_session)
     request.bot = _require_known_bot(request.bot)
     store = get_scheduler_store()
     _validate_update_fields(schedule_id, request, store)
@@ -473,6 +498,16 @@ async def update_schedule(schedule_id: str, request: UpdateScheduleRequest):
         if request.endpoint_config is not None:
             request.endpoint_config = normalized
     updates = {k: v for k, v in request.model_dump().items() if v is not None}
+    if agent_session:
+        current = store.get(schedule_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail="Schedule not found")
+        if (request.action or current.action) == "agent":
+            from api.services.agent_worker.session_capabilities import merge_creators
+
+            updates["agent_creator_session"] = merge_creators(
+                current.agent_creator_session, agent_session,
+            )
     entry = _store_write(store.update, schedule_id, **updates)
     if not entry:
         raise HTTPException(status_code=404, detail="Schedule not found")
@@ -493,15 +528,26 @@ async def trigger_schedule(
     schedule_id: str,
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     request_key: Optional[str] = Header(default=None, alias="X-Request-Key"),
+    x_lifeos_agent_session: Optional[str] = Header(default=None, alias=AGENT_SESSION_HEADER),
 ):
     """Manually fire a schedule immediately. For a ``once`` schedule this
     consumes it exactly like an unattended fire would: ``mark_triggered``
     disables it and clears its next fire, so it stops firing on its own
-    trigger too."""
+    trigger too. An agent-attributed trigger of an `agent` schedule adds the
+    agent to the creators of the task this fire writes."""
+    agent_session = _agent_session(x_lifeos_agent_session)
     store = get_scheduler_store()
     entry = store.get(schedule_id)
     if not entry:
         raise HTTPException(status_code=404, detail="Schedule not found")
+    if agent_session and entry.action == "agent":
+        from dataclasses import replace
+
+        from api.services.agent_worker.session_capabilities import merge_creators
+
+        entry = replace(entry, agent_creator_session=merge_creators(
+            entry.agent_creator_session, agent_session,
+        ))
 
     await get_scheduler()._fire_entry(
         entry, manual=True, request_key=request_key or idempotency_key,

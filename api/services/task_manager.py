@@ -691,8 +691,8 @@ class TaskManager:
         notes_merge = kwargs.pop("_notes_merge", None)
         expected_updated_at = kwargs.pop("_expected_updated_at", None)
         # Set by the task API for an agent-attributed write that assigns the
-        # task to an engine: stamps that agent as the task's creator unless
-        # the task already names one.
+        # task to an engine: adds that agent to the task's creators, so the
+        # session that runs it gets no more than every one of them has.
         agent_creator_session = kwargs.pop("_agent_creator_session", None)
         # Internal board action hook: called with the latest task, before any
         # of this write's own changes are applied, on every CAS retry. A
@@ -825,16 +825,12 @@ class TaskManager:
                             merged[k] = v
                     t.fields = merged
                 if agent_creator_session:
-                    from api.services.task_projects import (
-                        AGENT_CREATOR_SESSION_FIELD,
-                        CHILD_CREATOR_SESSION_FIELD,
-                    )
+                    from api.services.agent_worker.session_capabilities import merge_creators
+                    from api.services.task_projects import AGENT_CREATOR_SESSION_FIELD
 
-                    if not (
-                        t.fields.get(AGENT_CREATOR_SESSION_FIELD)
-                        or t.fields.get(CHILD_CREATOR_SESSION_FIELD)
-                    ):
-                        t.fields = {**t.fields, AGENT_CREATOR_SESSION_FIELD: agent_creator_session}
+                    t.fields = {**t.fields, AGENT_CREATOR_SESSION_FIELD: merge_creators(
+                        t.fields.get(AGENT_CREATOR_SESSION_FIELD), agent_creator_session,
+                    )}
                 # Any explicit lifecycle write supersedes the short lease
                 # between interactive launch and hook registration. The
                 # hook's first in_progress write clears it; a failed/terminal

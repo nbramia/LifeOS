@@ -5854,6 +5854,7 @@ class Worker:
         from api.services.agent_worker.session_capabilities import (
             CapabilityLookupError,
             host_shell_refusal,
+            remote_codex_refusal,
             resolve_lineage,
         )
 
@@ -5869,7 +5870,9 @@ class Worker:
             )
         except CapabilityLookupError as exc:
             return None, f"could not resolve the capabilities this session inherits: {exc}"
-        refusal = host_shell_refusal(session.routing, lineage.ceiling)
+        refusal = host_shell_refusal(session.routing, lineage.ceiling) or remote_codex_refusal(
+            session.routing, getattr(session, "host", None), lineage.ceiling,
+        )
         if refusal is None and lineage.depth > settings.agent_max_spawn_depth:
             refusal = (
                 f"this session is {lineage.depth} agent hops from the operator, "

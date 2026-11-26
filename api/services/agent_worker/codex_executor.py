@@ -57,8 +57,11 @@ from api.services.agent_worker.remote_spawn import (
 )
 from api.services.agent_worker.remote_spawn import api_host_name as _api_host_name
 from api.services.agent_worker.session_capabilities import (
+    active_capabilities,
     codex_disabled_servers,
     effective_for_executor,
+    remote_codex_refusal,
+    resolve_lineage,
 )
 from api.services.agent_worker.session_store import (
     STATUS_BLOCKED,
@@ -92,7 +95,7 @@ def _delegation_header(
     session_id: str, attempt_id: str | None = None, turn_id: str | None = None,
 ) -> str:
     """Per-session preamble line telling Codex its LifeOS session id and how to
-    hand work to a child session."""
+    hand off work it can't do (e.g. browser automation) to another engine."""
     identity = (
         f"\nlifeos_session_id={session_id}; lifeos_attempt_id={attempt_id}; "
         f"lifeos_turn_id={turn_id}."
@@ -100,11 +103,11 @@ def _delegation_header(
     )
     return "=== YOUR SESSION ===\n" + delegation_preamble(
         session_id,
-        trigger="To run background work in parallel,",
-        model=(
-            '"claude_code" for the Claude Code CLI (a child gets only the MCP '
-            'servers you have, and no Claude in Chrome)'
+        trigger=(
+            "If a task needs a capability you lack — e.g. browser/GUI "
+            "automation you can't perform headlessly —"
         ),
+        model='"claude_code" for the browser-enabled Claude Code CLI',
     ) + "\n\n" + PROJECT_TASK_GUIDANCE + identity
 
 
@@ -247,8 +250,8 @@ class CodexExecutor:
         self._warn_if_mcp_missing()
         # Prepend the LifeOS capabilities briefing so the fresh Codex turn has
         # the same situational awareness as the managed/local routes, plus a
-        # per-session delegation header so the agent can hand work to a child
-        # session, and — only when
+        # per-session delegation header so the agent can hand off work it can't
+        # do (e.g. browser automation → a claude_code child), and — only when
         # `working_dir` is a worker-provisioned worktree — the git-discipline
         # instructions. Only on the opening turn — resume() reloads the
         # thread, which already carries this from the first prompt.
@@ -529,9 +532,12 @@ class CodexExecutor:
         refusal = None
         if not capabilities.host_shell:
             refusal = "the session that started this one has no host shell"
-        elif is_remote and disabled_mcp_servers:
-            # The disabled set is computed from this machine's Codex config.
-            refusal = "a session with restricted MCP servers runs only on the API host"
+        elif is_remote and active_capabilities() is None:
+            # Run outside the worker's dispatch (which applies the same rule
+            # before the turn): check the spawn chain here.
+            refusal = remote_codex_refusal(
+                "codex", host, resolve_lineage(self.session_store, session).ceiling,
+            )
         if refusal:
             self.transcript_store.append(sid, "capability_refused", {"route": "codex", "host": host})
             self._cleanup_tempfile(last_msg_path)

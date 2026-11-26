@@ -303,37 +303,6 @@ def _claude_executor(store, transcripts, captured):
     )
 
 
-def _today_top_level_argv(session) -> list[str]:
-    """The argv a top-level Claude Code session runs with, spelled out."""
-    from api.services.agent_worker.claude_code_executor import _CLARIFY_OPERATOR, _SYSTEM_PROMPT
-    from api.services.agent_worker.delegation import PROJECT_TASK_GUIDANCE, delegation_preamble
-
-    platform_desc = "Linux server running Ubuntu" if os.uname().sysname == "Linux" else "Mac running macOS"
-    prompt = _SYSTEM_PROMPT.format(
-        vault_path=settings.vault_path, user_name=settings.user_name,
-        code_dir=settings.code_dir, platform_desc=platform_desc, git_discipline="",
-        tool_summary="You already have a browser (--chrome), filesystem, and shell.",
-        clarification=_CLARIFY_OPERATOR,
-        delegation=delegation_preamble(
-            session.session_id, trigger="To run background work in parallel,",
-            model='"claude_code" with tier="haiku"/"sonnet"/"opus", '
-                  'or "local" for the on-box model',
-        ),
-        project_guidance=PROJECT_TASK_GUIDANCE,
-        turn_identity=(
-            f"lifeos_session_id={session.session_id}; lifeos_attempt_id={session.attempt_id}; "
-            f"lifeos_turn_id={session.turn_id}."
-        ),
-    )
-    return [
-        "/usr/bin/claude-example", "-p", "do the synthetic thing",
-        "--output-format", "stream-json", "--verbose",
-        "--max-turns", str(settings.claude_max_turns),
-        "--dangerously-skip-permissions", "--chrome",
-        "--append-system-prompt", prompt,
-    ]
-
-
 def _run_claude(store, transcripts, session):
     captured: list = []
     executor = _claude_executor(store, transcripts, captured)
@@ -341,20 +310,30 @@ def _run_claude(store, transcripts, session):
     return outcome, (captured[0] if captured else None)
 
 
-def test_top_level_claude_code_argv_is_exactly_todays(store, transcripts):
+def test_top_level_claude_code_spawn_event_records_no_capabilities(store, transcripts):
     session = store.create(task_id="op-1", routing="claude_code", origin="operator")
     outcome, cmd = _run_claude(store, transcripts, session)
     assert outcome.status == STATUS_COMPLETED
-    assert cmd == _today_top_level_argv(store.get("op-1"))
-    assert "You already have a browser (--chrome), filesystem, and shell. Your LifeOS" in cmd[cmd.index("--append-system-prompt") + 1]
     spawn_event = [e for e in transcripts.read(session.session_id) if e["kind"] == "claude_code_spawn"][0]
     assert "capabilities" not in spawn_event["payload"]
 
 
-def test_claude_code_child_of_claude_code_parent_is_unrestricted(store, transcripts):
-    parent = _root(store, "claude_code")
-    child = _child(store, parent, "claude_code")
-    _, cmd = _run_claude(store, transcripts, child)
+@pytest.mark.parametrize("parent_origin", ["operator", None])
+def test_claude_code_delegation_through_spawn_keeps_full_tools(store, transcripts, parent_origin):
+    """Claude Code parent -> lifeos_agent_spawn -> worker gate -> executor."""
+    parent = _root(store, "claude_code", task_id=f"cc_parent_{parent_origin}", origin=parent_origin)
+    result = dispatch(_ctx(store, transcripts, parent, task_fields=lambda _tid: {}), "lifeos_agent_spawn", {
+        "prompt": "open the dashboard and screenshot it", "model": "claude_code", "tier": "sonnet",
+    })
+    assert result["ok"], result
+    child = store.get_by_session_id(result["child_session_id"])
+    assert child.parent_session_id == parent.session_id and child.routing == "claude_code"
+    stub, _ = _worker_stub(store, transcripts, {})
+    capabilities, refusal = stub._resolve_capabilities(child)
+    assert refusal is None and capabilities == UNRESTRICTED
+    with capability_context(capabilities):
+        outcome, cmd = _run_claude(store, transcripts, child)
+    assert outcome.status == STATUS_COMPLETED
     assert "--chrome" in cmd
     assert "--no-chrome" not in cmd and "--strict-mcp-config" not in cmd
 
@@ -666,12 +645,38 @@ def test_creator_stamp_cannot_be_set_through_fields(task_manager):
         task_manager.update(task.id, fields={AGENT_CREATOR_FIELD: "sess_x"})
 
 
-def test_agent_assignment_stamps_once(task_manager):
+def test_agent_assignment_adds_every_assigning_agent(task_manager):
     task = task_manager.create(description="Operator task")
     updated = task_manager.update(task.id, tags=["claude"], _agent_creator_session="sess_first")
     assert updated.fields[AGENT_CREATOR_FIELD] == "sess_first"
     again = task_manager.update(task.id, tags=["codex"], _agent_creator_session="sess_second")
-    assert again.fields[AGENT_CREATOR_FIELD] == "sess_first"
+    assert again.fields[AGENT_CREATOR_FIELD] == "sess_first,sess_second"
+    repeat = task_manager.update(task.id, tags=["claude"], _agent_creator_session="sess_first")
+    assert repeat.fields[AGENT_CREATOR_FIELD] == "sess_first,sess_second"
+
+
+def test_reassignment_by_a_restricted_agent_restricts_the_task(store):
+    full_creator = _root(store, "claude_code", task_id="cc_creator")
+    managed_assigner = _root(store, "claude", task_id="mgr_assigner")
+    claimed = store.create(task_id="ab12cd34", status=STATUS_RUNNING, routing="claude_code")
+    fields = {AGENT_CREATOR_FIELD: f"{full_creator.session_id},{managed_assigner.session_id}"}
+    lineage = resolve_lineage(store, claimed, own_fields=fields)
+    assert lineage.ceiling == route_capabilities("claude")
+    assert host_shell_refusal("claude_code", lineage.ceiling) is not None
+    # Each creator's own chain counts toward depth.
+    deep = _child(store, _child(store, full_creator, "claude_code"), "claude_code")
+    fields = {AGENT_CREATOR_FIELD: f"{managed_assigner.session_id},{deep.session_id}"}
+    assert resolve_lineage(store, claimed, own_fields=fields).depth == 3
+
+
+def test_project_child_stamp_and_assigner_both_count(store):
+    hermes = _root(store, "hermes", task_id="h_creator")
+    managed = _root(store, "claude", task_id="m_assigner")
+    claimed = store.create(task_id="ab12cd35", status=STATUS_RUNNING, routing="local")
+    lineage = resolve_lineage(store, claimed, own_fields={
+        PROJECT_CHILD_CREATOR_FIELD: hermes.session_id, AGENT_CREATOR_FIELD: managed.session_id,
+    })
+    assert lineage.ceiling == route_capabilities("claude")
 
 
 def test_assigns_engine_detects_tags_and_description_hashtags():
@@ -739,24 +744,25 @@ def _repair_child(store, root, routing="claude_code", *, workflow_id="inherit"):
     )
 
 
-def _child_argv(session) -> list[str]:
-    """The argv any spawned Claude Code child runs with when nothing limits it."""
-    from api.services.agent_worker.claude_code_executor import _CLARIFY_CHILD, _CLARIFY_OPERATOR
+def test_doctor_repair_child_runs_with_todays_full_argv(store, transcripts, pinned_settings, tmp_path):
+    from api.services.agent_worker.claude_code_executor import ClaudeCodeExecutor as Cce
 
-    expected = _today_top_level_argv(session)
-    idx = expected.index("--append-system-prompt") + 1
-    expected[idx] = expected[idx].replace(_CLARIFY_OPERATOR, _CLARIFY_CHILD)
-    return expected
-
-
-def test_doctor_repair_child_runs_with_todays_full_argv(store, transcripts):
     root = _hermes_root(store, "conv-doctor-1", "doctor")
     assert root.workflow_id and caps_mod.is_doctor_repair_root(store, root)
-    child = _repair_child(store, root)
+    # Same session id as the pinned child, so the prompt it embeds matches.
+    child = store.create(
+        task_id="doctor-child", session_id="sess_pin_child", status=STATUS_RUNNING,
+        routing="claude_code", parent_session_id=root.session_id,
+        root_session_id=root.session_id, spawn_depth=1, workflow_id=root.workflow_id,
+    )
     assert resolve_lineage(store, child).ceiling is None
-    outcome, cmd = _run_claude(store, transcripts, child)
-    assert outcome.status == STATUS_COMPLETED
-    assert cmd == _child_argv(store.get(child.task_id))
+    cmd = normalized_argv(Cce, "/usr/bin/claude-example", child, store, transcripts, tmp_path)
+    _assert_pinned(cmd, PINNED_ARGV["claude_code_child"], prompt_after="--append-system-prompt")
+    # The same child under a non-doctor Hermes parent differs.
+    plain_root = _hermes_root(store, "conv-plain-1", None)
+    plain = store.create(task_id="plain-child", session_id="sess_pin_child2", status=STATUS_RUNNING,
+                         routing="claude_code", parent_session_id=plain_root.session_id)
+    assert "--no-chrome" in normalized_argv(Cce, "/usr/bin/claude-example", plain, store, transcripts, tmp_path)
     spawn_event = [e for e in transcripts.read(child.session_id) if e["kind"] == "claude_code_spawn"][0]
     assert "capabilities" not in spawn_event["payload"]
 
@@ -841,3 +847,277 @@ def test_every_doctor_root_marker_is_required(field, value):
     if field:
         root[field] = value
     assert caps_mod.is_doctor_repair_root(fake_store, types.SimpleNamespace(**root)) is (field is None)
+
+
+# ---------------------------------------------------------------------------
+# Agent-created schedules hand their creators to the tasks they write
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def schedule_api(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from api.main import app
+    from api.routes import scheduler as scheduler_route
+    from api.services.scheduler_store import SchedulerScheduler, SchedulerStore
+    from api.services.task_manager import TaskManager
+
+    store = SchedulerStore(vault_path=tmp_path / "sched-vault", index_path=tmp_path / "sched-index.json")
+    sessions = SessionStore(db_path=tmp_path / "sched-sessions.db")
+    scheduler = SchedulerScheduler(store, session_store=sessions)
+    manager = TaskManager(vault_path=tmp_path / "sched-task-vault", index_path=tmp_path / "sched-task-index.json")
+    monkeypatch.setattr(scheduler_route, "get_scheduler_store", lambda: store)
+    monkeypatch.setattr(scheduler_route, "get_scheduler", lambda: scheduler)
+    monkeypatch.setattr("api.services.task_manager.get_task_manager", lambda: manager)
+    return TestClient(app), store, manager, tmp_path
+
+
+def _agent_schedule(client, headers=None, **overrides):
+    body = {"name": "Synthetic job", "schedule_type": "manual", "schedule_value": "",
+            "action": "agent", "executor": "claude", "message_content": "Do the synthetic job"}
+    body.update(overrides)
+    response = client.post("/api/scheduler", json=body, headers=headers or {})
+    assert response.status_code == 200, response.text
+    return response.json()["id"]
+
+
+def _fired_task_fields(client, manager, schedule_id, headers=None):
+    response = client.post(f"/api/scheduler/{schedule_id}/trigger", headers=headers or {})
+    assert response.status_code == 200, response.text
+    tasks = [t for t in manager.list_tasks() if "Do the synthetic job" in t.description]
+    assert len(tasks) == 1
+    return tasks[0].fields
+
+
+def test_agent_schedule_stamps_its_creator_on_every_task(schedule_api):
+    from api.services.scheduler_store import SchedulerStore
+
+    client, store, manager, tmp_path = schedule_api
+    schedule_id = _agent_schedule(client, {"X-LifeOS-Agent-Session": "sess-sched-agent"})
+    assert store.get(schedule_id).agent_creator_session == "sess-sched-agent"
+    # The stamp round-trips through the entry's Markdown line.
+    reloaded = SchedulerStore(vault_path=tmp_path / "sched-vault", index_path=tmp_path / "other-index.json")
+    assert reloaded.get(schedule_id).agent_creator_session == "sess-sched-agent"
+    fields = _fired_task_fields(client, manager, schedule_id)
+    assert fields[AGENT_CREATOR_FIELD] == "sess-sched-agent"
+
+
+def test_operator_schedule_writes_an_unstamped_task(schedule_api):
+    client, store, manager, _ = schedule_api
+    schedule_id = _agent_schedule(client)
+    assert store.get(schedule_id).agent_creator_session == ""
+    assert AGENT_CREATOR_FIELD not in _fired_task_fields(client, manager, schedule_id)
+
+
+def test_agent_update_and_trigger_add_the_agent(schedule_api):
+    client, store, manager, _ = schedule_api
+    schedule_id = _agent_schedule(client)
+    response = client.put(f"/api/scheduler/{schedule_id}", json={"message_content": "Do the synthetic job again"},
+                          headers={"X-LifeOS-Agent-Session": "sess-editor"})
+    assert response.status_code == 200, response.text
+    assert store.get(schedule_id).agent_creator_session == "sess-editor"
+    fields = _fired_task_fields(client, manager, schedule_id, {"X-LifeOS-Agent-Session": "sess-trigger"})
+    assert fields[AGENT_CREATOR_FIELD] == "sess-editor,sess-trigger"
+    # A trigger changes only the task it writes, not the schedule.
+    assert store.get(schedule_id).agent_creator_session == "sess-editor"
+
+
+def test_non_agent_schedule_is_not_stamped(schedule_api):
+    client, store, _, _ = schedule_api
+    schedule_id = _agent_schedule(client, {"X-LifeOS-Agent-Session": "sess-x"},
+                                  action="notify", executor="", message_content="hello")
+    assert store.get(schedule_id).agent_creator_session == ""
+
+
+def test_body_cannot_set_the_schedule_stamp(schedule_api):
+    client, store, _, _ = schedule_api
+    schedule_id = _agent_schedule(client, agent_creator_session="sess-forged")
+    assert store.get(schedule_id).agent_creator_session == ""
+    client.put(f"/api/scheduler/{schedule_id}", json={"agent_creator_session": "sess-forged"})
+    assert store.get(schedule_id).agent_creator_session == ""
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("lifeos_schedule_create", {"name": "x", "schedule_type": "manual", "action": "agent"}),
+    ("lifeos_schedule_update", {"schedule_id": "s1", "message_content": "x"}),
+    ("lifeos_schedule_trigger", {"schedule_id": "s1"}),
+])
+def test_mcp_sends_the_agent_header_on_schedule_writes(tool, args):
+    from unittest.mock import MagicMock
+
+    import mcp_server
+
+    server = mcp_server.LifeOSMCPServer(trusted_session_id="sess-stdio-agent")
+    response = MagicMock(status_code=200)
+    response.json.return_value = {"id": "s1"}
+    client = MagicMock()
+    client.post.return_value = client.put.return_value = client.request.return_value = response
+    server.client = client
+    server._call_api(tool, dict(args))
+    calls = [c for c in (client.post.call_args, client.put.call_args, client.request.call_args) if c]
+    assert calls and calls[0].kwargs["headers"][mcp_server.AGENT_SESSION_HEADER] == "sess-stdio-agent"
+
+
+# ---------------------------------------------------------------------------
+# Remote Codex children
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def remote_host(monkeypatch):
+    from api.services.agent_worker import remote_spawn
+
+    def resolve(host, api_host):
+        return object() if host == "studio" else None
+
+    monkeypatch.setattr(remote_spawn, "resolve_host_target", resolve)
+    return resolve
+
+
+def test_codex_child_on_a_remote_host_is_refused_even_with_nothing_to_disable(
+    store, transcripts, remote_host, monkeypatch, _synthetic_home,
+):
+    from api.services.agent_worker import codex_executor as cx
+
+    # This machine's Codex has only lifeos, so nothing would be disabled
+    # locally; the remote host's own config is unknown.
+    (_synthetic_home / ".codex" / "config.toml").write_text(
+        '[mcp_servers.lifeos]\ncommand = "/opt/example/python"\nargs = []\n'
+    )
+    monkeypatch.setattr(cx, "resolve_host_target", remote_host)
+    for parent_route in ("hermes", "codex"):
+        parent = _root(store, parent_route, task_id=f"remote_parent_{parent_route}")
+        child = store.create(
+            task_id=f"remote_child_{parent_route}", status=STATUS_RUNNING, routing="codex",
+            parent_session_id=parent.session_id, host="studio",
+        )
+        captured: list = []
+        outcome = _codex_executor(store, transcripts, captured).execute(child, {"description": "x"})
+        assert outcome.status == STATUS_FAILED and captured == []
+        stub, _ = _worker_stub(store, transcripts, {})
+        _, refusal = stub._resolve_capabilities(child)
+        assert refusal and "API host" in refusal
+
+
+def test_top_level_remote_codex_is_not_refused(store, transcripts, remote_host):
+    stub, _ = _worker_stub(store, transcripts, {})
+    session = store.create(task_id="cx-remote-top", status=STATUS_RUNNING, routing="codex",
+                           origin="operator", host="studio")
+    assert stub._resolve_capabilities(session)[1] is None
+    local_child = store.create(task_id="cx-local-child", status=STATUS_RUNNING, routing="codex",
+                               parent_session_id=_root(store, "local", task_id="lp").session_id)
+    assert stub._resolve_capabilities(local_child)[1] is None
+    remote_claude = store.create(task_id="cc-remote-top", status=STATUS_RUNNING, routing="claude_code",
+                                 origin="operator", host="studio")
+    assert stub._resolve_capabilities(remote_claude)[1] is None
+
+
+# ---------------------------------------------------------------------------
+# Top-level argv pinned to literal values captured from origin/main
+# ---------------------------------------------------------------------------
+
+PIN_SETTINGS = dict(vault_path="/vault/example", user_name="Example User",
+                    code_dir="/code/example", claude_max_turns=40)
+
+
+def normalized_argv(executor_cls, binary, session, store, transcripts, work_dir) -> list[str]:
+    """One executor's argv for `session`, with per-run values (turn ids,
+    working dir, temp output file) replaced by placeholders."""
+    import re
+
+    got = {}
+
+    def spawn(cmd, **_kwargs):
+        got["cmd"] = list(cmd)
+        raise FileNotFoundError("capture only")
+
+    executor_cls(session_store=store, transcript_store=transcripts, spawn_fn=spawn,
+                 binary_resolver=lambda: binary).execute(
+        session, {"description": "do the synthetic thing", "working_dir": str(work_dir)},
+    )
+    out = []
+    for token in got["cmd"]:
+        token = re.sub(r"lifeos_attempt_id=[^;\s]+", "lifeos_attempt_id=<A>", token)
+        token = re.sub(r"lifeos_turn_id=[^.\s]+", "lifeos_turn_id=<T>", token)
+        if token.startswith(tempfile.gettempdir()):
+            token = "<OUT>"
+        token = token.replace(str(work_dir), "<WORK>")
+        out.append(token)
+    return out
+
+
+def normalized_top_level_argv(cce, cx, store, transcripts, work_dir) -> dict:
+    """Top-level Claude Code and Codex argv, and a Claude Code child's, from
+    executor modules `cce`/`cx`. Shared with the script that captured the
+    pins below from origin/main."""
+    claude = store.create(task_id="pin-cc", session_id="sess_pin_cc", routing="claude_code", origin="operator")
+    codex = store.create(task_id="pin-cx", session_id="sess_pin_cx", routing="codex", origin="operator")
+    parent = store.create(task_id="pin-parent", session_id="sess_pin_parent", routing="claude_code",
+                          origin="operator", status=STATUS_RUNNING)
+    child = store.create(task_id="pin-child", session_id="sess_pin_child", routing="claude_code",
+                         parent_session_id=parent.session_id)
+    return {
+        "claude_code": normalized_argv(cce.ClaudeCodeExecutor, "/usr/bin/claude-example", claude,
+                                       store, transcripts, work_dir),
+        "codex": normalized_argv(cx.CodexExecutor, "/usr/bin/codex-example", codex,
+                                 store, transcripts, work_dir),
+        "claude_code_child": normalized_argv(cce.ClaudeCodeExecutor, "/usr/bin/claude-example", child,
+                                             store, transcripts, work_dir),
+    }
+
+
+# Captured from origin/main's executors with PIN_SETTINGS, the synthetic
+# Codex config of `_synthetic_home`, and `normalized_top_level_argv`.
+PINNED_ARGV = {
+    "claude_code": {
+        "flags": [
+            "/usr/bin/claude-example", "-p", "do the synthetic thing",
+            "--output-format", "stream-json", "--verbose", "--max-turns", "40",
+            "--dangerously-skip-permissions", "--chrome", "--append-system-prompt",
+        ],
+        "prompt_sha256": "5123941c82f09b83b5784a4716f338130d96c081bdd025eae5c50a82f43eb86d",
+    },
+    "claude_code_child": {
+        "flags": [
+            "/usr/bin/claude-example", "-p", "do the synthetic thing",
+            "--output-format", "stream-json", "--verbose", "--max-turns", "40",
+            "--dangerously-skip-permissions", "--chrome", "--append-system-prompt",
+        ],
+        "prompt_sha256": "435e54d337db65865fbb6877b4284534f874868d08d197aff0f974e1e6eda18d",
+    },
+    "codex": {
+        "flags": [
+            "/usr/bin/codex-example", "exec", "-c",
+            'mcp_servers.lifeos.env_vars=["LIFEOS_AGENT_SESSION_ID", "LIFEOS_AGENT_ATTEMPT_ID", "LIFEOS_AGENT_TURN_ID"]',
+            "--json", "--skip-git-repo-check", "--sandbox", "workspace-write",
+            "--dangerously-bypass-approvals-and-sandbox", "-C", "<WORK>", "-o", "<OUT>",
+        ],
+        "prompt_sha256": "3e9dcbcf48479b0a956216e83874956592d8af8a004720925a82afc1d4dcfcd7",
+    },
+}
+
+
+@pytest.fixture
+def pinned_settings(monkeypatch):
+    import platform
+
+    for key, value in PIN_SETTINGS.items():
+        monkeypatch.setattr(settings, key, value)
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+
+
+def _assert_pinned(cmd, pin, *, prompt_after=None):
+    import hashlib
+
+    index = cmd.index(prompt_after) + 1 if prompt_after else len(cmd) - 1
+    assert cmd[:index] + cmd[index + 1:] == pin["flags"]
+    assert hashlib.sha256(cmd[index].encode()).hexdigest() == pin["prompt_sha256"]
+
+
+def test_top_level_argv_matches_origin_main(store, transcripts, pinned_settings, tmp_path):
+    from api.services.agent_worker import claude_code_executor, codex_executor
+
+    argv = normalized_top_level_argv(claude_code_executor, codex_executor, store, transcripts, tmp_path)
+    _assert_pinned(argv["claude_code"], PINNED_ARGV["claude_code"], prompt_after="--append-system-prompt")
+    _assert_pinned(argv["claude_code_child"], PINNED_ARGV["claude_code_child"],
+                   prompt_after="--append-system-prompt")
+    _assert_pinned(argv["codex"], PINNED_ARGV["codex"])
