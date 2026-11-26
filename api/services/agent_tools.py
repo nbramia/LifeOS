@@ -2883,10 +2883,11 @@ def _task_complete_project(inp: dict) -> str:
     return f"Project completed: \"{task.description}\" (id: {task.id})"
 
 
-def _task_plan_project(inp: dict) -> str:
+def _task_plan_project(inp: dict, precondition=None) -> str:
     from api.services.task_manager import get_task_manager
     result = _task_project_service(get_task_manager(), lifecycle=True).plan_and_delegate(
         inp.get("task_id") or "", operation_id=inp.get("operation_id") or "",
+        precondition=precondition,
     )
     verb = "started" if result.get("created") else "recovered"
     return (

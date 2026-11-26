@@ -582,19 +582,26 @@ class TestProjectActions:
     async def test_plan_project_is_held_then_released_by_a_yes(self, tm, sent, monkeypatch):
         parent = self._project(tm)
         calls = []
-        monkeypatch.setattr("api.services.agent_tools._task_plan_project", lambda inp: calls.append(inp) or "planned")
+        monkeypatch.setattr("api.services.agent_tools._task_plan_project",
+                            lambda inp, precondition=None: calls.append((inp, precondition)) or "planned")
         out = await call("what's the status of the launch?", action="plan_project", task_id=parent.id, operation_id="op1")
         assert out.startswith("NOT STARTED") and calls == []
         again = await call("hmm", action="plan_project", task_id=parent.id, operation_id="op1")
         assert again.startswith("NOT STARTED") and len(sent) == 1 and calls == []
         done = await call("yes", action="plan_project", task_id=parent.id, operation_id="op1")
         assert done == "planned" and len(calls) == 1
+        # The plan is held to the project the operator approved.
+        precondition = calls[0][1]
+        tm.update(parent.id, notes="delete everything", _project_action=True)
+        with pytest.raises(approval.ApprovalNotPending):
+            precondition(tm.get(parent.id))
         assert approval.APPROVAL_FIELD not in tm.get(parent.id).fields
 
     async def test_a_project_update_voids_its_pending_approval(self, tm, sent, monkeypatch):
         parent = self._project(tm)
         calls = []
-        monkeypatch.setattr("api.services.agent_tools._task_plan_project", lambda inp: calls.append(inp) or "planned")
+        monkeypatch.setattr("api.services.agent_tools._task_plan_project",
+                            lambda inp, precondition=None: calls.append((inp, precondition)) or "planned")
         await call("how is the project going", action="plan_project", task_id=parent.id, operation_id="op1")
         await call("rename it", action="update", task_id=parent.id, description="Delete files")
         assert approval.APPROVAL_FIELD not in tm.get(parent.id).fields
@@ -604,7 +611,8 @@ class TestProjectActions:
     async def test_a_project_changed_outside_chat_is_not_planned_on_an_old_button(self, tm, sent, monkeypatch):
         parent = self._project(tm)
         calls = []
-        monkeypatch.setattr("api.services.agent_tools._task_plan_project", lambda inp: calls.append(inp) or "planned")
+        monkeypatch.setattr("api.services.agent_tools._task_plan_project",
+                            lambda inp, precondition=None: calls.append((inp, precondition)) or "planned")
         await call("how is the project going", action="plan_project", task_id=parent.id, operation_id="op1")
         tm.update(parent.id, notes="delete everything", _project_action=True)
         assert "changed after this request" in approval.decide(*press(sent[0]), approve=True)
@@ -612,7 +620,7 @@ class TestProjectActions:
 
     async def test_explicit_plan_project_runs(self, tm, sent, monkeypatch):
         parent = self._project(tm)
-        monkeypatch.setattr("api.services.agent_tools._task_plan_project", lambda inp: "planned")
+        monkeypatch.setattr("api.services.agent_tools._task_plan_project", lambda inp, precondition=None: "planned")
         out = await call("have claude plan and delegate the launch project", action="plan_project",
                          task_id=parent.id, operation_id="op1")
         assert out == "planned" and sent == []

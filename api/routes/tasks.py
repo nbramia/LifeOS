@@ -9,9 +9,10 @@ from datetime import date
 from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException, Query
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from api.services import human_queue
+from api.services import agent_task_approval, hermes_turn, human_queue
 from api.services.agent_board import AGENT_PICKUP_TAGS
 from api.services.agent_worker.session_store import SessionStore
 from api.services.agent_worker.transcript_store import TranscriptStore
@@ -45,6 +46,12 @@ AGENT_SESSION_HEADER = "X-LifeOS-Agent-Session"
 # task's id comment. Rejected outright rather than sanitized, so a forged
 # header never reaches the write path at all.
 _AGENT_SESSION_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+# The Hermes turn a call belongs to (`hermes_turn`): the
+# `<caller_session_id>.<lifeos_turn_id>` LifeOS wrote into the turn, or
+# `none`. Sent by the MCP server Hermes starts on the writes that can start
+# agent work. It names a turn and proves nothing; `_resolve_caller` looks it
+# up in LifeOS's own records.
+HERMES_TURN_HEADER = hermes_turn.HEADER
 # Tags a project child cannot carry when the write is agent-attributed.
 _HERMES_TAG = "hermes"
 _METERED_CHILD_TAGS = frozenset({"cloud", "cloud-haiku", "cloud-sonnet"})
@@ -146,6 +153,22 @@ def _clean_agent_session_header(value: Optional[str]) -> Optional[str]:
             },
         )
     return value
+
+
+def _resolve_caller(agent_session_header: Optional[str], hermes_turn_header: Optional[str]):
+    """Who a task write acts as: `(agent_session_id, approval_turn)`.
+
+    `AGENT_SESSION_HEADER` makes it that agent session's write. Otherwise a
+    `HERMES_TURN_HEADER` that names a running worker Hermes session makes it
+    that session's write, exactly as if it had sent `AGENT_SESSION_HEADER`
+    (creator stamp, project-child tag guard, no operator-only actions); any
+    other Hermes call gets the approval turn the agent-work approval gate
+    judges it by. With neither header, `(None, None)`: an operator write."""
+    agent_session_id = _clean_agent_session_header(agent_session_header)
+    if agent_session_id or hermes_turn_header is None:
+        return agent_session_id, None
+    caller = hermes_turn.resolve(hermes_turn_header)
+    return caller.agent_session_id, caller.approval_turn
 
 
 def _enforce_agent_child_tag_guard(
@@ -453,6 +476,7 @@ class ConflictListResponse(BaseModel):
 async def create_task(
     request: CreateTaskRequest,
     x_lifeos_agent_session: Optional[str] = Header(default=None, alias=AGENT_SESSION_HEADER),
+    x_lifeos_hermes_turn: Optional[str] = Header(default=None, alias=HERMES_TURN_HEADER),
 ):
     """Create a new task, or preview its agent routing without creating it.
 
@@ -471,25 +495,44 @@ async def create_task(
     with its agent origin and creator session; any other agent-attributed
     create is stamped with its creator session (`agent_creator_session`).
     An ordinary operator create carries neither header nor stamp.
+
+    `HERMES_TURN_HEADER` names the Hermes turn (`_resolve_caller`): a
+    running worker Hermes session's create is attributed to it as above;
+    any other Hermes create goes through the agent-work approval gate, so a
+    task the worker would pick up is saved parked (status `blocked`,
+    `agent_approval:: pending`) and sent to Telegram for approval unless
+    LifeOS's record of the operator's question for that turn asked for
+    agent work.
     """
     if request.dry_run and _has_agent_pickup_tag(request.tags):
         return _build_preflight_preview(request)
     _require_valid_status(request.status)
     manager = get_task_manager()
     fields = {k: v for k, v in (request.fields or {}).items() if v is not None}
-    agent_session_id = _clean_agent_session_header(x_lifeos_agent_session)
+    agent_session_id, approval_turn = _resolve_caller(x_lifeos_agent_session, x_lifeos_hermes_turn)
     parent_id = (fields.get("parent_id") or "").strip()
     if agent_session_id and parent_id:
         _enforce_agent_child_tag_guard(manager, parent_id=parent_id, tags=request.tags)
     child_creator_session = agent_session_id if (agent_session_id and parent_id) else None
     agent_creator_session = agent_session_id if (agent_session_id and not parent_id) else None
+    status = request.status or "todo"
+    gated = None
+    if approval_turn is not None:
+        gated = agent_task_approval.gate_create({
+            "description": request.description, "status": status, "tags": request.tags,
+            "notes": request.notes, "fields": fields,
+        }, approval_turn)
+        if gated.refusal:
+            raise HTTPException(status_code=422, detail=gated.refusal)
+        status, fields = gated.status, gated.fields
+    created = True
     try:
         if request.operation_key:
-            task, _created = manager.create_or_find_by_operation(
+            task, created = manager.create_or_find_by_operation(
                 request.operation_key,
                 description=request.description,
                 context=request.context or "Inbox",
-                status=request.status or "todo",
+                status=status,
                 priority=request.priority or "",
                 due_date=request.due_date,
                 tags=request.tags,
@@ -503,7 +546,7 @@ async def create_task(
             task = manager.create(
                 description=request.description,
                 context=request.context or "Inbox",
-                status=request.status or "todo",
+                status=status,
                 priority=request.priority or "",
                 due_date=request.due_date,
                 tags=request.tags,
@@ -519,6 +562,9 @@ async def create_task(
         raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
+    if gated is not None and gated.token and created:
+        agent_task_approval.open_parked_request(task.id, gated.token, approval_turn)
+        task = manager.get(task.id) or task
     return _task_response(manager, task)
 
 
@@ -987,9 +1033,51 @@ async def complete_project(task_id: str, body: CompleteProjectRequest):
     return _task_response(manager, task)
 
 
-@router.post("/{task_id}/project/plan")
-async def plan_project(task_id: str, body: ProjectOperationRequest):
+def _gated_project_action(task_id: str, action: str, approval_turn, runner):
+    """Run `runner(precondition)` through the agent-work approval gate. A
+    held action answers 202 with `awaiting_approval` and the notice for the
+    caller to relay."""
     try:
+        result = agent_task_approval._run_project_action(
+            {"task_id": task_id}, approval_turn, action, runner=runner,
+        )
+    except agent_task_approval.ApprovalNotPending:
+        raise HTTPException(status_code=409, detail=(
+            "The task changed after the operator approved it; nothing was started."
+        ))
+    if result is None:
+        raise KeyError(task_id)
+    if isinstance(result, str):
+        if result.startswith("Error:"):
+            raise HTTPException(status_code=409, detail=result.removeprefix("Error: "))
+        return JSONResponse(status_code=202, content={
+            "awaiting_approval": True, "task_id": task_id, "action": action, "message": result,
+        })
+    return result
+
+
+@router.post("/{task_id}/project/plan")
+async def plan_project(
+    task_id: str,
+    body: ProjectOperationRequest,
+    x_lifeos_hermes_turn: Optional[str] = Header(default=None, alias=HERMES_TURN_HEADER),
+    x_lifeos_agent_session: Optional[str] = Header(default=None, alias=AGENT_SESSION_HEADER),
+):
+    """Plan a project and delegate it to its agent owner. A Hermes call
+    (`HERMES_TURN_HEADER`, `_resolve_caller`) that is not a worker session's
+    own is held for the operator's approval (202, `awaiting_approval`)
+    unless LifeOS's record of their question for the turn asked for agent
+    work; an approved plan runs only while the project is the one the
+    operator approved (409 otherwise)."""
+    try:
+        _agent_session_id, approval_turn = _resolve_caller(x_lifeos_agent_session, x_lifeos_hermes_turn)
+        if approval_turn is not None:
+            return _gated_project_action(
+                task_id, agent_task_approval.ACTION_PLAN_PROJECT, approval_turn,
+                lambda precondition=None: _project_service().plan_and_delegate(
+                    task_id, operation_id=body.operation_id, precondition=precondition,
+                ),
+            )
         return _project_service().plan_and_delegate(task_id, operation_id=body.operation_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="Task not found")
@@ -1048,12 +1136,17 @@ async def pause_project(task_id: str, body: ProjectPauseRequest):
 async def resume_project(
     task_id: str,
     x_lifeos_agent_session: Optional[str] = Header(default=None, alias=AGENT_SESSION_HEADER),
+    x_lifeos_hermes_turn: Optional[str] = Header(default=None, alias=HERMES_TURN_HEADER),
 ):
-    """Clear a project's paused state. Refused with 403 for a caller that
-    carries `AGENT_SESSION_HEADER` — only the operator (a request that sends
-    no header at all) may resume a paused project, so an agent that paused
-    one cannot silently undo it."""
-    if (x_lifeos_agent_session or "").strip():
+    """Clear a project's paused state. Refused with 403 for an agent
+    session's call (`AGENT_SESSION_HEADER`, or a Hermes call from a running
+    worker session) — only the operator may resume a paused project, so an
+    agent that paused one cannot silently undo it. Any other Hermes call
+    whose resume would let an agent start is held for the operator's
+    approval (202, `awaiting_approval`) unless LifeOS's record of their
+    question for the turn asked for agent work."""
+    agent_session_id, approval_turn = _resolve_caller(x_lifeos_agent_session, x_lifeos_hermes_turn)
+    if agent_session_id:
         raise HTTPException(
             status_code=403,
             detail={
@@ -1063,7 +1156,18 @@ async def resume_project(
         )
     manager = get_task_manager()
     try:
-        task = _project_service(manager).resume_project(task_id)
+        if approval_turn is not None:
+            result = _gated_project_action(
+                task_id, agent_task_approval.ACTION_RESUME_PROJECT, approval_turn,
+                lambda precondition=None: _project_service(manager).resume_project(
+                    task_id, precondition=precondition,
+                ),
+            )
+            if isinstance(result, JSONResponse):
+                return result
+            task = result
+        else:
+            task = _project_service(manager).resume_project(task_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="Task not found")
     except ProjectConflictError as exc:
@@ -1097,10 +1201,31 @@ async def finalize_project_handoff(
 
 
 @router.post("/{task_id}/resume-execution", response_model=TaskResponse)
-async def resume_task_execution(task_id: str):
+async def resume_task_execution(
+    task_id: str,
+    x_lifeos_hermes_turn: Optional[str] = Header(default=None, alias=HERMES_TURN_HEADER),
+    x_lifeos_agent_session: Optional[str] = Header(default=None, alias=AGENT_SESSION_HEADER),
+):
+    """Resume a task's paused execution. A Hermes call (`HERMES_TURN_HEADER`,
+    `_resolve_caller`) that is not a worker session's own and would start an
+    agent is held for the operator's approval (202, `awaiting_approval`)
+    unless LifeOS's record of their question for the turn asked for agent
+    work."""
     manager = get_task_manager()
     try:
-        task = _project_service(manager).resume_execution(task_id)
+        _agent_session_id, approval_turn = _resolve_caller(x_lifeos_agent_session, x_lifeos_hermes_turn)
+        if approval_turn is not None:
+            result = _gated_project_action(
+                task_id, agent_task_approval.ACTION_RESUME_EXECUTION, approval_turn,
+                lambda precondition=None: _project_service(manager).resume_execution(
+                    task_id, precondition=precondition,
+                ),
+            )
+            if isinstance(result, JSONResponse):
+                return result
+            task = result
+        else:
+            task = _project_service(manager).resume_execution(task_id)
     except KeyError:
         raise HTTPException(status_code=404, detail="Task not found")
     except ProjectConflictError as exc:
@@ -1115,6 +1240,7 @@ async def update_task(
     task_id: str,
     request: UpdateTaskRequest,
     x_lifeos_agent_session: Optional[str] = Header(default=None, alias=AGENT_SESSION_HEADER),
+    x_lifeos_hermes_turn: Optional[str] = Header(default=None, alias=HERMES_TURN_HEADER),
 ):
     """Update an existing task.
 
@@ -1124,6 +1250,15 @@ async def update_task(
     see `_enforce_agent_child_tag_guard`. An agent-attributed write that
     assigns the task to an engine adds the agent to the task's creators
     (`agent_creator_session`). An operator write (no header) is unaffected.
+
+    `HERMES_TURN_HEADER` names the Hermes turn (`_resolve_caller`): a
+    running worker Hermes session's update is attributed to it as above;
+    any other Hermes update goes through the agent-work approval gate, so
+    an update that would hand the task to the worker (assigning an engine,
+    reopening an engine task, rewriting a queued one) parks it for Telegram
+    approval unless LifeOS's record of the operator's question for that turn
+    asked for agent work, and a parked task is released only by an explicit
+    request or the operator's go-ahead in the next turn.
     """
     _require_valid_status(request.status)
     manager = get_task_manager()
@@ -1131,7 +1266,7 @@ async def update_task(
     actor = updates.pop("actor", None)
     assignee = updates.pop("assignee", None)
     acting_agent = updates.pop("acting_agent", None)
-    agent_session_id = _clean_agent_session_header(x_lifeos_agent_session)
+    agent_session_id, approval_turn = _resolve_caller(x_lifeos_agent_session, x_lifeos_hermes_turn)
 
     from api.services import agent_board as _board
 
@@ -1376,8 +1511,17 @@ async def update_task(
         if _assigns_engine(before, requested_tags, updates.get("description")):
             updates["_agent_creator_session"] = agent_session_id
 
+    gated = None
+    if approval_turn is not None:
+        gated, precondition = _gate_update(manager, task_id, updates, assignee, approval_turn,
+                                           precondition)
+
     try:
         task = manager.update(task_id, _precondition=precondition, **updates)
+    except agent_task_approval.ApprovalChanged:
+        raise HTTPException(status_code=409, detail=(
+            "The task changed while it was being checked for approval; try again."
+        ))
     except _CardDecisionChanged as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail)
     except ProjectConflictError as e:
@@ -1388,7 +1532,54 @@ async def update_task(
         raise HTTPException(status_code=422, detail=str(e))
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
+    if gated is not None and gated.kind == "park" and gated.token:
+        agent_task_approval.open_parked_request(task.id, gated.token, approval_turn)
+        task = manager.get(task.id) or task
     return _task_response(manager, task)
+
+
+def _gate_update(manager, task_id: str, updates: dict, assignee: Optional[str],
+                 approval_turn, precondition):
+    """Run an update through the agent-work approval gate. Rewrites
+    `updates` with the status and fields the gate writes, and returns the
+    gate's decision with a precondition that also re-checks it against the
+    snapshot being written."""
+    from api.services import agent_board as _board
+
+    requested = dict(updates)
+
+    def inp_for(task) -> dict:
+        tags = requested.get("tags")
+        if assignee is not None:
+            tags = _board.swap_assignee(task.tags, assignee)
+        return {
+            "description": requested.get("description"),
+            "status": requested.get("status"),
+            "priority": requested.get("priority"),
+            "due_date": requested.get("due_date"),
+            "notes": requested.get("notes"),
+            "tags": tags,
+            "fields": requested.get("fields"),
+        }
+
+    gated = agent_task_approval.gate_update(manager, task_id, inp_for, approval_turn)
+    if gated is None:
+        return None, precondition
+    if gated.kind == "refuse":
+        waiting = "waiting for the operator's approval" in (gated.refusal or "")
+        raise HTTPException(status_code=409 if waiting else 422, detail=gated.refusal)
+    if gated.status is not None:
+        updates["status"] = gated.status
+    if gated.fields is not None:
+        updates["fields"] = gated.fields
+    earlier = precondition
+
+    def gated_precondition(snapshot) -> None:
+        if earlier is not None:
+            earlier(snapshot)
+        gated.precondition(snapshot)
+
+    return gated, gated_precondition
 
 
 @router.put("/{task_id}/complete", response_model=TaskResponse)

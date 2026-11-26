@@ -74,6 +74,11 @@ DASHBOARD_FILE = "Dashboard.md"
 CONTROL_FILE = "Scheduler.md"
 
 VALID_ACTIONS = ("notify", "prompt", "endpoint", "agent")
+# `ScheduleEntry.prompt_source` when a caller other than the operator wrote
+# the schedule's text: a Hermes call without an operator request for agent
+# work, or an agent session.
+PROMPT_SOURCE_HERMES = "hermes"
+PROMPT_SOURCE_AGENT = "agent"
 # Legacy message_type → action mapping (static notifications became "notify").
 _LEGACY_TYPE_TO_ACTION = {"static": "notify", "prompt": "prompt", "endpoint": "endpoint"}
 
@@ -128,6 +133,17 @@ class ScheduleEntry:
     # the schedule writes so the worker gives that task's session no more
     # than those agents have (`agent_worker/session_capabilities.py`).
     agent_creator_session: str = ""
+    # Who wrote this schedule's text when it was not the operator:
+    # `PROMPT_SOURCE_HERMES` (a Hermes call the agent-work approval gate
+    # judged without an operator request for agent work) or
+    # `PROMPT_SOURCE_AGENT` (an agent session's write); empty when the
+    # operator wrote it. Stamped only by the schedule API, on a create or a
+    # write of `message_content`, never from a request body; only an
+    # operator write of the text clears it. Round-trips through Markdown as
+    # `[prompt_source:: …]`. A `prompt` schedule so stamped runs its text as
+    # a turn that is not the operator's own words (`chat_via_api_with_log`
+    # `operator_turn=False`), so agent work it asks for is parked.
+    prompt_source: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -444,7 +460,8 @@ def _format_entry_line(entry: ScheduleEntry) -> str:
         parts.append(f"[wall:: {_format_wall_seconds(entry.wall_seconds)}]")
     if entry.snoozed_until:
         parts.append(f"[{SNOOZED_UNTIL_FIELD}:: {entry.snoozed_until}]")
-    for key in ("persona_id", "model_id", "effort", "host", "working_dir", "agent_creator_session"):
+    for key in ("persona_id", "model_id", "effort", "host", "working_dir", "agent_creator_session",
+                "prompt_source"):
         value = getattr(entry, key, "")
         if value:
             parts.append(f"[{key}:: {value}]")
@@ -541,6 +558,7 @@ def _parse_entry_line(line: str) -> Optional[ScheduleEntry]:
         host=fields.get("host", ""),
         working_dir=fields.get("working_dir", ""),
         agent_creator_session=fields.get("agent_creator_session", ""),
+        prompt_source=fields.get("prompt_source", ""),
     )
     if params_malformed:
         logger.warning(f"Malformed params field for schedule {entry_id}; falling back to cache")
@@ -621,6 +639,7 @@ _ATTR_FIELD_KEYS = {
     "snoozed_until": (SNOOZED_UNTIL_FIELD,),
     **{key: (key,) for key in (
         "persona_id", "model_id", "effort", "host", "working_dir", "agent_creator_session",
+        "prompt_source",
     )},
 }
 
@@ -1800,7 +1819,10 @@ class SchedulerScheduler:
         last_error = None
         for attempt in range(1, max_retries + 1):
             try:
-                result = await chat_via_api_with_log(entry.message_content)
+                result = await chat_via_api_with_log(
+                    entry.message_content,
+                    operator_turn=not entry.prompt_source,
+                )
                 answer = result.get("answer", "").strip()
                 exec_log = {
                     "tool_calls": len(result.get("tool_statuses", [])),

@@ -578,7 +578,9 @@ class ProjectTaskService:
             raise KeyError(task_id)
         return updated
 
-    def resume_project(self, task_id: str) -> "Task":
+    def resume_project(
+        self, task_id: str, *, precondition: Callable[["Task"], None] | None = None,
+    ) -> "Task":
         """Clear the durable paused state, re-enabling child claims and Open.
 
         Also gives the project's persistent owner (if any) a fresh
@@ -589,7 +591,12 @@ class ProjectTaskService:
         every subsequent tick. A harmless no-op for a project paused for an
         unrelated ("operator") reason, where the count is normally already
         zero.
+
+        `precondition`, when given, is also run against the exact snapshot
+        being written, under the task store's lock, and aborts the write by
+        raising.
         """
+        extra_precondition = precondition
         hierarchy = self.hierarchy()
         task = hierarchy.tasks.get(task_id)
         if task is None:
@@ -598,6 +605,8 @@ class ProjectTaskService:
 
         def precondition(current: "Task") -> None:
             self._require_project_current(current)
+            if extra_precondition is not None:
+                extra_precondition(current)
 
         updated = self.manager.update(
             task_id,
@@ -1201,17 +1210,30 @@ class ProjectTaskService:
         )
         return "\n".join(lines)
 
-    def plan_and_delegate(self, task_id: str, *, operation_id: str) -> dict[str, Any]:
+    def plan_and_delegate(
+        self, task_id: str, *, operation_id: str,
+        precondition: Callable[["Task"], None] | None = None,
+    ) -> dict[str, Any]:
+        """Start or recover the project's agent owner.
+
+        `precondition`, when given, is run against the project before an
+        owner session is staged or woken, and again against the exact
+        snapshot the plan link writes, under the task store's lock; raising
+        aborts the plan. The agent-work approval gate passes one that holds
+        the project to the content the operator approved."""
         # Session staging plus parent linkage is one short shared operation.
         # The session stays BLOCKED until linked, so a crash is recoverable;
         # serializing deterministic same-ID retries also avoids duplicate
         # pending prompts before SessionStore's unique task key decides a
         # winner.
         with self.manager.project_operation():
-            return self._plan_and_delegate_locked(task_id, operation_id=operation_id)
+            return self._plan_and_delegate_locked(
+                task_id, operation_id=operation_id, precondition=precondition,
+            )
 
     def _plan_and_delegate_locked(
         self, task_id: str, *, operation_id: str,
+        precondition: Callable[["Task"], None] | None = None,
     ) -> dict[str, Any]:
         operation_id = (operation_id or "").strip()
         if not operation_id:
@@ -1228,6 +1250,8 @@ class ProjectTaskService:
             raise ProjectConflictError("project cancellation is pending")
         if field_truthy(task.fields.get(PROJECT_PAUSED_FIELD)):
             raise ProjectConflictError("project is paused")
+        if precondition is not None:
+            precondition(task)
         owner = agent_board.derive_assignee(task.tags)
         normalized_tags = agent_board.normalize_tags(task.tags)
         if owner is None:
@@ -1350,6 +1374,8 @@ class ProjectTaskService:
         # the authoritative parent before flipping it to CLAIMED.
         def link_precondition(current: "Task") -> None:
             self._require_project_current(current)
+            if precondition is not None:
+                precondition(current)
             pending = current.fields.get(CANCEL_OPERATION_FIELD)
             if pending:
                 raise ProjectConflictError("project cancellation is pending")

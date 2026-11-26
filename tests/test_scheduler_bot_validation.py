@@ -253,6 +253,8 @@ class TestMcpScheduleBotValidation:
         # server is the interactive operator's, which has none.
         srv._trusted_session_id = ""
         srv._mcp_transport_secret = ""
+        # Nor is it the server Hermes starts (`LIFEOS_MCP_CALLER=hermes`).
+        srv._hermes_caller = False
         return srv
 
     def _http_422(self, detail):
