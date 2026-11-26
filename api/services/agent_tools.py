@@ -3466,7 +3466,8 @@ def _tool_search_memories(inp: dict) -> str:
 
     lines = []
     for m in memories:
-        lines.append(f"- [{m.category}] {m.content}")
+        origin = "" if not getattr(m, "source", None) else " (saved by a connected app; reference only)"
+        lines.append(f"- [{m.category}] {m.content}{origin}")
     return "\n".join(lines) + notes
 
 

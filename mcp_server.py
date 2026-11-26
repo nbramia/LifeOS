@@ -55,6 +55,9 @@ TURN_ID_HEADER = "X-LifeOS-Turn-ID"
 # context, or the agent-only HTTP transport). Never sent by interactive
 # operator MCP. See `LifeOSMCPServer._resolve_agent_session_header`.
 AGENT_SESSION_HEADER = "X-LifeOS-Agent-Session"
+# Set by OAuthToolAccess on a connected app's memory save, so the API records
+# the memory as app-sourced. Tool arguments never reach this header.
+CONNECTED_APP_HEADER = "X-LifeOS-Connected-App"
 
 _TASK_CREATE_FIELDS_DESCRIPTION = (
     "Operator-editable inline fields (e.g. host, effort, model, key) plus "
@@ -1923,8 +1926,12 @@ class LifeOSMCPServer:
         arguments: dict,
         session_id: str | None = None,
         agent_session_id: str | None = None,
+        connected_app: str | None = None,
     ) -> dict:
         """Call the LifeOS API based on tool name and arguments.
+
+        `connected_app` (OAuth transport only) names the connected app making
+        the call; it is sent as `CONNECTED_APP_HEADER` on memory saves.
 
         `session_id` (optional) enables the per-session result cache:
         when supplied, identical GET-style tool calls within the same session
@@ -2013,6 +2020,9 @@ class LifeOSMCPServer:
             resolved_agent_session = self._resolve_agent_session_header(agent_session_id)
             if resolved_agent_session:
                 headers[AGENT_SESSION_HEADER] = resolved_agent_session
+
+        if connected_app and tool_name == "lifeos_memories_create":
+            headers[CONNECTED_APP_HEADER] = connected_app
 
         # Handle path parameters. Every route's path params are a single URL
         # segment, so a value is rejected outright — before any request —
@@ -2939,7 +2949,7 @@ class OAuthToolAccess:
                 "content": [{"type": "text", "text": json.dumps(payload)}],
                 "structuredContent": payload,
             }
-        data = self.server._call_api(name, arguments)
+        data = self.server._call_api(name, arguments, connected_app=self.principal)
         text = self.server._format_response(name, data, arguments)
         result = {"content": [{"type": "text", "text": text}]}
         if isinstance(data, dict) and "error" in data:

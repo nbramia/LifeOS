@@ -956,3 +956,43 @@ class TestMemoryWorkflow:
         assert len(facts) >= 1
         assert len(preferences) >= 1
         assert len(reminders) >= 1
+
+
+@pytest.mark.unit
+class TestMemoryProvenance:
+    """Where a memory came from decides whether the chat prompt may carry it."""
+
+    def test_memories_without_a_source_field_load_as_operator_memories(self, tmp_path):
+        import json
+
+        from api.services.memory_store import MemoryStore
+
+        path = tmp_path / "memories.json"
+        path.write_text(json.dumps({"memories": [
+            {"id": "old-1", "content": "Synthetic legacy note", "is_active": True},
+        ]}))
+        memory = MemoryStore(str(path)).get_memory("old-1")
+        assert memory.source is None and memory.is_operator_memory
+        assert "source" not in memory.to_dict()
+
+    def test_source_persists_and_survives_update_and_delete(self, tmp_path):
+        from api.services.memory_store import MemoryStore
+
+        path = tmp_path / "memories.json"
+        store = MemoryStore(str(path))
+        created = store.create_memory("Synthetic app note", source="connected-app:abc")
+        store.update_memory(created.id, "Synthetic app note, edited")
+        assert MemoryStore(str(path)).get_memory(created.id).source == "connected-app:abc"
+
+    def test_app_memories_are_excluded_from_prompt_recall_but_searchable(self, tmp_path):
+        from api.services.memory_store import MemoryStore, format_memories_for_prompt
+
+        store = MemoryStore(str(tmp_path / "memories.json"))
+        mine = store.create_memory("Synthetic zebra preference of the operator")
+        theirs = store.create_memory("Synthetic zebra standing order", source="connected-app:abc")
+        assert [m.id for m in store.get_relevant_memories("zebra")] == [mine.id]
+        assert theirs.id in {m.id for m in store.search_memories("zebra")}
+        # The formatter withholds app memories even when handed one directly.
+        text = format_memories_for_prompt([mine, theirs])
+        assert "operator" in text and "standing order" not in text
+        assert format_memories_for_prompt([theirs]) == ""

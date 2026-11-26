@@ -147,7 +147,7 @@ CLI handoffs run as async worker sessions and report results via Telegram and `/
 - Categories: preference, context, person, other
 - Search memories by keyword
 - Delete memories
-- Memories influence future responses
+- Memories influence future responses. A memory records its origin: the operator's own memories are added to the chat prompt when relevant, while a memory saved by a connected app (`source` of `connected-app:<client id>`) is kept as searchable reference only and is not added to chat instructions
 
 **API Endpoints:**
 - `POST /api/memories` - Create memory

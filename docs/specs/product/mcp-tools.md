@@ -466,7 +466,7 @@ A `q` that matches no name and says it wants whoever fits ("who do I know in fun
 
 ### lifeos_memories_create
 
-Save a memory for future reference.
+Save a memory for future reference. A memory saved by a connected app is kept as reference and is not added to chat instructions.
 
 **Parameters:**
 | Name | Type | Required | Description |
