@@ -468,8 +468,9 @@ async def create_task(
     agent-attributed: a project-child create (`fields.parent_id` set) is
     refused if it carries `#hermes` or an out-of-scope paid route (see
     `_enforce_agent_child_tag_guard`), and on success the child is stamped
-    with its agent origin and creator session — an ordinary operator create
-    carries neither header nor stamp.
+    with its agent origin and creator session; any other agent-attributed
+    create is stamped with its creator session (`agent_creator_session`).
+    An ordinary operator create carries neither header nor stamp.
     """
     if request.dry_run and _has_agent_pickup_tag(request.tags):
         return _build_preflight_preview(request)
@@ -481,6 +482,7 @@ async def create_task(
     if agent_session_id and parent_id:
         _enforce_agent_child_tag_guard(manager, parent_id=parent_id, tags=request.tags)
     child_creator_session = agent_session_id if (agent_session_id and parent_id) else None
+    agent_creator_session = agent_session_id if (agent_session_id and not parent_id) else None
     try:
         if request.operation_key:
             task, _created = manager.create_or_find_by_operation(
@@ -495,6 +497,7 @@ async def create_task(
                 notes=request.notes,
                 fields=fields,
                 _project_child_creator_session=child_creator_session,
+                _agent_creator_session=agent_creator_session,
             )
         else:
             task = manager.create(
@@ -508,6 +511,7 @@ async def create_task(
                 notes=request.notes,
                 fields=fields,
                 _project_child_creator_session=child_creator_session,
+                _agent_creator_session=agent_creator_session,
             )
     except ProjectConflictError as e:
         raise HTTPException(status_code=409, detail=str(e))
@@ -516,6 +520,21 @@ async def create_task(
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     return _task_response(manager, task)
+
+
+def _assigns_engine(current, requested_tags: Optional[list[str]], description: Optional[str]) -> bool:
+    """True when an update adds a pickup tag, through the tag list or as a
+    hashtag the task store will read back from a new description."""
+    from api.services.task_manager import _TAG_RE
+
+    before: set[str] = set()
+    if current is not None:
+        before = {t.lstrip("#").lower() for t in current.tags}
+        before |= {t.lower() for t in _TAG_RE.findall(current.description or "")}
+    added = {t.lstrip("#").lower() for t in (requested_tags or [])} - before
+    if description:
+        added |= {t.lower() for t in _TAG_RE.findall(description)} - before
+    return bool(added & _AGENT_PICKUP_TAGS)
 
 
 def _has_agent_pickup_tag(tags: Optional[list[str]]) -> bool:
@@ -1102,8 +1121,9 @@ async def update_task(
     `AGENT_SESSION_HEADER`, when present, marks this update as agent-
     attributed: a tags patch that adds `#hermes` or an out-of-scope paid
     route to a task that is, or would become, a project child is refused —
-    see `_enforce_agent_child_tag_guard`. An operator write (no header)
-    is unaffected.
+    see `_enforce_agent_child_tag_guard`. An agent-attributed write that
+    assigns the task to an engine adds the agent to the task's creators
+    (`agent_creator_session`). An operator write (no header) is unaffected.
     """
     _require_valid_status(request.status)
     manager = get_task_manager()
@@ -1350,6 +1370,11 @@ async def update_task(
         # Swapped on the snapshot being written, so a concurrent tag edit
         # (Obsidian, the board) is kept rather than overwritten.
         updates["_tags_merge"] = lambda tags: _board.swap_assignee(tags, assignee)
+
+    if agent_session_id:
+        before = current if current is not None else manager.get(task_id)
+        if _assigns_engine(before, requested_tags, updates.get("description")):
+            updates["_agent_creator_session"] = agent_session_id
 
     try:
         task = manager.update(task_id, _precondition=precondition, **updates)

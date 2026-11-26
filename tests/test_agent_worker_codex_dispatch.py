@@ -168,7 +168,7 @@ def test_codex_child_completion_stays_silent_to_operator(tmp_path: Path):
         tmp_path, codex_executor=stub,
         plain_sends=plain_sends, withid_sends=withid_sends,
     )
-    parent = worker.session_store.create(task_id="parent-1", routing="local")
+    parent = worker.session_store.create(task_id="parent-1", routing="local", origin="operator")
     child = worker.session_store.create(
         task_id="cx-child", routing="codex",
         parent_session_id=parent.session_id,
@@ -289,7 +289,7 @@ def test_codex_failed_finalizes_session_row(tmp_path: Path):
 
 
 def _seed_codex_child(worker):
-    parent = worker.session_store.create(task_id="parent-1", routing="local")
+    parent = worker.session_store.create(task_id="parent-1", routing="local", origin="operator")
     return worker.session_store.create(
         task_id="cx-child", routing="codex",
         parent_session_id=parent.session_id,
@@ -482,7 +482,7 @@ def test_codex_child_completion_does_not_mirror(tmp_path: Path):
         outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="child codex result")
     )
     worker, conv_store = _mirroring_codex_worker(tmp_path, codex_executor=stub)
-    parent = worker.session_store.create(task_id="cx-parent", routing="local")
+    parent = worker.session_store.create(task_id="cx-parent", routing="local", origin="operator")
     child = worker.session_store.create(
         task_id="cx-child", routing="codex", parent_session_id=parent.session_id,
     )
@@ -499,7 +499,7 @@ def test_codex_child_failure_does_not_mirror(tmp_path: Path):
     conversation either (parity with the claude_code failure gate)."""
     stub = _StubCodexExecutor(outcome=ExecutorOutcome(status=STATUS_FAILED, reason="boom"))
     worker, conv_store = _mirroring_codex_worker(tmp_path, codex_executor=stub)
-    parent = worker.session_store.create(task_id="cx-parent-2", routing="local")
+    parent = worker.session_store.create(task_id="cx-parent-2", routing="local", origin="operator")
     child = worker.session_store.create(
         task_id="cx-child-2", routing="codex", parent_session_id=parent.session_id,
     )
@@ -662,7 +662,7 @@ def test_codex_child_session_bypasses_interrupted_gate(tmp_path: Path):
         outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=FIELD_FRAGMENT)
     )
     worker = _make_worker(tmp_path, codex_executor=stub, plain_sends=plain_sends, withid_sends=withid_sends)
-    parent = worker.session_store.create(task_id="cx-parent-3", routing="local")
+    parent = worker.session_store.create(task_id="cx-parent-3", routing="local", origin="operator")
     child = worker.session_store.create(
         task_id="cx-child-3", routing="codex", parent_session_id=parent.session_id,
     )

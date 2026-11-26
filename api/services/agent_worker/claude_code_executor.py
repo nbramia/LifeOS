@@ -17,6 +17,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, NamedTuple, Optional
 
 from api.services.agent_worker.assignment import ENGINE_CLAUDE_CODE, map_effort_for_engine
@@ -34,6 +35,11 @@ from api.services.agent_worker.remote_spawn import (
     resolve_host_target,
 )
 from api.services.agent_worker.remote_spawn import api_host_name as _api_host_name
+from api.services.agent_worker.session_capabilities import (
+    UNRESTRICTED,
+    SessionCapabilities,
+    effective_for_executor,
+)
 from api.services.agent_worker.session_store import (
     STATUS_BLOCKED,
     STATUS_COMPLETED,
@@ -200,7 +206,7 @@ NOTIFICATIONS — use [NOTIFY] for:
 - Plans before large changes
 
 DELEGATION:
-You already have a browser (--chrome), filesystem, and shell. {delegation}
+{tool_summary} {delegation}
 
 {project_guidance}
 {turn_identity}
@@ -455,7 +461,13 @@ class ClaudeCodeExecutor:
         git_discipline: str = "",
         attempt_id: str = "",
         turn_id: str = "",
+        capabilities: SessionCapabilities = UNRESTRICTED,
+        mcp_config_path: Optional[str] = None,
     ) -> list[str]:
+        """The CLI argv. `capabilities` is the session's effective set: a set
+        without Chrome runs with `--no-chrome`, and `mcp_config_path` (a
+        file listing only the servers the set allows) runs with
+        `--strict-mcp-config`. An unrestricted session gets neither."""
         platform_desc = (
             "Linux server running Ubuntu"
             if platform.system() == "Linux"
@@ -468,13 +480,19 @@ class ClaudeCodeExecutor:
             "--verbose",
             "--max-turns", str(settings.claude_max_turns),
             "--dangerously-skip-permissions",
-            "--chrome",
+            "--chrome" if capabilities.chrome else "--no-chrome",
             "--append-system-prompt", _SYSTEM_PROMPT.format(
                 vault_path=settings.vault_path,
                 user_name=settings.user_name,
                 code_dir=settings.code_dir,
                 platform_desc=platform_desc,
                 git_discipline=git_discipline,
+                tool_summary=(
+                    "You already have a browser (--chrome), filesystem, and shell."
+                    if capabilities.chrome else
+                    "You have a filesystem and shell but no browser, and only the "
+                    "MCP servers the session that started you has."
+                ),
                 clarification=_CLARIFY_CHILD if is_child else _CLARIFY_OPERATOR,
                 delegation=delegation_preamble(
                     session_id,
@@ -494,6 +512,8 @@ class ClaudeCodeExecutor:
                 ),
             ),
         ]
+        if mcp_config_path:
+            cmd.extend(["--strict-mcp-config", "--mcp-config", mcp_config_path])
         if model:
             cmd.extend(["--model", model])
         if resume_session_id:
@@ -585,6 +605,18 @@ class ClaudeCodeExecutor:
         # resume reloads the same CLI thread, which already carries them
         # from the first `--append-system-prompt`.
         git_discipline = _git_discipline_block(working_dir) if resume_session_id is None else ""
+        capabilities = effective_for_executor(self.session_store, session)
+        if not capabilities.host_shell:
+            self.transcript_store.append(sid, "capability_refused", {"route": "claude_code"})
+            return ExecutorOutcome(
+                status=STATUS_FAILED,
+                reason="the session that started this one has no host shell",
+            )
+        mcp_config_path = None
+        if capabilities.mcp_servers is not None:
+            from api.services.agent_worker.session_capabilities import MCP_CONFIG_FILENAME
+            from api.services.agent_worker.session_resources import scratch_dir_for
+            mcp_config_path = str(scratch_dir_for(sid) / MCP_CONFIG_FILENAME)
         cmd = self._build_command(
             prompt, resume_session_id, session_id=sid,
             # `session.model` is the board-assignment
@@ -598,6 +630,8 @@ class ClaudeCodeExecutor:
             git_discipline=git_discipline,
             attempt_id=session.attempt_id,
             turn_id=session.turn_id,
+            capabilities=capabilities,
+            mcp_config_path=mcp_config_path,
         )
 
         # Board-assigned host: resolve BEFORE any spawn call. An
@@ -610,6 +644,20 @@ class ClaudeCodeExecutor:
         except HostResolutionError as exc:
             self.transcript_store.append(sid, "claude_code_unknown_host", {"host": host})
             return ExecutorOutcome(status=STATUS_FAILED, reason=str(exc))
+        mcp_servers_listed = None
+        if mcp_config_path is not None:
+            if target is not None:
+                # The generated config lives on this machine; a remote CLI
+                # would not find it and would fall back to its own servers.
+                self.transcript_store.append(sid, "capability_refused", {"host": host})
+                return ExecutorOutcome(
+                    status=STATUS_FAILED,
+                    reason="a session with restricted MCP servers runs only on the API host",
+                )
+            from api.services.agent_worker.session_capabilities import write_strict_mcp_config
+            _path, mcp_servers_listed = write_strict_mcp_config(
+                capabilities.mcp_servers, Path(mcp_config_path).parent,
+            )
         if target is not None:
             is_remote = True
             cmd = build_remote_argv(
@@ -622,13 +670,21 @@ class ClaudeCodeExecutor:
                 ).items() if key in {"TMPDIR", "TMP", "TEMP", "LIFEOS_AGENT_ATTEMPT_ID", "LIFEOS_AGENT_TURN_ID"}},
             )
 
-        self.transcript_store.append(sid, "claude_code_spawn", {
+        spawn_event = {
             "resume": bool(resume_session_id),
             "plan_mode": plan_mode,
             "working_dir": working_dir,
             "host": host,
             "remote": is_remote,
-        })
+        }
+        if capabilities != UNRESTRICTED:
+            # Server names only: the generated config's entries may carry
+            # credentials and never reach the transcript.
+            spawn_event["capabilities"] = {
+                "chrome": capabilities.chrome,
+                "mcp_servers": mcp_servers_listed,
+            }
+        self.transcript_store.append(sid, "claude_code_spawn", spawn_event)
 
         try:
             proc = self._spawn_fn(

@@ -56,6 +56,13 @@ from api.services.agent_worker.remote_spawn import (
     resolve_host_target,
 )
 from api.services.agent_worker.remote_spawn import api_host_name as _api_host_name
+from api.services.agent_worker.session_capabilities import (
+    active_capabilities,
+    codex_disabled_servers,
+    effective_for_executor,
+    remote_codex_refusal,
+    resolve_lineage,
+)
 from api.services.agent_worker.session_store import (
     STATUS_BLOCKED,
     STATUS_COMPLETED,
@@ -301,6 +308,7 @@ class CodexExecutor:
         model: Optional[str] = None,
         effort: Optional[str] = None,
         is_remote: bool = False,
+        disabled_mcp_servers: tuple[str, ...] = (),
     ) -> list[str]:
         binary = self._binary_resolver()
         # `workspace-write` lets codex edit files inside the working dir
@@ -356,6 +364,10 @@ class CodexExecutor:
                     "mcp_servers.lifeos.env_vars=" + json.dumps(merged_env_vars),
                     *common,
                 ]
+        # A child whose creator lacks some of Codex's configured MCP servers
+        # runs with those servers switched off.
+        for name in disabled_mcp_servers:
+            common = ["-c", f"mcp_servers.{name}.enabled=false", *common]
         if resume_session_id:
             return [binary, "exec", "resume", resume_session_id, *common, prompt]
         return [binary, "exec", *common, prompt]
@@ -515,6 +527,22 @@ class CodexExecutor:
         if target is not None:
             is_remote = True
 
+        capabilities = effective_for_executor(self.session_store, session)
+        disabled_mcp_servers = tuple(codex_disabled_servers(capabilities))
+        refusal = None
+        if not capabilities.host_shell:
+            refusal = "the session that started this one has no host shell"
+        elif is_remote and active_capabilities() is None:
+            # Run outside the worker's dispatch (which applies the same rule
+            # before the turn): check the spawn chain here.
+            refusal = remote_codex_refusal(
+                "codex", host, resolve_lineage(self.session_store, session).ceiling,
+            )
+        if refusal:
+            self.transcript_store.append(sid, "capability_refused", {"route": "codex", "host": host})
+            self._cleanup_tempfile(last_msg_path)
+            return ExecutorOutcome(status=STATUS_FAILED, reason=refusal)
+
         command_working_dir = working_dir
         if command_working_dir is None and not is_remote:
             command_working_dir = os.getcwd()
@@ -523,6 +551,7 @@ class CodexExecutor:
             model=getattr(session, "model", None),
             effort=getattr(session, "effort", None),
             is_remote=is_remote,
+            disabled_mcp_servers=disabled_mcp_servers,
         )
 
         if target is not None:
@@ -536,12 +565,15 @@ class CodexExecutor:
                 ).items() if key in {"TMPDIR", "TMP", "TEMP", "LIFEOS_AGENT_ATTEMPT_ID", "LIFEOS_AGENT_TURN_ID"}},
             )
 
-        self.transcript_store.append(sid, "codex_spawn", {
+        spawn_event = {
             "resume": bool(resume_session_id),
             "working_dir": command_working_dir,
             "host": host,
             "remote": is_remote,
-        })
+        }
+        if disabled_mcp_servers:
+            spawn_event["disabled_mcp_servers"] = list(disabled_mcp_servers)
+        self.transcript_store.append(sid, "codex_spawn", spawn_event)
 
         try:
             proc = self._spawn_fn(

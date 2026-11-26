@@ -249,6 +249,10 @@ class TestMcpScheduleBotValidation:
         srv = LifeOSMCPServer.__new__(LifeOSMCPServer)
         srv.client = MagicMock()
         srv._result_cache = None
+        # Schedule writes carry the caller's agent identity; this bare
+        # server is the interactive operator's, which has none.
+        srv._trusted_session_id = ""
+        srv._mcp_transport_secret = ""
         return srv
 
     def _http_422(self, detail):

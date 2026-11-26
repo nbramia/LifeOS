@@ -313,6 +313,15 @@ STANDARD_HANDLERS: dict[str, Callable[..., ToolResult]] = {
 }
 
 
+def _host_tools_allowed() -> bool:
+    """The file, shell and web tools act from the operator's machine, so a
+    session whose creators have no host shell does not get them."""
+    from api.services.agent_worker.session_capabilities import active_capabilities
+
+    capabilities = active_capabilities()
+    return capabilities is None or capabilities.host_shell
+
+
 # ---------------------------------------------------------------------------
 # Tool registry — combines standard tools with LifeOS MCP tools
 # ---------------------------------------------------------------------------
@@ -346,10 +355,13 @@ class ToolRegistry:
 
     def definitions(self) -> list[dict[str, Any]]:
         """Anthropic-format tool definitions for the agent's system message."""
+        standard = STANDARD_TOOLS
+        if not _host_tools_allowed():
+            standard = [t for t in STANDARD_TOOLS if t["name"] not in STANDARD_HANDLERS]
         if self._inter_ctx is not None:
             from api.services.agent_worker.inter_agent import INTER_AGENT_TOOL_SCHEMAS
-            return STANDARD_TOOLS + list(INTER_AGENT_TOOL_SCHEMAS) + list(self._mcp_tools)
-        return STANDARD_TOOLS + list(self._mcp_tools)
+            return standard + list(INTER_AGENT_TOOL_SCHEMAS) + list(self._mcp_tools)
+        return standard + list(self._mcp_tools)
 
     def bind_caller_turn(self, attempt_id: str, turn_id: str) -> None:
         """Bind in-process inter-agent calls to the executor turn just begun."""
@@ -409,6 +421,12 @@ class ToolRegistry:
                 )
 
         handler = STANDARD_HANDLERS.get(name)
+        if handler is not None and not _host_tools_allowed():
+            return ToolResult(
+                f"tool {name} is not available: the session that started this one "
+                "has no host shell, so this session has LifeOS tools only",
+                is_error=True,
+            )
         if handler is not None:
             try:
                 return handler(arguments, base_dir=base_dir)

@@ -91,7 +91,8 @@ def caller_turn_proof_for_session(
 
 # Engines an in-flight agent may spawn a child on. `claude`/`local` are the
 # in-process routes (Managed Agents API / Gemma); `claude_code`/`codex` are the
-# CLI routes, used for capability fallback (browser/GUI, native computer use).
+# CLI routes. A child on any route gets no more than its caller has
+# (`session_capabilities`).
 # CLI routes are subscription-billed, so they skip the per-token dollar ceiling
 # and reuse the managed concurrency cap.
 CLI_ROUTINGS = ("claude_code", "codex")
@@ -177,6 +178,9 @@ class InterAgentContext:
     caller_attempt_id: str | None = None
     caller_turn_id: str | None = None
     task_manager: Any | None = None
+    # Reads a task's fields, so a caller started from an agent-created task
+    # inherits that agent's capability ceiling (`session_capabilities`).
+    task_fields: Any | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -622,11 +626,34 @@ def spawn(ctx: InterAgentContext, args: dict) -> dict:
                 code=decision.reason,
             )
 
-    # Cap: spawn depth.
-    new_depth = (caller.spawn_depth or 0) + 1
-    if new_depth > ctx.caps.max_spawn_depth:
+    # A child never has more than its caller: resolve the caller's effective
+    # capability set through every session that started it, including the
+    # agent that created the caller's task.
+    from api.services.agent_worker.session_capabilities import (
+        CapabilityLookupError,
+        host_shell_refusal,
+        resolve_lineage,
+    )
+    try:
+        lineage = resolve_lineage(ctx.session_store, caller, task_fields=ctx.task_fields)
+    except CapabilityLookupError as exc:
         return _err(
-            f"spawn depth {new_depth} exceeds cap {ctx.caps.max_spawn_depth}",
+            f"could not resolve this session's capabilities ({exc}); retry shortly",
+            code="capability_unverified",
+        )
+    caller_capabilities = lineage.effective(caller.routing)
+    if not caller_capabilities.may_spawn:
+        return _err("this session has no LifeOS tools to spawn with", code="capability_exceeds_parent")
+    refusal = host_shell_refusal(model, caller_capabilities)
+    if refusal:
+        return _err(refusal, code="capability_exceeds_parent")
+
+    # Cap: spawn depth, counted through task creation as well as spawning.
+    new_depth = (caller.spawn_depth or 0) + 1
+    chain_depth = max(new_depth, lineage.depth + 1)
+    if chain_depth > ctx.caps.max_spawn_depth:
+        return _err(
+            f"spawn depth {chain_depth} exceeds cap {ctx.caps.max_spawn_depth}",
             code="cap_spawn_depth",
         )
 

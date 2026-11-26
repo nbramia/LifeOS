@@ -121,6 +121,13 @@ class ScheduleEntry:
     # Markdown as `[snoozed_until:: …]`; the definition fields above are
     # untouched by a snooze.
     snoozed_until: Optional[str] = None
+    # The agent sessions that created or last changed this `action:: agent`
+    # schedule, comma-separated; empty for an operator schedule. Stamped by
+    # the schedule API from `X-LifeOS-Agent-Session`, round-trips through
+    # Markdown as `[agent_creator_session:: …]`, and is copied onto every task
+    # the schedule writes so the worker gives that task's session no more
+    # than those agents have (`agent_worker/session_capabilities.py`).
+    agent_creator_session: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -437,7 +444,7 @@ def _format_entry_line(entry: ScheduleEntry) -> str:
         parts.append(f"[wall:: {_format_wall_seconds(entry.wall_seconds)}]")
     if entry.snoozed_until:
         parts.append(f"[{SNOOZED_UNTIL_FIELD}:: {entry.snoozed_until}]")
-    for key in ("persona_id", "model_id", "effort", "host", "working_dir"):
+    for key in ("persona_id", "model_id", "effort", "host", "working_dir", "agent_creator_session"):
         value = getattr(entry, key, "")
         if value:
             parts.append(f"[{key}:: {value}]")
@@ -533,6 +540,7 @@ def _parse_entry_line(line: str) -> Optional[ScheduleEntry]:
         effort=fields.get("effort", ""),
         host=fields.get("host", ""),
         working_dir=fields.get("working_dir", ""),
+        agent_creator_session=fields.get("agent_creator_session", ""),
     )
     if params_malformed:
         logger.warning(f"Malformed params field for schedule {entry_id}; falling back to cache")
@@ -611,7 +619,9 @@ _ATTR_FIELD_KEYS = {
     "budget_dollars": ("budget",),
     "wall_seconds": ("wall",),
     "snoozed_until": (SNOOZED_UNTIL_FIELD,),
-    **{key: (key,) for key in ("persona_id", "model_id", "effort", "host", "working_dir")},
+    **{key: (key,) for key in (
+        "persona_id", "model_id", "effort", "host", "working_dir", "agent_creator_session",
+    )},
 }
 
 
@@ -1712,6 +1722,12 @@ class SchedulerScheduler:
             tags.append(f"sched-{entry.id}")
         description = (entry.message_content or entry.name) + _budget_hint_suffix(entry)
         manager = get_task_manager()
+        # An agent-made schedule hands its creators to every task it writes;
+        # an operator schedule passes nothing, leaving the task top-level.
+        creator_kwargs = (
+            {"_agent_creator_session": entry.agent_creator_session}
+            if entry.agent_creator_session else {}
+        )
         # Reconcile a crash after the Markdown rename but before the SQLite
         # link by searching the authoritative task files for the key.
         if occurrence_key:
@@ -1728,6 +1744,7 @@ class SchedulerScheduler:
                     description=description,
                     tags=tags,
                     fields=operation_fields,
+                    **creator_kwargs,
                 )
             if isinstance(operation_result, tuple) and len(operation_result) == 2:
                 task, _created = operation_result
@@ -1739,6 +1756,7 @@ class SchedulerScheduler:
                     tags=tags,
                     fields=operation_fields,
                     _log_content=False,
+                    **creator_kwargs,
                 )
             return f"task {task.id} (reconciled occurrence)"
         fields = {"occurrence_key": occurrence_key} if occurrence_key else {}
@@ -1757,6 +1775,7 @@ class SchedulerScheduler:
             tags=tags,
             fields=fields,
             _log_content=not bool(entry.operation_key),
+            **creator_kwargs,
         )
         return f"task {task.id} (tags: {', '.join('#' + t for t in tags)})"
 

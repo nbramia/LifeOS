@@ -1707,6 +1707,7 @@ class LifeOSMCPServer:
                 InterAgentContext,
                 dispatch as inter_dispatch,
             )
+            from api.services.agent_worker.session_capabilities import http_task_fields_lookup
             from api.services.agent_worker.session_store import SessionStore
             from api.services.agent_worker.transcript_store import TranscriptStore
             from config.settings import settings as _settings
@@ -1746,6 +1747,7 @@ class LifeOSMCPServer:
             managed_driver=managed_driver,
             caller_attempt_id=caller_attempt_id,
             caller_turn_id=caller_turn_id,
+            task_fields=http_task_fields_lookup(self.client, API_BASE),
         )
         return inter_dispatch(ctx, tool_name, arguments)
 
@@ -1998,11 +2000,16 @@ class LifeOSMCPServer:
         # Curated task writes carry the caller-asserted worker identity, so
         # the API can tell an agent-attributed project-child write from an
         # operator's — see `_resolve_agent_session_header`.
+        # Schedule writes and triggers carry it so an agent's `agent`
+        # schedule hands its tasks that agent's capability ceiling.
         # `lifeos_project_resume` gets the same header so the API can refuse
         # an agent-attributed resume (403) — see
         # `POST /api/tasks/{id}/project/resume`. `lifeos_project_pause` does
         # not need it: agents are allowed to pause a project.
-        if tool_name in ("lifeos_task_create", "lifeos_task_update", "lifeos_project_resume"):
+        if tool_name in (
+            "lifeos_task_create", "lifeos_task_update", "lifeos_project_resume",
+            "lifeos_schedule_create", "lifeos_schedule_update", "lifeos_schedule_trigger",
+        ):
             resolved_agent_session = self._resolve_agent_session_header(agent_session_id)
             if resolved_agent_session:
                 headers[AGENT_SESSION_HEADER] = resolved_agent_session

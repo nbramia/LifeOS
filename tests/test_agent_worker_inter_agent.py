@@ -43,10 +43,12 @@ def transcript(tmp_path: Path) -> TranscriptStore:
 
 @pytest.fixture
 def parent(store: SessionStore):
+    # A route with a host shell, so CLI children are within its capabilities
+    # (a Managed Agents parent has none; see test_session_capabilities.py).
     session = store.create(
         task_id="parent_task",
         status=STATUS_RUNNING,
-        routing="claude",
+        routing="local",
         budget={"wall_seconds": 3600, "max_tokens": 100_000, "max_dollars": 10.0},
         expected_output="text",
     )
@@ -189,9 +191,12 @@ def test_spawn_tier_ignored_for_non_claude_code(ctx, store):
 
 
 @pytest.mark.unit
-def test_spawn_cli_child_skips_dollar_ceiling(store, transcript):
+def test_spawn_cli_child_skips_dollar_ceiling(store, transcript, tmp_path, monkeypatch):
     """CLI routes are subscription-billed, so a CLI child spawns even when the
     parent has no remaining per-token dollar budget."""
+    # A Codex session reaches LifeOS through its config's lifeos server.
+    (tmp_path / "config.toml").write_text('[mcp_servers.lifeos]\ncommand = "python"\n')
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
     broke_parent = store.create(
         task_id="broke", status=STATUS_RUNNING, routing="codex",
         budget={"wall_seconds": 3600, "max_tokens": 100_000, "max_dollars": 0.0},
@@ -202,7 +207,7 @@ def test_spawn_cli_child_skips_dollar_ceiling(store, transcript):
         caller_session_id=broke_parent.session_id, caps=Caps(),
     )
     result = dispatch(ctx, "lifeos_agent_spawn", {"prompt": "x", "model": "claude_code"})
-    assert result["ok"]  # would be budget_exceeded for a managed child
+    assert result["ok"], result  # would be budget_exceeded for a managed child
 
 
 @pytest.mark.unit

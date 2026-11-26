@@ -1992,11 +1992,15 @@ class Worker:
         adapter = self._lifecycle_adapter(session)
         if adapter is None:
             raise RuntimeError(f"no executor for route {session.routing}")
+        capabilities, refusal = self._resolve_capabilities(session, request)
+        if refusal:
+            return self._capability_refused(session, refusal)
         if not self._executor_registry.begin(session, "start"):
             return None
         try:
+            from api.services.agent_worker.session_capabilities import capability_context
             from api.services.agent_worker.session_resources import session_scratch_context
-            with session_scratch_context(session.session_id):
+            with session_scratch_context(session.session_id), capability_context(capabilities):
                 return adapter.start(session, request)
         finally:
             self._executor_registry.finish(session, "start")
@@ -2005,11 +2009,15 @@ class Worker:
         adapter = self._lifecycle_adapter(session)
         if adapter is None:
             raise RuntimeError(f"no executor for route {session.routing}")
+        capabilities, refusal = self._resolve_capabilities(session)
+        if refusal:
+            return self._capability_refused(session, refusal)
         if not self._executor_registry.begin(session, "resume"):
             return None
         try:
+            from api.services.agent_worker.session_capabilities import capability_context
             from api.services.agent_worker.session_resources import session_scratch_context
-            with session_scratch_context(session.session_id):
+            with session_scratch_context(session.session_id), capability_context(capabilities):
                 return adapter.resume(session, message, working_dir=working_dir)
         finally:
             self._executor_registry.finish(session, "resume")
@@ -4547,6 +4555,7 @@ class Worker:
                     max_concurrent_managed=settings.agent_max_concurrent_managed,
                 ),
                 worker_handle=self,
+                task_fields=self._capability_task_fields,
             )
         registry = ToolRegistry(inter_agent_context=ctx)
         return LocalExecutor(
@@ -4589,6 +4598,7 @@ class Worker:
                     max_concurrent_managed=settings.agent_max_concurrent_managed,
                 ),
                 worker_handle=self,
+                task_fields=self._capability_task_fields,
             )
         registry = ToolRegistry(inter_agent_context=ctx)
         client, model_name, is_remote = _remote_only_llm_client()
@@ -5826,6 +5836,58 @@ class Worker:
         except Exception as exc:
             logger.warning("fetch_task %s failed: %s", task_id, exc)
             return _TASK_FETCH_FAILED if distinguish_failure else None
+
+    def _capability_task_fields(self, task_id: str) -> dict[str, Any] | None:
+        """`session_capabilities.TaskFieldsLookup` over the task API."""
+        from api.services.agent_worker.session_capabilities import CapabilityLookupError
+
+        task = self._fetch_task(task_id, distinguish_failure=True)
+        if task is _TASK_FETCH_FAILED:
+            raise CapabilityLookupError(f"task {task_id} could not be read")
+        if task is None:
+            return None
+        return task.get("fields") or {}
+
+    def _resolve_capabilities(self, session, request: Any = None):
+        """The effective capability set for `session`'s next turn, or a
+        refusal reason when its route needs more than its creators have."""
+        from api.services.agent_worker.session_capabilities import (
+            CapabilityLookupError,
+            host_shell_refusal,
+            remote_codex_refusal,
+            resolve_lineage,
+        )
+
+        own_fields = None
+        if isinstance(request, dict) and request.get("id") == session.task_id:
+            fields = request.get("fields")
+            if isinstance(fields, dict):
+                own_fields = fields
+        try:
+            lineage = resolve_lineage(
+                self.session_store, session,
+                task_fields=self._capability_task_fields, own_fields=own_fields,
+            )
+        except CapabilityLookupError as exc:
+            return None, f"could not resolve the capabilities this session inherits: {exc}"
+        refusal = host_shell_refusal(session.routing, lineage.ceiling) or remote_codex_refusal(
+            session.routing, getattr(session, "host", None), lineage.ceiling,
+        )
+        if refusal is None and lineage.depth > settings.agent_max_spawn_depth:
+            refusal = (
+                f"this session is {lineage.depth} agent hops from the operator, "
+                f"over the spawn depth cap of {settings.agent_max_spawn_depth}"
+            )
+        return lineage.effective(session.routing), refusal
+
+    def _capability_refused(self, session, reason: str):
+        from api.services.agent_worker.local_executor import ExecutorOutcome
+
+        self.transcript_store.append(session.session_id, "capability_refused", {"reason": reason})
+        return normalize_outcome(
+            ExecutorOutcome(status=STATUS_FAILED, reason=reason), session,
+            route=session.routing, transcript_store=self.transcript_store,
+        )
 
     def _with_project_context(self, task: dict[str, Any]) -> dict[str, Any]:
         """Add bounded parent objective and sibling status to a child dispatch."""

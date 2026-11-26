@@ -156,7 +156,7 @@ def test_spawned_child_completion_does_not_telegram_operator(tmp_path: Path):
         outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="Match 1: A vs B at noon.")
     )
     worker, store, _, sent = _capturing_worker(tmp_path, claude_code_executor=stub)
-    parent = store.create(task_id="parent-1", routing="local")
+    parent = store.create(task_id="parent-1", routing="local", origin="operator")
     child = store.create(
         task_id="child-1", routing="claude_code", parent_session_id=parent.session_id,
     )
@@ -190,7 +190,7 @@ def test_child_final_text_reads_claude_code_completed_event(tmp_path: Path):
         outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="")
     )
     worker, store, transcripts, _ = _capturing_worker(tmp_path, claude_code_executor=stub)
-    parent = store.create(task_id="parent-1", routing="local")
+    parent = store.create(task_id="parent-1", routing="local", origin="operator")
     child = store.create(
         task_id="child-1", routing="claude_code", parent_session_id=parent.session_id,
     )
@@ -205,7 +205,7 @@ def test_child_final_text_reads_codex_completed_event(tmp_path: Path):
     """The parent pulls a codex child's final_text from the codex_completed
     transcript event, since the codex completion send is child-gated too."""
     worker, store, transcripts, _ = _capturing_worker(tmp_path, claude_code_executor=None)
-    parent = store.create(task_id="parent-1", routing="local")
+    parent = store.create(task_id="parent-1", routing="local", origin="operator")
     child = store.create(
         task_id="child-1", routing="codex", parent_session_id=parent.session_id,
     )
@@ -221,7 +221,7 @@ def test_child_final_text_legacy_codex_event_without_key_does_not_clobber(tmp_pa
     no `final_text` key) must not wipe a real value from an earlier event —
     the key-presence guard is per-event, not per-kind."""
     worker, store, transcripts, _ = _capturing_worker(tmp_path, claude_code_executor=None)
-    parent = store.create(task_id="parent-1", routing="local")
+    parent = store.create(task_id="parent-1", routing="local", origin="operator")
     child = store.create(
         task_id="child-1", routing="codex", parent_session_id=parent.session_id,
     )
@@ -244,7 +244,7 @@ def test_resume_delivers_all_pending_messages(tmp_path: Path):
         outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="resumed.")
     )
     worker, store, _, _ = _capturing_worker(tmp_path, claude_code_executor=stub)
-    parent = store.create(task_id="parent-1", routing="local")
+    parent = store.create(task_id="parent-1", routing="local", origin="operator")
     store.create(
         task_id="child-1", routing="claude_code", parent_session_id=parent.session_id,
     )
@@ -269,7 +269,7 @@ def test_child_final_text_latest_completed_event_wins_even_when_empty(tmp_path: 
     re-deliver the first run's '[needs clarification] …' question to the
     parent — that would invite a re-answer loop."""
     worker, store, transcripts, _ = _capturing_worker(tmp_path, claude_code_executor=None)
-    parent = store.create(task_id="parent-1", routing="local")
+    parent = store.create(task_id="parent-1", routing="local", origin="operator")
     child = store.create(
         task_id="child-1", routing="claude_code", parent_session_id=parent.session_id,
     )
@@ -288,7 +288,7 @@ def test_child_final_text_legacy_event_without_key_does_not_clobber(tmp_path: Pa
     payloads recorded final_chars only) must not wipe a real value from an
     earlier event."""
     worker, store, transcripts, _ = _capturing_worker(tmp_path, claude_code_executor=None)
-    parent = store.create(task_id="parent-1", routing="local")
+    parent = store.create(task_id="parent-1", routing="local", origin="operator")
     child = store.create(
         task_id="child-1", routing="claude_code", parent_session_id=parent.session_id,
     )
@@ -580,7 +580,7 @@ def test_child_completion_does_not_mirror(tmp_path: Path):
         outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text="child result")
     )
     worker, store, conv_store = _mirroring_worker(tmp_path, claude_code_executor=stub)
-    parent = store.create(task_id="parent-1", routing="local")
+    parent = store.create(task_id="parent-1", routing="local", origin="operator")
     child = store.create(
         task_id="child-1", routing="claude_code", parent_session_id=parent.session_id,
     )
@@ -605,7 +605,7 @@ def test_child_failure_sends_no_operator_notice(tmp_path: Path):
         outcome=ExecutorOutcome(status=STATUS_FAILED, reason="boom")
     )
     worker, store, _, sent = _capturing_worker(tmp_path, claude_code_executor=stub)
-    parent = store.create(task_id="parent-1", routing="local")
+    parent = store.create(task_id="parent-1", routing="local", origin="operator")
     child = store.create(
         task_id="child-fail", routing="claude_code",
         parent_session_id=parent.session_id,
@@ -632,7 +632,7 @@ def test_child_budget_exceeded_sends_no_operator_notice(tmp_path: Path):
         outcome=ExecutorOutcome(status=STATUS_BUDGET_EXCEEDED, reason="wall_seconds")
     )
     worker, store, _, sent = _capturing_worker(tmp_path, claude_code_executor=stub)
-    parent = store.create(task_id="parent-1", routing="local")
+    parent = store.create(task_id="parent-1", routing="local", origin="operator")
     child = store.create(
         task_id="child-budget", routing="claude_code",
         parent_session_id=parent.session_id,
@@ -668,7 +668,7 @@ def test_child_executor_crash_records_failure_reason(tmp_path: Path):
 
     worker, store, _, sent = _capturing_worker(
         tmp_path, claude_code_executor=_CrashingExecutor())
-    parent = store.create(task_id="parent-1", routing="local")
+    parent = store.create(task_id="parent-1", routing="local", origin="operator")
     child = store.create(
         task_id="child-crash", routing="claude_code",
         parent_session_id=parent.session_id,
@@ -728,7 +728,7 @@ def test_child_failure_does_not_mirror(tmp_path: Path):
         outcome=ExecutorOutcome(status=STATUS_FAILED, reason="boom")
     )
     worker, store, conv_store = _mirroring_worker(tmp_path, claude_code_executor=stub)
-    parent = store.create(task_id="parent-1", routing="local")
+    parent = store.create(task_id="parent-1", routing="local", origin="operator")
     child = store.create(
         task_id="child-fail-web", routing="claude_code",
         parent_session_id=parent.session_id,
@@ -1000,7 +1000,7 @@ def test_child_session_bypasses_interrupted_gate(tmp_path: Path):
         outcome=ExecutorOutcome(status=STATUS_COMPLETED, final_text=FIELD_FRAGMENT)
     )
     worker, store, transcripts, sent = _capturing_worker(tmp_path, claude_code_executor=stub)
-    parent = store.create(task_id="parent-1", routing="local")
+    parent = store.create(task_id="parent-1", routing="local", origin="operator")
     child = store.create(
         task_id="child-1", routing="claude_code", parent_session_id=parent.session_id,
     )

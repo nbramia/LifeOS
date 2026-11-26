@@ -3110,6 +3110,10 @@ def test_spawned_dispatch_uses_persisted_canonical_route_model_effort_and_direct
         codex_executor=_Codex(),
         cli_pool=pool,
     )
+    w.session_store.create(
+        task_id="canonical-parent", session_id="synthetic-parent",
+        routing="codex", origin="operator", status=STATUS_RUNNING,
+    )
     session = w.session_store.create(
         task_id="canonical-child",
         status=STATUS_CLAIMED,
