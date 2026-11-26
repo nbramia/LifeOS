@@ -8,7 +8,9 @@ import asyncio
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+import re
+
+from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from api.services.memory_store import get_memory_store, Memory
@@ -17,6 +19,11 @@ from api.services.synthesizer import get_synthesizer
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/memories", tags=["memories"])
+
+# Set by the MCP transport on a connected app's memory save. The API takes the
+# origin of a memory from this header only, never from the request body.
+CONNECTED_APP_HEADER = "X-LifeOS-Connected-App"
+_CONNECTED_APP_PATTERN = re.compile(r"^[A-Za-z0-9._:@\-]{1,128}$")
 
 
 class CreateMemoryRequest(BaseModel):
@@ -38,6 +45,7 @@ class MemoryResponse(BaseModel):
     keywords: list[str]
     created_at: str
     updated_at: str
+    source: Optional[str] = None
 
     @classmethod
     def from_memory(cls, memory: Memory) -> "MemoryResponse":
@@ -48,6 +56,7 @@ class MemoryResponse(BaseModel):
             keywords=memory.keywords,
             created_at=memory.created_at.isoformat() if memory.created_at else "",
             updated_at=memory.updated_at.isoformat() if memory.updated_at else "",
+            source=memory.source,
         )
 
 
@@ -100,7 +109,10 @@ async def synthesize_memory(content: str) -> str:
 
 
 @router.post("", response_model=MemoryResponse)
-async def create_memory(request: CreateMemoryRequest):
+async def create_memory(
+    request: CreateMemoryRequest,
+    x_lifeos_connected_app: Optional[str] = Header(default=None, alias=CONNECTED_APP_HEADER),
+):
     """
     **Save a persistent memory** that will be included in future conversation context.
 
@@ -115,7 +127,16 @@ async def create_memory(request: CreateMemoryRequest):
     - "I prefer ES6 syntax" → saves coding preferences
 
     Memories persist across sessions and are automatically retrieved when relevant.
+    A memory saved by a connected app is kept as searchable reference only and is
+    not added to chat instructions.
     """
+    source = None
+    if x_lifeos_connected_app is not None:
+        client = x_lifeos_connected_app.strip()
+        if not _CONNECTED_APP_PATTERN.match(client):
+            raise HTTPException(status_code=422, detail=f"{CONNECTED_APP_HEADER} is not a valid client id")
+        source = f"connected-app:{client}"
+
     store = get_memory_store()
 
     # Synthesize if requested
@@ -124,7 +145,7 @@ async def create_memory(request: CreateMemoryRequest):
         content = await synthesize_memory(request.content)
         logger.info(f"Synthesized memory: {content[:100]}...")
 
-    memory = store.create_memory(content)
+    memory = store.create_memory(content, source=source)
 
     return MemoryResponse.from_memory(memory)
 

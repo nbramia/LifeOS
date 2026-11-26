@@ -108,6 +108,8 @@ Create a new memory.
 }
 ```
 
+Each memory carries an optional `source`: absent for the operator, `connected-app:<client id>` for a memory saved by a connected app. The origin is taken from the `X-LifeOS-Connected-App` header set by the MCP transport; a `source` in the request body is ignored. App-sourced memories are returned by list and search but are not added to the chat system prompt.
+
 ### GET /api/memories
 
 List all memories.

@@ -152,6 +152,14 @@ class Memory:
     created_at: datetime
     updated_at: datetime
     is_active: bool = True
+    # Where the memory came from. None is the operator; "connected-app:<id>"
+    # marks a memory saved by a connected OAuth app. App-sourced memories stay
+    # searchable but are never added to the chat system prompt.
+    source: Optional[str] = None
+
+    @property
+    def is_operator_memory(self) -> bool:
+        return not self.source
 
     def to_dict(self) -> dict:
         """Convert to dictionary."""
@@ -163,6 +171,7 @@ class Memory:
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "is_active": self.is_active,
+            **({"source": self.source} if self.source else {}),
         }
 
 
@@ -265,16 +274,20 @@ class MemoryStore:
             keywords=data.get("keywords") or extract_keywords(data["content"]),
             created_at=created_at or datetime.now(),
             updated_at=updated_at or datetime.now(),
-            is_active=data.get("is_active", True)
+            is_active=data.get("is_active", True),
+            source=data.get("source") or None,
         )
 
-    def create_memory(self, content: str, category: str = None) -> Memory:
+    def create_memory(
+        self, content: str, category: str = None, source: Optional[str] = None
+    ) -> Memory:
         """
         Create a new memory.
 
         Args:
             content: Memory content
             category: Optional category (auto-detected if not provided)
+            source: Origin of the memory; None for the operator
 
         Returns:
             Created Memory object
@@ -286,7 +299,8 @@ class MemoryStore:
             keywords=extract_keywords(content),
             created_at=datetime.now(),
             updated_at=datetime.now(),
-            is_active=True
+            is_active=True,
+            source=source or None,
         )
 
         self._memories[memory.id] = memory
@@ -354,7 +368,8 @@ class MemoryStore:
             keywords=extract_keywords(content),
             created_at=memory.created_at,
             updated_at=datetime.now(),
-            is_active=True
+            is_active=True,
+            source=memory.source,
         )
 
         self._memories[memory_id] = updated
@@ -384,7 +399,8 @@ class MemoryStore:
             keywords=memory.keywords,
             created_at=memory.created_at,
             updated_at=datetime.now(),
-            is_active=False
+            is_active=False,
+            source=memory.source,
         )
 
         self._memories[memory_id] = deactivated
@@ -518,7 +534,8 @@ class MemoryStore:
         return memories
 
     def search_memories_detailed(
-        self, query: str, limit: int = 10, min_relevance: float = 0.15
+        self, query: str, limit: int = 10, min_relevance: float = 0.15,
+        operator_only: bool = False,
     ) -> tuple[list[Memory], MemorySearchStats]:
         """search_memories, plus the bounds that shaped the result.
 
@@ -544,6 +561,8 @@ class MemoryStore:
             return [], _stats()
 
         memories = self.list_memories(limit=MEMORY_SEARCH_CORPUS_LIMIT)
+        if operator_only:
+            memories = [m for m in memories if m.is_operator_memory]
         if not memories:
             return [], _stats()
 
@@ -612,7 +631,10 @@ class MemoryStore:
 
     def get_relevant_memories(self, query: str, limit: int = 5) -> list[Memory]:
         """
-        Get memories relevant to a query.
+        Get the operator's memories relevant to a query, for the chat prompt.
+
+        Memories saved by a connected app are left out: they stay searchable
+        through the memory tools but are not added to the chat instructions.
 
         Args:
             query: The user's query
@@ -621,7 +643,10 @@ class MemoryStore:
         Returns:
             List of relevant Memory objects
         """
-        return self.search_memories(query, limit=limit)
+        memories, _stats = self.search_memories_detailed(
+            query, limit=limit, operator_only=True
+        )
+        return memories
 
 
 def format_memories_for_prompt(memories: list[Memory]) -> str:
@@ -634,6 +659,10 @@ def format_memories_for_prompt(memories: list[Memory]) -> str:
     Returns:
         Formatted string for the prompt
     """
+    if not memories:
+        return ""
+
+    memories = [m for m in memories if m.is_operator_memory]
     if not memories:
         return ""
 

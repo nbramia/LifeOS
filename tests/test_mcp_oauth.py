@@ -2055,3 +2055,75 @@ def test_cli_open_rejects_a_negative_duration(store, capsys):
     with pytest.raises(SystemExit) as exc:
         cli.main(["--db", store.db_path, "open", "-5m"])
     assert exc.value.code == 2
+
+
+# ── memory provenance ────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def real_memories(server, tmp_path, monkeypatch):
+    """The real memories route and store behind the MCP server's API calls."""
+    from fastapi import FastAPI
+
+    from api.routes import memories as memory_routes
+    from api.services.memory_store import MemoryStore
+
+    store = MemoryStore(str(tmp_path / "memories.json"))
+    backend = FastAPI()
+    backend.include_router(memory_routes.router)
+
+    async def _identity(content: str) -> str:
+        return content
+
+    monkeypatch.setattr(memory_routes, "get_memory_store", lambda: store)
+    monkeypatch.setattr(memory_routes, "synthesize_memory", _identity)
+    monkeypatch.setattr(mcp_server.LifeOSMCPServer, "_call_api", _ORIGINAL_CALL_API)
+    monkeypatch.setattr(mcp_server, "API_BASE", "http://testserver")
+    server.client = TestClient(backend)
+    return store
+
+
+def test_app_saved_memory_is_sourced_and_kept_out_of_the_chat_prompt(client, real_memories):
+    from api.services.memory_store import format_memories_for_prompt
+
+    client_id, tokens, _ = _connect(client)
+    operator_memory = real_memories.create_memory("Synthetic operator note: quokka preference")
+    result = _rpc(client, tokens["access_token"], "tools/call", {
+        "name": "lifeos_memories_create",
+        # Client-supplied provenance in the arguments must not matter.
+        "arguments": {"content": "Synthetic quokka standing instruction", "source": "operator",
+                      "X-LifeOS-Connected-App": "operator"},
+    }).json()["result"]
+    assert "isError" not in result, result
+
+    saved = [m for m in real_memories.list_memories() if m.id != operator_memory.id]
+    assert [m.source for m in saved] == [f"connected-app:{client_id}"]
+    assert operator_memory.source is None
+
+    relevant = real_memories.get_relevant_memories("quokka", limit=5)
+    assert [m.id for m in relevant] == [operator_memory.id]
+    assert "standing instruction" not in format_memories_for_prompt(relevant)
+
+    found, _stats = real_memories.search_memories_detailed("quokka standing instruction", limit=5)
+    assert saved[0].id in {m.id for m in found}
+    searched = _rpc(client, tokens["access_token"], "tools/call", {
+        "name": "lifeos_memories_search", "arguments": {"query": "quokka"},
+    }).json()["result"]
+    assert "isError" not in searched
+
+
+def test_memory_route_ignores_a_body_source(real_memories):
+    from fastapi import FastAPI
+
+    from api.routes import memories as memory_routes
+
+    backend = FastAPI()
+    backend.include_router(memory_routes.router)
+    http = TestClient(backend)
+    resp = http.post("/api/memories", json={"content": "Synthetic note", "synthesize": False,
+                                            "source": "connected-app:forged"})
+    assert resp.status_code == 200
+    assert resp.json()["source"] is None
+    bad = http.post("/api/memories", json={"content": "x", "synthesize": False},
+                    headers={"X-LifeOS-Connected-App": "bad value\n"})
+    assert bad.status_code == 422
