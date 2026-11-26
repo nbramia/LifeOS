@@ -102,7 +102,7 @@ class SessionCapabilities:
 
 UNRESTRICTED = SessionCapabilities(host_shell=True, chrome=True, mcp_servers=None)
 # A creator the worker cannot identify (the shared HTTP transport, or a
-# session row that no longer exists) gets the set of the one route that
+# session row that is missing) gets the set of the one route that
 # reaches LifeOS that way: Managed Agents.
 _UNIDENTIFIED_CREATOR = SessionCapabilities(
     host_shell=False, chrome=False, mcp_servers=frozenset({LIFEOS_MCP_SERVER}),
