@@ -39,6 +39,7 @@ this side without that Hermes-side support would 500 every doctor turn on
 Hermes rather than run one.
 """
 
+import contextvars
 import hmac
 import hashlib
 import json
@@ -351,6 +352,50 @@ def _build_envelope(raw_body: bytes, person: Optional[PersonContext] = None) -> 
     if person:
         data["lifeos_context"]["turn"]["person_context"] = person.block
     return json.dumps(data).encode("utf-8")
+
+
+# The forwarded turn `_build_proxy_envelope` recorded for this request, as
+# (caller_session_id, lifeos_turn_id), handed to `_make_proxy_observer` in
+# the same request context so the record is closed when the relay ends.
+_recorded_proxy_turn: contextvars.ContextVar[Optional[tuple[str, str]]] = contextvars.ContextVar(
+    "hermes_recorded_proxy_turn", default=None,
+)
+
+
+def _build_proxy_envelope(raw_body: bytes, person: Optional[PersonContext] = None) -> bytes:
+    """`_build_envelope` for the proxy route, which also records the
+    operator's question under the turn's `caller_session_id` and a fresh
+    `lifeos_turn_id`, and sends that id in `turn.lifeos_turn_id`: the record
+    the agent-work approval gate judges a Hermes call by (`hermes_turn`)."""
+    from api.services import hermes_turn
+
+    body = _build_envelope(raw_body, person)
+    data = json.loads(body)
+    context = data["lifeos_context"]
+    caller = context["turn"].get("caller_session_id") or ""
+    turn_id = hermes_turn.record_proxy_turn(
+        caller,
+        data.get("question") or "",
+        data.get("conversation_id"),
+        context["persona"]["id"],
+    )
+    _recorded_proxy_turn.set((caller, turn_id) if turn_id else None)
+    if not turn_id:
+        return body
+    context["turn"]["lifeos_turn_id"] = turn_id
+    return json.dumps(data).encode("utf-8")
+
+
+def _make_proxy_observer(raw_body: bytes, person: Optional[PersonContext] = None):
+    """`_make_persister` for the proxy route: the persister also closes the
+    forwarded turn's record when the relay ends, so no later Hermes call can
+    be judged on it."""
+    persister = _make_persister(raw_body, person)
+    recorded = _recorded_proxy_turn.get()
+    _recorded_proxy_turn.set(None)
+    if persister is not None:
+        persister.closes_proxy_turn = recorded
+    return persister
 
 
 def _journal_capture_prelude(raw_body: bytes) -> list:
@@ -699,7 +744,21 @@ class _HermesTurnPersister:
         # the only trustworthy live signal for the "hermes_chat" surface.
         record_hermes_chat_turn_model(model)
 
+    # (caller_session_id, lifeos_turn_id) of the forwarded turn `finalize()`
+    # closes in `hermes_turn`, set by `_make_proxy_observer`; None otherwise.
+    closes_proxy_turn: Optional[tuple[str, str]] = None
+
     def finalize(self) -> None:
+        """Persist the turn (`_persist`) and close its forwarded-turn record."""
+        try:
+            self._persist()
+        finally:
+            if self.closes_proxy_turn is not None:
+                from api.services import hermes_turn
+
+                hermes_turn.end_proxy_turn(*self.closes_proxy_turn)
+
+    def _persist(self) -> None:
         """Write this turn to the stores, once each. Runs after the pump has
         drained upstream to its real end, so it's the only place in this
         class a blocking store call is allowed to happen.
@@ -854,8 +913,8 @@ router = make_backend_router(
     url_attr="hermes_backend_url",
     token_attr="hermes_backend_token",
     client_factory=lambda: _client(),
-    transform_body=_build_envelope,
-    make_observer=_make_persister,
+    transform_body=_build_proxy_envelope,
+    make_observer=_make_proxy_observer,
     pre_send=_journal_capture_prelude,
     prepare_turn=_prepare_person_context,
     # A configured-but-down Hermes must not look "available" — see

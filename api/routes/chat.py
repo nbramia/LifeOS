@@ -466,6 +466,13 @@ class AskStreamRequest(BaseModel):
     # any client staying connected). A queued turn's stream starts with a
     # `queued` event, then carries the ordinary frames once it starts.
     if_busy: Optional[str] = None
+    # False when `question` is not the operator's own words (a `prompt`
+    # schedule a Hermes turn wrote, see `ScheduleEntry.prompt_source`): the
+    # agent-work approval gate gets no operator text for the turn, so agent
+    # work it asks for is parked for approval, and `/agent` and "use codex"
+    # in it are not run as commands. It can only narrow what a turn may do,
+    # so it is accepted from the request. Default True.
+    operator_turn: bool = True
 
     @field_validator("if_busy")
     @classmethod
@@ -949,7 +956,9 @@ async def ask_stream(request: AskStreamRequest):
             # Equivalent affordance to Telegram's /agent command, calling
             # the same create_operator_session entry point.
             _stripped = request.question.strip()
-            if _stripped.lower() == "/agent" or _stripped.lower().startswith("/agent "):
+            if request.operator_turn and (
+                _stripped.lower() == "/agent" or _stripped.lower().startswith("/agent ")
+            ):
                 async for _ev in _handle_agent_slash(_stripped, conversation_id, store):
                     await turn.emit(_ev)
                 return
@@ -1123,7 +1132,7 @@ async def ask_stream(request: AskStreamRequest):
             # replaced by that clarification, and a code-action phrasing must
             # not emit `claude_intent` from here.
             _engine, _engine_task = ("", "")
-            if _effective_pid != JOURNAL_PERSONA_ID:
+            if _effective_pid != JOURNAL_PERSONA_ID and request.operator_turn:
                 from api.services.agent_loop import parse_engine_directive
                 _engine, _engine_task = parse_engine_directive(request.question)
             if _engine:
@@ -1334,6 +1343,7 @@ async def ask_stream(request: AskStreamRequest):
                     force_remote=force_remote,
                     persona_id=_effective_pid or "",
                     user_message=request.question,
+                    approval_message=request.question if request.operator_turn else "",
                     conversation_id=conversation_id or "",
                 ):
                     if event["type"] == "turn_state":

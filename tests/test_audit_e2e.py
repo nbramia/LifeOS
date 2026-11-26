@@ -102,7 +102,7 @@ class TestReminderPipelineE2E:
         """When first chat_via_api_with_log call fails, retries and succeeds."""
         call_count = [0]
 
-        async def flaky_chat(question):
+        async def flaky_chat(question, operator_turn=True):
             call_count[0] += 1
             if call_count[0] == 1:
                 raise ConnectionError("API temporarily unavailable")

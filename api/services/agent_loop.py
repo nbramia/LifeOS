@@ -19,7 +19,7 @@ import asyncio
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
 from api.services.claude_models import resolve_claude_model
 from api.services.agent_system_prompt import build_system_prompt
 from api.services.agent_tools import TOOL_STATUS_MESSAGES, execute_tool_parallel, begin_email_send_turn, tools_for_persona
@@ -494,6 +494,7 @@ async def run_agent_loop(
     persona_id: str = "",
     user_message: str = "",
     conversation_id: str = "",
+    approval_message: Optional[str] = None,
 ) -> AsyncGenerator[dict, None]:
     """
     Async generator that runs the agentic chat loop.
@@ -538,6 +539,10 @@ async def run_agent_loop(
         conversation_id: The conversation this turn belongs to. A task parked
             for approval records it, so an operator's go-ahead releases it
             only in a later turn of the same conversation.
+        approval_message: The operator's own words the agent-task approval
+            gate judges, when they differ from `user_message`: "" for a turn
+            whose text is not the operator's (a `prompt` schedule a Hermes
+            turn wrote). None judges `user_message`.
 
     Yields:
         Dicts with "type" key: "turn_state" (first event -- a live
@@ -716,7 +721,10 @@ async def run_agent_loop(
     # One agent-approval turn per call: the operator's message is judged at
     # most once, and ids parked this turn cannot be released in it.
     from api.services.agent_task_approval import ApprovalTurn
-    approval_turn = ApprovalTurn(user_message, conversation_id=conversation_id, persona_id=persona_id)
+    approval_turn = ApprovalTurn(
+        user_message if approval_message is None else approval_message,
+        conversation_id=conversation_id, persona_id=persona_id,
+    )
     # (task, start_monotonic, round_num) for every in-loop shadow call
     # fired this turn -- awaited together, capped, just before the final
     # "result" event below on the happy path. Everything from here to that

@@ -634,8 +634,9 @@ async def test_turn_shape_and_literal_keys(proxy_client):
     ctx = json.loads(_received["body"])["lifeos_context"]
     turn = ctx["turn"]
     # Literal keys pinned by the cross-repo schema comment, exactly —
-    # not a subset check. `caller_session_id` is the one key added
-    # here rather than by build_turn_context() itself — see hermes_proxy.py.
+    # not a subset check. `caller_session_id` and the proxy's per-turn
+    # `lifeos_turn_id` are added here rather than by build_turn_context()
+    # itself — see hermes_proxy.py.
     assert set(turn.keys()) == {
         "current_datetime", "current_datetime_iso", "timezone",
         "time_resolution_instruction", "personal_context",
@@ -643,7 +644,7 @@ async def test_turn_shape_and_literal_keys(proxy_client):
         "session_cost_usd", "session_turn_count",
         "session_input_tokens", "session_output_tokens",
         "session_cost_is_lower_bound",
-        "caller_session_id",
+        "caller_session_id", "lifeos_turn_id",
     }
     assert isinstance(turn["current_datetime"], str) and turn["current_datetime"]
     assert isinstance(turn["current_datetime_iso"], str) and turn["current_datetime_iso"]
@@ -655,6 +656,7 @@ async def test_turn_shape_and_literal_keys(proxy_client):
     assert "Projects are ordinary tasks" in turn["task_hierarchy_instruction"]
     assert "explicit confirmation" in turn["task_hierarchy_instruction"]
     assert isinstance(turn["caller_session_id"], str) and turn["caller_session_id"]
+    assert isinstance(turn["lifeos_turn_id"], str) and turn["lifeos_turn_id"]
     # `turn` and `persona` are siblings under `lifeos_context`, never merged
     # into one object — each key set is disjoint from the other's.
     # `caller_session_id` must respect that separation too: it lands in
@@ -699,14 +701,18 @@ async def test_turn_matches_endpoint_for_same_persona(proxy_client, monkeypatch)
     assert hermes_resp.status_code == 200
     envelope_turn = json.loads(_received["body"])["lifeos_context"]["turn"]
 
-    # `caller_session_id` is the one deliberate difference: it's an
-    # agent-worker session identity Hermes needs and the plain turn-context
-    # endpoint has no reason to hand out (it creates nothing). Every other
-    # field must still come from the identical build_turn_context() call.
+    # `caller_session_id` and `lifeos_turn_id` are the deliberate
+    # differences: an agent-worker session identity Hermes needs, and the id
+    # of this one forwarded turn, neither of which the plain turn-context
+    # endpoint has reason to hand out (it creates and forwards nothing).
+    # Every other field must still come from the identical
+    # build_turn_context() call.
     assert "caller_session_id" not in endpoint_turn
+    assert "lifeos_turn_id" not in endpoint_turn
     envelope_turn_without_session = dict(envelope_turn)
     caller_session_id = envelope_turn_without_session.pop("caller_session_id")
     assert isinstance(caller_session_id, str) and caller_session_id
+    assert envelope_turn_without_session.pop("lifeos_turn_id")
     assert envelope_turn_without_session == endpoint_turn
 
 
@@ -2420,6 +2426,10 @@ async def test_resolve_persona_matches_ask_stream_envelope_for_same_persona(
     assert ask_resp.status_code == 200
     ask_ctx = json.loads(_received["body"])["lifeos_context"]
 
+    # The proxy also names the one turn it forwards (`lifeos_turn_id`);
+    # `/resolve-persona` forwards nothing, so it has none.
+    assert ask_ctx["turn"].pop("lifeos_turn_id")
+    assert "lifeos_turn_id" not in resolved_ctx["turn"]
     assert resolved_ctx == ask_ctx
 
 

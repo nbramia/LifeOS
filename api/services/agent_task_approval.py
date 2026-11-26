@@ -32,6 +32,11 @@ they typed, "use codex to ...", "have Claude fix ...", "start an agent
 ...", "delegate this to codex". Text the operator quotes or asks about
 ("what does this mean: ...", anything in quotes, after a colon, or on a
 later line) never counts. Everything else is parked and asked.
+
+The task API runs the same gate (`gate_create`, `gate_update`,
+`_run_project_action`) for a Hermes call (`X-LifeOS-Hermes-Turn`), which
+also covers `resume_project` on a paused project; `hermes_turn` builds that
+call's `ApprovalTurn` from LifeOS's own record of the turn.
 """
 from __future__ import annotations
 
@@ -72,6 +77,9 @@ PICKUP_STATUSES = ("todo", "urgent")
 ACTION_RELEASE = "release"
 ACTION_PLAN_PROJECT = "plan_project"
 ACTION_RESUME_EXECUTION = "resume_execution"
+ACTION_RESUME_PROJECT = "resume_project"
+# The project actions chat's `manage_tasks` offers; the task API also gates
+# `ACTION_RESUME_PROJECT`.
 _PROJECT_ACTIONS = (ACTION_PLAN_PROJECT, ACTION_RESUME_EXECUTION)
 _CONTENT_KEYS = ("description", "notes", "tags", "fields")
 
@@ -155,6 +163,29 @@ def content_hash(task) -> str:
         },
     }
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8"))
+    return digest.hexdigest()[:32]
+
+
+def releasable_children(task) -> list:
+    """The children of project `task` that the worker would claim once the
+    project is not paused, ordered by id."""
+    from api.services.task_manager import get_task_manager
+    from api.services.task_projects import build_task_hierarchy
+
+    children = build_task_hierarchy(get_task_manager().list_tasks()).children(task.id)
+    return sorted((child for child in children if starts_agent(child)), key=lambda c: c.id)
+
+
+def request_hash(task, action: str) -> str:
+    """What an approval of `action` on `task` approves: the task's content
+    (`content_hash`) and, for `resume_project`, the id and content of every
+    child the resume releases, so a child added or changed afterwards voids
+    the approval."""
+    base = content_hash(task)
+    if action != ACTION_RESUME_PROJECT:
+        return base
+    released = [[child.id, content_hash(child)] for child in releasable_children(task)]
+    digest = hashlib.sha256(json.dumps([base, released]).encode("utf-8"))
     return digest.hexdigest()[:32]
 
 
@@ -286,16 +317,35 @@ def judge_operator_message(message: str) -> OperatorVerdict:
 
 class ApprovalTurn:
     """Per-turn approval state: the operator's own message, the conversation,
-    the ids this turn parked, and the verdict, judged at most once."""
+    the ids this turn parked, and the verdict, judged at most once.
 
-    def __init__(self, user_message: str = "", *, conversation_id: str = "", persona_id: str = ""):
+    `started_at` is the time the operator's message for the turn arrived,
+    when the caller knows it: a request parked at or after it was parked in
+    this turn, so this turn's go-ahead cannot release it. `surface` is
+    "chat" for the chat orchestrator's `manage_tasks` and "mcp" for the
+    LifeOS MCP task tools; it picks the tool names the notices give."""
+
+    def __init__(
+        self, user_message: str = "", *, conversation_id: str = "", persona_id: str = "",
+        started_at: Optional[float] = None, surface: str = "chat",
+    ):
         self.user_message = user_message or ""
         conv = (conversation_id or "").strip()
         self.conversation_id = conv if _CONVERSATION_ID_RE.match(conv) else ""
         self.persona_id = persona_id or ""
+        self.started_at = started_at
+        self.surface = surface
         self.parked_ids: set[str] = set()
         self._verdict: Optional[OperatorVerdict] = None
         self._lock = threading.Lock()
+
+    def _parked_before_this_turn(self, fields: dict) -> bool:
+        if self.started_at is None:
+            return True
+        try:
+            return float(fields.get(APPROVAL_AT_FIELD) or 0) < self.started_at
+        except ValueError:
+            return False
 
     def verdict(self) -> OperatorVerdict:
         with self._lock:
@@ -313,9 +363,10 @@ class ApprovalTurn:
             and task.id == latest_id
             and (fields.get(APPROVAL_ACTION_FIELD) or ACTION_RELEASE) == action
             and task.id not in self.parked_ids
+            and self._parked_before_this_turn(fields)
             and bool(self.conversation_id)
             and fields.get(APPROVAL_CONVERSATION_FIELD) == self.conversation_id
-            and fields.get(APPROVAL_HASH_FIELD) == content_hash(task)
+            and fields.get(APPROVAL_HASH_FIELD) == request_hash(task, action)
             and self.verdict().approves
         )
 
@@ -584,7 +635,125 @@ def _run_update(inp: dict, turn: ApprovalTurn) -> Optional[str]:
     return "Error: the task kept changing while it was being checked; try again."
 
 
-def _run_project_action(inp: dict, turn: ApprovalTurn, action: str) -> Optional[str]:
+# ---------------------------------------------------------------------------
+# The same gate for the task API, for callers that carry an approval turn
+# (the LifeOS MCP task tools as Hermes calls them)
+# ---------------------------------------------------------------------------
+
+class ApprovalChanged(Exception):
+    """The task changed between the gate's decision and the write; retry."""
+
+
+def approval_fields_error(fields: Any) -> Optional[str]:
+    if isinstance(fields, dict) and any(str(k) in APPROVAL_FIELDS for k in fields):
+        return "the agent_approval fields are set only by the approval flow"
+    return None
+
+
+@dataclass
+class GatedCreate:
+    """What to write for a task API create: `fields` and `status` replace the
+    request's; `token` is set when the task is parked."""
+    status: str
+    fields: dict
+    token: Optional[str] = None
+    refusal: Optional[str] = None
+
+
+def gate_create(inp: dict, turn: ApprovalTurn) -> GatedCreate:
+    """Decide a task API create. `inp` has the request's description,
+    status, tags, notes and fields."""
+    status = str(inp.get("status") or "todo")
+    fields = dict(inp.get("fields") or {})
+    refusal = approval_fields_error(fields)
+    if refusal:
+        return GatedCreate(status, fields, refusal=refusal)
+    proposed = _proposed_create(inp)
+    refusal = notes_routing_error(proposed)
+    if refusal:
+        return GatedCreate(status, fields, refusal=refusal.removeprefix("Error: "))
+    if not starts_agent(proposed) or turn.verdict().asks_for_agent:
+        return GatedCreate(status, fields)
+    token = _new_token()
+    return GatedCreate(
+        PARKED_STATUS,
+        {**fields, **_pending_fields(token, ACTION_RELEASE, turn, proposed.status)},
+        token=token,
+    )
+
+
+def open_parked_request(task_id: str, token: str, turn: ApprovalTurn) -> None:
+    """Seal and send the request for a task the task API just parked."""
+    _open_request(task_id, token, ACTION_RELEASE, turn)
+
+
+@dataclass
+class GatedUpdate:
+    """The gate's decision for a task API update: `status`/`fields` (when
+    set) replace the request's, and `precondition` re-checks the decision
+    against the snapshot being written, raising `ApprovalChanged`."""
+    kind: str
+    status: Optional[str] = None
+    fields: Optional[dict] = None
+    precondition: Any = None
+    token: Optional[str] = None
+    refusal: Optional[str] = None
+
+
+def gate_update(tm, task_id: str, inp_for, turn: ApprovalTurn) -> Optional[GatedUpdate]:
+    """Decide a task API update. `inp_for(task)` gives the update's
+    description, status, priority, due_date, notes, tags and fields as they
+    apply to `task` (an assignee change swaps one tag on that task's list).
+    None when the task does not exist."""
+    current = tm.get(task_id)
+    if current is None:
+        return None
+    inp = inp_for(current)
+    refusal = approval_fields_error(inp.get("fields"))
+    if refusal:
+        return GatedUpdate("refuse", refusal=refusal)
+    is_project = _is_project(tm, current.id)
+    latest_id = latest_request_id(tm, turn.conversation_id)
+    planned = _plan_update(current, inp, turn, is_project=is_project, latest_id=latest_id)
+    if planned.kind == "refuse":
+        return GatedUpdate("refuse", refusal=(planned.refusal or "").removeprefix("Error: "))
+
+    def precondition(snapshot) -> None:
+        again = _plan_update(snapshot, inp_for(snapshot), turn,
+                             is_project=is_project, latest_id=latest_id)
+        if again.signature != planned.signature:
+            raise ApprovalChanged()
+
+    if planned.kind == "pass":
+        return GatedUpdate("pass", precondition=precondition)
+    written = planned.tool_input or {}
+    return GatedUpdate(
+        planned.kind,
+        status=written.get("status"),
+        fields=written.get("fields"),
+        precondition=precondition,
+        token=planned.token,
+    )
+
+
+def resume_project_starts_agent(task) -> bool:
+    """True when resuming the paused project `task` would let an agent start:
+    a child the worker would claim once the pause is lifted, or a persistent
+    agent owner the resume hands back its turns."""
+    from api.services.task_projects import COORDINATOR_SESSION_FIELD, PROJECT_PAUSED_FIELD, field_truthy
+
+    fields = task.fields or {}
+    if not field_truthy(fields.get(PROJECT_PAUSED_FIELD)):
+        return False
+    return bool(fields.get(COORDINATOR_SESSION_FIELD)) or bool(releasable_children(task))
+
+
+def _run_project_action(inp: dict, turn: ApprovalTurn, action: str, runner=None):
+    """Run `plan_project`, `resume_execution` or `resume_project` through the
+    gate. Returns the runner's result, a notice or error string, or None for
+    a missing task. `runner(precondition)` performs the action and must hold
+    the action to `precondition` (raising `ApprovalNotPending` stops it); the
+    default is the chat tool's, and the task API passes its own."""
     from api.services import agent_tools
     from api.services.task_manager import get_task_manager
     from api.services.task_projects import EXECUTION_PAUSED_FIELD
@@ -595,15 +764,19 @@ def _run_project_action(inp: dict, turn: ApprovalTurn, action: str) -> Optional[
     def needs_approval(task) -> bool:
         if action == ACTION_PLAN_PROJECT:
             return True
+        if action == ACTION_RESUME_PROJECT:
+            return resume_project_starts_agent(task)
         resumed = copy.copy(task)
         resumed.fields = {k: v for k, v in (task.fields or {}).items() if k != EXECUTION_PAUSED_FIELD}
         if task.status == "in_progress":
             resumed.status = "todo"
         return starts_agent(resumed)
 
-    def run(precondition=None) -> str:
+    def run(precondition=None):
+        if runner is not None:
+            return runner(precondition)
         if action == ACTION_PLAN_PROJECT:
-            return agent_tools._task_plan_project(inp)
+            return agent_tools._task_plan_project(inp, precondition=precondition)
         return agent_tools._task_resume_execution(inp, precondition=precondition)
 
     for _attempt in range(_WRITE_ATTEMPTS):
@@ -628,21 +801,21 @@ def _run_project_action(inp: dict, turn: ApprovalTurn, action: str) -> Optional[
             approved_hash = current.fields.get(APPROVAL_HASH_FIELD)
             try:
                 tm.update(current.id, fields=_cleared_fields(),
-                          _precondition=_still_requested(token, approved_hash))
+                          _precondition=_still_requested(token, approved_hash, action))
             except ApprovalNotPending:
                 continue
-            return run(_content_is(approved_hash))
+            return run(_content_is(approved_hash, action))
         if is_pending(current) and (current.fields or {}).get(APPROVAL_ACTION_FIELD) == action:
-            return _project_notice(current, action, sent=None)
+            return _project_notice(current, action, sent=None, surface=turn.surface)
         token = _new_token()
         tm.update(current.id, fields={**_cleared_fields(), **_pending_fields(token, action, turn)})
         return _open_request(current.id, token, action, turn)
     return "Error: the task kept changing while it was being checked; try again."
 
 
-def _still_requested(token: Optional[str], approved_hash: Optional[str]):
-    """Precondition: the request is still pending with this token, and the
-    content is still what it was when the request was made."""
+def _still_requested(token: Optional[str], approved_hash: Optional[str], action: str):
+    """Precondition: the request is still pending with this token, and what
+    it approves (`request_hash`) is still what it was when it was made."""
     def check(task) -> None:
         fields = task.fields or {}
         if (
@@ -651,15 +824,15 @@ def _still_requested(token: Optional[str], approved_hash: Optional[str]):
             or fields.get(APPROVAL_ID_FIELD) != token
             or not approved_hash
             or fields.get(APPROVAL_HASH_FIELD) != approved_hash
-            or content_hash(task) != approved_hash
+            or request_hash(task, action) != approved_hash
         ):
             raise ApprovalNotPending()
     return check
 
 
-def _content_is(approved_hash: Optional[str]):
+def _content_is(approved_hash: Optional[str], action: str):
     def check(task) -> None:
-        if content_hash(task) != approved_hash:
+        if request_hash(task, action) != approved_hash:
             raise ApprovalNotPending()
     return check
 
@@ -680,7 +853,7 @@ def _open_request(task_id: str, token: str, action: str, turn: ApprovalTurn) -> 
             raise ApprovalNotPending()
 
     try:
-        task = tm.update(task_id, fields={APPROVAL_HASH_FIELD: content_hash(task)},
+        task = tm.update(task_id, fields={APPROVAL_HASH_FIELD: request_hash(task, action)},
                          _precondition=same_request) or task
     except ApprovalNotPending:
         return ""
@@ -693,7 +866,7 @@ def _open_request(task_id: str, token: str, action: str, turn: ApprovalTurn) -> 
             pass
     if action == ACTION_RELEASE:
         return _parked_notice(task, sent=message_id is not None)
-    return _project_notice(task, action, sent=message_id is not None)
+    return _project_notice(task, action, sent=message_id is not None, surface=turn.surface)
 
 
 def _parked_notice(task, *, sent: bool) -> str:
@@ -709,18 +882,34 @@ def _parked_notice(task, *, sent: bool) -> str:
     )
 
 
-def _project_notice(task, action: str, *, sent: Optional[bool]) -> str:
-    verb = "plan and delegate the project" if action == ACTION_PLAN_PROJECT else "resume execution"
+_MCP_PROJECT_TOOLS = {
+    ACTION_PLAN_PROJECT: "lifeos_project_plan",
+    ACTION_RESUME_EXECUTION: "lifeos_task_resume_execution",
+    ACTION_RESUME_PROJECT: "lifeos_project_resume",
+}
+_PROJECT_VERBS = {
+    ACTION_PLAN_PROJECT: "plan and delegate the project",
+    ACTION_RESUME_EXECUTION: "resume execution",
+    ACTION_RESUME_PROJECT: "resume the paused project",
+}
+
+
+def _project_notice(task, action: str, *, sent: Optional[bool], surface: str = "chat") -> str:
+    verb = _PROJECT_VERBS[action]
     telegram = (
         " An Approve/Deny request was sent to the operator's Telegram." if sent
         else " It is already waiting for the operator's approval." if sent is None
         else ""
     )
+    again = (
+        f"call {_MCP_PROJECT_TOOLS[action]} with task_id={task.id} again" if surface == "mcp"
+        else f"call manage_tasks {action} with task_id={task.id} again"
+    )
     return (
         f"NOT STARTED, AWAITING OPERATOR APPROVAL: {action} on task {task.id} would start an "
         f"agent, and the operator's own message this turn did not ask for agent work.{telegram} "
         f"Ask the operator whether to {verb} for \"{task.description}\". If their next message "
-        f"says yes, call manage_tasks {action} with task_id={task.id} again."
+        f"says yes, {again}."
     )
 
 
@@ -736,8 +925,19 @@ def request_text(task, action: str, persona_id: str = "") -> str:
     what = {
         ACTION_PLAN_PROJECT: "Plan and delegate this project (starts its agent owner)",
         ACTION_RESUME_EXECUTION: f"Resume agent execution ({engines})",
+        ACTION_RESUME_PROJECT: "Resume this paused project (its agent work starts again)",
     }.get(action, f"Start an agent on this task ({engines})")
     head = f"Approve agent work?\n\n{what}\n\nTask {task.id}: {task.description}"
+    if action == ACTION_RESUME_PROJECT:
+        released = releasable_children(task)
+        listed = "\n".join(
+            f"- {child.id}: {child.description} ("
+            + (", ".join(f"#{t}" for t in agent_tags(child)) or "an agent") + ")"
+            for child in released[:20]
+        )
+        if len(released) > 20:
+            listed += f"\n- and {len(released) - 20} more"
+        head += f"\n\nStarts again:\n{listed}" if released else ""
     tail = (
         f"\n\nAsked from: {persona_id or 'chat'}. It stays parked until you decide; "
         "Approve releases it once."
@@ -785,6 +985,16 @@ def send_approval_request(task, token: str, action: str, turn: ApprovalTurn) -> 
         return None
 
 
+def _resume_project(task_id: str, *, precondition) -> str:
+    from api.services import agent_tools
+    from api.services.task_manager import get_task_manager
+
+    task = agent_tools._task_project_service(get_task_manager(), lifecycle=True).resume_project(
+        task_id, precondition=precondition,
+    )
+    return f"Project resumed: \"{task.description}\" (id: {task.id})"
+
+
 def decide(task_id: str, token: str, *, approve: bool, message_id: Optional[int] = None) -> str:
     """Record the operator's Approve or Deny for one request.
 
@@ -793,7 +1003,8 @@ def decide(task_id: str, token: str, *, approve: bool, message_id: Optional[int]
     one is checked again inside the write, under the task store's lock, and
     the request is spent on first use. Deny keeps the task parked. Approve
     releases a parked task to its engine, or runs the held
-    `plan_project`/`resume_execution`.
+    `plan_project`/`resume_execution`/`resume_project`, held to the content
+    the request showed.
     """
     from api.services.task_manager import get_task_manager
 
@@ -805,14 +1016,14 @@ def decide(task_id: str, token: str, *, approve: bool, message_id: Optional[int]
     if message_id is not None and fields.get(APPROVAL_MESSAGE_FIELD) != str(message_id):
         return "This message is not the current request for that task; nothing changed."
     approved_hash = fields.get(APPROVAL_HASH_FIELD)
-    check = _still_requested(token, approved_hash)
+    action = fields.get(APPROVAL_ACTION_FIELD) or ACTION_RELEASE
+    check = _still_requested(token, approved_hash, action)
     try:
         if fields.get(APPROVAL_FIELD) != PENDING or fields.get(APPROVAL_ID_FIELD) != token:
             raise ApprovalNotPending()
-        if content_hash(current) != approved_hash:
+        if request_hash(current, action) != approved_hash:
             return ("The task changed after this request was sent, so nothing was started. "
                     "It stays parked.")
-        action = fields.get(APPROVAL_ACTION_FIELD) or ACTION_RELEASE
         if not approve:
             tm.update(task_id, fields={APPROVAL_FIELD: DENIED, APPROVAL_ID_FIELD: None},
                       _precondition=check)
@@ -832,10 +1043,15 @@ def decide(task_id: str, token: str, *, approve: bool, message_id: Optional[int]
 
     try:
         if action == ACTION_PLAN_PROJECT:
-            outcome = agent_tools._task_plan_project({"task_id": task_id, "operation_id": f"approval-{token}"})
+            outcome = agent_tools._task_plan_project(
+                {"task_id": task_id, "operation_id": f"approval-{token}"},
+                precondition=_content_is(approved_hash, action),
+            )
+        elif action == ACTION_RESUME_PROJECT:
+            outcome = _resume_project(task_id, precondition=_content_is(approved_hash, action))
         else:
             outcome = agent_tools._task_resume_execution(
-                {"task_id": task_id}, precondition=_content_is(approved_hash),
+                {"task_id": task_id}, precondition=_content_is(approved_hash, action),
             )
     except ApprovalNotPending:
         return "Approved, but the task changed before it started; nothing was started."

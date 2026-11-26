@@ -480,6 +480,29 @@ additive, caller-asserted identity, the same trust model as the existing
 `actor` and `fields.assigned_by` fields, not cryptographic attestation.
 `lifeos_project_pause` does not send it: an agent may pause a project.
 
+`POST /api/tasks`, `PUT /api/tasks/{id}`, `POST /api/tasks/{id}/project/plan`,
+`POST /api/tasks/{id}/project/resume`, `POST /api/tasks/{id}/resume-execution`,
+`POST /api/scheduler`, `PUT /api/scheduler/{id}` and
+`POST /api/scheduler/{id}/trigger` also accept `X-LifeOS-Hermes-Turn`: the
+Hermes turn behind the call as `<caller_session_id>.<lifeos_turn_id>` (the
+two ids LifeOS wrote into the turn it forwarded), a bare `caller_session_id`,
+or `none`. The MCP server Hermes starts (`LIFEOS_MCP_CALLER=hermes`) sends it
+on the matching tools. The value proves nothing; when there is no
+`X-LifeOS-Agent-Session`, the API resolves it against its own records:
+- a running worker Hermes session: the request is that agent session's own,
+  exactly as if it had sent `X-LifeOS-Agent-Session` with that id (the rules
+  below apply);
+- anything else: the request goes through the agent-work approval gate,
+  judged on LifeOS's own record of the operator's question for that turn
+  (only when both ids name the forwarded turn that is current for that
+  session), and with no operator text for every other value. Work that would start an agent is
+  parked, and a held plan, resume or schedule write answers `202` with
+  `{"awaiting_approval": true, "action", "message", ...}` (`task_id` for a
+  task, `schedule_id` and `schedule` for a schedule).
+
+See [agent-worker.md](agent-worker.md#agent-work-a-hermes-turn-creates).
+Without the header these routes behave as described elsewhere here.
+
 When the header is present and the task being written is, or would become,
 a project child (`fields.parent_id` set, or already parented):
 - Assigning the `#hermes` tag is refused with **422**
@@ -670,7 +693,10 @@ Clear a project's paused state, so claims, Open, and Plan and delegate
 succeed again. Refused with **403**
 `{"code": "agent_resume_forbidden", ...}` for a caller that carries
 `X-LifeOS-Agent-Session` — only the operator (no header) may resume a
-project an agent paused.
+project an agent paused. A Hermes call (`X-LifeOS-Hermes-Turn`) from a
+running worker session gets the same **403**; any other Hermes call whose
+resume would let an agent start is held (**202** `awaiting_approval`) unless
+the operator's forwarded question asked for agent work.
 
 ### POST /api/tasks/{id}/resume-execution
 
@@ -934,6 +960,8 @@ Delete a schedule.
 ### POST /api/scheduler/{id}/trigger
 
 Manually fire a schedule immediately. For a `once` schedule this consumes it: the fire disables it and clears its next-fire time, exactly as an unattended fire would. A `manual` schedule — one with no trigger of its own — stays enabled and can be triggered again; this is its only way to ever fire.
+
+`POST /api/scheduler`, `PUT /api/scheduler/{id}` and this route accept `X-LifeOS-Hermes-Turn` (see [Agent-session attribution](#agent-session-attribution-and-project-child-guards)). For a Hermes call the approval gate judges, a schedule whose action is `agent`, or `endpoint` with `POST`, is saved disabled on a create or on an update that makes it such a schedule or changes its definition, and is not fired on a trigger; each answers **202** `awaiting_approval` with the schedule, and the operator approves on Telegram. A create, or a write of `message_content`, by such a call marks the schedule `prompt_source: hermes`, and by an agent session (`X-LifeOS-Agent-Session`, or a Hermes call from a running worker session) `prompt_source: agent`; the mark is never settable from a request body. A `prompt` schedule so marked runs its text with `operator_turn: false` (see [`POST /api/ask/stream`](api-communications.md#post-apiaskstream)). Only an operator write (no Hermes or agent-session header) that sets `message_content` clears the mark.
 
 ### POST /api/scheduler/send
 

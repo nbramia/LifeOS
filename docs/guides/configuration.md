@@ -192,6 +192,7 @@ The HTTP MCP transport exposes LifeOS tools to remote agents (primarily Anthropi
 | `LIFEOS_MCP_FUNNEL_CONTAINER` | str | `lifeos-mcp-funnel` | Docker container name of the public MCP node. |
 | `LIFEOS_MCP_FUNNEL_IMAGE` | str | `tailscale/tailscale:v1.102.4` | Image the public MCP node runs. |
 | `LIFEOS_MCP_FUNNEL_STATE_DIR` | str | `~/.local/share/lifeos-mcp-ts` | Host directory holding the public MCP node's Tailscale state (its login). |
+| `LIFEOS_MCP_CALLER` | str | — | Set to `hermes` in the `env` of the stdio `lifeos` MCP server that Hermes starts (`mcp_servers.lifeos.env` in each Hermes home's `config.yaml`). The task and schedule writes that can start agent work then carry the Hermes turn (`X-LifeOS-Hermes-Turn`) and go through the agent-work approval gate, judged on LifeOS's own record of the operator's question for that turn ([agent-worker.md](../specs/product/agent-worker.md#agent-work-a-hermes-turn-creates)). Read from the MCP server's own environment, not `.env`. Leave unset for every other MCP client. |
 
 ## Host Tools
 

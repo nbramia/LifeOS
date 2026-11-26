@@ -636,11 +636,12 @@ async def chat_via_api(
     }
 
 
-async def chat_via_api_with_log(question: str) -> dict:
+async def chat_via_api_with_log(question: str, *, operator_turn: bool = True) -> dict:
     """Run a question through the chat pipeline and capture execution metadata.
 
     Like chat_via_api() but also returns tool_statuses, token usage, and cost
-    for reminder execution logging.
+    for reminder execution logging. `operator_turn=False` runs `question` as
+    text that is not the operator's own words (`AskStreamRequest.operator_turn`).
 
     Returns:
         {"answer": str, "conversation_id": str, "tool_statuses": list[str],
@@ -648,6 +649,8 @@ async def chat_via_api_with_log(question: str) -> dict:
     """
     port = settings.port
     body: dict = {"question": question}
+    if not operator_turn:
+        body["operator_turn"] = False
 
     full_text = ""
     conv_id = None
@@ -1207,7 +1210,8 @@ class TelegramBotListener:
             logger.warning(f"hermes-fallback notice failed to send: {exc}")
 
     async def _handle_callback_query(self, callback_query: dict) -> None:
-        """Decide an agent-task approval from its Approve/Deny button.
+        """Decide an agent-work approval (a parked task, a held project
+        action, or a held schedule) from its Approve/Deny button.
 
         Only the primary bot sends those buttons, and only the operator's own
         press decides anything: the press must come from the configured
@@ -1215,7 +1219,8 @@ class TelegramBotListener:
         id is the operator's user id), on a message in that chat. The
         decision is bound to the task, its request token, the message that
         carried the buttons and the content it showed, and is spent the first
-        time it is used (see `agent_task_approval.decide`).
+        time it is used (see `agent_task_approval.decide` and
+        `agent_schedule_approval.decide`).
         """
         if not self._is_primary:
             return
@@ -1229,21 +1234,30 @@ class TelegramBotListener:
         if from_id != operator:
             logger.warning("Ignoring button press from a user other than the operator")
             return
-        from api.services import agent_task_approval
+        from api.services import agent_schedule_approval, agent_task_approval
 
-        parsed = agent_task_approval.parse_callback_data(callback_query.get("data") or "")
-        if parsed is None:
+        data = callback_query.get("data") or ""
+        message_id = int(message.get("message_id") or 0)
+        parsed = agent_task_approval.parse_callback_data(data)
+        scheduled = None if parsed else agent_schedule_approval.parse_callback_data(data)
+        if parsed is None and scheduled is None:
             await answer_callback_query(callback_query.get("id", ""))
             return
-        approve, task_id, token = parsed
         try:
-            outcome = await asyncio.to_thread(
-                agent_task_approval.decide, task_id, token, approve=approve,
-                message_id=int(message.get("message_id") or 0),
-            )
+            if parsed is not None:
+                approve, task_id, token = parsed
+                outcome = await asyncio.to_thread(
+                    agent_task_approval.decide, task_id, token, approve=approve,
+                    message_id=message_id,
+                )
+            else:
+                approve, token = scheduled
+                outcome = await asyncio.to_thread(
+                    agent_schedule_approval.decide, token, approve=approve, message_id=message_id,
+                )
         except Exception as exc:  # keep the listener running
-            logger.warning(f"agent-task approval decision failed: {exc}")
-            outcome = "Could not record that decision; the task stays parked."
+            logger.warning(f"agent-work approval decision failed: {exc}")
+            outcome = "Could not record that decision; nothing was started."
         await answer_callback_query(callback_query.get("id", ""), outcome)
         if message.get("message_id"):
             await edit_message_text(

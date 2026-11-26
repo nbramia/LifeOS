@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 from croniter import croniter
 from fastapi import APIRouter, Header, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from api.services.scheduler_store import (
@@ -28,8 +29,9 @@ from api.services.scheduler_validation import (
 )
 from config.settings import settings
 
-# Same header the task API reads (`api/routes/tasks.py`).
+# Same headers the task API reads (`api/routes/tasks.py`).
 AGENT_SESSION_HEADER = "X-LifeOS-Agent-Session"
+HERMES_TURN_HEADER = "X-LifeOS-Hermes-Turn"
 
 logger = logging.getLogger(__name__)
 
@@ -319,24 +321,51 @@ def _validate_update_fields(schedule_id: str, request: "UpdateScheduleRequest", 
 # Routes (static paths MUST come before {schedule_id} to avoid capture)
 # ---------------------------------------------------------------------------
 
-def _agent_session(header: Optional[str]) -> Optional[str]:
-    from api.routes.tasks import _clean_agent_session_header
+def _caller(agent_session_header: Optional[str], hermes_turn_header: Optional[str]):
+    """`(agent_session_id, approval_turn)` for a schedule write, resolved
+    exactly as the task API resolves a task write (`tasks._resolve_caller`)."""
+    from api.routes.tasks import _resolve_caller
 
-    return _clean_agent_session_header(header)
+    return _resolve_caller(agent_session_header, hermes_turn_header)
+
+
+def _held(entry: ScheduleEntry, kind: str, turn) -> JSONResponse:
+    """202 for a schedule write the agent-work approval gate holds, with the
+    notice for the caller to relay (`agent_schedule_approval`)."""
+    from api.services import agent_schedule_approval
+
+    message = agent_schedule_approval.open_request(entry, kind, turn)
+    return JSONResponse(status_code=202, content={
+        "awaiting_approval": True,
+        "schedule_id": entry.id,
+        "action": kind,
+        "message": message,
+        "schedule": ScheduleResponse.from_entry(entry).model_dump(mode="json"),
+    })
 
 
 @router.post("", response_model=ScheduleResponse)
 async def create_schedule(
     request: CreateScheduleRequest,
     x_lifeos_agent_session: Optional[str] = Header(default=None, alias=AGENT_SESSION_HEADER),
+    x_lifeos_hermes_turn: Optional[str] = Header(default=None, alias=HERMES_TURN_HEADER),
 ):
     """Create a new schedule. A 'manual' schedule has no trigger of its own —
     it fires only via ``POST /{schedule_id}/trigger`` — so its schedule_value
     is ignored and stored blank regardless of what's supplied.
 
-    An agent-attributed (`X-LifeOS-Agent-Session`) `agent` schedule records
-    its creator, and every task it writes carries that creator."""
-    agent_session = _agent_session(x_lifeos_agent_session)
+    An agent-attributed (`X-LifeOS-Agent-Session`, or a Hermes call from a
+    running worker session) `agent` schedule records its creator, and every
+    task it writes carries that creator. Any other Hermes call
+    (`X-LifeOS-Hermes-Turn`) that creates an enabled schedule that starts
+    agent work is saved disabled and answered 202 `awaiting_approval`
+    unless LifeOS's record of the operator's question asked for agent work
+    (`agent_schedule_approval`). A schedule an agent session or such a
+    Hermes call creates records that the operator did not write its text
+    (`prompt_source`)."""
+    from api.services import agent_schedule_approval
+
+    agent_session, approval_turn = _caller(x_lifeos_agent_session, x_lifeos_hermes_turn)
     if request.schedule_type not in ("once", "cron", "manual"):
         raise HTTPException(status_code=400, detail="schedule_type must be 'once', 'cron', or 'manual'")
     try:
@@ -356,6 +385,12 @@ async def create_schedule(
         request.budget_dollars, request.wall_seconds,
     )
 
+    held = approval_turn is not None and agent_schedule_approval.holds_create(
+        action, request.endpoint_config, request.enabled, approval_turn,
+    )
+    prompt_source = agent_schedule_approval.prompt_source_for(
+        approval_turn, agent_session, writes_text=True,
+    )
     store = get_scheduler_store()
     entry = _store_write(
         store.create,
@@ -368,7 +403,7 @@ async def create_schedule(
         endpoint_config=request.endpoint_config,
         executor=request.executor,
         bot=request.bot,
-        enabled=request.enabled,
+        enabled=request.enabled and not held,
         timezone=request.timezone,
         persona_id=request.persona_id or "",
         model_id=request.model_id or "",
@@ -378,7 +413,10 @@ async def create_schedule(
         budget_dollars=request.budget_dollars,
         wall_seconds=request.wall_seconds,
         agent_creator_session=(agent_session or "") if action == "agent" else "",
+        prompt_source=prompt_source or "",
     )
+    if held:
+        return _held(entry, agent_schedule_approval.KIND_ENABLE, approval_turn)
     return ScheduleResponse.from_entry(entry)
 
 
@@ -456,13 +494,20 @@ async def update_schedule(
     schedule_id: str,
     request: UpdateScheduleRequest,
     x_lifeos_agent_session: Optional[str] = Header(default=None, alias=AGENT_SESSION_HEADER),
+    x_lifeos_hermes_turn: Optional[str] = Header(default=None, alias=HERMES_TURN_HEADER),
 ):
     """Update an existing schedule. Converting to schedule_type='manual'
     clears schedule_value — a manual schedule has no trigger of its own.
 
     An agent-attributed update that leaves the schedule an `agent` schedule
-    adds the agent to its creators."""
-    agent_session = _agent_session(x_lifeos_agent_session)
+    adds the agent to its creators. Any other Hermes call whose update
+    leaves an enabled schedule that starts agent work, when it did not
+    before or its definition changes, is saved with the schedule disabled
+    and answered 202 `awaiting_approval` unless LifeOS's record of the
+    operator's question asked for agent work."""
+    from api.services import agent_schedule_approval
+
+    agent_session, approval_turn = _caller(x_lifeos_agent_session, x_lifeos_hermes_turn)
     request.bot = _require_known_bot(request.bot)
     store = get_scheduler_store()
     _validate_update_fields(schedule_id, request, store)
@@ -508,9 +553,27 @@ async def update_schedule(
             updates["agent_creator_session"] = merge_creators(
                 current.agent_creator_session, agent_session,
             )
-    entry = _store_write(store.update, schedule_id, **updates)
+    held = False
+    prompt_source = agent_schedule_approval.prompt_source_for(
+        approval_turn, agent_session, writes_text=request.message_content is not None,
+    )
+    if prompt_source is not None:
+        updates["prompt_source"] = prompt_source
+    # Decided against the entry as it is under the store's lock, so no
+    # other write lands between the decision and this one.
+    with store._lock:
+        if approval_turn is not None:
+            current = store.get(schedule_id)
+            if current is None:
+                raise HTTPException(status_code=404, detail="Schedule not found")
+            held = agent_schedule_approval.holds_update(current, updates, approval_turn)
+            if held:
+                updates["enabled"] = False
+        entry = _store_write(store.update, schedule_id, **updates)
     if not entry:
         raise HTTPException(status_code=404, detail="Schedule not found")
+    if held:
+        return _held(entry, agent_schedule_approval.KIND_ENABLE, approval_turn)
     return ScheduleResponse.from_entry(entry)
 
 
@@ -529,17 +592,25 @@ async def trigger_schedule(
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     request_key: Optional[str] = Header(default=None, alias="X-Request-Key"),
     x_lifeos_agent_session: Optional[str] = Header(default=None, alias=AGENT_SESSION_HEADER),
+    x_lifeos_hermes_turn: Optional[str] = Header(default=None, alias=HERMES_TURN_HEADER),
 ):
     """Manually fire a schedule immediately. For a ``once`` schedule this
     consumes it exactly like an unattended fire would: ``mark_triggered``
     disables it and clears its next fire, so it stops firing on its own
     trigger too. An agent-attributed trigger of an `agent` schedule adds the
-    agent to the creators of the task this fire writes."""
-    agent_session = _agent_session(x_lifeos_agent_session)
+    agent to the creators of the task this fire writes. Any other Hermes
+    call that would fire a schedule that starts agent work is not fired and
+    is answered 202 `awaiting_approval` unless LifeOS's record of the
+    operator's question asked for agent work."""
+    from api.services import agent_schedule_approval
+
+    agent_session, approval_turn = _caller(x_lifeos_agent_session, x_lifeos_hermes_turn)
     store = get_scheduler_store()
     entry = store.get(schedule_id)
     if not entry:
         raise HTTPException(status_code=404, detail="Schedule not found")
+    if approval_turn is not None and agent_schedule_approval.holds_trigger(entry, approval_turn):
+        return _held(entry, agent_schedule_approval.KIND_TRIGGER, approval_turn)
     if agent_session and entry.action == "agent":
         from dataclasses import replace
 

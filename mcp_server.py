@@ -59,6 +59,23 @@ AGENT_SESSION_HEADER = "X-LifeOS-Agent-Session"
 # the memory as app-sourced. Tool arguments never reach this header.
 CONNECTED_APP_HEADER = "X-LifeOS-Connected-App"
 
+# The writes that can start agent work. When Hermes starts this server
+# (`LIFEOS_MCP_CALLER=hermes`), each of them carries the Hermes turn it
+# belongs to: the `<caller_session_id>.<lifeos_turn_id>` Hermes's
+# `lifeos_agent_approval` plugin puts in `_lifeos_hermes_turn`, as the
+# `X-LifeOS-Hermes-Turn` header (`none` without a valid one). The value names a session and proves
+# nothing; the API resolves it against its own records and runs the write
+# through the agent-work approval gate. See `api/services/hermes_turn.py`.
+HERMES_TURN_HEADER = "X-LifeOS-Hermes-Turn"
+HERMES_TURN_ARGUMENT = "_lifeos_hermes_turn"
+HERMES_GATED_TOOLS = frozenset({
+    "lifeos_task_create", "lifeos_task_update",
+    "lifeos_project_plan", "lifeos_task_resume_execution", "lifeos_project_resume",
+    "lifeos_schedule_create", "lifeos_schedule_update", "lifeos_schedule_trigger",
+})
+# `<caller_session_id>` or `<caller_session_id>.<lifeos_turn_id>`.
+_HERMES_TURN_VALUE_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}(?:\.[A-Za-z0-9_-]{1,64})?$")
+
 _TASK_CREATE_FIELDS_DESCRIPTION = (
     "Operator-editable inline fields (e.g. host, effort, model, key) plus "
     "custom fields. Set parent_id to a stable task ID to create a durable "
@@ -696,6 +713,9 @@ class LifeOSMCPServer:
         ).strip()
         self._trusted_attempt_id = os.environ.get("LIFEOS_AGENT_ATTEMPT_ID", "").strip()
         self._trusted_turn_id = os.environ.get("LIFEOS_AGENT_TURN_ID", "").strip()
+        # Set in Hermes's `mcp_servers.lifeos.env`; a stdio MCP child gets only
+        # the environment its client names, so the model cannot unset it.
+        self._hermes_caller = os.environ.get("LIFEOS_MCP_CALLER", "").strip().lower() == "hermes"
         self._mcp_transport_secret = ""
         # (principal, vault-relative id) -> resolved path for documents
         # `chatgpt_search` returned to that principal; `chatgpt_fetch` serves
@@ -1948,6 +1968,7 @@ class LifeOSMCPServer:
         log reads the same request after dispatch).
         """
         arguments = dict(arguments or {})
+        hermes_turn = arguments.pop(HERMES_TURN_ARGUMENT, None)
         # Custom handlers for tools that don't map 1:1 to endpoints
         if tool_name == "lifeos_sync_trigger":
             return self._handle_sync_trigger(arguments)
@@ -2020,6 +2041,13 @@ class LifeOSMCPServer:
             resolved_agent_session = self._resolve_agent_session_header(agent_session_id)
             if resolved_agent_session:
                 headers[AGENT_SESSION_HEADER] = resolved_agent_session
+        if (
+            tool_name in HERMES_GATED_TOOLS
+            and AGENT_SESSION_HEADER not in headers
+            and (self._hermes_caller or hermes_turn is not None)
+        ):
+            value = hermes_turn.strip() if isinstance(hermes_turn, str) else ""
+            headers[HERMES_TURN_HEADER] = value if _HERMES_TURN_VALUE_RE.fullmatch(value) else "none"
 
         if connected_app and tool_name == "lifeos_memories_create":
             headers[CONNECTED_APP_HEADER] = connected_app
@@ -2091,6 +2119,10 @@ class LifeOSMCPServer:
                 return ("Investments snapshot not synced yet — the macbook refresh "
                         "(weekdays ~18:30) hasn't landed a summary.json here yet.")
             return f"Error: {err}"
+
+        # A write the agent-work approval gate held (202): relay its notice.
+        if tool_name in HERMES_GATED_TOOLS and data.get("awaiting_approval"):
+            return str(data.get("message") or "Not started: waiting for the operator's approval.")
 
         # Tool-specific formatting
         if tool_name == "lifeos_ask":
@@ -2734,7 +2766,7 @@ class LifeOSMCPServer:
             text = f"Task created: **{data.get('description', '')}** (ID: {data.get('id', '')})\nContext: {data.get('context', 'Inbox')} | File: {data.get('source_file', '')}"
             if data.get("parent_id"):
                 text += f"\nParent: {data.get('parent_title') or 'Unknown parent'} [id:{data['parent_id']}]"
-            return text
+            return text + _agent_approval_notice(data)
 
         elif tool_name == "lifeos_task_list":
             return _format_task_collection(data, arguments=arguments)
@@ -2748,7 +2780,7 @@ class LifeOSMCPServer:
                 text += f"\nParent: {data.get('parent_title') or 'Unknown parent'} [id:{data['parent_id']}]"
             elif data.get("is_project"):
                 text += f"\nProject: {data.get('child_count', 0)} children"
-            return text
+            return text + _agent_approval_notice(data)
 
         elif tool_name == "lifeos_task_complete":
             return f"Task completed: **{data.get('description', '')}** (ID: {data.get('id', '')})"
@@ -3048,6 +3080,25 @@ def dispatch(
     """
     response = respond(server, request, access=access, caller=caller)
     return None if request.get("id") is None else response
+
+
+def _agent_approval_notice(task: dict) -> str:
+    """What a model is told about a task the approval gate just parked."""
+    fields = task.get("fields") or {}
+    if fields.get("agent_approval") != "pending":
+        return ""
+    sent = (
+        " An Approve/Deny request was sent to the operator's Telegram."
+        if fields.get("agent_approval_message") else ""
+    )
+    return (
+        "\n\nAWAITING OPERATOR APPROVAL: this task would start an agent, and the operator's "
+        "own message this turn did not ask for agent work, so it was saved parked (status "
+        f"blocked, agent_approval: pending) and will not run.{sent} Tell the operator what the "
+        "task is and ask whether to start it. Do not release it in this turn. If their next "
+        f"message says yes, release it with lifeos_task_update task_id={task.get('id', '')} "
+        "status=todo."
+    )
 
 
 def _host_tool_names() -> frozenset[str]:
