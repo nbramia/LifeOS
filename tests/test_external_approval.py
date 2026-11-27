@@ -78,7 +78,12 @@ def sent(monkeypatch):
 
 @pytest.fixture
 def app():
+    from fastapi.exceptions import RequestValidationError
+
+    from api.main import validation_exception_handler
+
     application = FastAPI()
+    application.add_exception_handler(RequestValidationError, validation_exception_handler)
     application.include_router(routes.router)
     return application
 
@@ -171,9 +176,9 @@ def test_the_default_ttl_is_three_hours(local, sent):
     {"source": ""},
     {"source": "s" * 121},
 ])
-def test_an_invalid_body_is_422_and_sends_nothing(local, sent, store, overrides):
+def test_an_invalid_body_is_400_and_sends_nothing(local, sent, store, overrides):
     resp = local.post("/api/approvals/external", json=body(**overrides))
-    assert resp.status_code == 422
+    assert resp.status_code == 400
     assert sent == []
     with ea.connect_closing(store.db_path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM external_approvals").fetchone()[0] == 0
