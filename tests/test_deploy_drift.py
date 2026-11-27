@@ -825,6 +825,7 @@ case "$1" in
         unit="$2"
         date +%s > "$STATE/since_$unit"
         echo "restart $unit" >> "$STATE/restart.log"
+        echo "restart $unit" >> "$STATE/events.log"
         exit 0
         ;;
 esac
@@ -839,7 +840,14 @@ def _write_policy_stubs(state: Path) -> Path:
     bindir.mkdir(exist_ok=True)
     _stub_bin(bindir, "systemctl", _SYSTEMCTL_STUB)
     _stub_bin(bindir, "sudo", _SUDO_STUB)
-    _stub_bin(bindir, "curl", "exit 0\n")  # only reached if something restarted
+    # Only reached if something restarted. Records each probe so a test can
+    # check ordering against restarts; LIFEOS_TEST_CURL_FAIL=1 refuses it.
+    _stub_bin(
+        bindir,
+        "curl",
+        'echo "health-probe" >> "$LIFEOS_TEST_STATE/events.log"\n'
+        '[ "${LIFEOS_TEST_CURL_FAIL:-}" != 1 ]\n',
+    )
     return bindir
 
 
@@ -1509,3 +1517,153 @@ def test_held_lock_with_only_a_busy_worker_stale_leaves_no_pending_marker(tmp_pa
     _tick_with_lock_held(repo, state, venv)
 
     assert not _pending_marker(repo).exists()
+
+
+# ---------------------------------------------------------------------------
+# wait_for_api_health — deadline-based /health wait with crash detection
+# ---------------------------------------------------------------------------
+def _health_wait(
+    tmp_path: Path,
+    *,
+    curl_fail_count: int,
+    unit_states: list[str],
+    timeout_s: int,
+    baseline: str = "0 100",
+) -> subprocess.CompletedProcess:
+    """Run wait_for_api_health against stub `curl` and `systemctl`.
+
+    The stub curl fails `curl_fail_count` times, then succeeds. The stub
+    systemctl answers each `show` call with the next entry of `unit_states`
+    ("NRestarts MainPID ActiveState"), repeating the last one. Prints the
+    return code, seconds waited and the reason."""
+    repo = _make_repo_for_drift(tmp_path)
+    shims = tmp_path / "shims"
+    shims.mkdir()
+    state = tmp_path / "shim-state"
+    state.mkdir()
+    (state / "states").write_text("\n".join(unit_states) + "\n")
+    _stub_bin(
+        shims,
+        "curl",
+        f'n=$(cat "{state}/curl_n" 2>/dev/null || echo 0)\n'
+        f'echo $((n + 1)) > "{state}/curl_n"\n'
+        f'[ "$n" -ge {curl_fail_count} ]\n',
+    )
+    _stub_bin(
+        shims,
+        "systemctl",
+        f'n=$(cat "{state}/sc_n" 2>/dev/null || echo 0)\n'
+        f'echo $((n + 1)) > "{state}/sc_n"\n'
+        f'total=$(wc -l < "{state}/states")\n'
+        '[ "$n" -ge "$total" ] && n=$((total - 1))\n'
+        f'read -r r p a <<< "$(sed -n "$((n + 1))p" "{state}/states")"\n'
+        'printf "NRestarts=%s\\nMainPID=%s\\nActiveState=%s\\n" "$r" "$p" "$a"\n',
+    )
+    env = {
+        "PATH": f"{shims}:{os.environ['PATH']}",
+        "LIFEOS_DEPLOY_HEALTH_TIMEOUT_S": str(timeout_s),
+        "LIFEOS_DEPLOY_HEALTH_POLL_S": "1",
+        "API_RESTART_STATE": baseline,
+    }
+    return _run_sourced(
+        repo,
+        'wait_for_api_health; rc=$?; echo "rc=$rc secs=$HEALTH_WAIT_SECONDS reason=$HEALTH_WAIT_REASON"',
+        env,
+    )
+
+
+@pytest.mark.unit
+def test_health_wait_succeeds_after_several_failed_polls(tmp_path: Path):
+    """A slow start (several refused polls) within the deadline is healthy."""
+    result = _health_wait(
+        tmp_path, curl_fail_count=3, unit_states=["0 100 activating", "0 100 active"], timeout_s=30
+    )
+    assert "rc=0 secs=" in result.stdout, result.stdout + result.stderr
+    assert "reason=\n" in result.stdout
+
+
+@pytest.mark.unit
+def test_health_wait_fails_fast_when_restart_count_rises(tmp_path: Path):
+    start = time.monotonic()
+    result = _health_wait(
+        tmp_path, curl_fail_count=1000, unit_states=["1 100 activating"], timeout_s=60
+    )
+    assert "rc=1 " in result.stdout, result.stdout + result.stderr
+    assert "NRestarts 0 -> 1" in result.stdout
+    assert time.monotonic() - start < 15
+
+
+@pytest.mark.unit
+def test_health_wait_fails_fast_when_main_pid_changes(tmp_path: Path):
+    start = time.monotonic()
+    result = _health_wait(
+        tmp_path, curl_fail_count=1000, unit_states=["0 200 activating"], timeout_s=60
+    )
+    assert "rc=1 " in result.stdout, result.stdout + result.stderr
+    assert "main PID changed (100 -> 200)" in result.stdout
+    assert time.monotonic() - start < 15
+
+
+@pytest.mark.unit
+def test_health_wait_fails_fast_when_unit_failed(tmp_path: Path):
+    start = time.monotonic()
+    result = _health_wait(
+        tmp_path, curl_fail_count=1000, unit_states=["0 0 failed"], timeout_s=60
+    )
+    assert "rc=1 " in result.stdout, result.stdout + result.stderr
+    assert "failed state" in result.stdout
+    assert time.monotonic() - start < 15
+
+
+@pytest.mark.unit
+def test_health_wait_times_out_with_a_live_unit_and_names_the_timeout(tmp_path: Path):
+    result = _health_wait(
+        tmp_path, curl_fail_count=1000, unit_states=["0 100 active"], timeout_s=2
+    )
+    assert "rc=1 " in result.stdout, result.stdout + result.stderr
+    assert "timed out after 2s" in result.stdout
+
+
+def _stale_all_units(tmp_path: Path):
+    repo, state, code_epoch = _make_policy_repo(tmp_path)
+    for unit in ("lifeos-api", "lifeos-mcp-http", "lifeos-agent-worker"):
+        (state / f"active_{unit}").touch()
+        (state / f"since_{unit}").write_text(str(code_epoch - 3600))
+    return repo, state
+
+
+@pytest.mark.unit
+def test_main_restarts_mcp_http_only_after_the_api_is_healthy(tmp_path: Path):
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo, state = _stale_all_units(tmp_path)
+
+    result = _run_main(repo, state, _venv_with_python(tmp_path))
+    assert result.returncode == 0, (result.stdout, result.stderr)
+
+    events = (state / "events.log").read_text().split("\n")
+    assert events.index("restart lifeos-api") < events.index("health-probe")
+    assert events.index("health-probe") < events.index("restart lifeos-mcp-http")
+    assert events.index("health-probe") < events.index("restart lifeos-agent-worker")
+
+
+@pytest.mark.unit
+def test_main_restarts_the_other_units_even_when_the_api_never_becomes_healthy(tmp_path: Path):
+    if not AUTO_DEPLOY.exists():
+        pytest.skip("scripts/auto-deploy.sh not present")
+    repo, state = _stale_all_units(tmp_path)
+
+    result = _run_main(
+        repo, state, _venv_with_python(tmp_path),
+        {
+            "LIFEOS_TEST_CURL_FAIL": "1",
+            "LIFEOS_DEPLOY_HEALTH_TIMEOUT_S": "1",
+            "LIFEOS_DEPLOY_HEALTH_POLL_S": "1",
+        },
+    )
+    assert result.returncode == 1, (result.stdout, result.stderr)
+
+    restarts = (state / "restart.log").read_text()
+    assert "restart lifeos-mcp-http" in restarts
+    assert "restart lifeos-agent-worker" in restarts
+    assert "timed out after 1s" in (repo / "logs" / "auto-deploy.log").read_text()
