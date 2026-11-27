@@ -1266,7 +1266,7 @@ The primary bot sends the operator chat `Chief of Staff asks:`, the summary verb
 
 **Response:** `{"token": "<16 hex>", "expires_at": "<ISO-8601 UTC>"}`
 
-**Errors:** **422** for an invalid body (no message sent); **403** as above; **503** when Telegram is disabled or the send fails, in which case nothing is kept and the caller asks in chat.
+**Errors:** **400** `{"error": "Validation error", ...}` for an invalid body (no message sent); **403** as above; **503** when Telegram is disabled or the send fails, in which case nothing is kept and the caller asks in chat.
 
 ### GET /api/approvals/external/{token}
 
