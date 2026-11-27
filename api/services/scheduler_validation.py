@@ -13,6 +13,7 @@ import math
 import re
 from typing import Optional
 
+from api.services.external_approval import is_approval_path
 from api.services.markdown_lines import has_line_break
 
 
@@ -76,6 +77,11 @@ def validate_action_inputs(
             raise ScheduleActionValidationError(
                 "endpoint_config.endpoint",
                 f"endpoint_config.endpoint must start with '/api/', got {path!r}",
+            )
+        if is_approval_path(path):
+            raise ScheduleActionValidationError(
+                "endpoint_config.endpoint",
+                "endpoint_config.endpoint must not be an approval route",
             )
         params = cfg.get("params")
         if params is not None and not isinstance(params, dict):

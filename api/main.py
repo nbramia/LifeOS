@@ -64,7 +64,7 @@ from starlette.middleware.gzip import GZipMiddleware
 
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
-from api.routes import search, ask, calendar, gmail, drive, people, chat, briefings, admin, conversations, memories, imessage, crm, slack, photos, reminders, scheduler, tasks, monarch, investments, jobs, perf, agents, agent_assignment, vault, fitness, voice, agent_proxy, hermes_proxy, journal, journal_trends, journal_ingest, home
+from api.routes import search, ask, calendar, gmail, drive, people, chat, briefings, admin, conversations, memories, imessage, crm, slack, photos, reminders, scheduler, tasks, monarch, investments, jobs, perf, agents, agent_assignment, vault, fitness, voice, agent_proxy, hermes_proxy, journal, journal_trends, journal_ingest, home, external_approvals
 from api.services.log_redaction import configure_telegram_log_redaction, install_query_string_redaction_filter
 from api.services.route_timing import RouteTimingMiddleware
 from api.services.request_origin import RequestOriginMiddleware, TrustedOrigins
@@ -543,6 +543,7 @@ app.include_router(journal.router)
 app.include_router(journal_trends.router)
 app.include_router(journal_ingest.router)
 app.include_router(home.router)
+app.include_router(external_approvals.router)
 
 # Serve static files
 web_dir = Path(__file__).parent.parent / "web"

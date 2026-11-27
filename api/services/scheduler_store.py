@@ -60,6 +60,7 @@ from zoneinfo import ZoneInfo
 from config.settings import settings
 from api.services.agent_board import SNOOZED_UNTIL_FIELD, is_snoozed, parse_snoozed_until
 from api.services.atomic_write import atomic_write_text
+from api.services.external_approval import SCHEDULED_FIRE_HEADER, is_approval_path
 from api.services.markdown_lines import split_body_lines
 from api.services.operation_lock import exclusive_operation_lock
 from api.services.scheduler_validation import validate_entry_fields
@@ -1870,7 +1871,11 @@ class SchedulerScheduler:
         return False
 
     async def _call_endpoint(self, config: Optional[dict]) -> Optional[str]:
-        """Call a LifeOS API endpoint and format the result."""
+        """Call a LifeOS API endpoint and format the result.
+
+        The operator approval routes are never called: a schedule cannot
+        open or read an approval request. Every call is marked with the
+        scheduled-fire header, which those routes also refuse."""
         if not config:
             return "No endpoint configuration provided."
 
@@ -1878,14 +1883,17 @@ class SchedulerScheduler:
         method = config.get("method", "GET").upper()
         params = config.get("params", {})
         port = settings.port
+        if is_approval_path(endpoint):
+            return "Schedules cannot call the approval routes."
+        headers = {SCHEDULED_FIRE_HEADER: "1"}
 
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 url = f"http://localhost:{port}{endpoint}"
                 if method == "GET":
-                    resp = await client.get(url, params=params)
+                    resp = await client.get(url, params=params, headers=headers)
                 else:
-                    resp = await client.post(url, json=params)
+                    resp = await client.post(url, json=params, headers=headers)
 
                 if resp.status_code != 200:
                     return f"API call failed: {resp.status_code}"
