@@ -407,11 +407,6 @@ sync_in_progress_lock_release() {
     exec 9>&- 2>/dev/null || true
 }
 
-# Everything below is the operational run — wrapped in a function, guarded so
-# it only fires when the file is executed directly, so tests can `source` this
-# script to call the decision helpers above (newest_code_mtime,
-# service_active_since_epoch, worker_busy) against a synthetic repo/stubbed
-# systemctl without tripping the opt-in gate, guards, or a real git fetch/pull.
 # lifeos-api's restart count, main PID and unit state as "NRestarts MainPID
 # ActiveState". Parsed from KEY=VALUE lines because `systemctl show` orders
 # properties by its own table, not by the order they were requested.
@@ -466,6 +461,11 @@ wait_for_api_health() {
     done
 }
 
+# Everything below is the operational run — wrapped in a function, guarded so
+# it only fires when the file is executed directly, so tests can `source` this
+# script to call the decision helpers above (newest_code_mtime,
+# service_active_since_epoch, worker_busy) against a synthetic repo/stubbed
+# systemctl without tripping the opt-in gate, guards, or a real git fetch/pull.
 main() {
 
 # --- Opt-in gate ---------------------------------------------------------------
