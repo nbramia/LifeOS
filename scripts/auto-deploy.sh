@@ -412,6 +412,60 @@ sync_in_progress_lock_release() {
 # script to call the decision helpers above (newest_code_mtime,
 # service_active_since_epoch, worker_busy) against a synthetic repo/stubbed
 # systemctl without tripping the opt-in gate, guards, or a real git fetch/pull.
+# lifeos-api's restart count, main PID and unit state as "NRestarts MainPID
+# ActiveState". Parsed from KEY=VALUE lines because `systemctl show` orders
+# properties by its own table, not by the order they were requested.
+api_unit_state() {
+    local out
+    out=$(systemctl show lifeos-api -p NRestarts,MainPID,ActiveState 2>/dev/null) || return 1
+    echo "$(echo "$out" | sed -n 's/^NRestarts=//p') $(echo "$out" | sed -n 's/^MainPID=//p') $(echo "$out" | sed -n 's/^ActiveState=//p')"
+}
+
+# Wait for lifeos-api's /health after a restart. The API can take minutes to
+# bind when the host is under heavy disk load, and /health itself can take
+# longer than a few seconds on a busy box, so the wait is a deadline in
+# seconds (LIFEOS_DEPLOY_HEALTH_TIMEOUT_S, default 300) and each probe gets a
+# generous curl timeout. A real failure ends the wait early: the unit entering
+# "failed", or its restart count or main PID changing from the values recorded
+# right after the deploy restart (API_RESTART_STATE, "NRestarts MainPID"),
+# which means it crashed and is being restarted by systemd.
+# Returns 0 when healthy, 1 otherwise. Sets HEALTH_WAIT_SECONDS and, on
+# failure, HEALTH_WAIT_REASON.
+wait_for_api_health() {
+    local timeout="${LIFEOS_DEPLOY_HEALTH_TIMEOUT_S:-300}"
+    local poll="${LIFEOS_DEPLOY_HEALTH_POLL_S:-5}"
+    local start=$SECONDS state base_restarts base_pid cur_restarts cur_pid cur_active
+    HEALTH_WAIT_SECONDS=0
+    HEALTH_WAIT_REASON=""
+    state="${API_RESTART_STATE:-$(api_unit_state | awk '{print $1, $2}')}"
+    read -r base_restarts base_pid <<< "$state"
+    while :; do
+        if curl -s -f --max-time 20 http://localhost:8000/health > /dev/null 2>&1; then
+            HEALTH_WAIT_SECONDS=$((SECONDS - start))
+            return 0
+        fi
+        HEALTH_WAIT_SECONDS=$((SECONDS - start))
+        read -r cur_restarts cur_pid cur_active <<< "$(api_unit_state)"
+        if [ "$cur_active" = "failed" ]; then
+            HEALTH_WAIT_REASON="lifeos-api entered the failed state"
+            return 1
+        fi
+        if [ -n "$base_restarts" ] && [ -n "$cur_restarts" ] && [ "$cur_restarts" -gt "$base_restarts" ]; then
+            HEALTH_WAIT_REASON="lifeos-api crashed and was restarted by systemd (NRestarts $base_restarts -> $cur_restarts)"
+            return 1
+        fi
+        if [ -n "$base_pid" ] && [ "$base_pid" != "0" ] && [ -n "$cur_pid" ] && [ "$cur_pid" != "$base_pid" ]; then
+            HEALTH_WAIT_REASON="lifeos-api main PID changed ($base_pid -> $cur_pid), so it restarted"
+            return 1
+        fi
+        if [ "$HEALTH_WAIT_SECONDS" -ge "$timeout" ]; then
+            HEALTH_WAIT_REASON="timed out after ${timeout}s with lifeos-api still running"
+            return 1
+        fi
+        sleep "$poll"
+    done
+}
+
 main() {
 
 # --- Opt-in gate ---------------------------------------------------------------
@@ -542,6 +596,17 @@ if [ -n "$CODE_MTIME" ] || [ -n "$ENV_MTIME" ]; then
         if sudo -n systemctl restart "$unit" 2>>"$LOG_FILE"; then
             RESTARTED+=("$unit")
             mark_env_mtime_applied "$unit"
+            # The API goes first (DEPLOY_UNITS order) and the remaining units
+            # restart only once it is listening: mcp-http reads the API's
+            # OpenAPI spec at start and falls back to empty tool schemas if
+            # the API is not up. If the API never comes up, the others still
+            # restart so no unit stays on stale code; the alarm follows below.
+            if [ "$unit" = "lifeos-api" ]; then
+                API_RESTART_STATE=$(api_unit_state | awk '{print $1, $2}')
+                API_HEALTH_RC=0
+                wait_for_api_health || API_HEALTH_RC=1
+                API_HEALTH_WAITED=1
+            fi
         else
             FAILED+=("$unit")
             log "ERROR: restart failed for $unit"
@@ -560,26 +625,22 @@ if [ "${#RESTARTED[@]}" -eq 0 ]; then
     exit 0   # nothing was stale (or the only stale unit deferred, already logged)
 fi
 
-# --- Post-deploy health check (API takes ~30-60s to reload its ML model) --------
-HEALTHY=0
-for _ in $(seq 1 18); do
-    if curl -s -f --max-time 5 http://localhost:8000/health > /dev/null 2>&1; then
-        HEALTHY=1
-        break
-    fi
-    sleep 5
-done
-
-if [ "$HEALTHY" -ne 1 ]; then
-    log "restarted ${RESTARTED[*]} for drift, but /health did not recover"
+# --- Post-deploy health check (the API can take minutes to bind under load) -----
+if [ -z "${API_HEALTH_WAITED:-}" ]; then
+    # Only other units restarted: the API itself was not touched.
+    API_HEALTH_RC=0
+    wait_for_api_health || API_HEALTH_RC=1
+fi
+if [ "$API_HEALTH_RC" -ne 0 ]; then
+    log "restarted ${RESTARTED[*]} for drift, but /health did not recover: $HEALTH_WAIT_REASON (waited ${HEALTH_WAIT_SECONDS}s)"
     notify_failure "🚨 *LifeOS Auto-Deploy*
-Restarted ${RESTARTED[*]} (was running stale code), but \`/health\` never came back. Check the host."
+Restarted ${RESTARTED[*]} (was running stale code), but \`/health\` never came back: $HEALTH_WAIT_REASON (waited ${HEALTH_WAIT_SECONDS}s). Check the host."
     exit 1
 fi
 
-log "restarted ${RESTARTED[*]} for drift, health OK"
+log "restarted ${RESTARTED[*]} for drift, health OK after ${HEALTH_WAIT_SECONDS}s"
 notify_success "✅ *LifeOS Auto-Deploy*
-Restarted ${RESTARTED[*]} — was running stale code. Health OK."
+Restarted ${RESTARTED[*]} — was running stale code. Health OK after ${HEALTH_WAIT_SECONDS}s."
 exit 0
 }
 

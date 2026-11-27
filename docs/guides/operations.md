@@ -214,7 +214,7 @@ sudo ./scripts/setup-systemd.sh    # installs + enables the timer
 systemctl list-timers lifeos-autodeploy.timer
 ```
 
-**Watch it:** `tail -f logs/auto-deploy.log`. Failures (fetch, diverged pull, pip, restart, or `/health` not recovering post-deploy) send a Telegram alert.
+**Watch it:** `tail -f logs/auto-deploy.log`. Failures (fetch, diverged pull, pip, restart, or `/health` not recovering post-deploy) send a Telegram alert. `lifeos-api` restarts first, and the other stale units (MCP HTTP, agent worker) restart only after it is healthy, so they start against a listening API; if it never becomes healthy they still restart, then the alarm fires. After restarting `lifeos-api` the deploy polls `/health` until it answers, for up to 300 s (`LIFEOS_DEPLOY_HEALTH_TIMEOUT_S`), so a slow start under heavy load does not alert. It gives up early, and says why, if the unit enters `failed` or systemd restarts it (restart count or main PID changes). The alert and the success message both include the seconds waited.
 
 For a deployment result that must be consumed as running-process evidence, use
 `./scripts/server.sh verify-runtime-evidence` after the restart wrapper has
