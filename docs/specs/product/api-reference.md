@@ -33,7 +33,8 @@ Catalog of every HTTP endpoint LifeOS exposes, with request/response shapes. Fou
 16. [Admin Endpoints](#admin-endpoints)
 17. [Card Assignment Endpoints](#card-assignment-endpoints)
 18. [Home Endpoints (Eero)](#home-endpoints-eero)
-19. [MCP Tools — see mcp-tools.md](mcp-tools.md)
+19. [External Approval Endpoints](#external-approval-endpoints)
+20. [MCP Tools — see mcp-tools.md](mcp-tools.md)
 
 ---
 
@@ -929,7 +930,7 @@ Create a schedule. Supports `schedule_type` of `once` (ISO datetime), `cron`, or
 
 `timezone` must resolve as a valid IANA zone, and `schedule_value` must parse for its `schedule_type` (a cron expression for `cron`, an ISO datetime for `once`; unchecked for `manual`) — either failure returns **422** with a detail naming what's wrong, and nothing is stored.
 
-The resulting action must have what it needs to fire, checked after every other field above: for `action: "endpoint"`, `endpoint_config` must have a `method` of `GET` or `POST` (case-insensitive; stored upper-case), an `endpoint` path starting with `/api/`, and `params` absent or a JSON object; for `notify`/`prompt`/`agent`, `message_content` must be non-blank; `budget_dollars`/`wall_seconds` are accepted only for `action: "agent"` (**422** naming the field otherwise) and, when present, must each be a finite, non-negative number. Either failure returns **422** naming the specific field. An `agent` action's execution context — `persona_id`, `model_id`, `effort`, `host`, `working_dir` — round-trips as plain top-level fields alongside `executor`; all default to empty (no override). `budget_dollars`/`wall_seconds` default to `null` (no override) and, when set, are rendered into the created task's title on every fire (see [agent-worker.md § Budgets](agent-worker.md#budgets)).
+The resulting action must have what it needs to fire, checked after every other field above: for `action: "endpoint"`, `endpoint_config` must have a `method` of `GET` or `POST` (case-insensitive; stored upper-case), an `endpoint` path starting with `/api/` that is not under `/api/approvals/` (however it is spelled), and `params` absent or a JSON object; for `notify`/`prompt`/`agent`, `message_content` must be non-blank; `budget_dollars`/`wall_seconds` are accepted only for `action: "agent"` (**422** naming the field otherwise) and, when present, must each be a finite, non-negative number. Either failure returns **422** naming the specific field. An `agent` action's execution context — `persona_id`, `model_id`, `effort`, `host`, `working_dir` — round-trips as plain top-level fields alongside `executor`; all default to empty (no override). `budget_dollars`/`wall_seconds` default to `null` (no override) and, when set, are rendered into the created task's title on every fire (see [agent-worker.md § Budgets](agent-worker.md#budgets)).
 
 ### GET /api/scheduler
 
@@ -1237,6 +1238,50 @@ Resume a profile or device's internet access. Same idempotent, state-reconciling
 
 ---
 
+## External Approval Endpoints
+
+A process on this host asks the operator to Approve or Deny an action on the primary Telegram bot. Chief of Staff's `ask-nathan` is the caller. These routes are not MCP tools, and a schedule cannot call them.
+
+**Who may call.** Both routes answer only a request whose direct peer is loopback (`127.0.0.1`, `::1`, `::ffff:127.0.0.1`) and that carries no proxy or edge header (`X-Forwarded-*`, `Forwarded`, `X-Real-IP`, `Tailscale-*`, `CF-Connecting-IP`), no browser marker (`Origin`, `Sec-Fetch-*`, a `Mozilla/` user agent), and none of LifeOS's own relay headers (`X-LifeOS-Agent-Session`, `X-LifeOS-Hermes-Turn`, `X-LifeOS-Connected-App`, `X-LifeOS-Turn-ID`, `X-LifeOS-Scheduled-Fire`). Anything else gets **403** and no message is sent.
+
+### POST /api/approvals/external
+
+Open a request and send it to the operator.
+
+**Request body:**
+```json
+{
+  "summary": "Reply to the plumber's thread with the Tuesday quote",
+  "request_hash": "<64 lowercase hex>",
+  "ttl_seconds": 10800,
+  "source": "text from +1 555 0100"
+}
+```
+- `summary` (required): 1–300 characters of plain text; control characters other than newlines are removed.
+- `request_hash` (required): exactly 64 lowercase hex characters, the caller's hash of the action it wants to take.
+- `ttl_seconds` (optional): integer 60–86400, default 10800 (3 hours).
+- `source` (optional): 1–120 characters on one line, where the request came from; control characters are removed.
+
+The primary bot sends the operator chat `Chief of Staff asks:`, the summary verbatim with each line marked as quoted (so summary text cannot pass for the lines after it), `From: <source>` when given, the first 12 characters of `request_hash`, and the expiry time in `LIFEOS_TIMEZONE`, with **Approve** and **Deny** buttons.
+
+**Response:** `{"token": "<16 hex>", "expires_at": "<ISO-8601 UTC>"}`
+
+**Errors:** **422** for an invalid body (no message sent); **403** as above; **503** when Telegram is disabled or the send fails, in which case nothing is kept and the caller asks in chat.
+
+### GET /api/approvals/external/{token}
+
+**Response:** `{"state": "pending" | "approved" | "denied" | "expired", "request_hash": "...", "expires_at": "<ISO-8601 UTC>", "source": "..." | null}`. A pending request past its expiry reads `expired`. The caller checks that `request_hash` is the hash of the action it means before acting on `approved`.
+
+**Errors:** **404** `{"detail": "unknown or lost"}` for an unknown, malformed, or pruned token; **403** as above.
+
+**Decisions.** Only the operator's press, in the operator chat, on the message that carried the buttons, decides a request. It counts once and only while the request is pending and unexpired; the message is edited to show the outcome. A press after expiry leaves it `expired` and answers "This request expired; nothing was approved."; a later press answers that it was already decided. A press on a request missing from the store answers "This request was lost; ask again."
+
+**Persistence.** Requests are kept in `data/external_approvals.db` (next to the other LifeOS stores) and survive an API restart; expiry comes from the stored times, so a restart neither extends nor resets it. Requests more than 7 days past expiry are deleted when a new one is opened. Summaries and sources are stored and shown to the operator, never logged; each open, decision, expiry and refusal is logged with its token, hash and outcome.
+
+**What a local process can still do.** Any process on the host can open a prompt headed "Chief of Staff asks:" with a summary and source of its choosing, so the operator reads the summary, source and hash prefix before approving. It cannot approve a request (only the operator's press does), read another request's result without its 64-bit token, or affect a request bound to a different `request_hash`.
+
+---
+
 ## Related Documents
 
 - [api-communications.md](api-communications.md) — Chat/search, Google integration, and messaging HTTP endpoints (split out from this file)
@@ -1252,3 +1297,4 @@ Resume a profile or device's internet access. Same idempotent, state-reconciling
 - [Observability](../technical/observability.md#route-timing) — How `/api/perf/routes` is populated (`RouteTimingMiddleware`, the slow-request threshold)
 - [Agent Viz](agent-viz.md) — The `/agents` Kanban board these endpoints back
 - [Home — eero](../../guides/home-eero.md) — Login, target configuration, and failure alerting for the Home Endpoints above
+- [Client Surfaces](../technical/client-surfaces.md#external-approvals) — The external approval service among the API's consumers

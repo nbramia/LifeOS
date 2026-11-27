@@ -1211,7 +1211,8 @@ class TelegramBotListener:
 
     async def _handle_callback_query(self, callback_query: dict) -> None:
         """Decide an agent-work approval (a parked task, a held project
-        action, or a held schedule) from its Approve/Deny button.
+        action, or a held schedule) or an external caller's request
+        (`external_approval`) from its Approve/Deny button.
 
         Only the primary bot sends those buttons, and only the operator's own
         press decides anything: the press must come from the configured
@@ -1220,7 +1221,8 @@ class TelegramBotListener:
         decision is bound to the task, its request token, the message that
         carried the buttons and the content it showed, and is spent the first
         time it is used (see `agent_task_approval.decide` and
-        `agent_schedule_approval.decide`).
+        `agent_schedule_approval.decide`; an external request is bound to
+        its token and message, see `ExternalApprovalStore.decide`).
         """
         if not self._is_primary:
             return
@@ -1234,17 +1236,24 @@ class TelegramBotListener:
         if from_id != operator:
             logger.warning("Ignoring button press from a user other than the operator")
             return
-        from api.services import agent_schedule_approval, agent_task_approval
+        from api.services import agent_schedule_approval, agent_task_approval, external_approval
 
         data = callback_query.get("data") or ""
         message_id = int(message.get("message_id") or 0)
         parsed = agent_task_approval.parse_callback_data(data)
         scheduled = None if parsed else agent_schedule_approval.parse_callback_data(data)
-        if parsed is None and scheduled is None:
+        external = None if parsed or scheduled else external_approval.parse_callback_data(data)
+        if parsed is None and scheduled is None and external is None:
             await answer_callback_query(callback_query.get("id", ""))
             return
         try:
-            if parsed is not None:
+            if external is not None:
+                approve, token = external
+                outcome = await asyncio.to_thread(
+                    external_approval.get_store().decide, token, approve=approve,
+                    message_id=message_id,
+                )
+            elif parsed is not None:
                 approve, task_id, token = parsed
                 outcome = await asyncio.to_thread(
                     agent_task_approval.decide, task_id, token, approve=approve,
@@ -1257,7 +1266,8 @@ class TelegramBotListener:
                 )
         except Exception as exc:  # keep the listener running
             logger.warning(f"agent-work approval decision failed: {exc}")
-            outcome = "Could not record that decision; nothing was started."
+            outcome = ("Could not record that decision; nothing was approved." if external
+                       else "Could not record that decision; nothing was started.")
         await answer_callback_query(callback_query.get("id", ""), outcome)
         if message.get("message_id"):
             await edit_message_text(

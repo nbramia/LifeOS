@@ -105,7 +105,7 @@ internally, so "daily at 6pm" means 6pm local.
 |--------|--------------|
 | `notify` | Sends the static `message_content` via Telegram |
 | `prompt` | Runs `message_content` through the full chat pipeline (with retry) and sends the result |
-| `endpoint` | Calls a LifeOS API endpoint and sends the formatted result |
+| `endpoint` | Calls a LifeOS API endpoint and sends the formatted result. The operator approval routes (`/api/approvals/*`) are refused when the schedule is saved and when it fires |
 | `agent` | Writes an engine-assigned task into `LifeOS/Tasks/Inbox.md` so the agent worker runs it autonomously |
 
 For `notify` and `prompt`, the Telegram message is **suppressed** when the

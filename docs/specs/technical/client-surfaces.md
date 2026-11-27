@@ -17,6 +17,7 @@ LifeOS exposes the orchestrator to **HTTP consumers** — thin clients that subm
 | **whisper-relay** | Separate app → HTTP (voice transport API) | Server-side only: `POST /api/ask/stream`, handoff — via `src/voice_gateway/adapters/lifeos.py`; no browser UI after #21 |
 | **Voice (web)** | Browser → LifeOS reverse-proxy → whisper-relay | LifeOS `/chat` + `web/chat/voice.js`; proxies `/api/voice/*` — `api/routes/voice.py` |
 | MCP / Managed Agents / connected apps | stdio or HTTP MCP | Tool catalog only — `mcp_server.py`; OAuth-connected apps get a restricted tier ([mcp-oauth.md](mcp-oauth.md)) |
+| External approvals | Local process on this host → HTTP | `POST /api/approvals/external`, `GET /api/approvals/external/{token}` — `api/routes/external_approvals.py`; see [External approvals](#external-approvals) |
 
 **Response compression.** `api/main.py` applies `GZipMiddleware` scoped to `/api/crm/*`, `/api/people/*`, and the CRM page routes (`minimum_size=1024`, `compresslevel=6`), not app-wide. This is a deliberate scoping choice, not a required safety measure: the installed Starlette (0.52.x) already refuses to compress `text/event-stream` responses on its own, so applying `GZipMiddleware` app-wide would not in fact risk buffering any of the SSE streams documented above. Scoping to an allow-list instead simply keeps the gzip CPU cost confined to the handful of routes large enough to be worth it, independent of a dependency default that could change.
 
@@ -31,6 +32,12 @@ persisted with `TRUNCATION_MARKER` and `routing.truncated: true` plus
 already-rendered content, displays the error status, and re-enables the
 composer in either case, so a follow-up turn can be submitted. Provider and
 filesystem exception details remain server-side.
+
+### External approvals
+
+Chief of Staff's `ask-nathan`, running on this host, asks the operator to Approve or Deny through the primary bot ([API reference](../product/api-reference.md#external-approval-endpoints)). The routes accept only a direct loopback caller with no proxy, Tailscale, edge, browser or LifeOS relay header, because Tailscale Serve forwards tailnet traffic to the API from loopback. They are not in the MCP catalog, and the scheduler refuses an `endpoint` schedule under `/api/approvals/` both when it is saved and when it fires. `api/services/external_approval.py` holds the caller check, the SQLite store and the decision logic; `TelegramBotListener._handle_callback_query` routes `ext:` presses there after its operator chat and user checks.
+
+A decision is bound to the request token and the Telegram message that carried the buttons, and is written with one conditional update on a pending, unexpired row, so exactly one press counts across threads and processes. Requests survive a restart; a press on a request missing from the store answers that it was lost, and `GET` returns **404** `unknown or lost`, which the caller treats as "ask again in chat".
 
 ---
 
