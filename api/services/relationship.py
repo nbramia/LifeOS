@@ -11,6 +11,7 @@ import sqlite3
 import contextlib
 import json
 import threading
+import time
 import uuid
 import logging
 from dataclasses import dataclass, field, asdict
@@ -314,6 +315,11 @@ class Relationship:
         return None
 
 
+# A batch commits its open chunk once its first uncommitted write is this old,
+# which bounds how long the write lock is held.
+BATCH_MAX_CHUNK_SECONDS = 1.0
+
+
 class RelationshipStore:
     """
     SQLite-backed storage for Relationship records.
@@ -416,8 +422,14 @@ class RelationshipStore:
         if state is None or conn is not state["conn"]:
             conn.commit()
             return
+        now = time.monotonic()
+        if state["pending"] == 0:
+            state["chunk_started"] = now
         state["pending"] += 1
-        if state["pending"] >= state["commit_every"]:
+        if (
+            state["pending"] >= state["commit_every"]
+            or now - state["chunk_started"] >= BATCH_MAX_CHUNK_SECONDS
+        ):
             conn.commit()
             state["pending"] = 0
 
@@ -426,8 +438,9 @@ class RelationshipStore:
         """
         Run store calls in the current thread over one shared connection.
 
-        Writes commit every `commit_every` writes and on normal exit, so the
-        write lock is never held for long, and reads see the batch's own
+        Writes commit every `commit_every` writes, once the open chunk is
+        `BATCH_MAX_CHUNK_SECONDS` old, and on normal exit, so the write lock
+        is never held for long, and reads see the batch's own
         uncommitted writes. On an exception the open chunk is rolled back
         (earlier chunks stay committed), the connection is closed and the
         exception propagates. Other threads keep using their own connections.
@@ -440,6 +453,7 @@ class RelationshipStore:
         self._local.batch = {
             "conn": conn,
             "pending": 0,
+            "chunk_started": 0.0,
             "commit_every": max(1, commit_every),
         }
         try:

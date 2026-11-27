@@ -223,3 +223,89 @@ def test_run_full_discovery_batches_phases_then_cleans_hidden_people(store, coun
     assert store.get_between("a00001", "b00001") is None
     assert store.get_between("a00002", "b00002") is not None
     assert getattr(store._local, "batch", None) is None
+
+
+def _run_discovery_with_phases(store, people, first_phase, second_phase=None, crm_path=None):
+    patches = [patch.object(relationship_discovery, n, return_value=[]) for n in PHASES]
+    patches[0] = patch.object(relationship_discovery, PHASES[0], side_effect=first_phase)
+    if second_phase is not None:
+        patches[1] = patch.object(relationship_discovery, PHASES[1], side_effect=second_phase)
+    with patch.object(relationship_discovery, "get_relationship_store", return_value=store), \
+         patch.object(relationship_discovery, "get_person_entity_store", return_value=people), \
+         patch("api.services.source_entity.get_crm_db_path", side_effect=crm_path or (lambda: store.db_path)):
+        for p in patches:
+            p.start()
+        try:
+            return relationship_discovery.run_full_discovery()
+        finally:
+            for p in patches:
+                p.stop()
+
+
+def test_write_lock_is_released_between_phases(store):
+    """Writes left uncommitted by one phase must not block other writers during the next."""
+    people = _People([_Person("p1", False)])
+    outcome = {}
+
+    def phase_one(*args, **kwargs):
+        for i in range(3):
+            store.add(_rel(i))
+        return []
+
+    def phase_two(*args, **kwargs):
+        other = sqlite3.connect(store.db_path, timeout=0.1)
+        try:
+            other.execute("BEGIN IMMEDIATE")
+            other.execute("DELETE FROM relationships WHERE id = 'none'")
+            other.commit()
+            outcome["error"] = None
+        except sqlite3.OperationalError as exc:
+            outcome["error"] = str(exc)
+        finally:
+            other.close()
+        return []
+
+    _run_discovery_with_phases(store, people, phase_one, phase_two)
+    assert outcome["error"] is None
+    assert store.count() == 3
+
+
+def test_batch_commits_when_chunk_is_old(store, monkeypatch):
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(relationship_module.time, "monotonic", lambda: clock["t"])
+
+    def committed_rows():
+        other = sqlite3.connect(store.db_path)
+        try:
+            return other.execute("SELECT COUNT(*) FROM relationships").fetchone()[0]
+        finally:
+            other.close()
+
+    with store.batch(commit_every=1000):
+        store.add(_rel(1))
+        clock["t"] += 0.5
+        store.add(_rel(2))
+        assert committed_rows() == 0  # chunk is young and small
+        clock["t"] += 1.0
+        store.add(_rel(3))
+        assert committed_rows() == 3  # chunk aged past the limit
+        store.add(_rel(4))
+        assert committed_rows() == 3  # a new chunk started
+
+
+def test_hidden_people_cleanup_runs_after_batches_close(store):
+    people = _People([_Person("a00001", True)] + [_Person(f"p{i}", False) for i in range(4)])
+    seen = {}
+
+    def crm_path():
+        seen["batch_during_cleanup"] = getattr(store._local, "batch", None)
+        return store.db_path
+
+    def phase_one(*args, **kwargs):
+        store.add(_rel(1))
+        return []
+
+    _run_discovery_with_phases(store, people, phase_one, crm_path=crm_path)
+    assert "batch_during_cleanup" in seen  # the cleanup ran
+    assert seen["batch_during_cleanup"] is None
+    assert store.get_between("a00001", "b00001") is None
