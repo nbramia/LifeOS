@@ -11,6 +11,7 @@ import sqlite3
 import contextlib
 import json
 import threading
+import time
 import uuid
 import logging
 from dataclasses import dataclass, field, asdict
@@ -314,6 +315,11 @@ class Relationship:
         return None
 
 
+# A batch commits its open chunk once its first uncommitted write is this old,
+# which bounds how long the write lock is held.
+BATCH_MAX_CHUNK_SECONDS = 1.0
+
+
 class RelationshipStore:
     """
     SQLite-backed storage for Relationship records.
@@ -329,6 +335,7 @@ class RelationshipStore:
             db_path: Path to SQLite database (default from settings)
         """
         self.db_path = db_path or get_crm_db_path()
+        self._local = threading.local()
         self._init_db()
 
     def _init_db(self):
@@ -395,6 +402,71 @@ class RelationshipStore:
         """Get a database connection."""
         return sqlite3.connect(self.db_path)
 
+    def _acquire(self) -> sqlite3.Connection:
+        """Return the calling thread's batch connection, else a fresh one."""
+        state = getattr(self._local, "batch", None)
+        if state is not None:
+            return state["conn"]
+        return self._get_connection()
+
+    def _release(self, conn: sqlite3.Connection) -> None:
+        """Close a connection from `_acquire()` unless it belongs to a batch."""
+        state = getattr(self._local, "batch", None)
+        if state is not None and conn is state["conn"]:
+            return
+        conn.close()
+
+    def _commit(self, conn: sqlite3.Connection) -> None:
+        """Commit now, or count the write toward the batch's next chunk commit."""
+        state = getattr(self._local, "batch", None)
+        if state is None or conn is not state["conn"]:
+            conn.commit()
+            return
+        now = time.monotonic()
+        if state["pending"] == 0:
+            state["chunk_started"] = now
+        state["pending"] += 1
+        if (
+            state["pending"] >= state["commit_every"]
+            or now - state["chunk_started"] >= BATCH_MAX_CHUNK_SECONDS
+        ):
+            conn.commit()
+            state["pending"] = 0
+
+    @contextlib.contextmanager
+    def batch(self, commit_every: int = 5000):
+        """
+        Run store calls in the current thread over one shared connection.
+
+        Writes commit every `commit_every` writes, once the open chunk is
+        `BATCH_MAX_CHUNK_SECONDS` old, and on normal exit, so the write lock
+        is never held for long, and reads see the batch's own
+        uncommitted writes. On an exception the open chunk is rolled back
+        (earlier chunks stay committed), the connection is closed and the
+        exception propagates. Other threads keep using their own connections.
+        A nested `batch()` in the same thread joins the outer one.
+        """
+        if getattr(self._local, "batch", None) is not None:
+            yield
+            return
+        conn = sqlite3.connect(self.db_path, timeout=60.0)
+        self._local.batch = {
+            "conn": conn,
+            "pending": 0,
+            "chunk_started": 0.0,
+            "commit_every": max(1, commit_every),
+        }
+        try:
+            yield
+            conn.commit()
+        except BaseException:
+            with contextlib.suppress(sqlite3.Error):
+                conn.rollback()
+            raise
+        finally:
+            self._local.batch = None
+            conn.close()
+
     def _normalize_ids(self, person_a_id: str, person_b_id: str) -> tuple[str, str]:
         """Ensure person_a_id < person_b_id for uniqueness."""
         if person_a_id > person_b_id:
@@ -411,7 +483,7 @@ class RelationshipStore:
         Returns:
             The added relationship
         """
-        conn = self._get_connection()
+        conn = self._acquire()
         try:
             conn.execute("""
                 INSERT INTO relationships
@@ -440,10 +512,10 @@ class RelationshipStore:
                 relationship.shared_phone_calls_count,
                 relationship.shared_photos_count,
             ))
-            conn.commit()
+            self._commit(conn)
             return relationship
         finally:
-            conn.close()
+            self._release(conn)
 
     def add_or_update(self, relationship: Relationship) -> tuple[Relationship, bool]:
         """
@@ -487,7 +559,7 @@ class RelationshipStore:
             The updated relationship
         """
         relationship.updated_at = datetime.now(timezone.utc)
-        conn = self._get_connection()
+        conn = self._acquire()
         try:
             conn.execute("""
                 UPDATE relationships SET
@@ -521,14 +593,14 @@ class RelationshipStore:
                 relationship.shared_photos_count,
                 relationship.id,
             ))
-            conn.commit()
+            self._commit(conn)
             return relationship
         finally:
-            conn.close()
+            self._release(conn)
 
     def get_by_id(self, relationship_id: str) -> Optional[Relationship]:
         """Get relationship by ID."""
-        conn = self._get_connection()
+        conn = self._acquire()
         try:
             cursor = conn.execute(
                 "SELECT * FROM relationships WHERE id = ?",
@@ -539,12 +611,12 @@ class RelationshipStore:
                 return Relationship.from_row(row)
             return None
         finally:
-            conn.close()
+            self._release(conn)
 
     def get_between(self, person_a_id: str, person_b_id: str) -> Optional[Relationship]:
         """Get the relationship between two people."""
         a_id, b_id = self._normalize_ids(person_a_id, person_b_id)
-        conn = self._get_connection()
+        conn = self._acquire()
         try:
             cursor = conn.execute(
                 "SELECT * FROM relationships WHERE person_a_id = ? AND person_b_id = ?",
@@ -555,7 +627,7 @@ class RelationshipStore:
                 return Relationship.from_row(row)
             return None
         finally:
-            conn.close()
+            self._release(conn)
 
     def get_for_person(
         self,
@@ -574,7 +646,7 @@ class RelationshipStore:
         Returns:
             List of relationships
         """
-        conn = self._get_connection()
+        conn = self._acquire()
         try:
             if relationship_type:
                 cursor = conn.execute("""
@@ -594,7 +666,7 @@ class RelationshipStore:
 
             return [Relationship.from_row(row) for row in cursor.fetchall()]
         finally:
-            conn.close()
+            self._release(conn)
 
     def get_connections(self, person_id: str, limit: int = 100) -> list[str]:
         """
@@ -705,38 +777,38 @@ class RelationshipStore:
 
     def delete(self, relationship_id: str) -> bool:
         """Delete a relationship."""
-        conn = self._get_connection()
+        conn = self._acquire()
         try:
             cursor = conn.execute(
                 "DELETE FROM relationships WHERE id = ?",
                 (relationship_id,)
             )
-            conn.commit()
+            self._commit(conn)
             return cursor.rowcount > 0
         finally:
-            conn.close()
+            self._release(conn)
 
     def delete_for_person(self, person_id: str) -> int:
         """Delete all relationships involving a person."""
-        conn = self._get_connection()
+        conn = self._acquire()
         try:
             cursor = conn.execute(
                 "DELETE FROM relationships WHERE person_a_id = ? OR person_b_id = ?",
                 (person_id, person_id)
             )
-            conn.commit()
+            self._commit(conn)
             return cursor.rowcount
         finally:
-            conn.close()
+            self._release(conn)
 
     def count(self) -> int:
         """Get total number of relationships."""
-        conn = self._get_connection()
+        conn = self._acquire()
         try:
             cursor = conn.execute("SELECT COUNT(*) FROM relationships")
             return cursor.fetchone()[0]
         finally:
-            conn.close()
+            self._release(conn)
 
     def get_people_with_relationships(self) -> set[str]:
         """
@@ -745,7 +817,7 @@ class RelationshipStore:
         Returns:
             Set of person IDs with relationships
         """
-        conn = self._get_connection()
+        conn = self._acquire()
         try:
             cursor = conn.execute("""
                 SELECT DISTINCT person_a_id FROM relationships
@@ -754,7 +826,7 @@ class RelationshipStore:
             """)
             return {row[0] for row in cursor.fetchall()}
         finally:
-            conn.close()
+            self._release(conn)
 
     def get_for_people_batch(self, person_ids: set[str]) -> dict[str, list["Relationship"]]:
         """
@@ -771,7 +843,7 @@ class RelationshipStore:
         if not person_ids:
             return {}
 
-        conn = self._get_connection()
+        conn = self._acquire()
         try:
             # Create placeholders for IN clause
             placeholders = ",".join("?" * len(person_ids))
@@ -795,7 +867,7 @@ class RelationshipStore:
 
             return result
         finally:
-            conn.close()
+            self._release(conn)
 
     def open_connection(self) -> sqlite3.Connection:
         """
@@ -835,7 +907,7 @@ class RelationshipStore:
         """
         owns_conn = conn is None
         if owns_conn:
-            conn = self._get_connection()
+            conn = self._acquire()
         try:
             cursor = conn.execute(
                 "SELECT * FROM relationships WHERE person_a_id = ? OR person_b_id = ?",
@@ -844,7 +916,7 @@ class RelationshipStore:
             return [Relationship.from_row(row) for row in cursor.fetchall()]
         finally:
             if owns_conn:
-                conn.close()
+                self._release(conn)
 
     def get_top_neighbors(
         self, person_id: str, limit: int, conn: Optional[sqlite3.Connection] = None
@@ -886,7 +958,7 @@ class RelationshipStore:
 
         owns_conn = conn is None
         if owns_conn:
-            conn = self._get_connection()
+            conn = self._acquire()
         try:
             cursor = conn.execute(f"""
                 SELECT {_RELATIONSHIP_COLUMNS}
@@ -902,7 +974,7 @@ class RelationshipStore:
             return [Relationship.from_row(row) for row in cursor.fetchall()]
         finally:
             if owns_conn:
-                conn.close()
+                self._release(conn)
 
     def get_edges_among(
         self, person_ids, conn: Optional[sqlite3.Connection] = None
@@ -938,7 +1010,7 @@ class RelationshipStore:
 
         owns_conn = conn is None
         if owns_conn:
-            conn = self._get_connection()
+            conn = self._acquire()
         try:
             conn.execute("CREATE TEMP TABLE IF NOT EXISTS _network_edge_ids (id TEXT PRIMARY KEY)")
             conn.execute("DELETE FROM _network_edge_ids")
@@ -968,7 +1040,7 @@ class RelationshipStore:
             with contextlib.suppress(sqlite3.Error):
                 conn.execute("DROP TABLE IF EXISTS _network_edge_ids")
             if owns_conn:
-                conn.close()
+                self._release(conn)
 
     def get_all_relationships(self, limit: Optional[int] = None) -> list["Relationship"]:
         """
@@ -980,7 +1052,7 @@ class RelationshipStore:
         Returns:
             List of all relationships
         """
-        conn = self._get_connection()
+        conn = self._acquire()
         try:
             if limit is not None:
                 cursor = conn.execute("""
@@ -995,11 +1067,11 @@ class RelationshipStore:
                 """)
             return [Relationship.from_row(row) for row in cursor.fetchall()]
         finally:
-            conn.close()
+            self._release(conn)
 
     def get_statistics(self) -> dict:
         """Get aggregate statistics about relationships."""
-        conn = self._get_connection()
+        conn = self._acquire()
         try:
             total = conn.execute("SELECT COUNT(*) FROM relationships").fetchone()[0]
 
@@ -1024,7 +1096,7 @@ class RelationshipStore:
                 "avg_shared_interactions": round(avg, 2),
             }
         finally:
-            conn.close()
+            self._release(conn)
 
 
 # Singleton instance

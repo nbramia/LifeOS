@@ -378,6 +378,8 @@ Runs in this order (see [iMessage Sync Ordering](#imessage-sync-ordering) below)
 | `sync_strengths.py` | Hide new services and newsletters, then recalculate relationship strengths | `data/crm.db` |
 | `push_birthdays_to_contacts.py` | Push LifeOS birthdays to Apple Contacts (macOS-only — `skipped` on Linux) | `data/crm.db` |
 
+**Relationship discovery writes.** `run_full_discovery` runs each discovery phase inside its own `RelationshipStore.batch()`: one connection to `data/crm.db` per phase, committed every 5000 writes, whenever the open chunk is a second old, and at the phase's end, so the write lock is never held across a phase boundary and the step's runtime does not scale with fsync latency. Batching is per thread; other threads use their own connections, and a batch rolls back its open chunk if a phase raises. The hidden-people cleanup runs after the last batch has closed.
+
 ### Phase 4: Vector Store Indexing
 
 | Script | Purpose | Data Source |

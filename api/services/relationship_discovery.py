@@ -1348,18 +1348,28 @@ def run_full_discovery(days_back: int = DISCOVERY_WINDOW_DAYS) -> dict:
     Returns:
         Statistics about discovered relationships
     """
+    # Each phase runs in its own batch: one shared connection with chunked
+    # commits keeps the run independent of per-commit fsync latency, and the
+    # batch commits and releases the write lock at every phase boundary so the
+    # long read-only stretches of the next phase never hold it. All batches are
+    # closed before the cleanup below, which writes to the same database over
+    # its own connection.
+    def phase(fn, *args, **kwargs) -> int:
+        with get_relationship_store().batch():
+            return len(fn(*args, **kwargs))
+
     results = {
-        "calendar": len(discover_from_calendar(days_back)),
-        "calendar_direct": len(discover_from_calendar_direct(days_back)),
-        "email": len(discover_from_email_threads(days_back, min_shared_threads=1)),
-        "vault": len(discover_from_vault_comments(days_back)),
-        "messaging_groups": len(discover_from_messaging_groups(days_back)),
-        "imessage_direct": len(discover_from_imessage_direct(days_back)),
-        "whatsapp_direct": len(discover_from_whatsapp_direct(days_back)),
-        "phone_calls": len(discover_from_phone_calls(days_back)),
-        "slack_direct": len(discover_from_slack_direct(days_back)),
-        "linkedin": len(discover_linkedin_connections()),
-        "photos": len(discover_from_shared_photos(days_back)),
+        "calendar": phase(discover_from_calendar, days_back),
+        "calendar_direct": phase(discover_from_calendar_direct, days_back),
+        "email": phase(discover_from_email_threads, days_back, min_shared_threads=1),
+        "vault": phase(discover_from_vault_comments, days_back),
+        "messaging_groups": phase(discover_from_messaging_groups, days_back),
+        "imessage_direct": phase(discover_from_imessage_direct, days_back),
+        "whatsapp_direct": phase(discover_from_whatsapp_direct, days_back),
+        "phone_calls": phase(discover_from_phone_calls, days_back),
+        "slack_direct": phase(discover_from_slack_direct, days_back),
+        "linkedin": phase(discover_linkedin_connections),
+        "photos": phase(discover_from_shared_photos, days_back),
     }
 
     # Post-discovery cleanup: remove relationships involving hidden people.
