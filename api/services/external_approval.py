@@ -59,6 +59,7 @@ TTL_MIN_SECONDS = 60
 TTL_MAX_SECONDS = 86400
 TTL_DEFAULT_SECONDS = 10800
 RETENTION_SECONDS = 7 * 86400
+SUMMARY_QUOTE = "\u2502 "
 
 STATE_PENDING = "pending"
 STATE_APPROVED = "approved"
@@ -186,8 +187,12 @@ def _local_time(epoch: float) -> str:
 
 def request_text(summary: str, source: Optional[str], request_hash: str, expires_at: float) -> str:
     """The Telegram message: the exact summary the buttons decide, where the
-    request came from, and what identifies it."""
-    lines = ["Chief of Staff asks:", "", summary, ""]
+    request came from, and what identifies it. Every summary line carries a
+    quote marker, so text inside the summary cannot pass for the `From`,
+    `Request` or `Expires` lines that follow it."""
+    lines = ["Chief of Staff asks:", ""]
+    lines += [f"{SUMMARY_QUOTE}{line}" for line in summary.split("\n")]
+    lines.append("")
     if source:
         lines.append(f"From: {source}")
     lines.append(f"Request: {request_hash[:12]}")

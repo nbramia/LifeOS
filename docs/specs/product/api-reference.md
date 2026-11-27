@@ -1262,7 +1262,7 @@ Open a request and send it to the operator.
 - `ttl_seconds` (optional): integer 60–86400, default 10800 (3 hours).
 - `source` (optional): 1–120 characters on one line, where the request came from; control characters are removed.
 
-The primary bot sends the operator chat `Chief of Staff asks:`, the summary verbatim, `From: <source>` when given, the first 12 characters of `request_hash`, and the expiry time in `LIFEOS_TIMEZONE`, with **Approve** and **Deny** buttons.
+The primary bot sends the operator chat `Chief of Staff asks:`, the summary verbatim with each line marked as quoted (so summary text cannot pass for the lines after it), `From: <source>` when given, the first 12 characters of `request_hash`, and the expiry time in `LIFEOS_TIMEZONE`, with **Approve** and **Deny** buttons.
 
 **Response:** `{"token": "<16 hex>", "expires_at": "<ISO-8601 UTC>"}`
 
