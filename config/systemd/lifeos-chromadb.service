@@ -4,6 +4,8 @@ After=network.target
 
 [Service]
 Type=simple
+# Kept out of reach of a whole-machine OOM ahead of other processes.
+OOMScoreAdjust=-500
 User=__USER__
 WorkingDirectory=__LIFEOS_DIR__
 ExecStart=__VENV__/bin/chroma run --host localhost --port 8001 --path __LIFEOS_DIR__/data/chromadb
