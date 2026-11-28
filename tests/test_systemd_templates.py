@@ -45,12 +45,15 @@ def _oom_score_adjust(name: str) -> int:
     return int(match.group(1))
 
 
-def test_core_services_are_shielded_from_the_oom_killer_in_order():
-    api = _oom_score_adjust("lifeos-api.service")
+def test_oom_adjustments_weigh_chromadb_then_the_model_server():
     chroma = _oom_score_adjust("lifeos-chromadb.service")
     llm = _oom_score_adjust("lifeos-llm.service")
-    assert api < 0 and chroma < 0 and llm < 0
-    assert llm > max(api, chroma)
+    assert chroma < llm < 0
+
+
+def test_the_api_sets_no_oom_adjustment_its_agent_sessions_would_inherit():
+    text = (REPO_ROOT / "config" / "systemd" / "lifeos-api.service").read_text()
+    assert "OOMScoreAdjust" not in text
 
 
 def test_root_network_watchdog_runs_a_root_owned_copy():

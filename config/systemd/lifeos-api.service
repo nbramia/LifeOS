@@ -5,8 +5,6 @@ Wants=lifeos-chromadb.service
 
 [Service]
 Type=simple
-# Kept out of reach of a whole-machine OOM ahead of other processes.
-OOMScoreAdjust=-500
 User=__USER__
 WorkingDirectory=__LIFEOS_DIR__
 EnvironmentFile=__LIFEOS_DIR__/.env
