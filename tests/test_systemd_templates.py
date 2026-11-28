@@ -29,6 +29,33 @@ def test_llm_context_size_is_a_setting_with_the_current_default():
     assert '_read_env "LIFEOS_LLM_CONTEXT_SIZE" "32768"' in setup
 
 
+def test_llm_host_memory_caps_are_settings_with_small_defaults():
+    unit = (REPO_ROOT / "config" / "systemd" / "lifeos-llm.service").read_text()
+    setup = (REPO_ROOT / "scripts" / "setup-systemd.sh").read_text()
+    assert "--cache-ram __LLM_CACHE_RAM_MIB__" in unit
+    assert "--ctx-checkpoints __LLM_CTX_CHECKPOINTS__" in unit
+    assert '_read_env "LIFEOS_LLM_CACHE_RAM_MIB" "1024"' in setup
+    assert '_read_env "LIFEOS_LLM_CTX_CHECKPOINTS" "4"' in setup
+
+
+def _oom_score_adjust(name: str) -> int:
+    text = (REPO_ROOT / "config" / "systemd" / name).read_text()
+    match = re.search(r"^OOMScoreAdjust=(-?\d+)$", text, re.MULTILINE)
+    assert match, f"{name} sets no OOMScoreAdjust"
+    return int(match.group(1))
+
+
+def test_oom_adjustments_weigh_chromadb_then_the_model_server():
+    chroma = _oom_score_adjust("lifeos-chromadb.service")
+    llm = _oom_score_adjust("lifeos-llm.service")
+    assert chroma < llm < 0
+
+
+def test_the_api_sets_no_oom_adjustment_its_agent_sessions_would_inherit():
+    text = (REPO_ROOT / "config" / "systemd" / "lifeos-api.service").read_text()
+    assert "OOMScoreAdjust" not in text
+
+
 def test_root_network_watchdog_runs_a_root_owned_copy():
     """The root unit executes the installed copy, never the user-writable checkout."""
     unit = (REPO_ROOT / "config" / "systemd" / "lifeos-network-watchdog.service").read_text()

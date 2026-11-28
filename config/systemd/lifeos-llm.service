@@ -15,10 +15,16 @@ ExecStart=__LLAMA_CPP_DIR__/build/bin/llama-server \
     --jinja \
     --no-mmap \
     -c __LLM_CONTEXT_SIZE__ \
+    --cache-ram __LLM_CACHE_RAM_MIB__ \
+    --ctx-checkpoints __LLM_CTX_CHECKPOINTS__ \
     --host 0.0.0.0 \
     --port 8080
 Restart=__LLM_RESTART_POLICY__
 RestartSec=10
+# Weighs the OOM killer's choice away from the model server, less than
+# ChromaDB's -500: it reloads with nothing lost. The adjustment shifts its
+# memory-based score; it does not fix a kill order.
+OOMScoreAdjust=-200
 StandardOutput=append:__LIFEOS_DIR__/logs/llama-server.log
 StandardError=append:__LIFEOS_DIR__/logs/llama-server.log
 

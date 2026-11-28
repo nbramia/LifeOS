@@ -80,6 +80,8 @@ Governs chat synthesis, intent classification, and agentic orchestration. The to
 | `LIFEOS_LLM_MODEL` | str | — | Optional override for the GGUF model the `lifeos-llm` systemd unit loads. When unset, the unit uses its bundled `-hf` default; when set, the setup script substitutes a `-m`/`--mmproj` form. |
 | `LIFEOS_LOCAL_LLM_AUTOSTART` | bool | `false` | When `true`, the API service brings up `lifeos-llm` on its `Wants=` chain. Default `false` so a missing local model doesn't break the API. |
 | `LIFEOS_LLM_CONTEXT_SIZE` | int | `32768` | llama-server context size in tokens (`-c`), written into `lifeos-llm.service` by `setup-systemd.sh`. Raise it for agents that need a longer window (Hermes asks for at least 65536 for tool use); each doubling grows the KV cache, so check VRAM headroom first. Rerun `sudo ./scripts/setup-systemd.sh` from the repo root, then restart `lifeos-llm`, to apply. |
+| `LIFEOS_LLM_CACHE_RAM_MIB` | int | `1024` | Cap in MiB on llama-server's prompt cache (`--cache-ram`), which lives in system RAM. Each cached prompt also holds its context checkpoint, a few hundred MiB for a typical prompt, and a cache hit only saves re-reading part of a prompt, so a small cap costs speed on a miss, not answer quality. `0` disables it. Applied by `setup-systemd.sh` like the context size. |
+| `LIFEOS_LLM_CTX_CHECKPOINTS` | int | `4` | Context checkpoints llama-server keeps per slot (`--ctx-checkpoints`), in system RAM. A checkpoint's size grows with its prompt's length, so a long agent session can hold several GB per checkpoint; checkpoints only spare re-processing when a prompt diverges from what the slot holds. Applied by `setup-systemd.sh` like the context size. |
 
 ### Claude model names
 

@@ -4,6 +4,10 @@ After=network.target
 
 [Service]
 Type=simple
+# Weighs the OOM killer's choice away from the search index. ChromaDB starts
+# no child processes, so nothing else inherits the adjustment. The API sets
+# none: the agent sessions it launches would inherit it.
+OOMScoreAdjust=-500
 User=__USER__
 WorkingDirectory=__LIFEOS_DIR__
 ExecStart=__VENV__/bin/chroma run --host localhost --port 8001 --path __LIFEOS_DIR__/data/chromadb

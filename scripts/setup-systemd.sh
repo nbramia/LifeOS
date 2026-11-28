@@ -16,6 +16,8 @@
 #                               docs/guides/agent-worker-setup.md).
 #   __LLM_RESTART_POLICY__    → "on-failure" or "no" (from LIFEOS_LOCAL_LLM_AUTOSTART)
 #   __LLM_CONTEXT_SIZE__      → llama-server context size in tokens (LIFEOS_LLM_CONTEXT_SIZE)
+#   __LLM_CACHE_RAM_MIB__     → llama-server prompt cache cap in MiB (LIFEOS_LLM_CACHE_RAM_MIB)
+#   __LLM_CTX_CHECKPOINTS__   → llama-server context checkpoints per slot (LIFEOS_LLM_CTX_CHECKPOINTS)
 
 set -euo pipefail
 
@@ -61,6 +63,20 @@ LLM_AUTOSTART=$(_read_env "LIFEOS_LOCAL_LLM_AUTOSTART" "false")
 LLM_CONTEXT_SIZE=$(_read_env "LIFEOS_LLM_CONTEXT_SIZE" "32768")
 if ! [[ "$LLM_CONTEXT_SIZE" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: LIFEOS_LLM_CONTEXT_SIZE must be a positive integer (got '$LLM_CONTEXT_SIZE')" >&2
+    exit 1
+fi
+# Both live in system RAM, outside the model's GPU buffers: the prompt cache
+# up to its cap, and each slot's context checkpoints, which grow with prompt
+# length. They only save re-processing a prompt, so smaller caps cost speed on
+# a cache miss, never answer quality.
+LLM_CACHE_RAM_MIB=$(_read_env "LIFEOS_LLM_CACHE_RAM_MIB" "1024")
+if ! [[ "$LLM_CACHE_RAM_MIB" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    echo "ERROR: LIFEOS_LLM_CACHE_RAM_MIB must be a non-negative integer (got '$LLM_CACHE_RAM_MIB')" >&2
+    exit 1
+fi
+LLM_CTX_CHECKPOINTS=$(_read_env "LIFEOS_LLM_CTX_CHECKPOINTS" "4")
+if ! [[ "$LLM_CTX_CHECKPOINTS" =~ ^(0|[1-9][0-9]*)$ ]]; then
+    echo "ERROR: LIFEOS_LLM_CTX_CHECKPOINTS must be a non-negative integer (got '$LLM_CTX_CHECKPOINTS')" >&2
     exit 1
 fi
 MCP_BEARER_TOKEN=$(_read_env "LIFEOS_MCP_BEARER_TOKEN" "")
@@ -153,6 +169,8 @@ for unit in "$SYSTEMD_SRC"/*.service "$SYSTEMD_SRC"/*.timer; do
         -e "s|__LLM_SOURCE_ARGS__|$LLM_SOURCE_ARGS|g" \
         -e "s|__LLM_RESTART_POLICY__|$LLM_RESTART_POLICY|g" \
         -e "s|__LLM_CONTEXT_SIZE__|$LLM_CONTEXT_SIZE|g" \
+        -e "s|__LLM_CACHE_RAM_MIB__|$LLM_CACHE_RAM_MIB|g" \
+        -e "s|__LLM_CTX_CHECKPOINTS__|$LLM_CTX_CHECKPOINTS|g" \
         "$unit" > "$SYSTEMD_DST/$name"
     echo "  Installed $name"
 done
